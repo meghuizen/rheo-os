@@ -194,6 +194,47 @@ impl QueuePair {
             }
         }
     }
+
+    /// User-side submit: push one entry writing its fields individually.
+    /// `#[inline(always)]` and field-wise on purpose - it inlines into
+    /// U-mode code, where a whole-struct 64-byte write could lower to a
+    /// `memcpy` call into unmapped kernel `.text` and fault. Mirrors
+    /// `Ring::push`; the SPSC ordering is identical.
+    #[inline(always)]
+    pub fn submit(&self, opcode: u8, cap_id: u32, flow_id: u128, user_data: u64) -> bool {
+        let head = self.sq.head.load(Ordering::Relaxed);
+        let tail = self.sq.tail.load(Ordering::Acquire);
+        if head.wrapping_sub(tail) as usize >= RING_DEPTH {
+            return false;
+        }
+        let idx = (head as usize) & (RING_DEPTH - 1);
+        // SAFETY: idx is in-bounds; the ring memory is shared and mapped.
+        unsafe {
+            let slot = self.sq.entries.add(idx);
+            ptr::addr_of_mut!((*slot).opcode).write_volatile(opcode);
+            ptr::addr_of_mut!((*slot).cap_id).write_volatile(cap_id);
+            ptr::addr_of_mut!((*slot).flow_id).write_volatile(flow_id);
+            ptr::addr_of_mut!((*slot).user_data).write_volatile(user_data);
+        }
+        self.sq.head.store(head.wrapping_add(1), Ordering::Release);
+        true
+    }
+
+    /// User-side reap: pop one completion, returning its status, or None.
+    #[inline(always)]
+    pub fn reap(&self) -> Option<u32> {
+        let tail = self.cq.tail.load(Ordering::Relaxed);
+        let head = self.cq.head.load(Ordering::Acquire);
+        if tail == head {
+            return None;
+        }
+        let idx = (tail as usize) & (RING_DEPTH - 1);
+        // SAFETY: idx is in-bounds; matches the volatile writer in the
+        // kernel completion path.
+        let status = unsafe { ptr::addr_of!((*self.cq.entries.add(idx)).status).read_volatile() };
+        self.cq.tail.store(tail.wrapping_add(1), Ordering::Release);
+        Some(status)
+    }
 }
 
 /// The kernel side of the doorbell: drain the submission ring, grant-check

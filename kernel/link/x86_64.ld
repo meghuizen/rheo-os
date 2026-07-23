@@ -26,5 +26,20 @@ SECTIONS
         __bss_end = .;
     }
 
+    /* User image (see riscv64.ld for the rationale): one 2 MiB-aligned,
+       2 MiB window, so a single PD table covers it and per-cell roots
+       differ only in that slot. */
+    . = ALIGN(2M);
+    __user_start = .;
+    .user.text   : { *(.user.text .user.text.*) }
+    . = ALIGN(4K);
+    __user_data_start = .;
+    .user.data   : { *(.user.data .user.data.*) *(.user.bss .user.bss.*) }
+    . = __user_start + 2M;
+    __user_end = .;
+
+    . = ALIGN(2M);
+    __kernel_end = .;
+
     /DISCARD/ : { *(.eh_frame) *(.comment) }
 }

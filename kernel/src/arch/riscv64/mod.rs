@@ -5,11 +5,21 @@
 use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicU64, Ordering};
 
+mod paging;
+pub use paging::{
+    PagingRoot, paging_activate, paging_activate_kernel, paging_kernel_init, paging_map,
+    paging_new_root,
+};
+
 global_asm!(include_str!("../../../arch/riscv64/boot.S"));
-global_asm!(include_str!("../../../arch/riscv64/trap.S"));
+global_asm!(include_str!("../../../arch/riscv64/traps.S"));
 global_asm!(include_str!("../../../arch/riscv64/context_switch.S"));
 
 pub const NAME: &str = "RISC-V 64";
+
+/// Physical base of the frame pool: 64 MiB into RAM, well above the kernel
+/// image (checked against __kernel_end in frames::init).
+pub const FRAME_POOL_BASE: usize = 0x8400_0000;
 
 // ---------------------------------------------------------------- serial
 
@@ -72,6 +82,78 @@ pub fn doorbell_trap() {
 
 pub fn doorbell_count() -> u64 {
     DOORBELLS.load(Ordering::Relaxed)
+}
+
+// -------------------------------------------------------------- user mode
+
+/// Saved U-mode register state. Layout matches the offsets in traps.S:
+/// `regs[i]` is xi (regs[0]/x0 unused, regs[2] is the user sp), then sepc,
+/// then the kernel sp to load on trap entry.
+#[repr(C)]
+pub struct TrapFrame {
+    regs: [u64; 32],
+    sepc: u64,
+    kernel_sp: u64,
+}
+
+const REG_SP: usize = 2;
+const REG_A0: usize = 10; // first argument / return value
+const REG_A7: usize = 17; // syscall number
+const SCAUSE_ECALL_U: u64 = 8;
+
+/// Build a fresh frame that enters `entry` in U-mode with stack `user_sp`
+/// and `arg` in a0. `kernel_sp` is the stack the trap handler runs on.
+pub fn trapframe_new(entry: usize, user_sp: usize, arg: usize, kernel_sp: usize) -> TrapFrame {
+    let mut regs = [0u64; 32];
+    regs[REG_SP] = user_sp as u64;
+    regs[REG_A0] = arg as u64;
+    TrapFrame {
+        regs,
+        sepc: entry as u64,
+        kernel_sp: kernel_sp as u64,
+    }
+}
+
+/// (syscall number, first argument).
+pub fn decode_syscall(frame: &TrapFrame) -> (u64, u64) {
+    (frame.regs[REG_A7], frame.regs[REG_A0])
+}
+
+pub fn set_syscall_ret(frame: &mut TrapFrame, value: u64) {
+    frame.regs[REG_A0] = value;
+}
+
+unsafe extern "C" {
+    /// Enter U-mode with `frame`, saving kernel state for return_to_kernel.
+    pub fn enter_user_first(frame: *mut TrapFrame);
+    /// Unwind back out of enter_user_first. Diverges.
+    fn return_to_kernel_asm() -> !;
+}
+
+/// Leave U-mode and resume the kernel run loop (see enter_user_first).
+pub fn return_to_kernel() -> ! {
+    // SAFETY: only called while a cell is running, i.e. inside the
+    // dynamic extent of an enter_user_first call.
+    unsafe { return_to_kernel_asm() }
+}
+
+/// Called from traps.S on every U-mode trap. Advances past the ecall for
+/// syscalls, then hands off to the portable dispatcher, which returns the
+/// frame to resume (or diverges via return_to_kernel).
+#[unsafe(no_mangle)]
+extern "C" fn riscv_user_trap(scause: u64, stval: u64, frame: *mut TrapFrame) -> *mut TrapFrame {
+    let kind = if scause == SCAUSE_ECALL_U {
+        // Resume after the 4-byte ecall.
+        unsafe { (*frame).sepc += 4 };
+        super::TrapKind::Syscall
+    } else {
+        super::TrapKind::Fault
+    };
+    let resume = crate::user::on_user_trap(kind, stval as usize, frame);
+    if resume.is_null() {
+        return_to_kernel();
+    }
+    resume
 }
 
 // -------------------------------------------------------------- counters

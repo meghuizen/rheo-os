@@ -17,11 +17,18 @@
 #![no_std]
 #![no_main]
 
+#[path = "harness.rs"]
+mod harness;
+
+use harness::{CellStore, KernelStack, build_cell};
+use kernel::abi::{WORKLOAD_CROSSCELL, WORKLOAD_ROUNDTRIP, WORKLOAD_SYSCALL};
 use kernel::arch::{self, Context};
-use kernel::capability::{BUDGET_UNLIMITED, ObjectKind, ObjectTable, READ, WRITE};
+use kernel::capability::{BUDGET_UNLIMITED, CapTable, ObjectKind, ObjectTable, READ, WRITE};
 use kernel::cell::Cell;
 use kernel::println;
 use kernel::queue::{self, CqEntry, OP_NOP, QueuePair, RING_DEPTH, SqEntry};
+use kernel::user;
+use kernel::user_progs::{user_pong, user_worker};
 
 const CAL_ITERS: u64 = 100_000;
 const BATCHES: usize = 32;
@@ -210,6 +217,128 @@ extern "C" fn kernel_main() -> ! {
     }
     report("p3_context_switch", 2 * BATCH_OPS as u64, switch_best);
 
+    // -------------------------------------------------- user-mode P2 / P5
+    // The numbers that actually answer the seL4 comparison: work measured
+    // from U-mode, across the real syscall boundary, and (for P5) across a
+    // real address-space switch each way. Timing is done by the U-mode
+    // worker itself with rdcycle; the kernel reads it back from the shared
+    // params page.
+    user_mode_benches();
+
     println!("bench-core: DONE");
     arch::exit(arch::ExitCode::Success)
+}
+
+const USER_ITERS: u64 = 2048;
+
+#[unsafe(link_section = ".user.bss")]
+static mut STORE0: CellStore = CellStore::new();
+#[unsafe(link_section = ".user.bss")]
+static mut STORE1: CellStore = CellStore::new();
+static mut KSTACK: KernelStack = KernelStack::new();
+static mut U_OBJECTS: ObjectTable = ObjectTable::new();
+static mut U_CAPS0: CapTable = CapTable::new();
+static mut U_CAPS1: CapTable = CapTable::new();
+
+/// Run one single-cell user workload and return (ticks, ops) the worker
+/// measured across the boundary.
+fn run_single(workload: u64) -> (u64, u64) {
+    unsafe {
+        let objects = &mut *core::ptr::addr_of_mut!(U_OBJECTS);
+        let caps = &mut *core::ptr::addr_of_mut!(U_CAPS0);
+        let store = core::ptr::addr_of_mut!(STORE0);
+        let ksp = (*core::ptr::addr_of!(KSTACK)).top();
+
+        let (aspace, _obj, mut frame) = build_cell(
+            &mut *store,
+            objects,
+            caps,
+            ksp,
+            1,
+            user_worker,
+            workload,
+            USER_ITERS,
+        );
+        let qp = (*store).qp.qp.as_ptr();
+
+        user::reset();
+        user::install(
+            0,
+            &aspace,
+            caps,
+            objects,
+            qp,
+            core::ptr::addr_of_mut!(frame),
+        );
+        user::run(0);
+
+        let p = &(*store).params;
+        (p.ticks, p.ops)
+    }
+}
+
+/// Run the cross-cell workload: cell 0 (client) switches to cell 1 (a pong
+/// peer) and back, USER_ITERS times. One iteration = one round trip = two
+/// address-space switches (directly comparable to seL4 Call + ReplyRecv).
+fn run_crosscell() -> (u64, u64) {
+    unsafe {
+        let objects = &mut *core::ptr::addr_of_mut!(U_OBJECTS);
+        let caps0 = &mut *core::ptr::addr_of_mut!(U_CAPS0);
+        let caps1 = &mut *core::ptr::addr_of_mut!(U_CAPS1);
+        let s0 = core::ptr::addr_of_mut!(STORE0);
+        let s1 = core::ptr::addr_of_mut!(STORE1);
+        let ksp = (*core::ptr::addr_of!(KSTACK)).top();
+
+        let (aspace0, _o0, mut frame0) = build_cell(
+            &mut *s0,
+            objects,
+            caps0,
+            ksp,
+            1,
+            user_worker,
+            WORKLOAD_CROSSCELL,
+            USER_ITERS,
+        );
+        let (aspace1, _o1, mut frame1) =
+            build_cell(&mut *s1, objects, caps1, ksp, 2, user_pong, 0, 0);
+        let qp0 = (*s0).qp.qp.as_ptr();
+        let qp1 = (*s1).qp.qp.as_ptr();
+
+        user::reset();
+        user::install(
+            0,
+            &aspace0,
+            caps0,
+            objects,
+            qp0,
+            core::ptr::addr_of_mut!(frame0),
+        );
+        user::install(
+            1,
+            &aspace1,
+            caps1,
+            objects,
+            qp1,
+            core::ptr::addr_of_mut!(frame1),
+        );
+        user::run(0);
+
+        let p = &(*s0).params;
+        (p.ticks, p.ops)
+    }
+}
+
+fn report_user(name: &str, ticks: u64, ops: u64) {
+    report(name, ops, ticks);
+}
+
+fn user_mode_benches() {
+    let (t, n) = run_single(WORKLOAD_SYSCALL);
+    report_user("p2_user_syscall_floor", t, n);
+
+    let (t, n) = run_single(WORKLOAD_ROUNDTRIP);
+    report_user("p2_user_roundtrip", t, n);
+
+    let (t, n) = run_crosscell();
+    report_user("p5_crosscell_roundtrip", t, n);
 }

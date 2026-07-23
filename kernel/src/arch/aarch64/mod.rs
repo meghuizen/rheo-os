@@ -4,11 +4,21 @@
 use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicU64, Ordering};
 
+mod paging;
+pub use paging::{
+    PagingRoot, paging_activate, paging_activate_kernel, paging_kernel_init, paging_map,
+    paging_new_root,
+};
+
 global_asm!(include_str!("../../../arch/aarch64/boot.S"));
 global_asm!(include_str!("../../../arch/aarch64/vectors.S"));
 global_asm!(include_str!("../../../arch/aarch64/context_switch.S"));
 
 pub const NAME: &str = "ARM64";
+
+/// Physical base of the frame pool: 64 MiB into RAM, above the kernel
+/// image (checked against __kernel_end in frames::init).
+pub const FRAME_POOL_BASE: usize = 0x4400_0000;
 
 // ---------------------------------------------------------------- serial
 
@@ -75,6 +85,71 @@ pub fn doorbell_trap() {
 
 pub fn doorbell_count() -> u64 {
     DOORBELLS.load(Ordering::Relaxed)
+}
+
+// -------------------------------------------------------------- user mode
+
+/// Saved EL0 register state. Layout matches the offsets in vectors.S:
+/// x0..x30, then SP_EL0, ELR_EL1, SPSR_EL1, the kernel sp, and padding to
+/// a 16-byte multiple.
+#[repr(C)]
+pub struct TrapFrame {
+    regs: [u64; 31],
+    sp_el0: u64,
+    elr: u64,
+    spsr: u64,
+    kernel_sp: u64,
+    _pad: u64,
+}
+
+const REG_X0: usize = 0; // first argument / return value
+const REG_X8: usize = 8; // syscall number
+
+pub fn trapframe_new(entry: usize, user_sp: usize, arg: usize, kernel_sp: usize) -> TrapFrame {
+    let mut regs = [0u64; 31];
+    regs[REG_X0] = arg as u64;
+    TrapFrame {
+        regs,
+        sp_el0: user_sp as u64,
+        elr: entry as u64,
+        spsr: 0, // EL0t, interrupts unmasked (none are enabled)
+        kernel_sp: kernel_sp as u64,
+        _pad: 0,
+    }
+}
+
+pub fn decode_syscall(frame: &TrapFrame) -> (u64, u64) {
+    (frame.regs[REG_X8], frame.regs[REG_X0])
+}
+
+pub fn set_syscall_ret(frame: &mut TrapFrame, value: u64) {
+    frame.regs[REG_X0] = value;
+}
+
+unsafe extern "C" {
+    pub fn enter_user_first(frame: *mut TrapFrame);
+    fn return_to_kernel_asm() -> !;
+}
+
+pub fn return_to_kernel() -> ! {
+    // SAFETY: only called while a cell is running (inside enter_user_first).
+    unsafe { return_to_kernel_asm() }
+}
+
+/// Called from vectors.S on every EL0 trap. SVC (ELR already points past
+/// the instruction) is a syscall; any other exception class is a fault.
+#[unsafe(no_mangle)]
+extern "C" fn aarch64_user_trap(esr: u64, far: u64, frame: *mut TrapFrame) -> *mut TrapFrame {
+    let kind = if (esr >> 26) & 0x3F == EC_SVC64 {
+        super::TrapKind::Syscall
+    } else {
+        super::TrapKind::Fault
+    };
+    let resume = crate::user::on_user_trap(kind, far as usize, frame);
+    if resume.is_null() {
+        return_to_kernel();
+    }
+    resume
 }
 
 // -------------------------------------------------------------- counters

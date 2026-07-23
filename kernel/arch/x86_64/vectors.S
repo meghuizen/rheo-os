@@ -66,6 +66,7 @@ common_trap:
     mov 72(%rsp), %rdi      /* vector */
     mov 80(%rsp), %rsi      /* error code */
     mov 88(%rsp), %rdx      /* interrupt-frame RIP */
+    mov 96(%rsp), %rcx      /* interrupt-frame CS (RPL tells user vs kernel) */
     call x86_trap_handler
 
     popq %r11

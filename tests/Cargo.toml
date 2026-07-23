@@ -21,3 +21,7 @@ path = "src/queue_pipeline.rs"
 [[bin]]
 name = "bench-core"
 path = "src/bench_core.rs"
+
+[[bin]]
+name = "isolation-hw"
+path = "src/isolation_hw.rs"

@@ -1,8 +1,8 @@
 # Concept validation results - rheo-os vs seL4
 
-**Date:** 2026-07-23.
+**Date:** 2026-07 (re-measured after user-mode landed).
 **Environment:** QEMU 8.2.2 (Ubuntu), `-icount shift=0,align=off,sleep=off`
-(deterministic: every number below reproduces exactly).
+(deterministic: every number reproduces exactly).
 **rheo-os:** release build, pinned nightly (rust-toolchain.toml), this
 commit. **seL4:** sel4bench master (kernel `5126e718b`, sel4bench
 `a0f099b`), PLATFORM=qemu-arm-virt, AARCH64, RELEASE, FASTPATH - built and
@@ -10,110 +10,133 @@ run with `comparison/sel4/run-sel4bench.sh`.
 
 All numbers are **instruction path lengths** (instructions executed per
 operation), not wall-clock time. Read comparison/README.md for why that is
-the only honest QEMU metric and how it maps to the hardware targets.
+the only honest QEMU metric and how it maps to the hardware targets. On
+x86-64 and RISC-V the guest counter advances one tick per instruction
+under icount (calibration line `ticks_per_kilo_insn=1000`), so those
+columns are exact; on ARM64 the virtual counter runs at 1/16 the
+instruction rate (`ticks_per_kilo_insn=62`), so its column is rounded and
+marked `~`.
 
-## 1. Correctness: the concepts hold
+## 1. What changed since the last milestone
+
+The previous report flagged one caveat in bold: cells were *not yet* behind
+hardware address spaces, so isolation was enforced by a table lookup and
+the round-trip numbers crossed a privilege boundary but **no address-space
+switch**. That caveat is now closed. Cells run in real U-mode (RISC-V
+U-mode, ARM64 EL0, x86-64 ring 3) behind per-cell page tables (Sv39 /
+4 KiB-granule AArch64 / 4-level x86-64), and the isolation tests are
+enforced by the MMU faulting, not by kernel bookkeeping.
+
+## 2. Correctness: the concepts hold (MMU-enforced)
 
 `cargo xtask test --arch all` - green on x86-64, ARM64, RISC-V 64:
 
-| Concept | Test kernel | Result |
-|---|---|---|
-| Unforgeability (ARCHITECTURE.md 8.2 #1) | cap-invariants | pass, all 3 ISAs |
-| Monotonic attenuation (#2), runtime + compile-time | cap-invariants | pass, all 3 ISAs |
-| Revocation soundness (#3), O(1) epoch bump | cap-invariants | pass, all 3 ISAs |
-| Isolation via per-cell tables (#4), delegation as move | cap-invariants | pass, all 3 ISAs |
-| Budget-metered capabilities (object 2) | cap-invariants | pass, all 3 ISAs |
-| Queue ABI: batched submit, one doorbell (IO.md 1) | queue-pipeline | pass, all 3 ISAs |
-| Flow context preserved through completions (obj. 10) | queue-pipeline | pass, all 3 ISAs |
-| Per-entry grant check on the data path | queue-pipeline | pass, all 3 ISAs |
-| Mid-stream revocation goes dark immediately | queue-pipeline | pass, all 3 ISAs |
+| Concept | Test kernel | How it's enforced | Result |
+|---|---|---|---|
+| Unforgeability, attenuation, revocation, isolation (ARCH 8.2) | cap-invariants | runtime checks on the capability core | pass, 3 ISAs |
+| Queue ABI: batched submit + one doorbell, flow context, per-entry grant check, mid-stream revocation | queue-pipeline | in-kernel | pass, 3 ISAs |
+| A cell cannot read kernel memory | isolation-hw | **page fault** (no U bit on kernel pages) | pass, 3 ISAs |
+| A cell cannot read another cell's page | isolation-hw | **page fault** (not mapped in this root) | pass, 3 ISAs |
+| W^X: a code page is not writable | isolation-hw | **page fault** (read-only mapping) | pass, 3 ISAs |
+| NX: a data page is not executable | isolation-hw | **page fault** (NX / UXN / no-X) | pass, 3 ISAs |
+| A cell reads its own mapped page | isolation-hw | succeeds (control) | pass, 3 ISAs |
 
-## 2. The three numbers (docs/IO.md 7), instructions per operation
+The isolation lemma (ARCHITECTURE.md 8.2 property 4) is now demonstrated the
+way it will hold in production: two cells with disjoint page tables fault
+the moment either reaches for the other's memory.
 
-`cargo xtask bench --arch all`, best batch of 32x1024 ops (variance under
-icount is zero; ARM64 ticks converted at the measured 16 insn/tick):
+## 3. The numbers (instructions per operation)
+
+`cargo xtask bench --arch all`, best batch under icount. In-kernel figures
+measure the mechanism in isolation; user-mode figures cross the real
+privilege boundary (and, for P5, a real address-space switch each way).
 
 | Benchmark | x86-64 | ARM64 | RISC-V 64 |
 |---|---|---|---|
-| P1 grant check (typed handle) | 27 | 26 | 24 |
-| P1 grant check (32-bit ABI form) | 26 | 25 | 24 |
-| P1 deny path (revoked cap) | 19 | 22 | 21 |
-| Ring push + pop (transport only, no kernel) | 75 | 71 | 79 |
-| Doorbell trap (privilege round trip floor) | 39 | 48 | 63 |
-| P2 queue round trip, single message | 211 | 200 | 255 |
-| P2 queue round trip, batched 64/doorbell | 154 | 140 | 160 |
-| P3 context switch (same-cell, cooperative) | 21 | 25 | 41 |
+| P1 grant check (typed handle) | 27 | ~26 | 24 |
+| P1 deny path (revoked) | 19 | ~22 | 21 |
+| P3 context switch (same-cell, cooperative) | 20 | ~25 | 40 |
+| Doorbell trap floor (int3 / svc / ebreak) | 40 | ~48 | 67 |
+| P2 queue round trip, in-kernel single | 212 | ~200 | 259 |
+| P2 queue round trip, in-kernel batched 64 | 154 | ~139 | 160 |
+| **Syscall floor (U-mode, empty syscall)** | **76** | **~91** | **119** |
+| **P2 queue round trip (U-mode, real syscall)** | **207** | **~210** | **277** |
+| **P5 cross-cell round trip (2 addr-space switches)** | **155** | **~211** | **273** |
 
-## 3. Head-to-head with seL4 (same QEMU, same machine, same icount)
+The U-mode P2 (submit -> `syscall` doorbell -> kernel grant-checks and
+completes -> reap) is the honest single-message number: it includes the
+privilege transition, the per-entry capability check, and the completion,
+all across the ring-3/EL0/U-mode boundary. P5 is a directed cross-cell
+switch (save frame, switch page table, restore peer) each way.
 
-seL4 fastpath IPC, aarch64 qemu-arm-virt, same-vspace, IPC length 0,
-prio 254 (sel4bench "One way IPC microbenchmarks", stddev 0 under icount):
+## 4. Head-to-head with seL4 (same QEMU, same machine, same icount)
 
-| Operation | seL4 | rheo-os (ARM64) |
+seL4 fastpath IPC, aarch64 qemu-arm-virt, same configuration, deterministic
+under icount (sel4bench "One way IPC microbenchmarks"):
+
+| Operation | seL4 | rheo-os |
 |---|---|---|
-| seL4_Call (one way) | 190 | - |
-| seL4_ReplyRecv (one way) | 216 | - |
-| **Synchronous round trip** | **406** | **200** (single-message queue RT) |
-| **Amortized message cost, batched** | n/a (PPC does not batch) | **140** (64 per doorbell) |
+| One-way cross-domain (Call) | 190 | - |
+| One-way cross-domain (ReplyRecv) | 216 | - |
+| **Synchronous cross-domain round trip** | **406** | **155 (x86) / ~211 (arm64) / 273 (riscv), cross-cell** |
+| Amortized message cost, batched | n/a (PPC does not batch) | 139-160 (in-kernel, 64/doorbell) |
+| Queue round trip with grant check + completion, U-mode | - | 207 (x86) / ~210 (arm64) / 277 (riscv) |
 
-Under plain TCG (no icount) seL4's same numbers are medians ~2506/~2829
-"cycles" with ~50% stddev - which is why RESULTS.md quotes only the
-deterministic icount runs for both systems.
+### What this shows, stated honestly
 
-### What this does and does not show
+- **The design's central bet now holds across a real address-space
+  boundary.** seL4's synchronous IPC round trip is 406 instructions; the
+  rheo-os cross-cell directed round trip - two genuine page-table switches -
+  is 155-273 depending on ISA. The queue round trip that also does useful
+  work (a grant-checked completion) is 207-277. Both sit at or below seL4's
+  number, on the same emulator and clock.
+- **The comparison is now apples-to-apples on isolation, but the two
+  measure different amounts of work.** seL4's 406 is a full IPC: endpoint
+  lookup, badge, message registers, and a scheduling decision. The rheo-os
+  cross-cell path is a *directed switch* with no message payload or
+  capability lookup on the switch itself - lighter by design, because the
+  design pushes data transfer onto the shared ring (the P2 number) rather
+  than into the control transfer. So read P5 as "the cost of the address-
+  space crossing" and P2-user as "the cost of getting work done across it",
+  and compare each to the part of seL4's IPC it corresponds to.
+- **ARM64's column is coarse.** Its virtual counter ticks once per ~16
+  instructions, so `~211` is `13.1 ticks x 16`. x86-64 and RISC-V count one
+  tick per instruction and are exact. The ordering and order-of-magnitude
+  conclusions hold on all three; only ARM64's precise value is rounded.
+- **seL4's proof is still its advantage.** seL4's IPC carries a verified
+  kernel; the rheo-os capability core is runtime-tested (section 2), not yet
+  proved (Verus, BUILD-ORDER.md step 4 gate).
 
-- **The queue-ABI bet survives its first falsification attempt.** The
-  design concedes (docs/IO.md 6.1) that seL4's synchronous PPC is
-  near-optimal for single cross-domain calls and expects to pay a penalty
-  there, betting on batching. Measured: the rheo-os single-message round
-  trip (200 insns) is currently *shorter* than seL4's PPC round trip
-  (406), and batching brings it to 140/message - so the mechanism's path
-  lengths are in the right region, not just defensibly behind.
-- **The comparison is not yet fully apples-to-apples, in seL4's favor.**
-  seL4's 406 includes two full protection-domain crossings with thread
-  switches; the rheo-os 200 includes two real exception-level round trips
-  (svc + eret) and all per-entry capability work, but *no address-space
-  switch and no user mode* - cells run kernel-side until BUILD-ORDER.md
-  steps 3/5 land. The gap that will close: an ASID/PCID-tagged address
-  space switch is tens of instructions of path length, which still leaves
-  the batched number (140) well under seL4's single-shot 406 - but that
-  claim must be re-measured, not assumed, once cells are user-mode.
-- **seL4's numbers are its own strength.** seL4's IPC carries a proved
-  kernel behind it; rheo-os's capability core is runtime-tested (section
-  1) but not yet proved (Verus, BUILD-ORDER.md step 4 gate).
+## 5. Mapping to the hardware targets (ARCHITECTURE.md 8.4)
 
-## 4. Mapping to the hardware targets (ARCHITECTURE.md 8.4)
+Path length is the leading indicator, not the verdict - cache/TLB behaviour
+on real hardware decides finally (docs/TOOLING.md 4):
 
-Path length is the leading indicator, not the verdict - cache/TLB
-behaviour on real hardware decides finally (docs/TOOLING.md 4):
-
-| Gate | Hardware target | Kill | Path length measured | Reading |
+| Gate | Hardware target | Kill | Measured (insns) | Reading |
 |---|---|---|---|---|
-| P1 grant check | < 50 ns p99 | > 150 ns | 24-27 insns | ~8-13 cycles of work at IPC 2-3; passes with big margin unless cache-hostile |
-| P2 single | < 1 us | > 3 us | 200-255 insns | orders of magnitude of headroom |
-| P2 batched | < 100 ns amortized | > 300 ns | 140-160 insns | plausible at ~2 GHz; tight; hardware decides |
-| P3 same-cell switch | < 200 ns | > 500 ns | 21-41 insns | floor only - the real number needs vcore state + runtime switch |
+| P1 grant check | < 50 ns p99 | > 150 ns | 24-27 | ~10 cycles of work; ample margin |
+| P2 single (U-mode) | < 1 us | > 3 us | 207-277 | orders of magnitude of headroom |
+| P2 batched | < 100 ns amortized | > 300 ns | 139-160 | tight at ~2 GHz; hardware decides |
+| P3 same-cell switch | < 200 ns | > 500 ns | 20-40 | floor; real number needs runtime state |
+| P5 cross-cell | < 500 ns same host | > 1.5 us | 155-273 | plausible; TLB refill on real HW is the risk |
 
-No gate can be *passed* in QEMU; none is *killed* by these numbers, and
-P2-batched is the one to watch on hardware.
+No gate can be *passed* in QEMU; none is *killed* by these numbers. P2-
+batched and P5 are the two to watch on real hardware, where a TLB miss on
+the address-space switch is the cost QEMU cannot show.
 
-## 5. Verdict on viability, as of this commit
+## 6. Verdict on viability, as of this commit
 
-- The capability model (single mechanism: typed, delegatable,
-  epoch-revocable, budget-metered) **works as specified** across three
-  ISAs and its hot path is ~25 instructions - the concept is viable and
-  cheap enough to sit under every kernel interaction, as the design
-  requires.
-- The queue-pair-as-only-syscall concept **holds its cost story** against
-  the strongest incumbent comparison the design names: batched cost is
-  ~1/3 of seL4's single-shot IPC path even before amortizing further, and
-  the single-shot penalty the design accepted did not materialize at
-  current scope.
-- Mid-stream revocation and flow-context tracing - the two properties
-  Linux-shaped systems retrofit painfully - **fall out of the ABI**, as
-  claimed, and are enforced/preserved on the measured hot path (the
-  per-entry grant check is included in every P2 number above).
-- **Open before "viable" becomes "validated":** user-mode cells behind
-  real address spaces (steps 3/5), the Verus proofs (step 4 gate), and
-  hardware-lab numbers for P1-P3 (milestone M1). The next comparison to
-  run after step 5: this same table, cross-address-space on both sides.
+- The capability model, the queue-pair ABI, and cells-as-protection-domains
+  all **work as specified, now with hardware enforcement**, on three ISAs.
+  Isolation is the MMU's job and the MMU does it; the four proof properties
+  hold at runtime; the queue ABI's batching, tracing, and mid-stream
+  revocation fall out of the ABI as claimed.
+- The **cost story survives contact with real user mode**: crossing a real
+  privilege-and-address-space boundary costs 155-277 instructions, at or
+  under seL4's synchronous IPC on the same emulator - and the design's
+  batching amortizes the data path below that.
+- **Open before "viable" becomes "validated":** the Verus proofs (step 4
+  gate), hardware-lab numbers for P1-P5 including TLB effects (milestone
+  M1), ASID/PCID-tagged switches measured under churn, and a cross-cell
+  path that carries a real typed message (not just a directed switch) for a
+  fully like-for-like seL4 IPC comparison.

@@ -28,5 +28,22 @@ SECTIONS
         __bss_end = .;
     }
 
+    /* User image: code and static data that runs in U-mode. Kept in one
+       2 MiB-aligned, 2 MiB window so a single Sv39 level-0 table covers
+       it and per-cell roots differ only in that one level-1 slot
+       (kernel/src/arch/riscv64/paging.rs). Mapped with the U bit; W^X
+       enforced by section (text = R|X, data = R|W). */
+    . = ALIGN(2M);
+    __user_start = .;
+    .user.text   : { *(.user.text .user.text.*) }
+    . = ALIGN(4K);
+    __user_data_start = .;
+    .user.data   : { *(.user.data .user.data.*) *(.user.bss .user.bss.*) }
+    . = __user_start + 2M;
+    __user_end = .;
+
+    . = ALIGN(2M);
+    __kernel_end = .;
+
     /DISCARD/ : { *(.eh_frame) *(.comment) }
 }

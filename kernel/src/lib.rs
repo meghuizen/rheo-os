@@ -13,10 +13,14 @@
 #![allow(incomplete_features)]
 #![feature(generic_const_exprs)]
 
+pub mod abi;
 pub mod arch;
 pub mod capability;
 pub mod cell;
 #[macro_use]
 pub mod console;
+pub mod mm;
 mod panic;
 pub mod queue;
+pub mod user;
+pub mod user_progs;

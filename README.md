@@ -46,8 +46,9 @@ cargo xtask run --arch riscv64
 ```
 
 You get the serial console on your terminal, multiplexed with the QEMU
-monitor (Ctrl-A C toggles between them, Ctrl-A X quits). Today the kernel
-prints one boot line and exits - that is BUILD-ORDER.md step 1.
+monitor (Ctrl-A C toggles between them, Ctrl-A X quits). Pass
+`--bin bench-core` (or another test kernel) to boot that instead of the
+boot demo.
 
 ### 4. Run the boot tests
 
@@ -55,11 +56,12 @@ prints one boot line and exits - that is BUILD-ORDER.md step 1.
 cargo xtask test --arch all
 ```
 
-Every test kernel (the boot demo, the capability-invariants suite, the
-queue-pipeline scenario) is booted headless with a timeout. Each kernel
-reports pass/fail through a QEMU exit device, so the result is the
-process exit code - the same check CI runs on every push. Serial output
-is saved to `target/qemu-<arch>-<bin>.log`.
+Every test kernel is booted headless with a timeout: the boot demo, the
+capability-invariants suite, the queue-pipeline scenario, and
+`isolation-hw` (real user-mode cells whose isolation is enforced by the
+MMU faulting). Each reports pass/fail through a QEMU exit device, so the
+result is the process exit code - the same check CI runs on every push.
+Serial output is saved to `target/qemu-<arch>-<bin>.log`.
 
 ### 5. Run the benchmarks and the seL4 comparison
 

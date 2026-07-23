@@ -75,8 +75,12 @@ doorbell-coalesced batching wins. The P2 single-message number is where
 that trade-off is visible, and RESULTS.md reports it side by side with the
 batched number that carries the actual design claim.
 
-Current scope caveat: rheo-os cells do not yet run in user mode behind
-hardware address spaces (BUILD-ORDER.md steps 3/5 pending), so its round
-trip includes a real exception-level round trip (svc/int3/ebreak) but no
-address-space switch, while seL4's IPC includes a full thread switch.
-RESULTS.md quantifies this gap instead of hiding it.
+Scope: rheo-os cells now run in real user mode behind hardware address
+spaces (RISC-V U-mode, ARM64 EL0, x86-64 ring 3; BUILD-ORDER.md steps 3/5
+done). The isolation tests are MMU-enforced, and the P5 cross-cell
+benchmark does a real page-table switch each way. The remaining
+difference from seL4's IPC is *what* each transfer carries: seL4's IPC
+moves a message and does an endpoint lookup, while the rheo-os cross-cell
+switch is a directed control transfer with the data left on the shared
+ring (the P2 number). RESULTS.md reports both and says which part of
+seL4's IPC each corresponds to.

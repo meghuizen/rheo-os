@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 3] = ["kernel", "cap-invariants", "queue-pipeline"];
+const TEST_KERNELS: [&str; 4] = ["kernel", "cap-invariants", "queue-pipeline", "isolation-hw"];
 const BENCH_KERNEL: &str = "bench-core";
 
 #[derive(Clone, Copy, PartialEq)]
@@ -171,11 +171,15 @@ fn main() -> ExitCode {
             }
             build(arches[0], release) && run_interactive(arches[0], release, &bin)
         }
+        // Release always: U-mode programs must contain no out-of-line
+        // calls (debug builds insert pointer-check panics that land in
+        // unmapped kernel .text), and optimized path lengths are the
+        // system's real numbers anyway.
         "test" => arches.iter().all(|&a| {
-            build(a, release)
+            build(a, true)
                 && TEST_KERNELS
                     .iter()
-                    .all(|kernel| boot_expect_pass(a, release, kernel, &[]))
+                    .all(|kernel| boot_expect_pass(a, true, kernel, &[]))
         }),
         // Benchmarks always run the release build: instruction path
         // lengths of an unoptimized kernel are not the system's numbers.

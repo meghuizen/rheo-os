@@ -4,6 +4,12 @@
 use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicU64, Ordering};
 
+mod paging;
+pub use paging::{
+    PagingRoot, paging_activate, paging_activate_kernel, paging_kernel_init, paging_map,
+    paging_new_root,
+};
+
 global_asm!(
     include_str!("../../../arch/x86_64/boot.S"),
     options(att_syntax)
@@ -16,8 +22,16 @@ global_asm!(
     include_str!("../../../arch/x86_64/context_switch.S"),
     options(att_syntax)
 );
+global_asm!(
+    include_str!("../../../arch/x86_64/user.S"),
+    options(att_syntax)
+);
 
 pub const NAME: &str = "x86-64";
+
+/// Physical base of the frame pool: 64 MiB, above the kernel image and
+/// within the low-1 GiB identity map (checked in frames::init).
+pub const FRAME_POOL_BASE: usize = 0x0400_0000;
 
 // ---------------------------------------------------------------- serial
 
@@ -116,13 +130,27 @@ pub fn trap_init() {
 
 static DOORBELLS: AtomicU64 = AtomicU64::new(0);
 
-/// Called from the common stub in vectors.S. Vector 3 (breakpoint) is the
-/// doorbell stand-in and returns; everything else is fatal.
+/// Called from the common stub in vectors.S with the interrupt-frame CS so
+/// the RPL distinguishes a kernel trap from a user fault. Vector 3
+/// (breakpoint) is the in-kernel doorbell self-test and returns; a fault
+/// from ring 3 is recorded and unwinds; anything else is fatal.
 #[unsafe(no_mangle)]
-extern "C" fn x86_trap_handler(vector: u64, error_code: u64, rip: u64) {
+extern "C" fn x86_trap_handler(vector: u64, error_code: u64, rip: u64, cs: u64) {
     if vector == 3 {
         DOORBELLS.fetch_add(1, Ordering::Relaxed);
         return;
+    }
+    if cs & 3 == 3 {
+        // Fault from ring 3: the faulting address for a #PF is in CR2.
+        let cr2: u64;
+        unsafe { asm!("mov {0}, cr2", out(reg) cr2) };
+        let addr = if vector == 14 {
+            cr2 as usize
+        } else {
+            rip as usize
+        };
+        let _ = crate::user::on_user_trap(super::TrapKind::Fault, addr, core::ptr::null_mut());
+        return_to_kernel();
     }
     crate::println!("TRAP: vector {vector} error {error_code:#x} at rip {rip:#x}");
     exit(super::ExitCode::Failure);
@@ -135,6 +163,220 @@ pub fn doorbell_trap() {
 
 pub fn doorbell_count() -> u64 {
     DOORBELLS.load(Ordering::Relaxed)
+}
+
+// -------------------------------------------------------------- user mode
+
+/// Saved ring-3 register state. Layout matches the offsets in user.S.
+#[repr(C)]
+pub struct TrapFrame {
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    rbp: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    rip: u64,
+    rflags: u64,
+    rsp: u64,
+    kernel_sp: u64,
+    _pad: u64,
+}
+
+pub fn trapframe_new(entry: usize, user_sp: usize, arg: usize, kernel_sp: usize) -> TrapFrame {
+    TrapFrame {
+        rax: 0,
+        rbx: 0,
+        rcx: 0,
+        rdx: 0,
+        rsi: 0,
+        rdi: arg as u64, // first argument
+        rbp: 0,
+        r8: 0,
+        r9: 0,
+        r10: 0,
+        r11: 0,
+        r12: 0,
+        r13: 0,
+        r14: 0,
+        r15: 0,
+        rip: entry as u64,
+        rflags: 0x202, // IF set, reserved bit 1
+        rsp: user_sp as u64,
+        kernel_sp: kernel_sp as u64,
+        _pad: 0,
+    }
+}
+
+pub fn decode_syscall(frame: &TrapFrame) -> (u64, u64) {
+    (frame.rax, frame.rdi) // number in rax, argument in rdi
+}
+
+pub fn set_syscall_ret(frame: &mut TrapFrame, value: u64) {
+    frame.rax = value;
+}
+
+unsafe extern "C" {
+    pub fn enter_user_first(frame: *mut TrapFrame);
+    fn return_to_kernel_asm() -> !;
+}
+
+pub fn return_to_kernel() -> ! {
+    // SAFETY: only called while a cell is running (inside enter_user_first).
+    unsafe { return_to_kernel_asm() }
+}
+
+/// Called from user.S on a SYSCALL. Returns the frame to resume, or null
+/// to unwind (the stub jumps to return_to_kernel_asm on null).
+#[unsafe(no_mangle)]
+extern "C" fn x86_user_trap(kind: u64, fault_addr: u64, frame: *mut TrapFrame) -> *mut TrapFrame {
+    let k = if kind == 0 {
+        super::TrapKind::Syscall
+    } else {
+        super::TrapKind::Fault
+    };
+    crate::user::on_user_trap(k, fault_addr as usize, frame)
+}
+
+// Single CPU: the syscall stub reaches these as plain globals, no GS.
+#[unsafe(no_mangle)]
+static mut KERNEL_RSP: u64 = 0;
+#[unsafe(no_mangle)]
+static mut USER_RSP_SCRATCH: u64 = 0;
+#[unsafe(no_mangle)]
+static mut CUR_FRAME: u64 = 0;
+#[unsafe(no_mangle)]
+static mut KERNEL_CTX: u64 = 0;
+
+// ---------------------------------------------------------- GDT/TSS/MSRs
+
+#[repr(C, packed)]
+struct Tss {
+    reserved0: u32,
+    rsp: [u64; 3],
+    reserved1: u64,
+    ist: [u64; 7],
+    reserved2: u64,
+    reserved3: u16,
+    iomap_base: u16,
+}
+
+static mut TSS: Tss = Tss {
+    reserved0: 0,
+    rsp: [0; 3],
+    reserved1: 0,
+    ist: [0; 7],
+    reserved2: 0,
+    reserved3: 0,
+    iomap_base: 0,
+};
+
+// GDT: null, kernel code64, kernel data, user data, user code64, TSS (2).
+static mut GDT: [u64; 7] = [0; 7];
+
+#[repr(C, packed)]
+struct DescPtr {
+    limit: u16,
+    base: u64,
+}
+
+static mut SYSCALL_KSTACK: [u8; 64 * 1024] = [0; 64 * 1024];
+
+/// Set up ring 3: a full GDT with user segments and a TSS, then the
+/// SYSCALL/SYSRET MSRs. Called from paging_kernel_init.
+pub(super) fn user_init() {
+    unsafe {
+        let kstack_top = core::ptr::addr_of!(SYSCALL_KSTACK) as u64 + (64 * 1024);
+        *core::ptr::addr_of_mut!(KERNEL_RSP) = kstack_top;
+
+        let tss = &mut *core::ptr::addr_of_mut!(TSS);
+        tss.rsp[0] = kstack_top; // ring 3 -> ring 0 fault stack
+        tss.iomap_base = core::mem::size_of::<Tss>() as u16;
+
+        let gdt = &mut *core::ptr::addr_of_mut!(GDT);
+        gdt[0] = 0;
+        gdt[1] = 0x00AF_9A00_0000_FFFF; // 0x08 kernel code64
+        gdt[2] = 0x00CF_9200_0000_FFFF; // 0x10 kernel data
+        gdt[3] = 0x00CF_F200_0000_FFFF; // 0x18 user data (DPL3)
+        gdt[4] = 0x00AF_FA00_0000_FFFF; // 0x20 user code64 (DPL3)
+        let tss_base = core::ptr::addr_of!(TSS) as u64;
+        let tss_limit = (core::mem::size_of::<Tss>() - 1) as u64;
+        gdt[5] = tss_limit
+            | ((tss_base & 0xFF_FFFF) << 16)
+            | (0x89u64 << 40)
+            | (((tss_limit >> 16) & 0xF) << 48)
+            | (((tss_base >> 24) & 0xFF) << 56);
+        gdt[6] = tss_base >> 32;
+
+        let gdt_ptr = DescPtr {
+            limit: (core::mem::size_of::<[u64; 7]>() - 1) as u16,
+            base: core::ptr::addr_of!(GDT) as u64,
+        };
+        // Load the GDT, reload CS via a far return, set the data segments,
+        // and load the task register.
+        asm!(
+            "lgdt [{ptr}]",
+            "push 0x08",
+            "lea {tmp}, [rip + 2f]",
+            "push {tmp}",
+            "retfq",
+            "2:",
+            "mov ax, 0x10",
+            "mov ds, ax",
+            "mov es, ax",
+            "mov ss, ax",
+            "mov ax, 0x28",
+            "ltr ax",
+            ptr = in(reg) &gdt_ptr,
+            tmp = out(reg) _,
+            out("ax") _,
+        );
+
+        // EFER.SCE (enable SYSCALL); NXE was set in paging_kernel_init.
+        let efer = paging_rdmsr(0xC000_0080) | 1;
+        paging_wrmsr(0xC000_0080, efer);
+        // STAR: SYSCALL loads CS=0x08/SS=0x10; SYSRET base 0x10 -> user
+        // SS=0x18, CS=0x20.
+        paging_wrmsr(0xC000_0081, (0x10u64 << 48) | (0x08u64 << 32));
+        // LSTAR: the SYSCALL entry point.
+        paging_wrmsr(0xC000_0082, syscall_entry as *const () as u64);
+        // SFMASK: clear IF and DF on entry.
+        paging_wrmsr(0xC000_0084, 0x600);
+    }
+}
+
+unsafe extern "C" {
+    fn syscall_entry();
+}
+
+unsafe fn paging_rdmsr(msr: u32) -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi, options(nostack));
+    }
+    ((hi as u64) << 32) | lo as u64
+}
+
+unsafe fn paging_wrmsr(msr: u32, value: u64) {
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") value as u32,
+            in("edx") (value >> 32) as u32,
+            options(nostack),
+        );
+    }
 }
 
 // -------------------------------------------------------------- counters

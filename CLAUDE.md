@@ -14,16 +14,26 @@ what order; `docs/DEVELOPMENT.md` covers the day-to-day mechanics.
 
 ## Current state
 
-Steps 0-1 of BUILD-ORDER.md are done, plus early slices of steps 2, 4, 5
-and 6 built for concept validation: exception vectors + cycle counters +
-context switch per ISA; the capability core (mint / derive-subset /
-delegate / revoke-by-epoch / grant-check, runtime-tested for the four
+BUILD-ORDER.md steps 0-3 and 5 are done, plus slices of 2, 4 and 6:
+exception vectors + cycle counters + context switch per ISA; a bitmap
+frame allocator and per-ISA paging (Sv39 / AArch64 4 KiB granule /
+x86-64 4-level) with the MMU on; the capability core (mint / derive-subset
+/ delegate / revoke-by-epoch / grant-check, runtime-tested for the four
 ARCHITECTURE.md 8.2 proof properties); the queue-pair ABI (SqEntry/CqEntry
 rings + doorbell) with per-entry grant checks and flow-context
-propagation; cells as capability-table protection contexts (no hardware
-address spaces yet - user-mode cells need steps 3/5); and a benchmark +
-seL4 comparison harness (comparison/RESULTS.md). Timers, memory
-management, and the Verus proofs are still open.
+propagation; and **cells running in real user mode behind hardware address
+spaces** (RISC-V U-mode, ARM64 EL0, x86-64 ring 3), with isolation
+MMU-enforced and a cross-cell directed switch. Benchmarks run user-mode
+across the real privilege/address-space boundary and against seL4
+(comparison/RESULTS.md). Timers, memory reclaim, and the Verus proofs are
+still open.
+
+The `.user` linker section holds all U-mode code and per-cell data in one
+2 MiB window; per-cell page tables differ only in that window's mappings,
+which is what makes cross-cell isolation MMU-enforced. U-mode code must be
+free of out-of-line calls (no panics, no bounds checks) since kernel
+`.text` is not mapped in a cell - which is why the test kernels build
+`--release`.
 
 ## Commands
 
@@ -56,11 +66,13 @@ QEMU 8.x system emulators must be installed to run or test.
 ```
 docs/         the design documents (the spec - keep code consistent with it)
 kernel/       the no_std kernel library + boot demo bin
-  src/        ISA-independent: capability core, queue ABI, cells, console
-  src/arch/   per-ISA Rust modules (one dir per ISA)
-  arch/       per-ISA assembly (boot.S, vectors.S/trap.S, context_switch.S)
-  link/       linker scripts per ISA
-tests/        in-QEMU test kernels: cap-invariants, queue-pipeline, bench-core
+  src/        ISA-independent: capability core, queue ABI, cells, mm,
+              user run loop (user.rs), U-mode programs (user_progs.rs), abi
+  src/arch/   per-ISA Rust modules incl. paging.rs (one dir per ISA)
+  arch/       per-ISA assembly (boot, vectors/traps, context switch, user)
+  link/       linker scripts per ISA (incl. the .user window)
+tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
+              isolation-hw, bench-core (+ harness.rs for user-mode cells)
 comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md
 xtask/        build/run/test/bench orchestration (cargo xtask ...)
 idl/          system IDL + codegen        (future, step 6)
