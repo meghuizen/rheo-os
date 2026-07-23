@@ -1,0 +1,10 @@
+# Pinned nightly: build-std (DEVELOPMENT.md 3) needs nightly, and a pinned
+# date keeps builds reproducible (TOOLING.md 3). Bump deliberately, not daily.
+[toolchain]
+channel = "nightly-2026-07-23"
+components = ["rust-src", "llvm-tools", "rustfmt", "clippy"]
+targets = [
+    "x86_64-unknown-none",
+    "aarch64-unknown-none",
+    "riscv64gc-unknown-none-elf",
+]
