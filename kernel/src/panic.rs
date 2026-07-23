@@ -6,6 +6,6 @@ use core::panic::PanicInfo;
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    println!("KERNEL PANIC: {info}");
+    crate::println!("KERNEL PANIC: {info}");
     crate::arch::exit(crate::arch::ExitCode::Failure)
 }

@@ -17,6 +17,13 @@ _start:
     b 1b
 
 2:
+    /* Enable FP/SIMD at EL1 (CPACR_EL1.FPEN = 0b11): the
+       aarch64-unknown-none target compiles with NEON on, so the
+       compiler may vectorise ordinary copies. */
+    mov x0, #(0x3 << 20)
+    msr cpacr_el1, x0
+    isb
+
     ldr x0, =boot_stack_top
     mov sp, x0
 

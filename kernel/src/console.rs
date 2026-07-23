@@ -23,11 +23,13 @@ pub fn write(args: fmt::Arguments) {
     let _ = fmt::Write::write_fmt(&mut Console, args);
 }
 
+#[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => { $crate::console::write(format_args!($($arg)*)) };
 }
 
+#[macro_export]
 macro_rules! println {
-    () => { print!("\n") };
-    ($($arg:tt)*) => { print!("{}\n", format_args!($($arg)*)) };
+    () => { $crate::print!("\n") };
+    ($($arg:tt)*) => { $crate::print!("{}\n", format_args!($($arg)*)) };
 }

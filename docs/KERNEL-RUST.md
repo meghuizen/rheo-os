@@ -224,7 +224,9 @@ pub struct SqEntry {
     pub cap_id:    u32,
     pub flow_id:   u128,         // 16 bytes — the distributed trace handle
     pub user_data: u64,          // returned in CqEntry unchanged
-    pub payload:   [u8; 32],     // opcode-specific
+    pub payload:   [u8; 24],     // opcode-specific (24: the u128 flow_id
+                                 // aligns to offset 16, so 8 header + 16
+                                 // flow_id + 8 user_data leaves 24 of 64)
 }
 const _: () = assert!(core::mem::size_of::<SqEntry>() == 64);
 unsafe impl DmaSafe for SqEntry {}

@@ -1,0 +1,23 @@
+[package]
+name = "qemu-tests"
+version = "0.1.0"
+edition = "2024"
+
+# In-QEMU test kernels (docs/DEVELOPMENT.md 9): each binary boots as a
+# kernel, exercises one subsystem, and reports pass/fail through the QEMU
+# exit device. Run with `cargo xtask test` / `cargo xtask bench`.
+
+[dependencies]
+kernel = { path = "../kernel" }
+
+[[bin]]
+name = "cap-invariants"
+path = "src/cap_invariants.rs"
+
+[[bin]]
+name = "queue-pipeline"
+path = "src/queue_pipeline.rs"
+
+[[bin]]
+name = "bench-core"
+path = "src/bench_core.rs"

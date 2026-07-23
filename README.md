@@ -55,12 +55,25 @@ prints one boot line and exits - that is BUILD-ORDER.md step 1.
 cargo xtask test --arch all
 ```
 
-Each ISA is booted headless with a 60-second timeout. The kernel reports
-pass/fail through a QEMU exit device, so the result is the process exit
-code - the same check CI runs on every push. Serial output is saved to
-`target/qemu-<arch>.log`.
+Every test kernel (the boot demo, the capability-invariants suite, the
+queue-pipeline scenario) is booted headless with a timeout. Each kernel
+reports pass/fail through a QEMU exit device, so the result is the
+process exit code - the same check CI runs on every push. Serial output
+is saved to `target/qemu-<arch>-<bin>.log`.
 
-### 5. Debug
+### 5. Run the benchmarks and the seL4 comparison
+
+```sh
+cargo xtask bench --arch all
+```
+
+Boots the benchmark kernel under deterministic instruction counting and
+prints "the three numbers" (grant check, queue round trip, context
+switch) as instruction path lengths. `comparison/` holds the methodology,
+the script that builds and runs seL4's own benchmark suite in the same
+QEMU for a fair baseline, and the measured results (`comparison/RESULTS.md`).
+
+### 6. Debug
 
 Add `-s -S` style debugging per `docs/DEVELOPMENT.md` 7: run QEMU with a GDB
 stub, attach `gdb-multiarch`, break on `kernel_main`. The same document
@@ -71,16 +84,17 @@ into a source line.
 
 ```
 docs/         the design documents - the spec everything must stay consistent with
-kernel/       the no_std kernel crate
-  src/        ISA-independent kernel code
+kernel/       the no_std kernel library + boot demo
+  src/        ISA-independent code: capability core, queue ABI, cells
   src/arch/   per-ISA Rust modules (x86_64, aarch64, riscv64)
-  arch/       per-ISA assembly (boot.S entry stubs)
+  arch/       per-ISA assembly (boot, vectors, context switch)
   link/       linker scripts per ISA
-xtask/        build/run/test orchestration (cargo xtask ...)
+tests/        in-QEMU test kernels (invariants, pipeline, benchmarks)
+comparison/   seL4 comparison harness and measured results
+xtask/        build/run/test/bench orchestration (cargo xtask ...)
 idl/          system IDL + codegen                    (future)
 runtime/      strand runtime library                  (future)
 services/     system service cells                    (future)
-tests/        in-QEMU test kernels                    (future)
 targets/      custom target JSON, if ever needed
 ```
 

@@ -3,18 +3,26 @@
 //! invocation - so day-to-day commands stay short:
 //!
 //!   cargo xtask build --arch riscv64
-//!   cargo xtask run   --arch aarch64
+//!   cargo xtask run   --arch aarch64 [--bin bench-core]
 //!   cargo xtask test  --arch all
+//!   cargo xtask bench --arch all
 //!
-//! `test` boots the kernel headless in QEMU with a timeout and maps the QEMU
-//! exit code back to pass/fail (DEVELOPMENT.md 6, 9). Serial output is
-//! written to target/qemu-<arch>.log for CI artifacts.
+//! `test` boots every in-QEMU test kernel headless with a timeout and maps
+//! the QEMU exit code back to pass/fail (DEVELOPMENT.md 6, 9). `bench`
+//! boots the benchmark kernel under `-icount shift=0` so counters advance
+//! deterministically with executed instructions - QEMU results are
+//! instruction path lengths, never wall-clock claims (docs/TOOLING.md 4).
+//! Serial output lands in target/qemu-<arch>-<bin>.log for CI artifacts.
 
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(60);
+const TEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Every kernel binary booted by `cargo xtask test`, in order.
+const TEST_KERNELS: [&str; 3] = ["kernel", "cap-invariants", "queue-pipeline"];
+const BENCH_KERNEL: &str = "bench-core";
 
 #[derive(Clone, Copy, PartialEq)]
 enum Arch {
@@ -103,9 +111,9 @@ impl Arch {
         }
     }
 
-    fn kernel_path(self, release: bool) -> PathBuf {
+    fn kernel_path(self, release: bool, bin: &str) -> PathBuf {
         let profile = if release { "release" } else { "debug" };
-        PathBuf::from(format!("target/{}/{profile}/kernel", self.target()))
+        PathBuf::from(format!("target/{}/{profile}/{bin}", self.target()))
     }
 }
 
@@ -118,6 +126,7 @@ fn main() -> ExitCode {
 
     let mut arches = vec![Arch::X86_64];
     let mut release = false;
+    let mut bin = String::from("kernel");
     let mut iter = args[1..].iter();
     while let Some(flag) = iter.next() {
         match flag.as_str() {
@@ -137,6 +146,13 @@ fn main() -> ExitCode {
                     }
                 };
             }
+            "--bin" => {
+                let Some(value) = iter.next() else {
+                    eprintln!("error: --bin needs a value");
+                    return ExitCode::FAILURE;
+                };
+                bin = value.clone();
+            }
             "--release" => release = true,
             other => {
                 eprintln!("error: unknown flag '{other}'");
@@ -153,11 +169,17 @@ fn main() -> ExitCode {
                 eprintln!("error: 'run' takes exactly one --arch");
                 return ExitCode::FAILURE;
             }
-            build(arches[0], release) && run_interactive(arches[0], release)
+            build(arches[0], release) && run_interactive(arches[0], release, &bin)
         }
-        "test" => arches
-            .iter()
-            .all(|&a| build(a, release) && test(a, release)),
+        "test" => arches.iter().all(|&a| {
+            build(a, release)
+                && TEST_KERNELS
+                    .iter()
+                    .all(|kernel| boot_expect_pass(a, release, kernel, &[]))
+        }),
+        // Benchmarks always run the release build: instruction path
+        // lengths of an unoptimized kernel are not the system's numbers.
+        "bench" => arches.iter().all(|&a| build(a, true) && bench(a, true)),
         _ => {
             print_usage();
             false
@@ -173,18 +195,22 @@ fn main() -> ExitCode {
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo xtask <build|run|test> [--arch x86_64|aarch64|riscv64|all] [--release]"
+        "usage: cargo xtask <build|run|test|bench> \
+         [--arch x86_64|aarch64|riscv64|all] [--bin <kernel>] [--release]"
     );
 }
 
-/// Bare-metal build with build-std (DEVELOPMENT.md 3).
+/// Bare-metal build with build-std (DEVELOPMENT.md 3): the kernel and
+/// every in-QEMU test kernel.
 fn build(arch: Arch, release: bool) -> bool {
-    println!("[xtask] building kernel for {}", arch.name());
+    println!("[xtask] building kernels for {}", arch.name());
     let mut cmd = Command::new("cargo");
     cmd.args([
         "build",
         "-p",
         "kernel",
+        "-p",
+        "qemu-tests",
         "--target",
         arch.target(),
         "-Zbuild-std=core,alloc,compiler_builtins",
@@ -196,34 +222,50 @@ fn build(arch: Arch, release: bool) -> bool {
     matches!(cmd.status().map(|s| s.success()), Ok(true))
 }
 
-fn qemu_command(arch: Arch, release: bool) -> Command {
+fn qemu_command(arch: Arch, release: bool, bin: &str) -> Command {
     let mut cmd = Command::new(arch.qemu());
     cmd.args(arch.qemu_machine_args());
-    cmd.arg("-kernel").arg(arch.kernel_path(release));
+    cmd.arg("-kernel").arg(arch.kernel_path(release, bin));
     cmd.args(["-no-reboot", "-nodefaults"]);
     cmd
 }
 
 /// Interactive run: serial console + QEMU monitor multiplexed on the
 /// terminal (Ctrl-A C toggles, Ctrl-A X quits).
-fn run_interactive(arch: Arch, release: bool) -> bool {
-    let mut cmd = qemu_command(arch, release);
+fn run_interactive(arch: Arch, release: bool, bin: &str) -> bool {
+    let mut cmd = qemu_command(arch, release, bin);
     cmd.args(["-serial", "mon:stdio", "-display", "none"]);
-    println!("[xtask] running {} in QEMU (Ctrl-A X to quit)", arch.name());
+    println!(
+        "[xtask] running {bin} on {} in QEMU (Ctrl-A X to quit)",
+        arch.name()
+    );
     matches!(cmd.status().map(|s| s.success()), Ok(true))
 }
 
-/// Headless boot test: capture serial output, enforce a timeout, and map
-/// the QEMU exit code back to pass/fail.
-fn test(arch: Arch, release: bool) -> bool {
-    let log_path = PathBuf::from(format!("target/qemu-{}.log", arch.name()));
-    let mut cmd = qemu_command(arch, release);
+/// The benchmark run: deterministic instruction counting via icount.
+/// Results are instruction path lengths - comparable across runs and
+/// against other systems measured the same way, but not wall-clock.
+fn bench(arch: Arch, release: bool) -> bool {
+    boot_expect_pass(
+        arch,
+        release,
+        BENCH_KERNEL,
+        &["-icount", "shift=0,align=off,sleep=off"],
+    )
+}
+
+/// Headless boot of one kernel binary: capture serial output, enforce a
+/// timeout, and map the QEMU exit code back to pass/fail.
+fn boot_expect_pass(arch: Arch, release: bool, bin: &str, extra_args: &[&str]) -> bool {
+    let log_path = PathBuf::from(format!("target/qemu-{}-{bin}.log", arch.name()));
+    let mut cmd = qemu_command(arch, release, bin);
     cmd.args(["-display", "none", "-monitor", "none"]);
+    cmd.args(extra_args);
     cmd.arg("-serial")
         .arg(format!("file:{}", log_path.display()));
     cmd.stdin(Stdio::null());
 
-    println!("[xtask] boot-testing {} in QEMU", arch.name());
+    println!("[xtask] booting {bin} on {} in QEMU", arch.name());
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
@@ -260,7 +302,7 @@ fn test(arch: Arch, release: bool) -> bool {
     match status {
         None => {
             eprintln!(
-                "[xtask] {}: TIMEOUT after {}s",
+                "[xtask] {} {bin}: TIMEOUT after {}s",
                 arch.name(),
                 TEST_TIMEOUT.as_secs()
             );
@@ -269,11 +311,11 @@ fn test(arch: Arch, release: bool) -> bool {
         Some(status) => {
             let code = status.code().unwrap_or(-1);
             if code == arch.success_exit_code() {
-                println!("[xtask] {}: PASS", arch.name());
+                println!("[xtask] {} {bin}: PASS", arch.name());
                 true
             } else {
                 eprintln!(
-                    "[xtask] {}: FAIL (qemu exit code {code}, expected {})",
+                    "[xtask] {} {bin}: FAIL (qemu exit code {code}, expected {})",
                     arch.name(),
                     arch.success_exit_code()
                 );

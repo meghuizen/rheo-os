@@ -42,10 +42,10 @@ jobs:
       - name: clippy (xtask, host)
         run: cargo clippy -p xtask -- -D warnings
 
-      - name: clippy (kernel, all ISAs)
+      - name: clippy (kernel + test kernels, all ISAs)
         run: |
           for target in x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf; do
-            cargo clippy -p kernel --target "$target" $BUILD_STD_FLAGS -- -D warnings
+            cargo clippy -p kernel -p qemu-tests --target "$target" $BUILD_STD_FLAGS -- -D warnings
           done
 
   boot-test:
@@ -81,13 +81,20 @@ jobs:
             target
           key: boot-${{ matrix.arch }}-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
 
-      - name: Build and boot in QEMU
+      - name: Build and boot test kernels in QEMU
         run: cargo xtask test --arch ${{ matrix.arch }}
 
-      - name: Upload serial log
+      # Instruction-path-length benchmarks under deterministic icount
+      # (docs/TOOLING.md 4: QEMU tracks trends; wall-clock gates on the
+      # hardware lab only). Numbers land in the uploaded logs and feed
+      # comparison/RESULTS.md.
+      - name: Benchmark (icount path lengths)
+        run: cargo xtask bench --arch ${{ matrix.arch }}
+
+      - name: Upload serial logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: serial-log-${{ matrix.arch }}
-          path: target/qemu-${{ matrix.arch }}.log
+          name: serial-logs-${{ matrix.arch }}
+          path: target/qemu-${{ matrix.arch }}-*.log
           if-no-files-found: ignore

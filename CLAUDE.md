@@ -14,18 +14,26 @@ what order; `docs/DEVELOPMENT.md` covers the day-to-day mechanics.
 
 ## Current state
 
-BUILD-ORDER.md steps 0-1 are done: toolchain, xtask, CI, and a kernel that
-boots on all three ISAs in QEMU, prints over serial, and exits clean through
-the test device. Next up: step 2 (Arch trait skeleton: traps, timer).
+Steps 0-1 of BUILD-ORDER.md are done, plus early slices of steps 2, 4, 5
+and 6 built for concept validation: exception vectors + cycle counters +
+context switch per ISA; the capability core (mint / derive-subset /
+delegate / revoke-by-epoch / grant-check, runtime-tested for the four
+ARCHITECTURE.md 8.2 proof properties); the queue-pair ABI (SqEntry/CqEntry
+rings + doorbell) with per-entry grant checks and flow-context
+propagation; cells as capability-table protection contexts (no hardware
+address spaces yet - user-mode cells need steps 3/5); and a benchmark +
+seL4 comparison harness (comparison/RESULTS.md). Timers, memory
+management, and the Verus proofs are still open.
 
 ## Commands
 
 Everything routes through the xtask runner (`xtask/src/main.rs`):
 
 ```
-cargo xtask build --arch <x86_64|aarch64|riscv64|all>   # cross-compile kernel
-cargo xtask run   --arch riscv64                        # boot in QEMU, serial on terminal
-cargo xtask test  --arch all                            # headless boot test, pass/fail
+cargo xtask build --arch <x86_64|aarch64|riscv64|all>   # cross-compile all kernels
+cargo xtask run   --arch riscv64 [--bin bench-core]     # boot in QEMU, serial on terminal
+cargo xtask test  --arch all                            # boot every test kernel, pass/fail
+cargo xtask bench --arch all                            # icount path lengths (always release)
 cargo fmt --all                                         # format (CI-gated)
 cargo clippy -p xtask -- -D warnings                    # lint host code (CI-gated)
 ```
@@ -47,15 +55,17 @@ QEMU 8.x system emulators must be installed to run or test.
 
 ```
 docs/         the design documents (the spec - keep code consistent with it)
-kernel/       the no_std kernel crate
+kernel/       the no_std kernel library + boot demo bin
+  src/        ISA-independent: capability core, queue ABI, cells, console
   src/arch/   per-ISA Rust modules (one dir per ISA)
-  arch/       per-ISA assembly (boot.S; later vectors.S, context_switch.S)
+  arch/       per-ISA assembly (boot.S, vectors.S/trap.S, context_switch.S)
   link/       linker scripts per ISA
-xtask/        build/run/test orchestration (cargo xtask ...)
+tests/        in-QEMU test kernels: cap-invariants, queue-pipeline, bench-core
+comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md
+xtask/        build/run/test/bench orchestration (cargo xtask ...)
 idl/          system IDL + codegen        (future, step 6)
 runtime/      strand runtime library      (future, step 7)
 services/     system service cells        (future, phase 5)
-tests/        in-QEMU test kernels        (future, step 4)
 targets/      custom target JSON          (only if built-in targets fail)
 ```
 
@@ -78,10 +88,19 @@ targets/      custom target JSON          (only if built-in targets fail)
 - **CI must stay green** on all three ISAs (.github/workflows/ci.yml). A
   panic in the kernel exits QEMU with a failure code, so CI catches it.
 
+## How benchmarks stay honest
+
+`cargo xtask bench` boots tests/src/bench_core.rs under QEMU
+`-icount shift=0` - results are deterministic instruction path lengths,
+never wall-clock claims (QEMU has no caches/TLB; hardware gates P1-P12 at
+the lab, docs/TOOLING.md 4). The kernel self-calibrates the
+tick:instruction ratio each run. Comparisons against seL4 must use the
+same QEMU + icount setup on both sides: comparison/README.md.
+
 ## How the boot test works
 
-`cargo xtask test` boots the kernel headless in QEMU with a 60s timeout and
-reads the QEMU process exit code (docs/DEVELOPMENT.md 6): x86-64 uses
-isa-debug-exit (success exits 33), ARM64 uses semihosting SYS_EXIT (exits 0),
-RISC-V uses the sifive_test device (exits 0). Serial output lands in
-`target/qemu-<arch>.log`.
+`cargo xtask test` boots every test kernel headless in QEMU with a 120s
+timeout and reads the QEMU process exit code (docs/DEVELOPMENT.md 6):
+x86-64 uses isa-debug-exit (success exits 33), ARM64 uses semihosting
+SYS_EXIT (exits 0), RISC-V uses the sifive_test device (exits 0). Serial
+output lands in `target/qemu-<arch>-<bin>.log`.
