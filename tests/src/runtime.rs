@@ -25,10 +25,10 @@ use kernel::capability::{BUDGET_UNLIMITED, ObjectKind, ObjectTable, READ, WRITE}
 use kernel::cell::Cell;
 use kernel::queue::{CqEntry, OP_NOP, QueuePair, RING_DEPTH, SqEntry, kernel_process};
 use kernel::{arch, println};
-use runtime::channel;
 use runtime::rights::{
     Cap, EXECUTE as R_EXECUTE, Full, READ as R_READ, ReadOnly, ReadWrite, WRITE as R_WRITE,
 };
+use runtime::{Mutex, TicketLock, channel};
 
 #[global_allocator]
 static HEAP: runtime::Heap = runtime::Heap::empty();
@@ -48,7 +48,11 @@ extern "C" fn kernel_main() -> ! {
     test_rights();
     test_executor_basic();
     test_park_complete();
+    test_yield();
+    test_join();
     test_channel();
+    test_mutex();
+    test_ticket_lock();
     test_async_on_queue();
 
     println!("runtime: PASS");
@@ -153,6 +157,99 @@ fn test_park_complete() {
         "order was not B then A"
     );
     println!("runtime: park/complete wake ordering OK");
+}
+
+/// yield_now cooperatively hands the vcore to the other ready strand, so two
+/// strands interleave: a, b, then A, B.
+fn test_yield() {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    fn note(b: u8) {
+        let v = SEQ.load(Ordering::Relaxed);
+        SEQ.store((v << 8) | b as u32, Ordering::Relaxed);
+    }
+    runtime::reset();
+    SEQ.store(0, Ordering::Relaxed);
+    runtime::spawn(async {
+        note(b'a');
+        runtime::yield_now().await;
+        note(b'A');
+    });
+    runtime::spawn(async {
+        note(b'b');
+        runtime::yield_now().await;
+        note(b'B');
+    });
+    runtime::run();
+    assert!(!runtime::has_pending(), "yield left a strand pending");
+    // 'a''b''A''B' = 0x61_62_41_42
+    assert_eq!(
+        SEQ.load(Ordering::Relaxed),
+        0x6162_4142,
+        "yield did not interleave"
+    );
+    println!("runtime: yield_now cooperative interleave OK");
+}
+
+/// Structured concurrency: a parent strand spawns children and joins their
+/// typed results (one joined before it finishes, one after).
+fn test_join() {
+    static SUM: AtomicU64 = AtomicU64::new(0);
+    runtime::reset();
+    SUM.store(0, Ordering::Relaxed);
+    runtime::spawn(async {
+        let h1 = runtime::spawn(async { 3u64 });
+        let h2 = runtime::spawn(async { 4u64 });
+        let total = h1.join().await + h2.join().await;
+        SUM.store(total, Ordering::Relaxed);
+    });
+    runtime::run();
+    assert!(!runtime::has_pending(), "join left a strand pending");
+    assert_eq!(SUM.load(Ordering::Relaxed), 7, "join produced wrong total");
+    println!("runtime: spawn + typed join (structured concurrency) OK");
+}
+
+/// The async mutex serialises a read-modify-write that yields *inside* the
+/// critical section. Without the lock the interleaved yield would lose
+/// updates; with it every increment lands, so the total is exactly N.
+fn test_mutex() {
+    static RESULT: AtomicU64 = AtomicU64::new(0);
+    const N: u64 = 16;
+    runtime::reset();
+    RESULT.store(0, Ordering::Relaxed);
+    let m = Mutex::new(0u64);
+    for _ in 0..N {
+        let m2 = m.clone();
+        runtime::spawn(async move {
+            let mut g = m2.lock().await;
+            let v = *g;
+            // Yield while holding the lock: other strands must park on lock().
+            runtime::yield_now().await;
+            *g = v + 1;
+        });
+    }
+    // Reader acquires after the writers and publishes the total.
+    let mr = m.clone();
+    runtime::spawn(async move {
+        let g = mr.lock().await;
+        RESULT.store(*g, Ordering::Relaxed);
+    });
+    runtime::run();
+    assert!(!runtime::has_pending(), "mutex left a strand pending");
+    assert_eq!(RESULT.load(Ordering::Relaxed), N, "mutex lost updates");
+    println!("runtime: async mutex (park on contention, no lost updates) OK");
+}
+
+/// The ticket lock's algorithm, exercised uncontended (single owner): fair
+/// acquire/release round-trips correctly. (Contended use is for multi-vcore.)
+fn test_ticket_lock() {
+    let lock = TicketLock::new(0u64);
+    for _ in 0..100 {
+        let mut g = lock.lock();
+        *g += 1;
+    }
+    let g = lock.lock();
+    assert_eq!(*g, 100, "ticket lock miscounted");
+    println!("runtime: ticket lock (fair, uncontended) OK");
 }
 
 /// An async channel across two strands: the receiver parks empty, the sender

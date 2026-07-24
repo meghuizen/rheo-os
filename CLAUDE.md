@@ -61,7 +61,10 @@ allocation-free); an async **executor** where a *strand* is a `Future` that
 "blocks" structurally by parking on a token and is woken by the queue-pair
 completion carrying that token in `user_data` - one drained completion ring,
 N strands resumed, no blocking syscall; an async **channel** (park on empty,
-wake on send); and **capability rights at the type level**
+wake on send); `spawn`/typed `JoinHandle` (structured concurrency),
+`yield_now`, and locking adapted to the model - an async **`Mutex`** that
+parks a strand on contention (never loses the vcore) and a fair `TicketLock`
+for the future multi-vcore case; and **capability rights at the type level**
 (KERNEL-RUST.md 2: `Rights<MASK>` + `SubsetOf`, so widening a capability's
 rights is a compile error). The `runtime` test kernel exercises all of it -
 including strands doing I/O over the real queue-pair ABI - on all three ISAs.
@@ -69,6 +72,16 @@ Full Rust (generics, traits, async/await) runs natively; the runtime is
 proven kernel-context here, and the same library links into a U-mode cell
 (that last integration - a `.user` heap grant + `mem*` shims - is future
 work, the shell shows the U-mode constraints).
+
+**Strands are validated as light threads** (comparison/threads/): the exact
+executor, measured on the host against the named runtimes, spawns+tears down
+a task in ~85 ns and switches in ~12 ns - roughly **1,200-1,600x faster than
+OS threads** (Rust `std::thread`, Python `threading`), ~150x faster than
+Python `asyncio`, and ~8-17x faster than Go goroutines (strands are
+stackless, so there is no per-task stack to allocate). In-QEMU icount path
+lengths (`bench` `p4_*`): ~450 instructions to spawn+tear down, ~150 to
+switch, consistent across ISAs. (.NET 10 is not installed here, so it is left
+unmeasured with an architectural note rather than a fabricated number.)
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus

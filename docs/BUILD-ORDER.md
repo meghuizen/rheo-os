@@ -90,12 +90,17 @@ get built and proven early, because retrofitting trust is impossible
 - **Status (in progress):** the `runtime/` crate implements the core strand
   model - a `Future`-based executor whose strands park on a token and are
   woken by the queue-pair completion carrying it (async on the real queue-pair
-  ABI), an async channel, a heap allocator so `alloc` works in a cell, and
-  capability rights at the type level. Proven kernel-context on all three ISAs
-  (`runtime` test kernel). Still ahead: multiple vcores + granting, the
-  preemption doorbell (needs the timer/IRQ path), scheduler-activation
-  notifications, and running the runtime inside a U-mode cell (a `.user` heap
-  grant + `mem*` shims). Stackful strands and the P4 bench also pending.
+  ABI), an async channel, `spawn`/`JoinHandle`/`yield_now`, an async `Mutex`
+  (park-based) + a fair `TicketLock`, a heap allocator so `alloc` works in a
+  cell, and capability rights at the type level. Proven kernel-context on all
+  three ISAs (`runtime` test kernel). P4 is measured: `bench` reports
+  `p4_strand_spawn_teardown` (~450 insns) and `p4_strand_switch` (~150 insns),
+  and comparison/threads/ validates strands as light threads on the host
+  (~1,200-1,600x faster spawn than OS threads, ~8-17x vs goroutines). Still
+  ahead: multiple vcores + granting, the preemption doorbell (needs the
+  timer/IRQ path), scheduler-activation notifications, stackful strands,
+  priority-inheritance locks, and running the runtime inside a U-mode cell (a
+  `.user` heap grant + `mem*` shims).
 
 ## Phase 3 - Time, memory, and eyes
 

@@ -92,6 +92,16 @@ Same ChaCha20 primitive Linux uses; the win is the per-cell library-call
 model (no syscall on the hot path). On the reference host rheo-os is ~4.8x
 faster on key/nonce-sized draws and ~1.3x on bulk (`comparison/rng/README.md`).
 
+And the strand (light-thread) model against Linux/Go/Python:
+
+```sh
+sh comparison/threads/run.sh
+```
+
+Strands spawn+tear down in ~85 ns and switch in ~12 ns - ~1,200-1,600x
+faster than OS threads (`std::thread`, Python `threading`), ~150x vs Python
+`asyncio`, ~8-17x vs Go goroutines (`comparison/threads/README.md`).
+
 ### 6. Run the shell (lsh)
 
 ```sh

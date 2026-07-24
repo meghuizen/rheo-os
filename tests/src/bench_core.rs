@@ -47,6 +47,11 @@ static mut RNG_DRBG: Drbg = Drbg::ZERO;
 static mut RNG_BUF32: [u8; 32] = [0; 32];
 static mut RNG_KBUF: [u8; 1024] = [0; 1024];
 
+// Heap for the strand-runtime (P4) bench: spawn/join allocate.
+#[global_allocator]
+static HEAP: runtime::Heap = runtime::Heap::empty();
+static mut HEAP_MEM: [u8; 512 * 1024] = [0; 512 * 1024];
+
 fn report(name: &str, ops: u64, ticks: u64) {
     let milli = ticks * 1000 / ops;
     println!("BENCH {name} ops={ops} ticks={ticks} per_op_milliticks={milli}");
@@ -83,6 +88,11 @@ extern "C" fn worker_entry() -> ! {
 extern "C" fn kernel_main() -> ! {
     arch::init();
     println!("bench-core: start on {}", arch::NAME);
+
+    // SAFETY: once, before any allocation; HEAP_MEM is a unique static.
+    unsafe {
+        HEAP.init(core::ptr::addr_of_mut!(HEAP_MEM) as usize, 512 * 1024);
+    }
 
     // Calibration: a known loop of exactly 2 instructions per iteration.
     // ticks_per_kilo_insn ~= 1000 means 1 tick = 1 instruction (x86 tsc,
@@ -262,6 +272,50 @@ extern "C" fn kernel_main() -> ! {
         core::hint::black_box(drbg.next_u64());
         arch::doorbell_trap();
     });
+
+    // ------------------------------------------------------------- P4
+    // Strand spawn/teardown and context switch (docs/CONCURRENCY.md,
+    // BUILD-ORDER step 7). These are the "light thread" path lengths: a
+    // strand is a slab slot + a boxed state machine, and a switch is a
+    // cooperative yield - no syscall, no kernel stack. The host comparison
+    // (comparison/threads/) puts real ns on these vs Linux/Go/Python.
+    const STRANDS: usize = 256;
+    let mut spawn_best = u64::MAX;
+    for _ in 0..BATCHES {
+        runtime::reset();
+        let start = arch::cycles();
+        for _ in 0..STRANDS {
+            let _ = runtime::spawn(async {});
+        }
+        runtime::run();
+        let elapsed = arch::cycles() - start;
+        if elapsed < spawn_best {
+            spawn_best = elapsed;
+        }
+    }
+    report("p4_strand_spawn_teardown", STRANDS as u64, spawn_best);
+
+    let mut switch_best = u64::MAX;
+    for _ in 0..BATCHES {
+        runtime::reset();
+        let _ = runtime::spawn(async {
+            for _ in 0..STRANDS {
+                runtime::yield_now().await;
+            }
+        });
+        let _ = runtime::spawn(async {
+            for _ in 0..STRANDS {
+                runtime::yield_now().await;
+            }
+        });
+        let start = arch::cycles();
+        runtime::run();
+        let elapsed = arch::cycles() - start;
+        if elapsed < switch_best {
+            switch_best = elapsed;
+        }
+    }
+    report("p4_strand_switch", 2 * STRANDS as u64, switch_best);
 
     println!("bench-core: DONE");
     arch::exit(arch::ExitCode::Success)

@@ -3,14 +3,19 @@
 **Status:** Draft v0.1. Expands ARCHITECTURE.md 4.3; pairs with SCHEDULING.md
 (which schedules the vcores these strands run on).
 
-**Implemented (section 1):** the `runtime/` crate has the strand executor -
-strands are `Future`s, "blocking" is a park on a token, and the queue-pair
+**Implemented (sections 1, 6):** the `runtime/` crate has the strand executor
+- strands are `Future`s, "blocking" is a park on a token, and the queue-pair
 completion carrying that token in `user_data` is what unparks the strand (one
-drained completion ring, N strands resumed). An async channel is park/wake on
-top. Proven on all three ISAs by the `runtime` test kernel (single-vcore,
-kernel-context). Deferred: multiple vcores + granting, the preemption doorbell
-(section 4, needs the timer/IRQ path), stackful strands (section 2), and
-vcore-local storage.
+drained completion ring, N strands resumed). On top: an async channel,
+`spawn`/typed `JoinHandle` (structured concurrency), `yield_now`, an async
+`Mutex` that parks on contention (section 6 - the vcore is never lost to a
+held lock), and a fair `TicketLock` for the future multi-vcore case. Proven on
+all three ISAs by the `runtime` test kernel (single-vcore, kernel-context).
+Validated as light threads against Linux/Go/Python in comparison/threads/
+(~85 ns spawn+teardown, ~12 ns switch; ~1,200-1,600x faster than OS threads,
+~8-17x faster than goroutines). Deferred: multiple vcores + granting, the
+preemption doorbell (section 4, needs the timer/IRQ path), stackful strands
+(section 2), priority-inheritance locks, and vcore-local storage.
 
 Position: threads get light by splitting in two. The kernel schedules
 **vcores** (one kernel context each); the runtime inside a cell schedules

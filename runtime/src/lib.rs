@@ -29,8 +29,13 @@ extern crate alloc;
 
 pub mod channel;
 pub mod heap;
+pub mod lock;
 pub mod rights;
 pub mod strand;
 
 pub use heap::Heap;
-pub use strand::{StrandId, complete, has_pending, next_token, park_on, reset, run, spawn, stats};
+pub use lock::{Mutex, TicketLock};
+pub use strand::{
+    JoinHandle, StrandId, complete, has_pending, next_token, park_on, reset, run, spawn, stats,
+    yield_now,
+};
