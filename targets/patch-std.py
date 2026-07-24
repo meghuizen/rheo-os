@@ -67,6 +67,45 @@ EDITS = [
         '    target_os = "zkvm" => {\n        mod zkvm;\n        pub use zkvm::*;\n    }\n    _ => {\n        mod unsupported;\n        pub use unsupported::*;\n    }',
         '    target_os = "zkvm" => {\n        mod zkvm;\n        pub use zkvm::*;\n    }\n    target_os = "rheo" => {\n        mod rheo;\n        pub use rheo::*;\n    }\n    _ => {\n        mod unsupported;\n        pub use unsupported::*;\n    }',
     ),
+    # rheo uses the `unsupported` PAL, whose no-op `init` never stores argv.
+    # Forward to the rheo args arm so `std::env::args` works (M5). cfg-gated,
+    # so other `unsupported`-PAL targets are unaffected.
+    (
+        "pal/unsupported/common.rs",
+        "pub unsafe fn init(_argc: isize, _argv: *const *const u8, _sigpipe: u8) {}",
+        "pub unsafe fn init(_argc: isize, _argv: *const *const u8, _sigpipe: u8) {\n    #[cfg(target_os = \"rheo\")]\n    unsafe {\n        crate::sys::args::init(_argc, _argv);\n    }\n}",
+    ),
+    # rheo command-line args: enable the shared `common` Args helper and route
+    # to the repo-owned rheo arm (M5).
+    (
+        "args/mod.rs",
+        '    target_os = "xous",\n))]\nmod common;',
+        '    target_os = "xous",\n    target_os = "rheo",\n))]\nmod common;',
+    ),
+    (
+        "args/mod.rs",
+        '    target_os = "zkvm" => {\n        mod zkvm;\n        pub use zkvm::*;\n    }\n    _ => {\n        mod unsupported;\n        pub use unsupported::*;\n    }',
+        '    target_os = "zkvm" => {\n        mod zkvm;\n        pub use zkvm::*;\n    }\n    target_os = "rheo" => {\n        mod rheo;\n        pub use rheo::*;\n    }\n    _ => {\n        mod unsupported;\n        pub use unsupported::*;\n    }',
+    ),
+    # rheo environment vars: enable the shared `common` Env helper and route to
+    # the repo-owned rheo arm (in-process env table, M5).
+    (
+        "env/mod.rs",
+        '    target_os = "xous",\n))]\nmod common;',
+        '    target_os = "xous",\n    target_os = "rheo",\n))]\nmod common;',
+    ),
+    (
+        "env/mod.rs",
+        '    target_os = "zkvm" => {\n        mod zkvm;\n        pub use zkvm::*;\n    }\n    _ => {\n        mod unsupported;\n        pub use unsupported::*;\n    }',
+        '    target_os = "zkvm" => {\n        mod zkvm;\n        pub use zkvm::*;\n    }\n    target_os = "rheo" => {\n        mod rheo;\n        pub use rheo::*;\n    }\n    _ => {\n        mod unsupported;\n        pub use unsupported::*;\n    }',
+    ),
+    # rheo filesystem: route to the repo-owned rheo arm (fd syscalls over the
+    # VFS, M5) instead of the `unsupported` stub.
+    (
+        "fs/mod.rs",
+        '    target_os = "vexos" => {\n        mod vexos;\n        use vexos as imp;\n    }\n    _ => {\n        mod unsupported;\n        use unsupported as imp;\n    }',
+        '    target_os = "vexos" => {\n        mod vexos;\n        use vexos as imp;\n    }\n    target_os = "rheo" => {\n        mod rheo;\n        use rheo as imp;\n    }\n    _ => {\n        mod unsupported;\n        use unsupported as imp;\n    }',
+    ),
     # rheo process::exit -> SYS_EXIT_GROUP (instead of aborting).
     (
         "exit.rs",
@@ -80,6 +119,9 @@ EDITS = [
 COPIES = [
     ("std-rheo/alloc.rs", "alloc/rheo.rs"),
     ("std-rheo/stdio.rs", "stdio/rheo.rs"),
+    ("std-rheo/args.rs", "args/rheo.rs"),
+    ("std-rheo/env.rs", "env/rheo.rs"),
+    ("std-rheo/fs.rs", "fs/rheo.rs"),
 ]
 
 # The no_threads sync/TLS impls compile_error on targets that "have threads"

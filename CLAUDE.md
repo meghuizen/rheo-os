@@ -146,10 +146,26 @@ routes rheo to the single-threaded portable fallbacks (SMP deferred) with real
 rheo arms for the heap (a hole-list allocator over `SYS_MMAP`), non-blocking
 `stdio` (fds over the M2 syscalls), and `process::exit` (`SYS_EXIT_GROUP`); a
 crt0 (`rheo-rt`) provides `_start`. Float-heavy programs await U-mode FP/SIMD
-enablement. Next: coreutils (M5). Also built
+enablement. Also built
 alongside as an M4-prep workload: **rheo-json** (`json/`), a dependency-free
 zero-copy JSON parser that runs on the OS and is benchmarked against simdjson
 (docs/JSON.md).
+
+**Coreutils run on the OS** (M5, docs/USERLAND.md): standard command-line
+tools as a U-mode cell. Three OS capabilities land first - **argv/env** (the
+kernel builds the System V initial process stack in `setup_stack`; the crt0
+reads `argc`/`argv` so `std::env::args` works; env is an in-process table), and
+a **`std::fs` read/write path over the VFS** (a rheo `std` `fs` arm translating
+`File`/`metadata`/`read_dir` onto the file syscalls, now including `stat`/
+`fstat`/`getdents`, forwarded to the POSIX personality). On top of them
+**rheo-coreutils** (`targets/std-rheo/coreutils/`) is a busybox-style multicall
+program built against real `std` - `true`/`false`/`echo`/`cat`/`wc`/`head`/
+`ls`/`seq`/`basename`/`dirname`/`nl`/`pwd`/`env`, dispatched by `argv`. The
+`coreutils` test loads it with a real `argv`, runs one utility per invocation
+over a ramfs, and asserts each utility's exit code and exact stdout on all
+three ISAs. These are faithful from-scratch ports, not the upstream uutils
+crate (whose clap/uucore tree needs `std` surface rheo lacks - `IsTerminal`,
+locale, terminal width - so it is deferred; docs/USERLAND.md M5).
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
@@ -219,8 +235,10 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               posix, blockfs (live virtio-blk disk), elfrun (load a native
               ELF), posixrun (native program over the POSIX syscalls),
               libcrun (a program linked against rheo-libc), jsonrun (a
-              program parsing JSON with rheo-json on-OS), bench-core, and
-              the interactive lsh bin (+ harness.rs); fixtures/ holds the
+              program parsing JSON with rheo-json on-OS), stdrun (a real-std
+              program on-OS), coreutils (the coreutils multicall cell, with
+              argv + std::fs over the VFS), bench-core, and the interactive
+              lsh bin (+ harness.rs, vfs_personality.rs); fixtures/ holds the
               ext4 test image (+ gen-ext4.sh)
 comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md
 xtask/        build/run/test/bench orchestration (cargo xtask ...)
@@ -237,8 +255,10 @@ json/         rheo-json: a dependency-free, zero-copy JSON parser (scalar +
               (docs/JSON.md, comparison/json/)
 services/     system service cells        (future, phase 5)
 targets/      rheo-os custom target specs + the std port: rheo_os-*.json,
-              patch-std.py (rust-src std patch), std-rheo/ (rheo sys sources
-              + a std proof program). docs/USERLAND.md M4
+              patch-std.py (rust-src std patch: heap/stdio/args/env/fs arms),
+              std-rheo/ (rheo sys sources + the rheo-rt crt0, the std proof
+              program, and the rheo-coreutils multicall cell).
+              docs/USERLAND.md M4/M5
 ```
 
 ## Rules

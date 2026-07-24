@@ -28,15 +28,99 @@ pub fn load_elf(image: &[u8], aspace: &mut AddressSpace) -> Option<usize> {
     Some(elf.entry() as usize)
 }
 
-/// Map the initial user stack and return the top (the initial SP).
+/// Map the initial user stack with no arguments and return the initial SP.
+/// A thin wrapper over [`setup_stack`] with empty argv/envp, so a program that
+/// does not use its arguments (e.g. the std proof program) still sees a valid
+/// `argc == 0` block at SP.
 pub fn map_stack(aspace: &mut AddressSpace) -> usize {
+    setup_stack(aspace, &[], &[])
+}
+
+/// Map the initial user stack and lay out the System V initial process stack
+/// (docs/USERLAND.md M5): `argc`, the `argv` pointer array (NULL-terminated),
+/// then the `envp` pointer array (NULL-terminated), with the argument and
+/// environment strings living above. Returns the initial SP, which points at
+/// `argc`. A crt0's `_start` reads `argc`/`argv` from there; `std::env::args`
+/// then works over the real arguments.
+///
+/// The cell's address space is not active during load, so the kernel writes
+/// the block into the top stack frame through its identity mapping (PA = VA
+/// in kernel space) and stores *user* VAs in the pointer arrays. The block
+/// must fit in the top page; the caller keeps argv/envp small (asserted).
+pub fn setup_stack(aspace: &mut AddressSpace, args: &[&[u8]], envs: &[&[u8]]) -> usize {
+    // Allocate and map every stack page; remember the top page's physical
+    // frame so we can write the initial block into it below.
+    let mut top_pa = 0usize;
     let mut va = USER_STACK_TOP - USER_STACK_PAGES * FRAME_SIZE;
     while va < USER_STACK_TOP {
         let pa = frames::alloc();
         aspace.map_user_frame(va, pa, MapPerm::UserRw);
+        if va == USER_STACK_TOP - FRAME_SIZE {
+            top_pa = pa;
+        }
         va += FRAME_SIZE;
     }
-    USER_STACK_TOP
+
+    let base_va = USER_STACK_TOP - FRAME_SIZE;
+    // SAFETY: `top_pa` is a freshly allocated, zeroed, identity-mapped frame we
+    // just mapped at `base_va`; we write only within its FRAME_SIZE bytes.
+    let page = top_pa as *mut u8;
+
+    // Copy the argument then environment strings near the top of the page,
+    // growing downward, recording each string's user VA. Capped so a caller
+    // cannot overflow the fixed pointer-VA table.
+    const MAX_PTRS: usize = 64;
+    assert!(
+        args.len() + envs.len() <= MAX_PTRS,
+        "too many argv/envp entries"
+    );
+    let mut str_vas = [0usize; MAX_PTRS];
+    let mut off = FRAME_SIZE;
+    let write_str = |page: *mut u8, off: &mut usize, s: &[u8]| -> usize {
+        *off -= s.len() + 1; // room for the string and its NUL
+        // SAFETY: bounds ensured by the fit assertion below.
+        unsafe {
+            core::ptr::copy_nonoverlapping(s.as_ptr(), page.add(*off), s.len());
+            *page.add(*off + s.len()) = 0;
+        }
+        base_va + *off
+    };
+    for (i, s) in args.iter().chain(envs.iter()).enumerate() {
+        str_vas[i] = write_str(page, &mut off, s);
+    }
+
+    // The pointer block: argc, argv[..], NULL, envp[..], NULL. It sits below
+    // the strings, 16-byte aligned (the x86-64 SysV entry requires SP % 16 == 0
+    // at `argc`; base_va is already 16-aligned).
+    let words = 1 + args.len() + 1 + envs.len() + 1;
+    let block_bytes = words * 8;
+    let sp_off = (off - block_bytes) & !0xF;
+    assert!(
+        sp_off < off,
+        "argv/envp block does not fit the initial stack page"
+    );
+
+    // SAFETY: `sp_off .. off` lies within the page and below the strings.
+    unsafe {
+        let mut w = (page.add(sp_off)) as *mut u64;
+        w.write(args.len() as u64); // argc
+        // argv pointers, NULL, envp pointers, NULL - the string VAs are already
+        // in `str_vas` (args first, then envs).
+        for &va in &str_vas[..args.len()] {
+            w = w.add(1);
+            w.write(va as u64);
+        }
+        w = w.add(1);
+        w.write(0); // argv NULL terminator
+        for &va in &str_vas[args.len()..args.len() + envs.len()] {
+            w = w.add(1);
+            w.write(va as u64);
+        }
+        w = w.add(1);
+        w.write(0); // envp NULL terminator
+    }
+
+    base_va + sp_off
 }
 
 fn seg_perm(flags: u32) -> MapPerm {

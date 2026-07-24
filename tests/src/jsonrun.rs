@@ -60,6 +60,15 @@ fn c_read(_fd: u64, _b: u64, _l: u64) -> i64 {
 fn c_lseek(_fd: u64, _o: i64, _w: u64) -> i64 {
     -38
 }
+fn c_stat(_p: u64, _l: u64, _s: u64) -> i64 {
+    -38
+}
+fn c_fstat(_fd: u64, _s: u64) -> i64 {
+    -38
+}
+fn c_getdents(_p: u64, _l: u64, _b: u64, _bl: u64) -> i64 {
+    -38
+}
 
 static mut OBJECTS: ObjectTable = ObjectTable::new();
 static mut CAPS: CapTable = CapTable::new();
@@ -80,6 +89,9 @@ extern "C" fn kernel_main() -> ! {
         read: c_read,
         write: c_write,
         lseek: c_lseek,
+        stat: c_stat,
+        fstat: c_fstat,
+        getdents: c_getdents,
     });
 
     let mut aspace = AddressSpace::new(1);

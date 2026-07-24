@@ -70,7 +70,39 @@ hazard by construction.
   `targets/std-rheo/`), idempotent, applied by `cargo xtask std-patch`. Only
   **float-heavy** programs are gated - on U-mode FP/SIMD enablement - since
   the targets are soft-float (U-mode vector state is not saved yet).
-- **M5 - coreutils.** Cross-compile a uutils/coreutils subset and run it.
+- **M5 - coreutils. [done]** Standard command-line tools running on the OS. It
+  adds the three OS capabilities coreutils need and a multicall program that
+  uses them:
+  - **argv/env.** The kernel lays out the System V initial process stack
+    (`argc`, the `argv`/`envp` pointer arrays, and the strings) in the cell's
+    top stack page (kernel/src/load.rs `setup_stack`); the crt0 (`rheo-rt`)
+    reads `argc`/`argv` from SP and passes them to `main`, so `std::env::args`
+    works. Environment variables are an in-process table (empty at start,
+    `set_var`/`var`/`vars`), since rheo has no kernel env block yet.
+  - **`std::fs` over the VFS.** A rheo `std` `fs` arm
+    (`targets/std-rheo/fs.rs`) translates `File`/`metadata`/`read_dir` onto the
+    file syscalls (open/close/read/write/lseek plus new `stat`/`fstat`/
+    `getdents`, kernel/src/abi.rs), forwarded to the POSIX personality handler
+    backed by the `posix` VFS. Read and write both work; timestamps,
+    permissions, symlinks, and truncate return `Unsupported` (the VFS does not
+    model them yet) rather than faking success.
+  - **the coreutils cell.** `rheo-coreutils`
+    (`targets/std-rheo/coreutils/`) is a busybox-style multicall program built
+    against real `std` for the rheo-os target: `true`, `false`, `echo`, `cat`,
+    `wc`, `head`, `ls`, `seq`, `basename`, `dirname`, `nl`, `pwd`, `env`,
+    dispatched by `argv`. The `coreutils` test kernel loads it into a cell with
+    a real `argv`, runs one utility per invocation over a ramfs, and asserts
+    each utility's exit code and exact stdout - standard tools running on the
+    OS, on all three ISAs.
+
+  **Honest scope.** These are faithful from-scratch reimplementations, *not*
+  the upstream uutils crate. Building upstream uutils would pull in its
+  dependency tree (clap, uucore), which needs `std` surface rheo does not have
+  yet - `IsTerminal`, locale/`LC_*` handling, terminal-width detection - so it
+  is deferred behind that surface (and, for third-party crates, adding
+  `target_os = "rheo"` to std's `restricted_std` allowlist). The M5 deliverable
+  proves the *native-app path* end to end: a separately-compiled std program
+  takes arguments, reads files, and prints results as a U-mode cell.
 
 Each milestone builds and boots on all three ISAs before it lands.
 

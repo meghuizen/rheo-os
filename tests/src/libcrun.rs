@@ -17,11 +17,13 @@ use core::ptr::addr_of_mut;
 use kernel::capability::{CapTable, ObjectTable};
 use kernel::mm::AddressSpace;
 use kernel::queue::QueuePair;
-use kernel::svc::{self, FileOps};
+use kernel::svc;
 use kernel::user::{self, Outcome};
 use kernel::{arch, load, println};
-use posix::sys::Whence;
-use posix::{RamFs, fs, mount, sys};
+use posix::{RamFs, fs, mount};
+
+#[path = "vfs_personality.rs"]
+mod vfs_personality;
 
 #[global_allocator]
 static HEAP: runtime::Heap = runtime::Heap::empty();
@@ -45,73 +47,6 @@ static LIBCDEMO: &[u8] = include_bytes!(concat!(
 
 const GREETING: &[u8] = b"hi from libc\n";
 
-// Personality handler (see posixrun): user fds 0/1/2 = console, 3+ = the
-// posix fd table (offset by 3). Runs in kernel context, so raw user VAs work.
-
-fn p_open(path_va: u64, path_len: u64, flags: u64) -> i64 {
-    let bytes = unsafe { core::slice::from_raw_parts(path_va as *const u8, path_len as usize) };
-    let Ok(path) = core::str::from_utf8(bytes) else {
-        return -22;
-    };
-    match sys::open(path, flags as u32) {
-        Ok(fd) => (fd + 3) as i64,
-        Err(e) => -(sys::errno(e) as i64),
-    }
-}
-
-fn p_close(fd: u64) -> i64 {
-    if fd < 3 {
-        return 0;
-    }
-    match sys::close((fd - 3) as usize) {
-        Ok(()) => 0,
-        Err(e) => -(sys::errno(e) as i64),
-    }
-}
-
-fn p_read(fd: u64, buf_va: u64, len: u64) -> i64 {
-    if fd < 3 {
-        return 0;
-    }
-    let buf = unsafe { core::slice::from_raw_parts_mut(buf_va as *mut u8, len as usize) };
-    match sys::read((fd - 3) as usize, buf) {
-        Ok(n) => n as i64,
-        Err(e) => -(sys::errno(e) as i64),
-    }
-}
-
-fn p_write(fd: u64, buf_va: u64, len: u64) -> i64 {
-    let buf = unsafe { core::slice::from_raw_parts(buf_va as *const u8, len as usize) };
-    if fd == 1 || fd == 2 {
-        for &b in buf {
-            arch::serial_write_byte(b);
-        }
-        return len as i64;
-    }
-    if fd < 3 {
-        return -9;
-    }
-    match sys::write((fd - 3) as usize, buf) {
-        Ok(n) => n as i64,
-        Err(e) => -(sys::errno(e) as i64),
-    }
-}
-
-fn p_lseek(fd: u64, off: i64, whence: u64) -> i64 {
-    if fd < 3 {
-        return -9;
-    }
-    let w = match whence {
-        0 => Whence::Set,
-        1 => Whence::Cur,
-        _ => Whence::End,
-    };
-    match sys::lseek((fd - 3) as usize, off, w) {
-        Ok(o) => o as i64,
-        Err(e) => -(sys::errno(e) as i64),
-    }
-}
-
 static mut OBJECTS: ObjectTable = ObjectTable::new();
 static mut CAPS: CapTable = CapTable::new();
 static mut QP: MaybeUninit<QueuePair> = MaybeUninit::uninit();
@@ -133,13 +68,7 @@ extern "C" fn kernel_main() -> ! {
     posix::reset();
     mount::mount("/", Rc::new(RamFs::new()));
     fs::write("/greeting.txt", GREETING).expect("seed /greeting.txt");
-    svc::set_file_ops(FileOps {
-        open: p_open,
-        close: p_close,
-        read: p_read,
-        write: p_write,
-        lseek: p_lseek,
-    });
+    svc::set_file_ops(vfs_personality::ops());
 
     let mut aspace = AddressSpace::new(1);
     let entry = load::load_elf(LIBCDEMO, &mut aspace).expect("load libcdemo ELF");

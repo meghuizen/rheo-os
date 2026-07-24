@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 16] = [
+const TEST_KERNELS: [&str; 17] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -38,6 +38,7 @@ const TEST_KERNELS: [&str; 16] = [
     "libcrun",
     "jsonrun",
     "stdrun",
+    "coreutils",
 ];
 
 /// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
@@ -293,21 +294,21 @@ fn build_userland(arch: Arch) -> bool {
     matches!(cmd.status().map(|s| s.success()), Ok(true))
 }
 
-/// Build the real-std proof program (targets/std-rheo/hello) for the rheo-os
-/// target of `arch`, so the `stdrun` test can embed it (docs/USERLAND.md M4).
-/// Applies the rust-src std patch first (idempotent). Uses `-Zbuild-std=std`
-/// against the custom JSON target.
-fn build_std_hello(arch: Arch) -> bool {
+/// Build a real-std program (`manifest`) for the rheo-os target of `arch`, so
+/// a test can embed the ELF (docs/USERLAND.md M4/M5). Applies the rust-src std
+/// patch first (idempotent) and uses `-Zbuild-std=std` against the custom JSON
+/// target. Used for the `stdrun` proof program and the `coreutils` cell.
+fn build_std_program(arch: Arch, manifest: &str, label: &str) -> bool {
     if !std_patch() {
         return false;
     }
-    println!("[xtask] building std proof program for {}", arch.name());
+    println!("[xtask] building std program '{label}' for {}", arch.name());
     let target = format!("targets/rheo_os-{}.json", arch.name());
     let mut cmd = Command::new("cargo");
     cmd.args([
         "build",
         "--manifest-path",
-        "targets/std-rheo/hello/Cargo.toml",
+        manifest,
         "--release",
         "--target",
         &target,
@@ -322,7 +323,10 @@ fn build(arch: Arch, release: bool) -> bool {
     if !build_userland(arch) {
         return false;
     }
-    if !build_std_hello(arch) {
+    if !build_std_program(arch, "targets/std-rheo/hello/Cargo.toml", "hello") {
+        return false;
+    }
+    if !build_std_program(arch, "targets/std-rheo/coreutils/Cargo.toml", "coreutils") {
         return false;
     }
     println!("[xtask] building kernels for {}", arch.name());

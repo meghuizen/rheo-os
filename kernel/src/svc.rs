@@ -93,6 +93,9 @@ pub fn handle(nr: u64, args: &[u64; 6]) -> Option<u64> {
         SYS_READ => file_ops().map(|o| (o.read)(args[0], args[1], args[2]) as u64),
         SYS_WRITE_FD => file_ops().map(|o| (o.write)(args[0], args[1], args[2]) as u64),
         SYS_LSEEK => file_ops().map(|o| (o.lseek)(args[0], args[1] as i64, args[2]) as u64),
+        SYS_STAT => file_ops().map(|o| (o.stat)(args[0], args[1], args[2]) as u64),
+        SYS_FSTAT => file_ops().map(|o| (o.fstat)(args[0], args[1]) as u64),
+        SYS_GETDENTS => file_ops().map(|o| (o.getdents)(args[0], args[1], args[2], args[3]) as u64),
         _ => None,
     }
 }
@@ -110,6 +113,9 @@ pub struct FileOps {
     pub read: fn(fd: u64, buf_va: u64, len: u64) -> i64,
     pub write: fn(fd: u64, buf_va: u64, len: u64) -> i64,
     pub lseek: fn(fd: u64, off: i64, whence: u64) -> i64,
+    pub stat: fn(path_va: u64, path_len: u64, statbuf_va: u64) -> i64,
+    pub fstat: fn(fd: u64, statbuf_va: u64) -> i64,
+    pub getdents: fn(path_va: u64, path_len: u64, buf_va: u64, buf_len: u64) -> i64,
 }
 
 static mut FILE_OPS: Option<FileOps> = None;

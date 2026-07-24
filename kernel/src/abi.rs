@@ -98,6 +98,25 @@ pub const SYS_READ: u64 = 25;
 pub const SYS_WRITE_FD: u64 = 26;
 /// lseek(fd, offset, whence) -> new offset or -errno.
 pub const SYS_LSEEK: u64 = 27;
+/// stat(path_va, path_len, statbuf_va) -> 0 or -errno. Fills a `Stat` at
+/// `statbuf_va` (docs/USERLAND.md M5).
+pub const SYS_STAT: u64 = 28;
+/// fstat(fd, statbuf_va) -> 0 or -errno. Like `SYS_STAT` but by open fd.
+pub const SYS_FSTAT: u64 = 29;
+/// getdents(path_va, path_len, buf_va, buf_len) -> bytes written or -errno.
+/// Packs directory entries into `buf` (docs/USERLAND.md M5): each record is
+/// `[u32 kind][u32 name_len][name bytes]` with no padding, read sequentially
+/// by the std `ReadDir`. `kind`: 0 regular, 1 dir, 2 symlink, 3 other.
+pub const SYS_GETDENTS: u64 = 30;
+
+/// The `stat`/`fstat` result block (kept in sync with the std `fs` arm in
+/// targets/std-rheo/fs.rs). `kind`: 0 regular, 1 dir, 2 symlink, 3 other.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct Stat {
+    pub size: u64,
+    pub kind: u64,
+}
 
 /// Shared shell I/O block, one page in the cell's `.user` data, readable
 /// and writable by the kernel through its identity mapping.
