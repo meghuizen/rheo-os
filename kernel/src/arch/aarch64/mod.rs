@@ -301,6 +301,16 @@ pub fn set_syscall_ret(frame: &mut TrapFrame, value: u64) {
     frame.regs[REG_X0] = value;
 }
 
+/// x86-only `arch_prctl` TLS hook (docs/LINUX-COMPAT.md L1). Unreachable on
+/// ARM64: the asm-generic syscall table has no `arch_prctl` number, and EL0
+/// sets its own thread pointer with `msr tpidr_el0` (the kernel only uses
+/// TPIDR_EL1/TPIDRRO_EL0), so glibc never asks the kernel. Present only so
+/// the portable personality dispatch compiles on every ISA.
+pub fn set_user_fs_base(_addr: u64) {}
+pub fn user_fs_base() -> u64 {
+    0
+}
+
 unsafe extern "C" {
     pub fn enter_user_first(frame: *mut TrapFrame);
     fn return_to_kernel_asm() -> !;

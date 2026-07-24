@@ -14,28 +14,49 @@ use core::mem::MaybeUninit;
 use core::ptr::addr_of_mut;
 
 use kernel::capability::{CapTable, ObjectTable};
+use kernel::linux::stack as linux_stack;
 use kernel::mm::AddressSpace;
 use kernel::queue::QueuePair;
 use kernel::user::{self, Outcome, Personality};
 use kernel::{arch, load, println};
 
-#[cfg(target_arch = "x86_64")]
-static LINUXHELLO: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../target/x86_64-unknown-none/release/linuxhello"
-));
-#[cfg(target_arch = "aarch64")]
-static LINUXHELLO: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../target/aarch64-unknown-none-softfloat/release/linuxhello"
-));
-#[cfg(target_arch = "riscv64")]
-static LINUXHELLO: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../target/riscv64gc-unknown-none-elf/release/linuxhello"
-));
+/// `include_bytes!` a bare-target release artifact per ISA. The three arms
+/// differ only in the target-triple directory the userland crate builds to.
+macro_rules! fixture {
+    ($name:literal) => {{
+        #[cfg(target_arch = "x86_64")]
+        {
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../target/x86_64-unknown-none/release/",
+                $name
+            ))
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../target/aarch64-unknown-none-softfloat/release/",
+                $name
+            ))
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../target/riscv64gc-unknown-none-elf/release/",
+                $name
+            ))
+        }
+    }};
+}
 
-/// 42 only if the Linux write returned the full count (see linuxhello).
+// linuxhello (L0): raw Linux write + exit_group.
+static LINUXHELLO: &[u8] = fixture!("linuxhello");
+// linuxauxv (L1): walks its own auxv, exits 42 iff AT_PAGESZ/AT_RANDOM are OK.
+static LINUXAUXV: &[u8] = fixture!("linuxauxv");
+
+/// Both fixtures exit 42 on success.
 const EXPECTED_EXIT: u64 = 42;
 
 static mut OBJECTS: ObjectTable = ObjectTable::new();
@@ -46,23 +67,24 @@ static mut QP: MaybeUninit<QueuePair> = MaybeUninit::uninit();
 struct KStack([u8; 64 * 1024]);
 static mut KSTACK: KStack = KStack([0; 64 * 1024]);
 
-#[unsafe(no_mangle)]
-extern "C" fn kernel_main() -> ! {
-    arch::init();
-    println!("linuxrun: start on {}", arch::NAME);
-
+/// Run a Linux-personality cell built with the Linux loader + auxv stack, and
+/// assert it exits with `EXPECTED_EXIT`. `argv` is passed on the initial
+/// stack. Each call uses a fresh address space so globals start clean.
+fn run_linux(name: &str, image: &[u8], argv: &[&[u8]]) {
     let mut aspace = AddressSpace::new(1);
-    let entry = load::load_elf(LINUXHELLO, &mut aspace).expect("load linuxhello ELF");
-    let stack_top = load::map_stack(&mut aspace);
+    let img = load::load_elf_linux(image, &mut aspace).expect("load Linux ELF");
+    let sp = linux_stack::setup_stack(&mut aspace, &img, argv, &[]);
     println!(
-        "linuxrun: loaded linuxhello ({} bytes), entry {entry:#x}",
-        LINUXHELLO.len()
+        "linuxrun: loaded {name} ({} bytes), entry {:#x}, bias {:#x}",
+        image.len(),
+        img.entry,
+        img.bias
     );
 
-    // SAFETY: single-threaded init; the statics outlive the run.
+    // SAFETY: single-threaded init; the statics outlive the synchronous run.
     let outcome = unsafe {
         let kernel_sp = core::ptr::addr_of!(KSTACK.0) as usize + 64 * 1024;
-        let mut frame = arch::trapframe_new(entry, stack_top, 0, kernel_sp);
+        let mut frame = arch::trapframe_new(img.entry, sp, 0, kernel_sp);
         let objects = &mut *addr_of_mut!(OBJECTS);
         let caps = &mut *addr_of_mut!(CAPS);
         let qp = core::ptr::addr_of!(QP) as *const QueuePair;
@@ -73,15 +95,24 @@ extern "C" fn kernel_main() -> ! {
     };
 
     match outcome {
-        Outcome::Exited(code) => {
-            assert!(
-                code == EXPECTED_EXIT,
-                "linuxhello exited {code}, expected {EXPECTED_EXIT} (write count check failed?)"
-            );
-            println!("linuxrun: Linux-ABI program ran under Personality::Linux OK");
-        }
-        Outcome::Faulted(addr) => panic!("linuxhello faulted at {addr:#x}"),
+        Outcome::Exited(code) => assert!(
+            code == EXPECTED_EXIT,
+            "{name} exited {code}, expected {EXPECTED_EXIT}"
+        ),
+        Outcome::Faulted(addr) => panic!("{name} faulted at {addr:#x}"),
     }
+    println!("linuxrun: {name} OK");
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn kernel_main() -> ! {
+    arch::init();
+    println!("linuxrun: start on {}", arch::NAME);
+
+    // L0: raw Linux write + exit_group under Personality::Linux.
+    run_linux("linuxhello", LINUXHELLO, &[b"linuxhello"]);
+    // L1: the loaded program walks the auxv the kernel built and checks it.
+    run_linux("linuxauxv", LINUXAUXV, &[b"linuxauxv"]);
 
     println!("linuxrun: PASS");
     arch::exit(arch::ExitCode::Success)

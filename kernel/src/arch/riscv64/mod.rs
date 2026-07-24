@@ -268,6 +268,15 @@ pub fn set_syscall_ret(frame: &mut TrapFrame, value: u64) {
     frame.regs[REG_A0] = value;
 }
 
+/// x86-only `arch_prctl` TLS hook (docs/LINUX-COMPAT.md L1). Unreachable on
+/// RISC-V: the asm-generic table has no `arch_prctl` number, and U-mode sets
+/// its own `tp` (a saved GPR), so glibc never asks the kernel. Present only
+/// so the portable personality dispatch compiles on every ISA.
+pub fn set_user_fs_base(_addr: u64) {}
+pub fn user_fs_base() -> u64 {
+    0
+}
+
 unsafe extern "C" {
     /// Enter U-mode with `frame`, saving kernel state for return_to_kernel.
     pub fn enter_user_first(frame: *mut TrapFrame);

@@ -209,16 +209,24 @@ pub fn paging_kernel_init() {
         let tcr: u64 = 16 | (0b11 << 8) | (0b01 << 10) | (0b01 << 12) | (0b10 << 32) | (1 << 23);
         // CNTKCTL: allow EL0 to read the virtual + physical counters.
         let cntkctl: u64 = (1 << 0) | (1 << 1);
+        // CPACR_EL1.FPEN = 0b11: do not trap Advanced SIMD / FP at EL0 or EL1
+        // (docs/LINUX-COMPAT.md L1). glibc's NEON `memcpy`/`str*` ifunc
+        // variants use FP/SIMD unconditionally, so this is a hard
+        // prerequisite for any glibc binary. No FP state save/restore is
+        // needed yet: one EL0 context per cell, and the kernel is soft-float.
+        let cpacr: u64 = 0b11 << 20;
         core::arch::asm!(
             "msr mair_el1, {mair}",
             "msr tcr_el1, {tcr}",
             "msr ttbr0_el1, {ttbr}",
             "msr cntkctl_el1, {cnt}",
+            "msr cpacr_el1, {cpacr}",
             "isb",
             mair = in(reg) mair,
             tcr = in(reg) tcr,
             ttbr = in(reg) l0_pa as u64,
             cnt = in(reg) cntkctl,
+            cpacr = in(reg) cpacr,
         );
         // Enable MMU + caches; SPAN=1 keeps PSTATE.PAN clear on exception
         // entry so the EL1 handler can touch a cell's EL0 ring.

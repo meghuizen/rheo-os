@@ -434,6 +434,23 @@ pub fn set_syscall_ret(frame: &mut TrapFrame, value: u64) {
     frame.rax = value;
 }
 
+/// Set the U-mode thread-pointer base for the Linux personality's
+/// `arch_prctl(ARCH_SET_FS)` (docs/LINUX-COMPAT.md L1). x86-64 keeps the TLS
+/// base in the FS_BASE MSR, which ring 3 cannot write without FSGSBASE, so
+/// glibc asks the kernel. The kernel never uses FS, so programming the MSR
+/// once at glibc startup persists across this cell's syscalls. (Per-context
+/// reload on a cross-cell switch arrives with threads, L4.)
+pub fn set_user_fs_base(addr: u64) {
+    // SAFETY: a plain MSR write; FS is unused by the kernel.
+    unsafe { paging_wrmsr(0xC000_0100, addr) }
+}
+
+/// Read back the FS_BASE MSR for `arch_prctl(ARCH_GET_FS)`.
+pub fn user_fs_base() -> u64 {
+    // SAFETY: a plain MSR read.
+    unsafe { paging_rdmsr(0xC000_0100) }
+}
+
 unsafe extern "C" {
     pub fn enter_user_first(frame: *mut TrapFrame);
     fn return_to_kernel_asm() -> !;
@@ -549,6 +566,22 @@ pub(super) fn user_init() {
             tmp = out(reg) _,
             out("ax") _,
         );
+
+        // Enable SSE for U-mode (docs/LINUX-COMPAT.md L1): CR0.MP set,
+        // CR0.EM clear (no x87 emulation), CR0.TS clear; CR4.OSFXSR (fxsave
+        // area valid) + CR4.OSXMMEXCPT. glibc's SSE2 `memcpy`/`str*` ifunc
+        // variants are the x86-64 baseline and fault without this. AVX
+        // (XSAVE/XCR0) is intentionally not enabled: QEMU's default CPU does
+        // not expose it, so glibc's ifunc resolver stays on SSE2. No FP state
+        // save/restore yet (one ring-3 context per cell; kernel is soft-float).
+        let mut cr0: u64;
+        asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack));
+        cr0 = (cr0 | (1 << 1)) & !(1 << 2) & !(1 << 3);
+        asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack));
+        let mut cr4: u64;
+        asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+        cr4 |= (1 << 9) | (1 << 10);
+        asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack));
 
         // EFER.SCE (enable SYSCALL); NXE was set in paging_kernel_init.
         let efer = paging_rdmsr(0xC000_0080) | 1;

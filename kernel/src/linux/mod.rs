@@ -20,6 +20,7 @@
 //! silent hang.
 
 pub mod errno;
+pub mod stack;
 
 use crate::arch::linux_abi::nr;
 
@@ -44,6 +45,7 @@ pub fn handle(nr_val: u64, args: &[u64; 6]) -> Ctl {
     match nr_val {
         nr::WRITE => sys_write(args[0], args[1], args[2]),
         nr::EXIT | nr::EXIT_GROUP => Ctl::Exit(args[0]),
+        nr::ARCH_PRCTL => sys_arch_prctl(args[0], args[1]),
         other => {
             crate::println!("linux: ENOSYS nr={other}");
             err(errno::ENOSYS)
@@ -65,4 +67,28 @@ fn sys_write(fd: u64, buf_va: u64, count: u64) -> Ctl {
         crate::arch::serial_write_byte(b);
     }
     Ctl::Ret(count)
+}
+
+// arch_prctl codes (x86-64 asm/prctl.h).
+const ARCH_SET_FS: u64 = 0x1002;
+const ARCH_GET_FS: u64 = 0x1003;
+
+/// arch_prctl(code, addr) - x86-64 only (docs/LINUX-COMPAT.md L1). glibc's
+/// x86-64 startup sets the thread pointer with `ARCH_SET_FS` before any TLS
+/// access. ARM64/RISC-V never reach here (no such number in their table; they
+/// set the thread pointer in userspace). SET_FS programs the FS_BASE MSR;
+/// GET_FS writes the current base to `*addr`.
+fn sys_arch_prctl(code: u64, addr: u64) -> Ctl {
+    match code {
+        ARCH_SET_FS => {
+            crate::arch::set_user_fs_base(addr);
+            Ctl::Ret(0)
+        }
+        ARCH_GET_FS => {
+            // SAFETY: trap context; `addr` is a writable VA in the cell.
+            unsafe { (addr as *mut u64).write(crate::arch::user_fs_base()) };
+            Ctl::Ret(0)
+        }
+        _ => err(errno::EINVAL),
+    }
 }

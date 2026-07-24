@@ -10,7 +10,7 @@
 //! `.text`, which is what makes a separately-compiled binary runnable.
 
 use crate::arch::MapPerm;
-use crate::elf::{Elf, PF_W, PF_X, Segment};
+use crate::elf::{self, Elf, PF_W, PF_X, Segment};
 use crate::mm::AddressSpace;
 use crate::mm::frames::{self, FRAME_SIZE};
 
@@ -24,8 +24,49 @@ pub const USER_STACK_PAGES: usize = 8;
 /// builds a trap frame at that entry with a stack from `map_stack`.
 pub fn load_elf(image: &[u8], aspace: &mut AddressSpace) -> Option<usize> {
     let elf = Elf::parse(image)?;
-    elf.for_each_load(|seg| map_segment(aspace, image, seg))?;
+    elf.for_each_load(|seg| map_segment(aspace, image, seg, 0))?;
     Some(elf.entry() as usize)
+}
+
+/// Load bias for an `ET_DYN` (PIE / static-PIE) Linux image (docs/
+/// LINUX-COMPAT.md 4): 4 GiB, free in every cell root. `ET_EXEC` images load
+/// at their linked address (bias 0).
+pub const LINUX_DYN_BASE: usize = 0x1_0000_0000;
+
+/// What a loaded Linux image needs for its auxv (docs/LINUX-COMPAT.md L1).
+pub struct LinuxImage {
+    /// Entry point (already biased for `ET_DYN`).
+    pub entry: usize,
+    /// Load bias applied (`AT_BASE`-style; 0 for `ET_EXEC`).
+    pub bias: usize,
+    /// Virtual address of the program-header table (`AT_PHDR`), or 0 if the
+    /// headers were not covered by a `PT_LOAD` (rare; auxv then omits it).
+    pub phdr: usize,
+    /// `AT_PHENT` / `AT_PHNUM`.
+    pub phent: usize,
+    pub phnum: usize,
+}
+
+/// Load a Linux ELF (`ET_EXEC` or `ET_DYN`) into `aspace`, applying the
+/// standard bias for a position-independent image, and return the facts its
+/// auxv needs. Segments are mapped at `vaddr + bias`; no relocation
+/// processing (a static-PIE's `rcrt1` self-relocates, docs/LINUX-COMPAT.md).
+pub fn load_elf_linux(image: &[u8], aspace: &mut AddressSpace) -> Option<LinuxImage> {
+    let elf = Elf::parse(image)?;
+    let bias = match elf.etype() {
+        elf::ET_DYN => LINUX_DYN_BASE,
+        elf::ET_EXEC => 0,
+        _ => return None,
+    };
+    elf.for_each_load(|seg| map_segment(aspace, image, seg, bias))?;
+    let phdr = elf.phdr_vaddr().map(|v| v as usize + bias).unwrap_or(0);
+    Some(LinuxImage {
+        entry: elf.entry() as usize + bias,
+        bias,
+        phdr,
+        phent: elf.phentsize(),
+        phnum: elf.phnum(),
+    })
 }
 
 /// Map the initial user stack with no arguments and return the initial SP.
@@ -135,8 +176,8 @@ fn seg_perm(flags: u32) -> MapPerm {
     }
 }
 
-fn map_segment(aspace: &mut AddressSpace, image: &[u8], seg: &Segment) -> Option<()> {
-    let vaddr = seg.vaddr as usize;
+fn map_segment(aspace: &mut AddressSpace, image: &[u8], seg: &Segment, bias: usize) -> Option<()> {
+    let vaddr = seg.vaddr as usize + bias;
     let va0 = vaddr & !(FRAME_SIZE - 1);
     let mem_end = vaddr.checked_add(seg.memsz)?;
     let perm = seg_perm(seg.flags);

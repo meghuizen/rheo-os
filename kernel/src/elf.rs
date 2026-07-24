@@ -12,6 +12,10 @@ pub const PF_R: u32 = 4;
 
 const PT_LOAD: u32 = 1;
 
+/// ELF `e_type` values the loader distinguishes.
+pub const ET_EXEC: u16 = 2;
+pub const ET_DYN: u16 = 3;
+
 /// One loadable segment, in terms the loader maps directly.
 pub struct Segment {
     /// Virtual address the segment is linked at.
@@ -29,6 +33,7 @@ pub struct Segment {
 /// A parsed ELF64 image (little-endian).
 pub struct Elf<'a> {
     image: &'a [u8],
+    etype: u16,
     entry: u64,
     phoff: usize,
     phnum: usize,
@@ -58,6 +63,7 @@ impl<'a> Elf<'a> {
         if *image.get(5)? != 1 {
             return None; // EI_DATA: little-endian
         }
+        let etype = rd_u16(image, 16)?;
         let entry = rd_u64(image, 24)?;
         let phoff = rd_u64(image, 32)? as usize;
         let phentsize = rd_u16(image, 54)? as usize;
@@ -67,6 +73,7 @@ impl<'a> Elf<'a> {
         }
         Some(Elf {
             image,
+            etype,
             entry,
             phoff,
             phnum,
@@ -74,8 +81,54 @@ impl<'a> Elf<'a> {
         })
     }
 
+    /// The linked entry point (add the load bias for an `ET_DYN` image).
     pub fn entry(&self) -> u64 {
         self.entry
+    }
+
+    /// `e_type` (`ET_EXEC` or `ET_DYN`).
+    pub fn etype(&self) -> u16 {
+        self.etype
+    }
+
+    /// File offset of the program-header table.
+    pub fn phoff(&self) -> usize {
+        self.phoff
+    }
+
+    /// Program-header entry size and count (for the auxv AT_PHENT/AT_PHNUM).
+    pub fn phentsize(&self) -> usize {
+        self.phentsize
+    }
+    pub fn phnum(&self) -> usize {
+        self.phnum
+    }
+
+    /// The virtual address of the program-header table as the loaded image
+    /// will see it (auxv `AT_PHDR`), if a `PT_LOAD` segment covers the file
+    /// range `[phoff, phoff + phnum*phentsize)`. The load bias is added by
+    /// the caller for an `ET_DYN` image. Returns None if no segment maps the
+    /// headers (the caller then copies them to a page - docs/LINUX-COMPAT.md).
+    pub fn phdr_vaddr(&self) -> Option<u64> {
+        let lo = self.phoff;
+        let hi = lo + self.phnum * self.phentsize;
+        let mut found = None;
+        // Manual scan (for_each_load takes a closure that cannot early-return
+        // a value): a PT_LOAD whose file range contains the header table.
+        for i in 0..self.phnum {
+            let base = self.phoff + i * self.phentsize;
+            if rd_u32(self.image, base) != Some(PT_LOAD) {
+                continue;
+            }
+            let offset = rd_u64(self.image, base + 8)? as usize;
+            let vaddr = rd_u64(self.image, base + 16)?;
+            let filesz = rd_u64(self.image, base + 32)? as usize;
+            if offset <= lo && hi <= offset + filesz {
+                found = Some(vaddr + (lo - offset) as u64);
+                break;
+            }
+        }
+        found
     }
 
     /// Invoke `f` for each `PT_LOAD` segment in order. Returns None if the
