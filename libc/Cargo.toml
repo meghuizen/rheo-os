@@ -1,0 +1,22 @@
+[package]
+name = "rheo-libc"
+version = "0.1.0"
+edition = "2024"
+
+# The rheo-os libc (docs/USERLAND.md M3): a relibc-style Rust library that
+# provides the C/POSIX ABI over the OS's native syscalls - crt0 (`_start`), a
+# heap + allocator (so Rust `alloc` works), `malloc`/`free`, string helpers,
+# and fd-based I/O. C-ABI symbols let C/C++ link it later; Rust programs use
+# the ergonomic wrappers + the global allocator. Programs that link it live in
+# their own crate (or the demo bin here) so they inherit its _start/allocator/
+# panic handler without clashing with the raw-syscall programs in `userland`.
+
+[dependencies]
+runtime = { path = "../runtime" }
+
+[lib]
+name = "rheo_libc"
+
+[[bin]]
+name = "libcdemo"
+path = "src/bin/libcdemo.rs"

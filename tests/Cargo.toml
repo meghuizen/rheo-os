@@ -61,6 +61,10 @@ name = "posixrun"
 path = "src/posixrun.rs"
 
 [[bin]]
+name = "libcrun"
+path = "src/libcrun.rs"
+
+[[bin]]
 name = "shell-smoke"
 path = "src/shell_smoke.rs"
 

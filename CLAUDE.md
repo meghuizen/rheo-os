@@ -130,9 +130,13 @@ longer baked into the kernel image (the `elfrun` test); and a
 `exit_group`, and fd-based `open/close/read/write/lseek` forwarded to a
 **personality handler** (`svc::FileOps`, function pointers a service
 registers) backed by the `posix/` VFS, keeping the kernel filesystem-free
-(the `posixrun` test runs a native program that reads a file over the VFS).
-Next: the libc itself (M3), a custom Rust target + std port (M4), then
-coreutils (M5).
+(the `posixrun` test runs a native program that reads a file over the VFS);
+and a **Rust libc** (`libc/`, package `rheo-libc`) - a relibc-style
+translation layer with `crt0` (`_start`), a heap over `SYS_MMAP` wired as the
+global allocator (so Rust `alloc` works) plus C `malloc`/`free`, fd-based I/O
+wrappers, and `println!` (the `libcrun` test runs `libcdemo`, which builds a
+`Vec`, round-trips C `malloc`, formats output, and reads a file via the VFS).
+Next: a custom Rust target + std port (M4), then coreutils (M5).
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
@@ -201,8 +205,9 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               isolation-hw, resources, shell-smoke, hwinfo, rng, runtime,
               posix, blockfs (live virtio-blk disk), elfrun (load a native
               ELF), posixrun (native program over the POSIX syscalls),
-              bench-core, and the interactive lsh bin (+ harness.rs);
-              fixtures/ holds the ext4 test image (+ gen-ext4.sh)
+              libcrun (a program linked against rheo-libc), bench-core, and
+              the interactive lsh bin (+ harness.rs); fixtures/ holds the
+              ext4 test image (+ gen-ext4.sh)
 comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md
 xtask/        build/run/test/bench orchestration (cargo xtask ...)
 idl/          system IDL + codegen        (future, step 6)
@@ -210,6 +215,8 @@ runtime/      strand runtime: heap (alloc), async executor + channel,
               type-level capability rights (BUILD-ORDER step 7)
 userland/     native U-mode programs built for a bare target and loaded
               from an ELF (docs/USERLAND.md): hello, iodemo
+libc/         rheo-libc: the Rust libc translation layer (crt0, heap +
+              allocator, malloc, fd I/O, println) + the libcdemo program
 services/     system service cells        (future, phase 5)
 targets/      custom target JSON          (only if built-in targets fail)
 ```

@@ -20,6 +20,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rheo-libc"
+version = "0.1.0"
+dependencies = [
+ "runtime",
+]
+
+[[package]]
 name = "runtime"
 version = "0.1.0"
 

@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 13] = [
+const TEST_KERNELS: [&str; 14] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -35,6 +35,7 @@ const TEST_KERNELS: [&str; 13] = [
     "blockfs",
     "elfrun",
     "posixrun",
+    "libcrun",
 ];
 
 /// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
@@ -248,22 +249,26 @@ fn print_usage() {
 
 /// Bare-metal build with build-std (DEVELOPMENT.md 3): the kernel and
 /// every in-QEMU test kernel.
-/// Build the userland programs (docs/USERLAND.md) that the `elfrun` test
-/// embeds. Always release (a separate artifact from the kernel profile). The
-/// link base is per-arch (userland/link/<arch>.ld) so the default code model
-/// reaches it - no RUSTFLAGS override needed. Must run before the test
-/// kernels, which `include_bytes!` the built ELF.
+/// Build the userspace programs (docs/USERLAND.md) that the `elfrun`,
+/// `posixrun`, and `libcrun` tests embed: the raw `userland` programs and the
+/// libc-linked programs in `rheo-libc`. Always release (a separate artifact
+/// from the kernel profile). The link base is per-arch (userland/link/<arch>.ld)
+/// so the default code model reaches it - no RUSTFLAGS override needed.
+/// `alloc` is in build-std so libc-linked programs can use the heap. Must run
+/// before the test kernels, which `include_bytes!` the built ELFs.
 fn build_userland(arch: Arch) -> bool {
-    println!("[xtask] building userland for {}", arch.name());
+    println!("[xtask] building userspace for {}", arch.name());
     let mut cmd = Command::new("cargo");
     cmd.args([
         "build",
         "-p",
         "userland",
+        "-p",
+        "rheo-libc",
         "--release",
         "--target",
         arch.target(),
-        "-Zbuild-std=core,compiler_builtins",
+        "-Zbuild-std=core,alloc,compiler_builtins",
         "-Zbuild-std-features=compiler-builtins-mem",
     ]);
     matches!(cmd.status().map(|s| s.success()), Ok(true))

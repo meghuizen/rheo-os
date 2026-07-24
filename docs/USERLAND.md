@@ -50,8 +50,13 @@ hazard by construction.
   file, `mmap`s a buffer, reads the file, echoes it to stdout, and exits with
   the byte count. (`stat`/`getdents` and a real `brk` are folded into M3 as
   the libc needs them.)
-- **M3 - libc.** A Rust libc (relibc-style): `crt0`/`_start`, `malloc`
-  (over `brk`/`mmap`), `string.h`, `stdio`, `errno`, and the syscall stubs.
+- **M3 - libc. [done]** A Rust libc (`rheo-libc`, relibc-style): `crt0`
+  (`_start`), a heap over `SYS_MMAP` wired as the global allocator (so Rust
+  `alloc` works) plus C `malloc`/`free`/`calloc`/`realloc`, fd-based I/O
+  wrappers, and `print!`/`println!`/`eprintln!`. The `libcrun` test runs
+  `libcdemo` - a program that builds a `Vec`, round-trips C `malloc`, formats
+  output, and reads a file via the VFS. (C `str*` helpers and a real
+  `errno`/`brk` land in M4/M5 with the C-program + std work.)
 - **M4 - Rust target + std.** A `rheo-os` custom target JSON and a std `sys`
   backend over the libc, so `cargo build --target rheo-os` yields runnable
   ELFs.
