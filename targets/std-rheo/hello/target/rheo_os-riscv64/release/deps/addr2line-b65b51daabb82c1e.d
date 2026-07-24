@@ -1,0 +1,12 @@
+/home/user/rheo-os/targets/std-rheo/hello/target/rheo_os-riscv64/release/deps/addr2line-b65b51daabb82c1e.d: /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/lib.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/frame.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/function.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/line.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/lookup.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/unit.rs
+
+/home/user/rheo-os/targets/std-rheo/hello/target/rheo_os-riscv64/release/deps/libaddr2line-b65b51daabb82c1e.rlib: /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/lib.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/frame.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/function.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/line.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/lookup.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/unit.rs
+
+/home/user/rheo-os/targets/std-rheo/hello/target/rheo_os-riscv64/release/deps/libaddr2line-b65b51daabb82c1e.rmeta: /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/lib.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/frame.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/function.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/line.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/lookup.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/unit.rs
+
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/lib.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/frame.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/function.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/line.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/lookup.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/addr2line-0.27.0/src/unit.rs:

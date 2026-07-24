@@ -228,6 +228,10 @@ fn main() -> ExitCode {
         // Benchmarks always run the release build: instruction path
         // lengths of an unoptimized kernel are not the system's numbers.
         "bench" => arches.iter().all(|&a| build(a, true) && bench(a, true)),
+        // Patch the toolchain's vendored rust-src to add `target_os = "rheo"`
+        // so `std` can be built for the rheo-os target (docs/USERLAND.md M4).
+        // Idempotent; run once per toolchain before building std programs.
+        "std-patch" => std_patch(),
         _ => {
             print_usage();
             false
@@ -243,9 +247,22 @@ fn main() -> ExitCode {
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo xtask <build|run|test|bench> \
+        "usage: cargo xtask <build|run|test|bench|std-patch> \
          [--arch x86_64|aarch64|riscv64|all] [--bin <kernel>] [--release]"
     );
+}
+
+/// Apply the rheo-os std patch to the active toolchain's rust-src
+/// (targets/patch-std.py). Idempotent.
+fn std_patch() -> bool {
+    println!("[xtask] patching rust-src std for target_os = \"rheo\"");
+    matches!(
+        Command::new("python3")
+            .args(["targets/patch-std.py"])
+            .status()
+            .map(|s| s.success()),
+        Ok(true)
+    )
 }
 
 /// Bare-metal build with build-std (DEVELOPMENT.md 3): the kernel and

@@ -136,7 +136,16 @@ translation layer with `crt0` (`_start`), a heap over `SYS_MMAP` wired as the
 global allocator (so Rust `alloc` works) plus C `malloc`/`free`, fd-based I/O
 wrappers, and `println!` (the `libcrun` test runs `libcdemo`, which builds a
 `Vec`, round-trips C `malloc`, formats output, and reads a file via the VFS).
-Next: a custom Rust target + std port (M4), then coreutils (M5).
+A **custom Rust target + std port** is in progress (M4): real `std` compiles
+and links for a `rheo-os` target (`targets/rheo_os-*.json`, `os = "rheo"`) via
+a repo-held, idempotent rust-src patch (`cargo xtask std-patch`,
+`targets/patch-std.py` + `targets/std-rheo/`) - std routes rheo to the
+single-threaded portable fallbacks (SMP is deferred) with a real hole-list
+allocator over `SYS_MMAP`; a *running* std program still needs a crt0 `_start`
+and the rheo `stdio`/`process`/`fs` sys arms. Then coreutils (M5). Also built
+alongside as an M4-prep workload: **rheo-json** (`json/`), a dependency-free
+zero-copy JSON parser that runs on the OS and is benchmarked against simdjson
+(docs/JSON.md).
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
@@ -223,7 +232,9 @@ json/         rheo-json: a dependency-free, zero-copy JSON parser (scalar +
               SSE2 string-scan), no_std, host-tested + benchmarked
               (docs/JSON.md, comparison/json/)
 services/     system service cells        (future, phase 5)
-targets/      custom target JSON          (only if built-in targets fail)
+targets/      rheo-os custom target specs + the std port: rheo_os-*.json,
+              patch-std.py (rust-src std patch), std-rheo/ (rheo sys sources
+              + a std proof program). docs/USERLAND.md M4
 ```
 
 ## Rules

@@ -1,0 +1,18 @@
+[package]
+name = "rheo-std-hello"
+version = "0.1.0"
+edition = "2021"
+
+# Proof that real `std` compiles + links for the rheo-os target (docs/USERLAND.md
+# M4). Built with the patched rust-src (see targets/patch-std.py) via:
+#   cargo xtask std-patch
+#   cargo build -p rheo-std-hello --release \
+#     --target targets/rheo_os-riscv64.json \
+#     -Zbuild-std=std,panic_abort -Zjson-target-spec
+# Excluded from the workspace: it needs the custom target + build-std, so a
+# plain host `cargo build` cannot compile it.
+
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"
