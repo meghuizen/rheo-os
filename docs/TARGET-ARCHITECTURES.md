@@ -167,6 +167,7 @@ architecture.
 | Bandwidth partitioning | RDT/CAT/MBA (x86) and MPAM (ARM) behind one QoS interface |
 | Power management | DVFS (frequency/voltage scaling), idle/sleep states, per-engine power gating, energy counters - behind one interface; central to the low-power/remote profiles (PROFILES.md 4), a no-op on wall-powered servers |
 | Crypto dispatch | Measured selection among VAES/AVX-512, ARM CE, vector crypto - with the CPU as the benchmark every offload must beat |
+| Linux personality ABI | Syscall-number tables and ABI struct layouts (two variants: the x86-64 legacy table; the asm-generic table shared by ARM64/RISC-V), HWCAP/AT_PLATFORM values, TLS-register mechanics (docs/LINUX-COMPAT.md) |
 
 Boot, exception vectors, and the context-switch inner loop are the only
 assembly, a few files per ISA.

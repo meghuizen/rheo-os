@@ -14,3 +14,7 @@ path = "src/main.rs"
 [[bin]]
 name = "iodemo"
 path = "src/iodemo.rs"
+
+[[bin]]
+name = "linuxhello"
+path = "src/linuxhello.rs"

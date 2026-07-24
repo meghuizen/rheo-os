@@ -1,0 +1,37 @@
+//! Linux errno values (docs/LINUX-COMPAT.md). These are identical across
+//! x86-64, ARM64, and RISC-V (all use the asm-generic errno base), so they
+//! are portable personality constants, not arch ABI. Returned to userspace
+//! as `-errno` in the syscall return register.
+//!
+//! Source: Linux v6.6 `include/uapi/asm-generic/errno-base.h` + `errno.h`.
+
+pub const EPERM: i64 = 1;
+pub const ENOENT: i64 = 2;
+pub const EINTR: i64 = 4;
+pub const EIO: i64 = 5;
+pub const EBADF: i64 = 9;
+pub const EAGAIN: i64 = 11;
+pub const ENOMEM: i64 = 12;
+pub const EACCES: i64 = 13;
+pub const EFAULT: i64 = 14;
+pub const EEXIST: i64 = 17;
+pub const ENOTDIR: i64 = 20;
+pub const EISDIR: i64 = 21;
+pub const EINVAL: i64 = 22;
+pub const ENFILE: i64 = 23;
+pub const EMFILE: i64 = 24;
+pub const ENOTTY: i64 = 25;
+pub const ENOSPC: i64 = 28;
+pub const ESPIPE: i64 = 29;
+pub const EROFS: i64 = 30;
+pub const EPIPE: i64 = 32;
+pub const ERANGE: i64 = 34;
+pub const ENAMETOOLONG: i64 = 36;
+pub const ENOSYS: i64 = 38;
+pub const ENOTEMPTY: i64 = 39;
+
+// The `posix` VFS crate (outside the kernel) already returns these exact
+// numbers through the registered `svc::FileOps` handlers, so a VFS error
+// passes through the personality unchanged; the constants above are the
+// auditable boundary (docs/LINUX-COMPAT.md 3). The kernel itself stays
+// dependency-free - no `posix` import here.

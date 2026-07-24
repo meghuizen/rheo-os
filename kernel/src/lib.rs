@@ -25,6 +25,7 @@ pub mod event;
 pub mod graph;
 pub mod hw;
 pub mod lease;
+pub mod linux;
 pub mod load;
 pub mod mm;
 mod panic;

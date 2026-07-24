@@ -29,6 +29,18 @@ pub enum Outcome {
     Faulted(usize),
 }
 
+/// Which syscall ABI a cell speaks (docs/LINUX-COMPAT.md 2). Dispatch
+/// branches on this BEFORE interpreting the syscall number - native numbers
+/// 1-30 collide with Linux numbers (Linux x86-64 `write` = 1 is native
+/// `SYS_DOORBELL`), so the tag, not the number, decides the table.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Personality {
+    /// The native rheo-os ABI (kernel/src/abi.rs) - the default.
+    Native,
+    /// The Linux syscall ABI, translated by `crate::linux`.
+    Linux,
+}
+
 #[derive(Copy, Clone)]
 struct RunCell {
     aspace: *const AddressSpace,
@@ -38,6 +50,7 @@ struct RunCell {
     frame: *mut TrapFrame,
     outcome: Option<Outcome>,
     present: bool,
+    personality: Personality,
 }
 
 const EMPTY: RunCell = RunCell {
@@ -48,6 +61,7 @@ const EMPTY: RunCell = RunCell {
     frame: core::ptr::null_mut(),
     outcome: None,
     present: false,
+    personality: Personality::Native,
 };
 
 const MAX_CELLS: usize = 2;
@@ -118,7 +132,16 @@ pub unsafe fn install(
         frame,
         outcome: None,
         present: true,
+        personality: Personality::Native,
     };
+}
+
+/// Tag an installed cell with a syscall personality (call after `install`,
+/// before `run`). Native is the default; a Linux cell's traps are handled by
+/// `crate::linux` instead of the native dispatch.
+pub fn set_personality(idx: usize, p: Personality) {
+    assert!(cells()[idx].present, "set_personality on empty slot {idx}");
+    cells()[idx].personality = p;
 }
 
 /// Run starting from cell `idx` until some cell exits or faults. Returns
@@ -171,6 +194,19 @@ pub fn on_user_trap(kind: TrapKind, fault_addr: usize, frame: *mut TrapFrame) ->
     let (nr, args) = arch::decode_syscall(unsafe { &*frame });
     let arg = args[0];
     let cur = unsafe { *core::ptr::addr_of!(CURRENT) };
+
+    // Linux cells never reach native dispatch: the personality tag decides
+    // the syscall table before the number means anything (the ABIs collide).
+    if cells()[cur].personality == Personality::Linux {
+        return match crate::linux::handle(nr, &args) {
+            crate::linux::Ctl::Ret(v) => {
+                arch::set_syscall_ret(unsafe { &mut *frame }, v);
+                frame
+            }
+            crate::linux::Ctl::Exit(code) => finish(Outcome::Exited(code)),
+        };
+    }
+
     match nr {
         SYS_DOORBELL => {
             let cell = cells()[cur];

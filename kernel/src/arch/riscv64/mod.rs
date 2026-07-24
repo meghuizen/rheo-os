@@ -5,6 +5,10 @@
 use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicU64, Ordering};
 
+/// Linux personality ABI (asm-generic table, shared with ARM64;
+/// docs/LINUX-COMPAT.md).
+#[path = "../linux_abi_generic.rs"]
+pub mod linux_abi;
 mod paging;
 pub use paging::{
     PagingRoot, paging_activate, paging_activate_kernel, paging_kernel_init, paging_map,

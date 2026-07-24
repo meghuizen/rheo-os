@@ -71,6 +71,7 @@ mod imp;
 #[path = "riscv64/mod.rs"]
 mod imp;
 
+pub use imp::linux_abi;
 pub use imp::{
     FRAME_POOL_BASE, NAME, PagingRoot, TrapFrame, VIRTIO_MMIO_BASE, VIRTIO_MMIO_COUNT,
     VIRTIO_MMIO_STRIDE, context_init, context_switch, cpu_feature_names, cpu_report, cycles,

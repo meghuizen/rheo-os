@@ -7,9 +7,14 @@ the POSIX file syscall surface (`open`/`read`/`write`/`close`/`lseek`/
 `stat`/`getdents`/`mkdir`/`unlink`, errno) over the VFS, the per-session `/`
 mount table (section 3), and a `std::fs`-shaped facade so standard-library
 file code runs unchanged. Proven on all three ISAs (`posix` test kernel).
-Deferred: processes/fork/exec, signals, mmap, `/proc`+`/sys`, and hosting an
-unmodified Linux binary in a personality cell (needs the runtime-in-U-mode
-integration).
+Deferred: processes/fork/exec, signals, mmap, `/proc`+`/sys`.
+
+**Hosting unmodified Linux binaries** is now its own staged design and
+implementation: the **Linux personality** (docs/LINUX-COMPAT.md). It is
+currently kernel-resident (the `svc.rs` bridge pattern - "kernel-side
+handlers before the service framework exists"); its Linux-facing state
+(fds, PIDs, signals) is per-cell synthesized state, never a kernel object,
+and the migration path into a real personality cell is documented there.
 
 Position: POSIX is a **compatibility personality at the edge**, never the
 native model (the mistake Hurd made). It is a translation layer - gVisor-

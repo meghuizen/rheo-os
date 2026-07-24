@@ -77,6 +77,10 @@ name = "coreutils"
 path = "src/coreutils.rs"
 
 [[bin]]
+name = "linuxrun"
+path = "src/linuxrun.rs"
+
+[[bin]]
 name = "shell-smoke"
 path = "src/shell_smoke.rs"
 

@@ -4,6 +4,8 @@
 use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicU64, Ordering};
 
+/// Linux personality ABI (x86-64 legacy syscall table; docs/LINUX-COMPAT.md).
+pub mod linux_abi;
 mod paging;
 pub use paging::{
     PagingRoot, paging_activate, paging_activate_kernel, paging_kernel_init, paging_map,

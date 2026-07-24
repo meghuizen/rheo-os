@@ -12,7 +12,9 @@ rewrite of the GNU coreutils (uutils). Two decisions were made up front:
 1. **Native target, recompile.** Apps are *recompiled* for a rheo-os target,
    not run as unmodified Linux binaries. This matches the OS's "translation
    at the edge" philosophy and is far more tractable than emulating the Linux
-   syscall/ELF ABI. (A Linux-syscall shim could be layered on later.)
+   syscall/ELF ABI. (The "Linux-syscall shim layered on later" is now real:
+   the **Linux personality**, docs/LINUX-COMPAT.md - M6 below - complements
+   this recompile path rather than reversing it.)
 2. **A clean Rust libc as the translation layer.** A relibc-style libc
    (implemented in Rust) provides the C/POSIX ABI on top of rheo-os's native
    syscalls. It is C-ABI / source compatible, so C/C++/Rust source builds
@@ -70,6 +72,11 @@ hazard by construction.
   `targets/std-rheo/`), idempotent, applied by `cargo xtask std-patch`. Only
   **float-heavy** programs are gated - on U-mode FP/SIMD enablement - since
   the targets are soft-float (U-mode vector state is not saved yet).
+- **M6 - the Linux personality.** Run *unmodified* Linux binaries (unpatched
+  Rust std for `*-unknown-linux-gnu`, glibc-linked C, stock tools) through a
+  kernel-hosted Linux-syscall translation layer. Staged L0-L7 in
+  docs/LINUX-COMPAT.md - that document is the normative contract (dispatch,
+  ABI tables, the per-syscall honesty policy, fixture build matrix).
 - **M5 - coreutils. [done]** Standard command-line tools running on the OS. It
   adds the three OS capabilities coreutils need and a multicall program that
   uses them:
