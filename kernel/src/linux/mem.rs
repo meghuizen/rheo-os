@@ -84,6 +84,43 @@ pub fn mmap(st: &mut LinuxState, len: u64, prot: u64, flags: u64) -> i64 {
     base as i64
 }
 
+/// mremap(old_addr, old_size, new_size, flags, new_addr): resize a mapping.
+/// Shrinking unmaps the tail in place. Growing requires MREMAP_MAYMOVE (the
+/// bump mmap region cannot extend in place): a fresh region is mapped, the old
+/// contents copied, and the old range freed. glibc's `realloc` of large blocks
+/// depends on this; without it the malloc-copy-free fallback leaks our frames
+/// (docs/LINUX-COMPAT.md L3).
+pub fn mremap(st: &mut LinuxState, old_addr: u64, old_size: u64, new_size: u64, flags: u64) -> i64 {
+    const MREMAP_MAYMOVE: u64 = 1;
+    let old_addr = old_addr as usize;
+    let old_len = page_up(old_size as usize);
+    let new_len = page_up(new_size as usize);
+    if new_size == 0 {
+        return -EINVAL;
+    }
+    if new_len <= old_len {
+        if new_len < old_len {
+            user::unmap_range(old_addr + new_len, old_len - new_len);
+        }
+        return old_addr as i64;
+    }
+    // Grow: only by moving (the region is a forward bump allocator).
+    if flags & MREMAP_MAYMOVE == 0 {
+        return -ENOMEM;
+    }
+    let base = st.mmap_cursor;
+    user::map_anon_at(base, new_len, MapPerm::UserRw);
+    st.mmap_cursor = base + new_len;
+    // Copy the old contents; both ranges are mapped in the active cell root.
+    // SAFETY: trap context, cell address space active; `old_len` bytes of the
+    // source are mapped and `new_len >= old_len` bytes of the destination are.
+    unsafe {
+        core::ptr::copy_nonoverlapping(old_addr as *const u8, base as *mut u8, old_len);
+    }
+    user::unmap_range(old_addr, old_len);
+    base as i64
+}
+
 /// munmap(addr, len): unmap the pages and return their frames to the pool.
 pub fn munmap(addr: u64, len: u64) -> i64 {
     user::unmap_range(addr as usize, len as usize);

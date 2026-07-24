@@ -111,9 +111,10 @@ virtio-mmio on arm/riscv `virt`, and **virtio-pci on x86-64 q35**. The x86
 path drives the device *entirely through PCI configuration space* using the
 `VIRTIO_PCI_CAP_PCI_CFG` capability (virtio spec 4.1.4.8), so no BAR needs
 to be assigned or mapped - which matters because PVH boot has no firmware to
-program BARs and the kernel only identity-maps the low 1 GiB (the q35 PCI
-window sits above it); DMA still reaches the identity-mapped virtqueue since
-PA=VA. The `blockfs` test kernel discovers the device, reads a real ext4
+program BARs. Since the kernel moved to the high half (docs/MEMORY.md) PA no
+longer equals VA, so the driver hands the device **physical** addresses for
+the virtqueue via `virt_to_phys` (the queue lives in the kernel's own RAM,
+reached through its linear map). The `blockfs` test kernel discovers the device, reads a real ext4
 image off the *live disk* (attached by QEMU with `-drive`), mounts it, and
 reads files through `std::fs` - on **all three ISAs**. At the `BlockDevice`
 seam existing Rust FS drivers (redoxfs, fatfs, a read/write ext4 crate) can
@@ -193,7 +194,15 @@ real memory over the cell's own address space (`AddressSpace::unmap`/
 now also runs, on **all three ISAs** with exact stdout + exit asserted, two
 **unpatched static-glibc** binaries built from source: a Rust `std` hello and
 a C hello, each loaded at glibc's **stock ET_EXEC base, no relink**
-(docs/LINUX-COMPAT.md L2). glibc (not musl) is the supported libc.
+(docs/LINUX-COMPAT.md L2). glibc (not musl) is the supported libc. **L3 is
+done**: the **unmodified upstream uutils/coreutils** multicall binary (crates.io
+`coreutils` 0.0.29, pinned, static-glibc, built from source by xtask - no binary
+in git) runs as a `Personality::Linux` cell on **all three ISAs**; the
+`linuxtools` test asserts exact stdout + exit for eleven utilities (true, false,
+echo, cat, seq, head, wc, basename, dirname, ls, pwd). L3 added per-cell cwd
+(getcwd/chdir), statx, mremap, a single-process pipe2 (splice stays ENOSYS -
+uu_cat falls back), a per-fd getdents64 cursor, `/proc/self/auxv`, and the
+`openat` dirfd-as-`int` fix. `sort` is dropped (rayon threads = L4), not faked.
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
@@ -269,10 +278,12 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               program on-OS), coreutils (the coreutils multicall cell, with
               argv + std::fs over the VFS), linuxrun (Personality::Linux:
               bare Linux-ABI programs plus, at L2, unpatched static-glibc
-              Rust + C hellos), bench-core, and the interactive lsh bin
-              (+ harness.rs, vfs_personality.rs); fixtures/ holds the ext4
-              test image (+ gen-ext4.sh); linux-fixtures/ holds the
-              built-from-source glibc test binaries (rusthello/ + hello.c)
+              Rust + C hellos), linuxtools (L3: the unmodified upstream
+              uutils/coreutils multicall cell over a ramfs), bench-core, and
+              the interactive lsh bin (+ harness.rs, vfs_personality.rs);
+              fixtures/ holds the ext4 test image (+ gen-ext4.sh);
+              linux-fixtures/ holds the built-from-source glibc test binaries
+              (rusthello/ + hello.c; coreutils via cargo install, gitignored)
 comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md
 xtask/        build/run/test/bench orchestration (cargo xtask ...)
 idl/          system IDL + codegen        (future, step 6)

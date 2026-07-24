@@ -81,6 +81,10 @@ name = "linuxrun"
 path = "src/linuxrun.rs"
 
 [[bin]]
+name = "linuxtools"
+path = "src/linuxtools.rs"
+
+[[bin]]
 name = "shell-smoke"
 path = "src/shell_smoke.rs"
 

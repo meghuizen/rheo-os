@@ -101,17 +101,23 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 |---|---|---|
 | read / write | full | over the per-cell fd table (console, VFS files, /dev/{null,zero,urandom}) |
 | readv / writev | full | iterate the iovec array over read/write |
-| openat | partial | absolute path (or AT_FDCWD + absolute) only; dirfd-relative is L3; /dev/{null,zero,urandom,random} synthesized, else via `FileOps::open` |
-| close | full | frees the slot; closes the VFS fd |
-| lseek | full | VFS files; -ESPIPE on console/char devices |
-| fstat / newfstatat | full | `struct stat` per ABI (x86-64 144 B / asm-generic 128 B); console & /dev/* report a character device |
-| getdents64 | full | VFS directory (path stored per fd), repacked as `linux_dirent64` |
+| openat | partial | dirfd is a C `int` (low 32 bits, sign-extended - AT_FDCWD arrives as `0xffffff9c`); AT_FDCWD honored, paths resolved by the VFS; a real (positive) dirfd → -ENOSYS (no suite util needs it). `/dev/{null,zero,urandom,random}` and `/proc/self/auxv` synthesized, else via `FileOps::open` |
+| close | full | frees the slot; closes the VFS fd; reclaims a pipe when both ends close |
+| lseek | full | VFS files; -ESPIPE on console/char devices/pipes |
+| fstat / newfstatat | full | `struct stat` per ABI (x86-64 144 B / asm-generic 128 B); console & /dev/* report a character device; pipes S_IFIFO |
+| statx | full | same fields as fstat, into the ABI-independent `struct statx`; Rust `std`'s `File::metadata` issues `statx` directly and does not fall back to `newfstatat`, so real tools require it |
+| getdents64 | full | VFS directory (path stored per fd), packed as `linux_dirent64` and paged out via a per-fd cursor so a reader looping until 0 (real `ls`) terminates; directory must fit 4 KiB of records |
+| getcwd | full | the per-cell cwd (default `/`) + NUL; -ERANGE if the buffer is too small |
+| chdir | partial | stores the path as the cwd verbatim (absolute in practice); no existence check |
+| pipe2 | partial | a single-process, non-blocking, bounded in-process pipe (4 × 8 KiB per cell); lets a tool create a pipe and fall back when `splice` is unavailable (uu_cat). Blocking / cross-context pipe semantics are L6 |
+| splice | ENOSYS | uu_cat's Linux fast path probes `splice` and falls back to read/write on failure (documented fallback) |
+| /proc/self/auxv | full | serves the cell's own auxv byte stream (a read-only synthetic fd); glibc/rustix read it when no PR_GET_AUXV is provided |
 | dup / dup3 | partial | copies the slot; a duplicated VFS fd shares the underlying descriptor (close-once) |
 | fcntl | partial | F_DUPFD/F_DUPFD_CLOEXEC/F_GETFD/F_SETFD/F_GETFL(→O_RDWR)/F_SETFL only |
 | ioctl | partial | TIOCGWINSZ on a console fd → 80x24; every other request -ENOTTY |
 | poll / ppoll | partial | non-blocking readiness only (never waits); answers glibc/Rust fd sanitization at startup |
 | faccessat / faccessat2 | full | existence check via the VFS stat handler |
-| readlinkat | partial | always -ENOENT (/proc/self/exe etc. arrive in L3) |
+| readlinkat | partial | always -ENOENT (no symlinks in the VFS; /proc/self/exe is not read by the L3 suite - uu 0.0.29 gets argv[0] from `std::env::args`, not the auxv/execfn) |
 | brk | full | heap from the loaded image end; grows/shrinks the cell's own pages |
 | mmap | partial | anonymous MAP_PRIVATE only; fd-backed (L7) and MAP_FIXED → -ENOSYS |
 | munmap / mprotect | full | leaf unmap+`frames::free` / leaf permission rewrite |
@@ -130,8 +136,9 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 | set_tid_address | recorded | stores the clear-tid address, returns tid 1000; enacted with CHILD_CLEARTID at L4 |
 | set_robust_list | recorded | stores the head, returns 0; futex robustness is L4 |
 | rt_sigaction / rt_sigprocmask / sigaltstack | recorded | stored/ignored, returns 0; real signal delivery is L5 |
-| rseq / clone3 / statx / mremap | ENOSYS | glibc has documented fallbacks (rseq→unregistered, clone3→clone, statx→newfstatat, mremap→malloc copy) |
-| clone / execve / fork / wait4 / futex / pipe2 / kill / tgkill / rt_sigreturn | ENOSYS | threads (L4), signals (L5), processes (L6); a single-threaded static hello never hard-requires them |
+| mremap | full | shrink unmaps the tail in place; grow requires MREMAP_MAYMOVE (map a fresh region, copy, free the old); else -ENOMEM. glibc's large-block `realloc` needs it (the malloc-copy-free fallback otherwise leaks frames) |
+| rseq / clone3 | ENOSYS | glibc has documented fallbacks (rseq→unregistered, clone3→clone) |
+| clone / execve / fork / wait4 / futex / kill / tgkill / rt_sigreturn | ENOSYS | threads (L4), signals (L5), processes (L6). A util that hard-requires them (e.g. `sort`, which parallelizes with rayon and spawns worker threads) does not run until then |
 
 ### Planned identity/constants
 
@@ -188,9 +195,37 @@ syscalls).
     1 GHz assumption), arm CNTFRQ_EL0, riscv a documented 10 MHz timebase
     (`cycle` vs `time` CSR mismatch noted); REALTIME adds a fixed boot epoch.
   - Static-glibc's NSS/getaddrinfo warnings are irrelevant to these fixtures.
-- **L3** - cwd/openat/dirfd, /dev + /proc/self synthesis. Proof: the
-  **unpatched uutils coreutils** multicall binary (crates.io, pinned,
-  static-glibc) runs.
+- **L3 [done]** - per-cell cwd (`getcwd`/`chdir`), `statx`, `mremap`, a
+  single-process `pipe2`, `/proc/self/auxv`, and the `openat` dirfd-as-`int`
+  fix. Proof (`linuxtools`): the **unpatched upstream uutils/coreutils**
+  multicall binary - built from crates.io (**`coreutils` = 0.0.29**, pinned),
+  static-glibc ET_EXEC, stock base, no relink - runs on **all three ISAs** with
+  exact stdout + exit asserted for **true, false, echo, cat, seq, head, wc,
+  basename, dirname, ls, pwd** (11 utilities). The ENOSYS-driven loop drove the
+  exact additions: `statx` (Rust `std` issues it directly, no fallback),
+  `mremap` (glibc `realloc`), `pipe2`+`splice`-ENOSYS (uu_cat's Linux fast path
+  creates a pipe then falls back to read/write), a per-fd `getdents64` cursor
+  (real `ls` loops until it reads 0), and dirfd sign-extension (AT_FDCWD arrives
+  as the 32-bit `0xffffff9c`). Accommodations, all disclosed:
+  - **Fixture version: `coreutils` 0.0.29** (not the current 0.9.x). 0.9.x's
+    multicall dispatch reads the binary name from **AT_EXECFN via
+    `rustix::param::linux_execfn`**, and uutils/uucore enable rustix's
+    `use-libc-auxv`, so that resolves through glibc `getauxval` via rustix's
+    `weak!`/`dlsym` shim - which returns NULL in a **fully static** binary (no
+    dynamic symbol table). The multicall then cannot learn its own name and
+    prints usage instead of dispatching - a static-link limitation that hits
+    real Linux too, not a rheo gap. 0.0.29's dispatch takes argv[0] straight
+    from `std::env::args`, which the kernel supplies, so it dispatches
+    correctly. (When L7 lands dynamic linking, a 0.9.x fixture can be revisited.)
+  - **`sort` is dropped** from the asserted set: uu_sort parallelizes with
+    rayon and unconditionally spawns worker threads (clone/futex) - L4. It is
+    dropped, not faked.
+  - **`cat` uses `splice`** on Linux (its fast path): `pipe2` is answered with a
+    real bounded in-process pipe, `splice` returns -ENOSYS, and uu_cat falls
+    back to read/write. Correct output, no lying stub.
+  - **`--locked` is not used** when building the fixture (0.0.29's bundled
+    Cargo.lock pins an ancient rustix that no longer builds on current nightly);
+    the fixture *crate* is still version-pinned.
 - **L4** - threads: multi-context cells, clone/futex, cooperative
   scheduling at syscall boundaries (a spinning thread starves its siblings
   until timer preemption lands - accepted, documented).
@@ -223,10 +258,25 @@ xtask `build_linux_fixtures` (L2, above).
 All three cross toolchains and `*-unknown-linux-gnu` rustup targets are
 present in the build/CI environment, so **riscv64 genuinely passes** (no
 skip); the bare Linux-ABI fixtures (L0) remain the coverage floor if a future
-environment lacks a cross gcc. Named
-third-party fixture crates (the no-deps rule's "a doc must name the
-crate"): **uutils/coreutils** (crates.io, version pinned at L3), used
-unmodified as a test workload, never linked into the kernel or tools.
+environment lacks a cross gcc.
+
+**Third-party fixture crate (L3)** - the no-deps rule's "a doc must name the
+crate": **`coreutils` = 0.0.29** (uutils/coreutils, crates.io), the upstream
+multicall binary, built **unmodified from source** by xtask
+`build_coreutils_fixture` via `cargo install coreutils --version =0.0.29`
+(features `true,false,echo,cat,wc,head,seq,ls,sort,basename,dirname,pwd`;
+`RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static -C
+linker=<cross-gcc> -C link-arg=-no-pie"`; not `--locked` - see L3 above). It
+is a test workload only, never linked into the kernel or tools; the built
+binary is `include_bytes!`d by the `linuxtools` test and its build dir is
+gitignored (no binaries in git). If the crates.io fetch is unavailable the
+fixture build fails loudly (the L0-L2 fixtures keep the personality covered).
+
+| ISA | fixture target | link base |
+|---|---|---|
+| x86_64 | `x86_64-unknown-linux-gnu` (linker: `gcc`) | 0x400000 (stock, higher-half) |
+| aarch64 | `aarch64-unknown-linux-gnu` (linker: `aarch64-linux-gnu-gcc`) | 0x400000 (stock, higher-half) |
+| riscv64 | `riscv64gc-unknown-linux-gnu` (linker: `riscv64-linux-gnu-gcc`) | 0x10000 (stock, higher-half) |
 
 ## 7. Non-goals
 

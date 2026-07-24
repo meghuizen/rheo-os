@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 18] = [
+const TEST_KERNELS: [&str; 19] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -40,6 +40,7 @@ const TEST_KERNELS: [&str; 18] = [
     "stdrun",
     "coreutils",
     "linuxrun",
+    "linuxtools",
 ];
 
 /// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
@@ -392,6 +393,73 @@ fn build_linux_fixtures(arch: Arch) -> bool {
     ]);
     if !matches!(c.status().map(|s| s.success()), Ok(true)) {
         eprintln!("[xtask] C glibc fixture build failed for {}", arch.name());
+        return false;
+    }
+
+    build_coreutils_fixture(arch)
+}
+
+/// Pinned upstream uutils/coreutils crate for the L3 Linux-personality fixture
+/// (docs/LINUX-COMPAT.md 6). Bump deliberately, in the doc's fixture matrix too.
+const COREUTILS_VERSION: &str = "0.0.29";
+/// The subset of utilities the `linuxtools` test exercises (each is a crate
+/// feature that pulls in the matching `uu_*` dependency). Kept small so the
+/// static-glibc multicall binary and its build stay lean.
+const COREUTILS_FEATURES: &str = "true,false,echo,cat,wc,head,seq,ls,sort,basename,dirname,pwd";
+
+/// Build the **unpatched upstream uutils/coreutils** multicall binary from
+/// crates.io (pinned `COREUTILS_VERSION`), static-glibc ET_EXEC for `arch`, for
+/// the `linuxtools` test (docs/LINUX-COMPAT.md L3). Built with `cargo install`
+/// (which compiles the crate's own multicall `coreutils` bin from registry
+/// source) into the gitignored `build/<arch>/cu` root; no binary lives in git.
+/// Existence-cached: a rebuild is skipped if the binary is already present, so
+/// repeated `cargo xtask test` runs stay fast (delete `build/<arch>/cu` to force
+/// a rebuild after bumping the version or feature set).
+fn build_coreutils_fixture(arch: Arch) -> bool {
+    let cc = arch.linux_cc();
+    let root = format!("tests/linux-fixtures/build/{}/cu", arch.name());
+    let bin = format!("{root}/bin/coreutils");
+    if std::path::Path::new(&bin).exists() {
+        println!("[xtask] coreutils fixture cached for {}", arch.name());
+        return true;
+    }
+    println!(
+        "[xtask] building upstream uutils/coreutils {COREUTILS_VERSION} for {}",
+        arch.name()
+    );
+    let rustflags = format!(
+        "-C target-feature=+crt-static -C relocation-model=static \
+         -C linker={cc} -C link-arg=-no-pie"
+    );
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "install",
+        "coreutils",
+        "--version",
+        &format!("={COREUTILS_VERSION}"),
+        "--force",
+        // Not `--locked`: 0.0.29's bundled Cargo.lock pins an ancient rustix
+        // that no longer builds on current nightly; fresh resolution of the
+        // (semver-compatible) transitive deps is required. The fixture *crate*
+        // is still version-pinned, which is what the reproducibility contract
+        // (docs/LINUX-COMPAT.md 6) asks for.
+        "--no-default-features",
+        "--features",
+        COREUTILS_FEATURES,
+        "--target",
+        arch.linux_gnu_target(),
+        "--target-dir",
+        &format!("{root}-target"),
+        "--root",
+        &root,
+    ]);
+    cmd.env("RUSTFLAGS", &rustflags);
+    if !matches!(cmd.status().map(|s| s.success()), Ok(true)) {
+        eprintln!(
+            "[xtask] coreutils fixture build failed for {} (crates.io fetch + \
+             cross static-glibc link required)",
+            arch.name()
+        );
         return false;
     }
     true

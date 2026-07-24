@@ -32,6 +32,9 @@ use core::ptr::{addr_of, addr_of_mut};
 
 /// Per-cell Linux personality state (docs/LINUX-COMPAT.md L2). Fixed-size, so
 /// the kernel stays allocation-free.
+/// Longest per-cell current working directory (docs/LINUX-COMPAT.md L3).
+const CWD_MAX: usize = 256;
+
 pub struct LinuxState {
     fds: fd::FdTable,
     brk_start: usize,
@@ -39,6 +42,9 @@ pub struct LinuxState {
     mmap_cursor: usize,
     tid_addr: u64,
     robust_list: u64,
+    /// The cell's current working directory (getcwd/chdir; AT_FDCWD base).
+    cwd: [u8; CWD_MAX],
+    cwd_len: usize,
     initialized: bool,
 }
 
@@ -51,6 +57,8 @@ impl LinuxState {
             mmap_cursor: 0,
             tid_addr: 0,
             robust_list: 0,
+            cwd: [0; CWD_MAX],
+            cwd_len: 0,
             initialized: false,
         }
     }
@@ -69,6 +77,9 @@ fn state(idx: usize) -> &'static mut LinuxState {
 pub fn install_cell(idx: usize, image_end: usize) {
     let st = state(idx);
     st.fds.init_console();
+    st.fds.set_auxv(stack::last_auxv());
+    st.cwd_len = 1;
+    st.cwd[0] = b'/';
     let brk =
         (image_end + crate::mm::frames::FRAME_SIZE - 1) & !(crate::mm::frames::FRAME_SIZE - 1);
     st.brk_start = brk;
@@ -141,23 +152,30 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6]) -> Ctl {
         nr::WRITEV => ret(sys_readv(st, args[0] as i64, args[1], args[2], true)),
         nr::OPENAT => ret(st
             .fds
-            .openat(args[0] as i64, args[1], strlen(args[1]), args[2])),
+            .openat(dirfd(args[0]), args[1], strlen(args[1]), args[2])),
         nr::CLOSE => ret(st.fds.close(args[0] as i64)),
         nr::LSEEK => ret(st.fds.lseek(args[0] as i64, args[1] as i64, args[2])),
         nr::FSTAT => ret(st.fds.fstat(args[0] as i64, args[1])),
         nr::NEWFSTATAT => ret(sys_newfstatat(st, args)),
+        nr::STATX => ret(sys_statx(st, args)),
         nr::GETDENTS64 => ret(st.fds.getdents64(args[0] as i64, args[1], args[2])),
+        nr::PIPE2 => ret(st.fds.pipe2(args[0])),
         nr::DUP => ret(st.fds.dup(args[0] as i64)),
         nr::DUP3 => ret(st.fds.dup3(args[0] as i64, args[1] as i64)),
         nr::FCNTL => ret(st.fds.fcntl(args[0] as i64, args[1], args[2])),
         nr::IOCTL => ret(sys_ioctl(st, args[0] as i64, args[1], args[2])),
         nr::FACCESSAT | nr::FACCESSAT2 => ret(sys_faccessat(args[1])),
-        nr::READLINKAT => err(errno::ENOENT), // /proc/self/exe etc. - L3
+        nr::READLINKAT => err(errno::ENOENT), // no symlinks in the VFS; /proc/self/exe unused
         nr::POLL | nr::PPOLL => ret(sys_poll(st, args[0], args[1])),
+
+        // -- working directory (docs/LINUX-COMPAT.md L3) --
+        nr::GETCWD => ret(sys_getcwd(st, args[0], args[1])),
+        nr::CHDIR => ret(sys_chdir(st, args[0])),
 
         // -- memory --
         nr::BRK => Ctl::Ret(mem::brk(st, args[0])),
         nr::MMAP => ret(mem::mmap(st, args[1], args[2], args[3])),
+        nr::MREMAP => ret(mem::mremap(st, args[0], args[1], args[2], args[3])),
         nr::MUNMAP => ret(mem::munmap(args[0], args[1])),
         nr::MPROTECT => ret(mem::mprotect(args[0], args[1], args[2])),
         nr::MADVISE => Ctl::Ret(0), // advisory by specification
@@ -201,6 +219,14 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6]) -> Ctl {
             err(errno::ENOSYS)
         }
     }
+}
+
+/// A Linux `*at` directory fd is a C `int`: only the low 32 bits are
+/// meaningful, and callers routinely load AT_FDCWD (-100) with a 32-bit `mov`
+/// that zero-extends to `0xffffff9c`. Sign-extend the low 32 bits so AT_FDCWD
+/// and real (positive) fds are interpreted exactly as the Linux kernel does.
+fn dirfd(v: u64) -> i64 {
+    v as i32 as i64
 }
 
 /// Length of the NUL-terminated C string at user VA `va` (bounded).
@@ -295,7 +321,7 @@ fn sys_newfstatat(st: &mut LinuxState, args: &[u64; 6]) -> i64 {
     const AT_EMPTY_PATH: u64 = 0x1000;
     let path_len = strlen(args[1]);
     if path_len == 0 && args[3] & AT_EMPTY_PATH != 0 {
-        return st.fds.fstat(args[0] as i64, args[2]);
+        return st.fds.fstat(dirfd(args[0]), args[2]);
     }
     let Some(o) = crate::svc::file_ops() else {
         return -errno::ENOENT;
@@ -311,6 +337,88 @@ fn sys_newfstatat(st: &mut LinuxState, args: &[u64; 6]) -> i64 {
         crate::arch::linux_abi::Stat::new(mode, native.size, 1, 1, 1000, 1000, 0, 4096, blocks, 0);
     // SAFETY: statbuf is a writable VA in the calling cell.
     unsafe { (args[2] as *mut crate::arch::linux_abi::Stat).write(stat) };
+    0
+}
+
+/// The Linux `struct statx` (`include/uapi/linux/stat.h`). ABI-independent
+/// (fixed layout on every ISA, unlike `struct stat`), so it lives in the
+/// portable personality, not `arch::linux_abi`. 256 bytes; only the basic-stats
+/// fields are filled (docs/LINUX-COMPAT.md L3).
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+struct StatxTimestamp {
+    tv_sec: i64,
+    tv_nsec: u32,
+    __reserved: i32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+struct Statx {
+    stx_mask: u32,
+    stx_blksize: u32,
+    stx_attributes: u64,
+    stx_nlink: u32,
+    stx_uid: u32,
+    stx_gid: u32,
+    stx_mode: u16,
+    __spare0: u16,
+    stx_ino: u64,
+    stx_size: u64,
+    stx_blocks: u64,
+    stx_attributes_mask: u64,
+    stx_atime: StatxTimestamp,
+    stx_btime: StatxTimestamp,
+    stx_ctime: StatxTimestamp,
+    stx_mtime: StatxTimestamp,
+    stx_rdev_major: u32,
+    stx_rdev_minor: u32,
+    stx_dev_major: u32,
+    stx_dev_minor: u32,
+    stx_mnt_id: u64,
+    __spare2: u64,
+    __spare3: [u64; 12],
+}
+
+/// statx(dirfd, path, flags, mask, statxbuf): the modern stat. AT_EMPTY_PATH
+/// with an empty path stats the fd (`dirfd`); otherwise the (absolute) path is
+/// stat'd through the VFS. Rust `std`'s `File::metadata` issues `statx` directly
+/// and does not fall back to `newfstatat`, so this must be answered for real
+/// tools (docs/LINUX-COMPAT.md L3).
+fn sys_statx(st: &mut LinuxState, args: &[u64; 6]) -> i64 {
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const STATX_BASIC_STATS: u32 = 0x0000_07ff;
+    let path_len = strlen(args[1]);
+    let (mode, size) = if path_len == 0 && args[2] & AT_EMPTY_PATH != 0 {
+        match st.fds.mode_size(dirfd(args[0])) {
+            Ok(v) => v,
+            Err(e) => return e,
+        }
+    } else {
+        let Some(o) = crate::svc::file_ops() else {
+            return -errno::ENOENT;
+        };
+        let mut native = crate::abi::Stat { size: 0, kind: 0 };
+        let r = (o.stat)(args[1], path_len as u64, &mut native as *mut _ as u64);
+        if r < 0 {
+            return r;
+        }
+        (dirent::mode_for_kind(native.kind), native.size)
+    };
+    let stx = Statx {
+        stx_mask: STATX_BASIC_STATS,
+        stx_blksize: 4096,
+        stx_nlink: 1,
+        stx_uid: 1000,
+        stx_gid: 1000,
+        stx_mode: mode as u16,
+        stx_ino: 1,
+        stx_size: size,
+        stx_blocks: size.div_ceil(512),
+        ..Default::default()
+    };
+    // SAFETY: `args[4]` is a writable `struct statx` in the calling cell.
+    unsafe { (args[4] as *mut Statx).write(stx) };
     0
 }
 
@@ -353,6 +461,35 @@ fn sys_faccessat(path_va: u64) -> i64 {
         &mut native as *mut _ as u64,
     );
     if r < 0 { -errno::ENOENT } else { 0 }
+}
+
+/// getcwd(buf, size): copy the cell's cwd plus a NUL terminator into `buf`.
+/// The Linux raw syscall returns the number of bytes written including the NUL;
+/// -ERANGE if the buffer is too small (docs/LINUX-COMPAT.md L3).
+fn sys_getcwd(st: &LinuxState, buf: u64, size: u64) -> i64 {
+    let need = st.cwd_len + 1;
+    if buf == 0 || (size as usize) < need {
+        return -errno::ERANGE;
+    }
+    // SAFETY: `buf` is a writable range of at least `need` bytes in the cell.
+    unsafe {
+        core::ptr::copy_nonoverlapping(st.cwd.as_ptr(), buf as *mut u8, st.cwd_len);
+        *(buf as *mut u8).add(st.cwd_len) = 0;
+    }
+    need as i64
+}
+
+/// chdir(path): set the cell's cwd. The path is stored verbatim (absolute paths
+/// only in practice); path resolution against it is done by `openat`/AT_FDCWD.
+fn sys_chdir(st: &mut LinuxState, path_va: u64) -> i64 {
+    let len = strlen(path_va).min(CWD_MAX);
+    if len == 0 {
+        return -errno::ENOENT;
+    }
+    // SAFETY: `path_va` is a readable C string in the cell (bounded above).
+    unsafe { core::ptr::copy_nonoverlapping(path_va as *const u8, st.cwd.as_mut_ptr(), len) };
+    st.cwd_len = len;
+    0
 }
 
 /// uname: fill `struct utsname` (six 65-byte fields). release is "6.6.0-rheo"

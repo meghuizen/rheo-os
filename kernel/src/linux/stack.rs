@@ -134,6 +134,13 @@ pub fn setup_stack(
     push(AT_EXECFN, str_vas[0] as u64);
     push(AT_NULL, 0);
 
+    // Snapshot the finished auxv as the raw `/proc/self/auxv` byte stream (each
+    // entry a pair of native-endian u64, AT_NULL last). glibc/rustix read
+    // AT_EXECFN etc. from `/proc/self/auxv` when the kernel provides no
+    // PR_GET_AUXV (docs/LINUX-COMPAT.md L3); the pointer values (AT_EXECFN,
+    // AT_RANDOM) are user VAs into this same stack, valid while the cell runs.
+    record_auxv(&auxv[..n]);
+
     // Pointer block: argc, argv[..], NULL, envp[..], NULL, auxv pairs. Placed
     // below the strings, 16-aligned (base_va is 16-aligned).
     let words = 1 + args.len() + 1 + envs.len() + 1 + n * 2;
@@ -166,4 +173,37 @@ pub fn setup_stack(
     }
 
     base_va + sp_off
+}
+
+// ------------------------------------------------------- /proc/self/auxv
+
+/// Serialized `/proc/self/auxv` bytes for the most recently built stack. Room
+/// for the auxv this module emits (< 20 pairs * 16 B). Single cell installs at
+/// a time (single CPU, synchronous), so `install_cell` copies this into the
+/// cell's fd table immediately after `setup_stack`.
+const AUXV_BYTES_MAX: usize = 20 * 16;
+static mut LAST_AUXV: [u8; AUXV_BYTES_MAX] = [0; AUXV_BYTES_MAX];
+static mut LAST_AUXV_LEN: usize = 0;
+
+/// Serialize the `(type, value)` pairs into `LAST_AUXV`.
+fn record_auxv(pairs: &[(u64, u64)]) {
+    // SAFETY: single-threaded setup; `pairs.len() <= 20` (the push cap above).
+    unsafe {
+        let buf = &mut *core::ptr::addr_of_mut!(LAST_AUXV);
+        let mut off = 0;
+        for &(t, v) in pairs {
+            buf[off..off + 8].copy_from_slice(&t.to_ne_bytes());
+            buf[off + 8..off + 16].copy_from_slice(&v.to_ne_bytes());
+            off += 16;
+        }
+        LAST_AUXV_LEN = off;
+    }
+}
+
+/// The serialized auxv from the last `setup_stack` (for `/proc/self/auxv`).
+pub fn last_auxv() -> &'static [u8] {
+    // SAFETY: read of a buffer filled by the preceding `setup_stack`.
+    unsafe {
+        core::slice::from_raw_parts(core::ptr::addr_of!(LAST_AUXV) as *const u8, LAST_AUXV_LEN)
+    }
 }
