@@ -5,11 +5,16 @@
 SECURITY-IDENTITY.md.
 
 **Implemented (section 4):** the ChaCha20 per-cell DRBG with fast key
-erasure (`kernel/src/rng/`), hardware seeding with health tests, non-blocking
-draws, and the per-cell "library call, not a syscall" fast path (the lsh
-`rand` builtin draws over the cell's own state). See `kernel/src/rng/mod.rs`,
-the `rng` test kernel, and the host comparison in `comparison/rng/`
-(rheo-os ~4.8x faster than Linux `getrandom` on key/nonce-sized draws).
+erasure (`kernel/src/rng/`), hardware seeding with health tests, and
+non-blocking draws. See `kernel/src/rng/mod.rs`, the `rng` test kernel, and
+the host comparison in `comparison/rng/` (rheo-os ~4.8x faster than Linux
+`getrandom` on key/nonce-sized draws). The "library call, not a syscall"
+fast path (section 4) is proven at the primitive level - the host benchmark
+calls the DRBG directly - but the lsh `rand` builtin currently draws via
+`SYS_RANDOM`: linking the DRBG into a U-mode cell needs the strand runtime's
+`.user` heap + `mem*` shims (the `.user.text` window forbids the out-of-line
+calls a full DRBG emits), which is the same deferred U-mode-runtime
+integration noted in CONCURRENCY.md.
 Deferred: continuous background reseed scheduling, checkpoint/restore reseed
 (no checkpoint yet), attested seed configuration, virtio-rng feeding.
 

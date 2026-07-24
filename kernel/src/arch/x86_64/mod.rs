@@ -262,6 +262,14 @@ pub fn cpu_report(_inv: &crate::hw::Inventory) -> crate::hw::CpuReport {
     report
 }
 
+// ---------------------------------------------------- virtio-mmio slots
+// q35 has no virtio-mmio transport (virtio is PCIe here). virtio-blk on x86
+// needs the virtio-pci transport - a follow-on - so there are no slots to
+// scan and `virtio_blk::probe` finds nothing.
+pub const VIRTIO_MMIO_BASE: usize = 0;
+pub const VIRTIO_MMIO_STRIDE: usize = 0;
+pub const VIRTIO_MMIO_COUNT: usize = 0;
+
 // ----------------------------------------------------- hardware RNG
 
 /// True if the CPU has RDSEED or RDRAND.

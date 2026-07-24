@@ -179,6 +179,13 @@ pub fn cpu_report(_inv: &crate::hw::Inventory) -> crate::hw::CpuReport {
     report
 }
 
+// ---------------------------------------------------- virtio-mmio slots
+// QEMU arm `virt`: 32 virtio-mmio transports at 0x0a00_0000, stride 0x200
+// (within the 1 GiB device block the kernel identity-maps).
+pub const VIRTIO_MMIO_BASE: usize = 0x0a00_0000;
+pub const VIRTIO_MMIO_STRIDE: usize = 0x200;
+pub const VIRTIO_MMIO_COUNT: usize = 32;
+
 // ----------------------------------------------------- hardware RNG
 
 /// True if FEAT_RNG (the RNDR/RNDRRS registers) is implemented:

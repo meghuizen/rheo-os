@@ -6,20 +6,27 @@
 trait), a read-write **ramfs**, and a read-only **ext4** driver (Tier 1)
 that parses a real ext4 image - superblock, block-group descriptors, inodes,
 the extent tree, linear directories. It is host-validated against a
-`mkfs.ext4` image and read in-QEMU from an embedded image (there is no block
-driver yet). A mount table gives the per-session `/` (section 3), and the
-POSIX fd surface + a `std::fs` facade sit on top (POSIX-PERSONALITY.md).
+`mkfs.ext4` image. A mount table gives the per-session `/` (section 3), and
+the POSIX fd surface + a `std::fs` facade sit on top (POSIX-PERSONALITY.md).
 Proven on all three ISAs by the `posix` test kernel.
 
-**Route to live disk (the honest next step, not yet built):** a **virtio-blk
-driver** (MMIO on arm/riscv virt, PCI on x86) exposing a **`BlockDevice`**
-trait behind the same VFS. At that seam, existing Rust filesystem drivers -
-`redoxfs` (Redox OS), `fatfs`, a read/write ext4 crate - can be *dropped in*
-rather than hand-written, so we do not reimplement every on-disk format. The
-constraint is this repo's no-dependencies rule: any such crate must be named
-in a doc and ideally vendored/audited, since a filesystem driver parses
-untrusted on-disk data. Write support for ext4 (journaling, allocation) is
-deferred behind that block-device work.
+**Live disk (implemented on arm/riscv):** a **virtio-blk driver**
+(`kernel/src/hw/virtio_blk.rs`) over virtio-mmio exposes a **`BlockDevice`**
+trait (`kernel/src/hw/block.rs`) - 512-byte sectors, transport-agnostic -
+behind the same VFS. The `blockfs` test kernel discovers the device, reads a
+real ext4 image off the *live disk* (attached by QEMU with `-drive`), mounts
+it, and reads files through `std::fs`. It runs on the arm/riscv `virt`
+machines; x86-64 q35 has no virtio-mmio (virtio is PCIe there), so the probe
+finds nothing and the test skips - a documented gap (a virtio-pci transport
+is the follow-up).
+
+**Route to more formats:** at the `BlockDevice` seam, existing Rust
+filesystem drivers - `redoxfs` (Redox OS), `fatfs`, a read/write ext4 crate -
+can be *dropped in* rather than hand-written, so we do not reimplement every
+on-disk format. The constraint is this repo's no-dependencies rule: any such
+crate must be named in a doc and ideally vendored/audited, since a filesystem
+driver parses untrusted on-disk data. Write support for ext4 (journaling,
+allocation) is deferred behind that work.
 
 Position: there is no global filesystem tree in the native model - storage is
 a **capability-scoped object store**, and "filesystems" are either views over

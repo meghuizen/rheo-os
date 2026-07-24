@@ -168,6 +168,13 @@ fn contains_ci(hay: &str, needle: &str) -> bool {
     false
 }
 
+// ---------------------------------------------------- virtio-mmio slots
+// QEMU riscv `virt`: 8 virtio-mmio transports at 0x1000_1000, stride 0x1000
+// (within the 0..1 GiB MMIO gigapage the kernel maps).
+pub const VIRTIO_MMIO_BASE: usize = 0x1000_1000;
+pub const VIRTIO_MMIO_STRIDE: usize = 0x1000;
+pub const VIRTIO_MMIO_COUNT: usize = 8;
+
 // ----------------------------------------------------- hardware RNG
 
 /// No usable hardware RNG here. The scalar-crypto entropy source (Zkr, the

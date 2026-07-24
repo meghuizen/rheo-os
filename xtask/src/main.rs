@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 10] = [
+const TEST_KERNELS: [&str; 11] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -32,7 +32,27 @@ const TEST_KERNELS: [&str; 10] = [
     "rng",
     "runtime",
     "posix",
+    "blockfs",
 ];
+
+/// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
+/// (the ext4 fixture); only the riscv/arm `virt` machines have virtio-mmio, so
+/// x86 gets no device and the test skips there.
+fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
+    match (kernel, arch) {
+        ("blockfs", Arch::Riscv64 | Arch::Aarch64) => &[
+            // Present the modern (version 2) virtio-mmio transport, which the
+            // driver implements; QEMU defaults to the legacy version-1 layout.
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-drive",
+            "file=tests/fixtures/ext4.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-device,drive=blk0",
+        ],
+        _ => &[],
+    }
+}
 const BENCH_KERNEL: &str = "bench-core";
 
 #[derive(Clone, Copy, PartialEq)]
@@ -192,7 +212,7 @@ fn main() -> ExitCode {
             build(a, true)
                 && TEST_KERNELS
                     .iter()
-                    .all(|kernel| boot_expect_pass(a, true, kernel, &[]))
+                    .all(|kernel| boot_expect_pass(a, true, kernel, extra_qemu_args(a, kernel)))
         }),
         // Benchmarks always run the release build: instruction path
         // lengths of an unoptimized kernel are not the system's numbers.

@@ -17,8 +17,10 @@
 //! a PCIe device classified by its class code (see EngineKind).
 
 pub mod acpi;
+pub mod block;
 pub mod fdt;
 pub mod pci;
+pub mod virtio_blk;
 
 use crate::arch;
 

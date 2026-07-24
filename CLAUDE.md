@@ -28,8 +28,11 @@ The full single-host **kernel object model** is implemented: memory grants
 **cryptographic per-cell entropy** (a ChaCha20 DRBG with fast key erasure,
 seeded from the hardware RNG - RDSEED/RDRAND on x86-64, RNDR on ARM64 -
 after SP 800-90B health tests, non-blocking, falling back to a documented
-floor where no hwrng exists; a cell draws bytes as a library call over its
-own DRBG state, not a syscall, per docs/TIME-IDENTITY.md 4), typed event
+floor where no hwrng exists; the design's "library call over the cell's own
+DRBG state, not a syscall" path is proven at the primitive level in the host
+comparison, while the lsh `rand` builtin currently draws via `SYS_RANDOM` -
+linking the full DRBG into a U-mode cell awaits the runtime's `.user` heap +
+`mem*` shims, per docs/TIME-IDENTITY.md 4), typed event
 streams with flow context, EDF-admitted reservations, leases with fencing
 tokens + epoch revocation, and a dependency graph executed on a compute
 engine (attest-by-measurement). On
@@ -87,18 +90,27 @@ A **POSIX + filesystem stack** (`posix/`, docs/FILESYSTEMS.md,
 POSIX-PERSONALITY.md) sits on a **VFS** translation layer (a `FileSystem`
 trait): a read-write **ramfs** (the working store), a read-only **ext4**
 driver that parses a real ext4 image (superblock, block-group descriptors,
-inodes, the extent tree, linear dirs - host-validated and read in-QEMU from
-an embedded 512 KiB image, since there is no block driver yet), a mount
-table + path resolution (the per-session `/`), the **POSIX fd surface**
-(`open/read/write/close/lseek/stat/getdents/mkdir/unlink` with errno), and a
-**`std::fs`-shaped facade** (`File`, `OpenOptions`, `read`/`write`/
-`read_to_string`, `read_dir`, `metadata`) so standard-library file code runs
-natively. The `posix` test kernel exercises ramfs rw, ext4 ro (incl. a
-multi-block file), the errno surface, and the std facade on all three ISAs.
-The route to *live-disk* filesystems is a **virtio-blk driver + a
-`BlockDevice` trait** behind the same VFS, at which point existing Rust FS
-drivers (redoxfs, fatfs, a read/write ext4 crate) can be dropped in rather
-than hand-written - gated by the no-deps rule (a doc must name any crate).
+inodes, the extent tree, linear dirs - host-validated against a `mkfs.ext4`
+image), a mount table + path resolution (the per-session `/`), the **POSIX
+fd surface** (`open/read/write/close/lseek/stat/getdents/mkdir/unlink` with
+errno), and a **`std::fs`-shaped facade** (`File`, `OpenOptions`,
+`read`/`write`/`read_to_string`, `read_dir`, `metadata`) so standard-library
+file code runs natively. The `posix` test kernel exercises ramfs rw, ext4 ro
+(incl. a multi-block file), the errno surface, and the std facade on all
+three ISAs.
+
+A **live-disk block stack** closes the loop from storage transport to
+filesystem: a **`BlockDevice` trait** (`kernel/src/hw/block.rs`, 512-byte
+sectors, transport-agnostic) and a **virtio-blk driver**
+(`kernel/src/hw/virtio_blk.rs`) over virtio-mmio - reset/feature negotiation,
+a split virtqueue, and the block request protocol. The `blockfs` test kernel
+discovers the device, reads a real ext4 image off the *live disk* (attached
+by QEMU with `-drive`), mounts it, and reads files through `std::fs`. It runs
+on arm/riscv `virt`; x86-64 q35 has no virtio-mmio (virtio is PCIe there), so
+the probe finds nothing and the test skips (a virtio-pci transport is the
+follow-up). At the `BlockDevice` seam existing Rust FS drivers (redoxfs,
+fatfs, a read/write ext4 crate) can be dropped in rather than hand-written -
+gated by the no-deps rule (a doc must name any crate).
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
@@ -156,15 +168,17 @@ kernel/       the no_std kernel library + boot demo bin
               hwrng seeding), event streams,
               sched (reservations), lease, engine, graph, pty, svc
               (shell/resource syscalls), hw (ACPI/FDT/PCIe discovery +
-              the machine Inventory), user run loop, U-mode programs
+              the machine Inventory; block BlockDevice trait + virtio_blk
+              driver), user run loop, U-mode programs
               (user_progs.rs incl. the lsh shell), abi
   src/arch/   per-ISA Rust modules incl. paging.rs (one dir per ISA)
   arch/       per-ISA assembly (boot, vectors/traps, context switch, user)
   link/       linker scripts per ISA (incl. the .user text/rodata/data window)
 tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               isolation-hw, resources, shell-smoke, hwinfo, rng, runtime,
-              posix, bench-core, and the interactive lsh bin (+ harness.rs);
-              fixtures/ holds the ext4 test image (+ gen-ext4.sh)
+              posix, blockfs (live virtio-blk disk), bench-core, and the
+              interactive lsh bin (+ harness.rs); fixtures/ holds the ext4
+              test image (+ gen-ext4.sh)
 comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md
 xtask/        build/run/test/bench orchestration (cargo xtask ...)
 idl/          system IDL + codegen        (future, step 6)

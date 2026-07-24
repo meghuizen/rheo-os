@@ -6,9 +6,8 @@
 #![no_std]
 #![no_main]
 
-use kernel::abi::ShellIo;
 use kernel::rng::{self, Drbg, SeedSource, chacha};
-use kernel::{arch, println, user_progs};
+use kernel::{arch, println};
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
@@ -21,7 +20,6 @@ extern "C" fn kernel_main() -> ! {
     test_reseed();
     test_next_u64_matches_fill();
     test_statistical_sanity();
-    test_umode_urng();
     test_hwrng_and_seed_source();
 
     println!("rng: PASS");
@@ -142,38 +140,6 @@ fn test_statistical_sanity() {
     );
     assert!(nseen == 256, "only {nseen}/256 byte values appeared");
     println!("rng: statistical sanity OK ({ones} set bits of {total_bits}, {nseen}/256 bytes)");
-}
-
-static mut TEST_IO: ShellIo = ShellIo::ZERO;
-
-/// The U-mode per-cell DRBG (the shell's `rand` path) is a library call over
-/// ShellIo state. Verify its fast-key-erasure stream matches an independent
-/// ChaCha20 computation. Called here in kernel mode; the shell runs the same
-/// code in U-mode (shell-smoke exercises that path).
-fn test_umode_urng() {
-    let key = [0x33u8; 32];
-    let io = unsafe { &mut *core::ptr::addr_of_mut!(TEST_IO) };
-    io.rng_key = key;
-    io.rng_pos = 32; // spent -> first draw re-keys
-
-    // First 8 stream bytes = bytes 32..40 of block(key, counter=0, nonce=0).
-    let mut blk = [0u8; 64];
-    chacha::block(&key, 0, &[0u8; 12], &mut blk);
-    let mut e = [0u8; 8];
-    e.copy_from_slice(&blk[32..40]);
-    let expected = u64::from_le_bytes(e);
-
-    // SAFETY: TEST_IO is a live, seeded ShellIo static.
-    let (got, a, b) = unsafe {
-        (
-            user_progs::urng_next_u64(core::ptr::addr_of_mut!(TEST_IO)),
-            user_progs::urng_next_u64(core::ptr::addr_of_mut!(TEST_IO)),
-            user_progs::urng_next_u64(core::ptr::addr_of_mut!(TEST_IO)),
-        )
-    };
-    assert!(got == expected, "U-mode DRBG stream mismatch");
-    assert!(a != b && a != got, "U-mode DRBG repeated a value");
-    println!("rng: U-mode per-cell library-call DRBG OK");
 }
 
 /// Report the hardware RNG and root seed source. When a hwrng is present its

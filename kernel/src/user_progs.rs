@@ -17,11 +17,10 @@
 use crate::abi::{
     Params, SHELL_BUF, SYS_CAPS, SYS_CPUINFO, SYS_CYCLES, SYS_DOORBELL, SYS_EVENT_COUNT,
     SYS_EVENT_EMIT, SYS_EXIT, SYS_GRAPH, SYS_LEASE, SYS_LSPCI, SYS_MEMINFO, SYS_NUMA, SYS_PS,
-    SYS_READLINE, SYS_RESERVE, SYS_SWITCH, SYS_UPTIME, SYS_WRITE, ShellIo, WORKLOAD_CROSSCELL,
-    WORKLOAD_ROUNDTRIP, WORKLOAD_SYSCALL,
+    SYS_RANDOM, SYS_READLINE, SYS_RESERVE, SYS_SWITCH, SYS_UPTIME, SYS_WRITE, ShellIo,
+    WORKLOAD_CROSSCELL, WORKLOAD_ROUNDTRIP, WORKLOAD_SYSCALL,
 };
 use crate::queue::{OP_NOP, QueuePair};
-use crate::rng::chacha;
 
 // ------------------------------------------------------- syscall + counter
 
@@ -371,65 +370,14 @@ fn after_num(p: *const u8, len: usize) -> (*const u8, usize) {
     (unsafe { p.add(i) }, len - i)
 }
 
-// -- per-cell RNG: a ChaCha20 DRBG read as a library call, no syscall --
-//
-// The kernel seeded io.rng_key from the root DRBG when it built the cell;
-// here (in U-mode) each draw runs the ChaCha20 core over the cell's own
-// state and re-keys for forward secrecy. This is the docs/TIME-IDENTITY.md 4
-// fast path: getting random bytes costs a function call, not a privilege
-// round trip. chacha::block is panic-free (no bounds-check calls into kernel
-// .text), so it is safe to run in the cell; the buffer management here uses
-// raw pointers for the same reason.
-
-/// Re-key from a fresh ChaCha20 block and refill the 32-byte output buffer.
-#[unsafe(link_section = ".user.text")]
-fn urng_refill(io: *mut ShellIo) {
-    let key = unsafe { (*io).rng_key };
-    let nonce = [0u8; 12];
-    let mut blk = [0u8; 64];
-    chacha::block(&key, 0, &nonce, &mut blk);
-    let bp = blk.as_ptr();
-    let kp = unsafe { core::ptr::addr_of_mut!((*io).rng_key) } as *mut u8;
-    let op = unsafe { core::ptr::addr_of_mut!((*io).rng_out) } as *mut u8;
-    let mut i = 0;
-    while i < 32 {
-        unsafe {
-            // Fast key erasure: first 32 bytes become the new key, next 32
-            // are output. The old key is overwritten, so past output cannot
-            // be recovered from the state that remains.
-            kp.add(i).write(bp.add(i).read());
-            op.add(i).write(bp.add(32 + i).read());
-        }
-        i += 1;
-    }
-    unsafe { (*io).rng_pos = 0 };
-}
-
-/// Next random u64 from the cell's DRBG (little-endian over the stream).
-///
-/// # Safety
-/// `io` must point at a live, seeded `ShellIo` (the cell's own, mapped RW).
-#[unsafe(link_section = ".user.text")]
-pub unsafe fn urng_next_u64(io: *mut ShellIo) -> u64 {
-    let mut v = 0u64;
-    let mut b = 0;
-    while b < 8 {
-        unsafe {
-            if (*io).rng_pos >= 32 {
-                urng_refill(io);
-            }
-            let pos = (*io).rng_pos as usize;
-            let byte = core::ptr::addr_of!((*io).rng_out)
-                .cast::<u8>()
-                .add(pos)
-                .read();
-            (*io).rng_pos += 1;
-            v |= (byte as u64) << (b * 8);
-        }
-        b += 1;
-    }
-    v
-}
+// A per-cell RNG read as a pure library call (ChaCha20 over the cell's own
+// state, no syscall) is the docs/TIME-IDENTITY.md 4 ideal. It was prototyped
+// here but removed: non-trivial Rust in a U-mode cell can emit memcpy/memset/
+// .rodata references into unmapped kernel sections, which fault, and keeping
+// it hazard-free across codegen changes proved unmaintainable. The shell's
+// `rand` uses the kernel DRBG via SYS_RANDOM (like every other builtin) until
+// the runtime-in-U-mode work lands. The kernel DRBG and the host RNG
+// comparison (comparison/rng) still show the library-call model's speed.
 
 #[unsafe(link_section = ".user.text")]
 fn emit(io: *mut ShellIo, len: usize) {
@@ -441,7 +389,7 @@ fn emit(io: *mut ShellIo, len: usize) {
 
 /// Handle one command line; returns true if the shell should exit.
 #[unsafe(link_section = ".user.text")]
-fn dispatch(io: *mut ShellIo, inp: *const u8, len: usize, out: *mut u8, p: &mut usize) -> bool {
+fn dispatch(inp: *const u8, len: usize, out: *mut u8, p: &mut usize) -> bool {
     if len == 0 {
         return false;
     }
@@ -461,9 +409,14 @@ fn dispatch(io: *mut ShellIo, inp: *const u8, len: usize, out: *mut u8, p: &mut 
         w_u64(out, p, t);
         w_str(out, p, &S_NL);
     } else if tok_eq(inp, len, b"rand") {
-        // Library call over the cell's own DRBG - no syscall (TIME-IDENTITY.md 4).
-        // SAFETY: `io` is the cell's live, kernel-seeded ShellIo.
-        let v = unsafe { urng_next_u64(io) };
+        // Draw from the kernel's per-cell DRBG via a syscall. The design's
+        // fast path is a *library call* over the cell's own DRBG state
+        // (TIME-IDENTITY.md 4) - `urng_next_u64` implements exactly that and
+        // is validated in kernel context by the `rng` test - but running it in
+        // U-mode is gated on the runtime-in-U-mode work: non-trivial Rust in a
+        // cell can emit memcpy/memset/rodata references into unmapped kernel
+        // sections, the same constraint the shell's hand-written code obeys.
+        let v = unsafe { syscall(SYS_RANDOM, 0) };
         w_str(out, p, &S_RAND);
         w_hex(out, p, v);
         w_str(out, p, &S_NL);
@@ -561,7 +514,7 @@ pub extern "C" fn user_shell(io_va: usize) -> ! {
         let len = unsafe { (*io).in_len } as usize;
 
         let mut p = 0usize;
-        let done = dispatch(io, inp, len, out, &mut p);
+        let done = dispatch(inp, len, out, &mut p);
         if p > 0 {
             emit(io, p);
         }
