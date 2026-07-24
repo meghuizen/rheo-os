@@ -139,11 +139,30 @@ canonical half** so the whole low half belongs to user programs.
   low, identity-mapped, per-cell in TTBR0 - so isolation is unchanged. Because
   the kernel now spans high (`.text`/`.data`) and low (`.user`) symbols beyond
   the small code model's +-4 GiB `adrp` reach, the aarch64 kernel is built with
-  the **large code model** (xtask). x86_64/riscv64 remain low-half for now.
+  the **large code model** (xtask). x86_64 remains low-half for now.
+- **riscv64 (done):** a single `satp`, so - unlike aarch64's TTBR split - every
+  cell root still carries the kernel + MMIO (mapped **supervisor**, high), since
+  a trap enters with the cell root active and must reach the handler. The whole
+  low half is left free, so a stock Linux `ET_EXEC` at 0x10000 loads unmodified.
+  `KERNEL_VA_BASE = 0xFFFF_FFC0_0000_0000` is the base of the Sv39 39-bit
+  sign-extended high half (top-half level-2 indices 256..511); MMIO maps at
+  index 256, kernel RAM at 258. The boot trampoline (`arch/riscv64/boot.S`)
+  builds an initial root (high MMIO + high kernel RAM gigapages, plus a
+  transient low identity so the turn-on instruction stays mapped), writes
+  `satp`, and jumps to the high-half continuation before any Rust runs; that
+  boot root doubles as the kernel working root (`paging_activate_kernel`).
+  `paging_new_root` builds a cell root that maps the kernel + MMIO high
+  (supervisor) and leaves the low half free for the loader; the kernel-RAM
+  gigaregion is a level-1 table of supervisor superpages with the one `.user`
+  slot delegated to U pages. **Unlike aarch64 the `.user` window is linked
+  high**, adjacent to the kernel: RISC-V has no "large" code model (medany
+  reaches only +-2 GiB PC-relative), so keeping `.user` next to the kernel
+  keeps every kernel->`.user` reference in range. Isolation is unchanged - a
+  cell is gated by the U bit on the leaf PTE, not by the address.
 - **The `phys_to_virt` seam.** The kernel touches physical frames (page tables,
   freshly allocated frames, ELF-load target pages, DMA rings) at
-  `arch::phys_to_virt(pa)` - `pa | KERNEL_VA_BASE` on aarch64, the identity on
-  x86_64/riscv64 - never at the raw physical address, since the kernel no longer
+  `arch::phys_to_virt(pa)` - `pa | KERNEL_VA_BASE` on aarch64/riscv64, the
+  identity on x86_64 - never at the raw physical address, since the kernel no longer
   identity-maps RAM low. `arch::virt_to_phys` is the inverse, used to hand
   physical addresses to devices (virtio DMA) and to bounds-check the frame pool
   against the kernel image. Both are per-ISA functions behind the portable

@@ -340,11 +340,11 @@ impl Arch {
         }
     }
 
-    /// ET_EXEC link base for the fixtures (docs/LINUX-COMPAT.md L2): a VA that
-    /// is free in the cell's page-table root AND reachable by the ISA's default
-    /// code model. x86/riscv use 1 GiB (riscv medlow reaches < 2 GiB; x86 small
-    /// reaches < 2 GiB); ARM64's cell root maps kernel RAM at 1-2 GiB, so it
-    /// uses 2 GiB (aarch64 small reaches < 4 GiB).
+    /// ET_EXEC link base for the fixtures (docs/LINUX-COMPAT.md L2). Only
+    /// x86_64 still relinks (its kernel is low-half): 1 GiB is free in the cell
+    /// root and reachable by the small code model (< 2 GiB). aarch64 and
+    /// riscv64 are higher-half, so their fixtures keep glibc's stock base and
+    /// this is unused for them.
     fn linux_link_base(self) -> &'static str {
         match self {
             Arch::X86_64 | Arch::Riscv64 => "0x40000000",
@@ -365,18 +365,18 @@ fn build_linux_fixtures(arch: Arch) -> bool {
     let cc = arch.linux_cc();
 
     // Rust std hello: static glibc, ET_EXEC (-no-pie + static relocation
-    // model). On aarch64 the kernel is higher-half, so the whole low half is
-    // free and the fixture keeps glibc's stock ET_EXEC base (0x400000) - no
-    // relink - which proves a stock binary loads unmodified (docs/MEMORY.md,
-    // docs/LINUX-COMPAT.md L2). x86/riscv are still low-half, so their
-    // fixtures are relinked to a free per-arch base until their higher-half
+    // model). On aarch64 and riscv64 the kernel is higher-half, so the whole
+    // low half is free and the fixture keeps glibc's stock ET_EXEC base
+    // (0x400000 / 0x10000) - no relink - which proves a stock binary loads
+    // unmodified (docs/MEMORY.md, docs/LINUX-COMPAT.md L2). x86_64 is still
+    // low-half, so its fixture is relinked to a free base until its higher-half
     // move lands. The cross gcc is the linker so the right sysroot/crt objects
     // are used; x86 forces bfd ld because rust-lld rejects -Ttext-segment.
     let mut rustflags = format!(
         "-C target-feature=+crt-static -C relocation-model=static \
          -C linker={cc} -C link-arg=-no-pie"
     );
-    if arch != Arch::Aarch64 {
+    if arch == Arch::X86_64 {
         rustflags.push_str(&format!(" -C link-arg=-Wl,-Ttext-segment={base}"));
     }
     if arch == Arch::X86_64 {
@@ -408,7 +408,7 @@ fn build_linux_fixtures(arch: Arch) -> bool {
     }
     let mut c = Command::new(cc);
     c.arg("-static").arg("-no-pie");
-    if arch != Arch::Aarch64 {
+    if arch == Arch::X86_64 {
         c.arg(format!("-Wl,-Ttext-segment={base}"));
     }
     c.args([

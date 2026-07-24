@@ -1,22 +1,34 @@
 //! RISC-V Sv39 paging (BUILD-ORDER.md step 3). Three levels, 512 entries
 //! each, 4 KiB pages with 1 GiB and 2 MiB superpages.
 //!
-//! Address-space layout (identity-mapped; isolation comes from *which*
-//! frames each root maps with the U bit, not from address separation):
+//! Higher-half split (docs/MEMORY.md): the kernel, all MMIO, and the `.user`
+//! window are linked in the high canonical half (`phys_to_virt(pa) =
+//! pa | KERNEL_VA_BASE`), built once by the boot trampoline. RISC-V has a
+//! single `satp`, so a cell root still carries the kernel + MMIO (mapped
+//! supervisor, high) - a trap enters with the cell root active and must reach
+//! the handler - but the whole LOW half is left free, so a stock Linux
+//! ET_EXEC (0x10000) loads unmodified. Unlike aarch64 the `.user` window sits
+//! high too (RISC-V has no "large" code model; keeping it adjacent to the
+//! kernel keeps every kernel->`.user` reference within medany's +-2 GiB
+//! reach). Isolation is unchanged: it is the U bit on the leaf PTE, not the
+//! address, that gates a cell.
 //!
-//! - VA 0..1 GiB   -> gigapage, supervisor R|W: all MMIO (UART, test
-//!   device, PLIC, CLINT). Shared, identical in every root.
-//! - VA 2..3 GiB   -> a per-root level-1 table of 2 MiB supervisor R|W|X
-//!   superpages covering kernel RAM (image, page tables, frame pool),
-//!   except the one 2 MiB slot holding the `.user` window, which points
-//!   to a per-cell level-0 table where user pages carry the U bit.
+//! Address-space layout:
+//! - VA base+0..1 GiB -> gigapage, supervisor R|W: all MMIO (UART, test
+//!   device, PLIC, virtio, PCIe ECAM). Shared, identical in every root.
+//! - VA base+2..3 GiB -> kernel RAM. A kernel root maps it as one supervisor
+//!   R|W|X gigapage; a cell root maps it as a level-1 table of 2 MiB
+//!   supervisor superpages with the one `.user` slot delegated to a level-0
+//!   table where user pages carry the U bit.
+//! - The low half is unmapped in a cell root except the pages the loader adds
+//!   (paging_map_frame) - a stock ET_EXEC, its stack, mmap arenas.
 //!
-//! A cell can only reach a user page its own root maps U; another cell's
-//! root does not map it, so the MMU faults. W^X is enforced by the R/W/X
-//! bits per page.
+//! `table_mut` reaches page-table frames through the kernel's high linear map
+//! (`super::phys_to_virt`); the kernel no longer identity-maps RAM low.
 
 use crate::arch::MapPerm;
 use crate::mm::frames;
+use core::arch::asm;
 
 const PTE_V: u64 = 1 << 0;
 const PTE_R: u64 = 1 << 1;
@@ -31,7 +43,10 @@ const PAGE_SIZE: usize = 4096;
 const GIB: usize = 1 << 30;
 const MIB2: usize = 2 << 20;
 
-// The `.user` window (linker script: 2 MiB aligned, 2 MiB long).
+/// Physical base of kernel RAM (QEMU virt: RAM starts at 2 GiB).
+const RAM_PA_BASE: usize = 2 * GIB;
+
+// The `.user` window (linker script: 2 MiB aligned, 2 MiB long, high VMA).
 unsafe extern "C" {
     static __user_start: u8;
 }
@@ -46,6 +61,10 @@ pub struct PagingRoot {
     l2_pa: usize,
 }
 
+fn l2_index(va: usize) -> usize {
+    (va >> 30) & 0x1FF
+}
+
 fn pte_to_table(pte: u64) -> usize {
     // PPN is bits [53:10]; shift left 12 minus the 10-bit PPN offset.
     (((pte >> 10) & ((1 << 44) - 1)) as usize) << 12
@@ -56,43 +75,53 @@ fn table_to_pte(pa: usize, flags: u64) -> u64 {
 }
 
 fn table_mut(pa: usize) -> &'static mut [u64; 512] {
-    // SAFETY: `pa` is a frame we allocated and identity-map; it holds 512
-    // PTEs. The kernel is the sole writer of page tables.
-    unsafe { &mut *(pa as *mut [u64; 512]) }
+    // SAFETY: `pa` is an allocated table frame, reached through the kernel's
+    // high linear map. The kernel runs high, so a physical frame is touched at
+    // phys_to_virt(pa), never at its raw physical address. The kernel is the
+    // sole writer of page tables.
+    unsafe { &mut *(super::phys_to_virt(pa) as *mut [u64; 512]) }
 }
 
-/// Allocate a fresh root and install the shared kernel mappings.
+/// Allocate a fresh cell root: kernel + MMIO mapped supervisor HIGH (so a trap
+/// entering with this root active reaches the handler), the low half left free
+/// for the loader. The kernel-RAM gigaregion is a level-1 table of supervisor
+/// superpages with the one `.user` slot delegated to a level-0 table where user
+/// pages carry the U bit.
 pub fn paging_new_root() -> PagingRoot {
     let l2_pa = frames::alloc();
     let l2 = table_mut(l2_pa);
 
-    // VA 0..1 GiB: MMIO gigapage, supervisor R|W.
-    l2[0] = table_to_pte(0, PTE_V | PTE_R | PTE_W | PTE_G | PTE_A | PTE_D);
+    // High MMIO gigapage (0..1 GiB), supervisor R|W.
+    let mmio_va = super::phys_to_virt(0);
+    l2[l2_index(mmio_va)] = table_to_pte(0, PTE_V | PTE_R | PTE_W | PTE_G | PTE_A | PTE_D);
 
-    // VA 2..3 GiB: kernel RAM. A level-1 table of 2 MiB supervisor
-    // superpages, with the `.user` slot delegated to a level-0 table.
+    // High kernel RAM (2..3 GiB): level-1 table of 2 MiB supervisor superpages,
+    // with the `.user` slot delegated to a per-cell level-0 table.
     let l1_pa = frames::alloc();
     let l1 = table_mut(l1_pa);
-    let ram_base = 2 * GIB;
-    let user_base = user_window_base();
+    let user_slot_va = user_window_base() & !(MIB2 - 1);
     for (i, entry) in l1.iter_mut().enumerate() {
-        let va = ram_base + i * MIB2;
-        if va == (user_base & !(MIB2 - 1)) {
-            // Delegate this 2 MiB slot to a per-cell level-0 table; user
-            // pages are added later by paging_map. Empty for now.
+        let pa = RAM_PA_BASE + i * MIB2;
+        let va = super::phys_to_virt(pa);
+        if va == user_slot_va {
+            // Delegate this 2 MiB slot to a per-cell level-0 table; user pages
+            // are added later by paging_map. Empty for now.
             let l0_pa = frames::alloc();
             *entry = table_to_pte(l0_pa, PTE_V); // pointer PTE (no R/W/X)
         } else {
-            *entry = table_to_pte(va, PTE_V | PTE_R | PTE_W | PTE_X | PTE_G | PTE_A | PTE_D);
+            *entry = table_to_pte(pa, PTE_V | PTE_R | PTE_W | PTE_X | PTE_G | PTE_A | PTE_D);
         }
     }
-    l2[2] = table_to_pte(l1_pa, PTE_V); // pointer to the level-1 table
+    let ram_va = super::phys_to_virt(RAM_PA_BASE);
+    l2[l2_index(ram_va)] = table_to_pte(l1_pa, PTE_V); // pointer to the level-1 table
 
     PagingRoot { l2_pa }
 }
 
-/// Map one 4 KiB identity page for user access. `va` must lie in the
-/// `.user` window and be page aligned.
+/// Map one 4 KiB page for user access inside the `.user` window. `va` must lie
+/// in the (high) `.user` window and be page aligned; the backing frame is the
+/// window's own physical page (`virt_to_phys(va)`), so this is an identity map
+/// in the linear sense, carrying the U bit.
 pub fn paging_map(root: &mut PagingRoot, va: usize, perm: MapPerm) {
     assert!(va.is_multiple_of(PAGE_SIZE), "unaligned user map {va:#x}");
     let user_base = user_window_base();
@@ -102,8 +131,9 @@ pub fn paging_map(root: &mut PagingRoot, va: usize, perm: MapPerm) {
     );
 
     let l2 = table_mut(root.l2_pa);
-    let l1 = table_mut(pte_to_table(l2[2]));
-    let l1_idx = (va - 2 * GIB) / MIB2;
+    let ram_va = super::phys_to_virt(RAM_PA_BASE);
+    let l1 = table_mut(pte_to_table(l2[l2_index(ram_va)]));
+    let l1_idx = (va - ram_va) / MIB2;
     let l0 = table_mut(pte_to_table(l1[l1_idx]));
     let l0_idx = (va % MIB2) / PAGE_SIZE;
 
@@ -112,7 +142,8 @@ pub fn paging_map(root: &mut PagingRoot, va: usize, perm: MapPerm) {
         MapPerm::UserRw => PTE_R | PTE_W,
         MapPerm::UserRx => PTE_R | PTE_X,
     };
-    l0[l0_idx] = table_to_pte(va, PTE_V | PTE_U | PTE_A | PTE_D | rights);
+    let pa = super::virt_to_phys(va);
+    l0[l0_idx] = table_to_pte(pa, PTE_V | PTE_U | PTE_A | PTE_D | rights);
 }
 
 /// Get the level-N table a parent entry points at, creating an empty one
@@ -126,9 +157,9 @@ fn ensure_table(parent: &mut [u64; 512], idx: usize) -> usize {
 }
 
 /// Map one 4 KiB frame `pa` at an arbitrary user `va`, creating intermediate
-/// tables as needed (docs/USERLAND.md). `va` must avoid the kernel/MMIO
-/// ranges the cell root maps supervisor (0-1 GiB, 2-3 GiB); userland lives at
-/// 4 GiB+.
+/// tables as needed (docs/USERLAND.md). The cell root leaves the whole low
+/// half free, so any low `va` is available - including a stock ET_EXEC at
+/// 0x10000, its stack (8 GiB), and mmap arenas (12 GiB).
 pub fn paging_map_frame(root: &mut PagingRoot, va: usize, pa: usize, perm: MapPerm) {
     assert!(va.is_multiple_of(PAGE_SIZE), "unaligned user map {va:#x}");
     let l2 = table_mut(root.l2_pa);
@@ -198,7 +229,7 @@ pub fn paging_activate(root: &PagingRoot, asid: u16) {
     let satp = (8u64 << 60) | ((asid as u64) << 44) | ((root.l2_pa >> 12) as u64);
     // SAFETY: satp points at a well-formed root; sfence orders the switch.
     unsafe {
-        core::arch::asm!(
+        asm!(
             "csrw satp, {0}",
             "sfence.vma zero, {1}",
             in(reg) satp,
@@ -207,43 +238,39 @@ pub fn paging_activate(root: &PagingRoot, asid: u16) {
     }
 }
 
-/// Build the kernel's own address space and turn the MMU on. The kernel
-/// root is deliberately simple: MMIO gigapage + a single RAM gigapage,
-/// both supervisor, so setup code can read/write all of RAM (including
-/// the `.user` window it initialises before entering a cell). Cell roots
-/// (paging_new_root) do the fine-grained U-page carve-out.
-static mut KERNEL_ROOT_PA: usize = 0;
+unsafe extern "C" {
+    /// Physical address of the boot-built kernel working root, written by the
+    /// boot trampoline (kernel/arch/riscv64/boot.S) once the MMU is on.
+    static KERNEL_ROOT_PA: u64;
+}
 
-/// Re-activate the kernel's own address space (ASID 0). Called when a cell
-/// run returns, so kernel setup code can again reach all of RAM.
+/// Re-activate the kernel's own address space (ASID 0). Called when a cell run
+/// returns, so kernel setup code can again reach all of RAM (a cell root only
+/// maps that cell's user pages in the low half). The kernel root maps the
+/// kernel + MMIO high (supervisor gigapages) plus a low identity of kernel RAM
+/// left over from the boot turn-on.
 pub fn paging_activate_kernel() {
-    let l2_pa = unsafe { *core::ptr::addr_of!(KERNEL_ROOT_PA) };
+    let l2_pa = unsafe { core::ptr::addr_of!(KERNEL_ROOT_PA).read() } as usize;
     paging_activate(&PagingRoot { l2_pa }, 0);
 }
 
+/// Finish paging bring-up. The MMU and the kernel working root are already
+/// configured by the boot trampoline, which enabled paging and jumped the
+/// kernel to its high VAs before any Rust ran. All that is left is the frame
+/// allocator and the S-mode CSR bits U-mode relies on.
 pub fn paging_kernel_init() {
     frames::init();
 
-    let l2_pa = frames::alloc();
-    let l2 = table_mut(l2_pa);
-    // VA 0..1 GiB: MMIO, supervisor R|W.
-    l2[0] = table_to_pte(0, PTE_V | PTE_R | PTE_W | PTE_G | PTE_A | PTE_D);
-    // VA 2..3 GiB: kernel RAM, supervisor R|W|X gigapage.
-    l2[2] = table_to_pte(
-        2 * GIB,
-        PTE_V | PTE_R | PTE_W | PTE_X | PTE_G | PTE_A | PTE_D,
-    );
-
-    // SUM lets the S-mode kernel read/write U pages (needed so the
-    // doorbell handler can touch a cell's shared ring); scounteren lets
-    // U-mode read the cycle counter for the benchmark's own timing.
-    // sstatus.FS = Initial (0b01) enables the F/D floating-point unit for
-    // U-mode (docs/LINUX-COMPAT.md L1): glibc's ifunc string routines and
-    // ordinary FP both trap with FS=Off. No FP context save/restore is
-    // needed yet (one U-mode context per cell; the kernel is soft-float).
+    // SUM lets the S-mode kernel read/write U pages (needed so the doorbell
+    // handler can touch a cell's shared ring); scounteren lets U-mode read the
+    // cycle counter for the benchmark's own timing. sstatus.FS = Initial
+    // (0b01) enables the F/D floating-point unit for U-mode
+    // (docs/LINUX-COMPAT.md L1): glibc's ifunc string routines and ordinary FP
+    // both trap with FS=Off. No FP context save/restore is needed yet (one
+    // U-mode context per cell; the kernel is soft-float).
     // SAFETY: plain CSR writes.
     unsafe {
-        core::arch::asm!(
+        asm!(
             "csrs sstatus, {sum}",
             "csrs sstatus, {fs}",
             "csrw scounteren, {cen}",
@@ -252,8 +279,4 @@ pub fn paging_kernel_init() {
             cen = in(reg) 0x7u64,
         );
     }
-    unsafe {
-        *core::ptr::addr_of_mut!(KERNEL_ROOT_PA) = l2_pa;
-    }
-    paging_activate(&PagingRoot { l2_pa }, 0);
 }

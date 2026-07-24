@@ -28,22 +28,34 @@ pub const NAME: &str = "RISC-V 64";
 /// image (checked against __kernel_end in frames::init).
 pub const FRAME_POOL_BASE: usize = 0x8400_0000;
 
-/// Physical <-> kernel virtual address. RISC-V keeps the kernel identity-
-/// mapped for now (the higher-half move is a separate step), so these are the
-/// identity - the portable `phys_to_virt` seam (mm/frames, load, hw DMA) is a
-/// no-op here.
+/// Kernel linear-map offset (docs/MEMORY.md): the kernel, all MMIO, and the
+/// `.user` window run in the Sv39 high canonical half, so a physical address
+/// is reached at `pa | KERNEL_VA_BASE`. The whole low half is left to user
+/// programs. The boot trampoline builds this map before any Rust runs, and the
+/// kernel is linked at `phys_to_virt(load address)` (link/riscv64.ld). Base of
+/// the 39-bit sign-extended high half (top-half level-2 indices 256..511).
+pub const KERNEL_VA_BASE: usize = 0xFFFF_FFC0_0000_0000;
+
+/// Physical address -> kernel virtual address (the high linear map).
 #[inline(always)]
 pub fn phys_to_virt(pa: usize) -> usize {
-    pa
+    pa | KERNEL_VA_BASE
 }
+
+/// Kernel virtual address (high linear map) -> physical address.
 #[inline(always)]
 pub fn virt_to_phys(va: usize) -> usize {
-    va
+    va & !KERNEL_VA_BASE
 }
 
 // ---------------------------------------------------------------- serial
 
-const UART_BASE: usize = 0x1000_0000;
+// MMIO the kernel touches while a cell root is active (the serial UART for
+// cell stdout/stdin) must be reachable in that root; the kernel runs high, so
+// its base is a high linear-map VA (mapped supervisor in every root). Device
+// MMIO used only at boot (test-exit device, virtio, PCIe ECAM) is likewise
+// reached high for uniformity.
+const UART_BASE: usize = 0x1000_0000 | KERNEL_VA_BASE;
 const UART_THR: *mut u8 = UART_BASE as *mut u8; // transmit holding
 const UART_LSR: *mut u8 = (UART_BASE + 5) as *mut u8; // line status
 const LSR_THRE: u8 = 1 << 5; // transmit holding register empty
@@ -130,12 +142,13 @@ pub fn boot_firmware_ptr() -> usize {
     unsafe { core::ptr::addr_of!(BOOT_DTB).read() as usize }
 }
 
-/// Discover the machine from the device tree.
+/// Discover the machine from the device tree. OpenSBI passes a *physical* DTB
+/// pointer; the kernel runs high, so it is read through the high linear map.
 pub fn discover(inv: &mut crate::hw::Inventory) {
     let dtb = boot_firmware_ptr();
     if dtb != 0 {
         inv.firmware = crate::hw::Firmware::DeviceTree;
-        crate::hw::fdt::parse(dtb, inv);
+        crate::hw::fdt::parse(phys_to_virt(dtb), inv);
     }
 }
 
@@ -190,8 +203,8 @@ fn contains_ci(hay: &str, needle: &str) -> bool {
 
 // ---------------------------------------------------- virtio-mmio slots
 // QEMU riscv `virt`: 8 virtio-mmio transports at 0x1000_1000, stride 0x1000
-// (within the 0..1 GiB MMIO gigapage the kernel maps).
-pub const VIRTIO_MMIO_BASE: usize = 0x1000_1000;
+// (within the 0..1 GiB MMIO gigapage the kernel maps high).
+pub const VIRTIO_MMIO_BASE: usize = 0x1000_1000 | KERNEL_VA_BASE;
 pub const VIRTIO_MMIO_STRIDE: usize = 0x1000;
 pub const VIRTIO_MMIO_COUNT: usize = 8;
 
@@ -222,7 +235,7 @@ pub fn pci_cfg_read32(ecam: u64, bus: u8, dev: u8, func: u8, off: u16) -> u32 {
         + ((dev as u64) << 15)
         + ((func as u64) << 12)
         + (off as u64 & 0xFFC);
-    unsafe { (a as *const u32).read_volatile() }
+    unsafe { (phys_to_virt(a as usize) as *const u32).read_volatile() }
 }
 
 /// PCI config write through the ECAM window (RISC-V has no config ports).
@@ -232,7 +245,7 @@ pub fn pci_cfg_write32(ecam: u64, bus: u8, dev: u8, func: u8, off: u16, val: u32
         + ((dev as u64) << 15)
         + ((func as u64) << 12)
         + (off as u64 & 0xFFC);
-    unsafe { (a as *mut u32).write_volatile(val) }
+    unsafe { (phys_to_virt(a as usize) as *mut u32).write_volatile(val) }
 }
 
 // -------------------------------------------------------------- user mode
@@ -401,7 +414,7 @@ pub unsafe fn context_init(stack_top: *mut u8, entry: extern "C" fn() -> !) -> s
 /// sifive_test device at 0x10_0000: 0x5555 = pass (QEMU exits 0),
 /// (code << 16) | 0x3333 = fail (QEMU exits with the code).
 pub fn exit(code: super::ExitCode) -> ! {
-    const TEST_DEVICE: *mut u32 = 0x10_0000 as *mut u32;
+    const TEST_DEVICE: *mut u32 = (0x10_0000 | KERNEL_VA_BASE) as *mut u32;
     let value: u32 = match code {
         super::ExitCode::Success => 0x5555,
         super::ExitCode::Failure => (1 << 16) | 0x3333,
