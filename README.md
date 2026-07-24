@@ -59,9 +59,12 @@ cargo xtask test --arch all
 Every test kernel is booted headless with a timeout: the boot demo, the
 capability-invariants suite, the queue-pipeline scenario, `isolation-hw`
 (real user-mode cells whose isolation is enforced by the MMU faulting),
-the resource-object suite, `shell-smoke`, and `hwinfo` (hardware discovery:
+the resource-object suite, `shell-smoke`, `hwinfo` (hardware discovery:
 firmware source, CPU features, typed memory map, NUMA topology, PCIe
-devices). Each reports pass/fail through a QEMU exit device, so the result
+devices), `rng` (the ChaCha20 DRBG), and `runtime` (the strand async
+runtime: heap/`alloc`, executor, async channel, type-level capability
+rights, and native async over the real queue-pair ABI). Each reports
+pass/fail through a QEMU exit device, so the result
 is the process exit code - the same check CI runs on every push. Serial
 output is saved to `target/qemu-<arch>-<bin>.log`.
 

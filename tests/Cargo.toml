@@ -9,6 +9,7 @@ edition = "2024"
 
 [dependencies]
 kernel = { path = "../kernel" }
+runtime = { path = "../runtime" }
 
 [[bin]]
 name = "cap-invariants"
@@ -37,6 +38,10 @@ path = "src/hwinfo.rs"
 [[bin]]
 name = "rng"
 path = "src/rng.rs"
+
+[[bin]]
+name = "runtime"
+path = "src/runtime.rs"
 
 [[bin]]
 name = "shell-smoke"

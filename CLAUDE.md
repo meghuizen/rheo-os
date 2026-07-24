@@ -52,6 +52,24 @@ processing accelerator (NPU/TPU, PCI base class 0x12). The `hwinfo` test
 kernel asserts the basics on all three ISAs; `cargo xtask run --bin hwinfo`
 prints the full inventory.
 
+The **strand runtime** (`runtime/`, BUILD-ORDER.md step 7,
+docs/CONCURRENCY.md) is the userspace library that brings native async and
+`alloc` on the OS's own terms - not a POSIX threading port. It has a
+free-list **heap allocator** (`GlobalAlloc`, host-fuzzed) so `alloc`
+collections (Box/Vec/String/BTreeMap) work in a cell (the kernel itself is
+allocation-free); an async **executor** where a *strand* is a `Future` that
+"blocks" structurally by parking on a token and is woken by the queue-pair
+completion carrying that token in `user_data` - one drained completion ring,
+N strands resumed, no blocking syscall; an async **channel** (park on empty,
+wake on send); and **capability rights at the type level**
+(KERNEL-RUST.md 2: `Rights<MASK>` + `SubsetOf`, so widening a capability's
+rights is a compile error). The `runtime` test kernel exercises all of it -
+including strands doing I/O over the real queue-pair ABI - on all three ISAs.
+Full Rust (generics, traits, async/await) runs natively; the runtime is
+proven kernel-context here, and the same library links into a U-mode cell
+(that last integration - a `.user` heap grant + `mem*` shims - is future
+work, the shell shows the U-mode constraints).
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
 proofs, and the hardware-lab performance numbers. **SMP secondary-core
@@ -114,12 +132,13 @@ kernel/       the no_std kernel library + boot demo bin
   arch/       per-ISA assembly (boot, vectors/traps, context switch, user)
   link/       linker scripts per ISA (incl. the .user text/rodata/data window)
 tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
-              isolation-hw, resources, shell-smoke, hwinfo, bench-core, and
-              the interactive lsh bin (+ harness.rs for user-mode cells)
+              isolation-hw, resources, shell-smoke, hwinfo, rng, runtime,
+              bench-core, and the interactive lsh bin (+ harness.rs)
 comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md
 xtask/        build/run/test/bench orchestration (cargo xtask ...)
 idl/          system IDL + codegen        (future, step 6)
-runtime/      strand runtime library      (future, step 7)
+runtime/      strand runtime: heap (alloc), async executor + channel,
+              type-level capability rights (BUILD-ORDER step 7)
 services/     system service cells        (future, phase 5)
 targets/      custom target JSON          (only if built-in targets fail)
 ```

@@ -87,6 +87,15 @@ get built and proven early, because retrofitting trust is impossible
 - Unlocks: real concurrency, light threads, the async model end to end.
 - Done when: strand spawn/switch (P4) and same-cell context switch (P3) trend
   correctly; a runaway strand is preempted by the doorbell (CONCURRENCY.md 4).
+- **Status (in progress):** the `runtime/` crate implements the core strand
+  model - a `Future`-based executor whose strands park on a token and are
+  woken by the queue-pair completion carrying it (async on the real queue-pair
+  ABI), an async channel, a heap allocator so `alloc` works in a cell, and
+  capability rights at the type level. Proven kernel-context on all three ISAs
+  (`runtime` test kernel). Still ahead: multiple vcores + granting, the
+  preemption doorbell (needs the timer/IRQ path), scheduler-activation
+  notifications, and running the runtime inside a U-mode cell (a `.user` heap
+  grant + `mem*` shims). Stackful strands and the P4 bench also pending.
 
 ## Phase 3 - Time, memory, and eyes
 

@@ -3,6 +3,15 @@
 **Status:** Draft v0.1. Expands ARCHITECTURE.md 4.3; pairs with SCHEDULING.md
 (which schedules the vcores these strands run on).
 
+**Implemented (section 1):** the `runtime/` crate has the strand executor -
+strands are `Future`s, "blocking" is a park on a token, and the queue-pair
+completion carrying that token in `user_data` is what unparks the strand (one
+drained completion ring, N strands resumed). An async channel is park/wake on
+top. Proven on all three ISAs by the `runtime` test kernel (single-vcore,
+kernel-context). Deferred: multiple vcores + granting, the preemption doorbell
+(section 4, needs the timer/IRQ path), stackful strands (section 2), and
+vcore-local storage.
+
 Position: threads get light by splitting in two. The kernel schedules
 **vcores** (one kernel context each); the runtime inside a cell schedules
 **strands** - user-level threads costing ~200 bytes, spawned in the

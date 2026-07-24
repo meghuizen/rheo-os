@@ -1,0 +1,11 @@
+[package]
+name = "runtime"
+version = "0.1.0"
+edition = "2024"
+
+# The strand runtime (docs/BUILD-ORDER.md step 7, docs/CONCURRENCY.md): the
+# userspace library a cell links against for native async and the heap that
+# backs `alloc`. Dependency-free and `no_std + alloc`; the OS binding (the
+# queue-pair reactor) is injected by the caller via complete(token).
+
+[dependencies]

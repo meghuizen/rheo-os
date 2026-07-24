@@ -144,6 +144,19 @@ pub fn trap_init() {
         };
         asm!("lidt [{}]", in(reg) &pointer);
     }
+    mask_legacy_pic();
+}
+
+/// Mask every line on the legacy 8259 PIC. Under PVH there is no firmware to
+/// remap or disable it, and the kernel uses no legacy IRQs (the serial line is
+/// polled), so an unmasked PIT IRQ0 would be delivered on vector 0x08 - the
+/// #DF slot. Mask master and slave so nothing is delivered.
+fn mask_legacy_pic() {
+    // SAFETY: writing the PIC OCW1 mask registers; no memory effects.
+    unsafe {
+        outb(0xA1, 0xFF); // slave data
+        outb(0x21, 0xFF); // master data
+    }
 }
 
 static DOORBELLS: AtomicU64 = AtomicU64::new(0);
@@ -366,7 +379,14 @@ pub fn trapframe_new(entry: usize, user_sp: usize, arg: usize, kernel_sp: usize)
         r14: 0,
         r15: 0,
         rip: entry as u64,
-        rflags: 0x202, // IF set, reserved bit 1
+        // Reserved bit 1 only; IF stays *clear*. The kernel has no interrupt
+        // handlers yet (the preemption doorbell is future work, CONCURRENCY.md
+        // 4) and under PVH there is no firmware to remap the 8259 PIC, so a
+        // legacy IRQ (the PIT's IRQ0) would arrive on vector 0x08 and be
+        // mistaken for a #DF. Cells are cooperative and trap-driven, so
+        // masking interrupts in U-mode is correct until real IRQ handling
+        // lands. The PIC is also masked at boot (see mask_legacy_pic).
+        rflags: 0x002,
         rsp: user_sp as u64,
         kernel_sp: kernel_sp as u64,
         _pad: 0,

@@ -11,7 +11,12 @@ name = "qemu-tests"
 version = "0.1.0"
 dependencies = [
  "kernel",
+ "runtime",
 ]
+
+[[package]]
+name = "runtime"
+version = "0.1.0"
 
 [[package]]
 name = "xtask"
