@@ -10,6 +10,7 @@ edition = "2024"
 [dependencies]
 kernel = { path = "../kernel" }
 runtime = { path = "../runtime" }
+posix = { path = "../posix" }
 
 [[bin]]
 name = "cap-invariants"
@@ -42,6 +43,10 @@ path = "src/rng.rs"
 [[bin]]
 name = "runtime"
 path = "src/runtime.rs"
+
+[[bin]]
+name = "posix"
+path = "src/posix.rs"
 
 [[bin]]
 name = "shell-smoke"

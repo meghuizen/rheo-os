@@ -7,10 +7,15 @@ name = "kernel"
 version = "0.1.0"
 
 [[package]]
+name = "posix"
+version = "0.1.0"
+
+[[package]]
 name = "qemu-tests"
 version = "0.1.0"
 dependencies = [
  "kernel",
+ "posix",
  "runtime",
 ]
 

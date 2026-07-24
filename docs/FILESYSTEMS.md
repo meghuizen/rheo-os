@@ -2,6 +2,25 @@
 
 **Status:** Draft v0.1. Expands ARCHITECTURE.md 4.6.
 
+**Implemented (`posix/` crate):** a VFS translation layer (`FileSystem`
+trait), a read-write **ramfs**, and a read-only **ext4** driver (Tier 1)
+that parses a real ext4 image - superblock, block-group descriptors, inodes,
+the extent tree, linear directories. It is host-validated against a
+`mkfs.ext4` image and read in-QEMU from an embedded image (there is no block
+driver yet). A mount table gives the per-session `/` (section 3), and the
+POSIX fd surface + a `std::fs` facade sit on top (POSIX-PERSONALITY.md).
+Proven on all three ISAs by the `posix` test kernel.
+
+**Route to live disk (the honest next step, not yet built):** a **virtio-blk
+driver** (MMIO on arm/riscv virt, PCI on x86) exposing a **`BlockDevice`**
+trait behind the same VFS. At that seam, existing Rust filesystem drivers -
+`redoxfs` (Redox OS), `fatfs`, a read/write ext4 crate - can be *dropped in*
+rather than hand-written, so we do not reimplement every on-disk format. The
+constraint is this repo's no-dependencies rule: any such crate must be named
+in a doc and ideally vendored/audited, since a filesystem driver parses
+untrusted on-disk data. Write support for ext4 (journaling, allocation) is
+deferred behind that block-device work.
+
 Position: there is no global filesystem tree in the native model - storage is
 a **capability-scoped object store**, and "filesystems" are either views over
 it or translation layers around legacy formats. Three tiers, each with an

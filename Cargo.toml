@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["kernel", "runtime", "tests", "xtask"]
+members = ["kernel", "posix", "runtime", "tests", "xtask"]
 # Plain `cargo build` only builds the host-side xtask tool.
 # The kernel needs a bare-metal --target and is built via `cargo xtask build`.
 default-members = ["xtask"]

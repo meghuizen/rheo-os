@@ -83,6 +83,23 @@ lengths (`bench` `p4_*`): ~450 instructions to spawn+tear down, ~150 to
 switch, consistent across ISAs. (.NET 10 is not installed here, so it is left
 unmeasured with an architectural note rather than a fabricated number.)
 
+A **POSIX + filesystem stack** (`posix/`, docs/FILESYSTEMS.md,
+POSIX-PERSONALITY.md) sits on a **VFS** translation layer (a `FileSystem`
+trait): a read-write **ramfs** (the working store), a read-only **ext4**
+driver that parses a real ext4 image (superblock, block-group descriptors,
+inodes, the extent tree, linear dirs - host-validated and read in-QEMU from
+an embedded 512 KiB image, since there is no block driver yet), a mount
+table + path resolution (the per-session `/`), the **POSIX fd surface**
+(`open/read/write/close/lseek/stat/getdents/mkdir/unlink` with errno), and a
+**`std::fs`-shaped facade** (`File`, `OpenOptions`, `read`/`write`/
+`read_to_string`, `read_dir`, `metadata`) so standard-library file code runs
+natively. The `posix` test kernel exercises ramfs rw, ext4 ro (incl. a
+multi-block file), the errno surface, and the std facade on all three ISAs.
+The route to *live-disk* filesystems is a **virtio-blk driver + a
+`BlockDevice` trait** behind the same VFS, at which point existing Rust FS
+drivers (redoxfs, fatfs, a read/write ext4 crate) can be dropped in rather
+than hand-written - gated by the no-deps rule (a doc must name any crate).
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
 proofs, and the hardware-lab performance numbers. **SMP secondary-core
@@ -146,7 +163,8 @@ kernel/       the no_std kernel library + boot demo bin
   link/       linker scripts per ISA (incl. the .user text/rodata/data window)
 tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               isolation-hw, resources, shell-smoke, hwinfo, rng, runtime,
-              bench-core, and the interactive lsh bin (+ harness.rs)
+              posix, bench-core, and the interactive lsh bin (+ harness.rs);
+              fixtures/ holds the ext4 test image (+ gen-ext4.sh)
 comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md
 xtask/        build/run/test/bench orchestration (cargo xtask ...)
 idl/          system IDL + codegen        (future, step 6)

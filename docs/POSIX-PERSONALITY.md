@@ -2,6 +2,15 @@
 
 **Status:** Draft v0.1. Expands ARCHITECTURE.md 4.12 and doctrine 10.
 
+**Implemented (`posix/` crate):** the filesystem half of the personality -
+the POSIX file syscall surface (`open`/`read`/`write`/`close`/`lseek`/
+`stat`/`getdents`/`mkdir`/`unlink`, errno) over the VFS, the per-session `/`
+mount table (section 3), and a `std::fs`-shaped facade so standard-library
+file code runs unchanged. Proven on all three ISAs (`posix` test kernel).
+Deferred: processes/fork/exec, signals, mmap, `/proc`+`/sys`, and hosting an
+unmodified Linux binary in a personality cell (needs the runtime-in-U-mode
+integration).
+
 Position: POSIX is a **compatibility personality at the edge**, never the
 native model (the mistake Hurd made). It is a translation layer - gVisor-
 style - implementing POSIX syscalls over cells, capabilities, and queues, so

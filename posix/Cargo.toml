@@ -1,0 +1,11 @@
+[package]
+name = "posix"
+version = "0.1.0"
+edition = "2024"
+
+# The POSIX personality + filesystem stack (docs/POSIX-PERSONALITY.md,
+# docs/FILESYSTEMS.md): a VFS translation layer, a read-write ramfs, a
+# read-only ext4 driver, the POSIX fd syscall surface, and a std::fs-shaped
+# facade. no_std + alloc, dependency-free.
+
+[dependencies]

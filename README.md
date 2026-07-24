@@ -61,10 +61,12 @@ capability-invariants suite, the queue-pipeline scenario, `isolation-hw`
 (real user-mode cells whose isolation is enforced by the MMU faulting),
 the resource-object suite, `shell-smoke`, `hwinfo` (hardware discovery:
 firmware source, CPU features, typed memory map, NUMA topology, PCIe
-devices), `rng` (the ChaCha20 DRBG), and `runtime` (the strand async
-runtime: heap/`alloc`, executor, async channel, type-level capability
-rights, and native async over the real queue-pair ABI). Each reports
-pass/fail through a QEMU exit device, so the result
+devices), `rng` (the ChaCha20 DRBG), `runtime` (the strand async runtime:
+heap/`alloc`, executor, async channel, type-level capability rights, native
+async over the real queue-pair ABI), and `posix` (the filesystem + POSIX
+stack: a read-write ramfs and a read-only ext4 image behind a VFS, the
+POSIX fd surface, and a `std::fs` facade). Each reports pass/fail through a
+QEMU exit device, so the result
 is the process exit code - the same check CI runs on every push. Serial
 output is saved to `target/qemu-<arch>-<bin>.log`.
 
