@@ -61,12 +61,25 @@ EDITS = [
         '    target_os = "zkvm" => {\n        mod zkvm;\n        use zkvm as imp;\n    }\n}\n\npub use imp::{alloc, dealloc, realloc};',
         '    target_os = "zkvm" => {\n        mod zkvm;\n        use zkvm as imp;\n    }\n    target_os = "rheo" => {\n        mod rheo;\n        use rheo as imp;\n    }\n}\n\npub use imp::{alloc, dealloc, realloc};',
     ),
+    # rheo stdio arm (real fd 0/1/2; module file copied in by COPIES).
+    (
+        "stdio/mod.rs",
+        '    target_os = "zkvm" => {\n        mod zkvm;\n        pub use zkvm::*;\n    }\n    _ => {\n        mod unsupported;\n        pub use unsupported::*;\n    }',
+        '    target_os = "zkvm" => {\n        mod zkvm;\n        pub use zkvm::*;\n    }\n    target_os = "rheo" => {\n        mod rheo;\n        pub use rheo::*;\n    }\n    _ => {\n        mod unsupported;\n        pub use unsupported::*;\n    }',
+    ),
+    # rheo process::exit -> SYS_EXIT_GROUP (instead of aborting).
+    (
+        "exit.rs",
+        '        target_os = "xous" => {\n            crate::os::xous::ffi::exit(code as u32)\n        }\n        _ => {\n            let _ = code;\n            crate::intrinsics::abort()\n        }',
+        '        target_os = "xous" => {\n            crate::os::xous::ffi::exit(code as u32)\n        }\n        target_os = "rheo" => {\n            // rheo-os: leave U-mode via SYS_EXIT_GROUP (docs/USERLAND.md M4).\n            unsafe {\n                #[cfg(target_arch = "riscv64")]\n                core::arch::asm!("ecall", in("a7") 22u64, in("a0") code as u64, options(noreturn, nostack));\n                #[cfg(target_arch = "aarch64")]\n                core::arch::asm!("svc #0", in("x8") 22u64, in("x0") code as u64, options(noreturn, nostack));\n                #[cfg(target_arch = "x86_64")]\n                core::arch::asm!("syscall", in("rax") 22u64, in("rdi") code as u64, options(noreturn, nostack));\n            }\n        }\n        _ => {\n            let _ = code;\n            crate::intrinsics::abort()\n        }',
+    ),
 ]
 
 # rheo `sys` module files this repo owns, copied into the std tree.
 # (repo-relative source, std-sys-relative destination)
 COPIES = [
     ("std-rheo/alloc.rs", "alloc/rheo.rs"),
+    ("std-rheo/stdio.rs", "stdio/rheo.rs"),
 ]
 
 # The no_threads sync/TLS impls compile_error on targets that "have threads"

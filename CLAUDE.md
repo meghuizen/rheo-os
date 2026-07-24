@@ -136,13 +136,17 @@ translation layer with `crt0` (`_start`), a heap over `SYS_MMAP` wired as the
 global allocator (so Rust `alloc` works) plus C `malloc`/`free`, fd-based I/O
 wrappers, and `println!` (the `libcrun` test runs `libcdemo`, which builds a
 `Vec`, round-trips C `malloc`, formats output, and reads a file via the VFS).
-A **custom Rust target + std port** is in progress (M4): real `std` compiles
-and links for a `rheo-os` target (`targets/rheo_os-*.json`, `os = "rheo"`) via
-a repo-held, idempotent rust-src patch (`cargo xtask std-patch`,
-`targets/patch-std.py` + `targets/std-rheo/`) - std routes rheo to the
-single-threaded portable fallbacks (SMP is deferred) with a real hole-list
-allocator over `SYS_MMAP`; a *running* std program still needs a crt0 `_start`
-and the rheo `stdio`/`process`/`fs` sys arms. Then coreutils (M5). Also built
+A **custom Rust target + std port** works (M4): real `std` compiles, links,
+and **runs on the OS on all three ISAs** - a std program using
+`String`/`Vec`/`format!`/`println!` returning an `ExitCode` (the `stdrun`
+test). The `rheo-os` targets (`targets/rheo_os-*.json`, `os = "rheo"`,
+soft-float) build std via a repo-held, idempotent rust-src patch
+(`cargo xtask std-patch`, `targets/patch-std.py` + `targets/std-rheo/`): std
+routes rheo to the single-threaded portable fallbacks (SMP deferred) with real
+rheo arms for the heap (a hole-list allocator over `SYS_MMAP`), non-blocking
+`stdio` (fds over the M2 syscalls), and `process::exit` (`SYS_EXIT_GROUP`); a
+crt0 (`rheo-rt`) provides `_start`. Float-heavy programs await U-mode FP/SIMD
+enablement. Next: coreutils (M5). Also built
 alongside as an M4-prep workload: **rheo-json** (`json/`), a dependency-free
 zero-copy JSON parser that runs on the OS and is benchmarked against simdjson
 (docs/JSON.md).

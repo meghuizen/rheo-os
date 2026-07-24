@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "rheo-rt"
+version = "0.1.0"
+
+[[package]]
 name = "rheo-std-hello"
 version = "0.1.0"
+dependencies = [
+ "rheo-rt",
+]

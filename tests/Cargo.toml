@@ -69,6 +69,10 @@ name = "jsonrun"
 path = "src/jsonrun.rs"
 
 [[bin]]
+name = "stdrun"
+path = "src/stdrun.rs"
+
+[[bin]]
 name = "shell-smoke"
 path = "src/shell_smoke.rs"
 

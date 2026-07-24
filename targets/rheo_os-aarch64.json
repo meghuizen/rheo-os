@@ -1,0 +1,24 @@
+{
+  "abi": "softfloat",
+  "rustc-abi": "softfloat",
+  "arch": "aarch64",
+  "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32",
+  "eh-frame-header": false,
+  "executables": true,
+  "features": "+v8a,+strict-align,-neon",
+  "linker": "rust-lld",
+  "linker-flavor": "gnu-lld",
+  "llvm-target": "aarch64-unknown-none",
+  "max-atomic-width": 128,
+  "metadata": {
+    "description": "rheo-os on ARM64 (soft-float)",
+    "host_tools": false,
+    "std": true,
+    "tier": 3
+  },
+  "os": "rheo",
+  "panic-strategy": "abort",
+  "relocation-model": "static",
+  "target-pointer-width": 64,
+  "vendor": "unknown"
+}

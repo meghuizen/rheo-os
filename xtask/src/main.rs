@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 15] = [
+const TEST_KERNELS: [&str; 16] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -37,6 +37,7 @@ const TEST_KERNELS: [&str; 15] = [
     "posixrun",
     "libcrun",
     "jsonrun",
+    "stdrun",
 ];
 
 /// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
@@ -292,8 +293,36 @@ fn build_userland(arch: Arch) -> bool {
     matches!(cmd.status().map(|s| s.success()), Ok(true))
 }
 
+/// Build the real-std proof program (targets/std-rheo/hello) for the rheo-os
+/// target of `arch`, so the `stdrun` test can embed it (docs/USERLAND.md M4).
+/// Applies the rust-src std patch first (idempotent). Uses `-Zbuild-std=std`
+/// against the custom JSON target.
+fn build_std_hello(arch: Arch) -> bool {
+    if !std_patch() {
+        return false;
+    }
+    println!("[xtask] building std proof program for {}", arch.name());
+    let target = format!("targets/rheo_os-{}.json", arch.name());
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "build",
+        "--manifest-path",
+        "targets/std-rheo/hello/Cargo.toml",
+        "--release",
+        "--target",
+        &target,
+        "-Zbuild-std=std,panic_abort",
+        "-Zbuild-std-features=compiler-builtins-mem",
+        "-Zjson-target-spec",
+    ]);
+    matches!(cmd.status().map(|s| s.success()), Ok(true))
+}
+
 fn build(arch: Arch, release: bool) -> bool {
     if !build_userland(arch) {
+        return false;
+    }
+    if !build_std_hello(arch) {
         return false;
     }
     println!("[xtask] building kernels for {}", arch.name());

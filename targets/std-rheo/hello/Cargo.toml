@@ -12,6 +12,9 @@ edition = "2021"
 # Excluded from the workspace: it needs the custom target + build-std, so a
 # plain host `cargo build` cannot compile it.
 
+[dependencies]
+rheo-rt = { path = "../rheo-rt" }
+
 [profile.dev]
 panic = "abort"
 [profile.release]

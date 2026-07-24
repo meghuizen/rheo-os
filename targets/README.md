@@ -15,9 +15,10 @@ targets (`x86_64-unknown-none`, `aarch64-unknown-none-softfloat`,
   `no_threads` sync/TLS - sound because SMP is deferred - `generic` io errors,
   `unsupported` random) and installs a real allocator. Idempotent; the anchors
   are checked so a toolchain bump fails loudly instead of misapplying.
-- `std-rheo/` - the rheo `sys` module sources this repo owns (currently
-  `alloc.rs`, a hole-list heap over `SYS_MMAP`) that `patch-std.py` copies into
-  the std tree, plus `hello/`, a real-`std` proof program.
+- `std-rheo/` - the rheo `sys` module sources this repo owns (`alloc.rs`, a
+  hole-list heap over `SYS_MMAP`; `stdio.rs`, non-blocking fd 0/1/2 I/O) that
+  `patch-std.py` copies into the std tree, plus `rheo-rt/` (the crt0 `_start`)
+  and `hello/`, a real-`std` proof program.
 
 ## Building a std program for rheo-os
 
@@ -25,9 +26,11 @@ targets (`x86_64-unknown-none`, `aarch64-unknown-none-softfloat`,
 cargo xtask std-patch          # apply the rust-src patch (once per toolchain)
 cargo build --manifest-path targets/std-rheo/hello/Cargo.toml --release \
   --target targets/rheo_os-riscv64.json \
-  -Zbuild-std=std,panic_abort -Zjson-target-spec
+  -Zbuild-std=std,panic_abort -Zbuild-std-features=compiler-builtins-mem \
+  -Zjson-target-spec
 ```
 
-std compiles and links today. Running a std binary on the OS additionally
-needs a crt0 `_start`, the rheo `stdio`/`process`/`fs` `sys` arms over the M2
-syscalls, and U-mode FP/SIMD enablement - see docs/USERLAND.md M4.
+A std program compiles, links, and **runs on the OS on all three ISAs** - the
+`stdrun` test kernel loads and runs it (`cargo xtask test`). The targets are
+soft-float, so only float-heavy programs are gated, pending U-mode FP/SIMD
+enablement (docs/USERLAND.md M4).

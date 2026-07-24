@@ -57,20 +57,19 @@ hazard by construction.
   `libcdemo` - a program that builds a `Vec`, round-trips C `malloc`, formats
   output, and reads a file via the VFS. (C `str*` helpers and a real
   `errno`/`brk` land in M4/M5 with the C-program + std work.)
-- **M4 - Rust target + std. [in progress]** A `rheo-os` custom target JSON
-  (`targets/rheo_os-*.json`, `os = "rheo"`) and a `std` port. Real `std`
-  *compiles and links* for the target: the modern `sys` layer routes rheo to
-  the portable fallbacks (single-threaded `no_threads` sync/TLS - sound
-  because SMP is deferred - plus `generic` errors and `unsupported` random),
-  with a real rheo allocator (a hole-list heap over `SYS_MMAP`, the same
-  design as `runtime::Heap`). The patch to the vendored `rust-src` is held in
-  this repo (`targets/patch-std.py`, `targets/std-rheo/`) and applied
-  idempotently by `cargo xtask std-patch`; `targets/std-rheo/hello` is the
-  proof (`cargo build ... --target targets/rheo_os-riscv64.json
-  -Zbuild-std=std,panic_abort -Zjson-target-spec`). **Remaining to a running
-  std program:** a crt0 `_start` (call the C `main`, exit), the rheo `sys`
-  arms for `stdio`/`process`/`fs` (over the M2 syscalls), and U-mode FP/SIMD
-  enablement for float-using code - then load + run a std binary on the OS.
+- **M4 - Rust target + std. [done]** A `rheo-os` custom target
+  (`targets/rheo_os-*.json`, `os = "rheo"`, soft-float) and a real `std` port:
+  a std program **compiles, links, and runs on the OS on all three ISAs**
+  (the `stdrun` test - it uses `String`/`Vec`/`format!`/`println!` and returns
+  an `ExitCode`). The modern `sys` layer routes rheo to the portable
+  single-threaded fallbacks (SMP deferred) with real rheo arms for the heap
+  (a hole-list allocator over `SYS_MMAP`, same design as `runtime::Heap`),
+  `stdio` (fds 0/1/2 over the M2 syscalls, **non-blocking**), and
+  `process::exit` (`SYS_EXIT_GROUP`); a crt0 (`rheo-rt`) provides `_start`.
+  The `rust-src` patch is held in the repo (`targets/patch-std.py`,
+  `targets/std-rheo/`), idempotent, applied by `cargo xtask std-patch`. Only
+  **float-heavy** programs are gated - on U-mode FP/SIMD enablement - since
+  the targets are soft-float (U-mode vector state is not saved yet).
 - **M5 - coreutils.** Cross-compile a uutils/coreutils subset and run it.
 
 Each milestone builds and boots on all three ISAs before it lands.
