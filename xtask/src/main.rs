@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 12] = [
+const TEST_KERNELS: [&str; 13] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -34,6 +34,7 @@ const TEST_KERNELS: [&str; 12] = [
     "posix",
     "blockfs",
     "elfrun",
+    "posixrun",
 ];
 
 /// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk

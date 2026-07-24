@@ -76,6 +76,29 @@ pub struct DebugWrite {
     pub len: u64,
 }
 
+// ---- POSIX personality syscalls (docs/USERLAND.md M2) ----
+//
+// Multi-argument, fd-based: the arguments are read from a0..a5 (see each
+// arch's `decode_syscall`). Return values are `i64` in the return register:
+// >= 0 on success (fd / byte count / offset / base VA), or a negated errno.
+// The memory/process calls are handled in the kernel; the file calls are
+// forwarded to a registered personality handler (`svc::FileOps`).
+
+/// mmap_anon(len) -> base VA of `len` bytes of fresh zeroed RW pages (0 fails).
+pub const SYS_MMAP: u64 = 21;
+/// exit_group(code): leave U-mode, like `SYS_EXIT`.
+pub const SYS_EXIT_GROUP: u64 = 22;
+/// open(path_va, path_len, flags) -> fd or -errno.
+pub const SYS_OPEN: u64 = 23;
+/// close(fd) -> 0 or -errno.
+pub const SYS_CLOSE: u64 = 24;
+/// read(fd, buf_va, len) -> bytes read or -errno.
+pub const SYS_READ: u64 = 25;
+/// write(fd, buf_va, len) -> bytes written or -errno.
+pub const SYS_WRITE_FD: u64 = 26;
+/// lseek(fd, offset, whence) -> new offset or -errno.
+pub const SYS_LSEEK: u64 = 27;
+
 /// Shared shell I/O block, one page in the cell's `.user` data, readable
 /// and writable by the kernel through its identity mapping.
 pub const SHELL_BUF: usize = 256;

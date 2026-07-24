@@ -117,6 +117,23 @@ seam existing Rust FS drivers (redoxfs, fatfs, a read/write ext4 crate) can
 be dropped in rather than hand-written - gated by the no-deps rule (a doc
 must name any crate).
 
+A **native-userland** path is being built out so real Rust/C/C++ apps
+(eventually the uutils/coreutils) run as cells, recompiled for a rheo-os
+target over a relibc-style Rust libc (docs/USERLAND.md, milestones M1-M5).
+Done so far: an **ELF loader** (`kernel/src/elf.rs` + `load.rs`) with a
+general per-cell address space (`arch::paging_map_frame` maps an arbitrary
+user VA to an allocated frame, creating tables on demand) - a separately-
+compiled program (the `userland` crate) is loaded into a cell and run, no
+longer baked into the kernel image (the `elfrun` test); and a
+**multi-argument POSIX syscall surface** - the ABI is now
+`decode_syscall -> (nr, [u64;6])`, with kernel-native `mmap`-anon +
+`exit_group`, and fd-based `open/close/read/write/lseek` forwarded to a
+**personality handler** (`svc::FileOps`, function pointers a service
+registers) backed by the `posix/` VFS, keeping the kernel filesystem-free
+(the `posixrun` test runs a native program that reads a file over the VFS).
+Next: the libc itself (M3), a custom Rust target + std port (M4), then
+coreutils (M5).
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
 proofs, and the hardware-lab performance numbers. **SMP secondary-core
@@ -172,23 +189,27 @@ kernel/       the no_std kernel library + boot demo bin
               (frames + grants), time (clock), rng (ChaCha20 DRBG +
               hwrng seeding), event streams,
               sched (reservations), lease, engine, graph, pty, svc
-              (shell/resource syscalls), hw (ACPI/FDT/PCIe discovery +
-              the machine Inventory; block BlockDevice trait + virtio_blk
-              driver), user run loop, U-mode programs
+              (shell/resource/POSIX-file syscalls), hw (ACPI/FDT/PCIe
+              discovery + the machine Inventory; block BlockDevice trait +
+              virtio_blk driver), elf + load (ELF loader for native
+              programs), user run loop, U-mode programs
               (user_progs.rs incl. the lsh shell), abi
   src/arch/   per-ISA Rust modules incl. paging.rs (one dir per ISA)
   arch/       per-ISA assembly (boot, vectors/traps, context switch, user)
   link/       linker scripts per ISA (incl. the .user text/rodata/data window)
 tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               isolation-hw, resources, shell-smoke, hwinfo, rng, runtime,
-              posix, blockfs (live virtio-blk disk), bench-core, and the
-              interactive lsh bin (+ harness.rs); fixtures/ holds the ext4
-              test image (+ gen-ext4.sh)
+              posix, blockfs (live virtio-blk disk), elfrun (load a native
+              ELF), posixrun (native program over the POSIX syscalls),
+              bench-core, and the interactive lsh bin (+ harness.rs);
+              fixtures/ holds the ext4 test image (+ gen-ext4.sh)
 comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md
 xtask/        build/run/test/bench orchestration (cargo xtask ...)
 idl/          system IDL + codegen        (future, step 6)
 runtime/      strand runtime: heap (alloc), async executor + channel,
               type-level capability rights (BUILD-ORDER step 7)
+userland/     native U-mode programs built for a bare target and loaded
+              from an ELF (docs/USERLAND.md): hello, iodemo
 services/     system service cells        (future, phase 5)
 targets/      custom target JSON          (only if built-in targets fail)
 ```

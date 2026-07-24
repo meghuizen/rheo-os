@@ -278,8 +278,19 @@ pub fn trapframe_new(entry: usize, user_sp: usize, arg: usize, kernel_sp: usize)
     }
 }
 
-pub fn decode_syscall(frame: &TrapFrame) -> (u64, u64) {
-    (frame.regs[REG_X8], frame.regs[REG_X0])
+/// (syscall number in x8, arguments a0..a5 = x0..x5).
+pub fn decode_syscall(frame: &TrapFrame) -> (u64, [u64; 6]) {
+    (
+        frame.regs[REG_X8],
+        [
+            frame.regs[REG_X0],
+            frame.regs[REG_X0 + 1],
+            frame.regs[REG_X0 + 2],
+            frame.regs[REG_X0 + 3],
+            frame.regs[REG_X0 + 4],
+            frame.regs[REG_X0 + 5],
+        ],
+    )
 }
 
 pub fn set_syscall_ret(frame: &mut TrapFrame, value: u64) {

@@ -416,8 +416,16 @@ pub fn trapframe_new(entry: usize, user_sp: usize, arg: usize, kernel_sp: usize)
     }
 }
 
-pub fn decode_syscall(frame: &TrapFrame) -> (u64, u64) {
-    (frame.rax, frame.rdi) // number in rax, argument in rdi
+/// (syscall number in rax, arguments a0..a5). Linux-style argument
+/// registers: rdi, rsi, rdx, r10, r8, r9 (r10 not rcx, which `syscall`
+/// clobbers).
+pub fn decode_syscall(frame: &TrapFrame) -> (u64, [u64; 6]) {
+    (
+        frame.rax,
+        [
+            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+        ],
+    )
 }
 
 pub fn set_syscall_ret(frame: &mut TrapFrame, value: u64) {

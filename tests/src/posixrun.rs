@@ -1,0 +1,178 @@
+//! In-QEMU test kernel for the POSIX syscall surface (docs/USERLAND.md M2):
+//! load a native program (`userland` iodemo) that opens a file on a mounted
+//! filesystem, reads it via the fd-based `read`, writes the bytes to stdout,
+//! and exits with the byte count. The kernel forwards the file syscalls to a
+//! personality handler backed by the `posix` VFS; `mmap`/`exit_group` are
+//! kernel-native. Proves the multi-argument ABI + memory + file path.
+
+#![no_std]
+#![no_main]
+
+extern crate alloc;
+
+use alloc::rc::Rc;
+use core::mem::MaybeUninit;
+use core::ptr::addr_of_mut;
+
+use kernel::capability::{CapTable, ObjectTable};
+use kernel::mm::AddressSpace;
+use kernel::queue::QueuePair;
+use kernel::svc::{self, FileOps};
+use kernel::user::{self, Outcome};
+use kernel::{arch, load, println};
+use posix::sys::Whence;
+use posix::{RamFs, fs, mount, sys};
+
+#[global_allocator]
+static HEAP: runtime::Heap = runtime::Heap::empty();
+static mut HEAP_MEM: [u8; 2 * 1024 * 1024] = [0; 2 * 1024 * 1024];
+
+#[cfg(target_arch = "x86_64")]
+static IODEMO: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../target/x86_64-unknown-none/release/iodemo"
+));
+#[cfg(target_arch = "aarch64")]
+static IODEMO: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../target/aarch64-unknown-none-softfloat/release/iodemo"
+));
+#[cfg(target_arch = "riscv64")]
+static IODEMO: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../target/riscv64gc-unknown-none-elf/release/iodemo"
+));
+
+/// Seeded into the VFS; iodemo reads it back and exits with its length.
+const CONTENT: &[u8] = b"hello from the rheo-os VFS!\n";
+
+// The personality handler. User fds 0/1/2 are the console; 3+ map to the
+// posix fd table (offset by 3 so they never collide with the console fds).
+// Each runs in kernel context during the trap, so raw user VAs are usable.
+
+fn p_open(path_va: u64, path_len: u64, flags: u64) -> i64 {
+    let bytes = unsafe { core::slice::from_raw_parts(path_va as *const u8, path_len as usize) };
+    let Ok(path) = core::str::from_utf8(bytes) else {
+        return -22; // EINVAL
+    };
+    match sys::open(path, flags as u32) {
+        Ok(fd) => (fd + 3) as i64,
+        Err(e) => -(sys::errno(e) as i64),
+    }
+}
+
+fn p_close(fd: u64) -> i64 {
+    if fd < 3 {
+        return 0;
+    }
+    match sys::close((fd - 3) as usize) {
+        Ok(()) => 0,
+        Err(e) => -(sys::errno(e) as i64),
+    }
+}
+
+fn p_read(fd: u64, buf_va: u64, len: u64) -> i64 {
+    if fd < 3 {
+        return 0; // no stdin in M2
+    }
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_va as *mut u8, len as usize) };
+    match sys::read((fd - 3) as usize, buf) {
+        Ok(n) => n as i64,
+        Err(e) => -(sys::errno(e) as i64),
+    }
+}
+
+fn p_write(fd: u64, buf_va: u64, len: u64) -> i64 {
+    let buf = unsafe { core::slice::from_raw_parts(buf_va as *const u8, len as usize) };
+    if fd == 1 || fd == 2 {
+        for &b in buf {
+            arch::serial_write_byte(b);
+        }
+        return len as i64;
+    }
+    if fd < 3 {
+        return -9; // EBADF (stdin)
+    }
+    match sys::write((fd - 3) as usize, buf) {
+        Ok(n) => n as i64,
+        Err(e) => -(sys::errno(e) as i64),
+    }
+}
+
+fn p_lseek(fd: u64, off: i64, whence: u64) -> i64 {
+    if fd < 3 {
+        return -9; // EBADF
+    }
+    let w = match whence {
+        0 => Whence::Set,
+        1 => Whence::Cur,
+        _ => Whence::End,
+    };
+    match sys::lseek((fd - 3) as usize, off, w) {
+        Ok(o) => o as i64,
+        Err(e) => -(sys::errno(e) as i64),
+    }
+}
+
+static mut OBJECTS: ObjectTable = ObjectTable::new();
+static mut CAPS: CapTable = CapTable::new();
+static mut QP: MaybeUninit<QueuePair> = MaybeUninit::uninit();
+
+#[repr(align(16))]
+struct KStack([u8; 64 * 1024]);
+static mut KSTACK: KStack = KStack([0; 64 * 1024]);
+
+#[unsafe(no_mangle)]
+extern "C" fn kernel_main() -> ! {
+    arch::init();
+    println!("posixrun: start on {}", arch::NAME);
+
+    // SAFETY: once, before any allocation.
+    unsafe {
+        HEAP.init(addr_of_mut!(HEAP_MEM) as usize, 2 * 1024 * 1024);
+    }
+
+    // A ramfs at / with one seeded file, and the personality wired up.
+    posix::reset();
+    mount::mount("/", Rc::new(RamFs::new()));
+    fs::write("/hello.txt", CONTENT).expect("seed /hello.txt");
+    svc::set_file_ops(FileOps {
+        open: p_open,
+        close: p_close,
+        read: p_read,
+        write: p_write,
+        lseek: p_lseek,
+    });
+
+    let mut aspace = AddressSpace::new(1);
+    let entry = load::load_elf(IODEMO, &mut aspace).expect("load iodemo ELF");
+    let stack_top = load::map_stack(&mut aspace);
+    println!("posixrun: loaded iodemo, entry {entry:#x}");
+
+    // SAFETY: single-threaded init; the statics outlive the run.
+    let outcome = unsafe {
+        let kernel_sp = core::ptr::addr_of!(KSTACK.0) as usize + 64 * 1024;
+        let mut frame = arch::trapframe_new(entry, stack_top, 0, kernel_sp);
+        let objects = &mut *addr_of_mut!(OBJECTS);
+        let caps = &mut *addr_of_mut!(CAPS);
+        let qp = core::ptr::addr_of!(QP) as *const QueuePair;
+        user::reset();
+        user::install(0, &aspace, caps, objects, qp, addr_of_mut!(frame));
+        user::run(0).1
+    };
+
+    match outcome {
+        Outcome::Exited(code) => {
+            assert!(
+                code == CONTENT.len() as u64,
+                "iodemo exited {code}, expected {} (file length)",
+                CONTENT.len()
+            );
+            println!("posixrun: iodemo read {code} bytes via the VFS and exited OK");
+        }
+        Outcome::Faulted(addr) => panic!("iodemo faulted at {addr:#x}"),
+    }
+
+    println!("posixrun: PASS");
+    arch::exit(arch::ExitCode::Success)
+}

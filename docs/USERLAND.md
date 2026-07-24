@@ -35,13 +35,21 @@ hazard by construction.
 
 ## Milestones
 
-- **M1 - loader + address space.** An ELF64 loader and a general per-cell
-  address space (map an arbitrary user VA to an allocated frame, not just the
-  fixed window). Load a separately-compiled freestanding Rust ELF into a cell
-  and run it (write a line, exit with a known code). Proves the whole path.
-- **M2 - syscall surface.** Grow the ABI from the ~20 bespoke calls to a
-  multi-argument POSIX set (`open/read/write/close/lseek/stat/getdents/
-  mmap/brk/exit_group/...`) routed to the `posix/` VFS + kernel objects.
+- **M1 - loader + address space. [done]** An ELF64 loader and a general
+  per-cell address space (map an arbitrary user VA to an allocated frame, not
+  just the fixed window). Loads a separately-compiled freestanding Rust ELF
+  into a cell and runs it (`elfrun` test).
+- **M2 - syscall surface. [done]** A multi-argument syscall ABI
+  (`decode_syscall -> (nr, [u64;6])` on all three ISAs), kernel-native memory
+  and process calls (`mmap`-anon bump allocator, `exit_group`), and fd-based
+  file calls (`open/close/read/write/lseek`) forwarded to a **personality
+  handler** (`svc::FileOps`) - function pointers a service/test registers,
+  keeping the kernel free of a filesystem dependency. The handler runs in
+  kernel context during the trap (user memory accessible) and is backed by
+  the `posix/` VFS. The `posixrun` test loads a native program that opens a
+  file, `mmap`s a buffer, reads the file, echoes it to stdout, and exits with
+  the byte count. (`stat`/`getdents` and a real `brk` are folded into M3 as
+  the libc needs them.)
 - **M3 - libc.** A Rust libc (relibc-style): `crt0`/`_start`, `malloc`
   (over `brk`/`mmap`), `string.h`, `stdio`, `errno`, and the syscall stubs.
 - **M4 - Rust target + std.** A `rheo-os` custom target JSON and a std `sys`

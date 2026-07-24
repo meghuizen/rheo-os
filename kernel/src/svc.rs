@@ -37,7 +37,8 @@ fn events() -> &'static mut EventStream {
 
 /// Handle a shell/resource syscall. Returns Some(ret) if this module owns
 /// the number, None otherwise (the caller faults the cell).
-pub fn handle(nr: u64, arg: u64) -> Option<u64> {
+pub fn handle(nr: u64, args: &[u64; 6]) -> Option<u64> {
+    let arg = args[0];
     match nr {
         SYS_READLINE => Some(read_line(arg)),
         SYS_WRITE => Some(write(arg)),
@@ -83,8 +84,47 @@ pub fn handle(nr: u64, arg: u64) -> Option<u64> {
             Some(0)
         }
         SYS_DEBUG_WRITE => Some(debug_write(arg)),
+        // POSIX file syscalls (docs/USERLAND.md M2): forwarded to the
+        // registered personality handler. The handler runs in kernel context
+        // with user-memory access enabled, so it takes raw user VAs. Returns
+        // None (faults the cell) if no personality is installed.
+        SYS_OPEN => file_ops().map(|o| (o.open)(args[0], args[1], args[2]) as u64),
+        SYS_CLOSE => file_ops().map(|o| (o.close)(args[0]) as u64),
+        SYS_READ => file_ops().map(|o| (o.read)(args[0], args[1], args[2]) as u64),
+        SYS_WRITE_FD => file_ops().map(|o| (o.write)(args[0], args[1], args[2]) as u64),
+        SYS_LSEEK => file_ops().map(|o| (o.lseek)(args[0], args[1] as i64, args[2]) as u64),
         _ => None,
     }
+}
+
+/// The POSIX personality's file operations (docs/USERLAND.md M2). In the full
+/// design these live in a service cell reached over a queue pair; for M2 they
+/// are function pointers a test/service registers, keeping the kernel free of
+/// any filesystem dependency. Each runs in kernel context during the trap and
+/// takes raw user VAs (readable/writable there). A negative return is
+/// `-errno`.
+#[derive(Copy, Clone)]
+pub struct FileOps {
+    pub open: fn(path_va: u64, path_len: u64, flags: u64) -> i64,
+    pub close: fn(fd: u64) -> i64,
+    pub read: fn(fd: u64, buf_va: u64, len: u64) -> i64,
+    pub write: fn(fd: u64, buf_va: u64, len: u64) -> i64,
+    pub lseek: fn(fd: u64, off: i64, whence: u64) -> i64,
+}
+
+static mut FILE_OPS: Option<FileOps> = None;
+
+/// Install the POSIX personality handler (called once at boot by the cell
+/// that provides the filesystem view).
+pub fn set_file_ops(ops: FileOps) {
+    unsafe {
+        *core::ptr::addr_of_mut!(FILE_OPS) = Some(ops);
+    }
+}
+
+fn file_ops() -> Option<&'static FileOps> {
+    // SAFETY: set once at boot, read-only afterwards.
+    unsafe { (*core::ptr::addr_of!(FILE_OPS)).as_ref() }
 }
 
 /// Copy `len` bytes from a loaded program's buffer to the console

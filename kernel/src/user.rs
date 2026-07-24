@@ -11,11 +11,16 @@
 //! per-CPU scheduler, there is one CPU at this stage, and traps are
 //! synchronous, so there is no concurrent access to guard against.
 
-use crate::abi::{SYS_CYCLES, SYS_DOORBELL, SYS_EXIT, SYS_SWITCH};
-use crate::arch::{self, TrapFrame, TrapKind};
+use crate::abi::{SYS_CYCLES, SYS_DOORBELL, SYS_EXIT, SYS_EXIT_GROUP, SYS_MMAP, SYS_SWITCH};
+use crate::arch::{self, MapPerm, TrapFrame, TrapKind};
 use crate::capability::{CapTable, ObjectTable};
-use crate::mm::AddressSpace;
+use crate::mm::{AddressSpace, frames};
 use crate::queue::{self, QueuePair};
+
+/// Base VA of the per-cell anonymous mmap region (docs/USERLAND.md M2): 12 GiB,
+/// above the image (1-4 GiB) and stack (8 GiB), free in every cell root.
+const MMAP_BASE: usize = 0x3_0000_0000;
+static mut MMAP_NEXT: usize = MMAP_BASE;
 
 /// Why a cell's run ended.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -59,6 +64,36 @@ fn cells() -> &'static mut [RunCell; MAX_CELLS] {
 /// Clear the run table (call before installing a fresh set of cells).
 pub fn reset() {
     *cells() = [EMPTY; MAX_CELLS];
+    // SAFETY: single CPU, between runs.
+    unsafe {
+        *core::ptr::addr_of_mut!(MMAP_NEXT) = MMAP_BASE;
+    }
+}
+
+/// Back `len` bytes of fresh zeroed RW pages into the current cell and return
+/// the base VA (0 on empty request). A bump allocator over the anon region -
+/// the primitive the libc's malloc grows its heap with (docs/USERLAND.md M2).
+fn mmap_anon(cur: usize, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let cell = cells()[cur];
+    // SAFETY: single CPU; the running cell's address space is uniquely owned
+    // for the duration of the run, and adding not-present -> present leaf
+    // entries to the active root is safe (re-activated below to publish them).
+    let aspace = unsafe { &mut *(cell.aspace as *mut AddressSpace) };
+    let pages = len.div_ceil(frames::FRAME_SIZE);
+    let base = unsafe { *core::ptr::addr_of!(MMAP_NEXT) };
+    for i in 0..pages {
+        let pa = frames::alloc();
+        aspace.map_user_frame(base + i * frames::FRAME_SIZE, pa, MapPerm::UserRw);
+    }
+    unsafe {
+        *core::ptr::addr_of_mut!(MMAP_NEXT) = base + pages * frames::FRAME_SIZE;
+    }
+    // Publish the new mappings on the active root (fence / tlbi / cr3 reload).
+    aspace.activate();
+    base
 }
 
 /// Register a runnable cell in slot `idx`. The pointers must outlive the
@@ -133,7 +168,8 @@ pub fn on_user_trap(kind: TrapKind, fault_addr: usize, frame: *mut TrapFrame) ->
         return finish(Outcome::Faulted(fault_addr));
     }
 
-    let (nr, arg) = arch::decode_syscall(unsafe { &*frame });
+    let (nr, args) = arch::decode_syscall(unsafe { &*frame });
+    let arg = args[0];
     let cur = unsafe { *core::ptr::addr_of!(CURRENT) };
     match nr {
         SYS_DOORBELL => {
@@ -158,10 +194,15 @@ pub fn on_user_trap(kind: TrapKind, fault_addr: usize, frame: *mut TrapFrame) ->
             }
             peer_cell.frame
         }
-        SYS_EXIT => finish(Outcome::Exited(arg)),
-        // Shell / resource syscalls are handled by the system-service
+        SYS_EXIT | SYS_EXIT_GROUP => finish(Outcome::Exited(arg)),
+        SYS_MMAP => {
+            let base = mmap_anon(cur, args[0] as usize);
+            arch::set_syscall_ret(unsafe { &mut *frame }, base as u64);
+            frame
+        }
+        // Shell / resource / file syscalls are handled by the system-service
         // module; an unrecognised number faults the cell.
-        other => match crate::svc::handle(other, arg) {
+        other => match crate::svc::handle(other, &args) {
             Some(ret) => {
                 arch::set_syscall_ret(unsafe { &mut *frame }, ret);
                 frame
