@@ -1,0 +1,9 @@
+[alias]
+# `cargo xtask <cmd>` runs the build/run/test orchestrator (DEVELOPMENT.md 2).
+xtask = "run -p xtask --"
+
+# The x86_64-unknown-none target defaults to position-independent code.
+# The kernel is linked at a fixed physical address and nothing relocates it,
+# so force static relocation. code-model=small is correct for the low 2 GiB.
+[target.x86_64-unknown-none]
+rustflags = ["-C", "relocation-model=static", "-C", "code-model=small"]

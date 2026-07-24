@@ -1,0 +1,100 @@
+# CI per TOOLING.md 4 / DEVELOPMENT.md 9: on every commit, lint the code
+# and boot a test kernel headless in QEMU on all three ISAs, gating on the
+# QEMU exit code. Serial output is uploaded as a log artifact.
+#
+# QEMU runs track correctness; absolute performance numbers only gate on
+# the hardware lab (from milestone M1).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  BUILD_STD_FLAGS: -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
+
+jobs:
+  lint:
+    name: Format and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup reads rust-toolchain.toml (pinned nightly, components, targets)
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lint-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy (xtask, host)
+        run: cargo clippy -p xtask -- -D warnings
+
+      - name: clippy (kernel + test kernels, all ISAs)
+        run: |
+          for target in x86_64-unknown-none aarch64-unknown-none-softfloat riscv64gc-unknown-none-elf; do
+            cargo clippy -p kernel -p qemu-tests --target "$target" $BUILD_STD_FLAGS -- -D warnings
+          done
+
+  boot-test:
+    name: Boot test (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            qemu-package: qemu-system-x86
+          - arch: aarch64
+            qemu-package: qemu-system-arm
+          - arch: riscv64
+            qemu-package: qemu-system-misc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.qemu-package }}
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: boot-${{ matrix.arch }}-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+
+      - name: Build and boot test kernels in QEMU
+        run: cargo xtask test --arch ${{ matrix.arch }}
+
+      # Instruction-path-length benchmarks under deterministic icount
+      # (docs/TOOLING.md 4: QEMU tracks trends; wall-clock gates on the
+      # hardware lab only). Numbers land in the uploaded logs and feed
+      # comparison/RESULTS.md.
+      - name: Benchmark (icount path lengths)
+        run: cargo xtask bench --arch ${{ matrix.arch }}
+
+      - name: Upload serial logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: serial-logs-${{ matrix.arch }}
+          path: target/qemu-${{ matrix.arch }}-*.log
+          if-no-files-found: ignore

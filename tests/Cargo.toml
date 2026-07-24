@@ -1,0 +1,57 @@
+[package]
+name = "qemu-tests"
+version = "0.1.0"
+edition = "2024"
+
+# In-QEMU test kernels (docs/DEVELOPMENT.md 9): each binary boots as a
+# kernel, exercises one subsystem, and reports pass/fail through the QEMU
+# exit device. Run with `cargo xtask test` / `cargo xtask bench`.
+
+[dependencies]
+kernel = { path = "../kernel" }
+runtime = { path = "../runtime" }
+posix = { path = "../posix" }
+
+[[bin]]
+name = "cap-invariants"
+path = "src/cap_invariants.rs"
+
+[[bin]]
+name = "queue-pipeline"
+path = "src/queue_pipeline.rs"
+
+[[bin]]
+name = "bench-core"
+path = "src/bench_core.rs"
+
+[[bin]]
+name = "isolation-hw"
+path = "src/isolation_hw.rs"
+
+[[bin]]
+name = "resources"
+path = "src/resources.rs"
+
+[[bin]]
+name = "hwinfo"
+path = "src/hwinfo.rs"
+
+[[bin]]
+name = "rng"
+path = "src/rng.rs"
+
+[[bin]]
+name = "runtime"
+path = "src/runtime.rs"
+
+[[bin]]
+name = "posix"
+path = "src/posix.rs"
+
+[[bin]]
+name = "shell-smoke"
+path = "src/shell_smoke.rs"
+
+[[bin]]
+name = "lsh"
+path = "src/lsh.rs"
