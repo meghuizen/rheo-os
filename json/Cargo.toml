@@ -1,0 +1,18 @@
+[package]
+name = "rheo-json"
+version = "0.1.0"
+edition = "2024"
+
+# A dependency-free, zero-copy JSON parser (docs/JSON.md). `no_std + alloc` so
+# it runs in a cell over rheo-libc; built and correctness-tested on the host
+# (`cargo test -p rheo-json`) and benchmarked against simdjson
+# (comparison/json/). The design follows the OS's "measured runtime dispatch
+# over wide SIMD" stance (ARCHITECTURE.md 1.4): a scalar core that runs
+# everywhere, plus a SIMD structural pre-scan chosen at runtime.
+
+[features]
+# Enable the SSE2 string-scan fast path (host benchmark). Off by default, so
+# the on-OS build stays scalar until cells can run SIMD.
+simd = []
+
+[dependencies]

@@ -13,6 +13,7 @@ edition = "2024"
 
 [dependencies]
 runtime = { path = "../runtime" }
+rheo-json = { path = "../json" }
 
 [lib]
 name = "rheo_libc"
@@ -20,3 +21,7 @@ name = "rheo_libc"
 [[bin]]
 name = "libcdemo"
 path = "src/bin/libcdemo.rs"
+
+[[bin]]
+name = "jsondemo"
+path = "src/bin/jsondemo.rs"

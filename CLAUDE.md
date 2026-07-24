@@ -205,7 +205,8 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               isolation-hw, resources, shell-smoke, hwinfo, rng, runtime,
               posix, blockfs (live virtio-blk disk), elfrun (load a native
               ELF), posixrun (native program over the POSIX syscalls),
-              libcrun (a program linked against rheo-libc), bench-core, and
+              libcrun (a program linked against rheo-libc), jsonrun (a
+              program parsing JSON with rheo-json on-OS), bench-core, and
               the interactive lsh bin (+ harness.rs); fixtures/ holds the
               ext4 test image (+ gen-ext4.sh)
 comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md
@@ -216,7 +217,11 @@ runtime/      strand runtime: heap (alloc), async executor + channel,
 userland/     native U-mode programs built for a bare target and loaded
               from an ELF (docs/USERLAND.md): hello, iodemo
 libc/         rheo-libc: the Rust libc translation layer (crt0, heap +
-              allocator, malloc, fd I/O, println) + the libcdemo program
+              allocator, malloc, fd I/O, println) + the libcdemo/jsondemo
+              programs
+json/         rheo-json: a dependency-free, zero-copy JSON parser (scalar +
+              SSE2 string-scan), no_std, host-tested + benchmarked
+              (docs/JSON.md, comparison/json/)
 services/     system service cells        (future, phase 5)
 targets/      custom target JSON          (only if built-in targets fail)
 ```
