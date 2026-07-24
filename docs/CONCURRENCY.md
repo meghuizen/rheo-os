@@ -41,6 +41,24 @@ debugging tool.
   poller unparks exactly that strand. One kernel notification carries a batch
   of completions - one wakeup, N strands resumed.
 
+**Status - the "kernel schedules N contexts per cell" half is real for Linux
+cells (docs/LINUX-COMPAT.md L4).** The Linux personality realizes the vcore
+mechanism directly: a Linux cell holds up to 8 execution contexts (a TrapFrame +
+FP save area each), scheduled **cooperatively, round-robin, at syscall
+boundaries** on the single CPU (`kernel/src/linux/thread.rs`). `clone` creates a
+context, `futex` WAIT/WAKE is the wait-on-address primitive that parks/wakes one,
+`exit` ends one, `sched_yield` hands off. FP/SIMD state is saved/restored eagerly
+per switch (two contexts time-share the vector registers) and the TLS base is
+reloaded per context. This is the *cooperative* form: unlike a strand runtime
+that yields at every await point, a Linux thread only yields when it issues a
+syscall, so **a compute-bound thread that never syscalls starves its siblings**
+until the preemption doorbell (section 4, task #27) - accepted and documented.
+Two other section-6/1-mandated properties are deferred with the same honesty:
+**priority inheritance** on futex wake is a TODO (plain FIFO for now; no
+RT-reservation mutexes in the L4 suite), and multiple *vcores* (real SMP
+parallelism) still awaits secondary-core bring-up. The native strand runtime
+(sections 1-3) remains the single-vcore userspace scheduler.
+
 ## 2. Both stack disciplines
 
 - **Stackless** (async state machines): bytes per strand, no stack, maximum

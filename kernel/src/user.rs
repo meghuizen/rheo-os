@@ -95,6 +95,13 @@ pub fn current_index() -> usize {
     unsafe { *core::ptr::addr_of!(CURRENT) }
 }
 
+/// The installed frame pointer for cell `idx`. The Linux personality's thread
+/// table uses this as its initial (thread 0) execution context
+/// (docs/LINUX-COMPAT.md L4); clone-created threads get kernel-owned frames.
+pub fn cell_frame(idx: usize) -> *mut TrapFrame {
+    cells()[idx].frame
+}
+
 /// Run `f` against the current cell's address space, then re-activate it so
 /// any new/removed mappings take effect (TLB flush). The mechanism the Linux
 /// personality's memory syscalls (brk/mmap/munmap/mprotect) build on; mirrors
@@ -141,6 +148,31 @@ pub fn unmap_range(va: usize, len: usize) {
             if let Some(pa) = aspace.unmap(a) {
                 frames::free(pa);
             }
+            a += frames::FRAME_SIZE;
+        }
+    });
+}
+
+/// Commit every whole page in `[va, va+len)` in the current cell with `perm`:
+/// pages already mapped are reprotected in place (their frame and contents
+/// kept); pages not yet mapped get a fresh zeroed frame. This is the
+/// demand-commit path for `mprotect` making a reserved region accessible
+/// (docs/LINUX-COMPAT.md L4) - glibc reserves large `PROT_NONE` regions
+/// (per-thread malloc arenas, thread-stack guards) and commits sub-ranges as it
+/// grows, so eager backing on `mmap` would exhaust the frame pool.
+pub fn commit_range(va: usize, len: usize, perm: MapPerm) {
+    if len == 0 {
+        return;
+    }
+    let base = va & !(frames::FRAME_SIZE - 1);
+    let end = va + len;
+    with_current_aspace(|aspace| {
+        let mut a = base;
+        while a < end {
+            // Unmap returns the existing frame (if any) so a reprotect keeps
+            // the page's contents; otherwise allocate a fresh zeroed frame.
+            let pa = aspace.unmap(a).unwrap_or_else(frames::alloc);
+            aspace.map_user_frame(a, pa, perm);
             a += frames::FRAME_SIZE;
         }
     });
@@ -277,12 +309,17 @@ pub fn on_user_trap(kind: TrapKind, fault_addr: usize, frame: *mut TrapFrame) ->
     // Linux cells never reach native dispatch: the personality tag decides
     // the syscall table before the number means anything (the ABIs collide).
     if cells()[cur].personality == Personality::Linux {
-        return match crate::linux::handle(cur, nr, &args) {
+        return match crate::linux::handle(cur, nr, &args, frame) {
             crate::linux::Ctl::Ret(v) => {
                 arch::set_syscall_ret(unsafe { &mut *frame }, v);
                 frame
             }
             crate::linux::Ctl::Exit(code) => finish(Outcome::Exited(code)),
+            // A thread switch (futex/yield/clone-exit): resume a different
+            // context of the same cell. That context's frame already carries
+            // its saved state and pending return value; FP/TLS were swapped by
+            // the thread scheduler before this point (docs/LINUX-COMPAT.md L4).
+            crate::linux::Ctl::Switch(next) => next,
         };
     }
 

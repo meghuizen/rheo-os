@@ -18,6 +18,12 @@ pub use paging::{
 /// `uname` machine string for the Linux personality (docs/LINUX-COMPAT.md L2).
 pub const LINUX_UNAME_MACHINE: &str = "riscv64";
 
+/// clone(2) argument order (docs/LINUX-COMPAT.md L4): RISC-V selects
+/// `CLONE_BACKWARDS`, so the raw order is `(flags, stack, parent_tid, tls,
+/// child_tid)` - `tls` and `child_tid` are swapped relative to x86-64 (glibc's
+/// riscv `clone.S` passes tls in a3, child_tid in a4).
+pub const CLONE_BACKWARDS: bool = true;
+
 global_asm!(include_str!("../../../arch/riscv64/boot.S"));
 global_asm!(include_str!("../../../arch/riscv64/traps.S"));
 global_asm!(include_str!("../../../arch/riscv64/context_switch.S"));
@@ -254,6 +260,7 @@ pub fn pci_cfg_write32(ecam: u64, bus: u8, dev: u8, func: u8, off: u16, val: u32
 /// `regs[i]` is xi (regs[0]/x0 unused, regs[2] is the user sp), then sepc,
 /// then the kernel sp to load on trap entry.
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct TrapFrame {
     regs: [u64; 32],
     sepc: u64,
@@ -261,6 +268,7 @@ pub struct TrapFrame {
 }
 
 const REG_SP: usize = 2;
+const REG_TP: usize = 4; // thread pointer (TLS); a saved GPR, so per-context
 const REG_A0: usize = 10; // first argument / return value
 const REG_A7: usize = 17; // syscall number
 const SCAUSE_ECALL_U: u64 = 8;
@@ -295,6 +303,72 @@ pub fn decode_syscall(frame: &TrapFrame) -> (u64, [u64; 6]) {
 
 pub fn set_syscall_ret(frame: &mut TrapFrame, value: u64) {
     frame.regs[REG_A0] = value;
+}
+
+/// A zeroed frame, for static per-context storage (docs/LINUX-COMPAT.md L4).
+pub const fn trapframe_zeroed() -> TrapFrame {
+    TrapFrame {
+        regs: [0; 32],
+        sepc: 0,
+        kernel_sp: 0,
+    }
+}
+
+/// Build a thread child's frame from the cloning parent's (docs/LINUX-COMPAT.md
+/// L4): same code/return point (`sepc`, already advanced past the parent's
+/// `ecall`) and kernel stack, a new user stack, `a0 = 0` so `clone` returns 0
+/// in the child, and the child's TLS in `tp` (a saved GPR, restored on resume).
+pub fn clone_child_frame(parent: &TrapFrame, child_sp: u64, tls: u64) -> TrapFrame {
+    let mut f = *parent;
+    f.regs[REG_SP] = child_sp;
+    f.regs[REG_A0] = 0;
+    f.regs[REG_TP] = tls;
+    f
+}
+
+/// Save the live U-mode FP state (f0-f31 + fcsr) into `area`, for a cooperative
+/// context switch between two threads of one cell (docs/LINUX-COMPAT.md L4).
+/// The kernel runs with sstatus.FS enabled and is soft-float, so the registers
+/// still hold the trapped thread's values.
+///
+/// # Safety
+/// `area` must point to at least 264 writable, 8-byte-aligned bytes.
+pub unsafe fn save_user_fp(area: *mut u8) {
+    unsafe {
+        asm!(
+            "fsd f0, 0({b})", "fsd f1, 8({b})", "fsd f2, 16({b})", "fsd f3, 24({b})",
+            "fsd f4, 32({b})", "fsd f5, 40({b})", "fsd f6, 48({b})", "fsd f7, 56({b})",
+            "fsd f8, 64({b})", "fsd f9, 72({b})", "fsd f10, 80({b})", "fsd f11, 88({b})",
+            "fsd f12, 96({b})", "fsd f13, 104({b})", "fsd f14, 112({b})", "fsd f15, 120({b})",
+            "fsd f16, 128({b})", "fsd f17, 136({b})", "fsd f18, 144({b})", "fsd f19, 152({b})",
+            "fsd f20, 160({b})", "fsd f21, 168({b})", "fsd f22, 176({b})", "fsd f23, 184({b})",
+            "fsd f24, 192({b})", "fsd f25, 200({b})", "fsd f26, 208({b})", "fsd f27, 216({b})",
+            "fsd f28, 224({b})", "fsd f29, 232({b})", "fsd f30, 240({b})", "fsd f31, 248({b})",
+            "frcsr {t}", "sd {t}, 256({b})",
+            b = in(reg) area, t = out(reg) _, options(nostack),
+        );
+    }
+}
+
+/// Restore U-mode FP state saved by [`save_user_fp`].
+///
+/// # Safety
+/// `area` must point to a valid 264-byte image written by `save_user_fp`.
+pub unsafe fn restore_user_fp(area: *const u8) {
+    unsafe {
+        asm!(
+            "fld f0, 0({b})", "fld f1, 8({b})", "fld f2, 16({b})", "fld f3, 24({b})",
+            "fld f4, 32({b})", "fld f5, 40({b})", "fld f6, 48({b})", "fld f7, 56({b})",
+            "fld f8, 64({b})", "fld f9, 72({b})", "fld f10, 80({b})", "fld f11, 88({b})",
+            "fld f12, 96({b})", "fld f13, 104({b})", "fld f14, 112({b})", "fld f15, 120({b})",
+            "fld f16, 128({b})", "fld f17, 136({b})", "fld f18, 144({b})", "fld f19, 152({b})",
+            "fld f20, 160({b})", "fld f21, 168({b})", "fld f22, 176({b})", "fld f23, 184({b})",
+            "fld f24, 192({b})", "fld f25, 200({b})", "fld f26, 208({b})", "fld f27, 216({b})",
+            "fld f28, 224({b})", "fld f29, 232({b})", "fld f30, 240({b})", "fld f31, 248({b})",
+            "ld {t}, 256({b})", "fscsr {t}",
+            b = in(reg) area, t = out(reg) _, options(nostack, readonly),
+        );
+    }
 }
 
 /// x86-only `arch_prctl` TLS hook (docs/LINUX-COMPAT.md L1). Unreachable on

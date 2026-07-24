@@ -17,6 +17,11 @@ pub use paging::{
 /// `uname` machine string for the Linux personality (docs/LINUX-COMPAT.md L2).
 pub const LINUX_UNAME_MACHINE: &str = "aarch64";
 
+/// clone(2) argument order (docs/LINUX-COMPAT.md L4): ARM64 selects
+/// `CLONE_BACKWARDS`, so the raw order is `(flags, stack, parent_tid, tls,
+/// child_tid)` - `tls` and `child_tid` are swapped relative to x86-64.
+pub const CLONE_BACKWARDS: bool = true;
+
 global_asm!(include_str!("../../../arch/aarch64/boot.S"));
 global_asm!(include_str!("../../../arch/aarch64/vectors.S"));
 global_asm!(include_str!("../../../arch/aarch64/context_switch.S"));
@@ -280,16 +285,18 @@ pub fn pci_cfg_write32(ecam: u64, bus: u8, dev: u8, func: u8, off: u16, val: u32
 // -------------------------------------------------------------- user mode
 
 /// Saved EL0 register state. Layout matches the offsets in vectors.S:
-/// x0..x30, then SP_EL0, ELR_EL1, SPSR_EL1, the kernel sp, and padding to
-/// a 16-byte multiple.
+/// x0..x30, then SP_EL0, ELR_EL1, SPSR_EL1, the kernel sp, and TPIDR_EL0 (the
+/// EL0 thread pointer, saved/restored per context so each thread of a cell
+/// keeps its own TLS; docs/LINUX-COMPAT.md L4).
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct TrapFrame {
     regs: [u64; 31],
     sp_el0: u64,
     elr: u64,
     spsr: u64,
     kernel_sp: u64,
-    _pad: u64,
+    tpidr_el0: u64,
 }
 
 const REG_X0: usize = 0; // first argument / return value
@@ -304,7 +311,85 @@ pub fn trapframe_new(entry: usize, user_sp: usize, arg: usize, kernel_sp: usize)
         elr: entry as u64,
         spsr: 0, // EL0t, interrupts unmasked (none are enabled)
         kernel_sp: kernel_sp as u64,
-        _pad: 0,
+        tpidr_el0: 0,
+    }
+}
+
+/// A zeroed frame, for static per-context storage (docs/LINUX-COMPAT.md L4).
+pub const fn trapframe_zeroed() -> TrapFrame {
+    TrapFrame {
+        regs: [0; 31],
+        sp_el0: 0,
+        elr: 0,
+        spsr: 0,
+        kernel_sp: 0,
+        tpidr_el0: 0,
+    }
+}
+
+/// Build a thread child's frame from the cloning parent's (docs/LINUX-COMPAT.md
+/// L4): same code/return point (`elr`, past the parent's `svc`) and kernel
+/// stack, a new user stack, `x0 = 0` so `clone` returns 0 in the child, and the
+/// child's TLS in TPIDR_EL0 (restored on resume by the vector trampoline).
+pub fn clone_child_frame(parent: &TrapFrame, child_sp: u64, tls: u64) -> TrapFrame {
+    let mut f = *parent;
+    f.regs[REG_X0] = 0;
+    f.sp_el0 = child_sp;
+    f.tpidr_el0 = tls;
+    f
+}
+
+/// Save the live EL0 FP/SIMD state (V0-V31 + FPSR + FPCR) into `area`, for a
+/// cooperative context switch between two threads of one cell
+/// (docs/LINUX-COMPAT.md L4). FP is enabled at EL1 (CPACR_EL1.FPEN) and the
+/// kernel is soft-float, so the registers still hold the trapped thread's
+/// values.
+///
+/// # Safety
+/// `area` must point to at least 528 writable, 16-byte-aligned bytes.
+pub unsafe fn save_user_fp(area: *mut u8) {
+    unsafe {
+        asm!(
+            // The kernel builds soft-float (no fp-armv8 feature), but FP/SIMD
+            // is enabled in hardware (CPACR_EL1.FPEN); enable the instructions
+            // for the assembler over just this block to save the user V-regs.
+            ".arch armv8-a+fp+simd",
+            "stp q0, q1, [{b}, #0]", "stp q2, q3, [{b}, #32]",
+            "stp q4, q5, [{b}, #64]", "stp q6, q7, [{b}, #96]",
+            "stp q8, q9, [{b}, #128]", "stp q10, q11, [{b}, #160]",
+            "stp q12, q13, [{b}, #192]", "stp q14, q15, [{b}, #224]",
+            "stp q16, q17, [{b}, #256]", "stp q18, q19, [{b}, #288]",
+            "stp q20, q21, [{b}, #320]", "stp q22, q23, [{b}, #352]",
+            "stp q24, q25, [{b}, #384]", "stp q26, q27, [{b}, #416]",
+            "stp q28, q29, [{b}, #448]", "stp q30, q31, [{b}, #480]",
+            "mrs {t}, fpcr", "str {t}, [{b}, #512]",
+            "mrs {t}, fpsr", "str {t}, [{b}, #520]",
+            b = in(reg) area, t = out(reg) _, options(nostack),
+        );
+    }
+}
+
+/// Restore EL0 FP/SIMD state saved by [`save_user_fp`].
+///
+/// # Safety
+/// `area` must point to a valid 528-byte image written by `save_user_fp`.
+pub unsafe fn restore_user_fp(area: *const u8) {
+    unsafe {
+        asm!(
+            // See `save_user_fp`: enable FP/SIMD for the assembler here.
+            ".arch armv8-a+fp+simd",
+            "ldp q0, q1, [{b}, #0]", "ldp q2, q3, [{b}, #32]",
+            "ldp q4, q5, [{b}, #64]", "ldp q6, q7, [{b}, #96]",
+            "ldp q8, q9, [{b}, #128]", "ldp q10, q11, [{b}, #160]",
+            "ldp q12, q13, [{b}, #192]", "ldp q14, q15, [{b}, #224]",
+            "ldp q16, q17, [{b}, #256]", "ldp q18, q19, [{b}, #288]",
+            "ldp q20, q21, [{b}, #320]", "ldp q22, q23, [{b}, #352]",
+            "ldp q24, q25, [{b}, #384]", "ldp q26, q27, [{b}, #416]",
+            "ldp q28, q29, [{b}, #448]", "ldp q30, q31, [{b}, #480]",
+            "ldr {t}, [{b}, #512]", "msr fpcr, {t}",
+            "ldr {t}, [{b}, #520]", "msr fpsr, {t}",
+            b = in(reg) area, t = out(reg) _, options(nostack, readonly),
+        );
     }
 }
 

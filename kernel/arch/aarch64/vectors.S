@@ -13,10 +13,11 @@
  */
 
 // TrapFrame offsets (see aarch64/mod.rs).
-.equ TF_SP,   248
-.equ TF_ELR,  256
-.equ TF_SPSR, 264
-.equ TF_KSP,  272
+.equ TF_SP,    248
+.equ TF_ELR,   256
+.equ TF_SPSR,  264
+.equ TF_KSP,   272
+.equ TF_TPIDR, 280
 
 .section .text
 
@@ -114,6 +115,8 @@ el0_sync:
     str x1, [x0, #TF_ELR]
     mrs x1, spsr_el1
     str x1, [x0, #TF_SPSR]
+    mrs x1, tpidr_el0           // per-thread TLS pointer
+    str x1, [x0, #TF_TPIDR]
 
     ldr x1, [x0, #TF_KSP]
     mov sp, x1
@@ -130,6 +133,8 @@ el0_resume:                     // x0 = &TrapFrame
     msr elr_el1, x1
     ldr x1, [x0, #TF_SPSR]
     msr spsr_el1, x1
+    ldr x1, [x0, #TF_TPIDR]     // per-thread TLS pointer
+    msr tpidr_el0, x1
     ldr x1, [x0, #TF_SP]
     msr sp_el0, x1
     ldp x2, x3, [x0, #16]

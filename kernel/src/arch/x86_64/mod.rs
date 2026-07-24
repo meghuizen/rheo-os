@@ -15,6 +15,10 @@ pub use paging::{
 /// `uname` machine string for the Linux personality (docs/LINUX-COMPAT.md L2).
 pub const LINUX_UNAME_MACHINE: &str = "x86_64";
 
+/// clone(2) argument order (docs/LINUX-COMPAT.md L4): x86-64 uses the standard
+/// order `(flags, stack, parent_tid, child_tid, tls)` (not `CLONE_BACKWARDS`).
+pub const CLONE_BACKWARDS: bool = false;
+
 global_asm!(
     include_str!("../../../arch/x86_64/boot.S"),
     options(att_syntax)
@@ -392,6 +396,7 @@ pub fn pci_cfg_write32(_ecam: u64, bus: u8, dev: u8, func: u8, off: u16, val: u3
 
 /// Saved ring-3 register state. Layout matches the offsets in user.S.
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct TrapFrame {
     rax: u64,
     rbx: u64,
@@ -445,6 +450,64 @@ pub fn trapframe_new(entry: usize, user_sp: usize, arg: usize, kernel_sp: usize)
         kernel_sp: kernel_sp as u64,
         _pad: 0,
     }
+}
+
+/// A zeroed frame, for static per-context storage (docs/LINUX-COMPAT.md L4).
+/// Not runnable as-is; `clone_child_frame` fills one from a parent.
+pub const fn trapframe_zeroed() -> TrapFrame {
+    TrapFrame {
+        rax: 0,
+        rbx: 0,
+        rcx: 0,
+        rdx: 0,
+        rsi: 0,
+        rdi: 0,
+        rbp: 0,
+        r8: 0,
+        r9: 0,
+        r10: 0,
+        r11: 0,
+        r12: 0,
+        r13: 0,
+        r14: 0,
+        r15: 0,
+        rip: 0,
+        rflags: 0,
+        rsp: 0,
+        kernel_sp: 0,
+        _pad: 0,
+    }
+}
+
+/// Build a thread child's frame from the cloning parent's (docs/LINUX-COMPAT.md
+/// L4): same code/return point (`rip` = the post-`syscall` RIP the parent
+/// saved), same kernel stack, a new user stack, and `rax = 0` so `clone`
+/// returns 0 in the child. The TLS base is programmed separately (x86-64 keeps
+/// it in the FS_BASE MSR, reloaded per context switch), so `tls` is unused here.
+pub fn clone_child_frame(parent: &TrapFrame, child_sp: u64, _tls: u64) -> TrapFrame {
+    let mut f = *parent;
+    f.rsp = child_sp;
+    f.rax = 0;
+    f
+}
+
+/// Save the live U-mode FP/SIMD state (SSE: XMM0-15 + MXCSR + x87) into a
+/// 512-byte 16-aligned area, for a cooperative context switch between two
+/// threads of one cell (docs/LINUX-COMPAT.md L4). The kernel is soft-float, so
+/// the registers still hold the trapped thread's values.
+///
+/// # Safety
+/// `area` must point to at least 512 writable, 16-byte-aligned bytes.
+pub unsafe fn save_user_fp(area: *mut u8) {
+    unsafe { asm!("fxsave [{p}]", p = in(reg) area, options(nostack)) };
+}
+
+/// Restore U-mode FP/SIMD state saved by [`save_user_fp`].
+///
+/// # Safety
+/// `area` must point to a valid 512-byte FXSAVE image (16-aligned).
+pub unsafe fn restore_user_fp(area: *const u8) {
+    unsafe { asm!("fxrstor [{p}]", p = in(reg) area, options(nostack, readonly)) };
 }
 
 /// (syscall number in rax, arguments a0..a5). Linux-style argument

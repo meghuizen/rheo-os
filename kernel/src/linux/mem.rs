@@ -13,8 +13,11 @@ use crate::mm::frames::FRAME_SIZE;
 use crate::user;
 
 // mmap prot bits.
+const PROT_READ: u64 = 1;
 const PROT_WRITE: u64 = 2;
 const PROT_EXEC: u64 = 4;
+/// Any access bit set (PROT_NONE is the absence of all of them).
+const PROT_ANY: u64 = PROT_READ | PROT_WRITE | PROT_EXEC;
 // mmap flags.
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
@@ -79,7 +82,15 @@ pub fn mmap(st: &mut LinuxState, len: u64, prot: u64, flags: u64) -> i64 {
     }
     let bytes = page_up(len as usize);
     let base = st.mmap_cursor;
-    user::map_anon_at(base, bytes, perm_from_prot(prot));
+    // Demand-commit (docs/LINUX-COMPAT.md L4): a PROT_NONE mapping only reserves
+    // address space (no frames) - glibc reserves large PROT_NONE regions (a
+    // 64 MiB malloc arena per thread, thread-stack guards) and commits
+    // sub-ranges with `mprotect` as it grows. Backing them eagerly would
+    // exhaust the frame pool the moment a second thread is created. An
+    // accessible mapping is committed now.
+    if prot & PROT_ANY != 0 {
+        user::map_anon_at(base, bytes, perm_from_prot(prot));
+    }
     st.mmap_cursor = base + bytes;
     base as i64
 }
@@ -127,8 +138,15 @@ pub fn munmap(addr: u64, len: u64) -> i64 {
     0
 }
 
-/// mprotect(addr, len, prot): rewrite page permissions in place.
+/// mprotect(addr, len, prot): change page permissions. Making a reserved
+/// (uncommitted) range accessible commits fresh frames for it (the glibc
+/// arena/stack growth path, docs/LINUX-COMPAT.md L4); PROT_NONE decommits the
+/// range, returning its frames to the pool.
 pub fn mprotect(addr: u64, len: u64, prot: u64) -> i64 {
-    user::protect_range(addr as usize, len as usize, perm_from_prot(prot));
+    if prot & PROT_ANY == 0 {
+        user::unmap_range(addr as usize, len as usize);
+    } else {
+        user::commit_range(addr as usize, len as usize, perm_from_prot(prot));
+    }
     0
 }

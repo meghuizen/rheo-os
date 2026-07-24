@@ -119,26 +119,32 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 | faccessat / faccessat2 | full | existence check via the VFS stat handler |
 | readlinkat | partial | always -ENOENT (no symlinks in the VFS; /proc/self/exe is not read by the L3 suite - uu 0.0.29 gets argv[0] from `std::env::args`, not the auxv/execfn) |
 | brk | full | heap from the loaded image end; grows/shrinks the cell's own pages |
-| mmap | partial | anonymous MAP_PRIVATE only; fd-backed (L7) and MAP_FIXED → -ENOSYS |
-| munmap / mprotect | full | leaf unmap+`frames::free` / leaf permission rewrite |
+| mmap | partial | anonymous MAP_PRIVATE only; fd-backed (L7) and MAP_FIXED → -ENOSYS. A PROT_NONE mapping only **reserves** address space (no frames); accessible mappings are committed eagerly (demand-commit, L4) |
+| munmap / mprotect | full | leaf unmap+`frames::free` / leaf permission rewrite. `mprotect` making a reserved range accessible **commits** fresh frames (glibc grows a PROT_NONE-reserved arena/stack this way, L4); PROT_NONE decommits |
 | madvise | full | advisory by specification: success, no action |
-| exit / exit_group | full | ends the cell run with the code (exit_group == exit until threads, L4) |
-| getpid / gettid | full | synthesized pid/tid 1000 |
+| exit | full | ends the calling **thread** (L4): CHILD_CLEARTID clear+futex-wake, then switch to the next ready context; ends the cell only if it was the last |
+| exit_group | full | ends the whole cell (all contexts) with the code |
+| getpid | full | synthesized pid/tgid 1000 |
+| gettid | full | per-context tid (L4): the main thread is 1000, clone children 1001+ |
+| clone | partial | the pthread-create flag set (CLONE_VM/FS/FILES/SIGHAND/THREAD/SETTLS/PARENT_SETTID/CHILD_CLEARTID): a new context in the same address space with its own stack/TLS, returns 0 in the child / tid in the parent (L4). Not `fork` (L6); >`MAX_CONTEXTS` (8) per cell → -EAGAIN. Arg order is arch ABI (`CLONE_BACKWARDS` on ARM64/RISC-V) |
+| futex | partial | FUTEX_WAIT/WAKE (+ WAIT_BITSET/WAKE_BITSET as plain WAIT/WAKE; PRIVATE ignored); WAIT re-checks the word and parks the caller, WAKE moves up to `val` waiters to ready (L4). Any timeout treated as infinite; **priority inheritance is a documented TODO** (FIFO wake; no RT-reservation mutexes in the suite) |
 | getppid | full | 0 (no parent) |
 | getuid / geteuid / getgid / getegid | full | 1000 (no root, SECURITY-IDENTITY) |
 | uname | full | sysname "Linux", release "6.6.0-rheo", machine per ISA |
 | clock_gettime | partial | MONOTONIC via `arch::ticks_to_ns`; REALTIME = fixed epoch + monotonic (unsynced, disclosed) |
 | clock_nanosleep / nanosleep | partial | returns immediately (0), no actual sleep |
 | getrandom | full | fills from the cell's DRBG; flags ignored (never blocks) |
-| sched_yield | full | no-op (single context per cell until L4) |
+| sched_yield | full | switches to the next ready context (L4); returns 0 (no-op if it is the only runnable context) |
+| sched_getaffinity | partial | reports a single online CPU (bit 0) so `available_parallelism` reads 1 and thread pools (rayon) stay small/deterministic (L4) |
 | prlimit64 / getrlimit | full | RLIMIT_STACK 1 MiB, RLIMIT_NOFILE 64, else unlimited; not settable |
-| arch_prctl | full | x86-64 only: SET_FS/GET_FS program the FS_BASE MSR (L1) |
-| set_tid_address | recorded | stores the clear-tid address, returns tid 1000; enacted with CHILD_CLEARTID at L4 |
-| set_robust_list | recorded | stores the head, returns 0; futex robustness is L4 |
+| arch_prctl | full | x86-64 only: SET_FS/GET_FS program the FS_BASE MSR (L1); the base is recorded per context and reloaded on a context switch (L4) |
+| prctl | partial | PR_SET_NAME/PR_GET_NAME accepted as a cosmetic no-op (rayon names its workers and treats failure as fatal, L4); every other option -ENOSYS |
+| set_tid_address | full | records the calling context's clear-tid address, returns its tid (L4; enacted by CHILD_CLEARTID on thread exit) |
+| set_robust_list | recorded | stores the head, returns 0; robust-futex unwinding on abnormal thread exit is not enacted (no suite util depends on it) |
 | rt_sigaction / rt_sigprocmask / sigaltstack | recorded | stored/ignored, returns 0; real signal delivery is L5 |
 | mremap | full | shrink unmaps the tail in place; grow requires MREMAP_MAYMOVE (map a fresh region, copy, free the old); else -ENOMEM. glibc's large-block `realloc` needs it (the malloc-copy-free fallback otherwise leaks frames) |
-| rseq / clone3 | ENOSYS | glibc has documented fallbacks (rseq→unregistered, clone3→clone) |
-| clone / execve / fork / wait4 / futex / kill / tgkill / rt_sigreturn | ENOSYS | threads (L4), signals (L5), processes (L6). A util that hard-requires them (e.g. `sort`, which parallelizes with rayon and spawns worker threads) does not run until then |
+| rseq / clone3 | ENOSYS | glibc has documented fallbacks (rseq→unregistered, clone3→clone); verified via the ENOSYS logger that glibc/rust fall back to `clone`, so clone3 stays ENOSYS |
+| execve / fork / wait4 / kill / tgkill / rt_sigreturn | ENOSYS | signals (L5), processes (L6). `clone`/`futex` are done at L4 (above) - a real threaded upstream coreutil (`sort`, which parallelizes with rayon) now runs |
 
 ### Planned identity/constants
 
@@ -217,18 +223,46 @@ syscalls).
     real Linux too, not a rheo gap. 0.0.29's dispatch takes argv[0] straight
     from `std::env::args`, which the kernel supplies, so it dispatches
     correctly. (When L7 lands dynamic linking, a 0.9.x fixture can be revisited.)
-  - **`sort` is dropped** from the asserted set: uu_sort parallelizes with
-    rayon and unconditionally spawns worker threads (clone/futex) - L4. It is
-    dropped, not faked.
+  - **`sort` was dropped** at L3 (uu_sort parallelizes with rayon and spawns
+    worker threads via clone/futex) and is **re-enabled at L4** - it now runs
+    and its exact sorted output is asserted, proving a real threaded upstream
+    coreutil works on the multi-context cell.
   - **`cat` uses `splice`** on Linux (its fast path): `pipe2` is answered with a
     real bounded in-process pipe, `splice` returns -ENOSYS, and uu_cat falls
     back to read/write. Correct output, no lying stub.
   - **`--locked` is not used** when building the fixture (0.0.29's bundled
     Cargo.lock pins an ancient rustix that no longer builds on current nightly);
     the fixture *crate* is still version-pinned.
-- **L4** - threads: multi-context cells, clone/futex, cooperative
-  scheduling at syscall boundaries (a spinning thread starves its siblings
-  until timer preemption lands - accepted, documented).
+- **L4 (done)** - threads: **multi-context cells** (the CONCURRENCY.md vcore
+  model made real for a Linux cell). A cell holds up to `MAX_CONTEXTS` = **8**
+  execution contexts (a `TrapFrame` + run state + FP save area each), scheduled
+  **cooperatively, round-robin, at syscall boundaries** on the single CPU. All
+  contexts share one address space and one kernel stack (cheap switch, no page-
+  table reload); FP/SIMD state is saved/restored eagerly per switch and the
+  per-thread TLS base is reloaded (x86-64 FS_BASE; ARM64 TPIDR_EL0 / RISC-V `tp`
+  ride in the frame). Added: `clone` (pthread flag set, new context with its own
+  stack/TLS, arch-specific arg order via `CLONE_BACKWARDS`), `futex`
+  (WAIT/WAKE + the _BITSET variants), per-context `gettid`, thread `exit` vs
+  `exit_group`, CHILD_CLEARTID clear+wake on thread exit, `set_tid_address`,
+  real `sched_yield`, `sched_getaffinity`/`prctl`(name) for rayon. Memory gained
+  **demand-commit** (PROT_NONE `mmap` reserves without frames; `mprotect`
+  commits) so glibc's per-thread 64 MiB PROT_NONE arenas don't exhaust the frame
+  pool. PIDs/TIDs/futex waiter lists stay per-cell synthesized state - no kernel
+  object (`kernel/src/linux/thread.rs`). Proof: an unpatched multi-threaded Rust
+  `std` binary (`std::thread` ×4 + `mpsc` + `Mutex` + `Arc<AtomicUsize>` + join)
+  runs on **all three ISAs** with exact stdout/exit asserted (`linuxthreads`
+  test), and `sort` is re-enabled in `linuxtools`.
+  - **Cooperative, no preemption (accepted, documented)**: a compute-bound
+    thread that never issues a syscall starves its siblings. The fix is timer
+    preemption (task #27); L4 is correct for syscall-driven workloads (glibc
+    mutexes/condvars/channels block via futex).
+  - **Priority inheritance is a TODO**: futex wake is plain FIFO. CONCURRENCY.md
+    mandates PI for RT-reservation mutexes; no reservation-holding threads exist
+    in the suite, so this is deferred with a code TODO.
+  - **`clone3` stays ENOSYS**: verified via the logger that glibc/rust fall back
+    to `clone`.
+  - **Frame pool** stays 32768 frames (128 MiB); demand-commit keeps N thread
+    stacks + arenas within it (`linuxthreads` runs 5 contexts comfortably).
 - **L5** - signals: delivery by trap-frame rewrite + restorer trampoline;
   faults become SIGSEGV-to-handler.
 - **L6** - processes: fork (clone-cell-within-capability-bundle, eager
@@ -254,6 +288,10 @@ xtask `build_linux_fixtures` (L2, above).
 | x86_64 | `x86_64-unknown-linux-gnu` | host `gcc` | 0x400000 (stock, higher-half) |
 | aarch64 | `aarch64-unknown-linux-gnu` (linker: aarch64-linux-gnu-gcc) | `aarch64-linux-gnu-gcc` | 0x400000 (stock, higher-half) |
 | riscv64 | `riscv64gc-unknown-linux-gnu` (linker: riscv64-linux-gnu-gcc) | `riscv64-linux-gnu-gcc` | 0x10000 (stock, higher-half) |
+
+The Rust std column covers two fixtures per ISA, built with the same recipe: the
+single-threaded `rusthello` (L2) and the multi-threaded `rustthreads` (L4,
+`tests/linux-fixtures/rustthreads`, the `linuxthreads` proof).
 
 All three cross toolchains and `*-unknown-linux-gnu` rustup targets are
 present in the build/CI environment, so **riscv64 genuinely passes** (no

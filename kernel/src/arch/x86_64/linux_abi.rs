@@ -50,9 +50,11 @@ pub mod nr {
     pub const GETEGID: u64 = 108;
     pub const GETPPID: u64 = 110;
     pub const SIGALTSTACK: u64 = 131;
+    pub const PRCTL: u64 = 157;
     pub const ARCH_PRCTL: u64 = 158;
     pub const GETTID: u64 = 186;
     pub const FUTEX: u64 = 202;
+    pub const SCHED_GETAFFINITY: u64 = 204;
     pub const GETDENTS64: u64 = 217;
     pub const SET_TID_ADDRESS: u64 = 218;
     pub const CLOCK_GETTIME: u64 = 228;

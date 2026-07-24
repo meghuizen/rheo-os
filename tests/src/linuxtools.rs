@@ -201,9 +201,14 @@ extern "C" fn kernel_main() -> ! {
     );
     check(&[b"coreutils", b"basename", b"/a/b/c.txt"], 0, b"c.txt\n");
     check(&[b"coreutils", b"dirname", b"/a/b/c.txt"], 0, b"/a/b\n");
-    // NOTE: `sort` is intentionally omitted - uu_sort parallelizes with rayon
-    // and unconditionally spawns worker threads (clone/futex), which is L4
-    // (docs/LINUX-COMPAT.md). It is dropped rather than faked.
+    // `sort` re-enabled at L4 (docs/LINUX-COMPAT.md): uu_sort parallelizes with
+    // rayon, which spawns worker threads (clone/futex) - proving a real
+    // threaded upstream coreutil works on the multi-context cell.
+    check(
+        &[b"coreutils", b"sort", b"/multi.txt"],
+        0,
+        b"apple\nbanana\ncherry\n",
+    );
     check(
         &[b"coreutils", b"ls", b"/"],
         0,

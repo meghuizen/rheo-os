@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 19] = [
+const TEST_KERNELS: [&str; 20] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -41,6 +41,7 @@ const TEST_KERNELS: [&str; 19] = [
     "coreutils",
     "linuxrun",
     "linuxtools",
+    "linuxthreads",
 ];
 
 /// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
@@ -373,6 +374,26 @@ fn build_linux_fixtures(arch: Arch) -> bool {
     if !matches!(rust.status().map(|s| s.success()), Ok(true)) {
         eprintln!(
             "[xtask] Rust glibc fixture build failed for {}",
+            arch.name()
+        );
+        return false;
+    }
+
+    // Multi-threaded Rust std fixture (L4, docs/LINUX-COMPAT.md): same
+    // static-glibc ET_EXEC recipe, exercising clone/futex/TLS/join.
+    let mut threads = Command::new("cargo");
+    threads.args([
+        "build",
+        "--manifest-path",
+        "tests/linux-fixtures/rustthreads/Cargo.toml",
+        "--release",
+        "--target",
+        arch.linux_gnu_target(),
+    ]);
+    threads.env("RUSTFLAGS", &rustflags);
+    if !matches!(threads.status().map(|s| s.success()), Ok(true)) {
+        eprintln!(
+            "[xtask] Rust threads fixture build failed for {}",
             arch.name()
         );
         return false;

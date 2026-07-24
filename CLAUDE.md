@@ -202,7 +202,24 @@ in git) runs as a `Personality::Linux` cell on **all three ISAs**; the
 echo, cat, seq, head, wc, basename, dirname, ls, pwd). L3 added per-cell cwd
 (getcwd/chdir), statx, mremap, a single-process pipe2 (splice stays ENOSYS -
 uu_cat falls back), a per-fd getdents64 cursor, `/proc/self/auxv`, and the
-`openat` dirfd-as-`int` fix. `sort` is dropped (rayon threads = L4), not faked.
+`openat` dirfd-as-`int` fix. **L4 is done**: **threads as multi-context cells**
+(the CONCURRENCY.md vcore model made real) - a Linux cell holds up to 8
+execution contexts (a `TrapFrame` + FP save area each), scheduled
+**cooperatively, round-robin, at syscall boundaries** on the single CPU
+(`kernel/src/linux/thread.rs`), sharing one address space and kernel stack with
+eager FP/SIMD save-restore and per-context TLS. Added `clone` (pthread flag set,
+arch-specific arg order via `CLONE_BACKWARDS`), `futex` (WAIT/WAKE + _BITSET),
+per-context `gettid`, thread `exit` vs `exit_group`, CHILD_CLEARTID clear+wake,
+`set_tid_address`, real `sched_yield`, and `sched_getaffinity`/`prctl`(name);
+memory gained demand-commit (PROT_NONE `mmap` reserves without frames,
+`mprotect` commits) so glibc's per-thread 64 MiB arenas don't exhaust the pool.
+PIDs/TIDs/futex waiter lists stay per-cell synthesized state (no kernel object).
+An **unpatched multi-threaded Rust `std`** binary (4 `std::thread`s + `mpsc` +
+`Mutex` + `Arc<AtomicUsize>` + join) runs on **all three ISAs** with exact
+stdout/exit asserted (the `linuxthreads` test), and `sort` (rayon-threaded) is
+re-enabled in `linuxtools`. Cooperative-only (a spinning thread starves siblings
+until timer preemption, task #27) and futex wake is FIFO (priority inheritance is
+a documented TODO) - both disclosed in docs/LINUX-COMPAT.md + CONCURRENCY.md.
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
@@ -279,11 +296,13 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               argv + std::fs over the VFS), linuxrun (Personality::Linux:
               bare Linux-ABI programs plus, at L2, unpatched static-glibc
               Rust + C hellos), linuxtools (L3: the unmodified upstream
-              uutils/coreutils multicall cell over a ramfs), bench-core, and
-              the interactive lsh bin (+ harness.rs, vfs_personality.rs);
-              fixtures/ holds the ext4 test image (+ gen-ext4.sh);
-              linux-fixtures/ holds the built-from-source glibc test binaries
-              (rusthello/ + hello.c; coreutils via cargo install, gitignored)
+              uutils/coreutils multicall cell over a ramfs, incl. threaded
+              sort), linuxthreads (L4: an unpatched multi-threaded Rust std
+              binary - clone/futex/TLS/join), bench-core, and the interactive
+              lsh bin (+ harness.rs, vfs_personality.rs); fixtures/ holds the
+              ext4 test image (+ gen-ext4.sh); linux-fixtures/ holds the
+              built-from-source glibc test binaries (rusthello/ + rustthreads/
+              + hello.c; coreutils via cargo install, gitignored)
 comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md
 xtask/        build/run/test/bench orchestration (cargo xtask ...)
 idl/          system IDL + codegen        (future, step 6)

@@ -25,7 +25,9 @@ pub mod errno;
 pub mod fd;
 pub mod mem;
 pub mod stack;
+pub mod thread;
 
+use crate::arch::TrapFrame;
 use crate::arch::linux_abi::nr;
 use crate::user::MAX_CELLS;
 use core::ptr::{addr_of, addr_of_mut};
@@ -88,6 +90,9 @@ pub fn install_cell(idx: usize, image_end: usize) {
     st.tid_addr = 0;
     st.robust_list = 0;
     st.initialized = true;
+    // Seed the multi-context thread table with context 0 (docs/LINUX-COMPAT.md
+    // L4), reusing the cell's installed frame.
+    thread::init_cell(idx);
 }
 
 /// Clear all per-cell Linux state (called from `user::reset`).
@@ -95,6 +100,7 @@ pub fn reset() {
     for i in 0..MAX_CELLS {
         *state(i) = LinuxState::new();
     }
+    thread::reset();
 }
 
 // ------------------------------------------------------------- stdout tap
@@ -120,13 +126,18 @@ pub(crate) fn tap_stdout(bytes: &[u8]) {
 
 // ------------------------------------------------------------- dispatch
 
-/// What the dispatcher should do after a Linux syscall: resume the cell with
-/// a return value, or end its run with an exit code.
+/// What the dispatcher should do after a Linux syscall: resume the current
+/// context with a return value, end the whole cell, or switch to another
+/// context of the same cell (docs/LINUX-COMPAT.md L4).
 pub enum Ctl {
     /// Write the value to the syscall return register and resume.
     Ret(u64),
-    /// End the cell's run (`exit` / `exit_group`) with this code.
+    /// End the cell's run (`exit_group`, or the last thread's `exit`).
     Exit(u64),
+    /// Resume a different context of this cell (futex/yield/thread-exit). The
+    /// frame already carries its saved state and pending return value; the
+    /// thread scheduler swapped FP/TLS before returning this.
+    Switch(*mut TrapFrame),
 }
 
 /// Encode a negative errno as the u64 return-register value (Linux userspace
@@ -141,8 +152,9 @@ fn ret(v: i64) -> Ctl {
 }
 
 /// Handle one Linux syscall for cell `cur`. `args` are the six raw argument
-/// registers (already Linux-ordered by `arch::decode_syscall`).
-pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6]) -> Ctl {
+/// registers (already Linux-ordered by `arch::decode_syscall`); `frame` is the
+/// calling context's saved state (the parent for `clone`).
+pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -> Ctl {
     let st = state(cur);
     match nr_val {
         // -- I/O over the fd table --
@@ -180,11 +192,30 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6]) -> Ctl {
         nr::MPROTECT => ret(mem::mprotect(args[0], args[1], args[2])),
         nr::MADVISE => Ctl::Ret(0), // advisory by specification
 
-        // -- process lifetime --
-        nr::EXIT | nr::EXIT_GROUP => Ctl::Exit(args[0]),
+        // -- threads (multi-context cell, docs/LINUX-COMPAT.md L4) --
+        // clone(flags, child_stack, parent_tid, {child_tid, tls}) - the last
+        // two are swapped on CLONE_BACKWARDS ISAs (ARM64); the order is arch
+        // ABI (crate::arch::CLONE_BACKWARDS), decoded here so thread::clone
+        // stays portable.
+        nr::CLONE => {
+            let (child_tid, tls) = if crate::arch::CLONE_BACKWARDS {
+                (args[4], args[3])
+            } else {
+                (args[3], args[4])
+            };
+            ret(thread::clone(
+                cur, frame, args[0], args[1], args[2], child_tid, tls,
+            ))
+        }
+        nr::FUTEX => thread::futex(cur, args[0], args[1], args[2] as u32),
+
+        // -- process / thread lifetime --
+        nr::EXIT => thread::exit_thread(cur, args[0]),
+        nr::EXIT_GROUP => Ctl::Exit(args[0]),
 
         // -- identity (docs/LINUX-COMPAT.md 3: pid/uid/gid 1000, no root) --
-        nr::GETPID | nr::GETTID => Ctl::Ret(1000),
+        nr::GETPID => Ctl::Ret(1000),
+        nr::GETTID => Ctl::Ret(thread::gettid(cur)),
         nr::GETPPID => Ctl::Ret(0),
         nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID => Ctl::Ret(1000),
         nr::UNAME => ret(sys_uname(args[0])),
@@ -193,20 +224,24 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6]) -> Ctl {
         nr::CLOCK_GETTIME => ret(sys_clock_gettime(args[0], args[1])),
         nr::CLOCK_NANOSLEEP | nr::NANOSLEEP => Ctl::Ret(0), // return immediately
         nr::GETRANDOM => ret(sys_getrandom(args[0], args[1])),
-        nr::SCHED_YIELD => Ctl::Ret(0),
+        nr::SCHED_YIELD => thread::sched_yield(cur),
+        nr::SCHED_GETAFFINITY => ret(sys_sched_getaffinity(args[1], args[2])),
+        nr::PRCTL => ret(sys_prctl(args[0])),
 
         // -- resource limits --
         nr::PRLIMIT64 => ret(sys_prlimit64(args[1], args[2], args[3])),
         nr::GETRLIMIT => ret(sys_getrlimit(args[0], args[1])),
 
         // -- x86-64 thread pointer (ARM64/RISC-V set theirs in userspace) --
-        nr::ARCH_PRCTL => sys_arch_prctl(args[0], args[1]),
+        nr::ARCH_PRCTL => sys_arch_prctl(cur, args[0], args[1]),
 
         // -- recorded (stored, success returned; enacted in a later milestone,
         //    docs/LINUX-COMPAT.md 3). Real signals are L5; threads are L4. --
         nr::SET_TID_ADDRESS => {
             st.tid_addr = args[0];
-            Ctl::Ret(1000)
+            // Record the calling context's clear_child_tid and report its tid
+            // (docs/LINUX-COMPAT.md L4).
+            Ctl::Ret(thread::set_tid_address(cur, args[0]) as u64)
         }
         nr::SET_ROBUST_LIST => {
             st.robust_list = args[0];
@@ -549,6 +584,36 @@ fn sys_getrandom(buf: u64, count: u64) -> i64 {
     count as i64
 }
 
+/// sched_getaffinity(pid, cpusetsize, mask): report a single online CPU. The
+/// cooperative multi-context model runs on one core (docs/LINUX-COMPAT.md L4),
+/// so `available_parallelism` reads 1 and thread pools (rayon) stay small and
+/// deterministic. Returns the number of bytes written to `mask`.
+fn sys_sched_getaffinity(cpusetsize: u64, mask: u64) -> i64 {
+    let n = (cpusetsize as usize).min(128);
+    if mask == 0 || n == 0 {
+        return -errno::EINVAL;
+    }
+    // SAFETY: `mask` is a writable range of `n` bytes in the calling cell.
+    unsafe {
+        core::ptr::write_bytes(mask as *mut u8, 0, n);
+        *(mask as *mut u8) = 1; // CPU 0 online
+    }
+    n as i64
+}
+
+/// prctl(option, ...): only thread naming (PR_SET_NAME/PR_GET_NAME) is
+/// accepted, as a cosmetic no-op - rayon names its worker threads and treats a
+/// failure as fatal (docs/LINUX-COMPAT.md L4, allowlisted). Every other option
+/// is -ENOSYS.
+fn sys_prctl(option: u64) -> i64 {
+    const PR_SET_NAME: u64 = 15;
+    const PR_GET_NAME: u64 = 16;
+    match option {
+        PR_SET_NAME | PR_GET_NAME => 0,
+        _ => -errno::ENOSYS,
+    }
+}
+
 #[repr(C)]
 struct RLimit {
     cur: u64,
@@ -607,9 +672,13 @@ const ARCH_GET_FS: u64 = 0x1003;
 /// access. ARM64/RISC-V never reach here (no such number in their table; they
 /// set the thread pointer in userspace). SET_FS programs the FS_BASE MSR;
 /// GET_FS writes the current base to `*addr`.
-fn sys_arch_prctl(code: u64, addr: u64) -> Ctl {
+fn sys_arch_prctl(cur: usize, code: u64, addr: u64) -> Ctl {
     match code {
         ARCH_SET_FS => {
+            // Record it as this context's TLS base so it is reloaded when the
+            // context is next scheduled (docs/LINUX-COMPAT.md L4), then program
+            // the MSR now for the running context.
+            thread::set_current_fs_base(cur, addr);
             crate::arch::set_user_fs_base(addr);
             Ctl::Ret(0)
         }

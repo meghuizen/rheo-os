@@ -44,11 +44,13 @@ pub mod nr {
     pub const NANOSLEEP: u64 = 101;
     pub const CLOCK_GETTIME: u64 = 113;
     pub const CLOCK_NANOSLEEP: u64 = 115;
+    pub const SCHED_GETAFFINITY: u64 = 123;
     pub const SCHED_YIELD: u64 = 124;
     pub const KILL: u64 = 129;
     pub const TGKILL: u64 = 131;
     pub const SIGALTSTACK: u64 = 132;
     pub const RT_SIGACTION: u64 = 134;
+    pub const PRCTL: u64 = 167;
     pub const RT_SIGPROCMASK: u64 = 135;
     pub const RT_SIGRETURN: u64 = 139;
     pub const UNAME: u64 = 160;
