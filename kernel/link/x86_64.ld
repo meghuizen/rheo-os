@@ -33,6 +33,9 @@ SECTIONS
     __user_start = .;
     .user.text   : { *(.user.text .user.text.*) }
     . = ALIGN(4K);
+    __user_rodata_start = .;
+    .user.rodata : { *(.user.rodata .user.rodata.*) }
+    . = ALIGN(4K);
     __user_data_start = .;
     .user.data   : { *(.user.data .user.data.*) *(.user.bss .user.bss.*) }
     . = __user_start + 2M;

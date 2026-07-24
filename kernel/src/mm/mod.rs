@@ -7,6 +7,7 @@
 //! elastic grants, reclaim, and pressure events are later steps.
 
 pub mod frames;
+pub mod grant;
 
 use crate::arch::{self, MapPerm};
 
@@ -55,14 +56,25 @@ impl AddressSpace {
 
 unsafe extern "C" {
     static __user_start: u8;
+    static __user_rodata_start: u8;
     static __user_data_start: u8;
     static __user_end: u8;
 }
 
-/// The `.user.text` VA range (code that runs in U-mode, mapped read+exec).
+/// The `.user.text` VA range (code that runs in U-mode, mapped read+exec;
+/// shared into every cell).
 pub fn user_text_range() -> (usize, usize) {
     (
         core::ptr::addr_of!(__user_start) as usize,
+        core::ptr::addr_of!(__user_rodata_start) as usize,
+    )
+}
+
+/// The `.user.rodata` VA range (shared read-only constants used by U-mode
+/// code, e.g. the shell's strings; mapped read-only into every cell).
+pub fn user_rodata_range() -> (usize, usize) {
+    (
+        core::ptr::addr_of!(__user_rodata_start) as usize,
         core::ptr::addr_of!(__user_data_start) as usize,
     )
 }

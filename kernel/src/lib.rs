@@ -19,8 +19,16 @@ pub mod capability;
 pub mod cell;
 #[macro_use]
 pub mod console;
+pub mod engine;
+pub mod event;
+pub mod graph;
+pub mod lease;
 pub mod mm;
 mod panic;
+pub mod pty;
 pub mod queue;
+pub mod sched;
+pub mod svc;
+pub mod time;
 pub mod user;
 pub mod user_progs;

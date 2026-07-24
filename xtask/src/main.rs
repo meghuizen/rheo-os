@@ -21,7 +21,14 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 4] = ["kernel", "cap-invariants", "queue-pipeline", "isolation-hw"];
+const TEST_KERNELS: [&str; 6] = [
+    "kernel",
+    "cap-invariants",
+    "queue-pipeline",
+    "isolation-hw",
+    "resources",
+    "shell-smoke",
+];
 const BENCH_KERNEL: &str = "bench-core";
 
 #[derive(Clone, Copy, PartialEq)]
@@ -45,7 +52,7 @@ impl Arch {
     fn target(self) -> &'static str {
         match self {
             Arch::X86_64 => "x86_64-unknown-none",
-            Arch::Aarch64 => "aarch64-unknown-none",
+            Arch::Aarch64 => "aarch64-unknown-none-softfloat",
             Arch::Riscv64 => "riscv64gc-unknown-none-elf",
         }
     }

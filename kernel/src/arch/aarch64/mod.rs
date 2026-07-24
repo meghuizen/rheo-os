@@ -38,6 +38,19 @@ pub fn serial_write_byte(byte: u8) {
     }
 }
 
+const FR_RXFE: u32 = 1 << 4; // receive FIFO empty
+
+/// Non-blocking read of one byte from the PL011, or None if none pending.
+pub fn serial_read_byte() -> Option<u8> {
+    unsafe {
+        if PL011_FR.read_volatile() & FR_RXFE != 0 {
+            None
+        } else {
+            Some(PL011_DR.read_volatile() as u8)
+        }
+    }
+}
+
 // ----------------------------------------------------------------- traps
 
 unsafe extern "C" {

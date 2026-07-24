@@ -44,7 +44,7 @@ jobs:
 
       - name: clippy (kernel + test kernels, all ISAs)
         run: |
-          for target in x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf; do
+          for target in x86_64-unknown-none aarch64-unknown-none-softfloat riscv64gc-unknown-none-elf; do
             cargo clippy -p kernel -p qemu-tests --target "$target" $BUILD_STD_FLAGS -- -D warnings
           done
 

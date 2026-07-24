@@ -25,3 +25,15 @@ path = "src/bench_core.rs"
 [[bin]]
 name = "isolation-hw"
 path = "src/isolation_hw.rs"
+
+[[bin]]
+name = "resources"
+path = "src/resources.rs"
+
+[[bin]]
+name = "shell-smoke"
+path = "src/shell_smoke.rs"
+
+[[bin]]
+name = "lsh"
+path = "src/lsh.rs"

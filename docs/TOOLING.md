@@ -41,7 +41,7 @@ possible.
 ## 3. Build
 
 - **Cargo workspaces** with `build-std` for the bare-metal kernel targets;
-  cross-compilation is a `--target` invocation (`aarch64-unknown-none`,
+  cross-compilation is a `--target` invocation (`aarch64-unknown-none-softfloat`,
   `riscv64gc-unknown-none`, x86-64 variant) - any port needing more than an
   Arch trait implementation is treated as an architecture bug.
 - The **system image** is a content-addressed signed manifest (BOOT.md 2) -

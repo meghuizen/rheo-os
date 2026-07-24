@@ -15,7 +15,9 @@
 #![allow(clippy::empty_loop)]
 
 use crate::abi::{
-    Params, SYS_CYCLES, SYS_DOORBELL, SYS_EXIT, SYS_SWITCH, WORKLOAD_CROSSCELL, WORKLOAD_ROUNDTRIP,
+    Params, SHELL_BUF, SYS_CAPS, SYS_CYCLES, SYS_DOORBELL, SYS_EVENT_COUNT, SYS_EVENT_EMIT,
+    SYS_EXIT, SYS_GRAPH, SYS_LEASE, SYS_MEMINFO, SYS_PS, SYS_RANDOM, SYS_READLINE, SYS_RESERVE,
+    SYS_SWITCH, SYS_UPTIME, SYS_WRITE, ShellIo, WORKLOAD_CROSSCELL, WORKLOAD_ROUNDTRIP,
     WORKLOAD_SYSCALL,
 };
 use crate::queue::{OP_NOP, QueuePair};
@@ -192,5 +194,314 @@ pub extern "C" fn user_prober(params_va: usize) -> ! {
         (*p).status = 1;
         syscall(SYS_EXIT, 1);
     }
+    loop {}
+}
+
+// ------------------------------------------------------------- lsh shell
+//
+// A freestanding shell running as a U-mode cell. Everything below runs in
+// the cell's address space: helpers live in .user.text, string constants
+// in .user.rodata (both shared, mapped into the cell), and all buffer
+// access is through raw pointers so nothing calls into unmapped kernel
+// .text. The shell reads a line from the PTY (SYS_READLINE), dispatches a
+// builtin, and writes the response (SYS_WRITE); resource-touching builtins
+// call the matching syscall and format the result here.
+
+/// Place a byte-string constant in .user.rodata, sized to fit.
+macro_rules! rostr {
+    ($name:ident, $lit:literal) => {
+        #[unsafe(link_section = ".user.rodata")]
+        static $name: [u8; $lit.len()] = *$lit;
+    };
+}
+
+rostr!(S_BANNER, b"\r\nlsh - the Lattice shell. type 'help'.\r\n");
+rostr!(S_PROMPT, b"lsh> ");
+rostr!(S_BYE, b"lsh: goodbye\r\n");
+rostr!(S_NL, b"\r\n");
+rostr!(
+    S_HELP,
+    b"builtins: help echo uptime rand meminfo ps caps event graph reserve lease exit\r\n"
+);
+rostr!(S_UPTIME, b"uptime ticks: ");
+rostr!(S_RAND, b"random: ");
+rostr!(S_MEM_A, b"frames free ");
+rostr!(S_MEM_B, b" of ");
+rostr!(S_PS, b"cells running: ");
+rostr!(S_CAPS, b"capabilities held: ");
+rostr!(S_EV_A, b"events buffered ");
+rostr!(S_EV_B, b" total ");
+rostr!(S_GRAPH, b"graph (n+1)*n = ");
+rostr!(S_RES_OK, b"reservation admitted; utilization ppm ");
+rostr!(
+    S_RES_NO,
+    b"reservation refused (would overcommit the core)\r\n"
+);
+rostr!(S_LEASE, b"lease acquired; fencing token ");
+rostr!(S_UNK, b"lsh: unknown command (try 'help')\r\n");
+
+// -- output builder over a raw buffer (all in .user.text) --
+
+#[unsafe(link_section = ".user.text")]
+fn w_byte(buf: *mut u8, pos: &mut usize, b: u8) {
+    if *pos < SHELL_BUF {
+        unsafe { buf.add(*pos).write(b) };
+        *pos += 1;
+    }
+}
+
+#[unsafe(link_section = ".user.text")]
+fn w_str(buf: *mut u8, pos: &mut usize, s: &[u8]) {
+    let mut i = 0;
+    while i < s.len() {
+        w_byte(buf, pos, unsafe { *s.as_ptr().add(i) });
+        i += 1;
+    }
+}
+
+#[unsafe(link_section = ".user.text")]
+fn w_u64(buf: *mut u8, pos: &mut usize, mut v: u64) {
+    if v == 0 {
+        w_byte(buf, pos, b'0');
+        return;
+    }
+    let mut tmp = [0u8; 20];
+    let tp = tmp.as_mut_ptr();
+    let mut n = 0usize;
+    while v > 0 {
+        unsafe { tp.add(n).write(b'0' + (v % 10) as u8) };
+        v /= 10;
+        n += 1;
+    }
+    while n > 0 {
+        n -= 1;
+        w_byte(buf, pos, unsafe { *tp.add(n) });
+    }
+}
+
+#[unsafe(link_section = ".user.text")]
+fn w_hex(buf: *mut u8, pos: &mut usize, v: u64) {
+    w_byte(buf, pos, b'0');
+    w_byte(buf, pos, b'x');
+    let mut shift = 60i32;
+    let mut started = false;
+    while shift >= 0 {
+        let nib = ((v >> shift) & 0xF) as u8;
+        if nib != 0 || started || shift == 0 {
+            started = true;
+            let c = if nib < 10 {
+                b'0' + nib
+            } else {
+                b'a' + nib - 10
+            };
+            w_byte(buf, pos, c);
+        }
+        shift -= 4;
+    }
+}
+
+// -- input tokenising over a raw buffer (all in .user.text) --
+
+#[unsafe(link_section = ".user.text")]
+fn byte_at(p: *const u8, i: usize) -> u8 {
+    unsafe { *p.add(i) }
+}
+
+#[unsafe(link_section = ".user.text")]
+fn tok_len(p: *const u8, len: usize) -> usize {
+    let mut i = 0;
+    while i < len && byte_at(p, i) != b' ' {
+        i += 1;
+    }
+    i
+}
+
+#[unsafe(link_section = ".user.text")]
+fn tok_eq(p: *const u8, len: usize, s: &[u8]) -> bool {
+    let tl = tok_len(p, len);
+    if tl != s.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < tl {
+        if byte_at(p, i) != unsafe { *s.as_ptr().add(i) } {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// (pointer, length) of the region after the first token, spaces skipped.
+#[unsafe(link_section = ".user.text")]
+fn arg_of(p: *const u8, len: usize) -> (*const u8, usize) {
+    let mut i = tok_len(p, len);
+    while i < len && byte_at(p, i) == b' ' {
+        i += 1;
+    }
+    (unsafe { p.add(i) }, len - i)
+}
+
+#[unsafe(link_section = ".user.text")]
+fn parse_u64(p: *const u8, len: usize) -> u64 {
+    let mut v = 0u64;
+    let mut i = 0;
+    while i < len {
+        let c = byte_at(p, i);
+        if !c.is_ascii_digit() {
+            break;
+        }
+        v = v.wrapping_mul(10).wrapping_add((c - b'0') as u64);
+        i += 1;
+    }
+    v
+}
+
+/// Advance past a leading number and following spaces (for two-arg cmds).
+#[unsafe(link_section = ".user.text")]
+fn after_num(p: *const u8, len: usize) -> (*const u8, usize) {
+    let mut i = 0;
+    while i < len && byte_at(p, i).is_ascii_digit() {
+        i += 1;
+    }
+    while i < len && byte_at(p, i) == b' ' {
+        i += 1;
+    }
+    (unsafe { p.add(i) }, len - i)
+}
+
+#[unsafe(link_section = ".user.text")]
+fn emit(io: *mut ShellIo, len: usize) {
+    unsafe {
+        (*io).out_len = len as u64;
+        syscall(SYS_WRITE, io as usize as u64);
+    }
+}
+
+/// Handle one command line; returns true if the shell should exit.
+#[unsafe(link_section = ".user.text")]
+fn dispatch(inp: *const u8, len: usize, out: *mut u8, p: &mut usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    if tok_eq(inp, len, b"help") {
+        w_str(out, p, &S_HELP);
+    } else if tok_eq(inp, len, b"echo") {
+        let (a, al) = arg_of(inp, len);
+        let mut i = 0;
+        while i < al {
+            w_byte(out, p, byte_at(a, i));
+            i += 1;
+        }
+        w_str(out, p, &S_NL);
+    } else if tok_eq(inp, len, b"uptime") {
+        let t = unsafe { syscall(SYS_UPTIME, 0) };
+        w_str(out, p, &S_UPTIME);
+        w_u64(out, p, t);
+        w_str(out, p, &S_NL);
+    } else if tok_eq(inp, len, b"rand") {
+        let v = unsafe { syscall(SYS_RANDOM, 0) };
+        w_str(out, p, &S_RAND);
+        w_hex(out, p, v);
+        w_str(out, p, &S_NL);
+    } else if tok_eq(inp, len, b"meminfo") {
+        let m = unsafe { syscall(SYS_MEMINFO, 0) };
+        w_str(out, p, &S_MEM_A);
+        w_u64(out, p, m >> 32);
+        w_str(out, p, &S_MEM_B);
+        w_u64(out, p, m & 0xFFFF_FFFF);
+        w_str(out, p, &S_NL);
+    } else if tok_eq(inp, len, b"ps") {
+        let n = unsafe { syscall(SYS_PS, 0) };
+        w_str(out, p, &S_PS);
+        w_u64(out, p, n);
+        w_str(out, p, &S_NL);
+    } else if tok_eq(inp, len, b"caps") {
+        let n = unsafe { syscall(SYS_CAPS, 0) };
+        w_str(out, p, &S_CAPS);
+        w_u64(out, p, n);
+        w_str(out, p, &S_NL);
+    } else if tok_eq(inp, len, b"event") {
+        let (a, al) = arg_of(inp, len);
+        let kind = parse_u64(a, al);
+        unsafe { syscall(SYS_EVENT_EMIT, kind) };
+        let c = unsafe { syscall(SYS_EVENT_COUNT, 0) };
+        w_str(out, p, &S_EV_A);
+        w_u64(out, p, c >> 32);
+        w_str(out, p, &S_EV_B);
+        w_u64(out, p, c & 0xFFFF_FFFF);
+        w_str(out, p, &S_NL);
+    } else if tok_eq(inp, len, b"graph") {
+        let (a, al) = arg_of(inp, len);
+        let n = parse_u64(a, al);
+        let r = unsafe { syscall(SYS_GRAPH, n) };
+        w_str(out, p, &S_GRAPH);
+        w_u64(out, p, r);
+        w_str(out, p, &S_NL);
+    } else if tok_eq(inp, len, b"reserve") {
+        let (a, al) = arg_of(inp, len);
+        let budget = parse_u64(a, al);
+        let (a2, al2) = after_num(a, al);
+        let period = parse_u64(a2, al2);
+        let arg = (budget << 32) | (period & 0xFFFF_FFFF);
+        let r = unsafe { syscall(SYS_RESERVE, arg) };
+        if r == u64::MAX {
+            w_str(out, p, &S_RES_NO);
+        } else {
+            w_str(out, p, &S_RES_OK);
+            w_u64(out, p, r);
+            w_str(out, p, &S_NL);
+        }
+    } else if tok_eq(inp, len, b"lease") {
+        let t = unsafe { syscall(SYS_LEASE, 0) };
+        w_str(out, p, &S_LEASE);
+        w_u64(out, p, t);
+        w_str(out, p, &S_NL);
+    } else if tok_eq(inp, len, b"exit") {
+        return true;
+    } else {
+        w_str(out, p, &S_UNK);
+    }
+    false
+}
+
+/// The shell entry point. `io_va` is the ShellIo block mapped into the
+/// cell (kernel fills in_buf on SYS_READLINE, reads out_buf on SYS_WRITE).
+#[unsafe(link_section = ".user.text")]
+#[unsafe(no_mangle)]
+pub extern "C" fn user_shell(io_va: usize) -> ! {
+    let io = io_va as *mut ShellIo;
+    let out = unsafe { core::ptr::addr_of_mut!((*io).out_buf).cast::<u8>() };
+    let inp = unsafe { core::ptr::addr_of!((*io).in_buf).cast::<u8>() };
+
+    let mut p = 0usize;
+    w_str(out, &mut p, &S_BANNER);
+    emit(io, p);
+
+    loop {
+        let mut p = 0usize;
+        w_str(out, &mut p, &S_PROMPT);
+        emit(io, p);
+
+        let got = unsafe { syscall(SYS_READLINE, io_va as u64) };
+        if got == 0 {
+            break; // end of input
+        }
+        let len = unsafe { (*io).in_len } as usize;
+
+        let mut p = 0usize;
+        let done = dispatch(inp, len, out, &mut p);
+        if p > 0 {
+            emit(io, p);
+        }
+        if done {
+            break;
+        }
+    }
+
+    let mut p = 0usize;
+    w_str(out, &mut p, &S_BYE);
+    emit(io, p);
+    unsafe { syscall(SYS_EXIT, 0) };
     loop {}
 }

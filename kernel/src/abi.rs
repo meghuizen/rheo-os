@@ -25,6 +25,57 @@ pub const SYS_EXIT: u64 = 3;
 /// without depending on per-ISA U-mode counter-enable quirks.
 pub const SYS_CYCLES: u64 = 4;
 
+// ---- Shell / resource syscalls (arg is a *const ShellIo unless noted) ----
+
+/// Read one PTY line into ShellIo.in_buf (blocking). Returns 1 if a line
+/// was read, 0 at end of input.
+pub const SYS_READLINE: u64 = 5;
+/// Write ShellIo.out_buf[..out_len] to the PTY. Returns 0.
+pub const SYS_WRITE: u64 = 6;
+/// Monotonic uptime ticks.
+pub const SYS_UPTIME: u64 = 7;
+/// Next per-cell random u64.
+pub const SYS_RANDOM: u64 = 8;
+/// Frame-pool stats: (free << 32) | total.
+pub const SYS_MEMINFO: u64 = 9;
+/// Number of runnable cells the kernel is tracking.
+pub const SYS_PS: u64 = 10;
+/// Live capability count in the calling cell's table.
+pub const SYS_CAPS: u64 = 11;
+/// Emit a user event (arg = event kind). Returns total events emitted.
+pub const SYS_EVENT_EMIT: u64 = 12;
+/// Event counts: (buffered << 32) | total.
+pub const SYS_EVENT_COUNT: u64 = 13;
+/// Run the demo dependency graph with input `arg`; returns its result.
+pub const SYS_GRAPH: u64 = 14;
+/// Admit a reservation (arg = (budget << 32) | period). Returns the
+/// committed utilization in parts-per-million, or u64::MAX if refused.
+pub const SYS_RESERVE: u64 = 15;
+/// Acquire a lease; returns its fencing token.
+pub const SYS_LEASE: u64 = 16;
+
+/// Shared shell I/O block, one page in the cell's `.user` data, readable
+/// and writable by the kernel through its identity mapping.
+pub const SHELL_BUF: usize = 256;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ShellIo {
+    pub in_buf: [u8; SHELL_BUF],
+    pub in_len: u64,
+    pub out_buf: [u8; SHELL_BUF],
+    pub out_len: u64,
+}
+
+impl ShellIo {
+    pub const ZERO: ShellIo = ShellIo {
+        in_buf: [0; SHELL_BUF],
+        in_len: 0,
+        out_buf: [0; SHELL_BUF],
+        out_len: 0,
+    };
+}
+
 /// Per-cell parameter/result block, one page, mapped U|RW into the cell
 /// and readable by the kernel through its identity mapping. The kernel
 /// fills the inputs before entry; the user writes the outputs before

@@ -39,6 +39,20 @@ pub fn serial_write_byte(byte: u8) {
     }
 }
 
+const UART_RBR: *mut u8 = UART_BASE as *mut u8; // receive buffer (= THR)
+const LSR_DR: u8 = 1 << 0; // data ready
+
+/// Non-blocking read of one byte from the UART, or None if none pending.
+pub fn serial_read_byte() -> Option<u8> {
+    unsafe {
+        if UART_LSR.read_volatile() & LSR_DR == 0 {
+            None
+        } else {
+            Some(UART_RBR.read_volatile())
+        }
+    }
+}
+
 // ----------------------------------------------------------------- traps
 
 unsafe extern "C" {

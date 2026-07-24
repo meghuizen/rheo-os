@@ -159,6 +159,31 @@ pub fn on_user_trap(kind: TrapKind, fault_addr: usize, frame: *mut TrapFrame) ->
             peer_cell.frame
         }
         SYS_EXIT => finish(Outcome::Exited(arg)),
-        _ => finish(Outcome::Faulted(0)),
+        // Shell / resource syscalls are handled by the system-service
+        // module; an unrecognised number faults the cell.
+        other => match crate::svc::handle(other, arg) {
+            Some(ret) => {
+                arch::set_syscall_ret(unsafe { &mut *frame }, ret);
+                frame
+            }
+            None => finish(Outcome::Faulted(0)),
+        },
+    }
+}
+
+/// Number of runnable cells the kernel is tracking (shell `ps`).
+pub fn cell_count() -> usize {
+    cells().iter().filter(|c| c.present).count()
+}
+
+/// Live capability count in the current cell's table (shell `caps`).
+pub fn current_caps_live() -> usize {
+    let cur = unsafe { *core::ptr::addr_of!(CURRENT) };
+    let cell = cells()[cur];
+    if cell.caps.is_null() {
+        0
+    } else {
+        // SAFETY: caps was validated at install time.
+        unsafe { (*cell.caps).live_count() }
     }
 }

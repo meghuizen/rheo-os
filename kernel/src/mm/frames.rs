@@ -58,6 +58,15 @@ pub fn alloc() -> usize {
     }
 }
 
+/// (free frames, total frames) - used by the shell's `meminfo` builtin.
+pub fn stats() -> (usize, usize) {
+    unsafe {
+        let bitmap = &*core::ptr::addr_of!(BITMAP);
+        let used: usize = bitmap.iter().map(|w| w.count_ones() as usize).sum();
+        (POOL_FRAMES - used, POOL_FRAMES)
+    }
+}
+
 /// Return a frame to the pool.
 pub fn free(pa: usize) {
     let offset = pa - arch::FRAME_POOL_BASE;

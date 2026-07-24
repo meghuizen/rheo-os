@@ -14,26 +14,39 @@ what order; `docs/DEVELOPMENT.md` covers the day-to-day mechanics.
 
 ## Current state
 
-BUILD-ORDER.md steps 0-3 and 5 are done, plus slices of 2, 4 and 6:
-exception vectors + cycle counters + context switch per ISA; a bitmap
-frame allocator and per-ISA paging (Sv39 / AArch64 4 KiB granule /
-x86-64 4-level) with the MMU on; the capability core (mint / derive-subset
-/ delegate / revoke-by-epoch / grant-check, runtime-tested for the four
-ARCHITECTURE.md 8.2 proof properties); the queue-pair ABI (SqEntry/CqEntry
-rings + doorbell) with per-entry grant checks and flow-context
-propagation; and **cells running in real user mode behind hardware address
-spaces** (RISC-V U-mode, ARM64 EL0, x86-64 ring 3), with isolation
-MMU-enforced and a cross-cell directed switch. Benchmarks run user-mode
-across the real privilege/address-space boundary and against seL4
-(comparison/RESULTS.md). Timers, memory reclaim, and the Verus proofs are
-still open.
+BUILD-ORDER.md steps 0-5 are done, plus slices of 6-10, and a native
+shell: exception vectors + cycle counters + context switch per ISA; a
+bitmap frame allocator and per-ISA paging (Sv39 / AArch64 4 KiB granule /
+x86-64 4-level) with the MMU on; the capability core (runtime-tested for
+the four ARCHITECTURE.md 8.2 proof properties); the queue-pair ABI with
+per-entry grant checks and flow-context propagation; **cells in real user
+mode behind hardware address spaces** (RISC-V U-mode, ARM64 EL0, x86-64
+ring 3), isolation MMU-enforced, with a cross-cell directed switch.
 
-The `.user` linker section holds all U-mode code and per-cell data in one
-2 MiB window; per-cell page tables differ only in that window's mappings,
-which is what makes cross-cell isolation MMU-enforced. U-mode code must be
-free of out-of-line calls (no panics, no bounds checks) since kernel
-`.text` is not mapped in a cell - which is why the test kernels build
-`--release`.
+The full single-host **kernel object model** is implemented: memory grants
+(typed, commit/decommit/seal), a monotonic clock + interval wall clock +
+per-cell DRBG entropy, typed event streams with flow context, EDF-admitted
+reservations, leases with fencing tokens + epoch revocation, and a
+dependency graph executed on a compute engine (attest-by-measurement). On
+top of these, **lsh** runs as a U-mode shell cell over a PTY (serial line
+discipline bridged by the kernel), with builtins that query the real
+objects (`uptime`, `rand`, `meminfo`, `caps`, `ps`, `event`, `graph`,
+`reserve`, `lease`); a pipeline is a dependency graph submitted to the
+kernel (docs/SHELL.md). Run it: `cargo xtask run --bin lsh --arch <isa>`.
+
+Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
+firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
+proofs, and the hardware-lab performance numbers.
+
+The `.user` linker window holds U-mode code (`.user.text`), shared
+read-only constants (`.user.rodata`), and per-cell data (`.user.bss`) in
+one 2 MiB span; per-cell page tables differ only in the per-cell data
+mappings, which is what makes cross-cell isolation MMU-enforced. U-mode
+code (the programs in `kernel/src/user_progs.rs`, including the shell) must
+be free of out-of-line calls into kernel `.text` (no panics, no bounds
+checks, no `core::fmt`, no autovectorized constant pools) since kernel
+`.text`/`.rodata` are not mapped in a cell - which is why the test kernels
+build `--release` and aarch64 uses the soft-float target.
 
 ## Commands
 
@@ -41,7 +54,7 @@ Everything routes through the xtask runner (`xtask/src/main.rs`):
 
 ```
 cargo xtask build --arch <x86_64|aarch64|riscv64|all>   # cross-compile all kernels
-cargo xtask run   --arch riscv64 [--bin bench-core]     # boot in QEMU, serial on terminal
+cargo xtask run   --arch riscv64 [--bin lsh]            # boot in QEMU, serial on terminal
 cargo xtask test  --arch all                            # boot every test kernel, pass/fail
 cargo xtask bench --arch all                            # icount path lengths (always release)
 cargo fmt --all                                         # format (CI-gated)
@@ -66,13 +79,17 @@ QEMU 8.x system emulators must be installed to run or test.
 ```
 docs/         the design documents (the spec - keep code consistent with it)
 kernel/       the no_std kernel library + boot demo bin
-  src/        ISA-independent: capability core, queue ABI, cells, mm,
-              user run loop (user.rs), U-mode programs (user_progs.rs), abi
+  src/        ISA-independent: capability core, queue ABI, cells, mm
+              (frames + grants), time (clock/entropy), event streams,
+              sched (reservations), lease, engine, graph, pty, svc
+              (shell/resource syscalls), user run loop, U-mode programs
+              (user_progs.rs incl. the lsh shell), abi
   src/arch/   per-ISA Rust modules incl. paging.rs (one dir per ISA)
   arch/       per-ISA assembly (boot, vectors/traps, context switch, user)
-  link/       linker scripts per ISA (incl. the .user window)
+  link/       linker scripts per ISA (incl. the .user text/rodata/data window)
 tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
-              isolation-hw, bench-core (+ harness.rs for user-mode cells)
+              isolation-hw, resources, shell-smoke, bench-core, and the
+              interactive lsh bin (+ harness.rs for user-mode cells)
 comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md
 xtask/        build/run/test/bench orchestration (cargo xtask ...)
 idl/          system IDL + codegen        (future, step 6)

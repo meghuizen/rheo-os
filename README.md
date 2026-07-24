@@ -75,7 +75,20 @@ switch) as instruction path lengths. `comparison/` holds the methodology,
 the script that builds and runs seL4's own benchmark suite in the same
 QEMU for a fair baseline, and the measured results (`comparison/RESULTS.md`).
 
-### 6. Debug
+### 6. Run the shell (lsh)
+
+```sh
+cargo xtask run --bin lsh --arch riscv64
+```
+
+Boots the kernel and drops you at the `lsh>` prompt on the serial console.
+lsh is a real user-mode cell talking to the kernel over a PTY; its builtins
+query genuine kernel objects. Try `help`, `uptime`, `rand`, `meminfo`,
+`caps`, `ps`, `event 8`, `graph 6` (a pipeline is a dependency graph
+submitted to the kernel), `reserve 3 10`, `lease`, and `exit`. The headless
+`shell-smoke` test drives the same shell with a scripted session for CI.
+
+### 7. Debug
 
 Add `-s -S` style debugging per `docs/DEVELOPMENT.md` 7: run QEMU with a GDB
 stub, attach `gdb-multiarch`, break on `kernel_main`. The same document

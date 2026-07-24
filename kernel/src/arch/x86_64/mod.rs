@@ -70,6 +70,18 @@ pub fn serial_write_byte(byte: u8) {
     }
 }
 
+/// Non-blocking read of one byte from COM1, or None if none pending
+/// (LSR bit 0 = data ready).
+pub fn serial_read_byte() -> Option<u8> {
+    unsafe {
+        if inb(COM1 + 5) & 0x01 == 0 {
+            None
+        } else {
+            Some(inb(COM1))
+        }
+    }
+}
+
 // ----------------------------------------------------------------- traps
 
 /// One 16-byte interrupt gate. Layout per the Intel SDM.

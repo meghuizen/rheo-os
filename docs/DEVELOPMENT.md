@@ -15,7 +15,7 @@ Install once:
 
 - **Rust nightly** (needed for `build-std` and some `no_std` features), via
   `rustup`.
-- Bare targets: `rustup target add x86_64-unknown-none aarch64-unknown-none
+- Bare targets: `rustup target add x86_64-unknown-none aarch64-unknown-none-softfloat
   riscv64gc-unknown-none-elf`.
 - `rust-src` component (for `build-std`): `rustup component add rust-src`.
 - **cargo-binutils** + `llvm-tools-preview` (gives `rust-objdump`,
@@ -66,7 +66,7 @@ cargo build \
 ```
 
 Cross-compiling to another ISA is only the `--target` flag
-(`aarch64-unknown-none`, `riscv64gc-unknown-none-elf`). Any port that needs
+(`aarch64-unknown-none-softfloat`, `riscv64gc-unknown-none-elf`). Any port that needs
 more than a new `arch/` module implementation is treated as an architecture
 bug (TARGET-ARCHITECTURES.md 4). The assembly stubs (`boot.S`, vectors,
 context switch) are the only non-Rust files, a handful per ISA.
@@ -117,7 +117,7 @@ qemu-system-aarch64 \
   -machine virt,gic-version=3,iommu=smmuv3,virtualization=on \
   -cpu max \
   -m 4G -smp 4 \
-  -kernel target/aarch64-unknown-none/debug/kernel \
+  -kernel target/aarch64-unknown-none-softfloat/debug/kernel \
   -serial mon:stdio -no-reboot
 ```
 
@@ -169,7 +169,7 @@ GDB server on TCP 1234, `-S` freezes the CPU at reset so you attach before the
 first instruction.
 
 ```
-gdb-multiarch target/aarch64-unknown-none/debug/kernel
+gdb-multiarch target/aarch64-unknown-none-softfloat/debug/kernel
 (gdb) set architecture aarch64        # if multiarch needs a hint
 (gdb) target remote :1234
 (gdb) break kernel_main
