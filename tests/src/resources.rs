@@ -11,8 +11,9 @@ use kernel::event::{self, EventStream};
 use kernel::graph::{Graph, GraphError, Input};
 use kernel::lease::{FencedResource, Lease, LeaseError};
 use kernel::mm::grant::{Grant, GrantError, MemKind};
+use kernel::rng::Drbg;
 use kernel::sched::{Admission, AdmitError};
-use kernel::time::{self, Drbg};
+use kernel::time;
 use kernel::{arch, println};
 
 #[unsafe(no_mangle)]

@@ -35,6 +35,10 @@ name = "hwinfo"
 path = "src/hwinfo.rs"
 
 [[bin]]
+name = "rng"
+path = "src/rng.rs"
+
+[[bin]]
 name = "shell-smoke"
 path = "src/shell_smoke.rs"
 

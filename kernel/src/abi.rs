@@ -72,6 +72,14 @@ pub struct ShellIo {
     pub in_len: u64,
     pub out_buf: [u8; SHELL_BUF],
     pub out_len: u64,
+    /// Per-cell ChaCha20 DRBG state (docs/TIME-IDENTITY.md 4). The kernel
+    /// seeds `rng_key` from the root DRBG when it builds the cell; the cell
+    /// then draws random bytes as a library call over this state - no
+    /// syscall on the fast path. `rng_pos == 32` means the output buffer is
+    /// spent and the next draw re-keys (fast key erasure / forward secrecy).
+    pub rng_key: [u8; 32],
+    pub rng_out: [u8; 32],
+    pub rng_pos: u64,
 }
 
 impl ShellIo {
@@ -80,6 +88,9 @@ impl ShellIo {
         in_len: 0,
         out_buf: [0; SHELL_BUF],
         out_len: 0,
+        rng_key: [0; 32],
+        rng_out: [0; 32],
+        rng_pos: 32,
     };
 }
 

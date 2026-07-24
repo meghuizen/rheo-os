@@ -249,6 +249,64 @@ pub fn cpu_report(_inv: &crate::hw::Inventory) -> crate::hw::CpuReport {
     report
 }
 
+// ----------------------------------------------------- hardware RNG
+
+/// True if the CPU has RDSEED or RDRAND.
+pub fn has_hwrng() -> bool {
+    use core::arch::x86_64::__cpuid_count;
+    let l1 = __cpuid_count(1, 0);
+    let l7 = __cpuid_count(7, 0);
+    l1.ecx & (1 << 30) != 0 || l7.ebx & (1 << 18) != 0
+}
+
+pub fn hwrng_name() -> &'static str {
+    use core::arch::x86_64::__cpuid_count;
+    if __cpuid_count(7, 0).ebx & (1 << 18) != 0 {
+        "RDSEED"
+    } else if __cpuid_count(1, 0).ecx & (1 << 30) != 0 {
+        "RDRAND"
+    } else {
+        "none"
+    }
+}
+
+/// One 64-bit hardware random word, or None if no source produced one within
+/// the bounded retry budget (never blocks). Prefers RDSEED (a true entropy
+/// source) over RDRAND (a reseeded DRBG).
+pub fn hwrng_u64() -> Option<u64> {
+    use core::arch::x86_64::__cpuid_count;
+    if __cpuid_count(7, 0).ebx & (1 << 18) != 0 {
+        for _ in 0..64 {
+            let (v, ok): (u64, u8);
+            // SAFETY: RDSEED is present (checked above); it writes a GPR and
+            // sets CF=1 on success, CF=0 when no entropy is ready.
+            unsafe {
+                asm!("rdseed {v}", "setc {ok}", v = out(reg) v, ok = out(reg_byte) ok,
+                     options(nomem, nostack));
+            }
+            if ok != 0 {
+                return Some(v);
+            }
+            core::hint::spin_loop();
+        }
+    }
+    if __cpuid_count(1, 0).ecx & (1 << 30) != 0 {
+        for _ in 0..64 {
+            let (v, ok): (u64, u8);
+            // SAFETY: RDRAND is present (checked above).
+            unsafe {
+                asm!("rdrand {v}", "setc {ok}", v = out(reg) v, ok = out(reg_byte) ok,
+                     options(nomem, nostack));
+            }
+            if ok != 0 {
+                return Some(v);
+            }
+            core::hint::spin_loop();
+        }
+    }
+    None
+}
+
 /// PCI config read via the CF8/CFC I/O ports (mechanism #1). The ECAM base
 /// is unused on x86 - the ports reach bus 0 without any MMIO mapping.
 pub fn pci_cfg_read32(_ecam: u64, bus: u8, dev: u8, func: u8, off: u16) -> u32 {

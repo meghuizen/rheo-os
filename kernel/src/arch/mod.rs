@@ -74,9 +74,9 @@ mod imp;
 pub use imp::{
     FRAME_POOL_BASE, NAME, PagingRoot, TrapFrame, context_init, context_switch, cpu_feature_names,
     cpu_report, cycles, decode_syscall, discover, doorbell_count, doorbell_trap, enter_user_first,
-    exit, paging_activate, paging_activate_kernel, paging_kernel_init, paging_map, paging_new_root,
-    pci_cfg_read32, return_to_kernel, serial_init, serial_read_byte, serial_write_byte,
-    set_syscall_ret, spin_loop, trap_init, trapframe_new,
+    exit, has_hwrng, hwrng_name, hwrng_u64, paging_activate, paging_activate_kernel,
+    paging_kernel_init, paging_map, paging_new_root, pci_cfg_read32, return_to_kernel, serial_init,
+    serial_read_byte, serial_write_byte, set_syscall_ret, spin_loop, trap_init, trapframe_new,
 };
 
 /// Full arch bring-up for a kernel binary: console, exception vectors,
@@ -87,5 +87,6 @@ pub fn init() {
     paging_kernel_init();
     crate::time::init();
     crate::hw::detect();
+    crate::rng::init();
     crate::svc::init();
 }

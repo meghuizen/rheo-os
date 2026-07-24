@@ -11,8 +11,9 @@ use crate::engine::{Engine, Op};
 use crate::event::{self, EventStream};
 use crate::graph::{Graph, Input};
 use crate::lease::Lease;
+use crate::rng::{self, Drbg};
 use crate::sched::Admission;
-use crate::time::{self, Drbg};
+use crate::time;
 use crate::{mm, pty, user};
 
 static mut DRBG: Drbg = Drbg::ZERO;
@@ -24,7 +25,7 @@ static mut READY: bool = false;
 /// One-time init: seed the per-cell DRBG and attach (measure) the engine.
 pub fn init() {
     unsafe {
-        *core::ptr::addr_of_mut!(DRBG) = time::derive_cell_drbg();
+        *core::ptr::addr_of_mut!(DRBG) = rng::derive_cell_drbg();
         (*core::ptr::addr_of_mut!(ENGINE)).attach();
         *core::ptr::addr_of_mut!(READY) = true;
     }

@@ -25,9 +25,14 @@ ring 3), isolation MMU-enforced, with a cross-cell directed switch.
 
 The full single-host **kernel object model** is implemented: memory grants
 (typed, commit/decommit/seal), a monotonic clock + interval wall clock +
-per-cell DRBG entropy, typed event streams with flow context, EDF-admitted
-reservations, leases with fencing tokens + epoch revocation, and a
-dependency graph executed on a compute engine (attest-by-measurement). On
+**cryptographic per-cell entropy** (a ChaCha20 DRBG with fast key erasure,
+seeded from the hardware RNG - RDSEED/RDRAND on x86-64, RNDR on ARM64 -
+after SP 800-90B health tests, non-blocking, falling back to a documented
+floor where no hwrng exists; a cell draws bytes as a library call over its
+own DRBG state, not a syscall, per docs/TIME-IDENTITY.md 4), typed event
+streams with flow context, EDF-admitted reservations, leases with fencing
+tokens + epoch revocation, and a dependency graph executed on a compute
+engine (attest-by-measurement). On
 top of these, **lsh** runs as a U-mode shell cell over a PTY (serial line
 discipline bridged by the kernel), with builtins that query the real
 objects (`uptime`, `rand`, `meminfo`, `caps`, `ps`, `event`, `graph`,
@@ -99,7 +104,8 @@ QEMU 8.x system emulators must be installed to run or test.
 docs/         the design documents (the spec - keep code consistent with it)
 kernel/       the no_std kernel library + boot demo bin
   src/        ISA-independent: capability core, queue ABI, cells, mm
-              (frames + grants), time (clock/entropy), event streams,
+              (frames + grants), time (clock), rng (ChaCha20 DRBG +
+              hwrng seeding), event streams,
               sched (reservations), lease, engine, graph, pty, svc
               (shell/resource syscalls), hw (ACPI/FDT/PCIe discovery +
               the machine Inventory), user run loop, U-mode programs

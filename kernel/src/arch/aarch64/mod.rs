@@ -179,6 +179,47 @@ pub fn cpu_report(_inv: &crate::hw::Inventory) -> crate::hw::CpuReport {
     report
 }
 
+// ----------------------------------------------------- hardware RNG
+
+/// True if FEAT_RNG (the RNDR/RNDRRS registers) is implemented:
+/// ID_AA64ISAR0_EL1.RNDR field [63:60] is nonzero.
+pub fn has_hwrng() -> bool {
+    let isar0: u64;
+    unsafe { asm!("mrs {0}, id_aa64isar0_el1", out(reg) isar0) };
+    (isar0 >> 60) & 0xF != 0
+}
+
+pub fn hwrng_name() -> &'static str {
+    if has_hwrng() { "RNDR" } else { "none" }
+}
+
+/// One 64-bit hardware random word from RNDR, or None if the entropy source
+/// was not ready within the bounded retry budget (never blocks). RNDR sets
+/// PSTATE.NZCV: Z=0 (NE) on success, Z=1 on failure.
+pub fn hwrng_u64() -> Option<u64> {
+    if !has_hwrng() {
+        return None;
+    }
+    for _ in 0..64 {
+        let (val, ok): (u64, u64);
+        // SAFETY: FEAT_RNG present (checked above). RNDR is S3_3_C2_C4_0.
+        unsafe {
+            asm!(
+                "mrs {v}, s3_3_c2_c4_0",
+                "cset {ok}, ne",
+                v = out(reg) val,
+                ok = out(reg) ok,
+                options(nostack),
+            );
+        }
+        if ok != 0 {
+            return Some(val);
+        }
+        core::hint::spin_loop();
+    }
+    None
+}
+
 /// PCI config read through the ECAM window.
 pub fn pci_cfg_read32(ecam: u64, bus: u8, dev: u8, func: u8, off: u16) -> u32 {
     let a = ecam

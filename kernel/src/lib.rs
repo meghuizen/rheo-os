@@ -28,6 +28,7 @@ pub mod mm;
 mod panic;
 pub mod pty;
 pub mod queue;
+pub mod rng;
 pub mod sched;
 pub mod svc;
 pub mod time;

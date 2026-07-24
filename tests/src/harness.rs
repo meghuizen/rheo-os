@@ -83,6 +83,10 @@ pub unsafe fn build_shell_cell(
     }
 
     store.io = ShellIo::ZERO;
+    // Seed the cell's per-cell DRBG from the root (docs/TIME-IDENTITY.md 4):
+    // the kernel seeds at cell creation; the cell then draws bytes as a
+    // library call over this state, no syscall.
+    kernel::rng::derive_cell_drbg().fill_bytes(&mut store.io.rng_key);
 
     let stack_top = stack_addr + STACK_BYTES;
     let frame = arch::trapframe_new(entry as usize, stack_top, io_addr, kernel_sp);

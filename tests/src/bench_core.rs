@@ -27,6 +27,7 @@ use kernel::capability::{BUDGET_UNLIMITED, CapTable, ObjectKind, ObjectTable, RE
 use kernel::cell::Cell;
 use kernel::println;
 use kernel::queue::{self, CqEntry, OP_NOP, QueuePair, RING_DEPTH, SqEntry};
+use kernel::rng::Drbg;
 use kernel::user;
 use kernel::user_progs::{user_pong, user_worker};
 
@@ -40,6 +41,11 @@ static mut CQ_STORAGE: [CqEntry; RING_DEPTH] = [CqEntry::ZERO; RING_DEPTH];
 static mut MAIN_CTX: Context = Context { sp: 0 };
 static mut WORKER_CTX: Context = Context { sp: 0 };
 static mut WORKER_STACK: [u8; 16 * 1024] = [0; 16 * 1024];
+
+// RNG bench buffers (kept off the boot stack).
+static mut RNG_DRBG: Drbg = Drbg::ZERO;
+static mut RNG_BUF32: [u8; 32] = [0; 32];
+static mut RNG_KBUF: [u8; 1024] = [0; 1024];
 
 fn report(name: &str, ops: u64, ticks: u64) {
     let milli = ticks * 1000 / ops;
@@ -224,6 +230,38 @@ extern "C" fn kernel_main() -> ! {
     // worker itself with rdcycle; the kernel reads it back from the shared
     // params page.
     user_mode_benches();
+
+    // ------------------------------------------------------------- P-RNG
+    // Cryptographic RNG path length (ChaCha20 DRBG, fast key erasure). The
+    // draw is a plain function call over the DRBG's own state - the per-cell
+    // "library call, not a syscall" model (TIME-IDENTITY.md 4). Divide the
+    // normalised instruction count by the byte count for bytes/instruction;
+    // rng_fill_1KiB is steady-state throughput, the u64/32B lines are the
+    // small-draw latency (nonce/key sized). Buffers live in statics so the
+    // 1 KiB output buffer does not overflow the kernel boot stack.
+    let drbg = unsafe { &mut *core::ptr::addr_of_mut!(RNG_DRBG) };
+    *drbg = Drbg::from_seed(0x0BADC0DE_CAFEF00D);
+    bench("rng_next_u64", || {
+        core::hint::black_box(drbg.next_u64());
+    });
+    let buf32 = unsafe { &mut *core::ptr::addr_of_mut!(RNG_BUF32) };
+    bench("rng_fill_32B", || {
+        drbg.fill_bytes(buf32);
+        core::hint::black_box(&buf32);
+    });
+    let kbuf = unsafe { &mut *core::ptr::addr_of_mut!(RNG_KBUF) };
+    bench("rng_fill_1KiB", || {
+        drbg.fill_bytes(kbuf);
+        core::hint::black_box(&kbuf);
+    });
+    // The syscall path an OS with a getrandom-style syscall pays on every
+    // draw: the same DRBG work plus one privilege round trip. Subtract
+    // rng_next_u64 from this to see the boundary cost the per-cell library-
+    // call model avoids.
+    bench("rng_u64_plus_doorbell", || {
+        core::hint::black_box(drbg.next_u64());
+        arch::doorbell_trap();
+    });
 
     println!("bench-core: DONE");
     arch::exit(arch::ExitCode::Success)

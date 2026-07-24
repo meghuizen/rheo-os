@@ -168,6 +168,26 @@ fn contains_ci(hay: &str, needle: &str) -> bool {
     false
 }
 
+// ----------------------------------------------------- hardware RNG
+
+/// No usable hardware RNG here. The scalar-crypto entropy source (Zkr, the
+/// `seed` CSR at 0x015) is an M-mode CSR; S-mode access must be granted by
+/// M-mode via mseccfg.sseed, which this OpenSBI/QEMU configuration does not
+/// enable, so reading it would trap. A real RISC-V board with Zkr and the
+/// mseccfg grant (or an SBI entropy call) would return true here. The root
+/// DRBG falls back accordingly (rng::SeedSource::Fallback).
+pub fn has_hwrng() -> bool {
+    false
+}
+
+pub fn hwrng_name() -> &'static str {
+    "none (Zkr seed CSR needs M-mode mseccfg grant)"
+}
+
+pub fn hwrng_u64() -> Option<u64> {
+    None
+}
+
 /// PCI config read through the ECAM window (RISC-V has no config ports).
 pub fn pci_cfg_read32(ecam: u64, bus: u8, dev: u8, func: u8, off: u16) -> u32 {
     let a = ecam

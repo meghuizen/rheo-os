@@ -73,9 +73,21 @@ cargo xtask bench --arch all
 
 Boots the benchmark kernel under deterministic instruction counting and
 prints "the three numbers" (grant check, queue round trip, context
-switch) as instruction path lengths. `comparison/` holds the methodology,
-the script that builds and runs seL4's own benchmark suite in the same
-QEMU for a fair baseline, and the measured results (`comparison/RESULTS.md`).
+switch) as instruction path lengths, plus the RNG path (`rng_*`).
+`comparison/` holds the methodology, the script that builds and runs seL4's
+own benchmark suite in the same QEMU for a fair baseline, and the measured
+results (`comparison/RESULTS.md`).
+
+For the cryptographic RNG there is a separate real-hardware comparison
+against Linux's own `getrandom`/`getentropy`/`/dev/urandom`:
+
+```sh
+sh comparison/rng/run.sh
+```
+
+Same ChaCha20 primitive Linux uses; the win is the per-cell library-call
+model (no syscall on the hot path). On the reference host rheo-os is ~4.8x
+faster on key/nonce-sized draws and ~1.3x on bulk (`comparison/rng/README.md`).
 
 ### 6. Run the shell (lsh)
 
@@ -85,8 +97,10 @@ cargo xtask run --bin lsh --arch riscv64
 
 Boots the kernel and drops you at the `lsh>` prompt on the serial console.
 lsh is a real user-mode cell talking to the kernel over a PTY; its builtins
-query genuine kernel objects. Try `help`, `uptime`, `rand`, `meminfo`,
-`caps`, `ps`, `event 8`, `graph 6` (a pipeline is a dependency graph
+query genuine kernel objects. Try `help`, `uptime`, `rand` (a
+cryptographic per-cell ChaCha20 DRBG, drawn as a library call - no
+syscall), `meminfo`, `caps`, `ps`, `event 8`, `graph 6` (a pipeline is a
+dependency graph
 submitted to the kernel), `reserve 3 10`, `lease`, and the hardware
 builtins `cpuinfo`, `lspci`, `numa` (from the boot discovery pass), then
 `exit`. The headless `shell-smoke` test drives the same shell with a

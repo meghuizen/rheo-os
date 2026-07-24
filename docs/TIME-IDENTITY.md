@@ -4,6 +4,15 @@
 (section 3, object 9). Boot-time entropy in BOOT.md 4; RNG security in
 SECURITY-IDENTITY.md.
 
+**Implemented (section 4):** the ChaCha20 per-cell DRBG with fast key
+erasure (`kernel/src/rng/`), hardware seeding with health tests, non-blocking
+draws, and the per-cell "library call, not a syscall" fast path (the lsh
+`rand` builtin draws over the cell's own state). See `kernel/src/rng/mod.rs`,
+the `rng` test kernel, and the host comparison in `comparison/rng/`
+(rheo-os ~4.8x faster than Linux `getrandom` on key/nonce-sized draws).
+Deferred: continuous background reseed scheduling, checkpoint/restore reseed
+(no checkpoint yet), attested seed configuration, virtio-rng feeding.
+
 Position: three problems OSes habitually blur, kept strictly apart - **what
 time is it** (clock sync), **what order did things happen** (causality), and
 **unpredictable bits** (entropy). Each has one owner and one honest contract.
