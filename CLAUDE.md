@@ -17,7 +17,10 @@ what order; `docs/DEVELOPMENT.md` covers the day-to-day mechanics.
 BUILD-ORDER.md steps 0-5 are done, plus slices of 6-10, and a native
 shell: exception vectors + cycle counters + context switch per ISA; a
 bitmap frame allocator and per-ISA paging (Sv39 / AArch64 4 KiB granule /
-x86-64 4-level) with the MMU on; the capability core (runtime-tested for
+x86-64 4-level) with the MMU on, the kernel run in the **higher half** on all
+three ISAs (docs/MEMORY.md) so the whole low half is free for user programs -
+a stock Linux `ET_EXEC` (0x400000) loads unmodified; the capability core
+(runtime-tested for
 the four ARCHITECTURE.md 8.2 proof properties); the queue-pair ABI with
 per-entry grant checks and flow-context propagation; **cells in real user
 mode behind hardware address spaces** (RISC-V U-mode, ARM64 EL0, x86-64
@@ -189,8 +192,8 @@ real memory over the cell's own address space (`AddressSpace::unmap`/
 `kernel/src/linux/mem.rs`), and per-ISA `ticks_to_ns`. The `linuxrun` test
 now also runs, on **all three ISAs** with exact stdout + exit asserted, two
 **unpatched static-glibc** binaries built from source: a Rust `std` hello and
-a C hello (ET_EXEC relinked to a per-arch free base; docs/LINUX-COMPAT.md L2).
-glibc (not musl) is the supported libc.
+a C hello, each loaded at glibc's **stock ET_EXEC base, no relink**
+(docs/LINUX-COMPAT.md L2). glibc (not musl) is the supported libc.
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus

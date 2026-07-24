@@ -38,17 +38,26 @@ pub const NAME: &str = "x86-64";
 /// within the low-1 GiB identity map (checked in frames::init).
 pub const FRAME_POOL_BASE: usize = 0x0400_0000;
 
-/// Physical <-> kernel virtual address. x86-64 keeps the kernel identity-
-/// mapped in the low half for now (the higher-half move is a separate step),
-/// so these are the identity - the portable `phys_to_virt` seam
-/// (mm/frames, load, hw DMA) is a no-op here.
+/// Kernel linear-map offset (docs/MEMORY.md): the kernel, all MMIO, and the
+/// `.user` window run in the top-2 GiB high half (the x86-64 "kernel" code
+/// model), so a physical address is reached at `pa | KERNEL_VA_BASE`. The whole
+/// low half is left to user programs. The boot trampoline builds this map before
+/// any Rust runs, and the kernel is linked at `phys_to_virt(load address)`
+/// (link/x86_64.ld). RAM (< 2 GiB with `-m 1G` and the pool at 64 MiB) fits the
+/// top-2 GiB window, so `pa | BASE == pa + BASE` for every physical address the
+/// kernel touches.
+pub const KERNEL_VA_BASE: usize = 0xFFFF_FFFF_8000_0000;
+
+/// Physical address -> kernel virtual address (the high linear map).
 #[inline(always)]
 pub fn phys_to_virt(pa: usize) -> usize {
-    pa
+    pa | KERNEL_VA_BASE
 }
+
+/// Kernel virtual address (high linear map) -> physical address.
 #[inline(always)]
 pub fn virt_to_phys(va: usize) -> usize {
-    va
+    va & !KERNEL_VA_BASE
 }
 
 // ---------------------------------------------------------------- serial
@@ -220,9 +229,13 @@ unsafe extern "C" {
     static BOOT_INFO: u64;
 }
 
-/// The PVH hvm_start_info pointer QEMU passed in ebx.
+/// The PVH hvm_start_info pointer QEMU passed in ebx. `BOOT_INFO` lives in the
+/// identity-mapped-low `.boot.bss` (the 32-bit trampoline wrote it before
+/// paging), so its symbol address equals its physical address; the kernel runs
+/// high, so it is read through the high linear map.
 pub fn boot_firmware_ptr() -> usize {
-    unsafe { core::ptr::addr_of!(BOOT_INFO).read() as usize }
+    let pa = core::ptr::addr_of!(BOOT_INFO) as usize;
+    unsafe { (phys_to_virt(pa) as *const u64).read() as usize }
 }
 
 /// Discover the machine via ACPI (RSDP handed over by the PVH start info).

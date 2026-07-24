@@ -1,14 +1,28 @@
-//! x86-64 paging (BUILD-ORDER.md step 3): 4-level, 4 KiB pages, identity
-//! mapped. The processor is already in long mode with a minimal boot map
-//! (kernel/arch/x86_64/boot.S); this replaces it with allocator-backed
-//! tables and per-cell roots.
+//! x86-64 paging (BUILD-ORDER.md step 3): 4-level, 4 KiB pages.
 //!
-//! Layout mirrors the other ports: the low 1 GiB (kernel image, page
-//! tables, frame pool) is mapped supervisor with 2 MiB pages (global, so
-//! it survives a CR3 reload), except the one 2 MiB slot holding the
-//! `.user` window, which is a page table of 4 KiB entries carrying the
-//! user (US) bit. W^X is the RW and NX bits per page; SMAP is left off so
-//! the kernel can touch a cell's ring during a doorbell.
+//! Higher-half split (docs/MEMORY.md): the kernel and the `.user` window are
+//! linked in the top-2 GiB high half (`phys_to_virt(pa) = pa | KERNEL_VA_BASE`),
+//! and the boot trampoline builds that linear map before any Rust runs. x86-64
+//! has a single CR3, so - like riscv64, unlike aarch64's TTBR split - a cell
+//! root still carries the kernel (mapped supervisor, high): a trap enters with
+//! the cell root active and must reach the handler. But the whole LOW half is
+//! left free, so a stock Linux ET_EXEC (0x400000) loads unmodified. The `.user`
+//! window sits HIGH too (the kernel code model reaches only the top 2 GiB, so
+//! keeping `.user` adjacent to the kernel keeps every kernel->`.user` reference
+//! in range). Isolation is unchanged: it is the US bit on the leaf PTE, not the
+//! address, that gates a cell.
+//!
+//! - VA base+0..1 GiB -> a PD of 2 MiB supervisor pages (kernel image, page
+//!   tables, frame pool), global so they survive a CR3 reload, except the one
+//!   2 MiB slot holding the `.user` window, which is a 4 KiB page table whose
+//!   leaves carry the US bit (per-cell). VA base+1..2 GiB is a second such PD.
+//! - The low half is unmapped in a cell root except the pages the loader adds
+//!   (paging_map_frame) - a stock ET_EXEC, its stack, mmap arenas.
+//!
+//! `table_mut` reaches page-table frames through the high linear map
+//! (`super::phys_to_virt`); the kernel no longer identity-maps RAM low. W^X is
+//! the RW and NX bits per page; SMAP is left off so the kernel can touch a
+//! cell's ring during a doorbell.
 
 use crate::arch::MapPerm;
 use crate::mm::frames;
@@ -36,9 +50,16 @@ pub struct PagingRoot {
     pml4_pa: usize,
 }
 
+/// Physical base of the top-2 GiB high half (KERNEL_VA_BASE), and the PML4 /
+/// PDPT indices that select it.
+const KVA: usize = super::KERNEL_VA_BASE;
+
 fn table_mut(pa: usize) -> &'static mut [u64; 512] {
-    // SAFETY: `pa` is an allocated, identity-mapped table frame.
-    unsafe { &mut *(pa as *mut [u64; 512]) }
+    // SAFETY: `pa` is an allocated table frame, reached through the kernel's
+    // high linear map. The kernel runs high, so a physical frame is touched at
+    // phys_to_virt(pa), never at its raw physical address. The kernel is the
+    // sole writer of page tables.
+    unsafe { &mut *(super::phys_to_virt(pa) as *mut [u64; 512]) }
 }
 
 fn addr_bits(pa: usize) -> u64 {
@@ -62,37 +83,50 @@ fn pt_index(va: usize) -> usize {
     (va >> 12) & 0x1FF
 }
 
-/// Build the low-1 GiB identity map (2 MiB supervisor pages) into `pd`,
-/// carving the `.user` 2 MiB slot out to a fresh page table when `carve`.
-fn fill_low_gib(pd: &mut [u64; 512], carve: bool) {
-    let user_slot = user_window_base() & !(MIB2 - 1);
+/// Fill one PD with 2 MiB supervisor pages covering the 1 GiB of physical
+/// memory starting at `phys_base`, carving the `.user` 2 MiB slot out to a
+/// fresh 4 KiB page table when `carve` (only the PD that spans the `.user`
+/// window's physical address does). The PD is the high linear map for that
+/// gigabyte: entry `i` maps `phys_base + i*2 MiB` at `phys_to_virt(...)`.
+fn fill_high_pd(pd: &mut [u64; 512], phys_base: usize, carve: bool) {
+    let user_slot_pa = super::virt_to_phys(user_window_base()) & !(MIB2 - 1);
     for (i, entry) in pd.iter_mut().enumerate() {
-        let va = i * MIB2;
-        if carve && va == user_slot {
+        let pa = phys_base + i * MIB2;
+        if carve && pa == user_slot_pa {
             let pt_pa = frames::alloc();
             *entry = addr_bits(pt_pa) | P | RW | US; // empty PT, filled by paging_map
         } else {
             // Supervisor 2 MiB page, executable (kernel code lives here).
-            *entry = addr_bits(va) | P | RW | PS | G;
+            *entry = addr_bits(pa) | P | RW | PS | G;
         }
     }
 }
 
-/// Allocate a cell root: low 1 GiB supervisor with the `.user` slot carved
-/// to a 4 KiB page table.
+/// Allocate a cell root: the kernel mapped supervisor HIGH (so a trap entering
+/// with this root active reaches the handler), the low half left free for the
+/// loader. The kernel's high gigabytes are PDs of 2 MiB supervisor pages, with
+/// the one `.user` slot delegated to a 4 KiB page table whose leaves carry the
+/// US bit.
 pub fn paging_new_root() -> PagingRoot {
     let pml4_pa = frames::alloc();
     let pdpt_pa = frames::alloc();
-    let pd_pa = frames::alloc();
+    let pd_lo_pa = frames::alloc();
+    let pd_hi_pa = frames::alloc();
     let pml4 = table_mut(pml4_pa);
     let pdpt = table_mut(pdpt_pa);
-    pml4[0] = addr_bits(pdpt_pa) | P | RW | US;
-    pdpt[0] = addr_bits(pd_pa) | P | RW | US;
-    fill_low_gib(table_mut(pd_pa), true);
+    // US on the upper tables lets the one carved `.user` leaf be user-
+    // accessible; per-page US at the PD/PT level keeps the kernel supervisor.
+    pml4[pml4_index(KVA)] = addr_bits(pdpt_pa) | P | RW | US;
+    pdpt[pdpt_index(KVA)] = addr_bits(pd_lo_pa) | P | RW | US; // phys 0-1 GiB
+    pdpt[pdpt_index(KVA) + 1] = addr_bits(pd_hi_pa) | P | RW | US; // phys 1-2 GiB
+    fill_high_pd(table_mut(pd_lo_pa), 0, true);
+    fill_high_pd(table_mut(pd_hi_pa), 1 << 30, false);
     PagingRoot { pml4_pa }
 }
 
-/// Map one 4 KiB identity page for user access inside the `.user` window.
+/// Map one 4 KiB page for user access inside the (high) `.user` window. `va`
+/// must lie in the window and be page aligned; the backing frame is the
+/// window's own physical page (`virt_to_phys(va)`), carrying the US bit.
 pub fn paging_map(root: &mut PagingRoot, va: usize, perm: MapPerm) {
     assert!(va.is_multiple_of(PAGE_SIZE), "unaligned user map {va:#x}");
     let base = user_window_base();
@@ -111,7 +145,7 @@ pub fn paging_map(root: &mut PagingRoot, va: usize, perm: MapPerm) {
         MapPerm::UserRw => P | RW | US | NX,
         MapPerm::UserRx => P | US, // read + execute, not writable
     };
-    pt[pt_index(va)] = addr_bits(va) | bits;
+    pt[pt_index(va)] = addr_bits(super::virt_to_phys(va)) | bits;
 }
 
 /// Get the table a parent entry points at, creating an empty one (present,
@@ -204,35 +238,35 @@ pub fn paging_activate(root: &PagingRoot, _asid: u16) {
     }
 }
 
-static mut KERNEL_ROOT_PA: usize = 0;
+unsafe extern "C" {
+    /// The boot-built PML4 (kernel/arch/x86_64/boot.S), identity-mapped low, so
+    /// its symbol address is its physical address. It doubles as the kernel
+    /// working root: kernel high (supervisor) plus the low-identity leftover
+    /// from the paging turn-on.
+    static boot_page_tables: u8;
+}
 
+/// Re-activate the kernel's own address space. Called when a cell run returns,
+/// so kernel setup code can again reach all of RAM through the high linear map
+/// (a cell root only maps that cell's user pages in the low half).
 pub fn paging_activate_kernel() {
-    let pml4_pa = unsafe { *core::ptr::addr_of!(KERNEL_ROOT_PA) };
+    let pml4_pa = core::ptr::addr_of!(boot_page_tables) as usize;
     paging_activate(&PagingRoot { pml4_pa }, 0);
 }
 
-/// Build the kernel address space (low 1 GiB supervisor, no user carve),
-/// enable NX, and set up ring 3 (GDT/TSS + syscall MSRs).
+/// Finish paging bring-up. The MMU and the kernel working root are already
+/// configured by the boot trampoline, which enabled paging and jumped the
+/// kernel to its high VAs before any Rust ran. All that is left is the frame
+/// allocator, enabling NX, and ring 3 (GDT/TSS + syscall MSRs).
 pub fn paging_kernel_init() {
     frames::init();
 
-    let pml4_pa = frames::alloc();
-    let pdpt_pa = frames::alloc();
-    let pd_pa = frames::alloc();
-    let pml4 = table_mut(pml4_pa);
-    let pdpt = table_mut(pdpt_pa);
-    pml4[0] = addr_bits(pdpt_pa) | P | RW | US;
-    pdpt[0] = addr_bits(pd_pa) | P | RW | US;
-    fill_low_gib(table_mut(pd_pa), false);
-
+    // Enable NXE (EFER bit 11) so the NX bit is honoured (the boot tables set
+    // no NX; cell roots and paging_map set NX on user data pages).
     unsafe {
-        *core::ptr::addr_of_mut!(KERNEL_ROOT_PA) = pml4_pa;
-
-        // Enable NXE (EFER bit 11) so the NX bit is honoured.
         let efer = rdmsr(0xC000_0080) | (1 << 11);
         wrmsr(0xC000_0080, efer);
     }
-    paging_activate(&PagingRoot { pml4_pa }, 0);
 
     // GDT, TSS, and the syscall/sysret MSRs (kernel/arch/x86_64/mod.rs).
     super::user_init();

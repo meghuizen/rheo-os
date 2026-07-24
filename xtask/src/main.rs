@@ -339,49 +339,26 @@ impl Arch {
             Arch::Riscv64 => "riscv64-linux-gnu-gcc",
         }
     }
-
-    /// ET_EXEC link base for the fixtures (docs/LINUX-COMPAT.md L2). Only
-    /// x86_64 still relinks (its kernel is low-half): 1 GiB is free in the cell
-    /// root and reachable by the small code model (< 2 GiB). aarch64 and
-    /// riscv64 are higher-half, so their fixtures keep glibc's stock base and
-    /// this is unused for them.
-    fn linux_link_base(self) -> &'static str {
-        match self {
-            Arch::X86_64 | Arch::Riscv64 => "0x40000000",
-            Arch::Aarch64 => "0x80000000",
-        }
-    }
 }
 
 /// Build the Linux-personality test fixtures from source (docs/LINUX-COMPAT.md
 /// L2, fixture matrix in section 6): a static-glibc Rust `std` hello and a
-/// static-glibc C hello, both ET_EXEC relinked to a per-arch free base so the
-/// simple (no-relocation) loader path applies. No binaries live in git; these
-/// are `include_bytes!`d by the `linuxrun` test kernel. Must run before the
-/// kernels.
+/// static-glibc C hello. No binaries live in git; these are `include_bytes!`d
+/// by the `linuxrun` test kernel. Must run before the kernels.
 fn build_linux_fixtures(arch: Arch) -> bool {
     println!("[xtask] building Linux fixtures for {}", arch.name());
-    let base = arch.linux_link_base();
     let cc = arch.linux_cc();
 
     // Rust std hello: static glibc, ET_EXEC (-no-pie + static relocation
-    // model). On aarch64 and riscv64 the kernel is higher-half, so the whole
-    // low half is free and the fixture keeps glibc's stock ET_EXEC base
-    // (0x400000 / 0x10000) - no relink - which proves a stock binary loads
-    // unmodified (docs/MEMORY.md, docs/LINUX-COMPAT.md L2). x86_64 is still
-    // low-half, so its fixture is relinked to a free base until its higher-half
-    // move lands. The cross gcc is the linker so the right sysroot/crt objects
-    // are used; x86 forces bfd ld because rust-lld rejects -Ttext-segment.
-    let mut rustflags = format!(
+    // model). All three ISAs are now higher-half kernels (docs/MEMORY.md), so
+    // the whole low half is free and every fixture keeps glibc's stock ET_EXEC
+    // base (x86/arm 0x400000, riscv 0x10000) - no relink - which proves a stock
+    // binary loads unmodified (docs/LINUX-COMPAT.md L2). The cross gcc is the
+    // linker so the right sysroot/crt objects are used.
+    let rustflags = format!(
         "-C target-feature=+crt-static -C relocation-model=static \
          -C linker={cc} -C link-arg=-no-pie"
     );
-    if arch == Arch::X86_64 {
-        rustflags.push_str(&format!(" -C link-arg=-Wl,-Ttext-segment={base}"));
-    }
-    if arch == Arch::X86_64 {
-        rustflags.push_str(" -C link-arg=-fuse-ld=bfd");
-    }
     let mut rust = Command::new("cargo");
     rust.args([
         "build",
@@ -400,7 +377,7 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         return false;
     }
 
-    // C hello: gcc -static -no-pie, relinked to the same base.
+    // C hello: gcc -static -no-pie, stock ET_EXEC base (no relink).
     let out_dir = format!("tests/linux-fixtures/build/{}", arch.name());
     if let Err(e) = std::fs::create_dir_all(&out_dir) {
         eprintln!("[xtask] mkdir {out_dir}: {e}");
@@ -408,9 +385,6 @@ fn build_linux_fixtures(arch: Arch) -> bool {
     }
     let mut c = Command::new(cc);
     c.arg("-static").arg("-no-pie");
-    if arch == Arch::X86_64 {
-        c.arg(format!("-Wl,-Ttext-segment={base}"));
-    }
     c.args([
         "tests/linux-fixtures/hello.c",
         "-o",
@@ -460,6 +434,20 @@ fn build(arch: Arch, release: bool) -> bool {
         // kernel is built with the large code model (absolute movz/movk). Only
         // this package needs it; the userland/std fixtures link low and small.
         cmd.env("RUSTFLAGS", "-C code-model=large");
+    }
+    if arch == Arch::X86_64 {
+        // Higher-half kernel (docs/MEMORY.md): the kernel + `.user` window run
+        // at top-2 GiB VAs. Kernel code references those symbols with signed
+        // 32-bit relocations, which reach the top 2 GiB only under the "kernel"
+        // code model - the small model (unsigned 32-bit, .cargo/config.toml)
+        // cannot address them. Static relocation is kept (nothing relocates the
+        // image). The env RUSTFLAGS overrides the config's [target] rustflags
+        // for this package only; the low-linked userland/std fixtures keep the
+        // config's small model.
+        cmd.env(
+            "RUSTFLAGS",
+            "-C relocation-model=static -C code-model=kernel",
+        );
     }
     matches!(cmd.status().map(|s| s.success()), Ok(true))
 }

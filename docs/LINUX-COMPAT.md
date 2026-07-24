@@ -172,21 +172,16 @@ syscalls).
   `std` hello (String/Vec/println!) and a static-glibc **C** hello, each built
   from source for the ISA's `*-unknown-linux-gnu` target, run on **all three
   ISAs** with exact stdout + exit code asserted. Accommodations, all disclosed:
-  - **ET_EXEC link base.** A stock static-glibc binary links at a low VA
-    (x86/arm 0x400000, riscv 0x10000). On **x86_64** (still a low-half kernel)
-    that VA collides with the supervisor identity map in a cell's page-table
-    root, so - since ET_EXEC cannot be relocated after linking - the x86_64
-    fixtures are relinked (`-no-pie -Wl,-Ttext-segment=`) to 1 GiB, a VA free in
-    the cell root *and* reachable by the small code model (< 2 GiB). On
-    **aarch64 and riscv64 the kernel is now higher-half** (docs/MEMORY.md): the
-    kernel + MMIO live in the high canonical half, a cell root leaves the entire
-    low half free, so those fixtures keep glibc's **stock base, unmodified, no
-    relink** - which is exactly what `linuxrun` proves (aarch64 rusthello at
-    ~0x400000, riscv64 rusthello at 0x14914 / chello at 0x10494, both bias 0).
-    The higher-half move for x86_64 will drop its relink too. Static-PIE
-    (ET_DYN, the documented alternative) is
-    *not* used because the riscv64 glibc dev package ships no `rcrt1.o`; the
-    loader's ET_DYN path (bias 0x1_0000_0000) remains for L7 dynamic linking.
+  - **ET_EXEC, stock base, no relink.** A stock static-glibc binary links at a
+    low VA (x86/arm 0x400000, riscv 0x10000). **All three kernels are now
+    higher-half** (docs/MEMORY.md): the kernel lives in the high canonical half
+    and a cell root leaves the entire low half free, so every fixture keeps
+    glibc's **stock base, unmodified, no relink** - which is exactly what
+    `linuxrun` proves (x86_64 rusthello at ~0x400000, aarch64 rusthello at
+    ~0x400000, riscv64 rusthello at 0x14914 / chello at 0x10494, all bias 0).
+    Static-PIE (ET_DYN, the documented alternative) is *not* used because the
+    riscv64 glibc dev package ships no `rcrt1.o`; the loader's ET_DYN path
+    (bias 0x1_0000_0000) remains for L7 dynamic linking.
   - **uname release "6.6.0-rheo"**, machine per ISA (x86_64/aarch64/riscv64).
   - **RLIMIT_STACK 1 MiB** (matches the mapped Linux stack); RLIMIT_NOFILE 64.
   - **clock_gettime** is monotonic but coarse: x86 TSC via CPUID 0x16 (else a
@@ -215,15 +210,13 @@ in git:
 
 All fixtures are static-glibc **ET_EXEC** (`-C target-feature=+crt-static -C
 relocation-model=static -no-pie`; the cross gcc is the linker so the right
-glibc sysroot/crt objects are used). x86_64 (a low-half kernel) is relinked to
-a free base with `-Wl,-Ttext-segment=<base>` and forces `-fuse-ld=bfd` (rust-lld
-rejects `-Ttext-segment`); **aarch64 and riscv64 are higher-half, so their
-fixtures keep glibc's stock base, no relink**. Built by xtask
-`build_linux_fixtures` (L2, above).
+glibc sysroot/crt objects are used). **All three kernels are higher-half, so
+every fixture keeps glibc's stock base, no relink** (docs/MEMORY.md). Built by
+xtask `build_linux_fixtures` (L2, above).
 
 | ISA | Rust std (unpatched) | C (glibc) | link base |
 |---|---|---|---|
-| x86_64 | `x86_64-unknown-linux-gnu` | host `gcc` | 1 GiB (relinked) |
+| x86_64 | `x86_64-unknown-linux-gnu` | host `gcc` | 0x400000 (stock, higher-half) |
 | aarch64 | `aarch64-unknown-linux-gnu` (linker: aarch64-linux-gnu-gcc) | `aarch64-linux-gnu-gcc` | 0x400000 (stock, higher-half) |
 | riscv64 | `riscv64gc-unknown-linux-gnu` (linker: riscv64-linux-gnu-gcc) | `riscv64-linux-gnu-gcc` | 0x10000 (stock, higher-half) |
 

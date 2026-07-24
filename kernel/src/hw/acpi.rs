@@ -3,20 +3,22 @@
 //! that same struct leads to the XSDT and from there to the MADT (CPU
 //! list), MCFG (PCIe ECAM base), and SRAT (NUMA affinities).
 //!
-//! Physical addresses are read through the kernel's low-1 GiB identity map
-//! (the MMU is on before discovery runs), so ACPI tables placed by QEMU in
-//! low RAM are directly readable.
+//! Physical addresses are read through the kernel's high linear map
+//! (`arch::phys_to_virt`; docs/MEMORY.md) - the MMU is on before discovery
+//! runs, and the kernel no longer identity-maps RAM low - so ACPI tables placed
+//! by QEMU in low RAM are reachable at their high alias.
 
 use super::{Inventory, MemKind};
+use crate::arch;
 
 fn rd8(pa: u64) -> u8 {
-    unsafe { (pa as *const u8).read() }
+    unsafe { (arch::phys_to_virt(pa as usize) as *const u8).read() }
 }
 fn rd32(pa: u64) -> u32 {
-    unsafe { (pa as *const u32).read_unaligned() }
+    unsafe { (arch::phys_to_virt(pa as usize) as *const u32).read_unaligned() }
 }
 fn rd64(pa: u64) -> u64 {
-    unsafe { (pa as *const u64).read_unaligned() }
+    unsafe { (arch::phys_to_virt(pa as usize) as *const u64).read_unaligned() }
 }
 
 fn sig4(pa: u64) -> [u8; 4] {

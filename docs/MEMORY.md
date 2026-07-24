@@ -139,7 +139,7 @@ canonical half** so the whole low half belongs to user programs.
   low, identity-mapped, per-cell in TTBR0 - so isolation is unchanged. Because
   the kernel now spans high (`.text`/`.data`) and low (`.user`) symbols beyond
   the small code model's +-4 GiB `adrp` reach, the aarch64 kernel is built with
-  the **large code model** (xtask). x86_64 remains low-half for now.
+  the **large code model** (xtask).
 - **riscv64 (done):** a single `satp`, so - unlike aarch64's TTBR split - every
   cell root still carries the kernel + MMIO (mapped **supervisor**, high), since
   a trap enters with the cell root active and must reach the handler. The whole
@@ -159,10 +159,34 @@ canonical half** so the whole low half belongs to user programs.
   reaches only +-2 GiB PC-relative), so keeping `.user` next to the kernel
   keeps every kernel->`.user` reference in range. Isolation is unchanged - a
   cell is gated by the U bit on the leaf PTE, not by the address.
+- **x86_64 (done):** a single CR3, so - like riscv64, unlike aarch64's TTBR
+  split - every cell root still carries the kernel (mapped **supervisor**,
+  high), since a trap enters with the cell root active and must reach the
+  handler. The whole low half is left free, so a stock Linux `ET_EXEC` at
+  0x400000 loads unmodified. `KERNEL_VA_BASE = 0xFFFF_FFFF_8000_0000` is the base
+  of the top-2 GiB high half - the natural x86-64 higher-half region, addressed
+  by the **kernel code model** (signed 32-bit relocations reaching the top
+  2 GiB); the kernel is built with that model (xtask), overriding the small
+  model the low-linked userland keeps. The boot trampoline (`arch/x86_64/boot.S`)
+  runs under PVH: entered in 32-bit protected mode with paging off, it builds
+  initial 4-level tables (PML4[511] = the kernel high linear map of phys
+  0-2 GiB as 2 MiB supervisor pages; PML4[0] = a transient low identity so the
+  instruction right after paging turns on stays mapped), enables PAE + long
+  mode + paging, far-jumps to 64-bit, then absolute-jumps to the high-half
+  continuation before any Rust runs; that boot root doubles as the kernel
+  working root (`paging_activate_kernel`). `paging_new_root` builds a cell root
+  that maps the kernel high (supervisor) - two PDs of 2 MiB supervisor pages
+  with the one `.user` slot delegated to a 4 KiB page table whose leaves carry
+  the US bit - and leaves the low half free for the loader (GDT/TSS/IDT and the
+  LSTAR syscall entry all live at high VAs). **Like riscv64 the `.user` window
+  is linked high**, adjacent to the kernel, so every kernel->`.user` reference
+  stays within the kernel code model's reach. x86 MMIO is port I/O (COM1
+  serial) or PCI config ports (CF8/CFC), so no device needs a high VA; ACPI
+  tables and the PVH start-info are read through the high linear map.
 - **The `phys_to_virt` seam.** The kernel touches physical frames (page tables,
   freshly allocated frames, ELF-load target pages, DMA rings) at
-  `arch::phys_to_virt(pa)` - `pa | KERNEL_VA_BASE` on aarch64/riscv64, the
-  identity on x86_64 - never at the raw physical address, since the kernel no longer
+  `arch::phys_to_virt(pa)` - `pa | KERNEL_VA_BASE` on all three ISAs - never at
+  the raw physical address, since the kernel no longer
   identity-maps RAM low. `arch::virt_to_phys` is the inverse, used to hand
   physical addresses to devices (virtio DMA) and to bounds-check the frame pool
   against the kernel image. Both are per-ISA functions behind the portable
