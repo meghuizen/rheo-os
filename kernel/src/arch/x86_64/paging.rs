@@ -141,6 +141,60 @@ pub fn paging_map_frame(root: &mut PagingRoot, va: usize, pa: usize, perm: MapPe
     pt[pt_index(va)] = addr_bits(pa) | bits;
 }
 
+/// Walk to the 4 KiB leaf for `va`, returning `(pt_pa, pt_index)` if every
+/// level is present and the leaf level is a 4 KiB page table (not a 2 MiB
+/// block). Used by unmap/protect on user VAs (docs/LINUX-COMPAT.md L2).
+fn leaf(root: &PagingRoot, va: usize) -> Option<(usize, usize)> {
+    let pml4 = table_mut(root.pml4_pa);
+    let e = pml4[pml4_index(va)];
+    if e & P == 0 {
+        return None;
+    }
+    let pdpt = table_mut(next_table(e));
+    let e = pdpt[pdpt_index(va)];
+    if e & P == 0 {
+        return None;
+    }
+    let pd = table_mut(next_table(e));
+    let e = pd[pd_index(va)];
+    if e & P == 0 || e & PS != 0 {
+        return None; // unmapped, or a 2 MiB supervisor block (never user)
+    }
+    Some((next_table(e), pt_index(va)))
+}
+
+/// Clear the leaf mapping at `va`, returning the physical frame it pointed at
+/// (for the caller to `frames::free`), or None if it was not mapped. The
+/// caller flushes the TLB by re-activating the root (docs/LINUX-COMPAT.md L2).
+pub fn paging_unmap_frame(root: &mut PagingRoot, va: usize) -> Option<usize> {
+    let (pt_pa, idx) = leaf(root, va)?;
+    let pt = table_mut(pt_pa);
+    if pt[idx] & P == 0 {
+        return None;
+    }
+    let pa = (pt[idx] & 0x000F_FFFF_FFFF_F000) as usize;
+    pt[idx] = 0;
+    Some(pa)
+}
+
+/// Rewrite the leaf permission bits at `va`, keeping the mapped frame. A no-op
+/// if `va` is unmapped. The caller flushes the TLB by re-activating the root.
+pub fn paging_protect(root: &mut PagingRoot, va: usize, perm: MapPerm) {
+    if let Some((pt_pa, idx)) = leaf(root, va) {
+        let pt = table_mut(pt_pa);
+        if pt[idx] & P == 0 {
+            return;
+        }
+        let pa = pt[idx] & 0x000F_FFFF_FFFF_F000;
+        let bits = match perm {
+            MapPerm::UserRo => P | US | NX,
+            MapPerm::UserRw => P | RW | US | NX,
+            MapPerm::UserRx => P | US,
+        };
+        pt[idx] = pa | bits;
+    }
+}
+
 /// Activate a root: load CR3. Kernel pages are global, so they survive the
 /// reload; user pages (non-global) are flushed - the isolation guarantee.
 pub fn paging_activate(root: &PagingRoot, _asid: u16) {

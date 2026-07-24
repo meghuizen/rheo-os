@@ -128,7 +128,10 @@ pub fn set_file_ops(ops: FileOps) {
     }
 }
 
-fn file_ops() -> Option<&'static FileOps> {
+/// The installed POSIX personality handler, if any. Public so the Linux
+/// personality's fd table can forward file I/O through the same VFS
+/// (docs/LINUX-COMPAT.md L2).
+pub fn file_ops() -> Option<&'static FileOps> {
     // SAFETY: set once at boot, read-only afterwards.
     unsafe { (*core::ptr::addr_of!(FILE_OPS)).as_ref() }
 }

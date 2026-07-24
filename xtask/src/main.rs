@@ -320,8 +320,106 @@ fn build_std_program(arch: Arch, manifest: &str, label: &str) -> bool {
     matches!(cmd.status().map(|s| s.success()), Ok(true))
 }
 
+impl Arch {
+    /// The `*-unknown-linux-gnu` rustup target for the Linux personality
+    /// fixtures (docs/LINUX-COMPAT.md L2).
+    fn linux_gnu_target(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "x86_64-unknown-linux-gnu",
+            Arch::Aarch64 => "aarch64-unknown-linux-gnu",
+            Arch::Riscv64 => "riscv64gc-unknown-linux-gnu",
+        }
+    }
+
+    /// The gcc that links a static-glibc binary for this ISA.
+    fn linux_cc(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "gcc",
+            Arch::Aarch64 => "aarch64-linux-gnu-gcc",
+            Arch::Riscv64 => "riscv64-linux-gnu-gcc",
+        }
+    }
+
+    /// ET_EXEC link base for the fixtures (docs/LINUX-COMPAT.md L2): a VA that
+    /// is free in the cell's page-table root AND reachable by the ISA's default
+    /// code model. x86/riscv use 1 GiB (riscv medlow reaches < 2 GiB; x86 small
+    /// reaches < 2 GiB); ARM64's cell root maps kernel RAM at 1-2 GiB, so it
+    /// uses 2 GiB (aarch64 small reaches < 4 GiB).
+    fn linux_link_base(self) -> &'static str {
+        match self {
+            Arch::X86_64 | Arch::Riscv64 => "0x40000000",
+            Arch::Aarch64 => "0x80000000",
+        }
+    }
+}
+
+/// Build the Linux-personality test fixtures from source (docs/LINUX-COMPAT.md
+/// L2, fixture matrix in section 6): a static-glibc Rust `std` hello and a
+/// static-glibc C hello, both ET_EXEC relinked to a per-arch free base so the
+/// simple (no-relocation) loader path applies. No binaries live in git; these
+/// are `include_bytes!`d by the `linuxrun` test kernel. Must run before the
+/// kernels.
+fn build_linux_fixtures(arch: Arch) -> bool {
+    println!("[xtask] building Linux fixtures for {}", arch.name());
+    let base = arch.linux_link_base();
+    let cc = arch.linux_cc();
+
+    // Rust std hello: static glibc, ET_EXEC (-no-pie + static relocation
+    // model), relinked to the per-arch base. The cross gcc is the linker so
+    // the right sysroot/crt objects are used; x86 forces bfd ld because
+    // rust-lld rejects -Ttext-segment.
+    let mut rustflags = format!(
+        "-C target-feature=+crt-static -C relocation-model=static \
+         -C linker={cc} -C link-arg=-no-pie -C link-arg=-Wl,-Ttext-segment={base}"
+    );
+    if arch == Arch::X86_64 {
+        rustflags.push_str(" -C link-arg=-fuse-ld=bfd");
+    }
+    let mut rust = Command::new("cargo");
+    rust.args([
+        "build",
+        "--manifest-path",
+        "tests/linux-fixtures/rusthello/Cargo.toml",
+        "--release",
+        "--target",
+        arch.linux_gnu_target(),
+    ]);
+    rust.env("RUSTFLAGS", &rustflags);
+    if !matches!(rust.status().map(|s| s.success()), Ok(true)) {
+        eprintln!(
+            "[xtask] Rust glibc fixture build failed for {}",
+            arch.name()
+        );
+        return false;
+    }
+
+    // C hello: gcc -static -no-pie, relinked to the same base.
+    let out_dir = format!("tests/linux-fixtures/build/{}", arch.name());
+    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+        eprintln!("[xtask] mkdir {out_dir}: {e}");
+        return false;
+    }
+    let mut c = Command::new(cc);
+    c.args([
+        "-static",
+        "-no-pie",
+        &format!("-Wl,-Ttext-segment={base}"),
+        "tests/linux-fixtures/hello.c",
+        "-o",
+        &format!("{out_dir}/chello"),
+    ]);
+    if !matches!(c.status().map(|s| s.success()), Ok(true)) {
+        eprintln!("[xtask] C glibc fixture build failed for {}", arch.name());
+        return false;
+    }
+    true
+}
+
 fn build(arch: Arch, release: bool) -> bool {
     if !build_userland(arch) {
+        return false;
+    }
+    if !build_linux_fixtures(arch) {
         return false;
     }
     if !build_std_program(arch, "targets/std-rheo/hello/Cargo.toml", "hello") {

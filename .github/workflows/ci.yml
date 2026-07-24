@@ -27,6 +27,16 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
 
+      # The Linux personality fixtures (docs/LINUX-COMPAT.md L2) are
+      # static-glibc binaries for each ISA; clippy on qemu-tests `include_bytes!`s
+      # them, so the cross gccs + `*-unknown-linux-gnu` targets are needed and
+      # the fixtures must be built before clippy checks the test kernels.
+      - name: Install Linux cross toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu
+          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu riscv64gc-unknown-linux-gnu
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -41,6 +51,11 @@ jobs:
 
       - name: clippy (xtask, host)
         run: cargo clippy -p xtask -- -D warnings
+
+      # Build fixtures/userspace for every ISA so every `include_bytes!` in the
+      # test kernels resolves before clippy compiles them.
+      - name: Build userspace + fixtures (all ISAs)
+        run: cargo xtask build --arch all
 
       - name: clippy (kernel + test kernels, all ISAs)
         run: |
@@ -57,20 +72,32 @@ jobs:
         include:
           - arch: x86_64
             qemu-package: qemu-system-x86
+            gnu-target: x86_64-unknown-linux-gnu
+            cross-gcc: ""
           - arch: aarch64
             qemu-package: qemu-system-arm
+            gnu-target: aarch64-unknown-linux-gnu
+            cross-gcc: gcc-aarch64-linux-gnu
           - arch: riscv64
             qemu-package: qemu-system-misc
+            gnu-target: riscv64gc-unknown-linux-gnu
+            cross-gcc: gcc-riscv64-linux-gnu
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install QEMU
+      # QEMU + the arch's static-glibc cross gcc (the host gcc covers x86_64);
+      # the fixtures the linuxrun kernel embeds are built from source by
+      # `cargo xtask test` (docs/LINUX-COMPAT.md L2).
+      - name: Install QEMU and cross toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ${{ matrix.qemu-package }}
+          sudo apt-get install -y --no-install-recommends ${{ matrix.qemu-package }} ${{ matrix.cross-gcc }}
 
       - name: Install Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Add the Linux-gnu target for fixtures
+        run: rustup target add ${{ matrix.gnu-target }}
 
       - name: Cache cargo
         uses: actions/cache@v4

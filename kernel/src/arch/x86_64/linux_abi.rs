@@ -14,6 +14,7 @@ pub mod nr {
     pub const WRITE: u64 = 1;
     pub const CLOSE: u64 = 3;
     pub const FSTAT: u64 = 5;
+    pub const POLL: u64 = 7;
     pub const LSEEK: u64 = 8;
     pub const MMAP: u64 = 9;
     pub const MPROTECT: u64 = 10;
@@ -62,6 +63,8 @@ pub mod nr {
     pub const MKDIRAT: u64 = 258;
     pub const NEWFSTATAT: u64 = 262;
     pub const UNLINKAT: u64 = 263;
+    pub const READLINKAT: u64 = 267;
+    pub const PPOLL: u64 = 271;
     pub const RENAMEAT: u64 = 264;
     pub const FACCESSAT: u64 = 269;
     pub const SET_ROBUST_LIST: u64 = 273;
@@ -73,4 +76,73 @@ pub mod nr {
     pub const RSEQ: u64 = 334;
     pub const CLONE3: u64 = 435;
     pub const FACCESSAT2: u64 = 439;
+}
+
+/// The x86-64 `struct stat` (docs/LINUX-COMPAT.md L2). 144 bytes; layout per
+/// Linux v6.6 `arch/x86/include/uapi/asm/stat.h`. ARM64/RISC-V use the smaller
+/// asm-generic layout in `arch/linux_abi_generic.rs`; portable dispatch only
+/// ever names `crate::arch::linux_abi::Stat`, so the two never mix.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct Stat {
+    st_dev: u64,
+    st_ino: u64,
+    st_nlink: u64,
+    st_mode: u32,
+    st_uid: u32,
+    st_gid: u32,
+    __pad0: u32,
+    st_rdev: u64,
+    st_size: i64,
+    st_blksize: i64,
+    st_blocks: i64,
+    st_atime: u64,
+    st_atime_nsec: u64,
+    st_mtime: u64,
+    st_mtime_nsec: u64,
+    st_ctime: u64,
+    st_ctime_nsec: u64,
+    __unused: [i64; 3],
+}
+
+impl Stat {
+    /// Build a `struct stat` from the fields the personality synthesizes
+    /// (docs/LINUX-COMPAT.md L2). `mode` is the full `st_mode` (type bits +
+    /// permission bits); the three timestamps are all set to `mtime_ns`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        mode: u32,
+        size: u64,
+        ino: u64,
+        nlink: u64,
+        uid: u32,
+        gid: u32,
+        rdev: u64,
+        blksize: u64,
+        blocks: u64,
+        mtime_ns: u64,
+    ) -> Stat {
+        let secs = mtime_ns / 1_000_000_000;
+        let nsec = mtime_ns % 1_000_000_000;
+        Stat {
+            st_dev: 0,
+            st_ino: ino,
+            st_nlink: nlink,
+            st_mode: mode,
+            st_uid: uid,
+            st_gid: gid,
+            __pad0: 0,
+            st_rdev: rdev,
+            st_size: size as i64,
+            st_blksize: blksize as i64,
+            st_blocks: blocks as i64,
+            st_atime: secs,
+            st_atime_nsec: nsec,
+            st_mtime: secs,
+            st_mtime_nsec: nsec,
+            st_ctime: secs,
+            st_ctime_nsec: nsec,
+            __unused: [0; 3],
+        }
+    }
 }

@@ -142,6 +142,57 @@ pub fn paging_map_frame(root: &mut PagingRoot, va: usize, pa: usize, perm: MapPe
     l0[(va >> 12) & 0x1FF] = table_to_pte(pa, PTE_V | PTE_U | PTE_A | PTE_D | rights);
 }
 
+/// Walk to the 4 KiB leaf for `va`, returning `(l0_pa, l0_index)` if every
+/// level is a valid pointer PTE (no superpage leaf on the way). Used by
+/// unmap/protect on user VAs (docs/LINUX-COMPAT.md L2).
+fn leaf(root: &PagingRoot, va: usize) -> Option<(usize, usize)> {
+    let l2 = table_mut(root.l2_pa);
+    let e = l2[(va >> 30) & 0x1FF];
+    // A pointer PTE has V set and R/W/X clear; anything else is unmapped or a
+    // gigapage leaf (never a user 4 KiB page).
+    if e & PTE_V == 0 || e & (PTE_R | PTE_W | PTE_X) != 0 {
+        return None;
+    }
+    let l1 = table_mut(pte_to_table(e));
+    let e = l1[(va >> 21) & 0x1FF];
+    if e & PTE_V == 0 || e & (PTE_R | PTE_W | PTE_X) != 0 {
+        return None;
+    }
+    Some((pte_to_table(e), (va >> 12) & 0x1FF))
+}
+
+/// Clear the leaf mapping at `va`, returning the physical frame it pointed at
+/// (for the caller to `frames::free`), or None if it was not mapped. The
+/// caller flushes the TLB by re-activating the root (docs/LINUX-COMPAT.md L2).
+pub fn paging_unmap_frame(root: &mut PagingRoot, va: usize) -> Option<usize> {
+    let (l0_pa, idx) = leaf(root, va)?;
+    let l0 = table_mut(l0_pa);
+    if l0[idx] & PTE_V == 0 {
+        return None;
+    }
+    let pa = pte_to_table(l0[idx]);
+    l0[idx] = 0;
+    Some(pa)
+}
+
+/// Rewrite the leaf permission bits at `va`, keeping the mapped frame. A no-op
+/// if `va` is unmapped. The caller flushes the TLB by re-activating the root.
+pub fn paging_protect(root: &mut PagingRoot, va: usize, perm: MapPerm) {
+    if let Some((l0_pa, idx)) = leaf(root, va) {
+        let l0 = table_mut(l0_pa);
+        if l0[idx] & PTE_V == 0 {
+            return;
+        }
+        let pa = pte_to_table(l0[idx]);
+        let rights = match perm {
+            MapPerm::UserRo => PTE_R,
+            MapPerm::UserRw => PTE_R | PTE_W,
+            MapPerm::UserRx => PTE_R | PTE_X,
+        };
+        l0[idx] = table_to_pte(pa, PTE_V | PTE_U | PTE_A | PTE_D | rights);
+    }
+}
+
 /// Activate a root: write satp (Sv39, ASID-tagged) and fence.
 pub fn paging_activate(root: &PagingRoot, asid: u16) {
     let satp = (8u64 << 60) | ((asid as u64) << 44) | ((root.l2_pa >> 12) as u64);

@@ -30,6 +30,7 @@ pub mod nr {
     pub const WRITE: u64 = 64;
     pub const READV: u64 = 65;
     pub const WRITEV: u64 = 66;
+    pub const PPOLL: u64 = 73;
     pub const READLINKAT: u64 = 78;
     pub const NEWFSTATAT: u64 = 79;
     pub const FSTAT: u64 = 80;
@@ -79,4 +80,83 @@ pub mod nr {
     /// `nr` so portable dispatch can name it; a number no program can issue
     /// here (the table tops out below it), so it can never collide.
     pub const ARCH_PRCTL: u64 = u64::MAX;
+
+    /// Not part of this table: the legacy `poll` (asm-generic ISAs use
+    /// `ppoll`). Named as unreachable so portable dispatch can list it, like
+    /// `ARCH_PRCTL`.
+    pub const POLL: u64 = u64::MAX - 1;
+}
+
+/// The asm-generic `struct stat` (docs/LINUX-COMPAT.md L2), shared by ARM64
+/// and RISC-V. 128 bytes; layout per Linux v6.6
+/// `include/uapi/asm-generic/stat.h`. x86-64 has its own 144-byte layout in
+/// `arch/x86_64/linux_abi.rs`; portable dispatch only ever names
+/// `crate::arch::linux_abi::Stat`, so the two never mix.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct Stat {
+    st_dev: u64,
+    st_ino: u64,
+    st_mode: u32,
+    st_nlink: u32,
+    st_uid: u32,
+    st_gid: u32,
+    st_rdev: u64,
+    __pad1: u64,
+    st_size: i64,
+    st_blksize: i32,
+    __pad2: i32,
+    st_blocks: i64,
+    st_atime: i64,
+    st_atime_nsec: u64,
+    st_mtime: i64,
+    st_mtime_nsec: u64,
+    st_ctime: i64,
+    st_ctime_nsec: u64,
+    __unused4: u32,
+    __unused5: u32,
+}
+
+impl Stat {
+    /// Build a `struct stat` from the fields the personality synthesizes
+    /// (docs/LINUX-COMPAT.md L2). Same signature as the x86-64 constructor, so
+    /// portable dispatch is identical across ABIs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        mode: u32,
+        size: u64,
+        ino: u64,
+        nlink: u64,
+        uid: u32,
+        gid: u32,
+        rdev: u64,
+        blksize: u64,
+        blocks: u64,
+        mtime_ns: u64,
+    ) -> Stat {
+        let secs = (mtime_ns / 1_000_000_000) as i64;
+        let nsec = mtime_ns % 1_000_000_000;
+        Stat {
+            st_dev: 0,
+            st_ino: ino,
+            st_mode: mode,
+            st_nlink: nlink as u32,
+            st_uid: uid,
+            st_gid: gid,
+            st_rdev: rdev,
+            __pad1: 0,
+            st_size: size as i64,
+            st_blksize: blksize as i32,
+            __pad2: 0,
+            st_blocks: blocks as i64,
+            st_atime: secs,
+            st_atime_nsec: nsec,
+            st_mtime: secs,
+            st_mtime_nsec: nsec,
+            st_ctime: secs,
+            st_ctime_nsec: nsec,
+            __unused4: 0,
+            __unused5: 0,
+        }
+    }
 }

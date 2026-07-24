@@ -8,8 +8,11 @@ use crate::arch;
 
 pub const FRAME_SIZE: usize = 4096;
 
-/// Pool size: 32 MiB = 8192 frames -> 1 KiB bitmap.
-pub const POOL_FRAMES: usize = 8192;
+/// Pool size: 128 MiB = 32768 frames -> 4 KiB bitmap. Bumped for the Linux
+/// personality (docs/LINUX-COMPAT.md L2): a static-glibc cell's BSS + brk +
+/// mmap arenas dwarf the native programs'. QEMU runs `-m 1G`, and the pool
+/// fits inside the identity-mapped RAM window on all three ISAs.
+pub const POOL_FRAMES: usize = 32768;
 
 static mut BITMAP: [u64; POOL_FRAMES / 64] = [0; POOL_FRAMES / 64];
 static mut NEXT_HINT: usize = 0;

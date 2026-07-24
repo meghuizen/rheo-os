@@ -11,8 +11,11 @@ pub mod linux_abi;
 mod paging;
 pub use paging::{
     PagingRoot, paging_activate, paging_activate_kernel, paging_kernel_init, paging_map,
-    paging_map_frame, paging_new_root,
+    paging_map_frame, paging_new_root, paging_protect, paging_unmap_frame,
 };
+
+/// `uname` machine string for the Linux personality (docs/LINUX-COMPAT.md L2).
+pub const LINUX_UNAME_MACHINE: &str = "aarch64";
 
 global_asm!(include_str!("../../../arch/aarch64/boot.S"));
 global_asm!(include_str!("../../../arch/aarch64/vectors.S"));
@@ -344,6 +347,19 @@ pub fn cycles() -> u64 {
     // isb keeps cntvct from being reordered around the measured code.
     unsafe { asm!("isb", "mrs {0}, cntvct_el0", out(reg) value) };
     value
+}
+
+/// Convert `cycles()` (virtual counter ticks) to nanoseconds for the Linux
+/// personality's `clock_gettime` (docs/LINUX-COMPAT.md L2). CNTFRQ_EL0 gives
+/// the counter frequency in Hz.
+pub fn ticks_to_ns(ticks: u64) -> u64 {
+    let freq: u64;
+    // SAFETY: reading the frequency system register (always accessible).
+    unsafe { asm!("mrs {0}, cntfrq_el0", out(reg) freq) };
+    if freq == 0 {
+        return ticks;
+    }
+    ((ticks as u128 * 1_000_000_000) / freq as u128) as u64
 }
 
 /// Calibration loop with a known instruction count: exactly 2

@@ -57,6 +57,21 @@ impl AddressSpace {
         }
     }
 
+    /// Unmap one 4 KiB user page at `va`, returning the physical frame it
+    /// pointed at (for the caller to `frames::free`) or None if it was not
+    /// mapped (docs/LINUX-COMPAT.md L2). The TLB is flushed by the next
+    /// `activate()`.
+    pub fn unmap(&mut self, va: usize) -> Option<usize> {
+        arch::paging_unmap_frame(&mut self.root, va)
+    }
+
+    /// Change the permission of one 4 KiB user page at `va`, keeping its
+    /// frame; a no-op if `va` is unmapped. The TLB is flushed by the next
+    /// `activate()`.
+    pub fn protect(&mut self, va: usize, perm: MapPerm) {
+        arch::paging_protect(&mut self.root, va, perm);
+    }
+
     /// Make this address space current (ASID-tagged, no full TLB flush).
     pub fn activate(&self) {
         arch::paging_activate(&self.root, self.asid);

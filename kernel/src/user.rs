@@ -64,7 +64,10 @@ const EMPTY: RunCell = RunCell {
     personality: Personality::Native,
 };
 
-const MAX_CELLS: usize = 2;
+/// Number of runnable cell slots. Bumped 2 -> 8 for the Linux personality
+/// (docs/LINUX-COMPAT.md L2): several Linux cells plus the peer used by the
+/// native `SYS_SWITCH` test. `SYS_SWITCH`'s `cur ^ 1` pairing is unaffected.
+pub const MAX_CELLS: usize = 8;
 
 static mut CELLS: [RunCell; MAX_CELLS] = [EMPTY; MAX_CELLS];
 static mut CURRENT: usize = 0;
@@ -82,6 +85,82 @@ pub fn reset() {
     unsafe {
         *core::ptr::addr_of_mut!(MMAP_NEXT) = MMAP_BASE;
     }
+    crate::linux::reset();
+}
+
+/// The index of the currently running cell (docs/LINUX-COMPAT.md L2). The
+/// Linux personality keys its per-cell state (fd table, brk, mmap cursor) on
+/// this.
+pub fn current_index() -> usize {
+    unsafe { *core::ptr::addr_of!(CURRENT) }
+}
+
+/// Run `f` against the current cell's address space, then re-activate it so
+/// any new/removed mappings take effect (TLB flush). The mechanism the Linux
+/// personality's memory syscalls (brk/mmap/munmap/mprotect) build on; mirrors
+/// how `mmap_anon` publishes fresh mappings.
+pub fn with_current_aspace<R>(f: impl FnOnce(&mut AddressSpace) -> R) -> R {
+    let cell = cells()[current_index()];
+    // SAFETY: single CPU; the running cell's address space is uniquely owned
+    // for the duration of the synchronous trap.
+    let aspace = unsafe { &mut *(cell.aspace as *mut AddressSpace) };
+    let r = f(aspace);
+    aspace.activate();
+    r
+}
+
+/// Map fresh zeroed frames for `[va, va+len)` in the current cell with `perm`.
+/// `va` and `len` need not be page-aligned; whole overlapping pages are mapped.
+pub fn map_anon_at(va: usize, len: usize, perm: MapPerm) {
+    if len == 0 {
+        return;
+    }
+    let base = va & !(frames::FRAME_SIZE - 1);
+    let end = va + len;
+    with_current_aspace(|aspace| {
+        let mut a = base;
+        while a < end {
+            let pa = frames::alloc();
+            aspace.map_user_frame(a, pa, perm);
+            a += frames::FRAME_SIZE;
+        }
+    });
+}
+
+/// Unmap every whole page in `[va, va+len)` in the current cell and free the
+/// frames. Pages that were not mapped are skipped.
+pub fn unmap_range(va: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let base = va & !(frames::FRAME_SIZE - 1);
+    let end = va + len;
+    with_current_aspace(|aspace| {
+        let mut a = base;
+        while a < end {
+            if let Some(pa) = aspace.unmap(a) {
+                frames::free(pa);
+            }
+            a += frames::FRAME_SIZE;
+        }
+    });
+}
+
+/// Change the permission of every whole page in `[va, va+len)` in the current
+/// cell, keeping the frames.
+pub fn protect_range(va: usize, len: usize, perm: MapPerm) {
+    if len == 0 {
+        return;
+    }
+    let base = va & !(frames::FRAME_SIZE - 1);
+    let end = va + len;
+    with_current_aspace(|aspace| {
+        let mut a = base;
+        while a < end {
+            aspace.protect(a, perm);
+            a += frames::FRAME_SIZE;
+        }
+    });
 }
 
 /// Back `len` bytes of fresh zeroed RW pages into the current cell and return
@@ -198,7 +277,7 @@ pub fn on_user_trap(kind: TrapKind, fault_addr: usize, frame: *mut TrapFrame) ->
     // Linux cells never reach native dispatch: the personality tag decides
     // the syscall table before the number means anything (the ABIs collide).
     if cells()[cur].personality == Personality::Linux {
-        return match crate::linux::handle(nr, &args) {
+        return match crate::linux::handle(cur, nr, &args) {
             crate::linux::Ctl::Ret(v) => {
                 arch::set_syscall_ret(unsafe { &mut *frame }, v);
                 frame

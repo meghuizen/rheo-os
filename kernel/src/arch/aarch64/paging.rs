@@ -156,6 +156,62 @@ pub fn paging_map_frame(root: &mut PagingRoot, va: usize, pa: usize, perm: MapPe
     l3[l3_index(va)] = addr_bits(pa) | ATTR_NORMAL | SH_INNER | ap | AF | NG | xn | TABLE | VALID;
 }
 
+/// Walk to the 4 KiB leaf for `va`, returning `(l3_pa, l3_index)` if every
+/// level is a valid table descriptor (no block leaf on the way). Used by
+/// unmap/protect on user VAs (docs/LINUX-COMPAT.md L2).
+fn leaf(root: &PagingRoot, va: usize) -> Option<(usize, usize)> {
+    let l0 = table_mut(root.l0_pa);
+    let e = l0[l0_index(va)];
+    if e & VALID == 0 {
+        return None;
+    }
+    let l1 = table_mut(next_table(e));
+    let e = l1[l1_index(va)];
+    // TABLE bit distinguishes a table descriptor from a 1 GiB/2 MiB block
+    // (kernel supervisor RAM); a user 4 KiB page only sits under tables.
+    if e & VALID == 0 || e & TABLE == 0 {
+        return None;
+    }
+    let l2 = table_mut(next_table(e));
+    let e = l2[l2_index(va)];
+    if e & VALID == 0 || e & TABLE == 0 {
+        return None;
+    }
+    Some((next_table(e), l3_index(va)))
+}
+
+/// Clear the leaf mapping at `va`, returning the physical frame it pointed at
+/// (for the caller to `frames::free`), or None if it was not mapped. The
+/// caller flushes the TLB by re-activating the root (docs/LINUX-COMPAT.md L2).
+pub fn paging_unmap_frame(root: &mut PagingRoot, va: usize) -> Option<usize> {
+    let (l3_pa, idx) = leaf(root, va)?;
+    let l3 = table_mut(l3_pa);
+    if l3[idx] & VALID == 0 {
+        return None;
+    }
+    let pa = (l3[idx] & 0x0000_FFFF_FFFF_F000) as usize;
+    l3[idx] = 0;
+    Some(pa)
+}
+
+/// Rewrite the leaf permission bits at `va`, keeping the mapped frame. A no-op
+/// if `va` is unmapped. The caller flushes the TLB by re-activating the root.
+pub fn paging_protect(root: &mut PagingRoot, va: usize, perm: MapPerm) {
+    if let Some((l3_pa, idx)) = leaf(root, va) {
+        let l3 = table_mut(l3_pa);
+        if l3[idx] & VALID == 0 {
+            return;
+        }
+        let pa = (l3[idx] & 0x0000_FFFF_FFFF_F000) as usize;
+        let (ap, xn) = match perm {
+            MapPerm::UserRo => (AP_RO_ALL, UXN | PXN),
+            MapPerm::UserRw => (AP_RW_ALL, UXN | PXN),
+            MapPerm::UserRx => (AP_RO_ALL, PXN),
+        };
+        l3[idx] = addr_bits(pa) | ATTR_NORMAL | SH_INNER | ap | AF | NG | xn | TABLE | VALID;
+    }
+}
+
 /// Activate a root: TTBR0_EL1 with ASID in the high bits, flush that
 /// ASID's stale entries (roots are recreated per run reusing ASIDs), isb.
 pub fn paging_activate(root: &PagingRoot, asid: u16) {

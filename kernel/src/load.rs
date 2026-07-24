@@ -45,6 +45,9 @@ pub struct LinuxImage {
     /// `AT_PHENT` / `AT_PHNUM`.
     pub phent: usize,
     pub phnum: usize,
+    /// Highest mapped VA rounded up to a page: where the `brk` heap starts
+    /// (docs/LINUX-COMPAT.md L2).
+    pub image_end: usize,
 }
 
 /// Load a Linux ELF (`ET_EXEC` or `ET_DYN`) into `aspace`, applying the
@@ -58,7 +61,15 @@ pub fn load_elf_linux(image: &[u8], aspace: &mut AddressSpace) -> Option<LinuxIm
         elf::ET_EXEC => 0,
         _ => return None,
     };
-    elf.for_each_load(|seg| map_segment(aspace, image, seg, bias))?;
+    let mut image_end = 0usize;
+    elf.for_each_load(|seg| {
+        let end = seg.vaddr as usize + bias + seg.memsz;
+        if end > image_end {
+            image_end = end;
+        }
+        map_segment(aspace, image, seg, bias)
+    })?;
+    let image_end = (image_end + FRAME_SIZE - 1) & !(FRAME_SIZE - 1);
     let phdr = elf.phdr_vaddr().map(|v| v as usize + bias).unwrap_or(0);
     Some(LinuxImage {
         entry: elf.entry() as usize + bias,
@@ -66,6 +77,7 @@ pub fn load_elf_linux(image: &[u8], aspace: &mut AddressSpace) -> Option<LinuxIm
         phdr,
         phent: elf.phentsize(),
         phnum: elf.phnum(),
+        image_end,
     })
 }
 

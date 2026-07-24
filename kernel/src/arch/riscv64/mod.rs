@@ -12,8 +12,11 @@ pub mod linux_abi;
 mod paging;
 pub use paging::{
     PagingRoot, paging_activate, paging_activate_kernel, paging_kernel_init, paging_map,
-    paging_map_frame, paging_new_root,
+    paging_map_frame, paging_new_root, paging_protect, paging_unmap_frame,
 };
+
+/// `uname` machine string for the Linux personality (docs/LINUX-COMPAT.md L2).
+pub const LINUX_UNAME_MACHINE: &str = "riscv64";
 
 global_asm!(include_str!("../../../arch/riscv64/boot.S"));
 global_asm!(include_str!("../../../arch/riscv64/traps.S"));
@@ -316,6 +319,16 @@ pub fn cycles() -> u64 {
     let value: u64;
     unsafe { asm!("csrr {0}, cycle", out(reg) value) };
     value
+}
+
+/// Convert `cycles()` to nanoseconds for the Linux personality's
+/// `clock_gettime` (docs/LINUX-COMPAT.md L2). `cycles()` reads the `cycle`
+/// CSR (retired cycles); QEMU virt exposes a 10 MHz timebase for the separate
+/// `time` CSR. These are different counters, so this is an approximation -
+/// accuracy is irrelevant for glibc's coarse clock probes on the fixtures.
+pub fn ticks_to_ns(ticks: u64) -> u64 {
+    const TIMEBASE_HZ: u64 = 10_000_000;
+    ((ticks as u128 * 1_000_000_000) / TIMEBASE_HZ as u128) as u64
 }
 
 /// Calibration loop with a known instruction count: exactly 2

@@ -176,9 +176,21 @@ state. L0 is done: a per-cell `Personality { Native, Linux }` tag branches
 dispatch *before* the syscall number is decoded (the ABIs collide),
 per-ISA Linux syscall-number tables live in `arch::linux_abi` (x86-64
 legacy table; asm-generic table shared by arm64/riscv64), unknown numbers
-log `linux: ENOSYS nr=<n>` and return -ENOSYS, and `write`/`exit`/
-`exit_group` work - the `linuxrun` test runs a bare program speaking the
-raw Linux ABI on all three ISAs. glibc (not musl) is the supported libc.
+log `linux: ENOSYS nr=<n>` and return -ENOSYS. L1 added the ELF auxv,
+ET_DYN loading, the U-mode thread pointer (fs_base / tpidr_el0 / tp), and
+U-mode FP/SIMD enablement. **L2 is done**: the core syscall set (read/write/
+readv/writev, openat/close/lseek, fstat/newfstatat, getdents64, brk,
+anonymous mmap/munmap/mprotect, poll/ppoll, uname, clock_gettime, getrandom,
+prlimit64, ioctl(TIOCGWINSZ), dup/fcntl, and the identity/recorded/ENOSYS
+calls - honesty table in docs/LINUX-COMPAT.md), a per-cell fd table
+(`kernel/src/linux/fd.rs`: console, VFS files, /dev/{null,zero,urandom}),
+real memory over the cell's own address space (`AddressSpace::unmap`/
+`protect` + per-ISA `paging_unmap_frame`/`paging_protect` + `frames::free`;
+`kernel/src/linux/mem.rs`), and per-ISA `ticks_to_ns`. The `linuxrun` test
+now also runs, on **all three ISAs** with exact stdout + exit asserted, two
+**unpatched static-glibc** binaries built from source: a Rust `std` hello and
+a C hello (ET_EXEC relinked to a per-arch free base; docs/LINUX-COMPAT.md L2).
+glibc (not musl) is the supported libc.
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
@@ -252,10 +264,12 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               libcrun (a program linked against rheo-libc), jsonrun (a
               program parsing JSON with rheo-json on-OS), stdrun (a real-std
               program on-OS), coreutils (the coreutils multicall cell, with
-              argv + std::fs over the VFS), linuxrun (a bare Linux-ABI
-              program under Personality::Linux), bench-core, and the
-              interactive lsh bin (+ harness.rs, vfs_personality.rs);
-              fixtures/ holds the ext4 test image (+ gen-ext4.sh)
+              argv + std::fs over the VFS), linuxrun (Personality::Linux:
+              bare Linux-ABI programs plus, at L2, unpatched static-glibc
+              Rust + C hellos), bench-core, and the interactive lsh bin
+              (+ harness.rs, vfs_personality.rs); fixtures/ holds the ext4
+              test image (+ gen-ext4.sh); linux-fixtures/ holds the
+              built-from-source glibc test binaries (rusthello/ + hello.c)
 comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md
 xtask/        build/run/test/bench orchestration (cargo xtask ...)
 idl/          system IDL + codegen        (future, step 6)

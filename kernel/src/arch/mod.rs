@@ -73,12 +73,13 @@ mod imp;
 
 pub use imp::linux_abi;
 pub use imp::{
-    FRAME_POOL_BASE, NAME, PagingRoot, TrapFrame, VIRTIO_MMIO_BASE, VIRTIO_MMIO_COUNT,
-    VIRTIO_MMIO_STRIDE, context_init, context_switch, cpu_feature_names, cpu_report, cycles,
-    decode_syscall, discover, doorbell_count, doorbell_trap, enter_user_first, exit, has_hwrng,
-    hwrng_name, hwrng_u64, paging_activate, paging_activate_kernel, paging_kernel_init, paging_map,
-    paging_map_frame, paging_new_root, pci_cfg_read32, pci_cfg_write32, return_to_kernel,
-    serial_init, serial_read_byte, serial_write_byte, set_syscall_ret, set_user_fs_base, spin_loop,
+    FRAME_POOL_BASE, LINUX_UNAME_MACHINE, NAME, PagingRoot, TrapFrame, VIRTIO_MMIO_BASE,
+    VIRTIO_MMIO_COUNT, VIRTIO_MMIO_STRIDE, context_init, context_switch, cpu_feature_names,
+    cpu_report, cycles, decode_syscall, discover, doorbell_count, doorbell_trap, enter_user_first,
+    exit, has_hwrng, hwrng_name, hwrng_u64, paging_activate, paging_activate_kernel,
+    paging_kernel_init, paging_map, paging_map_frame, paging_new_root, paging_protect,
+    paging_unmap_frame, pci_cfg_read32, pci_cfg_write32, return_to_kernel, serial_init,
+    serial_read_byte, serial_write_byte, set_syscall_ret, set_user_fs_base, spin_loop, ticks_to_ns,
     trap_init, trapframe_new, user_fs_base,
 };
 

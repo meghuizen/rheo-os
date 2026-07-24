@@ -9,8 +9,11 @@ pub mod linux_abi;
 mod paging;
 pub use paging::{
     PagingRoot, paging_activate, paging_activate_kernel, paging_kernel_init, paging_map,
-    paging_map_frame, paging_new_root,
+    paging_map_frame, paging_new_root, paging_protect, paging_unmap_frame,
 };
+
+/// `uname` machine string for the Linux personality (docs/LINUX-COMPAT.md L2).
+pub const LINUX_UNAME_MACHINE: &str = "x86_64";
 
 global_asm!(
     include_str!("../../../arch/x86_64/boot.S"),
@@ -629,6 +632,27 @@ pub fn cycles() -> u64 {
     // lfence keeps rdtsc from being reordered around the measured code.
     unsafe { asm!("lfence", "rdtsc", out("eax") lo, out("edx") hi) };
     ((hi as u64) << 32) | lo as u64
+}
+
+/// Convert `cycles()` (TSC ticks) to nanoseconds for the Linux personality's
+/// `clock_gettime` (docs/LINUX-COMPAT.md L2). Uses CPUID leaf 0x16 (processor
+/// base frequency in MHz) when the CPU reports it; otherwise a documented
+/// 1 GHz assumption. glibc reads this only for coarse timing, so exact TSC
+/// frequency is not load-bearing for the fixtures.
+pub fn ticks_to_ns(ticks: u64) -> u64 {
+    use core::arch::x86_64::__cpuid_count;
+    let max_leaf = __cpuid_count(0, 0).eax;
+    let mhz = if max_leaf >= 0x16 {
+        __cpuid_count(0x16, 0).eax as u64
+    } else {
+        0
+    };
+    let hz = if mhz != 0 {
+        mhz * 1_000_000
+    } else {
+        1_000_000_000
+    };
+    ((ticks as u128 * 1_000_000_000) / hz as u128) as u64
 }
 
 /// Calibration loop with a known instruction count: exactly 2
