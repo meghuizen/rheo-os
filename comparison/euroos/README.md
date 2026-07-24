@@ -147,29 +147,77 @@ growing monotonically.
 ## What this project can take from EuroOS
 
 The comparison is not one-way. EuroOS demonstrates several things this
-project has deferred and should not forget the cost of:
+project has deferred and should not forget the cost of. Ordered by how
+actionable they are for rheo-os today.
 
-- **Real-hardware breadth, early.** USB (hubs, HID, audio), NVMe and AHCI
-  on physical machines, e1000/CDC-ECM NICs, driverless printing and
-  scanning, install-to-disk. rheo-os is emulation-first by design, but
-  EuroOS shows a small team can hold a real-hardware matrix - and finds
-  the bug classes QEMU never shows.
-- **A working persistence story.** EuroFS ships copy-on-write snapshots,
-  A/B superblocks, checksummed data paths, and rollback today; rheo-os's
-  native object store is still design. Their crash-consistency test
-  discipline (disk-full recovery, multi-disk stress to 64 GiB) is worth
-  copying when the native store lands.
-- **Host-testable crates as the primary test surface.** ~1000 `cargo
-  test` tests in pure libraries with thin kernel glue, no VM needed, is a
-  faster inner loop than boot-tests-only; rheo-os does this for the
-  allocator and JSON parser and could do it for more.
-- **Proof-by-running-real-software.** Booting unmodified DOOM is worth a
-  thousand ABI tables. The Linux personality (docs/LINUX-COMPAT.md L0-L7)
-  should keep a similarly unarguable milestone binary in sight.
-- **Supply-chain and disclosure hygiene as deliverables.** CRA
-  self-assessment, SBOM, signed binaries end-to-end, a support policy.
-  rheo-os has the primitives (attestation, measurement, signing) but not
-  yet the compliance-shaped documents; they matter for adoption.
+**1. Verify-before-execute.** EuroOS refuses to run any binary whose
+Ed25519 signature does not verify. rheo-os's ELF loader currently loads
+whatever it is handed. Signature verification at load passes the section
+6 admission test cleanly (unforgeable enforcement, arbitrates a shared
+mechanism, policy - the trust roots - lives outside), composes with the
+existing attest-by-measurement engine model, and closes a real gap
+between the attestation story on paper and what the loader enforces.
+
+**2. Fuzz every parser of untrusted input.** EuroOS runs a deterministic
+fuzz harness (200k inputs per parser, panic-safe) over its filesystem,
+network, and format parsers. rheo-os host-fuzzes the heap allocator, but
+the ELF loader and the ext4 driver parse *attacker-shaped* bytes (a
+binary to run, a disk image to mount) and are only exercised by
+well-formed fixtures. Both are `no_std` libraries that already compile
+on the host - a fuzz target each is cheap and overdue.
+
+**3. Crash-consistency test discipline for storage.** EuroFS ships
+copy-on-write snapshots, A/B superblocks, checksummed data paths with
+scrub, and rollback - and tests disk-full recovery, multi-disk
+cross-copy, and stress to 64 GiB. rheo-os's write path today is ramfs
+(ext4 is read-only) and the native object store is still design. When
+write-capable persistence lands, EuroOS's test list (power-cut points,
+disk-full, checksum-detected corruption) is the acceptance bar to copy,
+and durability-as-typed-completion (docs 4.6) needs exactly this kind of
+adversarial testing to be credible.
+
+**4. Real-hardware breadth, early.** USB (hubs, HID, audio), NVMe and
+AHCI on physical machines, e1000/CDC-ECM NICs, driverless printing and
+scanning, install-to-disk. rheo-os is emulation-first by design and the
+hardware lab is scheduled, not skipped - but EuroOS shows a small team
+can hold a physical-hardware matrix, and QEMU never shows the bug
+classes real firmware, real timing, and real device errata produce. The
+longer the lab is deferred, the bigger the surprise bill.
+
+**5. Host-testable crates as the primary test surface.** Roughly a
+thousand `cargo test` tests in pure libraries with a thin kernel glue
+layer, no VM in the inner loop. rheo-os does this for the allocator,
+ext4 parsing, and rheo-json, but the capability core and queue-pair
+state machines are tested only as in-QEMU boot kernels. Factoring them
+to also run as host property tests would make the proof-property suite
+(ARCHITECTURE.md 8.2) seconds instead of boots, without replacing the
+in-QEMU tests that gate CI.
+
+**6. Proof-by-running-real-software milestones.** Booting the unmodified
+1993 DOOM binary is worth a thousand ABI tables - unarguable, and it
+forces syscall breadth honestly. The Linux personality
+(docs/LINUX-COMPAT.md L0-L7) currently proves `write`/`exit`; it should
+name its DOOM - one specific, well-known, unmodified binary per
+milestone (a static busybox is the natural L-series candidate).
+
+**7. Tamper-evident audit and operability plumbing.** EuroOS ships a
+hash-chained audit log, structured journal, kernel crash dumps, a
+deadman watchdog, and SMART-based disk health. rheo-os's event streams
+are the richer observability design (typed, flow-context, capability-
+scoped), but they are neither persisted nor tamper-evident, and there is
+no crash-dump or watchdog story yet. For the stated production-grade bar
+(PRODUCTION.md), hash-chaining the security-relevant event streams and a
+minimal crash-dump path are the missing operability pieces EuroOS
+already has.
+
+**8. Compliance-shaped deliverables.** CRA self-assessment, SBOM, a
+SECURITY.md with coordinated disclosure, a support policy, signed
+release artifacts, and one-click demo images. rheo-os has the stronger
+primitives (measured boot, attestation chains, capability audit) but
+none of the documents adopters and regulators actually ask for. These
+are cheap relative to the engineering already done, and the EU
+regulatory framing EuroOS targets (CRA) will apply to any OS shipped
+into that market.
 
 ## A measured comparison is possible
 
