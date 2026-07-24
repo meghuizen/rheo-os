@@ -160,6 +160,47 @@ fn leaf(root: &PagingRoot, va: usize) -> Option<(usize, usize)> {
     Some((next_table(e), l3_index(va)))
 }
 
+/// Invoke `f(va, pa, perm)` for every mapped 4 KiB user leaf in `root` - the
+/// primitive `fork`/`execve` teardown build on (docs/LINUX-COMPAT.md L6). A
+/// TTBR0 cell root maps only the cell's own user pages (kernel + MMIO are in
+/// TTBR1), so every valid level-3 page found is a user page.
+pub fn paging_for_each_user_leaf(root: &PagingRoot, f: &mut dyn FnMut(usize, usize, MapPerm)) {
+    let l0 = table_mut(root.l0_pa);
+    for (i0, &e0) in l0.iter().enumerate() {
+        if e0 & VALID == 0 || e0 & TABLE == 0 {
+            continue;
+        }
+        let l1 = table_mut(next_table(e0));
+        for (i1, &e1) in l1.iter().enumerate() {
+            if e1 & VALID == 0 || e1 & TABLE == 0 {
+                continue; // unmapped or a 1 GiB block (never a user 4 KiB page)
+            }
+            let l2 = table_mut(next_table(e1));
+            for (i2, &e2) in l2.iter().enumerate() {
+                if e2 & VALID == 0 || e2 & TABLE == 0 {
+                    continue; // unmapped or a 2 MiB block
+                }
+                let l3 = table_mut(next_table(e2));
+                for (i3, &e3) in l3.iter().enumerate() {
+                    if e3 & VALID == 0 {
+                        continue;
+                    }
+                    let va = (i0 << 39) | (i1 << 30) | (i2 << 21) | (i3 << 12);
+                    let pa = (e3 & 0x0000_FFFF_FFFF_F000) as usize;
+                    let perm = if e3 & (0b11 << 6) == AP_RW_ALL {
+                        MapPerm::UserRw
+                    } else if e3 & UXN != 0 {
+                        MapPerm::UserRo
+                    } else {
+                        MapPerm::UserRx
+                    };
+                    f(va, pa, perm);
+                }
+            }
+        }
+    }
+}
+
 /// Clear the leaf mapping at `va`, returning the physical frame it pointed at
 /// (for the caller to `frames::free`), or None if it was not mapped. The
 /// caller flushes the TLB by re-activating the root (docs/LINUX-COMPAT.md L2).

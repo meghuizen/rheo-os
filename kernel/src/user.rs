@@ -64,14 +64,19 @@ const EMPTY: RunCell = RunCell {
     personality: Personality::Native,
 };
 
-/// Number of runnable cell slots. Bumped 2 -> 8 for the Linux personality
-/// (docs/LINUX-COMPAT.md L2): several Linux cells plus the peer used by the
-/// native `SYS_SWITCH` test. `SYS_SWITCH`'s `cur ^ 1` pairing is unaffected.
-pub const MAX_CELLS: usize = 8;
+/// Number of runnable cell slots. Bumped 8 -> 16 for the Linux personality's
+/// **processes** (docs/LINUX-COMPAT.md L6): a shell plus several concurrent
+/// pipeline stages (each `fork` claims a slot until it is reaped). The native
+/// `SYS_SWITCH` test's `cur ^ 1` pairing (cells 0/1) is unaffected.
+pub const MAX_CELLS: usize = 16;
 
 static mut CELLS: [RunCell; MAX_CELLS] = [EMPTY; MAX_CELLS];
 static mut CURRENT: usize = 0;
 static mut EXITED: usize = 0;
+/// The cell `run` was entered with (docs/LINUX-COMPAT.md L6): the top of the
+/// Linux process tree. Only its exit ends the whole run; a forked child's exit
+/// makes it a zombie and reschedules another cell (`linux::proc`).
+static mut TOP_CELL: usize = 0;
 
 fn cells() -> &'static mut [RunCell; MAX_CELLS] {
     // SAFETY: single CPU, synchronous traps; no aliasing run concurrently.
@@ -263,6 +268,7 @@ pub fn run(idx: usize) -> (usize, Outcome) {
     assert!(cell.present, "run of empty cell slot {idx}");
     unsafe {
         *core::ptr::addr_of_mut!(CURRENT) = idx;
+        *core::ptr::addr_of_mut!(TOP_CELL) = idx;
         (*cell.aspace).activate();
         arch::enter_user_first(cell.frame);
     }
@@ -277,6 +283,25 @@ pub fn run(idx: usize) -> (usize, Outcome) {
     )
 }
 
+/// Turn a Linux personality `Ctl` into the frame to resume (or a null-frame
+/// unwind for the top cell's exit). Shared by the syscall path and the
+/// synchronous-fault path (docs/LINUX-COMPAT.md L6).
+///
+/// `Ctl::Switch` covers both a same-cell thread switch (L4) and a cross-cell
+/// process switch (L6): in the latter `crate::linux::proc` has already updated
+/// `CURRENT`, activated the target address space, and swapped FP/TLS, so here
+/// the trampoline just resumes the returned frame.
+fn linux_ctl(ctl: crate::linux::Ctl, frame: *mut TrapFrame) -> *mut TrapFrame {
+    match ctl {
+        crate::linux::Ctl::Ret(v) => {
+            arch::set_syscall_ret(unsafe { &mut *frame }, v);
+            frame
+        }
+        crate::linux::Ctl::Exit(code) => finish(Outcome::Exited(code)),
+        crate::linux::Ctl::Switch(next) => next,
+    }
+}
+
 /// Record why the current cell's run ended and signal an unwind by
 /// returning a null frame (the arch trampoline calls return_to_kernel).
 fn finish(outcome: Outcome) -> *mut TrapFrame {
@@ -286,6 +311,77 @@ fn finish(outcome: Outcome) -> *mut TrapFrame {
         *core::ptr::addr_of_mut!(EXITED) = cur;
     }
     core::ptr::null_mut()
+}
+
+/// The cell `run` was entered with - the top of the Linux process tree
+/// (docs/LINUX-COMPAT.md L6). Only its exit unwinds `run`.
+pub fn top_cell() -> usize {
+    unsafe { *core::ptr::addr_of!(TOP_CELL) }
+}
+
+/// Whether cell `idx` currently holds a runnable/live cell.
+pub fn cell_present(idx: usize) -> bool {
+    cells()[idx].present
+}
+
+/// The address-space pointer installed for cell `idx` (the Linux process
+/// scheduler's `fork`/`execve` build on it).
+pub fn cell_aspace(idx: usize) -> *const AddressSpace {
+    cells()[idx].aspace
+}
+
+/// Repoint cell `idx` at a new address space (after `execve` replaces the image,
+/// docs/LINUX-COMPAT.md L6).
+pub fn set_cell_aspace(idx: usize, aspace: *const AddressSpace) {
+    cells()[idx].aspace = aspace;
+}
+
+/// Repoint cell `idx` at a new context-0 frame (after `execve`).
+pub fn set_cell_frame(idx: usize, frame: *mut TrapFrame) {
+    cells()[idx].frame = frame;
+}
+
+/// Make cell `idx` the current cell and activate its address space - the Linux
+/// process scheduler's cross-cell switch (docs/LINUX-COMPAT.md L6), the same
+/// mechanism the native `SYS_SWITCH` uses, driven from `crate::linux::proc`
+/// instead of a syscall arm.
+pub fn switch_to_cell(idx: usize) {
+    unsafe {
+        *core::ptr::addr_of_mut!(CURRENT) = idx;
+        (*cells()[idx].aspace).activate();
+    }
+}
+
+/// Install a **forked** child in slot `idx` sharing the parent's capability
+/// bundle (POSIX fork = clone-cell-within-capability-bundle, docs/POSIX-
+/// PERSONALITY.md 2). The address space and frame are kernel-owned by
+/// `crate::linux::proc`; personality is Linux.
+///
+/// # Safety
+/// `aspace`/`frame` must outlive the child's run; `parent` must be present.
+pub unsafe fn install_forked(
+    idx: usize,
+    aspace: *const AddressSpace,
+    frame: *mut TrapFrame,
+    parent: usize,
+) {
+    let p = cells()[parent];
+    cells()[idx] = RunCell {
+        aspace,
+        caps: p.caps,
+        objects: p.objects,
+        qp: p.qp,
+        frame,
+        outcome: None,
+        present: true,
+        personality: Personality::Linux,
+    };
+}
+
+/// Free cell slot `idx` (a reaped zombie). The slot becomes reusable by a
+/// future `fork`.
+pub fn free_cell(idx: usize) {
+    cells()[idx] = EMPTY;
 }
 
 /// The trap dispatcher, called from each arch's U-mode trampoline. Returns
@@ -313,7 +409,13 @@ pub fn on_user_trap(
         if cells()[cur].personality == Personality::Linux {
             return match crate::linux::deliver_fault(cur, cause, fault_addr, frame) {
                 crate::linux::FaultOutcome::Resume(f) => f,
-                crate::linux::FaultOutcome::Terminate(code) => finish(Outcome::Exited(code)),
+                // A default (uncaught) fatal fault ends the process. For the top
+                // cell this unwinds `run` (reporting 128+signo); a forked child
+                // becomes a WIFSIGNALED zombie its parent reaps
+                // (docs/LINUX-COMPAT.md L6).
+                crate::linux::FaultOutcome::Terminate(signo) => {
+                    linux_ctl(crate::linux::proc::exit_signaled(cur, signo), frame)
+                }
             };
         }
         return finish(Outcome::Faulted(fault_addr));
@@ -326,18 +428,7 @@ pub fn on_user_trap(
     // Linux cells never reach native dispatch: the personality tag decides
     // the syscall table before the number means anything (the ABIs collide).
     if cells()[cur].personality == Personality::Linux {
-        return match crate::linux::handle(cur, nr, &args, frame) {
-            crate::linux::Ctl::Ret(v) => {
-                arch::set_syscall_ret(unsafe { &mut *frame }, v);
-                frame
-            }
-            crate::linux::Ctl::Exit(code) => finish(Outcome::Exited(code)),
-            // A thread switch (futex/yield/clone-exit): resume a different
-            // context of the same cell. That context's frame already carries
-            // its saved state and pending return value; FP/TLS were swapped by
-            // the thread scheduler before this point (docs/LINUX-COMPAT.md L4).
-            crate::linux::Ctl::Switch(next) => next,
-        };
+        return linux_ctl(crate::linux::handle(cur, nr, &args, frame), frame);
     }
 
     match nr {

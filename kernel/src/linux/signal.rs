@@ -137,6 +137,36 @@ fn bit(signo: u32) -> u64 {
     1u64 << ((signo - 1) as u64)
 }
 
+/// Copy cell `from`'s signal dispositions and context-0 mask/altstack into cell
+/// `to` - the `fork` inheritance step (docs/LINUX-COMPAT.md L6): a child inherits
+/// the parent's handlers and blocked mask.
+pub fn fork_copy(from: usize, to: usize) {
+    *actions(to) = *actions(from);
+    *ctx(to, 0) = *ctx(from, 0);
+    for i in 1..MAX_CONTEXTS {
+        *ctx(to, i) = SigCtx::new();
+    }
+}
+
+/// Reset cell `cell`'s dispositions across `execve` (docs/LINUX-COMPAT.md L6):
+/// caught signals revert to the default; ignored/default dispositions are kept
+/// (POSIX). The blocked mask is preserved (context 0), the pending set cleared.
+pub fn exec_reset(cell: usize) {
+    let a = actions(cell);
+    for act in a.iter_mut() {
+        if act.handler != SIG_DFL && act.handler != SIG_IGN {
+            *act = SigAction::dfl();
+        }
+    }
+    ctx(cell, 0).pending = 0;
+    ctx(cell, 0).alt_sp = 0;
+    ctx(cell, 0).alt_size = 0;
+    ctx(cell, 0).alt_active = false;
+    for i in 1..MAX_CONTEXTS {
+        *ctx(cell, i) = SigCtx::new();
+    }
+}
+
 /// Is `signo`'s default disposition to terminate the process? (Everything
 /// except the "ignore by default" set: SIGCHLD, SIGURG, SIGWINCH.)
 fn default_terminates(signo: u32) -> bool {
@@ -305,21 +335,20 @@ fn cause_signo(cause: arch::FaultCause) -> u32 {
     }
 }
 
-/// The synthesized pid/tgid of a Linux cell (docs/LINUX-COMPAT.md 3).
-const PID: i64 = 1000;
-
-/// kill(pid, sig): deliver to self. Only self-targeting is supported at L5
-/// (pid == our pid, the whole group 0, or -1); any other pid is -ESRCH.
+/// kill(pid, sig): deliver to self. Only self-targeting is supported (pid ==
+/// our own pid, the whole group 0, or -1); any other pid is -ESRCH. The pid is
+/// per-cell now that processes exist (docs/LINUX-COMPAT.md L6).
 pub fn kill(cell: usize, pid: i64, sig: u64, frame: *mut TrapFrame) -> Ctl {
-    if pid != PID && pid != 0 && pid != -1 {
+    let mypid = crate::linux::proc::pid(cell) as i64;
+    if pid != mypid && pid != 0 && pid != -1 {
         return err(ESRCH);
     }
     deliver_or_signal(cell, thread::current_context(cell), sig, frame, 0, 0)
 }
 
-/// tgkill(tgid, tid, sig): deliver to a thread of this process (self only at L5).
+/// tgkill(tgid, tid, sig): deliver to a thread of this process (self only).
 pub fn tgkill(cell: usize, tgid: i64, tid: i64, sig: u64, frame: *mut TrapFrame) -> Ctl {
-    if tgid != PID {
+    if tgid != crate::linux::proc::pid(cell) as i64 {
         return err(ESRCH);
     }
     tkill(cell, tid, sig, frame)
@@ -336,7 +365,7 @@ pub fn tkill(cell: usize, tid: i64, sig: u64, frame: *mut TrapFrame) -> Ctl {
 /// rt_sigqueueinfo(tgid, sig, uinfo): deliver to self, carrying the caller's
 /// si_code (the rest of the queued siginfo is not reconstructed at L5).
 pub fn rt_sigqueueinfo(cell: usize, tgid: i64, sig: u64, uinfo: u64, frame: *mut TrapFrame) -> Ctl {
-    if tgid != PID {
+    if tgid != crate::linux::proc::pid(cell) as i64 {
         return err(ESRCH);
     }
     // SAFETY: `uinfo` (if given) is a readable siginfo; si_code is at +8.
@@ -361,8 +390,11 @@ pub fn rt_sigtimedwait() -> i64 {
 pub enum FaultOutcome {
     /// Resume the (rewritten) frame at the handler.
     Resume(*mut TrapFrame),
-    /// No catchable handler: terminate the cell reporting this code (128+signo).
-    Terminate(u64),
+    /// No catchable handler: terminate the process with this signal (the caller
+    /// routes it through `proc::exit_signaled` - a zombie for a forked child,
+    /// or an unwind reporting 128+signo for the top cell, docs/LINUX-COMPAT.md
+    /// L6).
+    Terminate(u32),
 }
 
 /// The fault hook called from `user::on_user_trap` for a Linux cell. Delivers a
@@ -398,7 +430,7 @@ pub fn deliver_fault(
         };
         FaultOutcome::Resume(frame)
     } else {
-        FaultOutcome::Terminate(128 + signo as u64)
+        FaultOutcome::Terminate(signo)
     }
 }
 
@@ -427,9 +459,10 @@ fn deliver_or_signal(
     if act.handler == SIG_IGN || (act.handler == SIG_DFL && !default_terminates(signo)) {
         return ret(0);
     }
-    // SIG_DFL with a "terminate" default: the process dies now.
+    // SIG_DFL with a "terminate" default: the process dies now (a zombie for a
+    // forked child, an unwind for the top cell, docs/LINUX-COMPAT.md L6).
     if act.handler == SIG_DFL {
-        return Ctl::Exit(128 + signo as u64);
+        return crate::linux::proc::exit_signaled(cell, signo);
     }
     // A real handler. If the target is not the running context, or the signal
     // is blocked there, record it pending (delivered when next runnable/
@@ -516,7 +549,7 @@ fn check_pending_current(cell: usize, frame: *mut TrapFrame) -> Option<Ctl> {
             continue;
         }
         if act.handler == SIG_DFL {
-            return Some(Ctl::Exit(128 + s as u64));
+            return Some(crate::linux::proc::exit_signaled(cell, s));
         }
         // SAFETY: current context's frame; cell root active.
         unsafe {

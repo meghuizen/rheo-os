@@ -242,6 +242,31 @@ SIGSEGV handler `_exit(0)`, not a killed cell), `sig_dfl` (`raise(SIGABRT)`, no
 handler -> terminate 134). Scope: self / fault delivery (a signal to a non-running
 sibling context is recorded pending, not force-delivered); FP state is not
 saved across a handler - both documented.
+**L6 is done**: **processes - fork / execve / wait4 / cross-cell pipes** (no new
+kernel object; all per-cell synthesized state, `kernel/src/linux/proc.rs` +
+`pipe.rs`). `fork` is clone-cell-within-capability-bundle: a new `user` cell in
+the parent's bundle with the parent's committed pages **eager-copied** (COW
+deferred) via a per-ISA page-table user-leaf walk (`arch::paging_for_each_user_leaf`
+behind `AddressSpace::fork_from`/`free_user_frames`), the `LinuxState`/fds/cwd/
+signal dispositions deep-copied, child pid synthesized. `execve` **streams** a new
+ELF from the VFS into a fresh address space (`load::exec_elf_from_vfs`: only the
+header + phdrs are buffered; segments read page-by-page into destination frames,
+the kernel holds no whole-image buffer). `wait4` blocks the parent cooperatively
+until a child exits, reaping WIFEXITED/WIFSIGNALED status and freeing the child.
+`pipe2` is a **global cross-cell** ring buffer (`kernel/src/linux/pipe.rs`) whose
+two ends live in different cells after fork; reads/writes block cooperatively with
+cross-cell wake, EOF on all-writers-closed, SIGPIPE on all-readers-closed. The run
+loop is **generalized**: a cell that blocks or exits hands the CPU to the next
+runnable cell via the same address-space switch the native `SYS_SWITCH` uses -
+the native path is byte-for-byte unchanged, `crate::linux::proc` drives the
+cross-cell switch behind the `Personality::Linux` branch. `MAX_CELLS` 8 -> 16. The
+`linuxproc` test proves it on **all three ISAs**: (A) a direct static-glibc
+multi-process fixture (`procdemo`: pipe2+fork+dup2+execve of `/bin/cecho` from the
+VFS+wait4, exact transcript+exit), and (B) the **P11 gate** - `rsh`, a minimal
+from-scratch static-glibc shell (dash cross-build was out of budget), forks+execs
+the unpatched upstream uutils/coreutils multicall over pipelines and `&&`/`||`,
+passing a 12-command coreutils suite **12/12 = 100%** (gate >= 80%; POSIX-
+PERSONALITY.md 5).
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
@@ -322,12 +347,14 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               sort), linuxthreads (L4: an unpatched multi-threaded Rust std
               binary - clone/futex/TLS/join), linuxsig (L5: signal delivery -
               async raise, fault->SIGSEGV handler, SIG_DFL terminate),
+              linuxproc (L6: fork/execve/wait4/cross-cell pipes - a direct
+              multi-process C fixture + the P11 coreutils-suite shell),
               bench-core, and the interactive
               lsh bin (+ harness.rs, vfs_personality.rs); fixtures/ holds the
               ext4 test image (+ gen-ext4.sh); linux-fixtures/ holds the
               built-from-source glibc test binaries (rusthello/ + rustthreads/
-              + hello.c + sig_{raise,segv,dfl}.c; coreutils via cargo install,
-              gitignored)
+              + hello.c + sig_{raise,segv,dfl}.c + procdemo/cecho/rsh.c;
+              coreutils via cargo install, gitignored)
 comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md
 xtask/        build/run/test/bench orchestration (cargo xtask ...)
 idl/          system IDL + codegen        (future, step 6)

@@ -109,7 +109,7 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 | getdents64 | full | VFS directory (path stored per fd), packed as `linux_dirent64` and paged out via a per-fd cursor so a reader looping until 0 (real `ls`) terminates; directory must fit 4 KiB of records |
 | getcwd | full | the per-cell cwd (default `/`) + NUL; -ERANGE if the buffer is too small |
 | chdir | partial | stores the path as the cwd verbatim (absolute in practice); no existence check |
-| pipe2 | partial | a single-process, non-blocking, bounded in-process pipe (4 × 8 KiB per cell); lets a tool create a pipe and fall back when `splice` is unavailable (uu_cat). Blocking / cross-context pipe semantics are L6 |
+| pipe2 / pipe | full | a **cross-cell** bounded ring buffer (16 global pipes × 64 KiB, `kernel/src/linux/pipe.rs`), the two ends held by different cells after `fork` (L6). Read/write block **cooperatively** with cross-cell wake at syscall boundaries; EOF when all write ends close, SIGPIPE/-EPIPE when all read ends close. `dup`/`fork` refcount the ends. Single-process use (both ends in one cell, no peer to run) falls back to non-blocking -EAGAIN, keeping uu_cat's `splice`-fallback path (L3) working. `pipe` (x86-64 legacy) == `pipe2(...,0)` |
 | splice | ENOSYS | uu_cat's Linux fast path probes `splice` and falls back to read/write on failure (documented fallback) |
 | /proc/self/auxv | full | serves the cell's own auxv byte stream (a read-only synthetic fd); glibc/rustix read it when no PR_GET_AUXV is provided |
 | dup / dup3 | partial | copies the slot; a duplicated VFS fd shares the underlying descriptor (close-once) |
@@ -123,12 +123,12 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 | munmap / mprotect | full | leaf unmap+`frames::free` / leaf permission rewrite. `mprotect` making a reserved range accessible **commits** fresh frames (glibc grows a PROT_NONE-reserved arena/stack this way, L4); PROT_NONE decommits |
 | madvise | full | advisory by specification: success, no action |
 | exit | full | ends the calling **thread** (L4): CHILD_CLEARTID clear+futex-wake, then switch to the next ready context; ends the cell only if it was the last |
-| exit_group | full | ends the whole cell (all contexts) with the code |
-| getpid | full | synthesized pid/tgid 1000 |
+| exit_group | full | ends the whole process (all contexts). The top cell unwinds the run; a forked child becomes a zombie (its frames reclaimed) until the parent `wait4`s it (L6) |
+| getpid | full | synthesized pid/tgid: 1000 for the top process, 1001+ per forked child (L6) |
 | gettid | full | per-context tid (L4): the main thread is 1000, clone children 1001+ |
 | clone | partial | the pthread-create flag set (CLONE_VM/FS/FILES/SIGHAND/THREAD/SETTLS/PARENT_SETTID/CHILD_CLEARTID): a new context in the same address space with its own stack/TLS, returns 0 in the child / tid in the parent (L4). Not `fork` (L6); >`MAX_CONTEXTS` (8) per cell → -EAGAIN. Arg order is arch ABI (`CLONE_BACKWARDS` on ARM64/RISC-V) |
 | futex | partial | FUTEX_WAIT/WAKE (+ WAIT_BITSET/WAKE_BITSET as plain WAIT/WAKE; PRIVATE ignored); WAIT re-checks the word and parks the caller, WAKE moves up to `val` waiters to ready (L4). Any timeout treated as infinite; **priority inheritance is a documented TODO** (FIFO wake; no RT-reservation mutexes in the suite) |
-| getppid | full | 0 (no parent) |
+| getppid | full | the parent's pid (0 for the top of the process tree) |
 | getuid / geteuid / getgid / getegid | full | 1000 (no root, SECURITY-IDENTITY) |
 | uname | full | sysname "Linux", release "6.6.0-rheo", machine per ISA |
 | clock_gettime | partial | MONOTONIC via `arch::ticks_to_ns`; REALTIME = fixed epoch + monotonic (unsynced, disclosed) |
@@ -149,7 +149,12 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 | rt_sigtimedwait | partial | never blocks; returns -EAGAIN so callers loop/bail rather than hang (no fixture waits in it) (L5) |
 | mremap | full | shrink unmaps the tail in place; grow requires MREMAP_MAYMOVE (map a fresh region, copy, free the old); else -ENOMEM. glibc's large-block `realloc` needs it (the malloc-copy-free fallback otherwise leaks frames) |
 | rseq / clone3 | ENOSYS | glibc has documented fallbacks (rseq→unregistered, clone3→clone); verified via the ENOSYS logger that glibc/rust fall back to `clone`, so clone3 stays ENOSYS |
-| execve / fork / wait4 | ENOSYS | processes (L6). `clone`/`futex` are done at L4 - a real threaded upstream coreutil (`sort`, which parallelizes with rayon) now runs; signals (`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`/`kill`/`tgkill`/...) are done at L5 (above) |
+| fork / vfork | full | clone-cell-within-capability-bundle (docs/POSIX-PERSONALITY.md 2): a new `user` cell in the parent's bundle, the parent's committed pages **eager-copied** (COW deferred + documented), `LinuxState`/fd table/cwd/signal dispositions deep-copied, a child pid synthesized; child returns 0, parent returns the pid. Only the calling thread is duplicated (POSIX). Reached via `clone` without `CLONE_VM` on every ISA (glibc's `fork`), or the x86-64 `fork`/`vfork` numbers. Over the `MAX_CELLS` (16) cap → -EAGAIN. `vfork` is treated as `fork` (eager copy, no COW share - safe, just less lazy) (`kernel/src/linux/proc.rs`) |
+| execve | full | replaces the calling cell's image with one **streamed** from the VFS (`load::exec_elf_from_vfs`: only the ELF header + phdrs are buffered; each `PT_LOAD` segment is read page-by-page straight into its destination frame, so the kernel holds no whole-image buffer). Keeps the same cell/pid, fd table (close-on-exec is not tracked - documented), and cwd; resets signal handlers to default and starts single-threaded. ET_EXEC + static-PIE ET_DYN, stock base |
+| wait4 / waitpid | full | the parent blocks cooperatively (switching to a runnable child) until a child exits, then reaps: WIFEXITED/WEXITSTATUS for a normal exit, WIFSIGNALED for a signal-killed child; frees the child cell + its frames. `pid > 0` waits for that child, `pid <= 0` for any; WNOHANG honored; -ECHILD with no children. SIGCHLD is not queued to a handler (the parent reaps directly; documented) |
+| dup2 | full | (x86-64 legacy) == `dup3(old, new, 0)`; a pipe end is refcounted |
+| setpgid / setsid | recorded | returns 0 (single-session model, no job control); the shell queries process groups but does not depend on the effect |
+| getpgid / getsid | partial | returns the caller's pid (one group/session per process) |
 
 ### Planned identity/constants
 
@@ -300,10 +305,54 @@ syscalls).
   - **FP/SIMD across a handler is not saved/restored** (the ucontext carries
     GPRs/PC/SP + mask, not the vector state); L5 fixtures do not rely on FP
     liveness across a handler. Documented; eager per-signal FP save is future.
-- **L6** - processes: fork (clone-cell-within-capability-bundle, eager
-  copy), execve, wait4, pipes, a static-glibc shell. The
-  POSIX-PERSONALITY.md P11 gate (>= 80% of the defined coreutils suite) is
-  measured here.
+- **L6 [done]** - processes: **fork / execve / wait4 / cross-cell pipes**, plus
+  a shell running the P11 coreutils suite. All are per-cell synthesized state -
+  **no new kernel object** (docs/LINUX-COMPAT.md 1). The kernel mechanisms added
+  each pass the ARCHITECTURE.md 6 admission rule on their own merits, like L4's
+  multi-context cells: a page-table user-leaf walk (`arch::paging_for_each_user_leaf`)
+  behind `AddressSpace::fork_from`/`free_user_frames` (memory-grant mechanics -
+  eager copy + reclaim), a **generalized run loop** where a cell blocking
+  (`wait4`, an empty/full pipe) or exiting hands the CPU to the next runnable
+  cell via the same address-space switch the native `SYS_SWITCH` uses (the
+  native path is byte-for-byte unchanged - `crate::linux::proc` drives the
+  cross-cell switch behind the `Personality::Linux` branch), and a streaming
+  `execve` loader (`load::exec_elf_from_vfs`). `MAX_CELLS` 8 → **16** (a shell
+  plus concurrent pipeline stages); the frame pool stays 32768 (fork eager-copies
+  and `wait4`/`exit`/`execve` reclaim leaf frames, so a suite of pipelines stays
+  bounded - intermediate page-table frames leak a small, documented amount per
+  dead process).
+  - Proof (`linuxproc`, all three ISAs, exact stdout + exit): **(A)** a direct
+    multi-process static-glibc C fixture (`procdemo`) - `pipe2` + `fork`; the
+    child `dup2`s the pipe write end to stdout and `execve`s a second
+    static-glibc binary (`/bin/cecho`, served from the VFS); the parent drains
+    the pipe, `wait4`s, and prints a deterministic transcript, exiting with a
+    code derived from the child status. This proves fork + execve + wait4 + pipe
+    end-to-end. **(B)** the **P11 gate**: `rsh`, a minimal from-scratch
+    static-glibc shell (a full dash/busybox cross-build was out of budget; `rsh`
+    is honest - it exercises exactly the L6 primitives: `fork`/`execve`/`wait4`/
+    `pipe2`/`dup2` with pipelines and `&&`/`||`), forks + execs the **unpatched
+    upstream uutils/coreutils** multicall (L3's `coreutils` 0.0.29, from the VFS)
+    to run the suite below.
+  - **P11 coreutils suite** (`rsh -c "<cmdline>"`, exact stdout + exit each),
+    measured **12/12 = 100 %** on x86_64, aarch64, riscv64 (gate >= 80 %; kill
+    threshold < 60 %): `seq 1 5 | wc -l` (5), `echo hi | cat` (hi),
+    `true && echo ok` (ok), `false || echo rescued` (rescued),
+    `true && echo ok || echo no` (ok), `false && echo no || echo yes` (yes),
+    `basename /a/b/c.txt` (c.txt), `dirname /a/b/c.txt` (/a/b),
+    `seq 1 4 | head -n2` (1,2), `echo one two three | wc -w` (3), `pwd` (/),
+    `echo hello | wc -c` (6). Each pipeline stage `seq ...` runs as
+    `coreutils seq ...` (the multicall dispatches on the argument), so the
+    suite is the real Linux Rust coreutils driven by a shell over the L6
+    process primitives.
+  - Accommodations, all disclosed: **eager copy, COW deferred** - `fork`
+    copies every committed page (including the 1 MiB Linux stack); `execve`
+    frees it immediately, so the transient cost is bounded. **Cross-thread
+    SIGCHLD is not queued** - the parent reaps via `wait4` directly (no L6
+    fixture installs a SIGCHLD handler). **Close-on-exec is not tracked** -
+    `execve` keeps all fds open; a pipeline child closes its unused ends
+    explicitly (the shell does). **Cooperative, single CPU** (inherited from
+    L4): a compute-bound process starves peers until it hits a syscall
+    boundary - correct for the syscall-driven suite.
 - **L7** - dynamic linking: PT_INTERP -> ld-linux, /lib on the ext4 image,
   fd-backed private mmap. Proof: a dynamically-linked glibc hello.
 
@@ -334,6 +383,17 @@ same recipe as `chello`), the `linuxsig` proof: `sig_raise` (async
 `raise(SIGUSR1)` -> handler -> `rt_sigreturn` resume), `sig_segv` (a null write
 delivered to a SIGSEGV handler), and `sig_dfl` (`raise(SIGABRT)` with no handler
 -> terminate 134).
+
+The **L6 process fixtures** (`tests/linux-fixtures/{procdemo,cecho,rsh}.c`,
+static-glibc ET_EXEC via the same recipe), the `linuxproc` proof: `procdemo`
+(pipe2 + fork + dup2 + execve + wait4), `cecho` (its `execve` target, loaded
+from the VFS), and `rsh` (a minimal from-scratch POSIX-ish shell - pipelines +
+`&&`/`||` over fork/execve/wait4/pipe2/dup2 - for the P11 gate). `rsh` execs the
+L3 `coreutils` 0.0.29 multicall (already in the fixture matrix) from a ramfs, so
+the P11 suite is the real upstream Rust coreutils driven by a shell. Note: `rsh`
+is a purpose-built shell, not dash/busybox - a full shell cross-build for three
+ISAs was out of budget; `rsh` is honest about what it exercises (the L6 process
+primitives) and its source is in the tree.
 
 All three cross toolchains and `*-unknown-linux-gnu` rustup targets are
 present in the build/CI environment, so **riscv64 genuinely passes** (no

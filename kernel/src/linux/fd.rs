@@ -11,6 +11,7 @@
 use crate::arch::{self, linux_abi::Stat};
 use crate::linux::dirent;
 use crate::linux::errno::*;
+use crate::linux::pipe;
 use crate::svc;
 
 pub const NFD: usize = 64;
@@ -56,11 +57,10 @@ enum FdKind {
     ProcAuxv {
         pos: usize,
     },
-    /// One end of an in-process pipe (docs/LINUX-COMPAT.md L3): `idx` selects
-    /// the per-cell ring buffer, `writer` picks the end. A single-process,
-    /// non-blocking, bounded pipe - enough for tools that create a pipe and
-    /// fall back when the `splice` fast path is unavailable (e.g. uu_cat);
-    /// cross-context/blocking pipe semantics are L6.
+    /// One end of a **cross-cell** pipe (docs/LINUX-COMPAT.md L6): `idx` selects
+    /// the global ring buffer (`linux::pipe`), `writer` picks the end. After
+    /// `fork` the two ends live in different cells; blocking read/write with
+    /// cross-cell wake is handled by the process scheduler.
     Pipe {
         idx: u8,
         writer: bool,
@@ -71,38 +71,13 @@ enum FdKind {
 /// `linux::stack::AUXV_BYTES_MAX`).
 const AUXV_MAX: usize = 20 * 16;
 
-/// Per-cell in-process pipes: count and per-pipe ring capacity.
-const PIPE_COUNT: usize = 4;
-const PIPE_CAP: usize = 8192;
-
-/// One bounded ring-buffer pipe. `ends` counts open read+write descriptors; the
-/// slot is reclaimed when both ends close.
 #[derive(Copy, Clone)]
-struct Pipe {
-    buf: [u8; PIPE_CAP],
-    head: usize,
-    len: usize,
-    ends: u8,
-}
-
-impl Pipe {
-    const fn new() -> Pipe {
-        Pipe {
-            buf: [0; PIPE_CAP],
-            head: 0,
-            len: 0,
-            ends: 0,
-        }
-    }
-}
-
 pub struct FdTable {
     fds: [FdKind; NFD],
     /// The cell's `/proc/self/auxv` bytes, copied in by `install_cell` after
     /// the stack (with its auxv) is built.
     auxv: [u8; AUXV_MAX],
     auxv_len: usize,
-    pipes: [Pipe; PIPE_COUNT],
 }
 
 impl Default for FdTable {
@@ -117,7 +92,6 @@ impl FdTable {
             fds: [FdKind::Closed; NFD],
             auxv: [0; AUXV_MAX],
             auxv_len: 0,
-            pipes: [Pipe::new(); PIPE_COUNT],
         }
     }
 
@@ -136,15 +110,19 @@ impl FdTable {
         self.auxv_len = n;
     }
 
-    /// pipe2(pipefd[2], flags): allocate an in-process pipe and write the read
-    /// and write fds (two `int`s) into `pipefd`. Non-blocking, bounded
-    /// (docs/LINUX-COMPAT.md L3); flags (O_CLOEXEC/O_NONBLOCK) are accepted and
-    /// ignored (the ends are always non-blocking, always close-on-run-end).
+    /// pipe2(pipefd[2], flags): allocate a global cross-cell pipe and write the
+    /// read and write fds (two `int`s) into `pipefd` (docs/LINUX-COMPAT.md L6).
+    /// Flags (O_CLOEXEC/O_NONBLOCK) are accepted and ignored: the ends block
+    /// cooperatively (the scheduler decides). Close-on-exec is not tracked -
+    /// `execve` keeps all fds open (documented, docs/LINUX-COMPAT.md L6); a
+    /// pipeline child closes its unused ends explicitly, which the shell does.
     pub fn pipe2(&mut self, pipefd_va: u64) -> i64 {
-        let Some(idx) = (0..PIPE_COUNT).find(|&i| self.pipes[i].ends == 0) else {
+        let Some(idx) = pipe::alloc() else {
             return -ENFILE;
         };
         let Some(rd) = self.free_slot(3) else {
+            pipe::close_end(idx, false);
+            pipe::close_end(idx, true);
             return -EMFILE;
         };
         self.fds[rd] = FdKind::Pipe {
@@ -153,14 +131,14 @@ impl FdTable {
         };
         let Some(wr) = self.free_slot(3) else {
             self.fds[rd] = FdKind::Closed;
+            pipe::close_end(idx, false);
+            pipe::close_end(idx, true);
             return -EMFILE;
         };
         self.fds[wr] = FdKind::Pipe {
             idx: idx as u8,
             writer: true,
         };
-        self.pipes[idx] = Pipe::new();
-        self.pipes[idx].ends = 2;
         // SAFETY: `pipefd_va` is a writable [i32; 2] in the calling cell.
         unsafe {
             let p = pipefd_va as *mut i32;
@@ -168,6 +146,38 @@ impl FdTable {
             p.add(1).write(wr as i32);
         }
         0
+    }
+
+    /// If `fd` is a pipe end, its `(global pipe idx, writer)`. The process
+    /// scheduler uses this to route blocking read/write (docs/LINUX-COMPAT.md L6).
+    pub fn pipe_end(&self, fd: i64) -> Option<(usize, bool)> {
+        let slot = usize_fd(fd)?;
+        match self.fds[slot] {
+            FdKind::Pipe { idx, writer } => Some((idx as usize, writer)),
+            _ => None,
+        }
+    }
+
+    /// Bump the global pipe end-refcount for every pipe fd in this table - the
+    /// `fork` inheritance step, after the child's table is copied from the
+    /// parent (docs/LINUX-COMPAT.md L6): both processes now hold the end.
+    pub fn inherit_pipe_ends(&self) {
+        for f in self.fds.iter() {
+            if let FdKind::Pipe { idx, writer } = *f {
+                pipe::add_end(idx as usize, writer);
+            }
+        }
+    }
+
+    /// Close every open descriptor - the process-exit teardown
+    /// (docs/LINUX-COMPAT.md L6): drops pipe ends (firing EOF/EPIPE for peers)
+    /// and closes VFS files.
+    pub fn close_all(&mut self) {
+        for i in 0..NFD {
+            if !matches!(self.fds[i], FdKind::Closed) {
+                self.close(i as i64);
+            }
+        }
     }
 
     fn free_slot(&self, from: usize) -> Option<usize> {
@@ -230,17 +240,14 @@ impl FdTable {
                 self.fds[slot] = FdKind::ProcAuxv { pos: pos + n };
                 n as i64
             }
-            FdKind::Pipe { idx, writer: false } => {
-                let p = &mut self.pipes[idx as usize];
-                let n = p.len.min(count as usize);
-                let buf = unsafe { core::slice::from_raw_parts_mut(buf_va as *mut u8, n) };
-                for b in buf.iter_mut() {
-                    *b = p.buf[p.head];
-                    p.head = (p.head + 1) % PIPE_CAP;
-                }
-                p.len -= n;
-                n as i64
-            }
+            FdKind::Pipe { idx, writer: false } => match pipe::read(idx as usize, buf_va, count) {
+                // Non-blocking here: -EAGAIN when empty with writers still open.
+                // The blocking + cross-cell wake path is `proc::sys_read`, which
+                // intercepts pipe fds before reaching here; readv/writev on a
+                // pipe fall through to this non-blocking behavior (documented).
+                pipe::ReadNb::Done(n) => n,
+                pipe::ReadNb::WouldBlock => -EAGAIN,
+            },
             FdKind::Pipe { writer: true, .. } => -EBADF, // write end not readable
             FdKind::Vfs { vfs_fd, .. } => match svc::file_ops() {
                 Some(o) => (o.read)(vfs_fd as u64, buf_va, count),
@@ -269,21 +276,11 @@ impl FdTable {
             FdKind::Null | FdKind::Zero | FdKind::Urandom => count as i64,
             FdKind::ProcAuxv { .. } => -EBADF, // read-only
             FdKind::Pipe { writer: false, .. } => -EBADF, // read end not writable
-            FdKind::Pipe { idx, writer: true } => {
-                let p = &mut self.pipes[idx as usize];
-                let free = PIPE_CAP - p.len;
-                if free == 0 {
-                    return -EAGAIN; // non-blocking, buffer full
-                }
-                let n = free.min(count as usize);
-                let buf = unsafe { core::slice::from_raw_parts(buf_va as *const u8, n) };
-                for &b in buf {
-                    let tail = (p.head + p.len) % PIPE_CAP;
-                    p.buf[tail] = b;
-                    p.len += 1;
-                }
-                n as i64
-            }
+            FdKind::Pipe { idx, writer: true } => match pipe::write(idx as usize, buf_va, count) {
+                pipe::WriteNb::Done(n) => n,
+                pipe::WriteNb::WouldBlock => -EAGAIN,
+                pipe::WriteNb::Epipe => -EPIPE,
+            },
             FdKind::Vfs { vfs_fd, .. } => match svc::file_ops() {
                 Some(o) => (o.write)(vfs_fd as u64, buf_va, count),
                 None => -EBADF,
@@ -348,9 +345,8 @@ impl FdTable {
                     (o.close)(vfs_fd as u64);
                 }
             }
-            FdKind::Pipe { idx, .. } => {
-                let p = &mut self.pipes[idx as usize];
-                p.ends = p.ends.saturating_sub(1); // reclaim the slot when both ends close
+            FdKind::Pipe { idx, writer } => {
+                pipe::close_end(idx as usize, writer); // reclaimed when both ends close
             }
             _ => {}
         }
@@ -371,6 +367,7 @@ impl FdTable {
             return -EMFILE;
         };
         self.fds[slot] = self.fds[old];
+        self.bump_if_pipe(slot);
         slot as i64
     }
 
@@ -385,8 +382,17 @@ impl FdTable {
         if old != new {
             self.close(newfd);
             self.fds[new] = self.fds[old];
+            self.bump_if_pipe(new);
         }
         new as i64
+    }
+
+    /// If slot holds a pipe end, add a reference to the global pipe (a dup
+    /// shares the end, so close must be balanced).
+    fn bump_if_pipe(&self, slot: usize) {
+        if let FdKind::Pipe { idx, writer } = self.fds[slot] {
+            pipe::add_end(idx as usize, writer);
+        }
     }
 
     /// fcntl(fd, cmd, arg) - the minimal subset glibc needs.
@@ -410,6 +416,7 @@ impl FdTable {
                     return -EMFILE;
                 };
                 self.fds[dst] = self.fds[slot];
+                self.bump_if_pipe(dst);
                 dst as i64
             }
             F_GETFD | F_SETFD | F_SETFL => 0,

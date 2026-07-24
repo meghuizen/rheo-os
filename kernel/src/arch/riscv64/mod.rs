@@ -11,8 +11,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub mod linux_abi;
 mod paging;
 pub use paging::{
-    PagingRoot, paging_activate, paging_activate_kernel, paging_kernel_init, paging_map,
-    paging_map_frame, paging_new_root, paging_protect, paging_unmap_frame,
+    PagingRoot, paging_activate, paging_activate_kernel, paging_for_each_user_leaf,
+    paging_kernel_init, paging_map, paging_map_frame, paging_new_root, paging_protect,
+    paging_unmap_frame,
 };
 
 /// `uname` machine string for the Linux personality (docs/LINUX-COMPAT.md L2).
@@ -402,6 +403,12 @@ pub fn sig_tramp_code() -> &'static [u8] {
 /// The interrupted user stack pointer (for building a signal frame, L5).
 pub fn user_sp(frame: &TrapFrame) -> u64 {
     frame.regs[REG_SP]
+}
+
+/// The kernel stack pointer saved in `frame` (loaded on trap entry). `execve`
+/// reuses it when building the new image's entry frame (docs/LINUX-COMPAT.md L6).
+pub fn trapframe_kernel_sp(frame: &TrapFrame) -> usize {
+    frame.kernel_sp as usize
 }
 
 // rt_sigframe layout on the user stack: { siginfo(128); ucontext }.

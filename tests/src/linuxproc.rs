@@ -1,0 +1,233 @@
+//! In-QEMU test kernel for Linux-personality milestone L6 (docs/LINUX-COMPAT.md
+//! L6): **processes** - `fork`, `execve`, `wait4`, and cross-cell `pipe2`.
+//!
+//! A single unpatched static-glibc program (`procdemo`) runs as the top
+//! `Personality::Linux` cell and exercises the whole chain: it creates a pipe,
+//! `fork`s, the child redirects stdout to the pipe and `execve`s a second
+//! static-glibc binary (`/bin/cecho`, served from the VFS), the parent drains
+//! the pipe, `wait4`s the child, and prints a deterministic transcript. Exact
+//! stdout + exit are asserted on all three ISAs, proving fork + execve + wait4
+//! + pipes end-to-end.
+//!
+//! Fixtures are built from source by `cargo xtask` (`build_linux_fixtures`); no
+//! binary lives in git. `cecho` is written into a ramfs so the child's
+//! `execve` loads it through the real VFS path (`load::exec_elf_from_vfs`).
+
+#![no_std]
+#![no_main]
+
+extern crate alloc;
+
+use alloc::rc::Rc;
+use core::mem::MaybeUninit;
+use core::ptr::addr_of_mut;
+
+use kernel::capability::{CapTable, ObjectTable};
+use kernel::linux::{self, stack as linux_stack};
+use kernel::mm::AddressSpace;
+use kernel::queue::QueuePair;
+use kernel::svc;
+use kernel::user::{self, Outcome, Personality};
+use kernel::{arch, load, println};
+use posix::{RamFs, fs, mount, sys};
+
+#[path = "vfs_personality.rs"]
+mod vfs_personality;
+
+#[global_allocator]
+static HEAP: runtime::Heap = runtime::Heap::empty();
+static mut HEAP_MEM: [u8; 8 * 1024 * 1024] = [0; 8 * 1024 * 1024];
+
+/// The static-glibc fixtures, per ISA (built by `xtask::build_linux_fixtures`).
+macro_rules! fixture {
+    ($name:literal) => {{
+        #[cfg(target_arch = "x86_64")]
+        {
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/linux-fixtures/build/x86_64/",
+                $name
+            ))
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/linux-fixtures/build/aarch64/",
+                $name
+            ))
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/linux-fixtures/build/riscv64/",
+                $name
+            ))
+        }
+    }};
+}
+
+static PROCDEMO: &[u8] = fixture!("procdemo");
+static CECHO: &[u8] = fixture!("cecho");
+static RSH: &[u8] = fixture!("rsh");
+static COREUTILS: &[u8] = fixture!("cu/bin/coreutils");
+
+static mut OBJECTS: ObjectTable = ObjectTable::new();
+static mut CAPS: CapTable = CapTable::new();
+static mut QP: MaybeUninit<QueuePair> = MaybeUninit::uninit();
+
+#[repr(align(16))]
+struct KStack([u8; 64 * 1024]);
+static mut KSTACK: KStack = KStack([0; 64 * 1024]);
+
+// -- stdout capture, wired to the Linux personality's stdout tap --
+const CAP_MAX: usize = 8 * 1024;
+static mut STDOUT_CAP: [u8; CAP_MAX] = [0; CAP_MAX];
+static mut STDOUT_LEN: usize = 0;
+
+fn tap(bytes: &[u8]) {
+    // SAFETY: single-threaded; the tap is called only during a cell run.
+    unsafe {
+        for &b in bytes {
+            if STDOUT_LEN < CAP_MAX {
+                STDOUT_CAP[STDOUT_LEN] = b;
+                STDOUT_LEN += 1;
+            }
+        }
+    }
+}
+
+fn captured() -> &'static [u8] {
+    unsafe { &STDOUT_CAP[..STDOUT_LEN] }
+}
+
+/// Run `image` with `argv` under a fresh Linux cell, capturing stdout; returns
+/// (exit code, captured bytes). Used by the P11 shell suite.
+fn run_capture(image: &[u8], argv: &[&[u8]]) -> (u64, &'static [u8]) {
+    unsafe {
+        STDOUT_LEN = 0;
+    }
+    linux::set_stdout_tap(Some(tap));
+    let outcome = run(image, argv);
+    linux::set_stdout_tap(None);
+    let code = match outcome {
+        Outcome::Exited(c) => c,
+        Outcome::Faulted(addr) => panic!("P11 shell faulted at {addr:#x}"),
+    };
+    (code, captured())
+}
+
+fn run(image: &[u8], argv: &[&[u8]]) -> Outcome {
+    let mut aspace = AddressSpace::new(1);
+    let img = load::load_elf_linux(image, &mut aspace).expect("load Linux ELF");
+    let sp = linux_stack::setup_stack(&mut aspace, &img, argv, &[]);
+    // SAFETY: single-threaded init; the statics outlive the synchronous run.
+    unsafe {
+        let kernel_sp = core::ptr::addr_of!(KSTACK.0) as usize + 64 * 1024;
+        let mut frame = arch::trapframe_new(img.entry, sp, 0, kernel_sp);
+        let objects = &mut *addr_of_mut!(OBJECTS);
+        let caps = &mut *addr_of_mut!(CAPS);
+        let qp = core::ptr::addr_of!(QP) as *const QueuePair;
+        user::reset();
+        user::install(0, &aspace, caps, objects, qp, addr_of_mut!(frame));
+        user::set_personality(0, Personality::Linux);
+        linux::install_cell(0, img.image_end);
+        user::run(0).1
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn kernel_main() -> ! {
+    arch::init();
+    println!("linuxproc: start on {}", arch::NAME);
+
+    // SAFETY: once, before any allocation.
+    unsafe {
+        HEAP.init(addr_of_mut!(HEAP_MEM) as usize, 8 * 1024 * 1024);
+    }
+
+    // A ramfs at / holding the execve target at /bin/cecho, plus the VFS
+    // personality handler so `open`/`read`/`lseek` reach it.
+    posix::reset();
+    mount::mount("/", Rc::new(RamFs::new()));
+    sys::mkdir("/bin").expect("mkdir /bin");
+    fs::write("/bin/cecho", CECHO).expect("seed /bin/cecho");
+    svc::set_file_ops(vfs_personality::ops());
+
+    println!(
+        "linuxproc: procdemo={} cecho={} bytes",
+        PROCDEMO.len(),
+        CECHO.len()
+    );
+
+    unsafe {
+        STDOUT_LEN = 0;
+    }
+    linux::set_stdout_tap(Some(tap));
+    let outcome = run(PROCDEMO, &[b"procdemo"]);
+    linux::set_stdout_tap(None);
+
+    let want_out = b"child said: hi there\nchild exit: 0\n";
+    match outcome {
+        Outcome::Exited(code) => {
+            assert!(code == 7, "procdemo: exit {code}, expected 7");
+            let got = captured();
+            assert!(
+                got == want_out,
+                "procdemo: stdout mismatch\n  got:      {:?}\n  expected: {:?}",
+                core::str::from_utf8(got),
+                core::str::from_utf8(want_out),
+            );
+        }
+        Outcome::Faulted(addr) => panic!("procdemo: faulted at {addr:#x}"),
+    }
+    println!("linuxproc: procdemo OK (fork+execve+wait4+pipe2)");
+
+    // --- P11 gate (docs/POSIX-PERSONALITY.md 5): a shell running a coreutils
+    // suite. `rsh` (a minimal static-glibc shell) forks/execve's the unpatched
+    // uutils/coreutils multicall from the VFS, wiring pipes and && / ||. Each
+    // entry is run as `rsh -c "<cmdline>"`; we compare exact stdout + exit and
+    // MEASURE the pass rate against the >= 80% gate.
+    fs::write("/bin/coreutils", COREUTILS).expect("seed /bin/coreutils");
+
+    // (cmdline, expected exit, expected stdout). The suite exercises pipes,
+    // && / ||, and a spread of utilities.
+    let suite: &[(&[u8], u64, &[u8])] = &[
+        (b"seq 1 5 | wc -l", 0, b"5\n"),
+        (b"echo hi | cat", 0, b"hi\n"),
+        (b"true && echo ok", 0, b"ok\n"),
+        (b"false || echo rescued", 0, b"rescued\n"),
+        (b"true && echo ok || echo no", 0, b"ok\n"),
+        (b"false && echo no || echo yes", 0, b"yes\n"),
+        (b"basename /a/b/c.txt", 0, b"c.txt\n"),
+        (b"dirname /a/b/c.txt", 0, b"/a/b\n"),
+        (b"seq 1 4 | head -n2", 0, b"1\n2\n"),
+        (b"echo one two three | wc -w", 0, b"3\n"),
+        (b"pwd", 0, b"/\n"),
+        (b"echo hello | wc -c", 0, b"6\n"),
+    ];
+
+    let mut passed = 0usize;
+    for &(cmd, want_exit, want_out) in suite {
+        let (code, out) = run_capture(RSH, &[b"rsh", b"-c", cmd]);
+        let ok = code == want_exit && out == want_out;
+        if ok {
+            passed += 1;
+        }
+        println!(
+            "P11 [{}] '{}' -> exit {} out {:?}",
+            if ok { "PASS" } else { "FAIL" },
+            core::str::from_utf8(cmd).unwrap_or("?"),
+            code,
+            core::str::from_utf8(out),
+        );
+    }
+    let total = suite.len();
+    let pct = passed * 100 / total;
+    println!("linuxproc: P11 coreutils suite {passed}/{total} = {pct}% (gate >= 80%)");
+    assert!(pct >= 80, "P11 gate not met: {passed}/{total} = {pct}%");
+
+    println!("linuxproc: PASS");
+    arch::exit(arch::ExitCode::Success)
+}

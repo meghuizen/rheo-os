@@ -197,6 +197,48 @@ fn leaf(root: &PagingRoot, va: usize) -> Option<(usize, usize)> {
     Some((next_table(e), pt_index(va)))
 }
 
+/// Invoke `f(va, pa, perm)` for every mapped 4 KiB **user** leaf (US bit set) in
+/// `root` - the primitive `fork`/`execve` teardown build on (docs/LINUX-COMPAT.md
+/// L6). The kernel high half (its PML4 slot) and the supervisor 2 MiB blocks are
+/// skipped, so only the cell's own low-half user pages are visited.
+pub fn paging_for_each_user_leaf(root: &PagingRoot, f: &mut dyn FnMut(usize, usize, MapPerm)) {
+    let pml4 = table_mut(root.pml4_pa);
+    let kva_i = pml4_index(KVA);
+    for (i4, &e4) in pml4.iter().enumerate() {
+        if i4 == kva_i || e4 & P == 0 {
+            continue; // the kernel high half, or an empty slot
+        }
+        let pdpt = table_mut(next_table(e4));
+        for (i3, &e3) in pdpt.iter().enumerate() {
+            if e3 & P == 0 {
+                continue;
+            }
+            let pd = table_mut(next_table(e3));
+            for (i2, &e2) in pd.iter().enumerate() {
+                if e2 & P == 0 || e2 & PS != 0 {
+                    continue; // unmapped or a 2 MiB supervisor block
+                }
+                let pt = table_mut(next_table(e2));
+                for (i1, &e1) in pt.iter().enumerate() {
+                    if e1 & P == 0 || e1 & US == 0 {
+                        continue;
+                    }
+                    let va = (i4 << 39) | (i3 << 30) | (i2 << 21) | (i1 << 12);
+                    let pa = (e1 & 0x000F_FFFF_FFFF_F000) as usize;
+                    let perm = if e1 & RW != 0 {
+                        MapPerm::UserRw
+                    } else if e1 & NX != 0 {
+                        MapPerm::UserRo
+                    } else {
+                        MapPerm::UserRx
+                    };
+                    f(va, pa, perm);
+                }
+            }
+        }
+    }
+}
+
 /// Clear the leaf mapping at `va`, returning the physical frame it pointed at
 /// (for the caller to `frames::free`), or None if it was not mapped. The
 /// caller flushes the TLB by re-activating the root (docs/LINUX-COMPAT.md L2).

@@ -93,6 +93,10 @@ name = "linuxsig"
 path = "src/linuxsig.rs"
 
 [[bin]]
+name = "linuxproc"
+path = "src/linuxproc.rs"
+
+[[bin]]
 name = "shell-smoke"
 path = "src/shell_smoke.rs"
 

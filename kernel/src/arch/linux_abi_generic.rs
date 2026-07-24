@@ -73,6 +73,10 @@ pub mod nr {
     pub const MMAP: u64 = 222;
     pub const MPROTECT: u64 = 226;
     pub const MADVISE: u64 = 233;
+    pub const SETPGID: u64 = 154;
+    pub const GETPGID: u64 = 155;
+    pub const GETSID: u64 = 156;
+    pub const SETSID: u64 = 157;
     pub const WAIT4: u64 = 260;
     pub const PRLIMIT64: u64 = 261;
     pub const GETRANDOM: u64 = 278;
@@ -90,6 +94,16 @@ pub mod nr {
     /// `ppoll`). Named as unreachable so portable dispatch can list it, like
     /// `ARCH_PRCTL`.
     pub const POLL: u64 = u64::MAX - 1;
+
+    // Not part of this table: x86-64's legacy `fork`/`vfork`/`pipe`/`dup2`.
+    // The asm-generic ISAs route `fork` through `clone` (no CLONE_VM), `pipe`
+    // through `pipe2`, and `dup2` through `dup3`. Named as unreachable so
+    // portable dispatch can list them (like `ARCH_PRCTL`); no program can issue
+    // these numbers here, so they never collide (docs/LINUX-COMPAT.md L6).
+    pub const FORK: u64 = u64::MAX - 2;
+    pub const VFORK: u64 = u64::MAX - 3;
+    pub const PIPE: u64 = u64::MAX - 4;
+    pub const DUP2: u64 = u64::MAX - 5;
 }
 
 /// The asm-generic `struct stat` (docs/LINUX-COMPAT.md L2), shared by ARM64

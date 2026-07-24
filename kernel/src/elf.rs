@@ -131,6 +131,37 @@ impl<'a> Elf<'a> {
         found
     }
 
+    /// Like [`for_each_load`], but WITHOUT bounds-checking each segment's file
+    /// range against the image slice - for the streaming `execve` loader, where
+    /// only the ELF header + program-header table live in the passed buffer and
+    /// each segment's bytes are read separately from the file
+    /// (docs/LINUX-COMPAT.md L6). The program-header table itself must still lie
+    /// within the buffer.
+    pub fn for_each_load_streamed(&self, mut f: impl FnMut(&Segment) -> Option<()>) -> Option<()> {
+        for i in 0..self.phnum {
+            let base = self.phoff + i * self.phentsize;
+            if rd_u32(self.image, base)? != PT_LOAD {
+                continue;
+            }
+            let flags = rd_u32(self.image, base + 4)?;
+            let offset = rd_u64(self.image, base + 8)? as usize;
+            let vaddr = rd_u64(self.image, base + 16)?;
+            let filesz = rd_u64(self.image, base + 32)? as usize;
+            let memsz = rd_u64(self.image, base + 40)? as usize;
+            if filesz > memsz {
+                return None;
+            }
+            f(&Segment {
+                vaddr,
+                offset,
+                filesz,
+                memsz,
+                flags,
+            })?;
+        }
+        Some(())
+    }
+
     /// Invoke `f` for each `PT_LOAD` segment in order. Returns None if the
     /// headers are malformed, a segment's file range is out of bounds, or
     /// `f` returns None.

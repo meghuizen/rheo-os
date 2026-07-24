@@ -81,6 +81,110 @@ pub fn load_elf_linux(image: &[u8], aspace: &mut AddressSpace) -> Option<LinuxIm
     })
 }
 
+/// Load a Linux ELF for `execve` by **streaming** it from the VFS into a fresh
+/// address space (docs/LINUX-COMPAT.md L6): the kernel never holds the whole
+/// image in a contiguous buffer. Only the ELF header + program-header table are
+/// read into a small kernel buffer; each `PT_LOAD` segment's bytes are read
+/// page-by-page directly into its destination frame (through the kernel linear
+/// map). `open`/`read`/`lseek`/`close` are the registered `svc::FileOps` VFS
+/// handlers. Returns the `LinuxImage` (auxv facts) or None on any error.
+pub fn exec_elf_from_vfs(
+    ops: &crate::svc::FileOps,
+    path_va: u64,
+    path_len: u64,
+    aspace: &mut AddressSpace,
+) -> Option<LinuxImage> {
+    let fd = (ops.open)(path_va, path_len, 0);
+    if fd < 0 {
+        return None;
+    }
+    let fd = fd as u64;
+    let r = exec_elf_inner(ops, fd, aspace);
+    (ops.close)(fd);
+    r
+}
+
+/// The ELF header + program-header table fit here (glibc static binaries have
+/// `e_phoff == 64` and a handful of program headers).
+const HDR_BUF: usize = 4096;
+
+fn exec_elf_inner(
+    ops: &crate::svc::FileOps,
+    fd: u64,
+    aspace: &mut AddressSpace,
+) -> Option<LinuxImage> {
+    // Read the header region (ELF header + phdr table) into a kernel buffer.
+    let mut hdr = [0u8; HDR_BUF];
+    (ops.lseek)(fd, 0, 0); // SEEK_SET
+    let n = (ops.read)(fd, hdr.as_mut_ptr() as u64, HDR_BUF as u64);
+    if n < 64 {
+        return None;
+    }
+    let hdr = &hdr[..n as usize];
+    let elf = Elf::parse(hdr)?;
+    let bias = match elf.etype() {
+        elf::ET_DYN => LINUX_DYN_BASE,
+        elf::ET_EXEC => 0,
+        _ => return None,
+    };
+    let mut image_end = 0usize;
+    elf.for_each_load_streamed(|seg| {
+        let end = seg.vaddr as usize + bias + seg.memsz;
+        if end > image_end {
+            image_end = end;
+        }
+        stream_segment(ops, fd, seg, bias, aspace)
+    })?;
+    let image_end = (image_end + FRAME_SIZE - 1) & !(FRAME_SIZE - 1);
+    let phdr = elf.phdr_vaddr().map(|v| v as usize + bias).unwrap_or(0);
+    Some(LinuxImage {
+        entry: elf.entry() as usize + bias,
+        bias,
+        phdr,
+        phent: elf.phentsize(),
+        phnum: elf.phnum(),
+        image_end,
+    })
+}
+
+/// Map one `PT_LOAD` segment, reading its file bytes page-by-page from `fd`
+/// straight into each destination frame (through the kernel linear map, so no
+/// giant contiguous kernel buffer is needed - docs/LINUX-COMPAT.md L6).
+fn stream_segment(
+    ops: &crate::svc::FileOps,
+    fd: u64,
+    seg: &Segment,
+    bias: usize,
+    aspace: &mut AddressSpace,
+) -> Option<()> {
+    let vaddr = seg.vaddr as usize + bias;
+    let va0 = vaddr & !(FRAME_SIZE - 1);
+    let mem_end = vaddr.checked_add(seg.memsz)?;
+    let perm = seg_perm(seg.flags);
+    let mut va = va0;
+    while va < mem_end {
+        let pa = frames::alloc(); // zeroed (bss/zero-fill already done)
+        let copy_lo = va.max(vaddr);
+        let copy_hi = (va + FRAME_SIZE).min(vaddr + seg.filesz);
+        if copy_lo < copy_hi {
+            let n = (copy_hi - copy_lo) as u64;
+            let src_off = (seg.offset + (copy_lo - vaddr)) as i64;
+            let dst = arch::phys_to_virt(pa) + (copy_lo - va);
+            (ops.lseek)(fd, src_off, 0); // SEEK_SET
+            // FileOps reads into a VA in the *current* map; a kernel VA
+            // (phys_to_virt of the destination frame) is valid here because the
+            // VFS handler runs in kernel context.
+            let got = (ops.read)(fd, dst as u64, n);
+            if got != n as i64 {
+                return None;
+            }
+        }
+        aspace.map_user_frame(va, pa, perm);
+        va += FRAME_SIZE;
+    }
+    Some(())
+}
+
 /// Map the initial user stack with no arguments and return the initial SP.
 /// A thin wrapper over [`setup_stack`] with empty argv/envp, so a program that
 /// does not use its arguments (e.g. the std proof program) still sees a valid

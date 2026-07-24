@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 21] = [
+const TEST_KERNELS: [&str; 22] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -43,6 +43,7 @@ const TEST_KERNELS: [&str; 21] = [
     "linuxtools",
     "linuxthreads",
     "linuxsig",
+    "linuxproc",
 ];
 
 /// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
@@ -418,12 +419,16 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         return false;
     }
 
-    // Signal fixtures (L5, docs/LINUX-COMPAT.md): same static-glibc ET_EXEC
-    // recipe as chello, one binary per delivery path exercised by `linuxsig`.
+    // Signal fixtures (L5) + process fixtures (L6): same static-glibc ET_EXEC
+    // recipe as chello. `procdemo` (pipe2+fork+dup2+execve+wait4) and `cecho`
+    // (its execve target) are the `linuxproc` proof (docs/LINUX-COMPAT.md L6).
     for (src, bin) in [
         ("sig_raise.c", "sig_raise"),
         ("sig_segv.c", "sig_segv"),
         ("sig_dfl.c", "sig_dfl"),
+        ("procdemo.c", "procdemo"),
+        ("cecho.c", "cecho"),
+        ("rsh.c", "rsh"),
     ] {
         let mut sc = Command::new(cc);
         sc.arg("-static").arg("-no-pie");

@@ -29,6 +29,8 @@ pub mod nr {
     pub const IOCTL: u64 = 16;
     pub const READV: u64 = 19;
     pub const WRITEV: u64 = 20;
+    pub const PIPE: u64 = 22;
+    pub const DUP2: u64 = 33;
     pub const SCHED_YIELD: u64 = 24;
     pub const MREMAP: u64 = 25;
     pub const MADVISE: u64 = 28;
@@ -36,6 +38,8 @@ pub mod nr {
     pub const NANOSLEEP: u64 = 35;
     pub const GETPID: u64 = 39;
     pub const CLONE: u64 = 56;
+    pub const FORK: u64 = 57;
+    pub const VFORK: u64 = 58;
     pub const EXECVE: u64 = 59;
     pub const EXIT: u64 = 60;
     pub const WAIT4: u64 = 61;
@@ -52,6 +56,10 @@ pub mod nr {
     pub const GETEUID: u64 = 107;
     pub const GETEGID: u64 = 108;
     pub const GETPPID: u64 = 110;
+    pub const SETPGID: u64 = 109;
+    pub const GETPGID: u64 = 121;
+    pub const SETSID: u64 = 112;
+    pub const GETSID: u64 = 124;
     pub const SIGALTSTACK: u64 = 131;
     pub const PRCTL: u64 = 157;
     pub const ARCH_PRCTL: u64 = 158;

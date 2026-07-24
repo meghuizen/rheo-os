@@ -181,6 +181,90 @@ pub fn frame_ptr(cell: usize, idx: usize) -> *mut TrapFrame {
     threads(cell)[idx].frame
 }
 
+/// The saved `TrapFrame` of `cell`'s currently running context - the frame the
+/// process scheduler resumes when it switches into `cell` (docs/LINUX-COMPAT.md
+/// L6).
+pub fn current_frame(cell: usize) -> *mut TrapFrame {
+    threads(cell)[cur_thread(cell)].frame
+}
+
+/// Save the live U-mode FP/SIMD state into `cell`'s current context's save area
+/// (the outgoing half of a cross-cell process switch). The registers still hold
+/// the outgoing thread's values (the kernel is soft-float).
+pub fn save_current_fp(cell: usize) {
+    let fp = threads(cell)[cur_thread(cell)].fp.0.as_mut_ptr();
+    // SAFETY: `fp` is a 16-aligned 1 KiB area; the FP registers are live.
+    unsafe { arch::save_user_fp(fp) };
+}
+
+/// Load `cell`'s current context's FP/SIMD state and TLS base (the incoming
+/// half of a cross-cell process switch, docs/LINUX-COMPAT.md L6).
+pub fn restore_current(cell: usize) {
+    let (fp, fs) = {
+        let th = &threads(cell)[cur_thread(cell)];
+        (th.fp.0.as_ptr(), th.fs_base)
+    };
+    // SAFETY: `fp` is a valid FP image seeded at fork/clone or saved on a prior
+    // switch; reloading the TLS base is a no-op off x86-64.
+    unsafe { arch::restore_user_fp(fp) };
+    arch::set_user_fs_base(fs);
+}
+
+/// Set up cell `cell`'s thread table for a **forked** process: a single running
+/// context 0 whose frame is `frame` (the eager copy of the parent's calling
+/// thread, already primed to return 0), tid `tid`, TLS base `fs_base` inherited
+/// from the parent, and FP state seeded from the parent's live registers.
+/// Returns the stored context-0 frame pointer for `user::install_forked`
+/// (docs/LINUX-COMPAT.md L6).
+pub fn init_forked(
+    cell: usize,
+    tid: u32,
+    fs_base: u64,
+    clear_child_tid: u64,
+    frame: TrapFrame,
+) -> *mut TrapFrame {
+    let cf = child_frame_ptr(cell, 0);
+    // SAFETY: `cf` is stable kernel storage (FRAMES[cell][0], unused for the
+    // main thread of a test-installed cell but the owned store for a forked one).
+    unsafe { cf.write(frame) };
+    let t = threads(cell);
+    for th in t.iter_mut() {
+        *th = Thread::new();
+    }
+    t[0].frame = cf;
+    t[0].state = TState::Ready;
+    t[0].tid = tid;
+    t[0].fs_base = fs_base;
+    t[0].clear_child_tid = clear_child_tid;
+    // Seed the child's FP image from the parent's live registers (the parent is
+    // the running cell at fork time).
+    // SAFETY: the FP area is 16-aligned and large enough.
+    unsafe { arch::save_user_fp(t[0].fp.0.as_mut_ptr()) };
+    set_cur_thread(cell, 0);
+    // SAFETY: single CPU.
+    unsafe { (*addr_of_mut!(NEXT_TID))[cell] = tid + 1 };
+    cf
+}
+
+/// The current context's x86-64 TLS base (inherited by a forked child).
+pub fn current_fs_base(cell: usize) -> u64 {
+    threads(cell)[cur_thread(cell)].fs_base
+}
+
+/// The current context's `clear_child_tid` (inherited by a forked child so its
+/// own later thread-exit handshake still works).
+pub fn current_clear_child_tid(cell: usize) -> u64 {
+    threads(cell)[cur_thread(cell)].clear_child_tid
+}
+
+/// Re-seed cell `cell`'s thread table to a single context 0 after `execve`
+/// replaces the image (docs/LINUX-COMPAT.md L6): the new program starts
+/// single-threaded. `frame` is the fresh entry frame; `tid` is kept (the pid
+/// does not change across `execve`).
+pub fn reset_after_exec(cell: usize, tid: u32, frame: TrapFrame) -> *mut TrapFrame {
+    init_forked(cell, tid, 0, 0, frame)
+}
+
 /// Whether context `idx` in `cell` is a live (non-free) context.
 pub fn is_active(cell: usize, idx: usize) -> bool {
     threads(cell)[idx].state != TState::Free
@@ -370,7 +454,10 @@ pub fn exit_thread(cell: usize, code: u64) -> Ctl {
     match pick_next(cell, ci) {
         // The exiting context's FP state is gone; just load the successor's.
         Some(next) => resume(cell, next),
-        None => Ctl::Exit(code),
+        // Last thread of the cell: this is a whole-process exit. Route through
+        // the process scheduler (zombie + reap by the parent, or unwind if this
+        // is the top cell) - docs/LINUX-COMPAT.md L6.
+        None => crate::linux::proc::exit_group(cell, code),
     }
 }
 

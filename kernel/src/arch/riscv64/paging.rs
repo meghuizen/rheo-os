@@ -192,6 +192,43 @@ fn leaf(root: &PagingRoot, va: usize) -> Option<(usize, usize)> {
     Some((pte_to_table(e), (va >> 12) & 0x1FF))
 }
 
+/// Invoke `f(va, pa, perm)` for every mapped 4 KiB **user** leaf (U bit set) in
+/// `root` - the primitive `fork`/`execve` teardown build on (docs/LINUX-COMPAT.md
+/// L6). Supervisor mappings (the shared kernel + MMIO superpages, U bit clear)
+/// are skipped, so only the cell's own pages are visited.
+pub fn paging_for_each_user_leaf(root: &PagingRoot, f: &mut dyn FnMut(usize, usize, MapPerm)) {
+    let l2 = table_mut(root.l2_pa);
+    for (i2, &e2) in l2.iter().enumerate() {
+        // A pointer PTE has V set and R/W/X clear; a leaf (gigapage) is
+        // supervisor kernel/MMIO - never a user 4 KiB page.
+        if e2 & PTE_V == 0 || e2 & (PTE_R | PTE_W | PTE_X) != 0 {
+            continue;
+        }
+        let l1 = table_mut(pte_to_table(e2));
+        for (i1, &e1) in l1.iter().enumerate() {
+            if e1 & PTE_V == 0 || e1 & (PTE_R | PTE_W | PTE_X) != 0 {
+                continue; // unmapped or a 2 MiB supervisor superpage
+            }
+            let l0 = table_mut(pte_to_table(e1));
+            for (i0, &e0) in l0.iter().enumerate() {
+                if e0 & PTE_V == 0 || e0 & PTE_U == 0 {
+                    continue;
+                }
+                let va = (i2 << 30) | (i1 << 21) | (i0 << 12);
+                let pa = pte_to_table(e0);
+                let perm = if e0 & PTE_W != 0 {
+                    MapPerm::UserRw
+                } else if e0 & PTE_X != 0 {
+                    MapPerm::UserRx
+                } else {
+                    MapPerm::UserRo
+                };
+                f(va, pa, perm);
+            }
+        }
+    }
+}
+
 /// Clear the leaf mapping at `va`, returning the physical frame it pointed at
 /// (for the caller to `frames::free`), or None if it was not mapped. The
 /// caller flushes the TLB by re-activating the root (docs/LINUX-COMPAT.md L2).

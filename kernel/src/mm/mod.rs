@@ -76,6 +76,43 @@ impl AddressSpace {
     pub fn activate(&self) {
         arch::paging_activate(&self.root, self.asid);
     }
+
+    /// Eager-copy every committed user page of `self` into a fresh address
+    /// space with ASID `asid` - the POSIX `fork` primitive: the child gets its
+    /// own private physical copy of the parent's memory (docs/LINUX-COMPAT.md
+    /// L6). Fresh frames and page tables are allocated; contents are copied
+    /// through the kernel linear map, so neither space need be active.
+    /// Copy-on-write is deferred (documented).
+    pub fn fork_from(&self, asid: u16) -> AddressSpace {
+        let mut child = AddressSpace::new(asid);
+        arch::paging_for_each_user_leaf(&self.root, &mut |va, src_pa, perm| {
+            let dst_pa = frames::alloc();
+            // SAFETY: both frames are 4 KiB, reached through the kernel linear
+            // map (identity on x86/riscv; the high map on aarch64); `dst_pa` is
+            // freshly allocated and disjoint from `src_pa`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    arch::phys_to_virt(src_pa) as *const u8,
+                    arch::phys_to_virt(dst_pa) as *mut u8,
+                    frames::FRAME_SIZE,
+                );
+            }
+            child.map_user_frame(va, dst_pa, perm);
+        });
+        child
+    }
+
+    /// Return every committed user leaf frame of this space to the pool - the
+    /// child-reap / `execve` / process-exit teardown (docs/LINUX-COMPAT.md L6).
+    /// Intermediate page-table frames are intentionally NOT reclaimed (a small,
+    /// bounded, documented per-dead-process leak); the leaf frames (stacks,
+    /// heap, mmap arenas, the eager fork copy) are the pool pressure that
+    /// matters and are freed here.
+    pub fn free_user_frames(&self) {
+        arch::paging_for_each_user_leaf(&self.root, &mut |_va, pa, _perm| {
+            frames::free(pa);
+        });
+    }
 }
 
 unsafe extern "C" {

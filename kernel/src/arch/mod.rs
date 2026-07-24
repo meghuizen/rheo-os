@@ -119,12 +119,12 @@ pub use imp::{
     VIRTIO_MMIO_STRIDE, clone_child_frame, context_init, context_switch, cpu_feature_names,
     cpu_report, cycles, decode_syscall, discover, doorbell_count, doorbell_trap, enter_user_first,
     exit, has_hwrng, hwrng_name, hwrng_u64, paging_activate, paging_activate_kernel,
-    paging_kernel_init, paging_map, paging_map_frame, paging_new_root, paging_protect,
-    paging_unmap_frame, pci_cfg_read32, pci_cfg_write32, phys_to_virt, restore_rt_frame,
-    restore_user_fp, return_to_kernel, save_user_fp, serial_init, serial_read_byte,
-    serial_write_byte, set_syscall_ret, set_user_fs_base, setup_rt_frame, sig_tramp_code,
-    spin_loop, ticks_to_ns, trap_init, trapframe_new, trapframe_zeroed, user_fs_base, user_sp,
-    virt_to_phys,
+    paging_for_each_user_leaf, paging_kernel_init, paging_map, paging_map_frame, paging_new_root,
+    paging_protect, paging_unmap_frame, pci_cfg_read32, pci_cfg_write32, phys_to_virt,
+    restore_rt_frame, restore_user_fp, return_to_kernel, save_user_fp, serial_init,
+    serial_read_byte, serial_write_byte, set_syscall_ret, set_user_fs_base, setup_rt_frame,
+    sig_tramp_code, spin_loop, ticks_to_ns, trap_init, trapframe_kernel_sp, trapframe_new,
+    trapframe_zeroed, user_fs_base, user_sp, virt_to_phys,
 };
 
 /// Full arch bring-up for a kernel binary: console, exception vectors,

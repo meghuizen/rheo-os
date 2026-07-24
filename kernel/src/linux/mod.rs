@@ -24,6 +24,8 @@ pub mod dirent;
 pub mod errno;
 pub mod fd;
 pub mod mem;
+pub mod pipe;
+pub mod proc;
 pub mod signal;
 pub mod stack;
 pub mod thread;
@@ -96,6 +98,9 @@ pub fn install_cell(idx: usize, image_end: usize) {
     // Seed the multi-context thread table with context 0 (docs/LINUX-COMPAT.md
     // L4), reusing the cell's installed frame.
     thread::init_cell(idx);
+    // Seed the process entry: this is the top of the process tree (pid 1000,
+    // docs/LINUX-COMPAT.md L6).
+    proc::init_top(idx);
 }
 
 /// Clear all per-cell Linux state (called from `user::reset`).
@@ -105,6 +110,37 @@ pub fn reset() {
     }
     thread::reset();
     signal::reset();
+    pipe::reset();
+    proc::reset();
+}
+
+/// Deep-copy cell `from`'s Linux state into cell `to` (the `fork` inheritance
+/// step, docs/LINUX-COMPAT.md L6): the child gets the parent's fd table, cwd,
+/// brk/mmap bookkeeping, and auxv, then references the same pipes.
+pub(crate) fn dup_state(from: usize, to: usize) {
+    // SAFETY: single CPU, synchronous; `from != to`; both indices are in range.
+    unsafe {
+        let base = addr_of_mut!(LINUX_STATE) as *mut LinuxState;
+        core::ptr::copy_nonoverlapping(base.add(from), base.add(to), 1);
+    }
+    state(to).fds.inherit_pipe_ends();
+}
+
+/// Reset cell `cell`'s memory bookkeeping for a fresh `execve` image
+/// (docs/LINUX-COMPAT.md L6): new heap base + mmap cursor + auxv snapshot. The
+/// fd table and cwd are kept (POSIX `execve` semantics); the caller resets the
+/// signal dispositions separately.
+pub(crate) fn exec_reinit(cell: usize, image_end: usize) {
+    let st = state(cell);
+    st.fds.set_auxv(stack::last_auxv());
+    let brk =
+        (image_end + crate::mm::frames::FRAME_SIZE - 1) & !(crate::mm::frames::FRAME_SIZE - 1);
+    st.brk_start = brk;
+    st.brk_cur = brk;
+    st.mmap_cursor = mem::mmap_base();
+    st.tid_addr = 0;
+    st.robust_list = 0;
+    st.initialized = true;
 }
 
 // ------------------------------------------------------------- stdout tap
@@ -161,9 +197,9 @@ pub(crate) fn ret(v: i64) -> Ctl {
 pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -> Ctl {
     let st = state(cur);
     match nr_val {
-        // -- I/O over the fd table --
-        nr::READ => ret(st.fds.read(args[0] as i64, args[1], args[2])),
-        nr::WRITE => ret(st.fds.write(args[0] as i64, args[1], args[2])),
+        // -- I/O over the fd table (pipe fds may block cross-cell, L6) --
+        nr::READ => sys_read(cur, st, args[0] as i64, args[1], args[2]),
+        nr::WRITE => sys_write(cur, st, args[0] as i64, args[1], args[2], frame),
         nr::READV => ret(sys_readv(st, args[0] as i64, args[1], args[2], false)),
         nr::WRITEV => ret(sys_readv(st, args[0] as i64, args[1], args[2], true)),
         nr::OPENAT => ret(st
@@ -175,7 +211,6 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
         nr::NEWFSTATAT => ret(sys_newfstatat(st, args)),
         nr::STATX => ret(sys_statx(st, args)),
         nr::GETDENTS64 => ret(st.fds.getdents64(args[0] as i64, args[1], args[2])),
-        nr::PIPE2 => ret(st.fds.pipe2(args[0])),
         nr::DUP => ret(st.fds.dup(args[0] as i64)),
         nr::DUP3 => ret(st.fds.dup3(args[0] as i64, args[1] as i64)),
         nr::FCNTL => ret(st.fds.fcntl(args[0] as i64, args[1], args[2])),
@@ -202,25 +237,47 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
         // ABI (crate::arch::CLONE_BACKWARDS), decoded here so thread::clone
         // stays portable.
         nr::CLONE => {
-            let (child_tid, tls) = if crate::arch::CLONE_BACKWARDS {
-                (args[4], args[3])
+            // A `clone` without CLONE_VM is `fork` (a new process); with it, a
+            // new thread in the same address space (docs/LINUX-COMPAT.md L6).
+            if proc::is_fork(args[0]) {
+                ret(proc::fork(cur, frame))
             } else {
-                (args[3], args[4])
-            };
-            ret(thread::clone(
-                cur, frame, args[0], args[1], args[2], child_tid, tls,
-            ))
+                let (child_tid, tls) = if crate::arch::CLONE_BACKWARDS {
+                    (args[4], args[3])
+                } else {
+                    (args[3], args[4])
+                };
+                ret(thread::clone(
+                    cur, frame, args[0], args[1], args[2], child_tid, tls,
+                ))
+            }
         }
         nr::FUTEX => thread::futex(cur, args[0], args[1], args[2] as u32),
 
+        // -- processes (docs/LINUX-COMPAT.md L6) --
+        // `fork`/`vfork` (x86-64 have dedicated numbers; asm-generic routes
+        // through CLONE above). vfork is treated as fork (eager copy, no COW
+        // share) - safe, just less lazy.
+        nr::FORK | nr::VFORK => ret(proc::fork(cur, frame)),
+        nr::EXECVE => proc::execve(cur, args[0], args[1], args[2], frame),
+        nr::WAIT4 => proc::wait4(cur, args[0] as i64, args[1], args[2]),
+        // pipe(fd) (x86-64 legacy) == pipe2(fd, 0); pipe2 is the generic form.
+        nr::PIPE | nr::PIPE2 => ret(st.fds.pipe2(args[0])),
+        // dup2(old,new) (x86-64 legacy) == dup3(old,new,0).
+        nr::DUP2 => ret(st.fds.dup3(args[0] as i64, args[1] as i64)),
+        // process groups / sessions: recorded (single-session model, no job
+        // control); the shell queries them but does not depend on the effect.
+        nr::SETPGID | nr::SETSID => Ctl::Ret(0),
+        nr::GETPGID | nr::GETSID => Ctl::Ret(proc::pid(cur) as u64),
+
         // -- process / thread lifetime --
         nr::EXIT => thread::exit_thread(cur, args[0]),
-        nr::EXIT_GROUP => Ctl::Exit(args[0]),
+        nr::EXIT_GROUP => proc::exit_group(cur, args[0]),
 
-        // -- identity (docs/LINUX-COMPAT.md 3: pid/uid/gid 1000, no root) --
-        nr::GETPID => Ctl::Ret(1000),
+        // -- identity (docs/LINUX-COMPAT.md 3: uid/gid 1000, no root) --
+        nr::GETPID => Ctl::Ret(proc::pid(cur) as u64),
         nr::GETTID => Ctl::Ret(thread::gettid(cur)),
-        nr::GETPPID => Ctl::Ret(0),
+        nr::GETPPID => Ctl::Ret(proc::ppid(cur) as u64),
         nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID => Ctl::Ret(1000),
         nr::UNAME => ret(sys_uname(args[0])),
 
@@ -297,6 +354,70 @@ fn strlen(va: u64) -> usize {
         }
         n
     }
+}
+
+/// SIGPIPE (asm-generic and x86 agree).
+const SIGPIPE: u64 = 13;
+
+/// read(fd, buf, count) with cross-cell pipe blocking (docs/LINUX-COMPAT.md L6).
+/// A non-pipe fd goes straight through the fd table. A pipe read of an empty
+/// buffer parks the caller when a peer can run (the writer), else returns
+/// -EAGAIN (single-process fallback, matching L3).
+fn sys_read(cur: usize, st: &mut LinuxState, fd: i64, buf: u64, count: u64) -> Ctl {
+    if let Some((idx, writer)) = st.fds.pipe_end(fd) {
+        if writer {
+            return err(errno::EBADF); // the write end is not readable
+        }
+        return match pipe::read(idx, buf, count) {
+            pipe::ReadNb::Done(n) => ret(n),
+            pipe::ReadNb::WouldBlock => {
+                if proc::runnable_peer_exists(cur) {
+                    proc::block_pipe_read(cur, buf, count, idx)
+                } else {
+                    err(errno::EAGAIN)
+                }
+            }
+        };
+    }
+    ret(st.fds.read(fd, buf, count))
+}
+
+/// write(fd, buf, count) with cross-cell pipe blocking + SIGPIPE
+/// (docs/LINUX-COMPAT.md L6). Writing to a pipe with no readers raises SIGPIPE
+/// (default disposition terminates the writer - the normal end of
+/// `seq ... | head`); an ignored/handled SIGPIPE yields -EPIPE.
+fn sys_write(
+    cur: usize,
+    st: &mut LinuxState,
+    fd: i64,
+    buf: u64,
+    count: u64,
+    frame: *mut TrapFrame,
+) -> Ctl {
+    if let Some((idx, writer)) = st.fds.pipe_end(fd) {
+        if !writer {
+            return err(errno::EBADF); // the read end is not writable
+        }
+        return match pipe::write(idx, buf, count) {
+            pipe::WriteNb::Done(n) => ret(n),
+            pipe::WriteNb::WouldBlock => {
+                if proc::runnable_peer_exists(cur) {
+                    proc::block_pipe_write(cur, buf, count, idx)
+                } else {
+                    err(errno::EAGAIN)
+                }
+            }
+            pipe::WriteNb::Epipe => {
+                match signal::kill(cur, proc::pid(cur) as i64, SIGPIPE, frame) {
+                    // Ignored/handled SIGPIPE (no termination) -> the write reports
+                    // -EPIPE; a terminating/handler delivery returns that control.
+                    Ctl::Ret(_) => err(errno::EPIPE),
+                    other => other,
+                }
+            }
+        };
+    }
+    ret(st.fds.write(fd, buf, count))
 }
 
 /// readv/writev: iterate the iovec array, calling the fd read/write per entry.
