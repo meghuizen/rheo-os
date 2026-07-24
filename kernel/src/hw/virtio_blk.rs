@@ -1,14 +1,21 @@
-//! A virtio-blk driver over the virtio-mmio transport (virtio 1.0 "modern"),
-//! implementing `BlockDevice`. This is the OS's first real storage driver: a
-//! filesystem can now read a live disk instead of an embedded image.
+//! A virtio-blk driver (virtio 1.0 "modern") implementing `BlockDevice`, over
+//! either of two transports:
 //!
-//! Transport: virtio-mmio, which QEMU's `virt` machines expose at fixed
-//! addresses (per-ISA constants in `arch`). x86-64 q35 has no virtio-mmio -
-//! it needs the virtio-*pci* transport (BAR + capability parsing), which is a
-//! follow-on; `probe` simply finds no device there. Single-vcore, polled (no
-//! interrupt path yet). DMA has no IOMMU in QEMU, so the device uses physical
-//! addresses; kernel RAM is identity-mapped, so a buffer's address *is* its
-//! physical address.
+//! - **virtio-mmio** - QEMU's `virt` machines (arm/riscv) expose it at fixed
+//!   addresses (per-ISA constants in `arch`). Register access is plain MMIO.
+//! - **virtio-pci** - QEMU q35 (x86-64) has no virtio-mmio; virtio is a PCIe
+//!   device there. We drive it *entirely through PCI configuration space*
+//!   using the `VIRTIO_PCI_CAP_PCI_CFG` capability (virtio spec 4.1.4.8): the
+//!   device services BAR-relative reads/writes for us via a config-space
+//!   window, so no BAR needs to be assigned or mapped. This matters because
+//!   there is no firmware under PVH boot to program the BARs, and the kernel
+//!   only identity-maps the low 1 GiB (the q35 PCI window sits above it).
+//!
+//! Both transports share one virtqueue and one block-request path; they differ
+//! only in how registers are read/written and how the device is notified.
+//! Single-vcore, polled (no interrupt path yet). DMA has no IOMMU in QEMU, so
+//! the device uses physical addresses; kernel RAM is identity-mapped, so a
+//! buffer's address *is* its physical address on both transports.
 
 use super::block::{BlkError, BlockDevice, SECTOR};
 use crate::arch;
@@ -39,7 +46,7 @@ const CONFIG: usize = 0x100;
 const MAGIC_VALUE: u32 = 0x7472_6976; // "virt"
 const DEV_BLOCK: u32 = 2;
 
-// Status bits.
+// Status bits (shared by both transports).
 const S_ACK: u32 = 1;
 const S_DRIVER: u32 = 2;
 const S_DRIVER_OK: u32 = 4;
@@ -54,6 +61,40 @@ const BLK_T_IN: u32 = 0; // read
 const BLK_T_OUT: u32 = 1; // write
 
 const QSIZE: usize = 8;
+
+// -------------------------------------------------- virtio-pci constants
+
+const PCI_VENDOR_VIRTIO: u16 = 0x1af4;
+// Modern virtio-blk (device type 2): 0x1040 + 2. QEMU presents this ID when
+// the device is created with `disable-legacy=on`.
+const PCI_DEVICE_VIRTIO_BLK: u16 = 0x1042;
+
+const PCI_COMMAND: u16 = 0x04;
+const PCI_CMD_MEMORY: u32 = 1 << 1;
+const PCI_CMD_MASTER: u32 = 1 << 2;
+const PCI_CAP_PTR: u16 = 0x34;
+const PCI_STATUS_CAP_LIST: u32 = 1 << 4;
+
+const CAP_ID_VENDOR: u32 = 0x09;
+// virtio_pci_cap.cfg_type values.
+const VIRTIO_CAP_COMMON: u32 = 1;
+const VIRTIO_CAP_NOTIFY: u32 = 2;
+const VIRTIO_CAP_DEVICE: u32 = 4;
+const VIRTIO_CAP_PCI: u32 = 5;
+
+// virtio_pci_common_cfg field offsets (bytes).
+const CC_DEVICE_FEATURE_SELECT: u32 = 0;
+const CC_DEVICE_FEATURE: u32 = 4;
+const CC_DRIVER_FEATURE_SELECT: u32 = 8;
+const CC_DRIVER_FEATURE: u32 = 12;
+const CC_DEVICE_STATUS: u32 = 20;
+const CC_QUEUE_SELECT: u32 = 22;
+const CC_QUEUE_SIZE: u32 = 24;
+const CC_QUEUE_ENABLE: u32 = 28;
+const CC_QUEUE_NOTIFY_OFF: u32 = 30;
+const CC_QUEUE_DESC: u32 = 32;
+const CC_QUEUE_DRIVER: u32 = 40;
+const CC_QUEUE_DEVICE: u32 = 48;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -138,14 +179,111 @@ unsafe fn w32(base: usize, off: usize, v: u32) {
     unsafe { ((base + off) as *mut u32).write_volatile(v) }
 }
 
+/// The virtio-pci transport: a device on the PCI bus driven through the
+/// `VIRTIO_PCI_CAP_PCI_CFG` config-space window. Holds the located virtio
+/// capability regions (BAR + offset) and the queue-0 notify address.
+struct PciXport {
+    bus: u8,
+    dev: u8,
+    func: u8,
+    /// Config-space offset of the VIRTIO_PCI_CAP_PCI_CFG capability - the
+    /// window we route all BAR accesses through.
+    pci_cfg: u16,
+    common_bar: u8,
+    common_off: u32,
+    notify_bar: u8,
+    /// Absolute offset within `notify_bar` to poke for queue 0.
+    notify_off: u32,
+}
+
+impl PciXport {
+    fn cfg_w(&self, off: u16, v: u32) {
+        arch::pci_cfg_write32(0, self.bus, self.dev, self.func, off, v);
+    }
+    fn cfg_r(&self, off: u16) -> u32 {
+        arch::pci_cfg_read32(0, self.bus, self.dev, self.func, off)
+    }
+
+    /// Point the PCI_CFG window at `(bar, off)` for a `len`-byte access.
+    fn win(&self, bar: u8, off: u32, len: u32) {
+        // virtio_pci_cap layout: bar @ cap+4 (low byte), offset @ cap+8,
+        // length @ cap+12, pci_cfg_data @ cap+16 (all DWORD-aligned).
+        self.cfg_w(self.pci_cfg + 4, bar as u32);
+        self.cfg_w(self.pci_cfg + 12, len);
+        self.cfg_w(self.pci_cfg + 8, off);
+    }
+
+    /// Read `len` (1/2/4) bytes from `(bar, off)`. QEMU returns the value in
+    /// the low `len` bytes of pci_cfg_data (no offset-in-dword shifting).
+    fn read(&self, bar: u8, off: u32, len: u32) -> u32 {
+        self.win(bar, off, len);
+        let d = self.cfg_r(self.pci_cfg + 16);
+        if len == 4 {
+            d
+        } else {
+            d & ((1u32 << (len * 8)) - 1)
+        }
+    }
+
+    /// Write `len` (1/2/4) bytes to `(bar, off)` (value in the low bytes).
+    fn write(&self, bar: u8, off: u32, len: u32, val: u32) {
+        self.win(bar, off, len);
+        self.cfg_w(self.pci_cfg + 16, val);
+    }
+
+    // Common-configuration accessors (width matches the field).
+    fn cc_w32(&self, field: u32, v: u32) {
+        self.write(self.common_bar, self.common_off + field, 4, v);
+    }
+    fn cc_r16(&self, field: u32) -> u16 {
+        self.read(self.common_bar, self.common_off + field, 2) as u16
+    }
+    fn cc_w16(&self, field: u32, v: u16) {
+        self.write(self.common_bar, self.common_off + field, 2, v as u32);
+    }
+    fn cc_r8(&self, field: u32) -> u8 {
+        self.read(self.common_bar, self.common_off + field, 1) as u8
+    }
+    fn cc_w8(&self, field: u32, v: u8) {
+        self.write(self.common_bar, self.common_off + field, 1, v as u32);
+    }
+
+    fn notify_q0(&self) {
+        // Modern notify: write the virtqueue index (0) at the notify offset.
+        self.write(self.notify_bar, self.notify_off, 2, 0);
+    }
+}
+
+/// How a discovered device is reached.
+enum Transport {
+    Mmio { base: usize },
+    Pci(PciXport),
+}
+
+impl Transport {
+    fn notify_q0(&self) {
+        match self {
+            // SAFETY: `base` matched the virtio-mmio magic during probe.
+            Transport::Mmio { base } => unsafe { w32(*base, QUEUE_NOTIFY, 0) },
+            Transport::Pci(p) => p.notify_q0(),
+        }
+    }
+}
+
 /// A discovered virtio-blk device.
 pub struct VirtioBlk {
-    base: usize,
+    transport: Transport,
     capacity: u64,
 }
 
-/// Scan the virtio-mmio slots for a block device and initialise the first one.
+/// Find and initialise the first virtio-blk device on this machine, trying
+/// virtio-mmio (arm/riscv `virt`) first, then virtio-pci (x86 q35).
 pub fn probe() -> Option<VirtioBlk> {
+    probe_mmio().or_else(probe_pci)
+}
+
+/// Scan the virtio-mmio slots for a block device and initialise the first one.
+fn probe_mmio() -> Option<VirtioBlk> {
     let count = arch::VIRTIO_MMIO_COUNT;
     for slot in 0..count {
         let base = arch::VIRTIO_MMIO_BASE + slot * arch::VIRTIO_MMIO_STRIDE;
@@ -160,7 +298,7 @@ pub fn probe() -> Option<VirtioBlk> {
             if r32(base, DEVICE_ID) != DEV_BLOCK {
                 continue;
             }
-            if let Some(dev) = init(base) {
+            if let Some(dev) = init_mmio(base) {
                 return Some(dev);
             }
         }
@@ -170,7 +308,7 @@ pub fn probe() -> Option<VirtioBlk> {
 
 /// # Safety
 /// `base` must be a virtio-mmio block device that magic/version/id matched.
-unsafe fn init(base: usize) -> Option<VirtioBlk> {
+unsafe fn init_mmio(base: usize) -> Option<VirtioBlk> {
     unsafe {
         w32(base, STATUS, 0); // reset
         let mut status = S_ACK;
@@ -218,10 +356,168 @@ unsafe fn init(base: usize) -> Option<VirtioBlk> {
         let cap_hi = r32(base, CONFIG + 4) as u64;
         LAST_USED = (*core::ptr::addr_of!(VQ)).used.idx;
         Some(VirtioBlk {
-            base,
+            transport: Transport::Mmio { base },
             capacity: cap_lo | (cap_hi << 32),
         })
     }
+}
+
+/// Scan PCI bus 0 for a modern virtio-blk device and initialise it.
+fn probe_pci() -> Option<VirtioBlk> {
+    for dev in 0u8..32 {
+        for func in 0u8..8 {
+            let id = arch::pci_cfg_read32(0, 0, dev, func, 0x00);
+            let vendor = (id & 0xFFFF) as u16;
+            if vendor != PCI_VENDOR_VIRTIO {
+                continue;
+            }
+            if (id >> 16) as u16 != PCI_DEVICE_VIRTIO_BLK {
+                continue;
+            }
+            if let Some(d) = init_pci(0, dev, func) {
+                return Some(d);
+            }
+        }
+    }
+    None
+}
+
+/// Read one config-space byte (config access is DWORD-granular).
+fn cfg_read8(bus: u8, dev: u8, func: u8, off: u16) -> u8 {
+    let d = arch::pci_cfg_read32(0, bus, dev, func, off & !3);
+    ((d >> ((off & 3) * 8)) & 0xFF) as u8
+}
+
+/// Initialise a virtio-blk device found on the PCI bus. Walks the virtio PCI
+/// capabilities, then runs the modern handshake through the PCI_CFG window.
+fn init_pci(bus: u8, dev: u8, func: u8) -> Option<VirtioBlk> {
+    // A capability list must be present (PCI_STATUS bit 4; PCI_STATUS is the
+    // high half of the 0x04 dword, so the bit is at 16 + 4).
+    let status_cmd = arch::pci_cfg_read32(0, bus, dev, func, PCI_COMMAND);
+    if status_cmd & (PCI_STATUS_CAP_LIST << 16) == 0 {
+        return None;
+    }
+
+    // Locate the virtio capabilities.
+    let mut common: Option<(u8, u32)> = None;
+    let mut notify: Option<(u8, u32)> = None;
+    let mut notify_mult: u32 = 0;
+    let mut device: Option<(u8, u32)> = None;
+    let mut pci_cfg: Option<u16> = None;
+
+    let mut cap = cfg_read8(bus, dev, func, PCI_CAP_PTR) as u16;
+    let mut guard = 0;
+    while cap != 0 && cap != 0xFF && guard < 48 {
+        guard += 1;
+        let hdr = arch::pci_cfg_read32(0, bus, dev, func, cap); // [id,next,len,cfg_type]
+        let id = hdr & 0xFF;
+        let next = (hdr >> 8) & 0xFF;
+        let cfg_type = (hdr >> 24) & 0xFF;
+        if id == CAP_ID_VENDOR {
+            let bar = (arch::pci_cfg_read32(0, bus, dev, func, cap + 4) & 0xFF) as u8;
+            let offset = arch::pci_cfg_read32(0, bus, dev, func, cap + 8);
+            match cfg_type {
+                VIRTIO_CAP_COMMON => common = Some((bar, offset)),
+                VIRTIO_CAP_NOTIFY => {
+                    notify = Some((bar, offset));
+                    notify_mult = arch::pci_cfg_read32(0, bus, dev, func, cap + 16);
+                }
+                VIRTIO_CAP_DEVICE => device = Some((bar, offset)),
+                VIRTIO_CAP_PCI => pci_cfg = Some(cap),
+                _ => {}
+            }
+        }
+        cap = next as u16;
+    }
+
+    let (common_bar, common_off) = common?;
+    let (notify_bar, notify_base) = notify?;
+    let (device_bar, device_off) = device?;
+    let pci_cfg = pci_cfg?;
+
+    let mut x = PciXport {
+        bus,
+        dev,
+        func,
+        pci_cfg,
+        common_bar,
+        common_off,
+        notify_bar,
+        notify_off: 0,
+    };
+
+    // Enable memory-space decoding and bus mastering (DMA needs MASTER).
+    let cmd = arch::pci_cfg_read32(0, bus, dev, func, PCI_COMMAND);
+    arch::pci_cfg_write32(
+        0,
+        bus,
+        dev,
+        func,
+        PCI_COMMAND,
+        cmd | PCI_CMD_MEMORY | PCI_CMD_MASTER,
+    );
+
+    // Reset, then ACK + DRIVER.
+    x.cc_w8(CC_DEVICE_STATUS, 0);
+    x.cc_w8(CC_DEVICE_STATUS, S_ACK as u8);
+    x.cc_w8(CC_DEVICE_STATUS, (S_ACK | S_DRIVER) as u8);
+
+    // Require VIRTIO_F_VERSION_1 (feature bit 32 -> select 1, bit 0).
+    x.cc_w32(CC_DRIVER_FEATURE_SELECT, 1);
+    x.cc_w32(CC_DRIVER_FEATURE, 1);
+    x.cc_w32(CC_DRIVER_FEATURE_SELECT, 0);
+    x.cc_w32(CC_DRIVER_FEATURE, 0);
+    let _ = (CC_DEVICE_FEATURE_SELECT, CC_DEVICE_FEATURE);
+
+    x.cc_w8(CC_DEVICE_STATUS, (S_ACK | S_DRIVER | S_FEATURES_OK) as u8);
+    if x.cc_r8(CC_DEVICE_STATUS) & S_FEATURES_OK as u8 == 0 {
+        return None; // device rejected our feature set
+    }
+
+    // Queue 0 setup.
+    x.cc_w16(CC_QUEUE_SELECT, 0);
+    if (x.cc_r16(CC_QUEUE_SIZE) as usize) < QSIZE {
+        return None;
+    }
+    x.cc_w16(CC_QUEUE_SIZE, QSIZE as u16);
+
+    // SAFETY: single-vcore init; the static virtqueue is set up once here.
+    let (desc_pa, avail_pa, used_pa) = unsafe {
+        let vq = core::ptr::addr_of!(VQ);
+        (
+            core::ptr::addr_of!((*vq).desc) as u64,
+            core::ptr::addr_of!((*vq).avail) as u64,
+            core::ptr::addr_of!((*vq).used) as u64,
+        )
+    };
+    x.cc_w32(CC_QUEUE_DESC, desc_pa as u32);
+    x.cc_w32(CC_QUEUE_DESC + 4, (desc_pa >> 32) as u32);
+    x.cc_w32(CC_QUEUE_DRIVER, avail_pa as u32);
+    x.cc_w32(CC_QUEUE_DRIVER + 4, (avail_pa >> 32) as u32);
+    x.cc_w32(CC_QUEUE_DEVICE, used_pa as u32);
+    x.cc_w32(CC_QUEUE_DEVICE + 4, (used_pa >> 32) as u32);
+
+    let qnotify = x.cc_r16(CC_QUEUE_NOTIFY_OFF) as u32;
+    x.notify_off = notify_base + qnotify * notify_mult;
+
+    x.cc_w16(CC_QUEUE_ENABLE, 1);
+    x.cc_w8(
+        CC_DEVICE_STATUS,
+        (S_ACK | S_DRIVER | S_FEATURES_OK | S_DRIVER_OK) as u8,
+    );
+
+    // Capacity: virtio-blk device config, u64 sectors at offset 0.
+    let cap_lo = x.read(device_bar, device_off, 4) as u64;
+    let cap_hi = x.read(device_bar, device_off + 4, 4) as u64;
+
+    // SAFETY: single-vcore; initialise the used-ring watermark.
+    unsafe {
+        LAST_USED = (*core::ptr::addr_of!(VQ)).used.idx;
+    }
+    Some(VirtioBlk {
+        transport: Transport::Pci(x),
+        capacity: cap_lo | (cap_hi << 32),
+    })
 }
 
 impl VirtioBlk {
@@ -271,7 +567,7 @@ impl VirtioBlk {
             (*vq).avail.idx = idx.wrapping_add(1);
             fence(Ordering::SeqCst);
 
-            w32(self.base, QUEUE_NOTIFY, 0);
+            self.transport.notify_q0();
 
             // Poll the used ring (no interrupts yet).
             let mut spins = 0u64;

@@ -237,6 +237,16 @@ pub fn pci_cfg_read32(ecam: u64, bus: u8, dev: u8, func: u8, off: u16) -> u32 {
     unsafe { (a as *const u32).read_volatile() }
 }
 
+/// PCI config write through the ECAM window.
+pub fn pci_cfg_write32(ecam: u64, bus: u8, dev: u8, func: u8, off: u16, val: u32) {
+    let a = ecam
+        + ((bus as u64) << 20)
+        + ((dev as u64) << 15)
+        + ((func as u64) << 12)
+        + (off as u64 & 0xFFC);
+    unsafe { (a as *mut u32).write_volatile(val) }
+}
+
 // -------------------------------------------------------------- user mode
 
 /// Saved EL0 register state. Layout matches the offsets in vectors.S:

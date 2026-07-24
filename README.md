@@ -66,8 +66,9 @@ heap/`alloc`, executor, async channel, type-level capability rights, native
 async over the real queue-pair ABI), `posix` (the filesystem + POSIX
 stack: a read-write ramfs and a read-only ext4 image behind a VFS, the
 POSIX fd surface, and a `std::fs` facade), and `blockfs` (a virtio-blk
-driver reading a live ext4 disk through the `BlockDevice` seam; skips on
-x86-64, which has no virtio-mmio). Each reports pass/fail through a
+driver reading a live ext4 disk through the `BlockDevice` seam - virtio-mmio
+on arm/riscv, virtio-pci on x86-64, all three ISAs). Each reports pass/fail
+through a
 QEMU exit device, so the result
 is the process exit code - the same check CI runs on every push. Serial
 output is saved to `target/qemu-<arch>-<bin>.log`.

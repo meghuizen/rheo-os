@@ -4,9 +4,10 @@
 //! files through the VFS + std::fs facade. This closes the loop from a storage
 //! transport to a filesystem.
 //!
-//! virtio-mmio exists on the riscv/arm `virt` machines; x86-64 q35 has no
-//! virtio-mmio (virtio is PCIe there), so on x86 the probe finds nothing and
-//! the test skips - documented, like riscv hwrng.
+//! The transport differs per machine: virtio-mmio on the riscv/arm `virt`
+//! machines, virtio-pci on x86-64 q35 (driven through PCI config space). The
+//! probe tries both, so all three ISAs exercise the same block path. The
+//! skip branch below only fires if no virtio-blk device is attached at all.
 
 #![no_std]
 #![no_main]
@@ -38,9 +39,7 @@ extern "C" fn kernel_main() -> ! {
     let dev = match virtio_blk::probe() {
         Some(d) => d,
         None => {
-            println!(
-                "blockfs: no virtio-blk here (virtio-mmio absent; x86 needs virtio-pci) - skipping"
-            );
+            println!("blockfs: no virtio-blk device attached - skipping");
             println!("blockfs: PASS");
             arch::exit(arch::ExitCode::Success)
         }

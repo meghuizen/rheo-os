@@ -36,8 +36,9 @@ const TEST_KERNELS: [&str; 11] = [
 ];
 
 /// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
-/// (the ext4 fixture); only the riscv/arm `virt` machines have virtio-mmio, so
-/// x86 gets no device and the test skips there.
+/// (the ext4 fixture). arm/riscv `virt` present it over virtio-mmio; x86 q35
+/// has no virtio-mmio, so there it is a virtio-*pci* device (disable-legacy=on
+/// pins the modern-only layout the PCI-config-tunnel driver expects).
 fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
     match (kernel, arch) {
         ("blockfs", Arch::Riscv64 | Arch::Aarch64) => &[
@@ -49,6 +50,12 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "file=tests/fixtures/ext4.img,if=none,id=blk0,format=raw",
             "-device",
             "virtio-blk-device,drive=blk0",
+        ],
+        ("blockfs", Arch::X86_64) => &[
+            "-drive",
+            "file=tests/fixtures/ext4.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-pci,drive=blk0,disable-legacy=on",
         ],
         _ => &[],
     }

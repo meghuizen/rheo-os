@@ -102,15 +102,20 @@ three ISAs.
 A **live-disk block stack** closes the loop from storage transport to
 filesystem: a **`BlockDevice` trait** (`kernel/src/hw/block.rs`, 512-byte
 sectors, transport-agnostic) and a **virtio-blk driver**
-(`kernel/src/hw/virtio_blk.rs`) over virtio-mmio - reset/feature negotiation,
-a split virtqueue, and the block request protocol. The `blockfs` test kernel
-discovers the device, reads a real ext4 image off the *live disk* (attached
-by QEMU with `-drive`), mounts it, and reads files through `std::fs`. It runs
-on arm/riscv `virt`; x86-64 q35 has no virtio-mmio (virtio is PCIe there), so
-the probe finds nothing and the test skips (a virtio-pci transport is the
-follow-up). At the `BlockDevice` seam existing Rust FS drivers (redoxfs,
-fatfs, a read/write ext4 crate) can be dropped in rather than hand-written -
-gated by the no-deps rule (a doc must name any crate).
+(`kernel/src/hw/virtio_blk.rs`) - reset/feature negotiation, a split
+virtqueue, and the block request protocol - over **two transports**:
+virtio-mmio on arm/riscv `virt`, and **virtio-pci on x86-64 q35**. The x86
+path drives the device *entirely through PCI configuration space* using the
+`VIRTIO_PCI_CAP_PCI_CFG` capability (virtio spec 4.1.4.8), so no BAR needs
+to be assigned or mapped - which matters because PVH boot has no firmware to
+program BARs and the kernel only identity-maps the low 1 GiB (the q35 PCI
+window sits above it); DMA still reaches the identity-mapped virtqueue since
+PA=VA. The `blockfs` test kernel discovers the device, reads a real ext4
+image off the *live disk* (attached by QEMU with `-drive`), mounts it, and
+reads files through `std::fs` - on **all three ISAs**. At the `BlockDevice`
+seam existing Rust FS drivers (redoxfs, fatfs, a read/write ext4 crate) can
+be dropped in rather than hand-written - gated by the no-deps rule (a doc
+must name any crate).
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus

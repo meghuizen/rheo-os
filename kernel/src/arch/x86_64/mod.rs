@@ -342,6 +342,21 @@ pub fn pci_cfg_read32(_ecam: u64, bus: u8, dev: u8, func: u8, off: u16) -> u32 {
     }
 }
 
+/// PCI config write via the CF8/CFC I/O ports. `off` is DWORD-aligned (the
+/// low two bits are ignored), matching how the virtio-pci capabilities are
+/// laid out (every field is DWORD-aligned).
+pub fn pci_cfg_write32(_ecam: u64, bus: u8, dev: u8, func: u8, off: u16, val: u32) {
+    let addr = 0x8000_0000u32
+        | ((bus as u32) << 16)
+        | ((dev as u32) << 11)
+        | ((func as u32) << 8)
+        | (off as u32 & 0xFC);
+    unsafe {
+        outl(0xCF8, addr);
+        outl(0xCFC, val);
+    }
+}
+
 // -------------------------------------------------------------- user mode
 
 /// Saved ring-3 register state. Layout matches the offsets in user.S.

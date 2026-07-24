@@ -10,15 +10,18 @@ the extent tree, linear directories. It is host-validated against a
 the POSIX fd surface + a `std::fs` facade sit on top (POSIX-PERSONALITY.md).
 Proven on all three ISAs by the `posix` test kernel.
 
-**Live disk (implemented on arm/riscv):** a **virtio-blk driver**
-(`kernel/src/hw/virtio_blk.rs`) over virtio-mmio exposes a **`BlockDevice`**
-trait (`kernel/src/hw/block.rs`) - 512-byte sectors, transport-agnostic -
-behind the same VFS. The `blockfs` test kernel discovers the device, reads a
+**Live disk (implemented, all three ISAs):** a **virtio-blk driver**
+(`kernel/src/hw/virtio_blk.rs`) exposes a **`BlockDevice`** trait
+(`kernel/src/hw/block.rs`) - 512-byte sectors, transport-agnostic - behind
+the same VFS, over two transports: **virtio-mmio** on the arm/riscv `virt`
+machines and **virtio-pci** on x86-64 q35. The x86 path drives the device
+*entirely through PCI configuration space* via the `VIRTIO_PCI_CAP_PCI_CFG`
+capability (virtio spec 4.1.4.8), so no BAR is assigned or mapped - which
+matters because PVH boot ships no firmware to program BARs and the kernel
+only identity-maps the low 1 GiB; DMA still reaches the identity-mapped
+virtqueue (PA=VA). The `blockfs` test kernel discovers the device, reads a
 real ext4 image off the *live disk* (attached by QEMU with `-drive`), mounts
-it, and reads files through `std::fs`. It runs on the arm/riscv `virt`
-machines; x86-64 q35 has no virtio-mmio (virtio is PCIe there), so the probe
-finds nothing and the test skips - a documented gap (a virtio-pci transport
-is the follow-up).
+it, and reads files through `std::fs` - on all three ISAs.
 
 **Route to more formats:** at the `BlockDevice` seam, existing Rust
 filesystem drivers - `redoxfs` (Redox OS), `fatfs`, a read/write ext4 crate -
