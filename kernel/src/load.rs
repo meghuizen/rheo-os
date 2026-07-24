@@ -9,7 +9,7 @@
 //! its own base (4 GiB) and is fully self-contained - no dependence on kernel
 //! `.text`, which is what makes a separately-compiled binary runnable.
 
-use crate::arch::MapPerm;
+use crate::arch::{self, MapPerm};
 use crate::elf::{self, Elf, PF_W, PF_X, Segment};
 use crate::mm::AddressSpace;
 use crate::mm::frames::{self, FRAME_SIZE};
@@ -115,9 +115,10 @@ pub fn setup_stack(aspace: &mut AddressSpace, args: &[&[u8]], envs: &[&[u8]]) ->
     }
 
     let base_va = USER_STACK_TOP - FRAME_SIZE;
-    // SAFETY: `top_pa` is a freshly allocated, zeroed, identity-mapped frame we
-    // just mapped at `base_va`; we write only within its FRAME_SIZE bytes.
-    let page = top_pa as *mut u8;
+    // SAFETY: `top_pa` is a freshly allocated, zeroed frame we just mapped at
+    // `base_va`; the kernel writes it through its linear map (identity on
+    // x86/riscv; the high map on aarch64), only within its FRAME_SIZE bytes.
+    let page = arch::phys_to_virt(top_pa) as *mut u8;
 
     // Copy the argument then environment strings near the top of the page,
     // growing downward, recording each string's user VA. Capped so a caller
@@ -204,12 +205,14 @@ fn map_segment(aspace: &mut AddressSpace, image: &[u8], seg: &Segment, bias: usi
             let n = copy_hi - copy_lo;
             let src_off = seg.offset + (copy_lo - vaddr);
             let dst_off = copy_lo - va;
-            // SAFETY: `pa` is a freshly allocated, identity-mapped frame; the
-            // source range was bounds-checked in `Elf::for_each_load`.
+            // SAFETY: `pa` is a freshly allocated frame written through the
+            // kernel's linear map (identity on x86/riscv; the high map on
+            // aarch64); the source range was bounds-checked in
+            // `Elf::for_each_load`.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     image.as_ptr().add(src_off),
-                    (pa as *mut u8).add(dst_off),
+                    (arch::phys_to_virt(pa) as *mut u8).add(dst_off),
                     n,
                 );
             }

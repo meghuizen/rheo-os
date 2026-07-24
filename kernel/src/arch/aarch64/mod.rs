@@ -27,9 +27,32 @@ pub const NAME: &str = "ARM64";
 /// image (checked against __kernel_end in frames::init).
 pub const FRAME_POOL_BASE: usize = 0x4400_0000;
 
+/// Kernel linear-map offset (docs/MEMORY.md): the kernel runs in the high
+/// canonical half over TTBR1_EL1, so a physical address is reached at
+/// `pa | KERNEL_VA_BASE`. The whole low half (TTBR0_EL1) is left to user
+/// programs. The boot trampoline builds this map before any Rust runs, and
+/// the kernel is linked at `phys_to_virt(load address)` (link/aarch64.ld).
+pub const KERNEL_VA_BASE: usize = 0xFFFF_0000_0000_0000;
+
+/// Physical address -> kernel virtual address (the high linear map).
+#[inline(always)]
+pub fn phys_to_virt(pa: usize) -> usize {
+    pa | KERNEL_VA_BASE
+}
+
+/// Kernel virtual address (high linear map) -> physical address.
+#[inline(always)]
+pub fn virt_to_phys(va: usize) -> usize {
+    va & !KERNEL_VA_BASE
+}
+
 // ---------------------------------------------------------------- serial
 
-const PL011_BASE: usize = 0x0900_0000;
+// MMIO the kernel touches while a cell root (TTBR0) is active - the serial
+// UART for cell stdout/stdin - must sit in the shared TTBR1 map, so its base
+// is a high linear-map VA. Device MMIO used only at boot (PCIe ECAM, virtio)
+// is likewise reached high for uniformity.
+const PL011_BASE: usize = 0x0900_0000 | KERNEL_VA_BASE;
 const PL011_DR: *mut u32 = PL011_BASE as *mut u32; // data register
 const PL011_FR: *mut u32 = (PL011_BASE + 0x18) as *mut u32; // flag register
 const FR_TXFF: u32 = 1 << 5; // transmit FIFO full
@@ -189,7 +212,7 @@ pub fn cpu_report(_inv: &crate::hw::Inventory) -> crate::hw::CpuReport {
 // ---------------------------------------------------- virtio-mmio slots
 // QEMU arm `virt`: 32 virtio-mmio transports at 0x0a00_0000, stride 0x200
 // (within the 1 GiB device block the kernel identity-maps).
-pub const VIRTIO_MMIO_BASE: usize = 0x0a00_0000;
+pub const VIRTIO_MMIO_BASE: usize = 0x0a00_0000 | KERNEL_VA_BASE;
 pub const VIRTIO_MMIO_STRIDE: usize = 0x200;
 pub const VIRTIO_MMIO_COUNT: usize = 32;
 
@@ -241,7 +264,7 @@ pub fn pci_cfg_read32(ecam: u64, bus: u8, dev: u8, func: u8, off: u16) -> u32 {
         + ((dev as u64) << 15)
         + ((func as u64) << 12)
         + (off as u64 & 0xFFC);
-    unsafe { (a as *const u32).read_volatile() }
+    unsafe { (phys_to_virt(a as usize) as *const u32).read_volatile() }
 }
 
 /// PCI config write through the ECAM window.
@@ -251,7 +274,7 @@ pub fn pci_cfg_write32(ecam: u64, bus: u8, dev: u8, func: u8, off: u16, val: u32
         + ((dev as u64) << 15)
         + ((func as u64) << 12)
         + (off as u64 & 0xFFC);
-    unsafe { (a as *mut u32).write_volatile(val) }
+    unsafe { (phys_to_virt(a as usize) as *mut u32).write_volatile(val) }
 }
 
 // -------------------------------------------------------------- user mode

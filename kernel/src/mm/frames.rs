@@ -24,7 +24,10 @@ unsafe extern "C" {
 
 /// One-time setup; panics if the pool would overlap the kernel image.
 pub fn init() {
-    let kernel_end = core::ptr::addr_of!(__kernel_end) as usize;
+    // `__kernel_end` is a kernel virtual address; compare its physical address
+    // to the (physical) frame-pool base. Identity on x86/riscv; the high
+    // linear-map offset on aarch64 (docs/MEMORY.md).
+    let kernel_end = arch::virt_to_phys(core::ptr::addr_of!(__kernel_end) as usize);
     assert!(
         kernel_end <= arch::FRAME_POOL_BASE,
         "kernel image ({kernel_end:#x}) overlaps the frame pool ({:#x})",
@@ -53,7 +56,9 @@ pub fn alloc() -> usize {
                 bitmap[word] |= 1 << bit;
                 *core::ptr::addr_of_mut!(NEXT_HINT) = frame + 1;
                 let pa = arch::FRAME_POOL_BASE + frame * FRAME_SIZE;
-                core::ptr::write_bytes(pa as *mut u8, 0, FRAME_SIZE);
+                // Zero through the kernel's linear map (identity on x86/riscv;
+                // the high map on aarch64), never the raw physical address.
+                core::ptr::write_bytes(arch::phys_to_virt(pa) as *mut u8, 0, FRAME_SIZE);
                 return pa;
             }
         }

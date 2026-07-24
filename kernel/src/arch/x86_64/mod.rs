@@ -38,6 +38,19 @@ pub const NAME: &str = "x86-64";
 /// within the low-1 GiB identity map (checked in frames::init).
 pub const FRAME_POOL_BASE: usize = 0x0400_0000;
 
+/// Physical <-> kernel virtual address. x86-64 keeps the kernel identity-
+/// mapped in the low half for now (the higher-half move is a separate step),
+/// so these are the identity - the portable `phys_to_virt` seam
+/// (mm/frames, load, hw DMA) is a no-op here.
+#[inline(always)]
+pub fn phys_to_virt(pa: usize) -> usize {
+    pa
+}
+#[inline(always)]
+pub fn virt_to_phys(va: usize) -> usize {
+    va
+}
+
 // ---------------------------------------------------------------- serial
 
 const COM1: u16 = 0x3F8;

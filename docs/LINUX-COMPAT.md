@@ -172,17 +172,21 @@ syscalls).
   `std` hello (String/Vec/println!) and a static-glibc **C** hello, each built
   from source for the ISA's `*-unknown-linux-gnu` target, run on **all three
   ISAs** with exact stdout + exit code asserted. Accommodations, all disclosed:
-  - **ET_EXEC, relinked base.** A stock static-glibc binary links at a low VA
-    (x86/arm 0x400000, riscv 0x10000) that collides with the supervisor
-    identity map in a cell's page-table root. Since ET_EXEC cannot be relocated
-    after linking, the fixtures are relinked (`-no-pie -Wl,-Ttext-segment=`) to
-    a per-arch VA that is free in the cell root *and* reachable by the ISA's
-    default code model: **x86_64/riscv64 at 1 GiB** (small/medlow reach
-    < 2 GiB), **aarch64 at 2 GiB** (its cell root maps kernel RAM at 1-2 GiB).
-    The source and the toolchain are stock; only the link base moves.
-    Static-PIE (ET_DYN, the documented alternative) is *not* used because the
-    riscv64 glibc dev package ships no `rcrt1.o`; the loader's ET_DYN path
-    (bias 0x1_0000_0000) remains for L7 dynamic linking.
+  - **ET_EXEC link base.** A stock static-glibc binary links at a low VA
+    (x86/arm 0x400000, riscv 0x10000). On **x86_64/riscv64** (still low-half
+    kernels) that VA collides with the supervisor identity map in a cell's
+    page-table root, so - since ET_EXEC cannot be relocated after linking - the
+    fixtures are relinked (`-no-pie -Wl,-Ttext-segment=`) to a per-arch VA that
+    is free in the cell root *and* reachable by the ISA's default code model:
+    **x86_64/riscv64 at 1 GiB** (small/medlow reach < 2 GiB). On **aarch64 the
+    kernel is now higher-half** (docs/MEMORY.md): the kernel + MMIO live in
+    TTBR1_EL1, a cell's TTBR0_EL1 root maps only user pages, and the entire low
+    half is free - so the aarch64 fixtures keep glibc's **stock 0x400000 base,
+    unmodified, no relink**, which is exactly what `linuxrun` proves (rusthello
+    loads at ~0x400000, bias 0). The higher-half move for x86_64/riscv64 will
+    drop their relink too. Static-PIE (ET_DYN, the documented alternative) is
+    *not* used because the riscv64 glibc dev package ships no `rcrt1.o`; the
+    loader's ET_DYN path (bias 0x1_0000_0000) remains for L7 dynamic linking.
   - **uname release "6.6.0-rheo"**, machine per ISA (x86_64/aarch64/riscv64).
   - **RLIMIT_STACK 1 MiB** (matches the mapped Linux stack); RLIMIT_NOFILE 64.
   - **clock_gettime** is monotonic but coarse: x86 TSC via CPUID 0x16 (else a
@@ -209,17 +213,19 @@ syscalls).
 All Linux test binaries are built **from source** by xtask/CI - no binaries
 in git:
 
-All fixtures are static-glibc **ET_EXEC** relinked to a per-arch free base
-(`-C target-feature=+crt-static -C relocation-model=static -no-pie
--Wl,-Ttext-segment=<base>`; the cross gcc is the linker so the right glibc
-sysroot/crt objects are used, and x86 forces `-fuse-ld=bfd` because rust-lld
-rejects `-Ttext-segment`). Built by xtask `build_linux_fixtures` (L2, above).
+All fixtures are static-glibc **ET_EXEC** (`-C target-feature=+crt-static -C
+relocation-model=static -no-pie`; the cross gcc is the linker so the right
+glibc sysroot/crt objects are used). x86_64/riscv64 (low-half kernels) are
+relinked to a per-arch free base with `-Wl,-Ttext-segment=<base>` (x86 forces
+`-fuse-ld=bfd` because rust-lld rejects `-Ttext-segment`); **aarch64 is
+higher-half so its fixtures keep glibc's stock 0x400000 base, no relink**.
+Built by xtask `build_linux_fixtures` (L2, above).
 
 | ISA | Rust std (unpatched) | C (glibc) | link base |
 |---|---|---|---|
-| x86_64 | `x86_64-unknown-linux-gnu` | host `gcc` | 1 GiB |
-| aarch64 | `aarch64-unknown-linux-gnu` (linker: aarch64-linux-gnu-gcc) | `aarch64-linux-gnu-gcc` | 2 GiB |
-| riscv64 | `riscv64gc-unknown-linux-gnu` (linker: riscv64-linux-gnu-gcc) | `riscv64-linux-gnu-gcc` | 1 GiB |
+| x86_64 | `x86_64-unknown-linux-gnu` | host `gcc` | 1 GiB (relinked) |
+| aarch64 | `aarch64-unknown-linux-gnu` (linker: aarch64-linux-gnu-gcc) | `aarch64-linux-gnu-gcc` | 0x400000 (stock, higher-half) |
+| riscv64 | `riscv64gc-unknown-linux-gnu` (linker: riscv64-linux-gnu-gcc) | `riscv64-linux-gnu-gcc` | 1 GiB (relinked) |
 
 All three cross toolchains and `*-unknown-linux-gnu` rustup targets are
 present in the build/CI environment, so **riscv64 genuinely passes** (no

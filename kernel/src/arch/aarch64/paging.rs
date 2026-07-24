@@ -1,11 +1,14 @@
-//! ARM64 paging (BUILD-ORDER.md step 3): 4 KiB granule, 48-bit VA over
-//! TTBR0_EL1. Four levels (L0 512 GiB, L1 1 GiB, L2 2 MiB, L3 4 KiB).
+//! ARM64 paging (BUILD-ORDER.md step 3): 4 KiB granule, 48-bit VAs, four
+//! levels (L0 512 GiB, L1 1 GiB, L2 2 MiB, L3 4 KiB).
 //!
-//! Layout mirrors the RISC-V port: MMIO and kernel RAM are identity-mapped
-//! supervisor (1 GiB blocks in the kernel root; 2 MiB blocks in cell
-//! roots), and the one 2 MiB slot holding the `.user` window is a level-3
-//! table where per-cell user pages carry EL0 access. Isolation is the MMU
-//! faulting on a page a cell's root does not map; W^X is UXN/PXN + AP.
+//! Higher-half split (docs/MEMORY.md): the kernel + MMIO live in TTBR1_EL1
+//! (built once by the boot trampoline, shared by every cell), so a cell's
+//! **TTBR0_EL1 root maps only that cell's user pages** and the whole low half
+//! is free. The one 2 MiB slot holding the `.user` window is a level-3 table
+//! where per-cell user pages carry EL0 access; loader/stack pages are added at
+//! arbitrary low VAs on demand. Isolation is the MMU faulting on a page a
+//! cell's root does not map; W^X is UXN/PXN + AP. `table_mut` reaches page-
+//! table frames through the kernel's high linear map (`super::phys_to_virt`).
 
 use crate::arch::MapPerm;
 use crate::mm::frames;
@@ -13,10 +16,7 @@ use crate::mm::frames;
 // Descriptor bits.
 const VALID: u64 = 1 << 0;
 const TABLE: u64 = 1 << 1; // table (at L0-L2) or page (at L3)
-const BLOCK: u64 = 0; // block entry at L1/L2
-const ATTR_DEVICE: u64 = 0 << 2; // MAIR index 0
 const ATTR_NORMAL: u64 = 1 << 2; // MAIR index 1
-const AP_RW_EL1: u64 = 0b00 << 6; // RW at EL1, no EL0
 const AP_RW_ALL: u64 = 0b01 << 6; // RW at EL1 and EL0
 const AP_RO_ALL: u64 = 0b11 << 6; // RO at EL1 and EL0
 const SH_INNER: u64 = 0b11 << 8;
@@ -26,11 +26,7 @@ const PXN: u64 = 1 << 53;
 const UXN: u64 = 1 << 54;
 
 const PAGE_SIZE: usize = 4096;
-const GIB: usize = 1 << 30;
 const MIB2: usize = 2 << 20;
-
-const DEVICE_BASE: usize = 0; // MMIO gigabyte (UART, GIC, ...)
-const RAM_BASE: usize = 0x4000_0000;
 
 unsafe extern "C" {
     static __user_start: u8;
@@ -51,8 +47,10 @@ fn addr_bits(pa: usize) -> u64 {
 }
 
 fn table_mut(pa: usize) -> &'static mut [u64; 512] {
-    // SAFETY: `pa` is an allocated, identity-mapped table frame.
-    unsafe { &mut *(pa as *mut [u64; 512]) }
+    // SAFETY: `pa` is an allocated table frame, reached through the kernel's
+    // high linear map (TTBR1). The kernel runs high, so a physical frame is
+    // touched at phys_to_virt(pa), never at its raw physical address.
+    unsafe { &mut *(super::phys_to_virt(pa) as *mut [u64; 512]) }
 }
 
 fn next_table(entry: u64) -> usize {
@@ -72,37 +70,19 @@ fn l3_index(va: usize) -> usize {
     (va >> 12) & 0x1FF
 }
 
-/// Allocate a cell root: MMIO gigablock, kernel RAM as 2 MiB supervisor
-/// blocks, and the `.user` slot delegated to a level-3 table.
+/// Allocate a cell root (TTBR0_EL1, low half): maps ONLY user pages. The
+/// kernel and MMIO live in TTBR1_EL1 (set once at boot, shared by every cell),
+/// so a cell root carries no device/kernel-RAM blocks and the whole low half
+/// is free - a stock ET_EXEC at 0x400000 loads unmodified. Just the `.user`
+/// 2 MiB slot is pre-built as a level-3 table; the loader adds program/stack
+/// pages on demand via `paging_map_frame`.
 pub fn paging_new_root() -> PagingRoot {
     let l0_pa = frames::alloc();
-    let l1_pa = frames::alloc();
     let l0 = table_mut(l0_pa);
-    l0[l0_index(0)] = addr_bits(l1_pa) | TABLE | VALID;
-
-    let l1 = table_mut(l1_pa);
-    // 1 GiB device block at VA 0.
-    l1[l1_index(DEVICE_BASE)] =
-        addr_bits(DEVICE_BASE) | ATTR_DEVICE | AP_RW_EL1 | AF | UXN | PXN | BLOCK | VALID;
-
-    // Kernel RAM gigabyte as a level-2 table of 2 MiB supervisor blocks,
-    // with the `.user` slot carved out to a level-3 table.
-    let l2_pa = frames::alloc();
-    let l2 = table_mut(l2_pa);
-    let user_slot = user_window_base() & !(MIB2 - 1);
-    let mut va = RAM_BASE;
-    while va < RAM_BASE + GIB {
-        let idx = l2_index(va);
-        if va == user_slot {
-            let l3_pa = frames::alloc();
-            l2[idx] = addr_bits(l3_pa) | TABLE | VALID; // empty L3 for now
-        } else {
-            l2[idx] = addr_bits(va) | ATTR_NORMAL | SH_INNER | AP_RW_EL1 | AF | UXN | BLOCK | VALID;
-        }
-        va += MIB2;
-    }
-    l1[l1_index(RAM_BASE)] = addr_bits(l2_pa) | TABLE | VALID;
-
+    let slot = user_window_base() & !(MIB2 - 1);
+    let l1 = table_mut(ensure_table(l0, l0_index(slot)));
+    let l2 = table_mut(ensure_table(l1, l1_index(slot)));
+    let _l3 = ensure_table(l2, l2_index(slot)); // empty L3 for paging_map
     PagingRoot { l0_pa }
 }
 
@@ -139,9 +119,9 @@ fn ensure_table(parent: &mut [u64; 512], idx: usize) -> usize {
 }
 
 /// Map one 4 KiB frame `pa` at an arbitrary user `va`, creating intermediate
-/// tables as needed (docs/USERLAND.md). `va` must avoid the MMIO/kernel-RAM
-/// gigabytes the cell root maps supervisor (0-2 GiB); userland links at
-/// 4 GiB+.
+/// tables as needed (docs/USERLAND.md). The cell root maps only user pages
+/// (kernel + MMIO are in TTBR1), so any low `va` is available - including a
+/// stock ET_EXEC at 0x400000.
 pub fn paging_map_frame(root: &mut PagingRoot, va: usize, pa: usize, perm: MapPerm) {
     assert!(va.is_multiple_of(PAGE_SIZE), "unaligned user map {va:#x}");
     let l0 = table_mut(root.l0_pa);
@@ -231,68 +211,26 @@ pub fn paging_activate(root: &PagingRoot, asid: u16) {
     }
 }
 
-static mut KERNEL_ROOT_PA: usize = 0;
+unsafe extern "C" {
+    /// L0 root of the boot-built low identity map (TTBR0_EL1 at boot). Its
+    /// link address is its physical address (`.boot.bss` is identity-mapped).
+    static boot_l0_low: u8;
+}
 
-/// Re-activate the kernel's own address space (ASID 0).
+/// Re-activate the kernel's low-half working map in TTBR0_EL1 (ASID 0). The
+/// kernel proper lives in TTBR1_EL1 and is never switched; TTBR0 carries the
+/// boot low identity map so kernel setup code can reach the `.user` window
+/// (and RAM) at its low VA between cell runs. A cell run replaces TTBR0 with
+/// that cell's root; this restores the working map afterwards.
 pub fn paging_activate_kernel() {
-    let l0_pa = unsafe { *core::ptr::addr_of!(KERNEL_ROOT_PA) };
+    let l0_pa = core::ptr::addr_of!(boot_l0_low) as usize;
     paging_activate(&PagingRoot { l0_pa }, 0);
 }
 
-/// Build the kernel address space and turn the MMU on. Kernel root: MMIO
-/// gigablock + kernel RAM gigablock, both supervisor.
+/// Finish paging bring-up. The MMU, TCR, MAIR, TTBR0/TTBR1 and SCTLR are
+/// already configured by the boot trampoline (kernel/arch/aarch64/boot.S),
+/// which enabled the MMU and jumped the kernel to its high (TTBR1) VAs before
+/// any Rust ran. All that is left is the frame allocator.
 pub fn paging_kernel_init() {
     frames::init();
-
-    let l0_pa = frames::alloc();
-    let l1_pa = frames::alloc();
-    let l0 = table_mut(l0_pa);
-    l0[l0_index(0)] = addr_bits(l1_pa) | TABLE | VALID;
-    let l1 = table_mut(l1_pa);
-    l1[l1_index(DEVICE_BASE)] =
-        addr_bits(DEVICE_BASE) | ATTR_DEVICE | AP_RW_EL1 | AF | UXN | PXN | BLOCK | VALID;
-    // Kernel RAM gigablock: supervisor RWX (EL1 exec, no EL0).
-    l1[l1_index(RAM_BASE)] =
-        addr_bits(RAM_BASE) | ATTR_NORMAL | SH_INNER | AP_RW_EL1 | AF | UXN | BLOCK | VALID;
-
-    unsafe {
-        *core::ptr::addr_of_mut!(KERNEL_ROOT_PA) = l0_pa;
-
-        // MAIR: attr0 = Device-nGnRnE (0x00), attr1 = Normal WB (0xFF).
-        let mair: u64 = 0xFF << 8;
-        // TCR: T0SZ=16 (48-bit), TG0=4KB, inner-shareable WB-WA, IPS=40-bit,
-        // disable the TTBR1 walk (EPD1).
-        let tcr: u64 = 16 | (0b11 << 8) | (0b01 << 10) | (0b01 << 12) | (0b10 << 32) | (1 << 23);
-        // CNTKCTL: allow EL0 to read the virtual + physical counters.
-        let cntkctl: u64 = (1 << 0) | (1 << 1);
-        // CPACR_EL1.FPEN = 0b11: do not trap Advanced SIMD / FP at EL0 or EL1
-        // (docs/LINUX-COMPAT.md L1). glibc's NEON `memcpy`/`str*` ifunc
-        // variants use FP/SIMD unconditionally, so this is a hard
-        // prerequisite for any glibc binary. No FP state save/restore is
-        // needed yet: one EL0 context per cell, and the kernel is soft-float.
-        let cpacr: u64 = 0b11 << 20;
-        core::arch::asm!(
-            "msr mair_el1, {mair}",
-            "msr tcr_el1, {tcr}",
-            "msr ttbr0_el1, {ttbr}",
-            "msr cntkctl_el1, {cnt}",
-            "msr cpacr_el1, {cpacr}",
-            "isb",
-            mair = in(reg) mair,
-            tcr = in(reg) tcr,
-            ttbr = in(reg) l0_pa as u64,
-            cnt = in(reg) cntkctl,
-            cpacr = in(reg) cpacr,
-        );
-        // Enable MMU + caches; SPAN=1 keeps PSTATE.PAN clear on exception
-        // entry so the EL1 handler can touch a cell's EL0 ring.
-        let mut sctlr: u64;
-        core::arch::asm!("mrs {0}, sctlr_el1", out(reg) sctlr);
-        sctlr |= (1 << 0) | (1 << 2) | (1 << 12) | (1 << 23);
-        core::arch::asm!(
-            "msr sctlr_el1, {0}",
-            "isb",
-            in(reg) sctlr,
-        );
-    }
 }

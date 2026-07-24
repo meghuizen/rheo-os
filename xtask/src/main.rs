@@ -365,13 +365,20 @@ fn build_linux_fixtures(arch: Arch) -> bool {
     let cc = arch.linux_cc();
 
     // Rust std hello: static glibc, ET_EXEC (-no-pie + static relocation
-    // model), relinked to the per-arch base. The cross gcc is the linker so
-    // the right sysroot/crt objects are used; x86 forces bfd ld because
-    // rust-lld rejects -Ttext-segment.
+    // model). On aarch64 the kernel is higher-half, so the whole low half is
+    // free and the fixture keeps glibc's stock ET_EXEC base (0x400000) - no
+    // relink - which proves a stock binary loads unmodified (docs/MEMORY.md,
+    // docs/LINUX-COMPAT.md L2). x86/riscv are still low-half, so their
+    // fixtures are relinked to a free per-arch base until their higher-half
+    // move lands. The cross gcc is the linker so the right sysroot/crt objects
+    // are used; x86 forces bfd ld because rust-lld rejects -Ttext-segment.
     let mut rustflags = format!(
         "-C target-feature=+crt-static -C relocation-model=static \
-         -C linker={cc} -C link-arg=-no-pie -C link-arg=-Wl,-Ttext-segment={base}"
+         -C linker={cc} -C link-arg=-no-pie"
     );
+    if arch != Arch::Aarch64 {
+        rustflags.push_str(&format!(" -C link-arg=-Wl,-Ttext-segment={base}"));
+    }
     if arch == Arch::X86_64 {
         rustflags.push_str(" -C link-arg=-fuse-ld=bfd");
     }
@@ -400,10 +407,11 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         return false;
     }
     let mut c = Command::new(cc);
+    c.arg("-static").arg("-no-pie");
+    if arch != Arch::Aarch64 {
+        c.arg(format!("-Wl,-Ttext-segment={base}"));
+    }
     c.args([
-        "-static",
-        "-no-pie",
-        &format!("-Wl,-Ttext-segment={base}"),
         "tests/linux-fixtures/hello.c",
         "-o",
         &format!("{out_dir}/chello"),
@@ -443,6 +451,15 @@ fn build(arch: Arch, release: bool) -> bool {
     ]);
     if release {
         cmd.arg("--release");
+    }
+    if arch == Arch::Aarch64 {
+        // Higher-half kernel (docs/MEMORY.md): the kernel .text/.data run at
+        // high (TTBR1) VAs while the low `.user` window is per-cell in TTBR0.
+        // Kernel code materializes the addresses of low `.user` symbols, which
+        // is beyond the small code model's +-4 GiB adrp reach, so the aarch64
+        // kernel is built with the large code model (absolute movz/movk). Only
+        // this package needs it; the userland/std fixtures link low and small.
+        cmd.env("RUSTFLAGS", "-C code-model=large");
     }
     matches!(cmd.status().map(|s| s.success()), Ok(true))
 }

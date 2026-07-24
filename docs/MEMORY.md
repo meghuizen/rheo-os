@@ -116,7 +116,40 @@ boundary un-zeroed.
   slope visible early, and cell death returns everything (no kernel-side
   orphan state).
 
-## 9. Honest costs
+## 9. Kernel address-space layout (higher-half)
+
+A trap enters the kernel with the faulting cell's page-table root still active
+(no root switch on trap entry), so the kernel must be mapped in every cell's
+root. Mapping it supervisor-only in the **low** half wastes the low addresses a
+user program wants: a stock Linux `ET_EXEC` links at 0x400000 and collides with
+the kernel's low identity map. The fix is to run the kernel in the **high
+canonical half** so the whole low half belongs to user programs.
+
+- **aarch64 (done):** the kernel + all MMIO live in **TTBR1_EL1** (VAs with the
+  top bits set); a cell's **TTBR0_EL1** root maps *only* that cell's user pages.
+  The kernel is linked at `KERNEL_VA_BASE | load_address`
+  (`KERNEL_VA_BASE = 0xFFFF_0000_0000_0000`, link/aarch64.ld) and loaded at its
+  physical address via `AT()`; the boot trampoline (`arch/aarch64/boot.S`)
+  builds an initial TTBR1 linear map plus a temporary TTBR0 identity map,
+  enables the MMU, and branches to the high-half continuation before any Rust
+  runs. TTBR1 is set once at boot and never switched; `paging_activate` only
+  rewrites TTBR0 (per cell), and `paging_activate_kernel` restores the boot low
+  identity map between cell runs so setup code can still reach the low `.user`
+  window. The `.user` window (hand-written U-mode code + per-cell data) stays
+  low, identity-mapped, per-cell in TTBR0 - so isolation is unchanged. Because
+  the kernel now spans high (`.text`/`.data`) and low (`.user`) symbols beyond
+  the small code model's +-4 GiB `adrp` reach, the aarch64 kernel is built with
+  the **large code model** (xtask). x86_64/riscv64 remain low-half for now.
+- **The `phys_to_virt` seam.** The kernel touches physical frames (page tables,
+  freshly allocated frames, ELF-load target pages, DMA rings) at
+  `arch::phys_to_virt(pa)` - `pa | KERNEL_VA_BASE` on aarch64, the identity on
+  x86_64/riscv64 - never at the raw physical address, since the kernel no longer
+  identity-maps RAM low. `arch::virt_to_phys` is the inverse, used to hand
+  physical addresses to devices (virtio DMA) and to bounds-check the frame pool
+  against the kernel image. Both are per-ISA functions behind the portable
+  `crate::arch` surface, so `mm`, `load`, and the hw drivers stay ISA-neutral.
+
+## 10. Honest costs
 
 - Explicit commit policy and pressure-event handling push real work onto
   runtimes: a naive port that ignores pressure events simply loses its

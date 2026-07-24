@@ -12,7 +12,7 @@
 //! `load::setup_stack`. The whole block must fit in the top page; argv/envp
 //! for our fixtures easily do (asserted).
 
-use crate::arch::MapPerm;
+use crate::arch::{self, MapPerm};
 use crate::load::LinuxImage;
 use crate::mm::AddressSpace;
 use crate::mm::frames::{self, FRAME_SIZE};
@@ -68,9 +68,10 @@ pub fn setup_stack(
     }
 
     let base_va = USER_STACK_TOP - FRAME_SIZE;
-    // SAFETY: freshly allocated, zeroed, identity-mapped top frame; we write
-    // only within its FRAME_SIZE bytes (fit asserted below).
-    let page = top_pa as *mut u8;
+    // SAFETY: freshly allocated, zeroed top frame; the kernel writes it through
+    // its linear map (identity on x86/riscv; the high map on aarch64), only
+    // within its FRAME_SIZE bytes (fit asserted below).
+    let page = arch::phys_to_virt(top_pa) as *mut u8;
 
     const MAX_PTRS: usize = 64;
     assert!(

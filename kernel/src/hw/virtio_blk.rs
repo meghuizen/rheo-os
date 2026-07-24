@@ -14,8 +14,9 @@
 //! Both transports share one virtqueue and one block-request path; they differ
 //! only in how registers are read/written and how the device is notified.
 //! Single-vcore, polled (no interrupt path yet). DMA has no IOMMU in QEMU, so
-//! the device uses physical addresses; kernel RAM is identity-mapped, so a
-//! buffer's address *is* its physical address on both transports.
+//! the device uses physical addresses; the driver hands it `arch::virt_to_phys`
+//! of each ring/buffer VA (the identity on x86/riscv, the high linear-map
+//! offset on the aarch64 higher-half kernel - docs/MEMORY.md).
 
 use super::block::{BlkError, BlockDevice, SECTOR};
 use crate::arch;
@@ -337,9 +338,9 @@ unsafe fn init_mmio(base: usize) -> Option<VirtioBlk> {
         w32(base, QUEUE_NUM, QSIZE as u32);
 
         let vq = core::ptr::addr_of!(VQ);
-        let desc_pa = core::ptr::addr_of!((*vq).desc) as u64;
-        let avail_pa = core::ptr::addr_of!((*vq).avail) as u64;
-        let used_pa = core::ptr::addr_of!((*vq).used) as u64;
+        let desc_pa = arch::virt_to_phys(core::ptr::addr_of!((*vq).desc) as usize) as u64;
+        let avail_pa = arch::virt_to_phys(core::ptr::addr_of!((*vq).avail) as usize) as u64;
+        let used_pa = arch::virt_to_phys(core::ptr::addr_of!((*vq).used) as usize) as u64;
         w32(base, QUEUE_DESC_LOW, desc_pa as u32);
         w32(base, QUEUE_DESC_HIGH, (desc_pa >> 32) as u32);
         w32(base, QUEUE_DRIVER_LOW, avail_pa as u32);
@@ -485,9 +486,9 @@ fn init_pci(bus: u8, dev: u8, func: u8) -> Option<VirtioBlk> {
     let (desc_pa, avail_pa, used_pa) = unsafe {
         let vq = core::ptr::addr_of!(VQ);
         (
-            core::ptr::addr_of!((*vq).desc) as u64,
-            core::ptr::addr_of!((*vq).avail) as u64,
-            core::ptr::addr_of!((*vq).used) as u64,
+            arch::virt_to_phys(core::ptr::addr_of!((*vq).desc) as usize) as u64,
+            arch::virt_to_phys(core::ptr::addr_of!((*vq).avail) as usize) as u64,
+            arch::virt_to_phys(core::ptr::addr_of!((*vq).used) as usize) as u64,
         )
     };
     x.cc_w32(CC_QUEUE_DESC, desc_pa as u32);
@@ -533,8 +534,8 @@ impl VirtioBlk {
             };
             *core::ptr::addr_of_mut!(STATUS_BYTE) = 0xff;
 
-            let hdr_pa = core::ptr::addr_of!(HDR) as u64;
-            let status_pa = core::ptr::addr_of!(STATUS_BYTE) as u64;
+            let hdr_pa = arch::virt_to_phys(core::ptr::addr_of!(HDR) as usize) as u64;
+            let status_pa = arch::virt_to_phys(core::ptr::addr_of!(STATUS_BYTE) as usize) as u64;
 
             // desc0: header (device-readable) -> desc1: data -> desc2: status.
             let data_write = if kind == BLK_T_IN {
@@ -599,13 +600,15 @@ impl BlockDevice for VirtioBlk {
         if buf.is_empty() || !buf.len().is_multiple_of(SECTOR) {
             return Err(BlkError::Inval);
         }
-        self.request(BLK_T_IN, sector, buf.as_ptr() as u64, buf.len() as u32)
+        let pa = arch::virt_to_phys(buf.as_ptr() as usize) as u64;
+        self.request(BLK_T_IN, sector, pa, buf.len() as u32)
     }
 
     fn write(&self, sector: u64, buf: &[u8]) -> Result<(), BlkError> {
         if buf.is_empty() || !buf.len().is_multiple_of(SECTOR) {
             return Err(BlkError::Inval);
         }
-        self.request(BLK_T_OUT, sector, buf.as_ptr() as u64, buf.len() as u32)
+        let pa = arch::virt_to_phys(buf.as_ptr() as usize) as u64;
+        self.request(BLK_T_OUT, sector, pa, buf.len() as u32)
     }
 }

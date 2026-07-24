@@ -28,6 +28,19 @@ pub const NAME: &str = "RISC-V 64";
 /// image (checked against __kernel_end in frames::init).
 pub const FRAME_POOL_BASE: usize = 0x8400_0000;
 
+/// Physical <-> kernel virtual address. RISC-V keeps the kernel identity-
+/// mapped for now (the higher-half move is a separate step), so these are the
+/// identity - the portable `phys_to_virt` seam (mm/frames, load, hw DMA) is a
+/// no-op here.
+#[inline(always)]
+pub fn phys_to_virt(pa: usize) -> usize {
+    pa
+}
+#[inline(always)]
+pub fn virt_to_phys(va: usize) -> usize {
+    va
+}
+
 // ---------------------------------------------------------------- serial
 
 const UART_BASE: usize = 0x1000_0000;
