@@ -82,7 +82,26 @@ pub fn handle(nr: u64, arg: u64) -> Option<u64> {
             print_numa();
             Some(0)
         }
+        SYS_DEBUG_WRITE => Some(debug_write(arg)),
         _ => None,
+    }
+}
+
+/// Copy `len` bytes from a loaded program's buffer to the console
+/// (docs/USERLAND.md M1). The kernel runs in the cell's address space during
+/// the trap with supervisor access to user pages enabled, so the user VAs are
+/// directly readable. `len` is capped so a bad request cannot run away.
+fn debug_write(req_va: u64) -> u64 {
+    // SAFETY: the program passes the VA of a `DebugWrite` in its own mapped
+    // pages; we read the descriptor, then `len` bytes from `ptr`.
+    unsafe {
+        let req = (req_va as *const DebugWrite).read();
+        let len = (req.len as usize).min(4096);
+        let src = req.ptr as *const u8;
+        for i in 0..len {
+            crate::arch::serial_write_byte(src.add(i).read());
+        }
+        len as u64
     }
 }
 

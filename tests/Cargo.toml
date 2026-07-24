@@ -53,6 +53,10 @@ name = "blockfs"
 path = "src/blockfs.rs"
 
 [[bin]]
+name = "elfrun"
+path = "src/elfrun.rs"
+
+[[bin]]
 name = "shell-smoke"
 path = "src/shell_smoke.rs"
 

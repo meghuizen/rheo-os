@@ -61,6 +61,21 @@ pub const SYS_LSPCI: u64 = 18;
 /// Print the NUMA topology: per-node RAM and CPU counts.
 pub const SYS_NUMA: u64 = 19;
 
+/// Write bytes to the console from a loaded userland program (docs/USERLAND.md
+/// M1). The argument is the VA of a `DebugWrite { ptr, len }` in the cell;
+/// the kernel copies `len` bytes from `ptr` to the console. This is a
+/// bring-up primitive - the real fd-based `write(2)` arrives with the POSIX
+/// syscall surface (M2). Returns the number of bytes written.
+pub const SYS_DEBUG_WRITE: u64 = 20;
+
+/// The `SYS_DEBUG_WRITE` argument block (kept in sync with `userland`).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct DebugWrite {
+    pub ptr: u64,
+    pub len: u64,
+}
+
 /// Shared shell I/O block, one page in the cell's `.user` data, readable
 /// and writable by the kernel through its identity mapping.
 pub const SHELL_BUF: usize = 256;

@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 mod paging;
 pub use paging::{
     PagingRoot, paging_activate, paging_activate_kernel, paging_kernel_init, paging_map,
-    paging_new_root,
+    paging_map_frame, paging_new_root,
 };
 
 global_asm!(

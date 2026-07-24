@@ -128,6 +128,34 @@ pub fn paging_map(root: &mut PagingRoot, va: usize, perm: MapPerm) {
     l3[l3_index(va)] = addr_bits(va) | ATTR_NORMAL | SH_INNER | ap | AF | NG | xn | TABLE | VALID;
 }
 
+/// Get the next-level table a descriptor points at, creating an empty one
+/// (a table descriptor) if the slot is not yet valid.
+fn ensure_table(parent: &mut [u64; 512], idx: usize) -> usize {
+    if parent[idx] & VALID == 0 {
+        let t = frames::alloc(); // zeroed
+        parent[idx] = addr_bits(t) | TABLE | VALID;
+    }
+    next_table(parent[idx])
+}
+
+/// Map one 4 KiB frame `pa` at an arbitrary user `va`, creating intermediate
+/// tables as needed (docs/USERLAND.md). `va` must avoid the MMIO/kernel-RAM
+/// gigabytes the cell root maps supervisor (0-2 GiB); userland links at
+/// 4 GiB+.
+pub fn paging_map_frame(root: &mut PagingRoot, va: usize, pa: usize, perm: MapPerm) {
+    assert!(va.is_multiple_of(PAGE_SIZE), "unaligned user map {va:#x}");
+    let l0 = table_mut(root.l0_pa);
+    let l1 = table_mut(ensure_table(l0, l0_index(va)));
+    let l2 = table_mut(ensure_table(l1, l1_index(va)));
+    let l3 = table_mut(ensure_table(l2, l2_index(va)));
+    let (ap, xn) = match perm {
+        MapPerm::UserRo => (AP_RO_ALL, UXN | PXN),
+        MapPerm::UserRw => (AP_RW_ALL, UXN | PXN),
+        MapPerm::UserRx => (AP_RO_ALL, PXN), // EL0-executable (UXN clear)
+    };
+    l3[l3_index(va)] = addr_bits(pa) | ATTR_NORMAL | SH_INNER | ap | AF | NG | xn | TABLE | VALID;
+}
+
 /// Activate a root: TTBR0_EL1 with ASID in the high bits, flush that
 /// ASID's stale entries (roots are recreated per run reusing ASIDs), isb.
 pub fn paging_activate(root: &PagingRoot, asid: u16) {

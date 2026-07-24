@@ -37,6 +37,15 @@ impl AddressSpace {
         arch::paging_map(&mut self.root, va, perm);
     }
 
+    /// Map one 4 KiB frame `pa` at an arbitrary user `va` (docs/USERLAND.md).
+    /// Unlike `map_user`, `va` need not be identity or inside the `.user`
+    /// window: intermediate page tables are created on demand. Used by the
+    /// ELF loader to place a program at its own link base. Both must be 4 KiB
+    /// aligned.
+    pub fn map_user_frame(&mut self, va: usize, pa: usize, perm: MapPerm) {
+        arch::paging_map_frame(&mut self.root, va, pa, perm);
+    }
+
     /// Map every 4 KiB page overlapping [start, start+len) for user access.
     pub fn map_user_range(&mut self, start: usize, len: usize, perm: MapPerm) {
         let base = start & !(frames::FRAME_SIZE - 1);

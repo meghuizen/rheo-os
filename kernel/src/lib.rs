@@ -19,11 +19,13 @@ pub mod capability;
 pub mod cell;
 #[macro_use]
 pub mod console;
+pub mod elf;
 pub mod engine;
 pub mod event;
 pub mod graph;
 pub mod hw;
 pub mod lease;
+pub mod load;
 pub mod mm;
 mod panic;
 pub mod pty;

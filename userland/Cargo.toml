@@ -1,0 +1,12 @@
+[package]
+name = "userland"
+version = "0.1.0"
+edition = "2024"
+
+# The first native U-mode programs, built for a bare target and loaded from
+# an ELF by the kernel (docs/USERLAND.md M1) - not baked into the kernel
+# image like the hand-written programs in kernel/src/user_progs.rs.
+
+[[bin]]
+name = "hello"
+path = "src/main.rs"

@@ -114,6 +114,33 @@ pub fn paging_map(root: &mut PagingRoot, va: usize, perm: MapPerm) {
     pt[pt_index(va)] = addr_bits(va) | bits;
 }
 
+/// Get the table a parent entry points at, creating an empty one (present,
+/// writable, user-accessible so the walk can descend) if the slot is empty.
+fn ensure_table(parent: &mut [u64; 512], idx: usize) -> usize {
+    if parent[idx] & P == 0 {
+        let t = frames::alloc(); // zeroed
+        parent[idx] = addr_bits(t) | P | RW | US;
+    }
+    next_table(parent[idx])
+}
+
+/// Map one 4 KiB frame `pa` at an arbitrary user `va`, creating intermediate
+/// tables as needed (docs/USERLAND.md). `va` must lie above the kernel's low
+/// 1 GiB identity map (userland links at 4 GiB+).
+pub fn paging_map_frame(root: &mut PagingRoot, va: usize, pa: usize, perm: MapPerm) {
+    assert!(va.is_multiple_of(PAGE_SIZE), "unaligned user map {va:#x}");
+    let pml4 = table_mut(root.pml4_pa);
+    let pdpt = table_mut(ensure_table(pml4, pml4_index(va)));
+    let pd = table_mut(ensure_table(pdpt, pdpt_index(va)));
+    let pt = table_mut(ensure_table(pd, pd_index(va)));
+    let bits = match perm {
+        MapPerm::UserRo => P | US | NX,
+        MapPerm::UserRw => P | RW | US | NX,
+        MapPerm::UserRx => P | US, // read + execute, not writable
+    };
+    pt[pt_index(va)] = addr_bits(pa) | bits;
+}
+
 /// Activate a root: load CR3. Kernel pages are global, so they survive the
 /// reload; user pages (non-global) are flushed - the isolation guarantee.
 pub fn paging_activate(root: &PagingRoot, _asid: u16) {

@@ -115,6 +115,33 @@ pub fn paging_map(root: &mut PagingRoot, va: usize, perm: MapPerm) {
     l0[l0_idx] = table_to_pte(va, PTE_V | PTE_U | PTE_A | PTE_D | rights);
 }
 
+/// Get the level-N table a parent entry points at, creating an empty one
+/// (a pointer PTE, no R/W/X) if the slot is not yet valid.
+fn ensure_table(parent: &mut [u64; 512], idx: usize) -> usize {
+    if parent[idx] & PTE_V == 0 {
+        let t = frames::alloc(); // zeroed
+        parent[idx] = table_to_pte(t, PTE_V);
+    }
+    pte_to_table(parent[idx])
+}
+
+/// Map one 4 KiB frame `pa` at an arbitrary user `va`, creating intermediate
+/// tables as needed (docs/USERLAND.md). `va` must avoid the kernel/MMIO
+/// ranges the cell root maps supervisor (0-1 GiB, 2-3 GiB); userland lives at
+/// 4 GiB+.
+pub fn paging_map_frame(root: &mut PagingRoot, va: usize, pa: usize, perm: MapPerm) {
+    assert!(va.is_multiple_of(PAGE_SIZE), "unaligned user map {va:#x}");
+    let l2 = table_mut(root.l2_pa);
+    let l1 = table_mut(ensure_table(l2, (va >> 30) & 0x1FF));
+    let l0 = table_mut(ensure_table(l1, (va >> 21) & 0x1FF));
+    let rights = match perm {
+        MapPerm::UserRo => PTE_R,
+        MapPerm::UserRw => PTE_R | PTE_W,
+        MapPerm::UserRx => PTE_R | PTE_X,
+    };
+    l0[(va >> 12) & 0x1FF] = table_to_pte(pa, PTE_V | PTE_U | PTE_A | PTE_D | rights);
+}
+
 /// Activate a root: write satp (Sv39, ASID-tagged) and fence.
 pub fn paging_activate(root: &PagingRoot, asid: u16) {
     let satp = (8u64 << 60) | ((asid as u64) << 44) | ((root.l2_pa >> 12) as u64);
