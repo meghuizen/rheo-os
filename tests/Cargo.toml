@@ -31,6 +31,10 @@ name = "resources"
 path = "src/resources.rs"
 
 [[bin]]
+name = "hwinfo"
+path = "src/hwinfo.rs"
+
+[[bin]]
 name = "shell-smoke"
 path = "src/shell_smoke.rs"
 

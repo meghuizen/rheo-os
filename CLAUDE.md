@@ -31,12 +31,31 @@ dependency graph executed on a compute engine (attest-by-measurement). On
 top of these, **lsh** runs as a U-mode shell cell over a PTY (serial line
 discipline bridged by the kernel), with builtins that query the real
 objects (`uptime`, `rand`, `meminfo`, `caps`, `ps`, `event`, `graph`,
-`reserve`, `lease`); a pipeline is a dependency graph submitted to the
-kernel (docs/SHELL.md). Run it: `cargo xtask run --bin lsh --arch <isa>`.
+`reserve`, `lease`) and the machine inventory (`cpuinfo`, `lspci`, `numa`);
+a pipeline is a dependency graph submitted to the kernel (docs/SHELL.md).
+Run it: `cargo xtask run --bin lsh --arch <isa>`.
+
+A **hardware-discovery** layer (`kernel/src/hw/`) builds one portable
+machine `Inventory` at boot: firmware source (ACPI on x86-64 via the PVH
+RSDP, a flattened device tree on RISC-V, a fixed QEMU-virt profile on
+ARM64), CPU count and instruction-set features (CPUID / `ID_AA64*` / the
+device-tree ISA string), the typed physical memory map (DDR / reserved /
+ACPI / pmem), NUMA topology (SRAT memory + CPU affinities, memory regions
+split at node boundaries), and PCIe enumeration through the ECAM/config
+space, classifying each function into an engine kind - GPU, NIC, NVMe, or a
+processing accelerator (NPU/TPU, PCI base class 0x12). The `hwinfo` test
+kernel asserts the basics on all three ISAs; `cargo xtask run --bin hwinfo`
+prints the full inventory.
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
-proofs, and the hardware-lab performance numbers.
+proofs, and the hardware-lab performance numbers. **SMP secondary-core
+bring-up** is scoped separately: CPU *detection* and topology are done (4
+cores on x86-64/RISC-V, per-node affinity), but starting the other cores
+running kernel code needs per-CPU state + locking (the kernel is currently
+single-CPU `static mut`) and is blocked portably here - ARM64 PSCI CPU_ON
+traps from EL1 (no EL3/EL2 in this QEMU config) and x86 APs need a 16-bit
+real-mode trampoline.
 
 The `.user` linker window holds U-mode code (`.user.text`), shared
 read-only constants (`.user.rodata`), and per-cell data (`.user.bss`) in
@@ -82,14 +101,15 @@ kernel/       the no_std kernel library + boot demo bin
   src/        ISA-independent: capability core, queue ABI, cells, mm
               (frames + grants), time (clock/entropy), event streams,
               sched (reservations), lease, engine, graph, pty, svc
-              (shell/resource syscalls), user run loop, U-mode programs
+              (shell/resource syscalls), hw (ACPI/FDT/PCIe discovery +
+              the machine Inventory), user run loop, U-mode programs
               (user_progs.rs incl. the lsh shell), abi
   src/arch/   per-ISA Rust modules incl. paging.rs (one dir per ISA)
   arch/       per-ISA assembly (boot, vectors/traps, context switch, user)
   link/       linker scripts per ISA (incl. the .user text/rodata/data window)
 tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
-              isolation-hw, resources, shell-smoke, bench-core, and the
-              interactive lsh bin (+ harness.rs for user-mode cells)
+              isolation-hw, resources, shell-smoke, hwinfo, bench-core, and
+              the interactive lsh bin (+ harness.rs for user-mode cells)
 comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md
 xtask/        build/run/test/bench orchestration (cargo xtask ...)
 idl/          system IDL + codegen        (future, step 6)

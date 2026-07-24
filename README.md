@@ -57,11 +57,13 @@ cargo xtask test --arch all
 ```
 
 Every test kernel is booted headless with a timeout: the boot demo, the
-capability-invariants suite, the queue-pipeline scenario, and
-`isolation-hw` (real user-mode cells whose isolation is enforced by the
-MMU faulting). Each reports pass/fail through a QEMU exit device, so the
-result is the process exit code - the same check CI runs on every push.
-Serial output is saved to `target/qemu-<arch>-<bin>.log`.
+capability-invariants suite, the queue-pipeline scenario, `isolation-hw`
+(real user-mode cells whose isolation is enforced by the MMU faulting),
+the resource-object suite, `shell-smoke`, and `hwinfo` (hardware discovery:
+firmware source, CPU features, typed memory map, NUMA topology, PCIe
+devices). Each reports pass/fail through a QEMU exit device, so the result
+is the process exit code - the same check CI runs on every push. Serial
+output is saved to `target/qemu-<arch>-<bin>.log`.
 
 ### 5. Run the benchmarks and the seL4 comparison
 
@@ -85,8 +87,16 @@ Boots the kernel and drops you at the `lsh>` prompt on the serial console.
 lsh is a real user-mode cell talking to the kernel over a PTY; its builtins
 query genuine kernel objects. Try `help`, `uptime`, `rand`, `meminfo`,
 `caps`, `ps`, `event 8`, `graph 6` (a pipeline is a dependency graph
-submitted to the kernel), `reserve 3 10`, `lease`, and `exit`. The headless
-`shell-smoke` test drives the same shell with a scripted session for CI.
+submitted to the kernel), `reserve 3 10`, `lease`, and the hardware
+builtins `cpuinfo`, `lspci`, `numa` (from the boot discovery pass), then
+`exit`. The headless `shell-smoke` test drives the same shell with a
+scripted session for CI.
+
+To see the full machine inventory on its own, boot the discovery kernel:
+
+```sh
+cargo xtask run --bin hwinfo --arch riscv64
+```
 
 ### 7. Debug
 

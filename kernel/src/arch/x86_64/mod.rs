@@ -51,6 +51,12 @@ unsafe fn inb(port: u16) -> u8 {
     value
 }
 
+unsafe fn inl(port: u16) -> u32 {
+    let value: u32;
+    unsafe { asm!("in eax, dx", in("dx") port, out("eax") value) };
+    value
+}
+
 pub fn serial_init() {
     unsafe {
         outb(COM1 + 1, 0x00); // no interrupts
@@ -175,6 +181,86 @@ pub fn doorbell_trap() {
 
 pub fn doorbell_count() -> u64 {
     DOORBELLS.load(Ordering::Relaxed)
+}
+
+// ----------------------------------------------------- hardware discovery
+
+unsafe extern "C" {
+    static BOOT_INFO: u64;
+}
+
+/// The PVH hvm_start_info pointer QEMU passed in ebx.
+pub fn boot_firmware_ptr() -> usize {
+    unsafe { core::ptr::addr_of!(BOOT_INFO).read() as usize }
+}
+
+/// Discover the machine via ACPI (RSDP handed over by the PVH start info).
+pub fn discover(inv: &mut crate::hw::Inventory) {
+    inv.firmware = crate::hw::Firmware::Acpi;
+    crate::hw::acpi::parse(boot_firmware_ptr(), inv);
+}
+
+/// Feature names; bit i corresponds to index i in CpuReport.features.
+pub fn cpu_feature_names() -> &'static [&'static str] {
+    &[
+        "sse", "sse2", "sse3", "ssse3", "sse4.1", "sse4.2", "avx", "avx2", "avx512f", "aes", "sha",
+        "rdrand", "rdseed", "xsave", "fsgsbase", "nx", "pcid", "pdpe1gb", "x2apic",
+    ]
+}
+
+/// Decode CPU vendor + features via CPUID.
+pub fn cpu_report(_inv: &crate::hw::Inventory) -> crate::hw::CpuReport {
+    use core::arch::x86_64::__cpuid_count;
+    let mut report = crate::hw::CpuReport::EMPTY;
+    let v = __cpuid_count(0, 0);
+    // Vendor string is ebx, edx, ecx (12 bytes).
+    report.vendor[0..4].copy_from_slice(&v.ebx.to_le_bytes());
+    report.vendor[4..8].copy_from_slice(&v.edx.to_le_bytes());
+    report.vendor[8..12].copy_from_slice(&v.ecx.to_le_bytes());
+
+    let l1 = __cpuid_count(1, 0);
+    let l7 = __cpuid_count(7, 0);
+    let le = __cpuid_count(0x8000_0001, 0);
+
+    let mut set = |bit: u32, on: bool| {
+        if on {
+            report.features |= 1 << bit;
+        }
+    };
+    set(0, l1.edx & (1 << 25) != 0); // sse
+    set(1, l1.edx & (1 << 26) != 0); // sse2
+    set(2, l1.ecx & (1 << 0) != 0); // sse3
+    set(3, l1.ecx & (1 << 9) != 0); // ssse3
+    set(4, l1.ecx & (1 << 19) != 0); // sse4.1
+    set(5, l1.ecx & (1 << 20) != 0); // sse4.2
+    set(6, l1.ecx & (1 << 28) != 0); // avx
+    set(7, l7.ebx & (1 << 5) != 0); // avx2
+    set(8, l7.ebx & (1 << 16) != 0); // avx512f
+    set(9, l1.ecx & (1 << 25) != 0); // aes
+    set(10, l7.ebx & (1 << 29) != 0); // sha
+    set(11, l1.ecx & (1 << 30) != 0); // rdrand
+    set(12, l7.ebx & (1 << 18) != 0); // rdseed
+    set(13, l1.ecx & (1 << 26) != 0); // xsave
+    set(14, l7.ebx & (1 << 0) != 0); // fsgsbase
+    set(15, le.edx & (1 << 20) != 0); // nx
+    set(16, l1.ecx & (1 << 17) != 0); // pcid
+    set(17, le.edx & (1 << 26) != 0); // 1 GiB pages
+    set(18, l1.ecx & (1 << 21) != 0); // x2apic
+    report
+}
+
+/// PCI config read via the CF8/CFC I/O ports (mechanism #1). The ECAM base
+/// is unused on x86 - the ports reach bus 0 without any MMIO mapping.
+pub fn pci_cfg_read32(_ecam: u64, bus: u8, dev: u8, func: u8, off: u16) -> u32 {
+    let addr = 0x8000_0000u32
+        | ((bus as u32) << 16)
+        | ((dev as u32) << 11)
+        | ((func as u32) << 8)
+        | (off as u32 & 0xFC);
+    unsafe {
+        outl(0xCF8, addr);
+        inl(0xCFC)
+    }
 }
 
 // -------------------------------------------------------------- user mode

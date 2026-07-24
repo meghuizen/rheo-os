@@ -98,6 +98,86 @@ pub fn doorbell_count() -> u64 {
     DOORBELLS.load(Ordering::Relaxed)
 }
 
+// ----------------------------------------------------- hardware discovery
+
+unsafe extern "C" {
+    static BOOT_DTB: u64;
+    static BOOT_HARTID: u64;
+}
+
+/// The device-tree blob pointer OpenSBI passed in a1.
+pub fn boot_firmware_ptr() -> usize {
+    unsafe { core::ptr::addr_of!(BOOT_DTB).read() as usize }
+}
+
+/// Discover the machine from the device tree.
+pub fn discover(inv: &mut crate::hw::Inventory) {
+    let dtb = boot_firmware_ptr();
+    if dtb != 0 {
+        inv.firmware = crate::hw::Firmware::DeviceTree;
+        crate::hw::fdt::parse(dtb, inv);
+    }
+}
+
+/// Boot hart id (a0), for SMP.
+#[allow(dead_code)]
+pub fn boot_hartid() -> usize {
+    unsafe { core::ptr::addr_of!(BOOT_HARTID).read() as usize }
+}
+
+/// Feature names; bit i in CpuReport.features corresponds to index i.
+pub fn cpu_feature_names() -> &'static [&'static str] {
+    &[
+        "rv64", "M", "A", "F", "D", "C", "V", "Zicsr", "Zifencei", "Zba", "Zbb", "Zbs",
+    ]
+}
+
+/// Decode CPU features from the device-tree "riscv,isa" string (misa is an
+/// M-mode CSR and traps in S-mode, so the firmware string is the source).
+pub fn cpu_report(_inv: &crate::hw::Inventory) -> crate::hw::CpuReport {
+    let mut report = crate::hw::CpuReport::EMPTY;
+    report.vendor[..5].copy_from_slice(b"riscv");
+    let isa = crate::hw::fdt::riscv_isa();
+    // Base extensions are the single letters after "rv64", before any '_'.
+    let base = isa.get(4..).unwrap_or("").split('_').next().unwrap_or("");
+    for (i, name) in cpu_feature_names().iter().enumerate() {
+        let present = if name.len() == 1 {
+            let c = name.as_bytes()[0].to_ascii_lowercase();
+            base.as_bytes().contains(&c)
+        } else {
+            contains_ci(isa, name)
+        };
+        if present {
+            report.features |= 1 << i;
+        }
+    }
+    report
+}
+
+/// Case-insensitive substring search (no allocation).
+fn contains_ci(hay: &str, needle: &str) -> bool {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    if n.is_empty() || n.len() > h.len() {
+        return false;
+    }
+    for i in 0..=(h.len() - n.len()) {
+        if h[i..i + n.len()].eq_ignore_ascii_case(n) {
+            return true;
+        }
+    }
+    false
+}
+
+/// PCI config read through the ECAM window (RISC-V has no config ports).
+pub fn pci_cfg_read32(ecam: u64, bus: u8, dev: u8, func: u8, off: u16) -> u32 {
+    let a = ecam
+        + ((bus as u64) << 20)
+        + ((dev as u64) << 15)
+        + ((func as u64) << 12)
+        + (off as u64 & 0xFFC);
+    unsafe { (a as *const u32).read_volatile() }
+}
+
 // -------------------------------------------------------------- user mode
 
 /// Saved U-mode register state. Layout matches the offsets in traps.S:

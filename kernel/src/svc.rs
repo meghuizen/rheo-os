@@ -69,7 +69,144 @@ pub fn handle(nr: u64, arg: u64) -> Option<u64> {
             let lease = Lease::acquire(1 << 40, 0);
             Some(lease.token)
         }
+        SYS_CPUINFO => {
+            print_cpuinfo();
+            Some(0)
+        }
+        SYS_LSPCI => {
+            print_lspci();
+            Some(0)
+        }
+        SYS_NUMA => {
+            print_numa();
+            Some(0)
+        }
         _ => None,
+    }
+}
+
+// -- console helpers for the hardware builtins --
+//
+// These format straight to the PTY (the same UART the shell writes to), so
+// the per-ISA feature-name table and PCI classification stay kernel-side
+// instead of being duplicated into the U-mode shell. Lines end in "\r\n" to
+// match the cooked terminal the shell talks to.
+
+fn pty_str(s: &[u8]) {
+    pty::write(s);
+}
+
+fn pty_u64(mut v: u64) {
+    if v == 0 {
+        pty::put_byte(b'0');
+        return;
+    }
+    let mut tmp = [0u8; 20];
+    let mut n = 0;
+    while v > 0 {
+        tmp[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+    }
+    while n > 0 {
+        n -= 1;
+        pty::put_byte(tmp[n]);
+    }
+}
+
+fn pty_hex_pad(v: u64, nibbles: usize) {
+    pty_str(b"0x");
+    let mut i = nibbles;
+    while i > 0 {
+        i -= 1;
+        let nib = ((v >> (i * 4)) & 0xF) as u8;
+        pty::put_byte(if nib < 10 {
+            b'0' + nib
+        } else {
+            b'a' + nib - 10
+        });
+    }
+}
+
+/// vendor, core count, then each instruction-set feature by name.
+fn print_cpuinfo() {
+    let inv = crate::hw::inventory();
+    pty_str(b"cpu vendor: ");
+    for &c in inv.cpu.vendor.iter() {
+        if c == 0 {
+            break;
+        }
+        pty::put_byte(c);
+    }
+    pty_str(b"\r\ncpu cores: ");
+    pty_u64(inv.ncpus as u64);
+    pty_str(b"\r\ncpu features:");
+    let names = crate::arch::cpu_feature_names();
+    for (i, name) in names.iter().enumerate() {
+        if inv.cpu.features & (1 << i) != 0 {
+            pty::put_byte(b' ');
+            pty_str(name.as_bytes());
+        }
+    }
+    pty_str(b"\r\n");
+}
+
+/// Short engine label for the lspci line.
+fn engine_label(k: crate::hw::EngineKind) -> &'static [u8] {
+    use crate::hw::EngineKind::*;
+    match k {
+        Display => b"display",
+        Gpu => b"gpu",
+        Nic => b"nic",
+        Storage => b"storage",
+        Nvme => b"nvme",
+        Accelerator => b"accelerator",
+        Bridge => b"bridge",
+        Other => b"other",
+    }
+}
+
+/// One line per PCIe function: bus:dev.func vendor:device -> engine.
+fn print_lspci() {
+    let inv = crate::hw::inventory();
+    if inv.npci == 0 {
+        pty_str(b"no pci devices\r\n");
+        return;
+    }
+    for d in &inv.pci[..inv.npci] {
+        pty_hex_pad(d.bus as u64, 2);
+        pty::put_byte(b':');
+        pty_hex_pad(d.dev as u64, 2);
+        pty::put_byte(b'.');
+        pty_u64(d.func as u64);
+        pty::put_byte(b' ');
+        pty_hex_pad(d.vendor as u64, 4);
+        pty::put_byte(b':');
+        pty_hex_pad(d.device as u64, 4);
+        pty_str(b" -> ");
+        pty_str(engine_label(d.engine));
+        pty_str(b"\r\n");
+    }
+}
+
+/// Per-node RAM (MiB) and the CPU count homed on that node.
+fn print_numa() {
+    let inv = crate::hw::inventory();
+    pty_str(b"numa nodes: ");
+    pty_u64(inv.nnodes as u64);
+    pty_str(b"\r\n");
+    for node in 0..inv.nnodes as u8 {
+        let cpus = inv.cpus[..inv.ncpus]
+            .iter()
+            .filter(|c| c.node == node)
+            .count();
+        pty_str(b"node ");
+        pty_u64(node as u64);
+        pty_str(b": ram ");
+        pty_u64(inv.node_ram_bytes(node) / (1024 * 1024));
+        pty_str(b" MiB, cpus ");
+        pty_u64(cpus as u64);
+        pty_str(b"\r\n");
     }
 }
 

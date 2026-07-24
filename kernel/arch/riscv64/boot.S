@@ -25,6 +25,12 @@ _start:
     j 1b
 
 2:
+    /* Stash the boot hart id (a0) and device-tree pointer (a1) for the
+       hardware-discovery layer, then call kernel_main. */
+    la t0, BOOT_HARTID
+    sd a0, 0(t0)
+    la t0, BOOT_DTB
+    sd a1, 0(t0)
     call kernel_main
 3:
     wfi
@@ -35,3 +41,11 @@ _start:
 boot_stack:
     .space 64 * 1024
 boot_stack_top:
+
+.global BOOT_HARTID
+.global BOOT_DTB
+.p2align 3
+BOOT_HARTID:
+    .space 8
+BOOT_DTB:
+    .space 8

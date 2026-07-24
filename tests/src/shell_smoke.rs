@@ -38,6 +38,9 @@ graph 6\n\
 reserve 3 10\n\
 reserve 8 10\n\
 lease\n\
+cpuinfo\n\
+lspci\n\
+numa\n\
 bogus-command\n\
 exit\n";
 

@@ -15,10 +15,10 @@
 #![allow(clippy::empty_loop)]
 
 use crate::abi::{
-    Params, SHELL_BUF, SYS_CAPS, SYS_CYCLES, SYS_DOORBELL, SYS_EVENT_COUNT, SYS_EVENT_EMIT,
-    SYS_EXIT, SYS_GRAPH, SYS_LEASE, SYS_MEMINFO, SYS_PS, SYS_RANDOM, SYS_READLINE, SYS_RESERVE,
-    SYS_SWITCH, SYS_UPTIME, SYS_WRITE, ShellIo, WORKLOAD_CROSSCELL, WORKLOAD_ROUNDTRIP,
-    WORKLOAD_SYSCALL,
+    Params, SHELL_BUF, SYS_CAPS, SYS_CPUINFO, SYS_CYCLES, SYS_DOORBELL, SYS_EVENT_COUNT,
+    SYS_EVENT_EMIT, SYS_EXIT, SYS_GRAPH, SYS_LEASE, SYS_LSPCI, SYS_MEMINFO, SYS_NUMA, SYS_PS,
+    SYS_RANDOM, SYS_READLINE, SYS_RESERVE, SYS_SWITCH, SYS_UPTIME, SYS_WRITE, ShellIo,
+    WORKLOAD_CROSSCELL, WORKLOAD_ROUNDTRIP, WORKLOAD_SYSCALL,
 };
 use crate::queue::{OP_NOP, QueuePair};
 
@@ -221,7 +221,7 @@ rostr!(S_BYE, b"lsh: goodbye\r\n");
 rostr!(S_NL, b"\r\n");
 rostr!(
     S_HELP,
-    b"builtins: help echo uptime rand meminfo ps caps event graph reserve lease exit\r\n"
+    b"builtins: help echo uptime rand meminfo ps caps event graph reserve lease cpuinfo lspci numa exit\r\n"
 );
 rostr!(S_UPTIME, b"uptime ticks: ");
 rostr!(S_RAND, b"random: ");
@@ -457,6 +457,14 @@ fn dispatch(inp: *const u8, len: usize, out: *mut u8, p: &mut usize) -> bool {
         w_str(out, p, &S_LEASE);
         w_u64(out, p, t);
         w_str(out, p, &S_NL);
+    } else if tok_eq(inp, len, b"cpuinfo") {
+        // Kernel prints the report straight to the console; nothing to
+        // format here (p stays 0, so the shell skips its own emit).
+        unsafe { syscall(SYS_CPUINFO, 0) };
+    } else if tok_eq(inp, len, b"lspci") {
+        unsafe { syscall(SYS_LSPCI, 0) };
+    } else if tok_eq(inp, len, b"numa") {
+        unsafe { syscall(SYS_NUMA, 0) };
     } else if tok_eq(inp, len, b"exit") {
         return true;
     } else {

@@ -7,6 +7,9 @@
 .section .boot.text, "ax"
 .global _start
 _start:
+    /* QEMU passes the DTB pointer in x0; preserve it before we clobber x0. */
+    mov x19, x0
+
     /* Park any CPU that is not core 0 (safety net; QEMU should only
        start core 0). */
     mrs x0, mpidr_el1
@@ -37,6 +40,9 @@ _start:
     b 3b
 
 4:
+    /* Stash the DTB pointer for the hardware-discovery layer. */
+    ldr x0, =BOOT_DTB
+    str x19, [x0]
     bl kernel_main
 5:
     wfe
@@ -47,3 +53,8 @@ _start:
 boot_stack:
     .space 64 * 1024
 boot_stack_top:
+
+.global BOOT_DTB
+.p2align 3
+BOOT_DTB:
+    .space 8

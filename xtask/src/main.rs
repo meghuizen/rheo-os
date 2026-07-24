@@ -21,13 +21,14 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 6] = [
+const TEST_KERNELS: [&str; 7] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
     "isolation-hw",
     "resources",
     "shell-smoke",
+    "hwinfo",
 ];
 const BENCH_KERNEL: &str = "bench-core";
 
@@ -83,7 +84,9 @@ impl Arch {
             ],
             Arch::Aarch64 => &[
                 "-machine",
-                "virt,gic-version=3",
+                // highmem-ecam=off pins the PCIe ECAM to the low window
+                // (0x3f00_0000) the kernel identity-maps and discovers.
+                "virt,gic-version=3,highmem-ecam=off",
                 "-cpu",
                 "max",
                 "-m",

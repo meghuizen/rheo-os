@@ -53,6 +53,13 @@ pub const SYS_GRAPH: u64 = 14;
 pub const SYS_RESERVE: u64 = 15;
 /// Acquire a lease; returns its fencing token.
 pub const SYS_LEASE: u64 = 16;
+/// Print the CPU report (vendor, core count, instruction-set features) to
+/// the console. Kernel-formatted so feature names stay in one place.
+pub const SYS_CPUINFO: u64 = 17;
+/// Print the enumerated PCIe devices and their engine classification.
+pub const SYS_LSPCI: u64 = 18;
+/// Print the NUMA topology: per-node RAM and CPU counts.
+pub const SYS_NUMA: u64 = 19;
 
 /// Shared shell I/O block, one page in the cell's `.user` data, readable
 /// and writable by the kernel through its identity mapping.

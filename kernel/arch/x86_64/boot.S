@@ -22,6 +22,12 @@ _start32:
     cli
     cld
 
+    /* QEMU passes the PVH hvm_start_info pointer in ebx; save it before we
+       reuse ebx for page-table setup. It carries the memory map and the
+       ACPI RSDP address (see hardware discovery). */
+    movl %ebx, BOOT_INFO
+    movl $0, BOOT_INFO+4
+
     /* Zero the early page-table pages (this memory is not cleared yet). */
     mov $boot_page_tables, %edi
     xor %eax, %eax
@@ -122,3 +128,8 @@ boot_page_tables:
 boot_stack:
     .space 64 * 1024
 boot_stack_top:
+
+.global BOOT_INFO
+.align 8
+BOOT_INFO:
+    .space 8

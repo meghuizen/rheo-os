@@ -22,6 +22,7 @@ pub mod console;
 pub mod engine;
 pub mod event;
 pub mod graph;
+pub mod hw;
 pub mod lease;
 pub mod mm;
 mod panic;
