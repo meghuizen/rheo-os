@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 20] = [
+const TEST_KERNELS: [&str; 21] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -42,6 +42,7 @@ const TEST_KERNELS: [&str; 20] = [
     "linuxrun",
     "linuxtools",
     "linuxthreads",
+    "linuxsig",
 ];
 
 /// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
@@ -415,6 +416,29 @@ fn build_linux_fixtures(arch: Arch) -> bool {
     if !matches!(c.status().map(|s| s.success()), Ok(true)) {
         eprintln!("[xtask] C glibc fixture build failed for {}", arch.name());
         return false;
+    }
+
+    // Signal fixtures (L5, docs/LINUX-COMPAT.md): same static-glibc ET_EXEC
+    // recipe as chello, one binary per delivery path exercised by `linuxsig`.
+    for (src, bin) in [
+        ("sig_raise.c", "sig_raise"),
+        ("sig_segv.c", "sig_segv"),
+        ("sig_dfl.c", "sig_dfl"),
+    ] {
+        let mut sc = Command::new(cc);
+        sc.arg("-static").arg("-no-pie");
+        sc.args([
+            &format!("tests/linux-fixtures/{src}"),
+            "-o",
+            &format!("{out_dir}/{bin}"),
+        ]);
+        if !matches!(sc.status().map(|s| s.success()), Ok(true)) {
+            eprintln!(
+                "[xtask] signal fixture {bin} build failed for {}",
+                arch.name()
+            );
+            return false;
+        }
     }
 
     build_coreutils_fixture(arch)

@@ -220,6 +220,28 @@ stdout/exit asserted (the `linuxthreads` test), and `sort` (rayon-threaded) is
 re-enabled in `linuxtools`. Cooperative-only (a spinning thread starves siblings
 until timer preemption, task #27) and futex wake is FIFO (priority inheritance is
 a documented TODO) - both disclosed in docs/LINUX-COMPAT.md + CONCURRENCY.md.
+**L5 is done**: **synthesized POSIX signals, no kernel object** - dispositions a
+per-cell table, masks/pending/altstack per-context (`kernel/src/linux/signal.rs`).
+Delivery is a **saved-`TrapFrame` rewrite** in trap context: a Linux `rt_sigframe`
+(siginfo + ucontext with the interrupted GPRs/PC/SP + saved mask) is built on the
+user stack, the frame's PC set to the handler and its return to the restorer -
+glibc's `SA_RESTORER` on x86-64, an injected 2-instruction `rt_sigreturn`
+trampoline page (`arch::SIGTRAMP_VA`) on ARM64/RISC-V; `rt_sigreturn` restores.
+Real `rt_sigaction`/`rt_sigprocmask`/`sigaltstack`/`rt_sigreturn` (the L2 stubs)
+plus `kill`/`tgkill`/`tkill`/`rt_sigqueueinfo` (self-targeting). **Synchronous
+faults become signals**: `on_user_trap` maps the per-ISA fault cause (vector /
+ESR EC / scause -> `arch::FaultCause`) to SIGSEGV/SIGBUS/SIGILL/SIGFPE and, for a
+Linux cell with an installed unblocked handler, delivers by frame rewrite; else
+terminates 128+signo. A **native** cell fault stays terminal (`Outcome::Faulted`)
+- delivery is behind the Linux branch only; the x86-64 ring-3 fault path
+(`vectors.S`) now captures the full `TrapFrame` and resumes via `sysret`
+(ARM64/RISC-V already carried the frame). The `linuxsig` test asserts, on **all
+three ISAs**, three static-glibc C fixtures: `sig_raise` (async
+`raise(SIGUSR1)`->handler->resume, exit 0), `sig_segv` (null write ->
+SIGSEGV handler `_exit(0)`, not a killed cell), `sig_dfl` (`raise(SIGABRT)`, no
+handler -> terminate 134). Scope: self / fault delivery (a signal to a non-running
+sibling context is recorded pending, not force-delivered); FP state is not
+saved across a handler - both documented.
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
@@ -298,11 +320,14 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               Rust + C hellos), linuxtools (L3: the unmodified upstream
               uutils/coreutils multicall cell over a ramfs, incl. threaded
               sort), linuxthreads (L4: an unpatched multi-threaded Rust std
-              binary - clone/futex/TLS/join), bench-core, and the interactive
+              binary - clone/futex/TLS/join), linuxsig (L5: signal delivery -
+              async raise, fault->SIGSEGV handler, SIG_DFL terminate),
+              bench-core, and the interactive
               lsh bin (+ harness.rs, vfs_personality.rs); fixtures/ holds the
               ext4 test image (+ gen-ext4.sh); linux-fixtures/ holds the
               built-from-source glibc test binaries (rusthello/ + rustthreads/
-              + hello.c; coreutils via cargo install, gitignored)
+              + hello.c + sig_{raise,segv,dfl}.c; coreutils via cargo install,
+              gitignored)
 comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md
 xtask/        build/run/test/bench orchestration (cargo xtask ...)
 idl/          system IDL + codegen        (future, step 6)

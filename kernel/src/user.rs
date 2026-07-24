@@ -12,7 +12,7 @@
 //! synchronous, so there is no concurrent access to guard against.
 
 use crate::abi::{SYS_CYCLES, SYS_DOORBELL, SYS_EXIT, SYS_EXIT_GROUP, SYS_MMAP, SYS_SWITCH};
-use crate::arch::{self, MapPerm, TrapFrame, TrapKind};
+use crate::arch::{self, FaultCause, MapPerm, TrapFrame, TrapKind};
 use crate::capability::{CapTable, ObjectTable};
 use crate::mm::{AddressSpace, frames};
 use crate::queue::{self, QueuePair};
@@ -297,8 +297,25 @@ fn finish(outcome: Outcome) -> *mut TrapFrame {
 /// Dereferencing the raw `frame` (the state the trampoline just saved) is
 /// the whole point of the dispatcher.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn on_user_trap(kind: TrapKind, fault_addr: usize, frame: *mut TrapFrame) -> *mut TrapFrame {
+pub fn on_user_trap(
+    kind: TrapKind,
+    cause: FaultCause,
+    fault_addr: usize,
+    frame: *mut TrapFrame,
+) -> *mut TrapFrame {
     if kind == TrapKind::Fault {
+        let cur = unsafe { *core::ptr::addr_of!(CURRENT) };
+        // A Linux cell with an installed, unblocked handler for the fault's
+        // signal gets synchronous delivery (SIGSEGV/SIGBUS/SIGILL/SIGFPE) by
+        // trap-frame rewrite (docs/LINUX-COMPAT.md L5); otherwise it terminates
+        // reporting 128+signo. A NATIVE cell fault is always terminal
+        // (Outcome::Faulted) - signal delivery is behind the Linux branch only.
+        if cells()[cur].personality == Personality::Linux {
+            return match crate::linux::deliver_fault(cur, cause, fault_addr, frame) {
+                crate::linux::FaultOutcome::Resume(f) => f,
+                crate::linux::FaultOutcome::Terminate(code) => finish(Outcome::Exited(code)),
+            };
+        }
         return finish(Outcome::Faulted(fault_addr));
     }
 

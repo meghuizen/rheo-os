@@ -162,6 +162,30 @@ pub fn current_tid(cell: usize) -> u32 {
     threads(cell)[cur_thread(cell)].tid
 }
 
+/// The index of the currently running context (for the signal module's
+/// per-context state, docs/LINUX-COMPAT.md L5).
+pub fn current_context(cell: usize) -> usize {
+    cur_thread(cell)
+}
+
+/// The context index whose tid is `tid`, if it is a live context of `cell`
+/// (for `tgkill`/`tkill` self-targeting, docs/LINUX-COMPAT.md L5).
+pub fn index_of_tid(cell: usize, tid: u32) -> Option<usize> {
+    let t = threads(cell);
+    (0..MAX_THREADS).find(|&i| t[i].state != TState::Free && t[i].tid == tid)
+}
+
+/// The saved `TrapFrame` of context `idx` in `cell` (for delivering a signal to
+/// a context that is not the current one).
+pub fn frame_ptr(cell: usize, idx: usize) -> *mut TrapFrame {
+    threads(cell)[idx].frame
+}
+
+/// Whether context `idx` in `cell` is a live (non-free) context.
+pub fn is_active(cell: usize, idx: usize) -> bool {
+    threads(cell)[idx].state != TState::Free
+}
+
 /// Record the current context's `clear_child_tid` (from `set_tid_address`) and
 /// return its tid.
 pub fn set_tid_address(cell: usize, addr: u64) -> u32 {

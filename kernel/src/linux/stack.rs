@@ -67,6 +67,25 @@ pub fn setup_stack(
         va += FRAME_SIZE;
     }
 
+    // Inject the rt_sigreturn trampoline page for the signal machinery
+    // (docs/LINUX-COMPAT.md L5). ARM64/RISC-V have no SA_RESTORER path, so the
+    // handler returns through this 2-instruction page; x86-64 uses the caller's
+    // sa_restorer and returns an empty code slice, so nothing is mapped.
+    let tramp = arch::sig_tramp_code();
+    if !tramp.is_empty() {
+        let pa = frames::alloc();
+        aspace.map_user_frame(arch::SIGTRAMP_VA, pa, MapPerm::UserRx);
+        // SAFETY: freshly allocated frame; written through the kernel linear map
+        // within `tramp.len()` bytes (« FRAME_SIZE).
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                tramp.as_ptr(),
+                arch::phys_to_virt(pa) as *mut u8,
+                tramp.len(),
+            );
+        }
+    }
+
     let base_va = USER_STACK_TOP - FRAME_SIZE;
     // SAFETY: freshly allocated, zeroed top frame; the kernel writes it through
     // its linear map (identity on x86/riscv; the high map on aarch64), only

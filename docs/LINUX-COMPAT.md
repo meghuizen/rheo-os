@@ -141,10 +141,15 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 | prctl | partial | PR_SET_NAME/PR_GET_NAME accepted as a cosmetic no-op (rayon names its workers and treats failure as fatal, L4); every other option -ENOSYS |
 | set_tid_address | full | records the calling context's clear-tid address, returns its tid (L4; enacted by CHILD_CLEARTID on thread exit) |
 | set_robust_list | recorded | stores the head, returns 0; robust-futex unwinding on abnormal thread exit is not enacted (no suite util depends on it) |
-| rt_sigaction / rt_sigprocmask / sigaltstack | recorded | stored/ignored, returns 0; real signal delivery is L5 |
+| rt_sigaction | full | per-cell disposition table for signals 1..64; SIG_DFL/SIG_IGN honored; stores/returns the old action; SIGKILL/SIGSTOP -EINVAL. The kernel `struct sigaction` layout is ISA-specific (x86-64 carries `sa_restorer`, asm-generic does not: `arch::SIGACTION_HAS_RESTORER`) (L5) |
+| rt_sigprocmask | full | per-context blocked mask (BLOCK/UNBLOCK/SETMASK); SIGKILL/SIGSTOP never blockable; a now-unblocked pending signal is delivered before return (L5) |
+| sigaltstack | full | per-context alternate signal stack; honored for SA_ONSTACK handlers; -EPERM while executing on it (L5) |
+| rt_sigreturn | full | restores the interrupted `TrapFrame` + signal mask from the signal frame on the user stack; resumes where the signal interrupted (L5) |
+| kill / tgkill / tkill / rt_sigqueueinfo | partial | self-targeting only (own pid 1000 / own tids): `raise`/`abort` paths. Delivery is by trap-frame rewrite; a signal to a *non-running* sibling context is recorded pending (not force-delivered) - no L5 fixture needs it, documented. Non-self pid/tgid -ESRCH (L5) |
+| rt_sigtimedwait | partial | never blocks; returns -EAGAIN so callers loop/bail rather than hang (no fixture waits in it) (L5) |
 | mremap | full | shrink unmaps the tail in place; grow requires MREMAP_MAYMOVE (map a fresh region, copy, free the old); else -ENOMEM. glibc's large-block `realloc` needs it (the malloc-copy-free fallback otherwise leaks frames) |
 | rseq / clone3 | ENOSYS | glibc has documented fallbacks (rseq→unregistered, clone3→clone); verified via the ENOSYS logger that glibc/rust fall back to `clone`, so clone3 stays ENOSYS |
-| execve / fork / wait4 / kill / tgkill / rt_sigreturn | ENOSYS | signals (L5), processes (L6). `clone`/`futex` are done at L4 (above) - a real threaded upstream coreutil (`sort`, which parallelizes with rayon) now runs |
+| execve / fork / wait4 | ENOSYS | processes (L6). `clone`/`futex` are done at L4 - a real threaded upstream coreutil (`sort`, which parallelizes with rayon) now runs; signals (`rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn`/`kill`/`tgkill`/...) are done at L5 (above) |
 
 ### Planned identity/constants
 
@@ -263,8 +268,38 @@ syscalls).
     to `clone`.
   - **Frame pool** stays 32768 frames (128 MiB); demand-commit keeps N thread
     stacks + arenas within it (`linuxthreads` runs 5 contexts comfortably).
-- **L5** - signals: delivery by trap-frame rewrite + restorer trampoline;
-  faults become SIGSEGV-to-handler.
+- **L5 [done]** - signals: **synthesized POSIX signal delivery, no kernel
+  object** (docs/POSIX-PERSONALITY.md: signals are event delivery, not a
+  primitive). Dispositions are a per-cell table (SIG_DFL/SIG_IGN honored);
+  masks/pending/altstack are per-context (`kernel/src/linux/signal.rs`).
+  Delivery is a **saved-`TrapFrame` rewrite** in trap context: a Linux
+  `rt_sigframe` (siginfo + ucontext with the interrupted GPRs/PC/SP + the saved
+  mask) is built on the user stack (or the sigaltstack for SA_ONSTACK), the
+  frame's PC is pointed at the handler with arg0=signo (+ siginfo\*/ucontext\*),
+  and its return address at the **restorer**: glibc's `SA_RESTORER` on x86-64,
+  or an **injected 2-instruction `rt_sigreturn` trampoline page** (mapped at
+  `arch::SIGTRAMP_VA` by `linux::stack::setup_stack`) on ARM64/RISC-V, which
+  have no SA_RESTORER path. `rt_sigreturn` restores the frame + mask.
+  **Synchronous faults become signals**: `user::on_user_trap` maps the per-ISA
+  fault cause (vector / ESR EC / scause -> `arch::FaultCause`) to
+  SIGSEGV/SIGBUS/SIGILL/SIGFPE and, for a Linux cell with an installed,
+  unblocked handler, delivers it by frame rewrite (`siginfo.si_addr` = the fault
+  address); otherwise (SIG_DFL, SIG_IGN, or the signal blocked) the cell
+  terminates reporting 128+signo. **A native cell fault stays terminal**
+  (`Outcome::Faulted`) - delivery is behind the Linux branch only. `kill`/
+  `tgkill`/`tkill`/`raise` deliver to self; the x86-64 ring-3 fault path in
+  `vectors.S` now captures the full `TrapFrame` and resumes via `sysret`
+  (ARM64/RISC-V already carried the frame through the fault path). Proof
+  (`linuxsig`, all three ISAs, exact stdout + exit): `sig_raise` (async
+  `sigaction`+`raise(SIGUSR1)` -> handler -> `rt_sigreturn` resume, exit 0),
+  `sig_segv` (`sigaction(SIGSEGV)` + a null write -> handler `_exit(0)` instead
+  of a killed cell), `sig_dfl` (`raise(SIGABRT)`, no handler -> terminate 134).
+  - **Scope**: delivery is to self / synchronous faults. Signal targeting of a
+    *non-running* sibling context is recorded pending but not force-delivered
+    (no L5 fixture needs it; full cross-thread delivery is future work).
+  - **FP/SIMD across a handler is not saved/restored** (the ucontext carries
+    GPRs/PC/SP + mask, not the vector state); L5 fixtures do not rely on FP
+    liveness across a handler. Documented; eager per-signal FP save is future.
 - **L6** - processes: fork (clone-cell-within-capability-bundle, eager
   copy), execve, wait4, pipes, a static-glibc shell. The
   POSIX-PERSONALITY.md P11 gate (>= 80% of the defined coreutils suite) is
@@ -292,6 +327,13 @@ xtask `build_linux_fixtures` (L2, above).
 The Rust std column covers two fixtures per ISA, built with the same recipe: the
 single-threaded `rusthello` (L2) and the multi-threaded `rustthreads` (L4,
 `tests/linux-fixtures/rustthreads`, the `linuxthreads` proof).
+
+The C column additionally covers the three **L5 signal fixtures**
+(`tests/linux-fixtures/sig_{raise,segv,dfl}.c`, static-glibc ET_EXEC via the
+same recipe as `chello`), the `linuxsig` proof: `sig_raise` (async
+`raise(SIGUSR1)` -> handler -> `rt_sigreturn` resume), `sig_segv` (a null write
+delivered to a SIGSEGV handler), and `sig_dfl` (`raise(SIGABRT)` with no handler
+-> terminate 134).
 
 All three cross toolchains and `*-unknown-linux-gnu` rustup targets are
 present in the build/CI environment, so **riscv64 genuinely passes** (no

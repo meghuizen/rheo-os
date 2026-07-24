@@ -47,11 +47,14 @@ pub mod nr {
     pub const SCHED_GETAFFINITY: u64 = 123;
     pub const SCHED_YIELD: u64 = 124;
     pub const KILL: u64 = 129;
+    pub const TKILL: u64 = 130;
     pub const TGKILL: u64 = 131;
     pub const SIGALTSTACK: u64 = 132;
     pub const RT_SIGACTION: u64 = 134;
     pub const PRCTL: u64 = 167;
     pub const RT_SIGPROCMASK: u64 = 135;
+    pub const RT_SIGTIMEDWAIT: u64 = 137;
+    pub const RT_SIGQUEUEINFO: u64 = 138;
     pub const RT_SIGRETURN: u64 = 139;
     pub const UNAME: u64 = 160;
     pub const GETRLIMIT: u64 = 163;

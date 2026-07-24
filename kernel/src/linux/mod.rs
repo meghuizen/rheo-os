@@ -24,8 +24,11 @@ pub mod dirent;
 pub mod errno;
 pub mod fd;
 pub mod mem;
+pub mod signal;
 pub mod stack;
 pub mod thread;
+
+pub use signal::{FaultOutcome, deliver_fault};
 
 use crate::arch::TrapFrame;
 use crate::arch::linux_abi::nr;
@@ -101,6 +104,7 @@ pub fn reset() {
         *state(i) = LinuxState::new();
     }
     thread::reset();
+    signal::reset();
 }
 
 // ------------------------------------------------------------- stdout tap
@@ -142,12 +146,12 @@ pub enum Ctl {
 
 /// Encode a negative errno as the u64 return-register value (Linux userspace
 /// treats -1..-4095 as error).
-fn err(e: i64) -> Ctl {
+pub(crate) fn err(e: i64) -> Ctl {
     Ctl::Ret((-e) as u64)
 }
 
 /// Turn an i64 result (>= 0 value, or -errno) into a `Ctl::Ret`.
-fn ret(v: i64) -> Ctl {
+pub(crate) fn ret(v: i64) -> Ctl {
     Ctl::Ret(v as u64)
 }
 
@@ -247,7 +251,22 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
             st.robust_list = args[0];
             Ctl::Ret(0)
         }
-        nr::RT_SIGACTION | nr::RT_SIGPROCMASK | nr::SIGALTSTACK => Ctl::Ret(0),
+
+        // -- signals (real delivery by trap-frame rewrite, docs/LINUX-COMPAT.md
+        //    L5). Dispositions are per-cell; masks/pending per-context. --
+        nr::RT_SIGACTION => ret(signal::rt_sigaction(
+            cur, args[0], args[1], args[2], args[3],
+        )),
+        nr::RT_SIGPROCMASK => signal::rt_sigprocmask(cur, args[0], args[1], args[2], frame),
+        nr::SIGALTSTACK => ret(signal::sigaltstack(cur, args[0], args[1])),
+        nr::RT_SIGRETURN => signal::rt_sigreturn(cur, frame),
+        nr::KILL => signal::kill(cur, args[0] as i64, args[1], frame),
+        nr::TGKILL => signal::tgkill(cur, args[0] as i64, args[1] as i64, args[2], frame),
+        nr::TKILL => signal::tkill(cur, args[0] as i64, args[1], frame),
+        nr::RT_SIGQUEUEINFO => {
+            signal::rt_sigqueueinfo(cur, args[0] as i64, args[1], args[2], frame)
+        }
+        nr::RT_SIGTIMEDWAIT => ret(signal::rt_sigtimedwait()),
 
         other => {
             crate::println!("linux: ENOSYS nr={other}");

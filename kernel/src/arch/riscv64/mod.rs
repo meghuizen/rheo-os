@@ -380,6 +380,86 @@ pub fn user_fs_base() -> u64 {
     0
 }
 
+// ---------------------------------------------------- signal frame (L5)
+
+/// User VA of the injected `rt_sigreturn` trampoline page (docs/LINUX-COMPAT.md
+/// L5). Like ARM64, RISC-V has no SA_RESTORER path (the restorer normally comes
+/// from the vDSO), so a 2-instruction page is mapped into every Linux cell and
+/// the handler's `ra` is pointed at it. A free low page, below any load base.
+pub const SIGTRAMP_VA: usize = 0x2000;
+
+/// The asm-generic kernel `struct sigaction` has no `sa_restorer` field (the
+/// restorer comes from the injected trampoline, not the caller); `sa_mask`
+/// follows `sa_flags` directly (docs/LINUX-COMPAT.md L5).
+pub const SIGACTION_HAS_RESTORER: bool = false;
+
+/// The `rt_sigreturn` trampoline: `li a7, 139 (rt_sigreturn); ecall`.
+/// Encoded little-endian (addi a7,x0,139 = 0x08B00893; ecall = 0x00000073).
+pub fn sig_tramp_code() -> &'static [u8] {
+    &[0x93, 0x08, 0xB0, 0x08, 0x73, 0x00, 0x00, 0x00]
+}
+
+/// The interrupted user stack pointer (for building a signal frame, L5).
+pub fn user_sp(frame: &TrapFrame) -> u64 {
+    frame.regs[REG_SP]
+}
+
+// rt_sigframe layout on the user stack: { siginfo(128); ucontext }.
+const INFO_OFF: u64 = 0;
+const UC_OFF: u64 = 128;
+const UC_SIGMASK_OFF: u64 = 40; // uc_sigmask within the ucontext
+const MC_OFF: u64 = UC_OFF + 176; // uc_mcontext (sc_regs) within the frame
+const MC_PC: u64 = MC_OFF; // sc_regs[0] = pc
+const MC_REGS: u64 = MC_OFF; // sc_regs[i] = x[i] at MC_REGS + 8*i (i = 1..31)
+const FRAME_RESERVE: u64 = 1024;
+
+/// Build a Linux `rt_sigframe` on the user stack and rewrite `frame` to enter
+/// the handler (docs/LINUX-COMPAT.md L5). The cell's address space is active
+/// (trap context), so user VAs are written directly.
+///
+/// # Safety
+/// `spec.stack_top` must be a valid, writable user stack VA in the active cell.
+pub fn setup_rt_frame(frame: &mut TrapFrame, spec: &super::SigFrameSpec) {
+    let base = (spec.stack_top - FRAME_RESERVE) & !0xF; // 16-aligned SP
+    // SAFETY: [base, base+FRAME_RESERVE) is writable user stack in the active cell.
+    unsafe {
+        let w = |off: u64, v: u64| ((base + off) as *mut u64).write(v);
+        // siginfo: si_signo, si_errno, si_code, si_addr.
+        ((base + INFO_OFF) as *mut i32).write(spec.signo as i32);
+        ((base + INFO_OFF + 4) as *mut i32).write(0);
+        ((base + INFO_OFF + 8) as *mut i32).write(spec.si_code);
+        w(INFO_OFF + 16, spec.si_addr);
+        w(UC_OFF, 0); // uc_flags
+        w(UC_OFF + 8, 0); // uc_link
+        w(UC_OFF + UC_SIGMASK_OFF, spec.saved_mask);
+        w(MC_PC, frame.sepc); // sc_regs[0] = pc
+        for i in 1..32usize {
+            w(MC_REGS + (i as u64) * 8, frame.regs[i]);
+        }
+    }
+    frame.regs[REG_A0] = spec.signo as u64; // a0: signo
+    frame.regs[REG_A0 + 1] = base + INFO_OFF; // a1: siginfo*
+    frame.regs[REG_A0 + 2] = base + UC_OFF; // a2: ucontext*
+    frame.regs[1] = SIGTRAMP_VA as u64; // ra -> rt_sigreturn trampoline
+    frame.regs[REG_SP] = base;
+    frame.sepc = spec.handler;
+}
+
+/// Restore a `TrapFrame` saved by [`setup_rt_frame`] on `rt_sigreturn` and
+/// return the saved signal mask. On entry the handler's SP (frame base) is in
+/// the saved `x2` (the trampoline does not move it).
+pub fn restore_rt_frame(frame: &mut TrapFrame) -> u64 {
+    let base = frame.regs[REG_SP];
+    // SAFETY: `base` is the frame VA in the active cell, written by setup_rt_frame.
+    unsafe {
+        frame.sepc = ((base + MC_PC) as *const u64).read();
+        for i in 1..32usize {
+            frame.regs[i] = ((base + MC_REGS + (i as u64) * 8) as *const u64).read();
+        }
+        ((base + UC_OFF + UC_SIGMASK_OFF) as *const u64).read()
+    }
+}
+
 unsafe extern "C" {
     /// Enter U-mode with `frame`, saving kernel state for return_to_kernel.
     pub fn enter_user_first(frame: *mut TrapFrame);
@@ -406,11 +486,23 @@ extern "C" fn riscv_user_trap(scause: u64, stval: u64, frame: *mut TrapFrame) ->
     } else {
         super::TrapKind::Fault
     };
-    let resume = crate::user::on_user_trap(kind, stval as usize, frame);
+    let resume = crate::user::on_user_trap(kind, fault_cause(scause), stval as usize, frame);
     if resume.is_null() {
         return_to_kernel();
     }
     resume
+}
+
+/// Map an S-mode trap `scause` to a portable fault cause (docs/LINUX-COMPAT.md
+/// L5). Access/page faults are SIGSEGV; misaligned access SIGBUS; illegal
+/// instruction SIGILL.
+fn fault_cause(scause: u64) -> super::FaultCause {
+    match scause {
+        1 | 5 | 7 | 12 | 13 | 15 => super::FaultCause::Segv, // access / page faults
+        0 | 4 | 6 => super::FaultCause::Bus,                 // misaligned fetch/load/store
+        2 => super::FaultCause::Ill,                         // illegal instruction
+        _ => super::FaultCause::Segv,
+    }
 }
 
 // -------------------------------------------------------------- counters

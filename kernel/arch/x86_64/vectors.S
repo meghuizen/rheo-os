@@ -49,9 +49,17 @@ VECTOR 29, 0
 VECTOR 30, 0
 VECTOR 31, 0
 
-/* Save the SysV caller-saved registers, hand (vector, error, rip) to Rust,
-   restore, and return. The Rust handler only comes back for the doorbell
-   vector (3); everything else exits QEMU from Rust. */
+/* Save the SysV caller-saved registers, then split on the trap source.
+ *
+ * Stack at this point (after the 9 pushes below), low to high:
+ *   r11@0 r10@8 r9@16 r8@24 rdi@32 rsi@40 rdx@48 rcx@56 rax@64
+ *   vector@72 error@80 rip@88 cs@96 rflags@104 rsp@112 ss@120
+ *
+ * A ring-3 fault (CS RPL == 3) is captured into the current cell's TrapFrame
+ * and handed to x86_fault_trap, which either returns a rewritten frame to
+ * resume (a Linux signal handler entry) via sysret_resume, or null to unwind.
+ * A ring-0 trap (doorbell int3 or a fatal kernel exception) takes the old
+ * iretq path through x86_trap_handler. */
 common_trap:
     pushq %rax
     pushq %rcx
@@ -63,10 +71,14 @@ common_trap:
     pushq %r10
     pushq %r11
 
+    testb $3, 96(%rsp)     /* interrupt-frame CS: low 2 bits = RPL */
+    jnz .Lfault_from_user
+
+    /* Ring 0: doorbell or fatal. */
     mov 72(%rsp), %rdi      /* vector */
     mov 80(%rsp), %rsi      /* error code */
     mov 88(%rsp), %rdx      /* interrupt-frame RIP */
-    mov 96(%rsp), %rcx      /* interrupt-frame CS (RPL tells user vs kernel) */
+    mov 96(%rsp), %rcx      /* interrupt-frame CS */
     call x86_trap_handler
 
     popq %r11
@@ -80,6 +92,55 @@ common_trap:
     popq %rax
     add $16, %rsp           /* drop vector + error code */
     iretq
+
+/* Ring-3 fault: build the current cell's TrapFrame from the saved regs +
+   interrupt frame, then dispatch. TrapFrame offsets match x86_64/mod.rs:
+   rax0 rbx8 rcx16 rdx24 rsi32 rdi40 rbp48 r8_56 r9_64 r10_72 r11_80
+   r12_88 r13_96 r14_104 r15_112 rip120 rflags128 rsp136. */
+.Lfault_from_user:
+    mov CUR_FRAME(%rip), %rax     /* rax = &frame */
+    mov 64(%rsp), %rcx            /* saved rax */
+    mov %rcx, 0(%rax)
+    mov %rbx, 8(%rax)             /* rbx (never clobbered above) */
+    mov 56(%rsp), %rcx           /* saved rcx */
+    mov %rcx, 16(%rax)
+    mov 48(%rsp), %rcx           /* saved rdx */
+    mov %rcx, 24(%rax)
+    mov 40(%rsp), %rcx           /* saved rsi */
+    mov %rcx, 32(%rax)
+    mov 32(%rsp), %rcx           /* saved rdi */
+    mov %rcx, 40(%rax)
+    mov %rbp, 48(%rax)
+    mov 24(%rsp), %rcx           /* saved r8 */
+    mov %rcx, 56(%rax)
+    mov 16(%rsp), %rcx           /* saved r9 */
+    mov %rcx, 64(%rax)
+    mov 8(%rsp), %rcx            /* saved r10 */
+    mov %rcx, 72(%rax)
+    mov 0(%rsp), %rcx            /* saved r11 */
+    mov %rcx, 80(%rax)
+    mov %r12, 88(%rax)
+    mov %r13, 96(%rax)
+    mov %r14, 104(%rax)
+    mov %r15, 112(%rax)
+    mov 88(%rsp), %rcx           /* interrupt-frame rip */
+    mov %rcx, 120(%rax)
+    mov 104(%rsp), %rcx          /* rflags */
+    mov %rcx, 128(%rax)
+    mov 112(%rsp), %rcx          /* user rsp */
+    mov %rcx, 136(%rax)
+
+    mov 72(%rsp), %rdi           /* arg0 = vector */
+    mov 88(%rsp), %rsi           /* arg1 = fault addr (default: rip) */
+    cmpq $14, %rdi
+    jne 1f
+    mov %cr2, %rsi               /* #PF: faulting address in CR2 */
+1:
+    mov %rax, %rdx               /* arg2 = frame */
+    call x86_fault_trap          /* -> frame* to resume in rax, or null */
+    test %rax, %rax
+    jz return_to_kernel_asm
+    jmp sysret_resume            /* rax = frame; resume (handler or resumed pc) */
 
 /* Stub address table consumed by trap_init() in Rust. */
 .section .rodata

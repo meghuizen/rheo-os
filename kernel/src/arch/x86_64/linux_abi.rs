@@ -23,6 +23,9 @@ pub mod nr {
     pub const RT_SIGACTION: u64 = 13;
     pub const RT_SIGPROCMASK: u64 = 14;
     pub const RT_SIGRETURN: u64 = 15;
+    pub const RT_SIGTIMEDWAIT: u64 = 128;
+    pub const RT_SIGQUEUEINFO: u64 = 129;
+    pub const TKILL: u64 = 200;
     pub const IOCTL: u64 = 16;
     pub const READV: u64 = 19;
     pub const WRITEV: u64 = 20;

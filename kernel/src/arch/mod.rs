@@ -59,6 +59,47 @@ pub enum TrapKind {
     Fault,
 }
 
+/// The kind of a U-mode fault, classified per ISA (vector / ESR EC / scause)
+/// and mapped to a POSIX signal by the Linux personality (docs/LINUX-COMPAT.md
+/// L5). Only meaningful when `TrapKind::Fault`; the syscall path passes an
+/// arbitrary value. Kept portable so `crate::user`/`crate::linux` never name a
+/// per-ISA trap cause (the arch layer owns the decode).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum FaultCause {
+    /// Bad memory access (page/access fault, protection): SIGSEGV.
+    Segv,
+    /// Misaligned/unsupported access: SIGBUS.
+    Bus,
+    /// Illegal / undefined instruction: SIGILL.
+    Ill,
+    /// Arithmetic exception (divide error): SIGFPE.
+    Fpe,
+}
+
+/// What the arch layer needs to build a Linux `rt_sigframe` on the user stack
+/// and rewrite a `TrapFrame` to enter a signal handler (docs/LINUX-COMPAT.md
+/// L5). The register/ucontext layout is ISA-specific, so the frame is built in
+/// the arch layer; the portable personality (`crate::linux::signal`) fills this
+/// in and calls [`setup_rt_frame`].
+pub struct SigFrameSpec {
+    /// Signal number (1..64).
+    pub signo: u32,
+    /// User VA of the handler to enter.
+    pub handler: u64,
+    /// User `sa_restorer` (x86-64 supplies one via glibc). Ignored on
+    /// ARM64/RISC-V, which return through the injected trampoline (`SIGTRAMP_VA`).
+    pub restorer: u64,
+    /// The signal mask to save into the ucontext (restored by `rt_sigreturn`).
+    pub saved_mask: u64,
+    /// `siginfo.si_code`.
+    pub si_code: i32,
+    /// `siginfo.si_addr` (fault address for synchronous signals; 0 otherwise).
+    pub si_addr: u64,
+    /// Top of the stack region to build the frame on (current SP, or the
+    /// sigaltstack top when SA_ONSTACK is honored).
+    pub stack_top: u64,
+}
+
 #[cfg(target_arch = "x86_64")]
 #[path = "x86_64/mod.rs"]
 mod imp;
@@ -73,15 +114,17 @@ mod imp;
 
 pub use imp::linux_abi;
 pub use imp::{
-    CLONE_BACKWARDS, FRAME_POOL_BASE, LINUX_UNAME_MACHINE, NAME, PagingRoot, TrapFrame,
-    VIRTIO_MMIO_BASE, VIRTIO_MMIO_COUNT, VIRTIO_MMIO_STRIDE, clone_child_frame, context_init,
-    context_switch, cpu_feature_names, cpu_report, cycles, decode_syscall, discover,
-    doorbell_count, doorbell_trap, enter_user_first, exit, has_hwrng, hwrng_name, hwrng_u64,
-    paging_activate, paging_activate_kernel, paging_kernel_init, paging_map, paging_map_frame,
-    paging_new_root, paging_protect, paging_unmap_frame, pci_cfg_read32, pci_cfg_write32,
-    phys_to_virt, restore_user_fp, return_to_kernel, save_user_fp, serial_init, serial_read_byte,
-    serial_write_byte, set_syscall_ret, set_user_fs_base, spin_loop, ticks_to_ns, trap_init,
-    trapframe_new, trapframe_zeroed, user_fs_base, virt_to_phys,
+    CLONE_BACKWARDS, FRAME_POOL_BASE, LINUX_UNAME_MACHINE, NAME, PagingRoot,
+    SIGACTION_HAS_RESTORER, SIGTRAMP_VA, TrapFrame, VIRTIO_MMIO_BASE, VIRTIO_MMIO_COUNT,
+    VIRTIO_MMIO_STRIDE, clone_child_frame, context_init, context_switch, cpu_feature_names,
+    cpu_report, cycles, decode_syscall, discover, doorbell_count, doorbell_trap, enter_user_first,
+    exit, has_hwrng, hwrng_name, hwrng_u64, paging_activate, paging_activate_kernel,
+    paging_kernel_init, paging_map, paging_map_frame, paging_new_root, paging_protect,
+    paging_unmap_frame, pci_cfg_read32, pci_cfg_write32, phys_to_virt, restore_rt_frame,
+    restore_user_fp, return_to_kernel, save_user_fp, serial_init, serial_read_byte,
+    serial_write_byte, set_syscall_ret, set_user_fs_base, setup_rt_frame, sig_tramp_code,
+    spin_loop, ticks_to_ns, trap_init, trapframe_new, trapframe_zeroed, user_fs_base, user_sp,
+    virt_to_phys,
 };
 
 /// Full arch bring-up for a kernel binary: console, exception vectors,

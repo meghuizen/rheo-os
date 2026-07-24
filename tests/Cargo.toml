@@ -89,6 +89,10 @@ name = "linuxthreads"
 path = "src/linuxthreads.rs"
 
 [[bin]]
+name = "linuxsig"
+path = "src/linuxsig.rs"
+
+[[bin]]
 name = "shell-smoke"
 path = "src/shell_smoke.rs"
 

@@ -422,6 +422,94 @@ pub fn user_fs_base() -> u64 {
     0
 }
 
+// ---------------------------------------------------- signal frame (L5)
+
+/// User VA of the injected `rt_sigreturn` trampoline page (docs/LINUX-COMPAT.md
+/// L5). ARM64/RISC-V have no SA_RESTORER path; the kernel normally supplies the
+/// restorer via the vDSO, which does not exist here, so a 2-instruction page is
+/// mapped into every Linux cell (by `linux::stack::setup_stack`) and the signal
+/// handler's LR is pointed at it. A free low page, well below any load base.
+pub const SIGTRAMP_VA: usize = 0x2000;
+
+/// The asm-generic kernel `struct sigaction` has no `sa_restorer` field (the
+/// restorer comes from the injected trampoline, not the caller); `sa_mask`
+/// follows `sa_flags` directly (docs/LINUX-COMPAT.md L5).
+pub const SIGACTION_HAS_RESTORER: bool = false;
+
+/// The `rt_sigreturn` trampoline: `mov x8, #139 (rt_sigreturn); svc #0`.
+/// Encoded little-endian (movz x8,#139 = 0xD2801168; svc #0 = 0xD4000001).
+pub fn sig_tramp_code() -> &'static [u8] {
+    &[0x68, 0x11, 0x80, 0xD2, 0x01, 0x00, 0x00, 0xD4]
+}
+
+/// The interrupted user stack pointer (for building a signal frame, L5).
+pub fn user_sp(frame: &TrapFrame) -> u64 {
+    frame.sp_el0
+}
+
+// rt_sigframe layout on the user stack: { siginfo(128); ucontext }.
+const INFO_OFF: u64 = 0;
+const UC_OFF: u64 = 128;
+const UC_SIGMASK_OFF: u64 = 40; // uc_sigmask within the ucontext
+const MC_OFF: u64 = UC_OFF + 176; // uc_mcontext within the frame
+const MC_REGS: u64 = MC_OFF + 8; // sigcontext.regs[0] (x0)
+const MC_SP: u64 = MC_OFF + 8 + 31 * 8;
+const MC_PC: u64 = MC_SP + 8;
+const MC_PSTATE: u64 = MC_PC + 8;
+const FRAME_RESERVE: u64 = 1024;
+
+/// Build a Linux `rt_sigframe` on the user stack and rewrite `frame` to enter
+/// the handler (docs/LINUX-COMPAT.md L5). The cell's address space is active
+/// (trap context), so user VAs are written directly.
+///
+/// # Safety
+/// `spec.stack_top` must be a valid, writable user stack VA in the active cell.
+pub fn setup_rt_frame(frame: &mut TrapFrame, spec: &super::SigFrameSpec) {
+    let base = (spec.stack_top - FRAME_RESERVE) & !0xF; // 16-aligned SP
+    // SAFETY: [base, base+FRAME_RESERVE) is writable user stack in the active cell.
+    unsafe {
+        let w = |off: u64, v: u64| ((base + off) as *mut u64).write(v);
+        // siginfo: si_signo, si_errno, si_code, si_addr.
+        ((base + INFO_OFF) as *mut i32).write(spec.signo as i32);
+        ((base + INFO_OFF + 4) as *mut i32).write(0);
+        ((base + INFO_OFF + 8) as *mut i32).write(spec.si_code);
+        w(INFO_OFF + 16, spec.si_addr);
+        w(UC_OFF, 0); // uc_flags
+        w(UC_OFF + 8, 0); // uc_link
+        w(UC_OFF + UC_SIGMASK_OFF, spec.saved_mask);
+        w(MC_OFF, spec.si_addr); // sigcontext.fault_address
+        for i in 0..31usize {
+            w(MC_REGS + (i as u64) * 8, frame.regs[i]);
+        }
+        w(MC_SP, frame.sp_el0);
+        w(MC_PC, frame.elr);
+        w(MC_PSTATE, frame.spsr);
+    }
+    frame.regs[0] = spec.signo as u64; // x0: signo
+    frame.regs[1] = base + INFO_OFF; // x1: siginfo*
+    frame.regs[2] = base + UC_OFF; // x2: ucontext*
+    frame.regs[30] = SIGTRAMP_VA as u64; // lr -> rt_sigreturn trampoline
+    frame.sp_el0 = base;
+    frame.elr = spec.handler;
+}
+
+/// Restore a `TrapFrame` saved by [`setup_rt_frame`] on `rt_sigreturn` and
+/// return the saved signal mask. On entry the handler's SP (frame base) is in
+/// `frame.sp_el0` (the trampoline does not move it).
+pub fn restore_rt_frame(frame: &mut TrapFrame) -> u64 {
+    let base = frame.sp_el0;
+    // SAFETY: `base` is the frame VA in the active cell, written by setup_rt_frame.
+    unsafe {
+        for i in 0..31usize {
+            frame.regs[i] = ((base + MC_REGS + (i as u64) * 8) as *const u64).read();
+        }
+        frame.sp_el0 = ((base + MC_SP) as *const u64).read();
+        frame.elr = ((base + MC_PC) as *const u64).read();
+        frame.spsr = ((base + MC_PSTATE) as *const u64).read();
+        ((base + UC_OFF + UC_SIGMASK_OFF) as *const u64).read()
+    }
+}
+
 unsafe extern "C" {
     pub fn enter_user_first(frame: *mut TrapFrame);
     fn return_to_kernel_asm() -> !;
@@ -436,16 +524,30 @@ pub fn return_to_kernel() -> ! {
 /// the instruction) is a syscall; any other exception class is a fault.
 #[unsafe(no_mangle)]
 extern "C" fn aarch64_user_trap(esr: u64, far: u64, frame: *mut TrapFrame) -> *mut TrapFrame {
-    let kind = if (esr >> 26) & 0x3F == EC_SVC64 {
+    let ec = (esr >> 26) & 0x3F;
+    let kind = if ec == EC_SVC64 {
         super::TrapKind::Syscall
     } else {
         super::TrapKind::Fault
     };
-    let resume = crate::user::on_user_trap(kind, far as usize, frame);
+    let resume = crate::user::on_user_trap(kind, fault_cause(ec), far as usize, frame);
     if resume.is_null() {
         return_to_kernel();
     }
     resume
+}
+
+/// Map an EL0 exception class (ESR_EL1.EC) to a portable fault cause
+/// (docs/LINUX-COMPAT.md L5). Data/instruction aborts are SIGSEGV; PC/SP
+/// alignment faults SIGBUS; illegal execution / unknown SIGILL; FP-trap SIGFPE.
+fn fault_cause(ec: u64) -> super::FaultCause {
+    match ec {
+        0x20 | 0x21 | 0x24 | 0x25 => super::FaultCause::Segv, // instr / data abort
+        0x22 | 0x26 => super::FaultCause::Bus,                // PC / SP alignment
+        0x00 | 0x0E => super::FaultCause::Ill,                // unknown / illegal state
+        0x2C => super::FaultCause::Fpe,                       // trapped FP
+        _ => super::FaultCause::Segv,
+    }
 }
 
 // -------------------------------------------------------------- counters

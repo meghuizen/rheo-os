@@ -197,25 +197,46 @@ static DOORBELLS: AtomicU64 = AtomicU64::new(0);
 /// (breakpoint) is the in-kernel doorbell self-test and returns; a fault
 /// from ring 3 is recorded and unwinds; anything else is fatal.
 #[unsafe(no_mangle)]
-extern "C" fn x86_trap_handler(vector: u64, error_code: u64, rip: u64, cs: u64) {
+extern "C" fn x86_trap_handler(vector: u64, error_code: u64, rip: u64, _cs: u64) {
     if vector == 3 {
         DOORBELLS.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    if cs & 3 == 3 {
-        // Fault from ring 3: the faulting address for a #PF is in CR2.
-        let cr2: u64;
-        unsafe { asm!("mov {0}, cr2", out(reg) cr2) };
-        let addr = if vector == 14 {
-            cr2 as usize
-        } else {
-            rip as usize
-        };
-        let _ = crate::user::on_user_trap(super::TrapKind::Fault, addr, core::ptr::null_mut());
-        return_to_kernel();
-    }
+    // Ring-3 faults are handled by `x86_fault_trap` (via the .Lfault_from_user
+    // path in vectors.S), which builds the full TrapFrame the signal machinery
+    // needs. Reaching here means a kernel-mode exception: fatal.
     crate::println!("TRAP: vector {vector} error {error_code:#x} at rip {rip:#x}");
     exit(super::ExitCode::Failure);
+}
+
+/// Map a CPU exception vector to a portable fault cause (docs/LINUX-COMPAT.md
+/// L5). #PF/#GP/#SS/#NP are SIGSEGV; #UD is SIGILL; #DE is SIGFPE; #AC is SIGBUS.
+fn fault_cause(vector: u64) -> super::FaultCause {
+    match vector {
+        6 => super::FaultCause::Ill,  // #UD invalid opcode
+        0 => super::FaultCause::Fpe,  // #DE divide error
+        17 => super::FaultCause::Bus, // #AC alignment check
+        _ => super::FaultCause::Segv, // #PF/#GP/#SS/#NP and the rest
+    }
+}
+
+/// Called from the .Lfault_from_user path in vectors.S after a ring-3 fault has
+/// been captured into the cell's TrapFrame. Returns the frame to resume (a
+/// Linux signal handler entry, rewritten in place) or null to unwind and
+/// terminate the cell. `fault_addr` is CR2 for a page fault, else the faulting
+/// RIP (computed in asm).
+#[unsafe(no_mangle)]
+extern "C" fn x86_fault_trap(
+    vector: u64,
+    fault_addr: u64,
+    frame: *mut TrapFrame,
+) -> *mut TrapFrame {
+    crate::user::on_user_trap(
+        super::TrapKind::Fault,
+        fault_cause(vector),
+        fault_addr as usize,
+        frame,
+    )
 }
 
 /// One kernel-entry round trip via int3 (the doorbell measurement floor).
@@ -543,6 +564,139 @@ pub fn user_fs_base() -> u64 {
     unsafe { paging_rdmsr(0xC000_0100) }
 }
 
+// ---------------------------------------------------- signal frame (L5)
+
+/// x86-64 uses the caller-supplied `sa_restorer` (glibc always passes one), so
+/// no kernel trampoline page is injected. `SIGTRAMP_VA` is unused here (0) and
+/// `sig_tramp_code` is empty; the ARM64/RISC-V ports inject a 2-instruction
+/// `rt_sigreturn` page instead (docs/LINUX-COMPAT.md L5).
+pub const SIGTRAMP_VA: usize = 0;
+
+/// The x86-64 kernel `struct sigaction` carries an `sa_restorer` field (glibc
+/// supplies one), so the personality reads/writes it (docs/LINUX-COMPAT.md L5).
+pub const SIGACTION_HAS_RESTORER: bool = true;
+
+/// No injected trampoline on x86-64 (see `SIGTRAMP_VA`).
+pub fn sig_tramp_code() -> &'static [u8] {
+    &[]
+}
+
+/// The interrupted user stack pointer (for building a signal frame, L5).
+pub fn user_sp(frame: &TrapFrame) -> u64 {
+    frame.rsp
+}
+
+// rt_sigframe layout on the user stack (docs/LINUX-COMPAT.md L5):
+//   base+0   pretcode (restorer)
+//   base+8   ucontext { uc_flags, uc_link, uc_stack[24], uc_mcontext[256],
+//                       uc_sigmask(8) }
+//   base+320 siginfo (128)
+// The mcontext GPR offsets match Linux `struct sigcontext_64`, so a
+// SA_SIGINFO handler that inspects `uc_mcontext.gregs` sees the real layout.
+const UC_OFF: u64 = 8;
+const MC_OFF: u64 = UC_OFF + 40; // uc_mcontext within the frame
+const MASK_OFF: u64 = MC_OFF + 256; // uc_sigmask within the frame
+const INFO_OFF: u64 = MASK_OFF + 8; // siginfo within the frame
+const FRAME_RESERVE: u64 = 512;
+
+// sigcontext_64 GPR offsets (relative to MC_OFF).
+const SC_R8: u64 = 0;
+const SC_RDI: u64 = 64;
+const SC_RSI: u64 = 72;
+const SC_RBP: u64 = 80;
+const SC_RBX: u64 = 88;
+const SC_RDX: u64 = 96;
+const SC_RAX: u64 = 104;
+const SC_RCX: u64 = 112;
+const SC_RSP: u64 = 120;
+const SC_RIP: u64 = 128;
+const SC_EFLAGS: u64 = 136;
+
+/// Build a Linux `rt_sigframe` on the user stack and rewrite `frame` to enter
+/// the handler (docs/LINUX-COMPAT.md L5). The cell's address space is active
+/// (trap context), so the user VAs are written directly.
+///
+/// # Safety
+/// `spec.stack_top` must be a valid, writable user stack VA in the active cell.
+pub fn setup_rt_frame(frame: &mut TrapFrame, spec: &super::SigFrameSpec) {
+    // 16-align, then bias by -8 so the handler sees rsp % 16 == 8 (the
+    // post-`call` alignment the SysV ABI requires at function entry).
+    let base = ((spec.stack_top - FRAME_RESERVE) & !0xF) - 8;
+    // Offset of the mcontext relative to `base` (the `w` closure adds `base`).
+    let mc = MC_OFF;
+    // SAFETY: [base, base+FRAME_RESERVE) is writable user stack in the active cell.
+    unsafe {
+        let w = |off: u64, v: u64| ((base + off) as *mut u64).write(v);
+        w(0, spec.restorer); // pretcode
+        // ucontext header (uc_flags/uc_link/uc_stack) left zeroed.
+        w(UC_OFF, 0);
+        w(UC_OFF + 8, 0);
+        // mcontext GPRs, from the interrupted frame.
+        w(mc + SC_R8, frame.r8);
+        w(mc + SC_R8 + 8, frame.r9);
+        w(mc + SC_R8 + 16, frame.r10);
+        w(mc + SC_R8 + 24, frame.r11);
+        w(mc + SC_R8 + 32, frame.r12);
+        w(mc + SC_R8 + 40, frame.r13);
+        w(mc + SC_R8 + 48, frame.r14);
+        w(mc + SC_R8 + 56, frame.r15);
+        w(mc + SC_RDI, frame.rdi);
+        w(mc + SC_RSI, frame.rsi);
+        w(mc + SC_RBP, frame.rbp);
+        w(mc + SC_RBX, frame.rbx);
+        w(mc + SC_RDX, frame.rdx);
+        w(mc + SC_RAX, frame.rax);
+        w(mc + SC_RCX, frame.rcx);
+        w(mc + SC_RSP, frame.rsp);
+        w(mc + SC_RIP, frame.rip);
+        w(mc + SC_EFLAGS, frame.rflags);
+        w(MASK_OFF, spec.saved_mask);
+        // siginfo: si_signo, si_errno, si_code, then si_addr.
+        ((base + INFO_OFF) as *mut i32).write(spec.signo as i32);
+        ((base + INFO_OFF + 4) as *mut i32).write(0);
+        ((base + INFO_OFF + 8) as *mut i32).write(spec.si_code);
+        ((base + INFO_OFF + 16) as *mut u64).write(spec.si_addr);
+    }
+    frame.rsp = base;
+    frame.rip = spec.handler;
+    frame.rdi = spec.signo as u64; // arg0: signo
+    frame.rsi = base + INFO_OFF; // arg1: siginfo*
+    frame.rdx = base + UC_OFF; // arg2: ucontext*
+    frame.rax = 0;
+}
+
+/// Restore a `TrapFrame` saved by [`setup_rt_frame`] on `rt_sigreturn`
+/// (docs/LINUX-COMPAT.md L5) and return the saved signal mask. At the
+/// `rt_sigreturn` syscall the user rsp points at the ucontext (the handler
+/// `ret`ed past the pretcode), so the mcontext is at `rsp + 40`.
+pub fn restore_rt_frame(frame: &mut TrapFrame) -> u64 {
+    let uc = frame.rsp;
+    let mc = uc + 40;
+    // SAFETY: `uc` is the ucontext VA in the active cell, written by setup_rt_frame.
+    unsafe {
+        let r = |off: u64| ((mc + off) as *const u64).read();
+        frame.r8 = r(SC_R8);
+        frame.r9 = r(SC_R8 + 8);
+        frame.r10 = r(SC_R8 + 16);
+        frame.r11 = r(SC_R8 + 24);
+        frame.r12 = r(SC_R8 + 32);
+        frame.r13 = r(SC_R8 + 40);
+        frame.r14 = r(SC_R8 + 48);
+        frame.r15 = r(SC_R8 + 56);
+        frame.rdi = r(SC_RDI);
+        frame.rsi = r(SC_RSI);
+        frame.rbp = r(SC_RBP);
+        frame.rbx = r(SC_RBX);
+        frame.rdx = r(SC_RDX);
+        frame.rax = r(SC_RAX);
+        frame.rcx = r(SC_RCX);
+        frame.rsp = r(SC_RSP);
+        frame.rip = r(SC_RIP);
+        frame.rflags = r(SC_EFLAGS);
+        ((uc + (MASK_OFF - UC_OFF)) as *const u64).read()
+    }
+}
+
 unsafe extern "C" {
     pub fn enter_user_first(frame: *mut TrapFrame);
     fn return_to_kernel_asm() -> !;
@@ -562,7 +716,9 @@ extern "C" fn x86_user_trap(kind: u64, fault_addr: u64, frame: *mut TrapFrame) -
     } else {
         super::TrapKind::Fault
     };
-    crate::user::on_user_trap(k, fault_addr as usize, frame)
+    // The syscall path never faults; FaultCause is a placeholder here (only
+    // read when kind == Fault, which comes through `x86_fault_trap`).
+    crate::user::on_user_trap(k, super::FaultCause::Segv, fault_addr as usize, frame)
 }
 
 // Single CPU: the syscall stub reaches these as plain globals, no GS.
