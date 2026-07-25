@@ -6,10 +6,10 @@
 //! ARCHITECTURE.md 6 admission rule as memory-grant mechanics, independent of
 //! Linux. A Linux process's heap cannot exceed its hosting cell's grants.
 
-use crate::arch::MapPerm;
+use crate::arch::{self, MapPerm};
 use crate::linux::LinuxState;
 use crate::linux::errno::*;
-use crate::mm::frames::FRAME_SIZE;
+use crate::mm::frames::{self, FRAME_SIZE};
 use crate::user;
 
 // mmap prot bits.
@@ -67,32 +67,97 @@ pub fn brk(st: &mut LinuxState, addr: u64) -> u64 {
     st.brk_cur as u64
 }
 
-/// mmap(addr, len, prot, flags, fd, off) - anonymous private only for L2.
-/// fd-backed mappings are L7 (dynamic linking); MAP_FIXED is deferred. Both
-/// return -ENOSYS so glibc sees an honest failure rather than a wrong mapping.
-pub fn mmap(st: &mut LinuxState, len: u64, prot: u64, flags: u64) -> i64 {
-    if flags & MAP_ANONYMOUS == 0 {
-        return -ENOSYS; // fd-backed mmap is L7
-    }
-    if flags & MAP_FIXED != 0 {
-        return -ENOSYS; // fixed placement is not modeled yet
-    }
+/// mmap(addr, len, prot, flags, fd, offset).
+///
+/// - **Anonymous** (`MAP_ANONYMOUS`): a PROT_NONE mapping only *reserves*
+///   address space (demand-commit, L4) - glibc reserves large PROT_NONE arenas
+///   and commits sub-ranges via `mprotect`; an accessible mapping is committed
+///   now (fresh zeroed frames).
+/// - **File-backed private** (`MAP_PRIVATE` of an fd, L7): the file range
+///   `[offset, offset+len)` is read into fresh frames (partial last page
+///   zero-filled) and mapped with `prot`. This is exactly what ld.so does to
+///   map the program + libc; `MAP_SHARED` of a file is not modeled (ld.so uses
+///   PRIVATE).
+/// - **MAP_FIXED**: the mapping is placed at the caller's `addr`, replacing any
+///   existing pages there; without it, placement bumps the per-cell mmap
+///   cursor. ld.so reserves a library's whole span then `MAP_FIXED`-overlays
+///   each segment (text r-x, data rw) at computed offsets.
+pub fn mmap(
+    st: &mut LinuxState,
+    addr: u64,
+    len: u64,
+    prot: u64,
+    flags: u64,
+    fd: i64,
+    offset: u64,
+) -> i64 {
     if len == 0 {
         return -EINVAL;
     }
     let bytes = page_up(len as usize);
-    let base = st.mmap_cursor;
-    // Demand-commit (docs/LINUX-COMPAT.md L4): a PROT_NONE mapping only reserves
-    // address space (no frames) - glibc reserves large PROT_NONE regions (a
-    // 64 MiB malloc arena per thread, thread-stack guards) and commits
-    // sub-ranges with `mprotect` as it grows. Backing them eagerly would
-    // exhaust the frame pool the moment a second thread is created. An
-    // accessible mapping is committed now.
-    if prot & PROT_ANY != 0 {
-        user::map_anon_at(base, bytes, perm_from_prot(prot));
+    let fixed = flags & MAP_FIXED != 0;
+    let anon = flags & MAP_ANONYMOUS != 0;
+
+    let base = if fixed {
+        (addr as usize) & !(FRAME_SIZE - 1)
+    } else {
+        let b = st.mmap_cursor;
+        st.mmap_cursor = b + bytes;
+        b
+    };
+
+    if anon {
+        // Anonymous mmap always yields ZEROED memory. When MAP_FIXED overlays
+        // an already-mapped range (ld.so maps a library's bss this way, over
+        // the file-backed reservation it made first), the existing frames must
+        // be discarded and replaced with fresh zeroed ones - NOT reprotected in
+        // place (that would leak the reservation's file bytes into the bss and
+        // corrupt, e.g., libc's stdio locks). So free any existing pages, then
+        // map fresh zeroed frames.
+        if fixed {
+            user::unmap_range(base, bytes);
+        }
+        if prot & PROT_ANY != 0 {
+            user::map_anon_at(base, bytes, perm_from_prot(prot));
+        }
+        // PROT_NONE: leave it a bare reservation (no frames).
+    } else {
+        // File-backed private mapping (L7).
+        if fd < 0 {
+            return -EBADF;
+        }
+        map_file(st, base, bytes, prot, fd, offset as i64);
     }
-    st.mmap_cursor = base + bytes;
     base as i64
+}
+
+/// Map `bytes` (page count) of a VFS file at `base`, one page at a time: unmap
+/// any page already there (MAP_FIXED overlay), allocate a fresh zeroed frame,
+/// read the file range for that page into it through the kernel linear map, and
+/// map it with `perm`. A short read (EOF) leaves the page tail zero
+/// (docs/LINUX-COMPAT.md L7).
+fn map_file(st: &mut LinuxState, base: usize, bytes: usize, prot: u64, fd: i64, offset: i64) {
+    let perm = perm_from_prot(prot);
+    let pages = bytes / FRAME_SIZE;
+    for i in 0..pages {
+        let va = base + i * FRAME_SIZE;
+        // Reclaim any existing page at this VA (MAP_FIXED replaces it).
+        user::with_current_aspace(|aspace| {
+            if let Some(old) = aspace.unmap(va) {
+                frames::free(old);
+            }
+        });
+        let pa = frames::alloc(); // zeroed
+        let file_off = offset + (i * FRAME_SIZE) as i64;
+        // Read into the frame via the kernel high linear map (valid under any
+        // active cell root; the VFS handler runs in kernel context). The frame
+        // is not yet user-mapped, so this cannot alias user memory.
+        let kva = arch::phys_to_virt(pa) as u64;
+        st.fds.pread(fd, kva, FRAME_SIZE as u64, file_off);
+        user::with_current_aspace(|aspace| {
+            aspace.map_user_frame(va, pa, perm);
+        });
+    }
 }
 
 /// mremap(old_addr, old_size, new_size, flags, new_addr): resize a mapping.

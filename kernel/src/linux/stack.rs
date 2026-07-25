@@ -138,7 +138,9 @@ pub fn setup_stack(
     push(AT_PAGESZ, FRAME_SIZE as u64);
     push(AT_BASE, img.bias as u64);
     push(AT_FLAGS, 0);
-    push(AT_ENTRY, img.entry as u64);
+    // AT_ENTRY is the main program's entry even for a dynamically-linked binary
+    // (execution starts in ld.so, which jumps here after relocation, L7).
+    push(AT_ENTRY, img.at_entry as u64);
     push(AT_UID, 1000);
     push(AT_EUID, 1000);
     push(AT_GID, 1000);

@@ -28,6 +28,7 @@ pub mod nr {
     pub const LSEEK: u64 = 62;
     pub const READ: u64 = 63;
     pub const WRITE: u64 = 64;
+    pub const PREAD64: u64 = 67;
     pub const READV: u64 = 65;
     pub const WRITEV: u64 = 66;
     pub const PPOLL: u64 = 73;
@@ -104,6 +105,11 @@ pub mod nr {
     pub const VFORK: u64 = u64::MAX - 3;
     pub const PIPE: u64 = u64::MAX - 4;
     pub const DUP2: u64 = u64::MAX - 5;
+
+    /// Not part of this table: x86-64's legacy `access` (asm-generic ISAs use
+    /// `faccessat`). Named as unreachable so portable dispatch can list it;
+    /// no program can issue this number here (docs/LINUX-COMPAT.md L7).
+    pub const ACCESS: u64 = u64::MAX - 6;
 }
 
 /// The asm-generic `struct stat` (docs/LINUX-COMPAT.md L2), shared by ARM64

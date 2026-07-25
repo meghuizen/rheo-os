@@ -33,18 +33,32 @@ pub fn load_elf(image: &[u8], aspace: &mut AddressSpace) -> Option<usize> {
 /// at their linked address (bias 0).
 pub const LINUX_DYN_BASE: usize = 0x1_0000_0000;
 
+/// Load bias for the ELF **interpreter** (`ld-linux-*.so`) of a dynamically-
+/// linked binary (docs/LINUX-COMPAT.md L7): 64 GiB, well clear of the main
+/// image (4 GiB), the stack (8 GiB), and the anonymous mmap region (12 GiB and
+/// up, where ld.so maps the shared libraries), so the interpreter never
+/// collides with them. `AT_BASE` carries this to ld.so's self-relocation.
+pub const LINUX_INTERP_BASE: usize = 0x10_0000_0000;
+
 /// What a loaded Linux image needs for its auxv (docs/LINUX-COMPAT.md L1).
 pub struct LinuxImage {
-    /// Entry point (already biased for `ET_DYN`).
+    /// Entry point to start execution at (already biased). For a dynamically-
+    /// linked binary this is the **interpreter's** entry (ld.so runs first);
+    /// otherwise it is the program's own entry.
     pub entry: usize,
-    /// Load bias applied (`AT_BASE`-style; 0 for `ET_EXEC`).
+    /// `AT_BASE`: the interpreter's load bias for a dynamic binary
+    /// (`LINUX_INTERP_BASE`), else the program's own bias (0 for `ET_EXEC`).
     pub bias: usize,
-    /// Virtual address of the program-header table (`AT_PHDR`), or 0 if the
-    /// headers were not covered by a `PT_LOAD` (rare; auxv then omits it).
+    /// Virtual address of the **main program's** program-header table
+    /// (`AT_PHDR`), or 0 if the headers were not covered by a `PT_LOAD`. ld.so
+    /// walks these to relocate the program.
     pub phdr: usize,
-    /// `AT_PHENT` / `AT_PHNUM`.
+    /// `AT_PHENT` / `AT_PHNUM` (the main program's).
     pub phent: usize,
     pub phnum: usize,
+    /// `AT_ENTRY`: the **main program's** entry point (biased), even when
+    /// execution starts in the interpreter. ld.so jumps here after relocation.
+    pub at_entry: usize,
     /// Highest mapped VA rounded up to a page: where the `brk` heap starts
     /// (docs/LINUX-COMPAT.md L2).
     pub image_end: usize,
@@ -71,14 +85,79 @@ pub fn load_elf_linux(image: &[u8], aspace: &mut AddressSpace) -> Option<LinuxIm
     })?;
     let image_end = (image_end + FRAME_SIZE - 1) & !(FRAME_SIZE - 1);
     let phdr = elf.phdr_vaddr().map(|v| v as usize + bias).unwrap_or(0);
+    let main_entry = elf.entry() as usize + bias;
+
+    // Dynamically linked? A `PT_INTERP` names the ELF interpreter
+    // (`ld-linux-*.so`, docs/LINUX-COMPAT.md L7). Load it as a second `ET_DYN`
+    // at `LINUX_INTERP_BASE`, resolving its path through the VFS, and start
+    // execution there - ld.so then maps and relocates the program + libc at
+    // runtime. `AT_BASE` = the interpreter's bias; `AT_ENTRY` stays the main
+    // program's entry. No kernel relocation processing (ld.so self-relocates).
+    let (entry, at_base) = match elf.interp() {
+        Some((off, filesz)) => {
+            let interp_entry = load_interp(image, off, filesz, aspace)?;
+            (interp_entry, LINUX_INTERP_BASE)
+        }
+        None => (main_entry, bias),
+    };
+
     Some(LinuxImage {
-        entry: elf.entry() as usize + bias,
-        bias,
+        entry,
+        bias: at_base,
         phdr,
         phent: elf.phentsize(),
         phnum: elf.phnum(),
+        at_entry: main_entry,
         image_end,
     })
+}
+
+/// Load the ELF interpreter named by a `PT_INTERP` segment at
+/// `LINUX_INTERP_BASE`, streaming it from the VFS (docs/LINUX-COMPAT.md L7). The
+/// path bytes lie at `image[off..off+filesz]` (NUL-terminated); they are opened
+/// through the registered `svc::FileOps` handler (the same VFS the program's
+/// own file I/O uses), so the interpreter is found on the cell's `/lib` exactly
+/// as on Linux. Returns the interpreter's (biased) entry point.
+fn load_interp(
+    image: &[u8],
+    off: usize,
+    filesz: usize,
+    aspace: &mut AddressSpace,
+) -> Option<usize> {
+    let ops = crate::svc::file_ops()?;
+    // The path is NUL-terminated inside the segment; trim at the NUL.
+    let bytes = image.get(off..off + filesz)?;
+    let path_len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    let path_va = image.as_ptr() as u64 + off as u64;
+    let fd = (ops.open)(path_va, path_len as u64, 0);
+    if fd < 0 {
+        return None;
+    }
+    let fd = fd as u64;
+    let r = stream_elf_at(ops, fd, LINUX_INTERP_BASE, aspace);
+    (ops.close)(fd);
+    r
+}
+
+/// Stream every `PT_LOAD` of the ELF open on `fd` into `aspace` at load bias
+/// `bias`, reading each segment page-by-page from the VFS (docs/LINUX-COMPAT.md
+/// L7). Returns the biased entry point. Shared by the interpreter loader and
+/// the `execve` streaming path.
+fn stream_elf_at(
+    ops: &crate::svc::FileOps,
+    fd: u64,
+    bias: usize,
+    aspace: &mut AddressSpace,
+) -> Option<usize> {
+    let mut hdr = [0u8; HDR_BUF];
+    (ops.lseek)(fd, 0, 0);
+    let n = (ops.read)(fd, hdr.as_mut_ptr() as u64, HDR_BUF as u64);
+    if n < 64 {
+        return None;
+    }
+    let elf = Elf::parse(&hdr[..n as usize])?;
+    elf.for_each_load_streamed(|seg| stream_segment(ops, fd, seg, bias, aspace))?;
+    Some(elf.entry() as usize + bias)
 }
 
 /// Load a Linux ELF for `execve` by **streaming** it from the VFS into a fresh
@@ -137,12 +216,17 @@ fn exec_elf_inner(
     })?;
     let image_end = (image_end + FRAME_SIZE - 1) & !(FRAME_SIZE - 1);
     let phdr = elf.phdr_vaddr().map(|v| v as usize + bias).unwrap_or(0);
+    let entry = elf.entry() as usize + bias;
+    // `execve` of a dynamically-linked binary (PT_INTERP) is not handled on the
+    // streaming path yet - the L7 `linuxdyn` proof loads the dynamic binary
+    // directly (`load_elf_linux`), not via `execve` (docs/LINUX-COMPAT.md L7).
     Some(LinuxImage {
-        entry: elf.entry() as usize + bias,
+        entry,
         bias,
         phdr,
         phent: elf.phentsize(),
         phnum: elf.phnum(),
+        at_entry: entry,
         image_end,
     })
 }

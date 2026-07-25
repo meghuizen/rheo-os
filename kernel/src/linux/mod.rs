@@ -207,6 +207,11 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
             .openat(dirfd(args[0]), args[1], strlen(args[1]), args[2])),
         nr::CLOSE => ret(st.fds.close(args[0] as i64)),
         nr::LSEEK => ret(st.fds.lseek(args[0] as i64, args[1] as i64, args[2])),
+        // pread64(fd, buf, count, offset): a positioned read (ld.so reads ELF
+        // headers with it, docs/LINUX-COMPAT.md L7). VFS files only.
+        nr::PREAD64 => ret(st
+            .fds
+            .pread(args[0] as i64, args[1], args[2], args[3] as i64)),
         nr::FSTAT => ret(st.fds.fstat(args[0] as i64, args[1])),
         nr::NEWFSTATAT => ret(sys_newfstatat(st, args)),
         nr::STATX => ret(sys_statx(st, args)),
@@ -216,6 +221,9 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
         nr::FCNTL => ret(st.fds.fcntl(args[0] as i64, args[1], args[2])),
         nr::IOCTL => ret(sys_ioctl(st, args[0] as i64, args[1], args[2])),
         nr::FACCESSAT | nr::FACCESSAT2 => ret(sys_faccessat(args[1])),
+        // access(path, mode): x86-64 legacy; ld.so probes /etc/ld.so.preload
+        // etc. The path is arg0 (no dirfd), docs/LINUX-COMPAT.md L7.
+        nr::ACCESS => ret(sys_faccessat(args[0])),
         nr::READLINKAT => err(errno::ENOENT), // no symlinks in the VFS; /proc/self/exe unused
         nr::POLL | nr::PPOLL => ret(sys_poll(st, args[0], args[1])),
 
@@ -225,7 +233,17 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
 
         // -- memory --
         nr::BRK => Ctl::Ret(mem::brk(st, args[0])),
-        nr::MMAP => ret(mem::mmap(st, args[1], args[2], args[3])),
+        // mmap(addr, len, prot, flags, fd, offset): anonymous + file-backed
+        // MAP_PRIVATE (+ MAP_FIXED), docs/LINUX-COMPAT.md L7.
+        nr::MMAP => ret(mem::mmap(
+            st,
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4] as i64,
+            args[5],
+        )),
         nr::MREMAP => ret(mem::mremap(st, args[0], args[1], args[2], args[3])),
         nr::MUNMAP => ret(mem::munmap(args[0], args[1])),
         nr::MPROTECT => ret(mem::mprotect(args[0], args[1], args[2])),

@@ -97,6 +97,10 @@ name = "linuxproc"
 path = "src/linuxproc.rs"
 
 [[bin]]
+name = "linuxdyn"
+path = "src/linuxdyn.rs"
+
+[[bin]]
 name = "shell-smoke"
 path = "src/shell_smoke.rs"
 

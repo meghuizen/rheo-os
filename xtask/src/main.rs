@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 22] = [
+const TEST_KERNELS: [&str; 23] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -44,6 +44,7 @@ const TEST_KERNELS: [&str; 22] = [
     "linuxthreads",
     "linuxsig",
     "linuxproc",
+    "linuxdyn",
 ];
 
 /// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
@@ -343,6 +344,29 @@ impl Arch {
             Arch::Riscv64 => "riscv64-linux-gnu-gcc",
         }
     }
+
+    /// The toolchain runtime dynamic-linker + libc for the L7 dynamic fixture
+    /// (docs/LINUX-COMPAT.md L7): `(ld.so source path, libc.so.6 source path)`.
+    /// These live in the cross toolchain sysroots (host multiarch for x86-64)
+    /// and are copied into the gitignored fixture build dir at build time - no
+    /// `.so` blob is committed. If a path is missing for an ISA, that ISA's
+    /// dynamic fixture is skipped-with-reason (the static L2-L6 coverage stays).
+    fn dyn_runtime_libs(self) -> (&'static str, &'static str) {
+        match self {
+            Arch::X86_64 => (
+                "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+                "/lib/x86_64-linux-gnu/libc.so.6",
+            ),
+            Arch::Aarch64 => (
+                "/usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1",
+                "/usr/aarch64-linux-gnu/lib/libc.so.6",
+            ),
+            Arch::Riscv64 => (
+                "/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1",
+                "/usr/riscv64-linux-gnu/lib/libc.so.6",
+            ),
+        }
+    }
 }
 
 /// Build the Linux-personality test fixtures from source (docs/LINUX-COMPAT.md
@@ -446,7 +470,57 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         }
     }
 
+    if !build_dyn_fixture(arch, cc, &out_dir) {
+        return false;
+    }
+
     build_coreutils_fixture(arch)
+}
+
+/// Build the L7 **dynamically-linked** glibc fixture (docs/LINUX-COMPAT.md L7):
+/// a stock ET_DYN/PIE C hello (no `-static`/`-no-pie`) plus the toolchain's real
+/// `ld-linux` + `libc.so.6`, copied into the gitignored build dir so the
+/// `linuxdyn` test can `include_bytes!` them and seed the cell's `/lib`. The
+/// runtime `.so`s are never committed. If they cannot be located for this ISA,
+/// the fixture is **skipped-with-reason**: a 1-byte placeholder `ld.so` is
+/// written so the test still compiles, and it detects the placeholder and skips
+/// (the static L2-L6 coverage remains). Returns false only on a hard build
+/// error (the C compile itself failing), never on a missing runtime lib.
+fn build_dyn_fixture(arch: Arch, cc: &str, out_dir: &str) -> bool {
+    // Stock dynamic PIE: no -static, no -no-pie (ET_DYN/PIE is gcc's default).
+    let mut c = Command::new(cc);
+    c.args([
+        "tests/linux-fixtures/dhello.c",
+        "-o",
+        &format!("{out_dir}/dhello"),
+    ]);
+    if !matches!(c.status().map(|s| s.success()), Ok(true)) {
+        eprintln!("[xtask] dynamic C fixture build failed for {}", arch.name());
+        return false;
+    }
+
+    // Copy the real ld.so + libc.so.6 out of the toolchain, or skip-with-reason.
+    let (ld_src, libc_src) = arch.dyn_runtime_libs();
+    let ld_dst = format!("{out_dir}/ld.so");
+    let libc_dst = format!("{out_dir}/libc.so.6");
+    let copied =
+        std::fs::copy(ld_src, &ld_dst).is_ok() && std::fs::copy(libc_src, &libc_dst).is_ok();
+    if copied {
+        println!(
+            "[xtask] copied dynamic runtime ({ld_src}, {libc_src}) for {}",
+            arch.name()
+        );
+    } else {
+        eprintln!(
+            "[xtask] SKIP dynamic fixture for {}: runtime ld.so/libc not found \
+             ({ld_src}); linuxdyn will skip this ISA (static coverage stays)",
+            arch.name()
+        );
+        // 1-byte placeholders so the test still compiles + detects the skip.
+        let _ = std::fs::write(&ld_dst, [0u8]);
+        let _ = std::fs::write(&libc_dst, [0u8]);
+    }
+    true
 }
 
 /// Pinned upstream uutils/coreutils crate for the L3 Linux-personality fixture

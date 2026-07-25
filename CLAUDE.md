@@ -171,9 +171,10 @@ three ISAs. These are faithful from-scratch ports, not the upstream uutils
 crate (whose clap/uucore tree needs `std` surface rheo lacks - `IsTerminal`,
 locale, terminal width - so it is deferred; docs/USERLAND.md M5).
 
-A **Linux personality** is being built (docs/LINUX-COMPAT.md, milestones
-L0-L7) so *unmodified* Linux binaries - unpatched Rust std
-(`*-unknown-linux-gnu`), glibc-linked C, stock tools - run as cells. It is
+A **Linux personality** is complete (docs/LINUX-COMPAT.md, milestones
+L0-L7 all done) so *unmodified* Linux binaries - unpatched Rust std
+(`*-unknown-linux-gnu`), glibc-linked C (static and dynamic), stock tools - run
+as cells. It is
 kernel-resident like `svc.rs` (a documented bridge to a future personality
 cell) and adds no kernel object: PIDs/fds/signals are per-cell synthesized
 state. L0 is done: a per-cell `Personality { Native, Linux }` tag branches
@@ -267,6 +268,30 @@ from-scratch static-glibc shell (dash cross-build was out of budget), forks+exec
 the unpatched upstream uutils/coreutils multicall over pipelines and `&&`/`||`,
 passing a 12-command coreutils suite **12/12 = 100%** (gate >= 80%; POSIX-
 PERSONALITY.md 5).
+**L7 is done** (the final milestone): **dynamic linking - an *unmodified,
+dynamically-linked* glibc binary runs**. `load::load_elf_linux` parses `PT_INTERP`
+and, when present, loads BOTH the main program (ET_DYN, 4 GiB bias) and the ELF
+interpreter `ld-linux-*.so` (ET_DYN, 64 GiB bias `LINUX_INTERP_BASE`, streamed
+from the VFS), starting execution in ld.so with the auxv carrying `AT_BASE` =
+interp bias, `AT_PHDR`/`AT_ENTRY` = the main program's. The kernel does **no
+relocation processing** - ld.so self-relocates then maps + relocates the program
+and `libc.so.6` (initial-exec TLS + IRELATIVE/ifunc relocs run to completion on
+all three ISAs). `mmap` gained **file-backed MAP_PRIVATE + MAP_FIXED**
+(`kernel/src/linux/mem.rs`): ld.so reserves a library's span then MAP_FIXED-
+overlays each segment (text/data from the file, an anonymous **zeroed** overlay
+for the bss - the anon path frees+replaces the reservation's file frames, or
+libc's stdio/malloc bss locks keep file garbage and self-deadlock), plus
+`pread64` and x86-64 legacy `access`. The real per-ISA glibc (`ld-linux` +
+`libc.so.6`) is **copied from the cross toolchain at build time** into a
+gitignored dir (never committed) and seeded into a ramfs `/lib`; a missing
+runtime lib makes that ISA skip-with-reason (static coverage stays). The
+`linuxdyn` test runs a stock **dynamically-linked glibc C hello** (gcc default
+PIE, unmodified) on **all three ISAs**, exact stdout + exit asserted. This closes
+"unmodified Linux binaries run" for the common dynamic case; the whole
+**L0-L7 Linux personality is complete** - unpatched static and dynamic glibc C,
+unpatched Rust `std`, and the real upstream uutils/coreutils all run as cells,
+kernel-resident like `svc.rs` and adding no kernel object (`execve` of a *dynamic*
+binary and a dynamic Rust/uutils-0.9.x fixture are the documented next steps).
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
@@ -349,12 +374,15 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               async raise, fault->SIGSEGV handler, SIG_DFL terminate),
               linuxproc (L6: fork/execve/wait4/cross-cell pipes - a direct
               multi-process C fixture + the P11 coreutils-suite shell),
-              bench-core, and the interactive
+              linuxdyn (L7: an unmodified dynamically-linked glibc C hello over
+              PT_INTERP + ld-linux + fd-backed mmap), bench-core, and the
+              interactive
               lsh bin (+ harness.rs, vfs_personality.rs); fixtures/ holds the
               ext4 test image (+ gen-ext4.sh); linux-fixtures/ holds the
               built-from-source glibc test binaries (rusthello/ + rustthreads/
-              + hello.c + sig_{raise,segv,dfl}.c + procdemo/cecho/rsh.c;
-              coreutils via cargo install, gitignored)
+              + hello.c + sig_{raise,segv,dfl}.c + procdemo/cecho/rsh.c +
+              dhello.c; coreutils via cargo install, and the L7 ld.so/libc.so.6
+              copied from the toolchain - all gitignored)
 comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md
 xtask/        build/run/test/bench orchestration (cargo xtask ...)
 idl/          system IDL + codegen        (future, step 6)

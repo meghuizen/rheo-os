@@ -11,6 +11,9 @@ pub const PF_W: u32 = 2;
 pub const PF_R: u32 = 4;
 
 const PT_LOAD: u32 = 1;
+/// A `PT_INTERP` segment names the ELF interpreter (`ld-linux-*.so`) that must
+/// load and relocate a dynamically-linked binary (docs/LINUX-COMPAT.md L7).
+const PT_INTERP: u32 = 3;
 
 /// ELF `e_type` values the loader distinguishes.
 pub const ET_EXEC: u16 = 2;
@@ -129,6 +132,24 @@ impl<'a> Elf<'a> {
             }
         }
         found
+    }
+
+    /// The file offset and length of the `PT_INTERP` segment - the NUL-
+    /// terminated path of the ELF interpreter (`ld-linux-*.so`) for a
+    /// dynamically-linked binary (docs/LINUX-COMPAT.md L7), or None for a
+    /// static / static-PIE binary. The path bytes live at `image[offset..
+    /// offset+filesz]`; the caller resolves them through the VFS.
+    pub fn interp(&self) -> Option<(usize, usize)> {
+        for i in 0..self.phnum {
+            let base = self.phoff + i * self.phentsize;
+            if rd_u32(self.image, base)? != PT_INTERP {
+                continue;
+            }
+            let offset = rd_u64(self.image, base + 8)? as usize;
+            let filesz = rd_u64(self.image, base + 32)? as usize;
+            return Some((offset, filesz));
+        }
+        None
     }
 
     /// Like [`for_each_load`], but WITHOUT bounds-checking each segment's file

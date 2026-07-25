@@ -19,6 +19,8 @@ pub mod nr {
     pub const MMAP: u64 = 9;
     pub const MPROTECT: u64 = 10;
     pub const MUNMAP: u64 = 11;
+    pub const PREAD64: u64 = 17;
+    pub const ACCESS: u64 = 21;
     pub const BRK: u64 = 12;
     pub const RT_SIGACTION: u64 = 13;
     pub const RT_SIGPROCMASK: u64 = 14;

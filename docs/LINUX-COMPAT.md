@@ -100,6 +100,7 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 | Syscall | Status | Notes |
 |---|---|---|
 | read / write | full | over the per-cell fd table (console, VFS files, /dev/{null,zero,urandom}) |
+| pread64 | partial | positioned read of a VFS file (lseek+read); ld.so reads ELF headers with it (L7). Non-VFS fds → -EBADF |
 | readv / writev | full | iterate the iovec array over read/write |
 | openat | partial | dirfd is a C `int` (low 32 bits, sign-extended - AT_FDCWD arrives as `0xffffff9c`); AT_FDCWD honored, paths resolved by the VFS; a real (positive) dirfd → -ENOSYS (no suite util needs it). `/dev/{null,zero,urandom,random}` and `/proc/self/auxv` synthesized, else via `FileOps::open` |
 | close | full | frees the slot; closes the VFS fd; reclaims a pipe when both ends close |
@@ -117,9 +118,10 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 | ioctl | partial | TIOCGWINSZ on a console fd → 80x24; every other request -ENOTTY |
 | poll / ppoll | partial | non-blocking readiness only (never waits); answers glibc/Rust fd sanitization at startup |
 | faccessat / faccessat2 | full | existence check via the VFS stat handler |
+| access | full | x86-64 legacy; path in arg0, no dirfd. ld.so probes /etc/ld.so.preload etc. (L7); existence check via the VFS |
 | readlinkat | partial | always -ENOENT (no symlinks in the VFS; /proc/self/exe is not read by the L3 suite - uu 0.0.29 gets argv[0] from `std::env::args`, not the auxv/execfn) |
 | brk | full | heap from the loaded image end; grows/shrinks the cell's own pages |
-| mmap | partial | anonymous MAP_PRIVATE only; fd-backed (L7) and MAP_FIXED → -ENOSYS. A PROT_NONE mapping only **reserves** address space (no frames); accessible mappings are committed eagerly (demand-commit, L4) |
+| mmap | partial | anonymous MAP_PRIVATE **and file-backed MAP_PRIVATE** (L7: read `[offset, offset+len)` from a VFS fd into fresh frames, partial last page zero-filled); **MAP_FIXED** places at the caller's addr, replacing existing pages (ld.so reserves a library's span then overlays each segment). MAP_SHARED of a file is not modeled (ld.so uses PRIVATE). Anonymous mappings are always zeroed - a MAP_FIXED anon overlay of a file-backed reservation discards the file bytes (the library bss). A PROT_NONE mapping only **reserves** address space (no frames); accessible mappings are committed eagerly (demand-commit, L4) |
 | munmap / mprotect | full | leaf unmap+`frames::free` / leaf permission rewrite. `mprotect` making a reserved range accessible **commits** fresh frames (glibc grows a PROT_NONE-reserved arena/stack this way, L4); PROT_NONE decommits |
 | madvise | full | advisory by specification: success, no action |
 | exit | full | ends the calling **thread** (L4): CHILD_CLEARTID clear+futex-wake, then switch to the next ready context; ends the cell only if it was the last |
@@ -232,7 +234,11 @@ syscalls).
     prints usage instead of dispatching - a static-link limitation that hits
     real Linux too, not a rheo gap. 0.0.29's dispatch takes argv[0] straight
     from `std::env::args`, which the kernel supplies, so it dispatches
-    correctly. (When L7 lands dynamic linking, a 0.9.x fixture can be revisited.)
+    correctly. (L7 has since landed **dynamic** linking: a dynamically-linked
+    0.9.x multicall would have a dynamic symbol table, so glibc `getauxval` /
+    rustix `linux_execfn` resolves AT_EXECFN and the multicall dispatches by
+    name - a 0.9.x dynamic fixture is now feasible as future work; the pinned
+    0.0.29 static fixture remains the L3 proof.)
   - **`sort` was dropped** at L3 (uu_sort parallelizes with rayon and spawns
     worker threads via clone/futex) and is **re-enabled at L4** - it now runs
     and its exact sorted output is asserted, proving a real threaded upstream
@@ -353,8 +359,60 @@ syscalls).
     explicitly (the shell does). **Cooperative, single CPU** (inherited from
     L4): a compute-bound process starves peers until it hits a syscall
     boundary - correct for the syscall-driven suite.
-- **L7** - dynamic linking: PT_INTERP -> ld-linux, /lib on the ext4 image,
-  fd-backed private mmap. Proof: a dynamically-linked glibc hello.
+- **L7 [done]** - dynamic linking: running an **unmodified, dynamically-linked
+  glibc binary**. This closes "unmodified Linux binaries run" for the common
+  dynamic case. Three pieces, all per-cell / loader mechanics - **no new kernel
+  object**:
+  - **PT_INTERP + dual-load** (`kernel/src/{elf,load}.rs`): `load_elf_linux`
+    parses the `PT_INTERP` path (`Elf::interp`), and when present loads BOTH the
+    main program (ET_DYN, bias `LINUX_DYN_BASE` 4 GiB) AND the interpreter
+    `ld-linux-*.so` (ET_DYN, bias `LINUX_INTERP_BASE` 64 GiB, well clear of the
+    image/stack/mmap region), streaming the interpreter from the VFS exactly as
+    the program's own file I/O resolves it. Execution starts in ld.so; the auxv
+    (`linux/stack.rs`) carries `AT_BASE` = the interpreter's load bias,
+    `AT_PHDR`/`AT_PHENT`/`AT_PHNUM` = the **main program's**, and `AT_ENTRY` =
+    the **main program's** entry (a new `LinuxImage::at_entry`). **No kernel
+    relocation processing** - ld.so self-relocates, then relocates the program +
+    libc, including initial-exec TLS and IRELATIVE/ifunc relocations, which run
+    to completion on all three ISAs (no `__tls_get_addr` general-dynamic path is
+    exercised by the hello).
+  - **fd-backed `mmap`** (`kernel/src/linux/mem.rs`): file-backed MAP_PRIVATE
+    (read the file range into fresh frames, partial last page zero-filled) plus
+    **MAP_FIXED** (place at the caller's addr, freeing+replacing existing pages).
+    ld.so does exactly this: `mmap(NULL, span, PROT_READ, MAP_PRIVATE, fd, 0)`
+    to reserve a library's whole span, then MAP_FIXED-overlays each segment
+    (text r-x at its file offset, data rw) and an **anonymous** MAP_FIXED for the
+    bss. The bss overlay must yield **zeroed** frames - discarding the file bytes
+    the reservation mapped there - or libc's bss (its stdio/malloc locks) keeps
+    file garbage and self-deadlocks; `mem::mmap`'s anon path frees the existing
+    frames and maps fresh zeroed ones (distinct from `mprotect`'s content-
+    preserving demand-commit). Added `pread64` (ld.so reads ELF headers with it)
+    and x86-64 legacy `access` (ld.so's /etc/ld.so.preload probe).
+  - **/lib populated with the real per-ISA glibc**: the `linuxdyn` test seeds a
+    ramfs with the toolchain's actual `ld-linux-*.so` (at its `PT_INTERP` path)
+    and `libc.so.6` (`/lib`, found via `LD_LIBRARY_PATH=/lib` in envp). The `.so`
+    blobs are copied from the cross toolchains at build time by xtask
+    `build_dyn_fixture` (x86-64 from the host `/lib/x86_64-linux-gnu`, aarch64
+    from `/usr/aarch64-linux-gnu/lib`, riscv64 from `/usr/riscv64-linux-gnu/lib`)
+    and are **never committed** (the fixture build dir is gitignored). If a
+    runtime `.so` cannot be located for an ISA, `build_dyn_fixture` writes a
+    1-byte placeholder and `linuxdyn` **skips-with-reason** for that ISA (the
+    static L2-L6 coverage stays the floor); all three toolchains are present in
+    the build/CI environment here, so **all three ISAs genuinely pass**.
+  - Proof (`linuxdyn`, all three ISAs, exact stdout + exit): a stock
+    **dynamically-linked (non-static) glibc C hello** (`dhello`, ET_DYN/PIE,
+    built with the ISA's gcc and NO `-static`/`-no-pie` - the default), loaded
+    with `/lib` seeded from the toolchain, prints `hello from dynamic glibc` and
+    exits 12. The syscall log surfaces the real dynamic-startup sequence (brk,
+    access, openat/pread64/fstat on /lib, mmap fd-backed + MAP_FIXED, mprotect
+    for RELRO, arch_prctl/set_tid_address/set_robust_list, rseq→ENOSYS,
+    prlimit64) then main's write + exit_group.
+  - Accommodations, disclosed: **`execve` of a dynamic binary is not wired** -
+    the streaming `execve` path stays static/static-PIE only; the `linuxdyn`
+    proof loads the dynamic binary directly. A dynamic **Rust** `std` hello is
+    not built (it additionally needs `libgcc_s.so.1`/`libm.so.6` seeded); the C
+    hello is the L7 proof. **MAP_SHARED of a file** stays unmodeled (ld.so uses
+    PRIVATE).
 
 ## 6. Fixture build matrix (reproducibility)
 
@@ -390,9 +448,29 @@ static-glibc ET_EXEC via the same recipe), the `linuxproc` proof: `procdemo`
 from the VFS), and `rsh` (a minimal from-scratch POSIX-ish shell - pipelines +
 `&&`/`||` over fork/execve/wait4/pipe2/dup2 - for the P11 gate). `rsh` execs the
 L3 `coreutils` 0.0.29 multicall (already in the fixture matrix) from a ramfs, so
-the P11 suite is the real upstream Rust coreutils driven by a shell. Note: `rsh`
-is a purpose-built shell, not dash/busybox - a full shell cross-build for three
-ISAs was out of budget; `rsh` is honest about what it exercises (the L6 process
+the P11 suite is the real upstream Rust coreutils driven by a shell.
+
+The **L7 dynamic fixture** (`tests/linux-fixtures/dhello.c`, the `linuxdyn`
+proof) is the one binary built **dynamically** - stock ET_DYN/PIE, no
+`-static`/`-no-pie` (gcc's default) - so its `PT_INTERP` names the real
+`ld-linux`. Its runtime dependencies (the dynamic linker + `libc.so.6`) are
+**not built** but **copied from the cross toolchain** at build time by xtask
+`build_dyn_fixture` into the gitignored fixture build dir (never committed), and
+the `linuxdyn` test seeds them into a ramfs `/lib` so ld.so resolves them:
+
+| ISA | dynamic C (gcc, PIE) | ld.so source (interp path) | libc.so.6 source |
+|---|---|---|---|
+| x86_64 | host `gcc` | `/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2` (interp `/lib64/ld-linux-x86-64.so.2`) | `/lib/x86_64-linux-gnu/libc.so.6` |
+| aarch64 | `aarch64-linux-gnu-gcc` | `/usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1` (interp `/lib/ld-linux-aarch64.so.1`) | `/usr/aarch64-linux-gnu/lib/libc.so.6` |
+| riscv64 | `riscv64-linux-gnu-gcc` | `/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1` (interp `/lib/ld-linux-riscv64-lp64d.so.1`) | `/usr/riscv64-linux-gnu/lib/libc.so.6` |
+
+If a runtime `.so` is missing for an ISA, that ISA's dynamic fixture is
+**skipped-with-reason** (a 1-byte placeholder is written; `linuxdyn` detects it
+and skips), keeping the static L2-L6 coverage. All three toolchains are present
+in the build/CI environment here, so **all three ISAs genuinely pass**. Note:
+`rsh` (below) is a purpose-built shell, not dash/busybox - a full shell
+cross-build for three ISAs was out of budget; `rsh` is honest about what it
+exercises (the L6 process
 primitives) and its source is in the tree.
 
 All three cross toolchains and `*-unknown-linux-gnu` rustup targets are

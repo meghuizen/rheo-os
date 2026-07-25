@@ -289,6 +289,31 @@ impl FdTable {
         }
     }
 
+    /// Read up to `len` bytes at file `offset` from a VFS-backed fd into the
+    /// (kernel or user) VA `dst`, without disturbing the caller's view of the
+    /// fd position beyond an explicit seek. Backs `pread64` and the L7
+    /// fd-backed `mmap` (docs/LINUX-COMPAT.md L7): ld.so `pread`s ELF headers
+    /// and `mmap`s library segments from the same fd. Only VFS files are
+    /// readable this way; other fd kinds return -EBADF (ld.so maps regular
+    /// files only). A short read leaves the tail of `dst` untouched (mmap
+    /// pre-zeroes its frames).
+    pub fn pread(&self, fd: i64, dst: u64, len: u64, offset: i64) -> i64 {
+        let Some(slot) = usize_fd(fd) else {
+            return -EBADF;
+        };
+        match self.fds[slot] {
+            FdKind::Vfs { vfs_fd, .. } => match svc::file_ops() {
+                Some(o) => {
+                    (o.lseek)(vfs_fd as u64, offset, 0); // SEEK_SET
+                    (o.read)(vfs_fd as u64, dst, len)
+                }
+                None => -EBADF,
+            },
+            FdKind::Closed => -EBADF,
+            _ => -EBADF,
+        }
+    }
+
     /// openat(dirfd, path, flags, mode). L2: absolute paths (or AT_FDCWD with
     /// an absolute path) only. `/dev/{null,zero,urandom,random}` are
     /// synthesized; everything else forwards to `FileOps::open`.
