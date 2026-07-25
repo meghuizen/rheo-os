@@ -363,9 +363,37 @@ runtime enforcement is SMP/preemption-gated (task #27) - the runtime is
 single-CPU cooperative, so parallel strands interleave and a reservation is an
 admitted, not-yet-scheduled guarantee; the CPU engine is the only real engine
 (GPU/NPU accelerators ride the same graph/engine API as attested-firmware future
-work); a free-form graph's buffer-reduce node is the documented next step. Phases
-D-F (the kernel's first interrupt + terminal, IPC/compositor, process/time/net)
-are planned in docs/LIBRHEO.md.
+work); a free-form graph's buffer-reduce node is the documented next step.
+
+**Phase D** brings up the **kernel's first hardware interrupt** and the terminal.
+A native cell blocking on console input (`SYS_WAIT_INPUT`) parks, and the kernel
+idles until a byte arrives instead of spinning - the OS's **first block-and-wake**.
+Bytes land in a portable kernel-side **RX ring** (`kernel/src/input.rs`); the
+reactor gains a console-read slot (`rt::read_console`) that parks a strand and, when
+no queue completion is ready, blocks in `SYS_WAIT_INPUT`. The interrupt path is
+boot-critical and opt-in (`arch::enable_uart_rx_irq`, called only by the Phase D
+test, so the other 26 kernels are untouched): **on RISC-V it is interrupt-driven** -
+the 16550 UART's IRQ (source 10) is routed through the **AIA** (S-mode APLIC in
+MSI mode -> S-mode IMSIC via the `siselect`/`sireg`/`stopei` CSRs -> `sip.SEIP`),
+and the kernel takes the S external interrupt to drain the UART, halting at `wfi`
+(cells run with `sstatus.SIE` clear; SIE is set only to service a pending SEI after
+`wfi` woke on it) - a genuine 0%-CPU park. **x86-64 and ARM64 poll** (their
+IOAPIC/LAPIC and GICv3+PL011 bring-up is the documented next step; honest, not
+0%-idle). On top of the raw byte substrate, librheo gained **`term`** - the
+byte-stream terminal discipline: `input` (a decoder: CSI/SS3 escape sequences ->
+typed `Key`s, UTF-8, control chars, async `next_key().await`), `edit` (a line
+editor with insertion, cursor moves, word/line kill, history recall, completion
+hook), and `render` (a buffered, minimal-diff renderer, batched writes). The
+`librheoterm` test drives a read-eval loop with scripted keystrokes (typing,
+backspace, cursor-left + insert, an arrow-key escape, Up-arrow history) and asserts
+the exact committed lines + exit on **all three ISAs**, plus the idle-park (kernel
+idled at `wfi`) on RISC-V. Honest: only RISC-V is interrupt-driven (and QEMU's 16550
+loopback does not drive the APLIC line, so the deterministic test raises the UART's
+MSI in the IMSIC directly - exactly the MSI the configured APLIC would send; the
+byte is genuinely received and a genuine S external interrupt genuinely wakes `wfi`,
+docs/LIBRHEO.md Phase D). This is "wake on input", not preemptive scheduling
+(SMP/#27). Phases E-F (IPC/compositor, process/time/net) are planned in
+docs/LIBRHEO.md.
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
@@ -421,7 +449,9 @@ kernel/       the no_std kernel library + boot demo bin
   src/        ISA-independent: capability core, queue ABI, cells, mm
               (frames + grants), time (clock), rng (ChaCha20 DRBG +
               hwrng seeding), event streams,
-              sched (reservations), lease, engine, graph, pty, svc
+              sched (reservations), lease, engine, graph, pty, input
+              (kernel RX ring + the SYS_WAIT_INPUT park-until-input primitive -
+              docs/LIBRHEO.md Phase D), svc
               (shell/resource/POSIX-file syscalls), hw (ACPI/FDT/PCIe
               discovery + the machine Inventory; block BlockDevice trait +
               virtio_blk driver), elf + load (ELF loader for native
@@ -444,7 +474,10 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               mini-DuckDB scan - typed grants + async I/O opcodes + a zero-copy
               columnar scan off a live virtio-blk disk), librheocompute (librheo
               Phase C: parallel map_reduce + a userspace graph submitted to the
-              CPU engine + reservation admission), coreutils (the coreutils multicall cell, with
+              CPU engine + reservation admission), librheoterm (librheo Phase D:
+              the first interrupt-driven console wakeup + the term byte-stream
+              discipline - scripted editing/history/escape, idle-park on RISC-V),
+              coreutils (the coreutils multicall cell, with
               argv + std::fs over the VFS), linuxrun (Personality::Linux:
               bare Linux-ABI programs plus, at L2, unpatched static-glibc
               Rust + C hellos), linuxtools (L3: the unmodified upstream

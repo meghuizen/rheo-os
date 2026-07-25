@@ -29,3 +29,7 @@ path = "src/bin/librheo-data.rs"
 [[bin]]
 name = "librheo-compute"
 path = "src/bin/librheo-compute.rs"
+
+[[bin]]
+name = "librheo-term"
+path = "src/bin/librheo-term.rs"

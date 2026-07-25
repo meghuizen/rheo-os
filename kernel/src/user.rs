@@ -15,6 +15,7 @@ use crate::abi::{
     GrantInfo, QueueInfo, ReserveInfo, SYS_COMMIT, SYS_CYCLES, SYS_DECOMMIT, SYS_DOORBELL,
     SYS_EXIT, SYS_EXIT_GROUP, SYS_GRANT, SYS_MMAP, SYS_MMAP_FILE, SYS_MUNMAP, SYS_QUEUE_INFO,
     SYS_RESERVE_ADMIT, SYS_RESERVE_QUERY, SYS_RESERVE_RELEASE, SYS_SEAL, SYS_SWITCH,
+    SYS_WAIT_INPUT,
 };
 use crate::arch::{self, FaultCause, MapPerm, TrapFrame, TrapKind};
 use crate::capability::{BUDGET_UNLIMITED, CapTable, MAP, ObjectKind, ObjectTable, READ, WRITE};
@@ -914,6 +915,14 @@ pub fn on_user_trap(
         SYS_RESERVE_RELEASE => {
             let r = reserve_release(cur, args[0] as u32);
             arch::set_syscall_ret(unsafe { &mut *frame }, r);
+            frame
+        }
+        // Block until console input is available (docs/LIBRHEO.md Phase D). The
+        // OS's first block-and-wake: the kernel idles here (WFI where the UART
+        // RX interrupt is wired, poll otherwise) until a byte arrives.
+        SYS_WAIT_INPUT => {
+            let n = crate::input::wait_input(args[0], args[1] as usize);
+            arch::set_syscall_ret(unsafe { &mut *frame }, n as u64);
             frame
         }
         // Shell / resource / file syscalls are handled by the system-service

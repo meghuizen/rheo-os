@@ -85,6 +85,10 @@ name = "librheocompute"
 path = "src/librheocompute.rs"
 
 [[bin]]
+name = "librheoterm"
+path = "src/librheoterm.rs"
+
+[[bin]]
 name = "coreutils"
 path = "src/coreutils.rs"
 

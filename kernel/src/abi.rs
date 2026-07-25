@@ -196,6 +196,18 @@ pub const SYS_RESERVE_QUERY: u64 = 40;
 /// utilization (the RAII drop path). `u64::MAX` if the handle is not live.
 pub const SYS_RESERVE_RELEASE: u64 = 41;
 
+// ---- console input / the first block-and-wake (docs/LIBRHEO.md Phase D) ----
+
+/// wait_input(buf_va, len) -> nbytes. **Block** until at least one console
+/// input byte is available, copy up to `len` bytes into the cell buffer at
+/// `buf_va`, and return the count (0 = end of input). The OS's first
+/// block-and-wake: a native cell with nothing to do parks here and the kernel
+/// idles (WFI/HLT where the ISA's UART RX interrupt is wired, per-ISA in
+/// `kernel/src/arch`; a poll otherwise). The RX bytes come from a kernel-side
+/// ring (`kernel/src/input.rs`) so keystrokes typed while a cell computes are
+/// not lost. librheo's `term` builds its async input on this.
+pub const SYS_WAIT_INPUT: u64 = 42;
+
 /// The `SYS_ENGINE_INFO` result block (kept in sync with librheo's `compute`
 /// arm). `kind`: 0=CPU (the only real engine in QEMU; GPU/NPU are attested-
 /// firmware future work). `preemption`: 0=per-instruction, 1=per-op-boundary.

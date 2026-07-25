@@ -87,6 +87,24 @@ pub fn serial_read_byte() -> Option<u8> {
     }
 }
 
+// -------------------------------------------- console input wakeup seam
+// docs/LIBRHEO.md Phase D. Poll build: no PL011 RX interrupt is wired (the
+// GICv3 + PL011 IMSC.RXIM path is the documented next step), so the portable
+// input path (kernel/src/input.rs) polls the UART.
+
+/// Whether the UART RX interrupt is wired (false = poll path).
+pub fn uart_irq_enabled() -> bool {
+    false
+}
+/// Bring up the UART RX interrupt (GICv3 + PL011 IMSC.RXIM) - not yet on ARM64,
+/// so this leaves the poll path in place. Called only by the Phase D test.
+pub fn enable_uart_rx_irq() {}
+/// Halt until an interrupt (only called when `uart_irq_enabled`).
+pub fn idle_wait() {}
+/// Deliver a scripted byte through the real UART RX interrupt then halt until it
+/// is taken (only called when `uart_irq_enabled`).
+pub fn uart_inject_and_wait(_b: u8) {}
+
 // ----------------------------------------------------------------- traps
 
 unsafe extern "C" {

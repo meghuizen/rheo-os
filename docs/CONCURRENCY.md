@@ -59,6 +59,17 @@ RT-reservation mutexes in the L4 suite), and multiple *vcores* (real SMP
 parallelism) still awaits secondary-core bring-up. The native strand runtime
 (sections 1-3) remains the single-vcore userspace scheduler.
 
+**The first real wakeup (docs/LIBRHEO.md Phase D).** Until Phase D, "park on a
+token" was closed only by a synchronous doorbell drain - a reactor with nothing
+ready could only spin, because the kernel had **no interrupts on any ISA**. Phase
+D adds the OS's **first block-and-wake**: a librheo `term` cell whose strand parks
+on console input drives the reactor to block in `SYS_WAIT_INPUT`, and the kernel
+**idles at `wfi` until the UART RX interrupt delivers a byte** (RISC-V, S-mode
+external via the AIA IMSIC) instead of spinning - a genuine 0%-CPU park, one
+wakeup resuming the parked strand. x86-64/ARM64 still poll (their
+interrupt-controller bring-up is pending); the general completion-queue IRQ and
+the preemption doorbell (section 4) remain future work.
+
 ## 2. Both stack disciplines
 
 - **Stackless** (async state machines): bytes per strand, no stack, maximum

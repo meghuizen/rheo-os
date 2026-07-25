@@ -24,6 +24,7 @@ pub mod engine;
 pub mod event;
 pub mod graph;
 pub mod hw;
+pub mod input;
 pub mod lease;
 pub mod linux;
 pub mod load;

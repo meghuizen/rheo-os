@@ -27,6 +27,13 @@ pub struct Reactor {
     /// Completions drained but not yet claimed by their awaiting strand,
     /// keyed by the token (`user_data`) the strand parked on.
     results: BTreeMap<u64, CqEntry>,
+    /// A pending console read: `(buf_va, len, token)`. One reader at a time - a
+    /// terminal has a single input stream (docs/LIBRHEO.md Phase D). Serviced by
+    /// `block_on` when no queue completion is ready, by blocking in the kernel
+    /// (`SYS_WAIT_INPUT`) until input arrives - the terminal idle path.
+    console_req: Option<(u64, usize, u64)>,
+    /// Byte count the last serviced console read returned.
+    console_n: usize,
 }
 
 impl Reactor {
@@ -55,6 +62,29 @@ impl Reactor {
     fn take(&mut self, token: u64) -> Option<CqEntry> {
         self.results.remove(&token)
     }
+
+    /// Register a pending console read (the strand parks on `token`).
+    fn set_console_read(&mut self, buf: u64, len: usize, token: u64) {
+        self.console_req = Some((buf, len, token));
+    }
+
+    /// Service a pending console read by **blocking in the kernel** until input
+    /// arrives, then wake its strand. Returns false if none was pending. This is
+    /// where the terminal idles: the kernel halts (or polls) inside
+    /// `SYS_WAIT_INPUT` while every strand is parked.
+    fn service_console(&mut self) -> bool {
+        if let Some((buf, len, token)) = self.console_req.take() {
+            self.console_n = sys::wait_input(buf as *mut u8, len);
+            complete(token);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn console_result(&self) -> usize {
+        self.console_n
+    }
 }
 
 static mut REACTOR: Option<Reactor> = None;
@@ -68,6 +98,8 @@ pub fn init(caps: &CapSet, qp_va: u64) {
         qp,
         cap_id: caps.queue_cap_id(),
         results: BTreeMap::new(),
+        console_req: None,
+        console_n: 0,
     };
     // SAFETY: single-CPU cooperative cell; init runs once before any strand.
     unsafe {
@@ -103,10 +135,27 @@ pub async fn submit_and_await_flags(op: u8, flags: u8, args: [u8; 24]) -> CqEntr
     with_reactor(|r| r.take(token)).expect("librheo: completion missing after wake")
 }
 
+/// Block-and-wake console read: register a request, park until the reactor
+/// services it (the kernel idles until input where the UART RX interrupt is
+/// wired, polls otherwise), and return the byte count (0 = end of input). The
+/// terminal's async input substrate (`term`, docs/LIBRHEO.md Phase D): while
+/// this strand is parked the vcore runs the others, and only when they have all
+/// parked does the reactor block in the kernel for a byte.
+///
+/// # Safety
+/// `buf` must point at `len` writable bytes that outlive the await (the kernel
+/// writes them during `SYS_WAIT_INPUT`).
+pub async fn read_console(buf: *mut u8, len: usize) -> usize {
+    let token = next_token();
+    with_reactor(|r| r.set_console_read(buf as u64, len, token));
+    park_on(token).await;
+    with_reactor(|r| r.console_result())
+}
+
 /// Drive `root` (and every strand it spawns) to completion, servicing the
 /// queue whenever no strand is ready. The userland event loop: run ready
-/// strands, and when they have all parked, ring the doorbell + drain + wake,
-/// then run again.
+/// strands; when they have all parked, ring the doorbell + drain + wake; and if
+/// nothing was ready there, block for console input (the terminal idle path).
 pub fn block_on<F: Future<Output = ()> + 'static>(root: F) {
     spawn(root);
     let mut guard: u32 = 0;
@@ -116,8 +165,16 @@ pub fn block_on<F: Future<Output = ()> + 'static>(root: F) {
             break;
         }
         let woke = with_reactor(|r| r.pump());
-        guard += 1;
-        assert!(woke > 0 || guard < 4, "librheo: reactor made no progress");
+        if woke > 0 {
+            guard = 0; // queue completions woke strands: progress
+        } else if with_reactor(|r| r.service_console()) {
+            guard = 0; // blocked for console input and woke its strand: progress
+        } else {
+            // No completion, no console read: allow a few settling iterations
+            // (join hand-offs), then declare no progress.
+            guard += 1;
+            assert!(guard < 4, "librheo: reactor made no progress");
+        }
         assert!(guard < 100_000, "librheo: reactor ran away (deadlock)");
     }
 }

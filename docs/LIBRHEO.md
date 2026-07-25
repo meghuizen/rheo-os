@@ -375,9 +375,106 @@ only if every stage passed:
 4. **engine info** - the engine kind + measured throughput are printed (visible,
    not asserted-exact).
 
+## Phase D - the kernel's first interrupt + the terminal (this milestone)
+
+Phase D delivers the OS's **first block-and-wake**: a native cell with nothing to
+do parks, and the kernel idles until console input arrives instead of spinning.
+On top of it librheo grows **`term`**, the byte-stream terminal discipline a
+bash-quality shell is built on. The proof is the `librheoterm` test kernel: a cell
+runs an interactive read-eval loop over `term`, driven by scripted keystrokes that
+exercise editing, history, and an escape sequence, and exits `0x42` only if every
+committed line is exact - on all three ISAs.
+
+### Kernel surface added (Phase D)
+
+- **`SYS_WAIT_INPUT` (42)** - `wait_input(buf_va, len) -> nbytes`. **Blocks**
+  until at least one console input byte is available, copies up to `len` bytes
+  into the cell buffer, and returns the count (0 = end of input). The first
+  block-and-wake: the kernel idles here (WFI where the UART RX interrupt is wired,
+  a poll otherwise). This is **mechanism** (the arm-doorbell / completion-delivery
+  the plan names), not a new kernel object - it passes the docs/ARCHITECTURE.md 6
+  admission rule.
+- **a kernel-side RX ring** (`kernel/src/input.rs`, portable) - received bytes are
+  buffered here, so a keystroke typed while a cell computes is not lost (the
+  16-byte UART FIFO is the only other buffer). The producer is the UART RX
+  interrupt handler where one is wired, or the poll path; the consumer is
+  `wait_input`. A scripted source (headless tests) feeds the same path.
+
+The reactor (`rt`) grows a **console-read** slot: `rt::read_console(buf, len)`
+registers a request and parks the strand; `block_on`, when no queue completion is
+ready, services it by blocking in `SYS_WAIT_INPUT` - the terminal idle path. One
+reader at a time (a terminal has a single input stream). While the reader is
+parked the vcore runs the other strands; only when they have all parked does the
+kernel block for a byte. This is the docs/CONCURRENCY.md 1 park-on-a-token model
+finally closed by a real wakeup.
+
+### The interrupt path, per ISA (honest)
+
+This is the kernel's first hardware interrupt, and it is boot-critical, so it was
+brought up one ISA at a time behind an explicit, opt-in enable
+(`arch::enable_uart_rx_irq`, called only by the Phase D test) - the other 26 test
+kernels never touch it and run exactly as before.
+
+- **RISC-V 64 - interrupt-driven.** QEMU `virt` with `aia=aplic-imsic` routes the
+  16550 UART's IRQ (source 10) through the **AIA**: the S-mode APLIC
+  (`aplic@d000000`, MSI-delivery mode) raises an MSI into the S-mode IMSIC
+  (`imsics@28000000`, one interrupt file per hart, reached through the indirect
+  CSRs `siselect`/`sireg`/`stopei`), which drives `sip.SEIP`. The kernel enables
+  the UART's RX-data interrupt (IER bit 0), configures the S-APLIC (source 10
+  delegated by M-mode, level-high, MSI target = this hart + EIID 10) and the
+  S-IMSIC (`eidelivery`/`eithreshold`/`eie`), and takes the supervisor external
+  interrupt (`scause` = interrupt | 9) in the kernel trap handler, draining the
+  UART into the RX ring. Cells run with `sstatus.SIE` clear (a U-mode SEI would
+  look like a fault); the kernel sets SIE only briefly, after `wfi` woke on a
+  pending SEI, to service it - so `SYS_WAIT_INPUT` is a **genuine 0%-CPU park**.
+  The `librheoterm` test asserts the kernel actually idled at `wfi`
+  (`input::did_idle`). *QEMU caveat, documented for honesty:* QEMU's 16550
+  loopback (used to inject a deterministic scripted keystroke into the RX FIFO)
+  delivers the byte to the receiver but does **not** drive the APLIC's input line,
+  so the test raises the UART's MSI in the IMSIC directly - which is exactly the
+  MSI the configured S-APLIC would send. The byte is genuinely received, a genuine
+  S external interrupt genuinely fires, and the CPU genuinely halts at `wfi` until
+  it does; the full UART->APLIC->IMSIC wiring is configured but not exercised
+  end-to-end by loopback in this harness.
+- **x86-64 - poll.** The IOAPIC RTE for ISA IRQ4 + LAPIC + the 16550 IER path is
+  the documented next step; today `SYS_WAIT_INPUT` polls COM1 (the CPU spins -
+  honest, not 0%-idle). `input::interrupt_driven()` reports false.
+- **ARM64 - poll.** The GICv3 (GICD/GICR) + PL011 `IMSC.RXIM` path is the
+  documented next step; today `SYS_WAIT_INPUT` polls the PL011.
+
+`input::interrupt_driven()` reports which mode an ISA is in; the test asserts the
+idle-park only where it is interrupt-driven, and prints the mode either way.
+
+### librheo `term` (Phase D)
+
+| module | role |
+| --- | --- |
+| `term::input` | a decoder turning the raw console byte stream into typed [`Key`]s - CSI (`ESC [ ...`) and SS3 (`ESC O ...`) escape sequences (arrows, Home/End/Delete/Insert/PageUp-Down, F1..F12), UTF-8 codepoints, control chars - with an async `next_key().await` that parks on the input completion (`rt::read_console`). Escape/keymap decoding is userland, never kernel (docs/SHELL.md 1). |
+| `term::edit` | a line editor over a `Vec<char>` buffer: insertion, cursor movement (left/right/home/end), backspace/delete, word-kill (^W) and line-kill (^U/^K), history recall (up/down with a stashed fresh line), and a completion hook (Tab) - the reedline/rustyline-class core. Returns an `Edit` (`Commit`/`Redraw`/`Eof`/`Noop`). |
+| `term::render` | a buffered, minimal-diff renderer: batched writes (one buffer, one `write` - not a syscall per byte), line repaint with erase-to-EOL (CSI K) so a shorter line clears leftovers, and absolute cursor positioning. ANSI escapes emitted in userland. |
+
+Raw mode is the default (no kernel echo or line discipline - librheo owns it); the
+byte stream (`rt::read_console`) is the primary API, with the typed `Key` layer on
+top. Typed `KeyEvent`/control channels (SHELL.md 1) remain an optional later layer.
+
+### The proof: `librheoterm`
+
+`librheo-term` runs the read-eval loop over `term` and is fed the scripted
+keystrokes `"worlq"<BS>"d"<CR>` -> `world`, `"helo"<Left>"l"<CR>` -> `hello`,
+`<Up><Up><CR>` -> `world` (recall the older history entry). It exercises typing,
+backspace, cursor-left + insert, an escape sequence (arrows), and history recall,
+verifies the three committed lines exactly, and exits `0x42`. The test asserts the
+exit code on all three ISAs, and on RISC-V additionally asserts the kernel idled at
+`wfi` (interrupt-driven), printing the input mode (interrupt-driven / poll) either
+way.
+
+Honest accounting: RISC-V is interrupt-driven (with the loopback/APLIC caveat
+above); x86-64 and ARM64 are on the poll path (their interrupt-controller bring-up
+- IOAPIC/LAPIC, GICv3+PL011 - is the documented next step). The cooperative,
+single-CPU model is unchanged: this is "wake on input", not preemptive scheduling
+(SMP/preemption is task #27).
+
 ## Later phases (planned, not in this milestone)
 
-D - the kernel's **first interrupt** (UART RX IRQ + park-until-completion +
-0%-CPU idle) and the `term` byte-stream terminal. E - services & IPC (cross-cell
-connect, a Wayland-class compositor demo). F - process/time/net + a
-librheo-native shell. See the plan for the full sequence.
+E - services & IPC (cross-cell connect, a Wayland-class compositor demo). F -
+process/time/net + a librheo-native shell. See the plan for the full sequence.

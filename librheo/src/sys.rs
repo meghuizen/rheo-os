@@ -47,6 +47,10 @@ pub const SYS_RESERVE_ADMIT: u64 = 39;
 pub const SYS_RESERVE_QUERY: u64 = 40;
 /// reserve_release(cap_id) -> 0 | u64::MAX. Frees an admitted reservation.
 pub const SYS_RESERVE_RELEASE: u64 = 41;
+/// wait_input(buf_va, len) -> nbytes. Block until console input is available;
+/// copy up to `len` bytes to `buf` and return the count (0 = end of input).
+/// The OS's first block-and-wake (docs/LIBRHEO.md Phase D); `term` builds on it.
+pub const SYS_WAIT_INPUT: u64 = 42;
 
 // ---- raw syscall stubs (from libc/src/sys.rs) ----
 
@@ -283,6 +287,12 @@ pub fn write(fd: u64, buf_va: u64, len: u64) -> i64 {
 }
 pub fn random_u64() -> u64 {
     unsafe { syscall1(SYS_RANDOM, 0) }
+}
+/// Block until at least one console input byte is available; copy up to `len`
+/// bytes into `buf` and return the count (0 = end of input). The kernel idles
+/// (WFI where the UART RX interrupt is wired, poll otherwise) while blocked.
+pub fn wait_input(buf: *mut u8, len: usize) -> usize {
+    unsafe { syscall2(SYS_WAIT_INPUT, buf as u64, len as u64) as usize }
 }
 /// Ring the doorbell; returns the number of completions produced.
 pub fn doorbell() -> usize {

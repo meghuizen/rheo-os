@@ -32,6 +32,7 @@ pub mod sched;
 mod start;
 pub mod store;
 pub mod sys;
+pub mod term;
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -39,8 +40,8 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     sys::exit(0xFE)
 }
 
-/// Formatted write to stdout (fd 1) with a trailing newline. A minimal
-/// print for bring-up; the full `term` renderer arrives in a later phase.
+/// Formatted write to stdout (fd 1) with a trailing newline. A minimal print;
+/// the buffered, cursor-aware terminal renderer is [`term::render`].
 #[macro_export]
 macro_rules! println {
     () => { $crate::print!("\n") };

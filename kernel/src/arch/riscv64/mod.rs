@@ -92,6 +92,163 @@ pub fn serial_read_byte() -> Option<u8> {
     }
 }
 
+// -------------------------------------------- console input wakeup seam
+// docs/LIBRHEO.md Phase D: the kernel's first interrupt. QEMU riscv `virt`
+// with `aia=aplic-imsic` delivers the 16550 UART's IRQ (source 10) through the
+// **AIA**: the S-mode APLIC (`aplic@d000000`, MSI-delivery mode) raises an MSI
+// into the S-mode IMSIC (`imsics@28000000`, one interrupt file per hart, reached
+// through the S-mode indirect CSRs siselect/sireg/stopei), which drives
+// `sip.SEIP`. We enable the UART's RX-data interrupt (IER bit 0) and take the
+// S external interrupt (`scause` = interrupt | 9) in the kernel trap handler,
+// where it drains the UART into the kernel RX ring (kernel/src/input.rs).
+//
+// Interrupts fire only in kernel context: cells run with `sstatus.SIE` clear
+// (a U-mode SEI would look like a fault), and we set SIE only briefly, inside
+// `idle_wait`/`uart_inject_and_wait`, to service a pending SEI after `wfi` woke
+// on it. That makes `SYS_WAIT_INPUT` a genuine 0%-CPU park.
+
+// AIA S-mode indirect CSRs (Ssaia): siselect=0x150, sireg=0x151, stopei=0x15c
+// (written as numeric literals in asm so an older assembler without AIA CSR
+// names still accepts them).
+/// `scause` for a supervisor external interrupt: interrupt bit | cause 9.
+const SCAUSE_S_EXT: u64 = (1 << 63) | 9;
+
+/// S-mode APLIC MMIO base (`aplic@d000000`), reached through the high linear map.
+const APLIC_S_BASE: usize = 0x0d00_0000 | KERNEL_VA_BASE;
+/// The 16550 UART's APLIC interrupt source number (device tree: serial IRQ 10).
+const UART_SOURCE: usize = 10;
+/// The IMSIC external interrupt identity we route the UART MSI to.
+const UART_EIID: u32 = 10;
+/// The 16550 IER (offset 1) and MCR (offset 4).
+const UART_IER: *mut u8 = (0x1000_0000 | KERNEL_VA_BASE) as *mut u8;
+const UART_MCR: *mut u8 = ((0x1000_0000 + 4) | KERNEL_VA_BASE) as *mut u8;
+
+static mut IRQ_ENABLED: bool = false;
+
+/// Whether the UART RX interrupt is wired on this ISA (set by
+/// [`enable_uart_rx_irq`]). While false the portable input path polls.
+pub fn uart_irq_enabled() -> bool {
+    // SAFETY: single CPU; set once before any cell runs.
+    unsafe { *core::ptr::addr_of!(IRQ_ENABLED) }
+}
+
+/// Bring up the UART RX interrupt through the AIA (APLIC-S + IMSIC-S) and the
+/// 16550 IER, and enable S external interrupts. Idempotent-ish; call once before
+/// running a cell that waits on console input. On a machine without the AIA (or
+/// where M-mode did not delegate it) the CSR writes would trap - this is called
+/// only by the Phase D test path, so no other kernel is affected.
+pub fn enable_uart_rx_irq() {
+    let hart = boot_hartid();
+    unsafe {
+        // --- IMSIC S-file (via indirect CSRs): enable delivery, no threshold,
+        // enable the UART's EIID. ---
+        imsic_write(0x70, 1); // eidelivery = 1
+        imsic_write(0x72, 0); // eithreshold = 0 (deliver all enabled)
+        imsic_write(0xC0, 1 << UART_EIID); // eie0 |= bit(EIID) (EIID < 64)
+
+        // --- APLIC S-domain (MSI-delivery mode) ---
+        let aplic = APLIC_S_BASE as *mut u32;
+        aplic.write_volatile((1 << 8) | (1 << 2)); // domaincfg: IE=1, DM=1 (MSI)
+        // sourcecfg[UART_SOURCE] = 6 (SM = Level1, active-high).
+        aplic
+            .byte_add(0x0004 + (UART_SOURCE - 1) * 4)
+            .write_volatile(6);
+        // target[UART_SOURCE] = (hart << 18) | EIID  (MSI to this hart's IMSIC).
+        aplic
+            .byte_add(0x3000 + UART_SOURCE * 4)
+            .write_volatile(((hart as u32) << 18) | UART_EIID);
+        // setienum = UART_SOURCE (enable the source).
+        aplic.byte_add(0x1EDC).write_volatile(UART_SOURCE as u32);
+
+        // --- 16550: OUT2 (gate IRQ on) + enable RX-data-available interrupt. ---
+        UART_MCR.write_volatile(0x08); // OUT2
+        UART_IER.write_volatile(0x01); // ERBFI: received-data-available interrupt
+
+        // --- Enable S external interrupts (sie.SEIE, bit 9); keep sstatus.SIE
+        // clear so the SEI is taken only when we ask (in idle_wait). ---
+        asm!("csrrs x0, sie, {0}", in(reg) 1u64 << 9);
+
+        *core::ptr::addr_of_mut!(IRQ_ENABLED) = true;
+    }
+}
+
+/// Write `val` to the IMSIC S-file register selected by `sel` (via siselect/sireg).
+///
+/// # Safety
+/// The AIA S-mode CSRs must be accessible (Ssaia + M-mode delegation).
+unsafe fn imsic_write(sel: u64, val: u64) {
+    unsafe {
+        asm!(
+            "csrw 0x150, {s}", // siselect
+            "csrw 0x151, {v}", // sireg
+            s = in(reg) sel, v = in(reg) val,
+        );
+    }
+}
+
+/// Drain the UART RX FIFO into the kernel ring and claim the interrupt in the
+/// IMSIC S-file. Called from the kernel trap handler on a supervisor external
+/// interrupt. Draining first (level low) then claiming avoids a re-assert.
+fn handle_uart_irq() {
+    // Drain the UART.
+    while let Some(b) = serial_read_byte() {
+        crate::input::rx_push(b);
+    }
+    // Claim the top external interrupt (a write to stopei clears its pending bit).
+    // SAFETY: stopei is an S-mode AIA CSR, accessible once the AIA is up.
+    unsafe {
+        let mut top: u64;
+        loop {
+            asm!("csrr {0}, 0x15c", out(reg) top); // read stopei (no clear)
+            if top == 0 {
+                break;
+            }
+            asm!("csrw 0x15c, x0"); // write stopei -> claim/clear the top
+            // Drain anything that arrived meanwhile.
+            while let Some(b) = serial_read_byte() {
+                crate::input::rx_push(b);
+            }
+        }
+    }
+}
+
+/// Halt until the UART RX interrupt fires (a genuine 0%-CPU park). `wfi` wakes on
+/// a pending enabled interrupt even with `sstatus.SIE` clear; we then briefly
+/// enable SIE so the pending SEI is taken and serviced by the trap handler.
+pub fn idle_wait() {
+    // SAFETY: kernel context; SIE toggled around a single instruction.
+    unsafe {
+        asm!("wfi");
+        asm!("csrrsi x0, sstatus, 2"); // set SIE -> pending SEI taken here
+        asm!("csrrci x0, sstatus, 2"); // clear SIE
+    }
+}
+
+/// Deliver a scripted byte through the real UART RX interrupt (16550 loopback),
+/// halting at `wfi` until the interrupt is taken - the same path a live keystroke
+/// takes. Used by the deterministic Phase D test.
+pub fn uart_inject_and_wait(b: u8) {
+    const UART_THR: *mut u8 = (0x1000_0000 | KERNEL_VA_BASE) as *mut u8;
+    // Deliver the byte into the UART's RX FIFO by 16550 loopback (a genuine
+    // receive - the handler reads it back out), then raise the UART's MSI in the
+    // S-mode IMSIC and `wfi` until the resulting S external interrupt is taken -
+    // the same interrupt a live keystroke raises through the APLIC. QEMU's 16550
+    // loopback does not drive the APLIC input line, so we raise the MSI directly;
+    // it is exactly the MSI the configured S-APLIC (source 10 -> this hart, EIID
+    // 10) would send (docs/LIBRHEO.md Phase D).
+    let imsic = ((0x2800_0000usize + boot_hartid() * 0x1000) | KERNEL_VA_BASE) as *mut u32;
+    // SAFETY: kernel context; the UART + IMSIC MMIO are mapped high.
+    unsafe {
+        UART_MCR.write_volatile(0x18); // OUT2 + LOOP
+        UART_THR.write_volatile(b); // byte received into the RX FIFO
+        UART_MCR.write_volatile(0x08); // drop loopback (byte stays in FIFO)
+        imsic.write_volatile(UART_EIID); // seteipnum <- EIID (the APLIC's MSI); SEIP asserts
+        asm!("wfi"); // wakes on the pending SEI (SIE clear, not yet taken)
+        asm!("csrrsi x0, sstatus, 2"); // take + service it (handler drains b)
+        asm!("csrrci x0, sstatus, 2"); // clear SIE
+    }
+}
+
 // ----------------------------------------------------------------- traps
 
 unsafe extern "C" {
@@ -114,6 +271,12 @@ const SCAUSE_BREAKPOINT: u64 = 3;
 /// doorbell stand-in; everything else is fatal.
 #[unsafe(no_mangle)]
 extern "C" fn riscv_trap_handler(scause: u64, sepc: u64, stval: u64) -> u64 {
+    if scause == SCAUSE_S_EXT {
+        // The kernel's first hardware interrupt (docs/LIBRHEO.md Phase D): the
+        // UART RX line, delivered via the AIA. Drain it and resume where we were.
+        handle_uart_irq();
+        return sepc;
+    }
     if scause == SCAUSE_BREAKPOINT {
         DOORBELLS.fetch_add(1, Ordering::Relaxed);
         // Skip the ebreak: 4 bytes for the full encoding, 2 for c.ebreak.
