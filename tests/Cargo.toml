@@ -121,6 +121,10 @@ name = "linuxdyn"
 path = "src/linuxdyn.rs"
 
 [[bin]]
+name = "librheoproc"
+path = "src/librheoproc.rs"
+
+[[bin]]
 name = "shell-smoke"
 path = "src/shell_smoke.rs"
 

@@ -231,6 +231,47 @@ pub const SYS_WAIT_INPUT: u64 = 42;
 /// calls this once to bind the shared ring (IO.md 6: connect = capability
 /// exchange yielding a typed queue pair).
 pub const SYS_CONNECT: u64 = 43;
+// ---- native process model + timers (docs/LIBRHEO.md Phase F,
+// docs/ARCHITECTURE.md 3 object 1 Cell, verb set "create/destroy cell" +
+// "arm timer/doorbell") ----
+//
+// These EXPOSE the existing Cell object (1) and the arm-timer verb to a native
+// cell as mechanism (ARCHITECTURE.md 6 admission rule); they add no new object.
+// Spawning is gated by a **cell-spawn capability** (an `ObjectKind::Cell` cap
+// carrying WRITE) so a cell without it cannot create cells - no ambient
+// authority. A spawned child is a fresh `Personality::Native` cell with its own
+// address space + mapped queue pair, sharing the parent's capability bundle
+// (like `fork`), running librheo. Native child faults stay terminal (no
+// signals); the parent reaps a fault as an exit code.
+
+/// spawn(path_va, path_len, argv_va, envp_va) -> child handle (>= 0), or
+/// u64::MAX on failure (no spawn capability, ELF not found, cell table full).
+/// Loads the ELF at `path` from the VFS into a NEW native cell, builds its
+/// initial stack from the NUL-terminated C-string arrays at `argv_va`/`envp_va`
+/// (copied out of the caller before the child's space is built), maps it a queue
+/// pair + mints a queue capability, and records the caller as its parent. The
+/// child is runnable but does not run until the parent `SYS_WAIT`s (or exits).
+/// The returned handle is passed to `SYS_WAIT`.
+pub const SYS_SPAWN: u64 = 45;
+/// wait(handle) -> the child's exit code (0..=255). **Blocks** cooperatively
+/// (the parent's other strands run meanwhile, driven by librheo's reactor) until
+/// the child named by `handle` exits, then reaps it and frees its slot. Returns
+/// u64::MAX if `handle` names no child of the caller. A native child that faults
+/// is reaped with a sentinel exit code (`FAULT_EXIT`), never a signal.
+pub const SYS_WAIT: u64 = 46;
+/// arm_timer(deadline_ns) -> 0. **Blocks** until `deadline_ns` nanoseconds of
+/// monotonic time elapse from the call, then returns. The "arm timer" verb: a
+/// one-shot deadline. Honors docs/POWER.md - the kernel only waits when a real
+/// deadline was requested. Cooperative on every ISA today (the deadline is
+/// checked against the monotonic clock; a true per-ISA timer IRQ is documented
+/// future work, docs/LIBRHEO.md Phase F), so this is an honest deadline wait, not
+/// a 0%-CPU idle. librheo's `time::sleep`/`timeout` build on it.
+pub const SYS_ARM_TIMER: u64 = 47;
+
+/// The exit code a native child is reaped with when it faults (native cells have
+/// no signal delivery, docs/LIBRHEO.md Phase F): 128 + a SIGSEGV-shaped 11.
+pub const FAULT_EXIT: u64 = 139;
+
 /// grant_share(grant_cap_id, out_va) -> 0, or u64::MAX on failure. Delegate a
 /// **sealed** memory grant to the peer cell: the kernel maps the grant's frames
 /// into the peer read-only, mints a MemoryGrant capability there referencing the

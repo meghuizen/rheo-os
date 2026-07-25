@@ -8,6 +8,11 @@ compat layer) and the Linux personality (docs/LINUX-COMPAT.md). librheo instead
 expresses the kernel's own object model (queue pairs, capabilities, per-cell
 entropy) as a Rust library a native program links.
 
+STATUS: **phases A-F complete** - librheo is a complete native userspace
+foundation (spine + memory/IO + compute/QoS + terminal + IPC/display + process/
+time + a librheo-native shell + an embedded config), proven on all three ISAs.
+See the per-phase sections below and the "Final honest accounting" at the end.
+
 Where the pieces sit:
 
 - `runtime/` - the lower layer: heap, strand executor, channel, Mutex,
@@ -584,7 +589,206 @@ server blends a surface into the scanout).
 - **Single frame, single buffer.** A `Surface` commits once; double-buffering
   with a per-frame buffer pool is a documented refinement.
 
-## Later phases (planned, not in this milestone)
+## Phase F - process, time, a librheo-native shell, embedded (the finale)
 
-F - process/time/net + a librheo-native shell. See the plan for the full
-sequence.
+Phase F closes librheo as a complete foundation: a **native process model**
+(spawn/wait), **time** (a monotonic clock + async timers), a **librheo-native
+shell** built on the whole stack, an **embedded** proof that librheo scales
+down, and **honest benchmarks**. The proof is the `librheoproc` test kernel -
+three scenarios (a direct spawn/wait/timer orchestrator, the shell, and the
+spine-only embedded cell) on all three ISAs.
+
+### Kernel surface added (Phase F)
+
+All additions **expose the existing Cell object (1)** or the **arm-timer verb**
+to a native cell as mechanism (they pass the docs/ARCHITECTURE.md 6 admission
+rule); none is a new kernel object. The process tree, wait status, and
+block/wake state are per-cell synthesized state in `kernel/src/nproc.rs`,
+mirroring the Linux personality's `linux::proc` (docs/LINUX-COMPAT.md L6) for
+`Personality::Native` cells - the native `run`/`SYS_SWITCH` path is untouched
+(a cell that never spawns has no entry in `nproc`).
+
+- **`SYS_SPAWN` (45)** - `spawn(path_va, path_len, argv_va, envp_va) -> child
+  handle | u64::MAX`. Gated by a **cell-spawn capability** (an `ObjectKind::Cell`
+  cap carrying WRITE - a cell without it cannot create cells, **no ambient
+  authority**). It streams the ELF from the VFS into a **new** native cell
+  (`load::exec_elf_from_vfs`, ET_EXEC bias 0), builds its SysV initial stack
+  from the caller's argv/envp (`load::setup_stack` - the argv/envp are copied out
+  of the caller into kernel scratch first), maps it its **own** queue-pair region
+  + mints a queue capability into the parent's **shared** capability bundle (like
+  `fork`), and records the caller as parent. The child's `arg0` is set to its
+  stack `argc` block so librheo's `_start` finds `argv`/`envp` with no naked
+  prologue. The child is runnable but does not run until the parent waits.
+- **`SYS_WAIT` (46)** - `wait(handle) -> exit code | u64::MAX`. **Blocks**
+  cooperatively (the same cross-cell hand-off `SYS_SWITCH` uses, generalized in
+  `nproc`): the parent parks, the CPU is handed to the runnable child, and when
+  the child exits it becomes a zombie and reschedules, waking the parent whose
+  wait is now satisfiable; the parent's `SYS_WAIT` returns the reaped exit code
+  and frees the slot. A native child that **faults** is reaped with a sentinel
+  code (`FAULT_EXIT` = 139) - native cells have **no signal delivery** (that is
+  the Linux personality's job, L5); a native fault is terminal for the child.
+- **`SYS_ARM_TIMER` (47)** - `arm_timer(deadline_ns)`. Blocks until `deadline_ns`
+  of monotonic time elapse. The "arm timer" verb, a one-shot deadline. It is a
+  **cooperative deadline check** against the monotonic cycle counter on **every
+  ISA today** (honest: not a 0%-CPU idle) - deterministic under QEMU `-icount`
+  (each spin advances the instruction count, which advances the counter). A true
+  per-ISA **timer interrupt** (x86 TSC-deadline/LAPIC, aarch64 CNTV_* + its PPI,
+  riscv sstc `stimecmp`) is the OS's **second interrupt** and is documented
+  future work (after Phase D's UART RX, the first). Honors docs/POWER.md: the
+  kernel waits here only when a real deadline was requested (librheo arms a timer
+  only for an actual `sleep`/`timeout`).
+
+`MAX_CELLS` stays 16; a spawned child reuses a slot once reaped. Kernel-owned
+per-child storage (address space, queue-pair overlay, trap frame) lives in fixed
+`nproc` arrays - the kernel stays allocation-free. The `ObjectKind::Cell` variant
+(object 1) is added for the spawn-authority capability.
+
+### librheo modules (Phase F)
+
+| module | role |
+| --- | --- |
+| `proc` (new) | `spawn(path, argv, env) -> Child` (over `SYS_SPAWN`), async `Child::wait().await -> exit code` (over the reactor's `SYS_WAIT` servicing - the parent's other strands run while it blocks), `args`/`env_args` (this cell's `argv`/`envp`, parsed from the initial stack `_start` captured), an in-process **`env` table** (`env_get`/`env_set`/`env_vars`, seeded from `envp`), and `identity`. |
+| `time` (new) | a monotonic `Instant`/`now()` (over `SYS_UPTIME`, ticks), a nanosecond `Duration`, async `sleep`/`timeout`/`interval` over the reactor's one-shot timer (`SYS_ARM_TIMER`). Two honest units meet: `Instant` compares raw ticks (per-ISA timebase); `Duration` names nanoseconds (what the kernel timer converts). |
+| `net` (stub) | **deferred, documented.** Async sockets over the same submit/complete machinery as `io` are the design, but the transport (virtio-net, a socket object) does not exist and networking is a *service*, not the foundation. Every call reports `Unsupported`; the real `net` service cell (over virtio-net, reusing Phase E `ipc` for connect/accept) is future work. |
+
+The reactor (`rt`) grew a **timer slot** and a **child-wait slot** alongside the
+Phase D console slot: `time::sleep`/`Child::wait` register a request and park;
+`block_on`, when no queue completion is ready, services them (arming the kernel
+deadline / blocking the parent in `SYS_WAIT`) - the same park-on-a-token loop.
+
+### Feature gating (embedded)
+
+librheo is now feature-gated: `default = ["full"]` pulls every extended module
+(`io`/`compute`/`ipc`/`display`/`term`/`proc`/`time`/`rng`/`net`); an **embedded**
+cell builds `--no-default-features` to link only the **spine** - `cap` + `rt` +
+`mem` + `sys` (+ crt0). `librheo-embed` is the proof: a spine-only cell that does
+a **direct** queue round-trip (no strand executor, no `BTreeMap`) and exits. Its
+loadable code+data is **~9x smaller** than a full librheo binary's (e.g. riscv64
+3,195 vs 31,420 bytes; x86-64 4,727 vs 43,444; aarch64 3,963 vs 34,738) - the
+dead-code eliminator drops the async machinery the embedded cell never calls.
+
+### The librheo-native shell (`lrsh`)
+
+`lrsh` is the integration capstone - a shell built **entirely** on librheo, no
+Linux personality. It reads command lines over the Phase D console-input path
+(parking on input, never spinning), runs builtins (`echo`/`cd`/`exit`), and for
+any other command **spawns** a native ELF from `/bin` with its argv (`proc::spawn`)
+and **awaits** its exit (`Child::wait`), printing the exit code. Everything runs
+on the reactor: while the shell blocks for input or a child, the vcore is free.
+The `librheoproc` test drives it with a scripted session (`echo hi there` /
+`child 8` / `exit`) and asserts the exact transcript + exit on all three ISAs. It
+spawns two tiny native coreutils built on librheo: `librheo-echo` (prints its
+argv) and `librheo-child` (parses `argv[1]`, prints, exits with that code).
+
+Scope (honest): `lrsh`'s line reader is a minimal raw-byte reader (newline-
+terminated, backspace-aware); the **full `term` line editor + history + escape
+decoding** (Phase D) is available and is the documented next integration, as are
+**pipelines/redirection** over cross-cell channels (Phase E `ipc`) - the direct
+`librheo-orch` proof and `lrsh` establish the spawn/wait spine a bash-quality
+shell is built on. Cross-cell stdout piping between spawned children (wiring one
+child's fd 1 to another's fd 0) reuses Phase E's shared queue pair and is the
+documented next step; today process aggregation is via exit codes (a real
+map/reduce: argv fan-out, exit-code reduce).
+
+### The proof: `librheoproc`
+
+`librheoproc` runs three scenarios as loaded librheo cells over a ramfs `/bin`
+and exits only if all pass, on all three ISAs:
+
+1. **direct spawn/wait/timer** (`librheo-orch`, holding a spawn cap): spawns
+   `/bin/echo`, then three `/bin/child` cells (argv `3`/`4`/`5`), awaits each,
+   reduces exit codes to **12**, and proves a `time::sleep` advanced the clock.
+2. **the shell** (`lrsh`): scripted session, exact transcript + exit `0x42`.
+3. **the embedded cell** (`librheo-embed`, **no** spawn cap, built
+   `--no-default-features`): a spine-only direct queue round-trip; asserted
+   **substantially smaller** (loadable size) than the full orchestrator.
+
+### Benchmarks (Phase F, honest icount)
+
+Deterministic instruction path lengths under QEMU `-icount shift=0` (never
+wall-clock; hardware gates at the lab, docs/TOOLING.md 4). `librheo-orch` emits
+self-timed `BENCH` lines; `cargo xtask bench` gives the per-op P2 numbers. Ticks
+are the ISA counter: on x86-64 and riscv64 **1 tick ~= 1 retired instruction**;
+on aarch64 the virtual-timer tick is **~16 instructions** (the bench `CALIB` line
+normalizes it). Per-op path lengths:
+
+| metric | x86-64 | aarch64 (ticks / ~insn) | riscv64 |
+| --- | ---: | ---: | ---: |
+| `p2_user_roundtrip` (bare async queue round-trip, from `bench_core`) | 283 | - / - | (see bench) |
+| `librheo_async_roundtrip` (full reactor: park + wake + `BTreeMap`) | 1,433 | 109 / ~1,744 | 2,048 |
+| `librheo_spawn_wait` (ELF stream-load + stack + queue map + cap mint + cross-cell schedule + child `_start`/heap/rng + exit + reap) | 263,484 | 34,010 / ~544,000 | 538,533 |
+
+Reading them: the **async round-trip** is the reactor's core op - a few
+hundred-to-~2k instructions (well within the P2 gate's spirit of `<1 us` single /
+`<100 ns` amortized on real hardware; the reactor adds strand park/wake + a
+`BTreeMap` insert/remove over the bare `p2_user_roundtrip=283`). **spawn+wait** is
+a full process create - hundreds of thousands of instructions, dominated by
+streaming and mapping the child ELF and running its crt0 (heap + DRBG seed); it is
+the cost of a *new address space + new cell*, not a thread, and is the honest
+price of process isolation. The **terminal keystroke->echo** path is the Phase D
+`SYS_WAIT_INPUT` boundary (~ the `p2_user_syscall_floor`, ~101 insns on x86-64)
+plus the userland `term` decode/render; it is proven by `librheoterm` (a genuine
+0%-CPU park on riscv64, poll elsewhere).
+
+## Final honest accounting - the whole librheo A-F
+
+librheo is now a **complete native userspace foundation** (docs/ARCHITECTURE.md's
+10-object model expressed as a Rust library a program links). A program today can:
+
+- **allocate** over a growable heap (`mem`), draw **entropy** as a library call
+  (`rng`, per-cell ChaCha20 DRBG), and hold **capability-typed handles** whose
+  widening is a compile error (`cap`) - **Phase A**.
+- reach the kernel **async-first**: submit an op, park a strand on the completion
+  token, be woken by the reactor - "one wakeup, N strands resumed" from userspace
+  (`rt`) - **Phase A**.
+- own **typed memory** (`mem`: DDR/HBM/CXL/PMEM grants, commit/decommit/seal,
+  file mmap, arenas) and do **real async I/O** (`io`/`store`: OP_OPEN/READ/WRITE/
+  CLOSE/FSTAT, zero-copy above the inline threshold, batched) - the terabytes/
+  analytical-DB substrate - **Phase B**.
+- run **parallel compute** (`compute`: `map_reduce`/`parallel_for`/`scan`),
+  submit a **dependency graph** to the CPU engine, and get **admission-checked
+  reservations** (`sched`, EDF) - **Phase C**.
+- **block and wake** on console input at 0% CPU where the UART RX interrupt is
+  wired, over a modern byte-stream **terminal** discipline (`term`: decoder, line
+  editor, history, buffered renderer) - **Phase D**.
+- **connect two cells** into a typed cross-cell queue pair and **pass a sealed
+  buffer grant** zero-copy (`ipc`/`display`: the Wayland-class compositor
+  mechanism - shared buffer + flip completion + input events) - **Phase E**.
+- **spawn/wait native processes** (`proc`, gated by a cell-spawn capability),
+  keep **time** (`time`: monotonic clock + async `sleep`/`timeout`), run a
+  **librheo-native shell** (`lrsh`), and **scale down to embedded** (spine-only,
+  ~9x smaller) - **Phase F**.
+
+What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
+
+- **Async-real**: the queue reactor (submit/doorbell/drain/complete), strand
+  park-on-token, `io` OP_* completions, batched doorbell coalescing, the Phase D
+  console block-and-wake (**a genuine 0%-CPU WFI park on riscv64**), `Child::wait`
+  and `time::sleep` as reactor-serviced parks (the parent's other strands run
+  until quiescent, then the cell blocks).
+- **Sync-translated / cooperative** (single-CPU, honest): the timer is a
+  **cooperative deadline check on every ISA** (no timer IRQ yet); the cross-cell
+  IPC channel is synchronous with an explicit peer hand-off (a fully symmetric
+  async `Sender`/`Receiver` is the documented refinement); parallel `compute`
+  strands **interleave** on one CPU rather than run on separate cores; reservations
+  are **admitted** (the EDF math is real and refuses over-commit) but not yet
+  **scheduled** (run-queue enforcement is SMP work); the console idle on **x86-64
+  and aarch64 is a poll** (their IOAPIC/LAPIC and GICv3+PL011 bring-up is the
+  documented next step - riscv64 is interrupt-driven).
+- **Deferred (documented)**: a **real GPU** (virtio-gpu scanout; the compositor
+  framebuffer is in-memory), a **full network stack** (`net` is a stub;
+  networking is a service over virtio-net), **SMP** secondary-core bring-up +
+  work-stealing + reservation enforcement + **priority-inheritance** locks (task
+  #27), a **symmetric async IPC channel**, real **HBM/CXL/PMEM** (emulated on DDR)
+  and NUMA (single-node), durability/latency **contracts** (advisory - no durable/
+  RT backend in QEMU), a **first-class file/socket capability** (fds are `FileOps`
+  handles today), the **timer IRQ** and the **x86/arm UART RX IRQ**, **cross-cell
+  stdout pipelines** between spawned cells, and the full `term` editor + history
+  wired into `lrsh`. These are engineering, not redesign: every one has its seam
+  in place (the queue object, the grant object, the `ipc` channel, the interrupt
+  path, the cooperative scheduler).
+
+librheo A-F is proven by **six in-QEMU test kernels on all three ISAs**
+(`librhearun`, `librheodata`, `librheocompute`, `librheoterm`, `librheowl`,
+`librheoproc`), each asserting exact behaviour, kept green alongside the whole
+suite (29 kernels x 3 ISAs).

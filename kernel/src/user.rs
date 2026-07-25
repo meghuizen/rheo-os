@@ -12,10 +12,10 @@
 //! synchronous, so there is no concurrent access to guard against.
 
 use crate::abi::{
-    ChannelInfo, GrantInfo, QueueInfo, ReserveInfo, SYS_COMMIT, SYS_CONNECT, SYS_CYCLES,
-    SYS_DECOMMIT, SYS_DOORBELL, SYS_EXIT, SYS_EXIT_GROUP, SYS_GRANT, SYS_GRANT_SHARE, SYS_MMAP,
-    SYS_MMAP_FILE, SYS_MUNMAP, SYS_QUEUE_INFO, SYS_RESERVE_ADMIT, SYS_RESERVE_QUERY,
-    SYS_RESERVE_RELEASE, SYS_SEAL, SYS_SWITCH, SYS_WAIT_INPUT, ShareInfo,
+    ChannelInfo, GrantInfo, QueueInfo, ReserveInfo, SYS_ARM_TIMER, SYS_COMMIT, SYS_CONNECT,
+    SYS_CYCLES, SYS_DECOMMIT, SYS_DOORBELL, SYS_EXIT, SYS_EXIT_GROUP, SYS_GRANT, SYS_GRANT_SHARE,
+    SYS_MMAP, SYS_MMAP_FILE, SYS_MUNMAP, SYS_QUEUE_INFO, SYS_RESERVE_ADMIT, SYS_RESERVE_QUERY,
+    SYS_RESERVE_RELEASE, SYS_SEAL, SYS_SPAWN, SYS_SWITCH, SYS_WAIT, SYS_WAIT_INPUT, ShareInfo,
 };
 use crate::arch::{self, FaultCause, MapPerm, TrapFrame, TrapKind};
 use crate::capability::{
@@ -209,6 +209,7 @@ pub fn reset() {
         *core::ptr::addr_of_mut!(CELL_ADMISSION) = [EMPTY_ADMISSION; MAX_CELLS];
     }
     crate::linux::reset();
+    crate::nproc::reset();
 }
 
 /// The index of the currently running cell (docs/LINUX-COMPAT.md L2). The
@@ -848,6 +849,57 @@ pub fn set_cell_aspace(idx: usize, aspace: *const AddressSpace) {
     cells()[idx].aspace = aspace;
 }
 
+/// The capability table pointer installed for cell `idx` (the native process
+/// scheduler's `SYS_SPAWN` mints the child's queue cap into the parent's shared
+/// bundle, docs/LIBRHEO.md Phase F).
+pub fn cell_caps(idx: usize) -> *mut CapTable {
+    cells()[idx].caps
+}
+
+/// The object table pointer installed for cell `idx` (paired with `cell_caps`).
+pub fn cell_objects(idx: usize) -> *const ObjectTable {
+    cells()[idx].objects
+}
+
+/// Install a **spawned** native child in slot `idx` (docs/LIBRHEO.md Phase F).
+/// Like `install_forked`, the child shares the parent's capability bundle
+/// (`caps`/`objects`), but it gets its **own** address space, queue pair, and
+/// frame, and stays `Personality::Native` so it runs librheo. The queue info
+/// (`qp_va`, `qp_cap_id`) is recorded so `SYS_QUEUE_INFO` binds the child's ring.
+///
+/// # Safety
+/// `aspace`/`qp`/`frame` must outlive the child's run; `parent` must be present.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn install_spawned(
+    idx: usize,
+    aspace: *const AddressSpace,
+    qp: *const QueuePair,
+    frame: *mut TrapFrame,
+    parent: usize,
+    qp_va: u64,
+    qp_cap_id: u32,
+) {
+    let p = cells()[parent];
+    cells()[idx] = RunCell {
+        aspace,
+        caps: p.caps,
+        objects: p.objects,
+        qp,
+        frame,
+        outcome: None,
+        present: true,
+        personality: Personality::Native,
+        qp_va,
+        qp_cap_id,
+        grant_next: GRANT_BASE,
+        filemmap_next: FILEMMAP_BASE,
+        chan_va: 0,
+        chan_cap_id: 0,
+        chan_role: 0,
+    };
+    *cell_grants(idx) = [EMPTY_GRANT; MAX_GRANTS_PER_CELL];
+}
+
 /// Repoint cell `idx` at a new context-0 frame (after `execve`).
 pub fn set_cell_frame(idx: usize, frame: *mut TrapFrame) {
     cells()[idx].frame = frame;
@@ -937,6 +989,13 @@ pub fn on_user_trap(
                 }
             };
         }
+        // A native cell fault stays terminal (no signals). But a *spawned*
+        // native child (docs/LIBRHEO.md Phase F) does not end the whole run: it
+        // becomes a zombie its parent reaps with `FAULT_EXIT`, and the CPU is
+        // handed to the next runnable cell - mirroring the Linux child path.
+        if let Some(f) = crate::nproc::on_fault(cur) {
+            return f;
+        }
         return finish(Outcome::Faulted(fault_addr));
     }
 
@@ -1022,7 +1081,35 @@ pub fn on_user_trap(
             }
             peer_cell.frame
         }
-        SYS_EXIT | SYS_EXIT_GROUP => finish(Outcome::Exited(arg)),
+        // A spawned native child's exit makes it a zombie and reschedules
+        // (docs/LIBRHEO.md Phase F); the top cell's exit unwinds `run`.
+        SYS_EXIT | SYS_EXIT_GROUP => match crate::nproc::on_exit(cur, arg) {
+            Some(f) => f,
+            None => finish(Outcome::Exited(arg)),
+        },
+        // Native process model (docs/LIBRHEO.md Phase F): create a cell / reap a
+        // child, gated by the cell-spawn capability. A cross-cell scheduler in
+        // `crate::nproc` generalizes the Linux L6 run loop for native cells.
+        SYS_SPAWN => {
+            let r = crate::nproc::spawn(cur, args[0], args[1], args[2], args[3], frame);
+            arch::set_syscall_ret(unsafe { &mut *frame }, r);
+            frame
+        }
+        SYS_WAIT => match crate::nproc::wait(cur, args[0], frame) {
+            crate::nproc::Sched::Ret(v) => {
+                arch::set_syscall_ret(unsafe { &mut *frame }, v);
+                frame
+            }
+            crate::nproc::Sched::Switch(f) => f,
+        },
+        // Arm a one-shot deadline; block until it elapses (docs/LIBRHEO.md Phase
+        // F). Cooperative deadline check against the monotonic clock (honest: not
+        // a 0%-CPU idle); a real per-ISA timer IRQ is documented future work.
+        SYS_ARM_TIMER => {
+            crate::time::arm_timer(args[0]);
+            arch::set_syscall_ret(unsafe { &mut *frame }, 0);
+            frame
+        }
         SYS_MMAP => {
             let base = mmap_anon(cur, args[0] as usize);
             arch::set_syscall_ret(unsafe { &mut *frame }, base as u64);

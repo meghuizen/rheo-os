@@ -15,6 +15,14 @@ edition = "2024"
 [dependencies]
 runtime = { path = "../runtime" }
 
+# Feature gating (docs/LIBRHEO.md): `full` (the default) pulls every extended
+# module; an **embedded** cell builds `--no-default-features` to link only the
+# spine (cap/rt/mem/sys), which is substantially smaller yet still does a queue
+# round-trip. `librheo-embed` is the proof; the other bins need `full`.
+[features]
+default = ["full"]
+full = []
+
 [lib]
 name = "librheo"
 
@@ -37,3 +45,25 @@ path = "src/bin/librheo-term.rs"
 [[bin]]
 name = "librheo-wl"
 path = "src/bin/librheo-wl.rs"
+
+# Phase F: native process model + a librheo-native shell + coreutils it spawns.
+[[bin]]
+name = "librheo-orch"
+path = "src/bin/librheo-orch.rs"
+
+[[bin]]
+name = "librheo-echo"
+path = "src/bin/librheo-echo.rs"
+
+[[bin]]
+name = "librheo-child"
+path = "src/bin/librheo-child.rs"
+
+[[bin]]
+name = "lrsh"
+path = "src/bin/lrsh.rs"
+
+# The embedded proof - built `--no-default-features` to prove librheo scales down.
+[[bin]]
+name = "librheo-embed"
+path = "src/bin/librheo-embed.rs"

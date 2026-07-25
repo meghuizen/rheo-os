@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 28] = [
+const TEST_KERNELS: [&str; 29] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -50,6 +50,7 @@ const TEST_KERNELS: [&str; 28] = [
     "linuxsig",
     "linuxproc",
     "linuxdyn",
+    "librheoproc",
 ];
 
 /// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
@@ -357,6 +358,33 @@ fn build_userland(arch: Arch) -> bool {
     matches!(cmd.status().map(|s| s.success()), Ok(true))
 }
 
+/// Rebuild only the `librheo-embed` bin with `--no-default-features` (the
+/// spine: cap/rt/mem/sys - no term/io/proc/rng/...) so it links the minimal
+/// surface (docs/LIBRHEO.md Phase F embedded proof). Overwrites the full-feature
+/// build `build_userland` produced at the same path; the `librheoproc` kernel
+/// embeds this minimal artifact and asserts it is substantially smaller.
+fn build_librheo_embedded(arch: Arch) -> bool {
+    println!(
+        "[xtask] building librheo-embed (no-default-features) for {}",
+        arch.name()
+    );
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "build",
+        "-p",
+        "librheo",
+        "--bin",
+        "librheo-embed",
+        "--no-default-features",
+        "--release",
+        "--target",
+        arch.target(),
+        "-Zbuild-std=core,alloc,compiler_builtins",
+        "-Zbuild-std-features=compiler-builtins-mem",
+    ]);
+    matches!(cmd.status().map(|s| s.success()), Ok(true))
+}
+
 /// Build a real-std program (`manifest`) for the rheo-os target of `arch`, so
 /// a test can embed the ELF (docs/USERLAND.md M4/M5). Applies the rust-src std
 /// patch first (idempotent) and uses `-Zbuild-std=std` against the custom JSON
@@ -648,6 +676,14 @@ fn build_coreutils_fixture(arch: Arch) -> bool {
 
 fn build(arch: Arch, release: bool) -> bool {
     if !build_userland(arch) {
+        return false;
+    }
+    // The embedded proof (docs/LIBRHEO.md Phase F): rebuild `librheo-embed` with
+    // NO default features (the spine only) so it links the minimal surface and is
+    // substantially smaller. Must run AFTER `build_userland` (which builds every
+    // librheo bin with the full feature set) so this minimal build is the one the
+    // `librheoproc` kernel embeds.
+    if !build_librheo_embedded(arch) {
         return false;
     }
     // The librheodata (Phase B) dataset the test kernel reads off the live disk.

@@ -22,19 +22,40 @@
 
 extern crate alloc;
 
+// The always-present spine (docs/LIBRHEO.md): the smallest surface a cell can
+// link. An **embedded** cell pulls only these (`--no-default-features`): typed
+// capabilities, the async reactor, the heap, and the raw syscall/queue ABI - it
+// can still do a queue round-trip and exit, proving librheo scales down.
 pub mod cap;
-pub mod compute;
-pub mod display;
-pub mod io;
-pub mod ipc;
 pub mod mem;
-pub mod rng;
 pub mod rt;
-pub mod sched;
 mod start;
-pub mod store;
 pub mod sys;
+
+// The extended modules (default feature `full`). An embedded build gates them
+// out to shrink the binary; a warehouse/compositor/shell pulls the ones it needs.
+#[cfg(feature = "full")]
+pub mod compute;
+#[cfg(feature = "full")]
+pub mod display;
+#[cfg(feature = "full")]
+pub mod io;
+#[cfg(feature = "full")]
+pub mod ipc;
+#[cfg(feature = "full")]
+pub mod net;
+#[cfg(feature = "full")]
+pub mod proc;
+#[cfg(feature = "full")]
+pub mod rng;
+#[cfg(feature = "full")]
+pub mod sched;
+#[cfg(feature = "full")]
+pub mod store;
+#[cfg(feature = "full")]
 pub mod term;
+#[cfg(feature = "full")]
+pub mod time;
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {

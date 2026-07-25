@@ -29,6 +29,31 @@ pub fn uptime_ticks() -> u64 {
     arch::cycles().wrapping_sub(BOOT_TICKS.load(Ordering::Relaxed))
 }
 
+/// `SYS_ARM_TIMER`: block until `deadline_ns` nanoseconds of monotonic time
+/// elapse from the call, then return (docs/LIBRHEO.md Phase F). A **cooperative
+/// deadline check** against the monotonic cycle counter - honest, not a 0%-CPU
+/// idle: a true per-ISA timer interrupt (x86 TSC-deadline / LAPIC, aarch64
+/// CNTV_*, riscv sstc) is documented future work, the OS's second interrupt.
+/// Honors docs/POWER.md: the kernel only waits here when a real deadline was
+/// requested (librheo arms a timer only for an actual `sleep`/`timeout`).
+///
+/// The busy-wait is deterministic under QEMU `-icount`: each spin advances the
+/// instruction count, which advances the cycle counter, so the deadline is
+/// reached in a bounded number of iterations.
+pub fn arm_timer(deadline_ns: u64) {
+    if deadline_ns == 0 {
+        return;
+    }
+    let start = arch::cycles();
+    loop {
+        let elapsed = arch::cycles().wrapping_sub(start);
+        if arch::ticks_to_ns(elapsed) >= deadline_ns {
+            return;
+        }
+        arch::spin_loop(1);
+    }
+}
+
 /// A wall-clock reading as a bounded interval [center-e, center+e]
 /// (docs/ARCHITECTURE.md 4.5). Without a synced time source the center is
 /// "ticks since boot" and the error bound is the whole interval - the API

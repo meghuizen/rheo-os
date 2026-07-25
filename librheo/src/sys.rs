@@ -62,6 +62,15 @@ pub const SYS_CONNECT: u64 = 43;
 /// grant_share(grant_cap_id, out_va) -> 0 or u64::MAX. Delegate a sealed grant
 /// to the peer cell; fills a `ShareInfo` (peer VA + cap). Zero-copy buffer pass.
 pub const SYS_GRANT_SHARE: u64 = 44;
+/// spawn(path_va, path_len, argv_va, envp_va) -> child handle or u64::MAX. Load
+/// an ELF into a new native cell; gated by the cell-spawn capability (Phase F).
+pub const SYS_SPAWN: u64 = 45;
+/// wait(handle) -> the child's exit code, or u64::MAX. Blocks cooperatively.
+pub const SYS_WAIT: u64 = 46;
+/// arm_timer(deadline_ns) -> 0. Block until `deadline_ns` monotonic ns elapse.
+pub const SYS_ARM_TIMER: u64 = 47;
+/// uptime() -> monotonic tick reading (SYS_UPTIME). `time` converts to ns.
+pub const SYS_UPTIME: u64 = 7;
 
 // ---- raw syscall stubs (from libc/src/sys.rs) ----
 
@@ -316,6 +325,26 @@ pub fn grant_share(cap_id: u32, out_va: u64) -> u64 {
 }
 pub fn write(fd: u64, buf_va: u64, len: u64) -> i64 {
     unsafe { syscall3(SYS_WRITE_FD, fd, buf_va, len) as i64 }
+}
+/// Spawn `path` as a new native cell with `argv`/`envp` (NUL-terminated C-string
+/// pointer arrays). Returns the child handle, or `u64::MAX` on failure (no
+/// spawn capability, ELF not found, cell table full). See `proc::spawn`.
+pub fn spawn(path_va: u64, path_len: u64, argv_va: u64, envp_va: u64) -> u64 {
+    unsafe { syscall4(SYS_SPAWN, path_va, path_len, argv_va, envp_va) }
+}
+/// Wait for the child named by `handle`; returns its exit code, or `u64::MAX` if
+/// it names no child. Blocks cooperatively (the caller's other strands run).
+pub fn wait(handle: u64) -> u64 {
+    unsafe { syscall1(SYS_WAIT, handle) }
+}
+/// Block until `deadline_ns` nanoseconds of monotonic time elapse. The kernel's
+/// cooperative one-shot deadline (docs/LIBRHEO.md Phase F). `time` builds on it.
+pub fn arm_timer(deadline_ns: u64) {
+    unsafe { syscall1(SYS_ARM_TIMER, deadline_ns) };
+}
+/// Monotonic uptime in raw ticks. `time::now` converts to nanoseconds.
+pub fn uptime() -> u64 {
+    unsafe { syscall1(SYS_UPTIME, 0) }
 }
 pub fn random_u64() -> u64 {
     unsafe { syscall1(SYS_RANDOM, 0) }

@@ -428,8 +428,40 @@ compositor's own composite into its framebuffer); the channel is synchronous wit
 an explicit peer hand-off (a fully-symmetric async `Sender`/`Receiver` parking on
 the reactor is the documented refinement); spawn-driven connect is Phase F; real
 GPU (virtio-gpu scanout) is deferred - the mechanism (shared sealed buffer + typed
-present queue + flip completion + input-event shape) is the deliverable. Phase F
-(process/time/net + a librheo-native shell) is planned in docs/LIBRHEO.md.
+present queue + flip completion + input-event shape) is the deliverable.
+
+**Phase F** closes librheo as a **complete foundation**: a native **process
+model**, **time**, a **librheo-native shell**, an **embedded** proof, and honest
+benchmarks. Three kernel additions **expose** the Cell object (1) / arm-timer verb
+(no new object; per-cell synthesized state in `kernel/src/nproc.rs`, mirroring
+`linux::proc` for `Personality::Native` cells). **`SYS_SPAWN` (45)** - gated by a
+**cell-spawn capability** (`ObjectKind::Cell` + WRITE - no ambient authority) -
+streams an ELF from the VFS into a **new** native cell with its own address space +
+queue pair (sharing the parent's cap bundle like `fork`), builds its SysV stack
+from the caller's argv/envp, and returns a child handle; **`SYS_WAIT` (46)** blocks
+the parent cooperatively (generalizing the L6 cross-cell run loop), runs the child,
+and reaps its exit code (a faulted native child is reaped with `FAULT_EXIT`=139 -
+native cells have no signals); **`SYS_ARM_TIMER` (47)** is a one-shot deadline,
+**cooperative on every ISA** (a deadline check against the monotonic clock; honest,
+not a 0%-CPU idle - a per-ISA timer IRQ is the OS's documented second interrupt).
+librheo gained **`proc`** (`spawn`/`Child::wait().await`/`args`/`env`/`identity`),
+**`time`** (monotonic `Instant`/`now` + async `sleep`/`timeout`/`interval` over the
+reactor's timer slot), and a **`net`** stub (deferred - networking is a service).
+It is **feature-gated**: `default=["full"]`; an **embedded** cell builds
+`--no-default-features` (spine only: cap/rt/mem/sys) - `librheo-embed` does a direct
+queue round-trip and is **~9x smaller** loadable than a full binary. **`lrsh`** is
+the librheo-native shell (builtins + `spawn`/`wait` of native coreutils over the
+Phase D console path). The `librheoproc` test proves it on **all three ISAs**: an
+orchestrator spawns `/bin/echo` + three `/bin/child` cells (argv fan-out), reduces
+exit codes to 12, and a `time::sleep` wakes on the timer; `lrsh` runs a scripted
+session (exact transcript + exit `0x42`); and the spine-only `librheo-embed`
+round-trips. Benchmarks (icount, per TOOLING.md): full async round-trip ~1,433
+(x86-64) / ~2,048 (riscv64) instructions, spawn+wait ~263k (x86-64) / ~539k
+(riscv64) - process create is dominated by ELF stream-load + child crt0, the honest
+price of a new address space. Honest deferrals: cross-cell stdout pipelines between
+spawned cells (reuses Phase E channels), full `term` editor wired into `lrsh`, the
+timer/x86-arm-UART IRQs, and the `net` stack - docs/LIBRHEO.md has the full A-F
+accounting. **librheo A-F is complete.**
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
@@ -492,7 +524,9 @@ kernel/       the no_std kernel library + boot demo bin
               discovery + the machine Inventory; block BlockDevice trait +
               virtio_blk driver), elf + load (ELF loader for native
               programs), user run loop (with per-cell syscall
-              personalities), linux (the Linux personality:
+              personalities), nproc (native process model: SYS_SPAWN/WAIT +
+              cooperative cross-cell scheduler - docs/LIBRHEO.md Phase F),
+              linux (the Linux personality:
               docs/LINUX-COMPAT.md), U-mode programs
               (user_progs.rs incl. the lsh shell), abi
   src/arch/   per-ISA Rust modules incl. paging.rs (one dir per ISA)
@@ -527,8 +561,9 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               linuxproc (L6: fork/execve/wait4/cross-cell pipes - a direct
               multi-process C fixture + the P11 coreutils-suite shell),
               linuxdyn (L7: an unmodified dynamically-linked glibc C hello over
-              PT_INTERP + ld-linux + fd-backed mmap), bench-core, and the
-              interactive
+              PT_INTERP + ld-linux + fd-backed mmap), librheoproc (librheo Phase
+              F: native spawn/wait + one-shot timer + the lrsh shell + the
+              embedded spine-only cell), bench-core, and the interactive
               lsh bin (+ harness.rs, vfs_personality.rs); fixtures/ holds the
               ext4 test image (+ gen-ext4.sh); linux-fixtures/ holds the
               built-from-source glibc test binaries (rusthello/ + rustthreads/
@@ -554,10 +589,16 @@ librheo/      the native userspace foundation library (docs/LIBRHEO.md):
               GraphBuilder)/sched (Reservation + lattice-rt Priority/PeriodicTask/
               TimingReport)/term (Phase D byte-stream input/edit/render)/ipc
               (Phase E cross-cell Channel + sealed-buffer share)/display (Phase E
-              Surface/Compositor/InputEvent) + crt0 + the librheo-demo (Phase A),
-              librheo-data (Phase B mini-DuckDB scan), librheo-compute (Phase C
-              parallel compute + graph + QoS), librheo-term (Phase D terminal),
-              and librheo-wl (Phase E compositor demo) programs
+              Surface/Compositor/InputEvent)/proc (Phase F spawn/wait/args/env)/
+              time (Phase F clock + async sleep/timeout)/net (Phase F stub) +
+              crt0 (feature-gated: default=full, --no-default-features=embedded
+              spine) + the librheo-demo (Phase A), librheo-data (Phase B
+              mini-DuckDB scan), librheo-compute (Phase C parallel compute + graph
+              + QoS), librheo-term (Phase D terminal), librheo-wl (Phase E
+              compositor demo), and Phase F: librheo-orch (spawn/wait/timer proof),
+              lrsh (the librheo-native shell), librheo-echo/librheo-child (native
+              coreutils it spawns), librheo-embed (the embedded spine-only cell)
+              programs
 json/         rheo-json: a dependency-free, zero-copy JSON parser (scalar +
               SSE2 string-scan), no_std, host-tested + benchmarked
               (docs/JSON.md, comparison/json/)

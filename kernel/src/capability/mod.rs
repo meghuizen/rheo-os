@@ -106,6 +106,12 @@ pub enum ObjectKind {
     /// reservation admitted by the per-cell EDF controller; commit/query/release
     /// grant-check it.
     Reservation,
+    /// A cell - a spawn/scheduling domain (docs/ARCHITECTURE.md 3 object 1). A
+    /// capability of this kind carrying WRITE is the **cell-spawn authority**
+    /// (`SYS_SPAWN`, docs/LIBRHEO.md Phase F): a cell without it cannot create
+    /// cells (no ambient authority). Held by an orchestrator/shell; not minted
+    /// into a spawned child by default.
+    Cell,
 }
 
 #[derive(Copy, Clone)]
@@ -358,6 +364,21 @@ impl CapTable {
     /// Count of live capabilities (used by tests).
     pub fn live_count(&self) -> usize {
         self.slots.iter().filter(|s| s.in_use).count()
+    }
+
+    /// True if this table holds a live capability of `kind` carrying all of
+    /// `required` rights, its object un-revoked. The cell-spawn authority check
+    /// (docs/LIBRHEO.md Phase F): `SYS_SPAWN` requires an `ObjectKind::Cell`
+    /// capability with WRITE, so a cell without one cannot create cells (no
+    /// ambient authority). A read-only scan; no budget is decremented.
+    pub fn holds(&self, objects: &ObjectTable, kind: ObjectKind, required: u32) -> bool {
+        self.slots.iter().any(|s| {
+            if !s.in_use || s.rights & required != required {
+                return false;
+            }
+            let obj = ObjectId(s.object);
+            objects.kind(obj) == kind && s.epoch == objects.epoch(obj)
+        })
     }
 
     fn mint_derived(

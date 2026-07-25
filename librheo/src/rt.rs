@@ -34,6 +34,18 @@ pub struct Reactor {
     console_req: Option<(u64, usize, u64)>,
     /// Byte count the last serviced console read returned.
     console_n: usize,
+    /// A pending timer: `(deadline_ns, token)` (docs/LIBRHEO.md Phase F). One at
+    /// a time (the nearest deadline); serviced by `block_on` when no queue
+    /// completion is ready, by arming the kernel's one-shot deadline. Honors
+    /// docs/POWER.md - the kernel waits only when a real deadline was requested.
+    timer_req: Option<(u64, u64)>,
+    /// A pending child wait: `(handle, token)` (docs/LIBRHEO.md Phase F). One
+    /// outstanding at a time (a shell waits its children in sequence); serviced
+    /// by `block_on` by blocking the parent in `SYS_WAIT` while its other strands
+    /// have all parked - the parent's reactor keeps running.
+    wait_req: Option<(u64, u64)>,
+    /// Exit code the last serviced child wait returned.
+    wait_code: u64,
 }
 
 impl Reactor {
@@ -85,9 +97,71 @@ impl Reactor {
     fn console_result(&self) -> usize {
         self.console_n
     }
+
+    /// Register a pending one-shot timer (the strand parks on `token`).
+    fn set_timer(&mut self, deadline_ns: u64, token: u64) {
+        self.timer_req = Some((deadline_ns, token));
+    }
+
+    /// Service a pending timer by arming the kernel's one-shot deadline (which
+    /// blocks until it elapses), then wake its strand. Returns false if none was
+    /// pending. Cooperative: while parked, the vcore first drains every other
+    /// ready strand; only when all have parked does `block_on` reach here.
+    fn service_timer(&mut self) -> bool {
+        if let Some((deadline_ns, token)) = self.timer_req.take() {
+            sys::arm_timer(deadline_ns);
+            complete(token);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Register a pending child wait (the strand parks on `token`).
+    fn set_wait(&mut self, handle: u64, token: u64) {
+        self.wait_req = Some((handle, token));
+    }
+
+    /// Service a pending child wait by blocking the parent in `SYS_WAIT` (the
+    /// child runs cooperatively until it exits), then wake its strand. Returns
+    /// false if none was pending.
+    fn service_wait(&mut self) -> bool {
+        if let Some((handle, token)) = self.wait_req.take() {
+            self.wait_code = sys::wait(handle);
+            complete(token);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn wait_result(&self) -> u64 {
+        self.wait_code
+    }
 }
 
 static mut REACTOR: Option<Reactor> = None;
+
+/// The initial-stack pointer the kernel entered `_start` with (arg0), pointing
+/// at the System V `argc` block (docs/LIBRHEO.md Phase F). 0 = no arguments (a
+/// top-level cell installed with an empty stack). `proc::args`/`env` parse it.
+static mut ARGS_PTR: u64 = 0;
+
+/// Record the initial-stack pointer (called by `_start`).
+///
+/// # Safety
+/// Called once at startup, before `proc::args`/`env` read it.
+pub unsafe fn set_args(arg: u64) {
+    unsafe {
+        *core::ptr::addr_of_mut!(ARGS_PTR) = arg;
+    }
+}
+
+/// The initial-stack pointer (the SysV `argc` block VA), or 0 if none.
+pub fn args_ptr() -> u64 {
+    // SAFETY: set once at startup, read-only afterwards.
+    unsafe { *core::ptr::addr_of!(ARGS_PTR) }
+}
 
 /// Build the reactor from the cell's queue capability and mapped ring VA
 /// (called by `_start`).
@@ -100,6 +174,9 @@ pub fn init(caps: &CapSet, qp_va: u64) {
         results: BTreeMap::new(),
         console_req: None,
         console_n: 0,
+        timer_req: None,
+        wait_req: None,
+        wait_code: 0,
     };
     // SAFETY: single-CPU cooperative cell; init runs once before any strand.
     unsafe {
@@ -152,6 +229,27 @@ pub async fn read_console(buf: *mut u8, len: usize) -> usize {
     with_reactor(|r| r.console_result())
 }
 
+/// Async sleep: park until `deadline_ns` nanoseconds of monotonic time elapse
+/// (docs/LIBRHEO.md Phase F). While parked the vcore runs the other strands;
+/// only when they have all parked does the reactor arm the kernel's one-shot
+/// deadline. `time::sleep`/`timeout`/`interval` build on this.
+pub async fn sleep_ns(deadline_ns: u64) {
+    let token = next_token();
+    with_reactor(|r| r.set_timer(deadline_ns, token));
+    park_on(token).await;
+}
+
+/// Async wait for a spawned child (docs/LIBRHEO.md Phase F): register the wait,
+/// park until the reactor blocks the parent in `SYS_WAIT` and the child exits,
+/// and return the child's exit code. While parked the vcore runs the other
+/// strands. `proc::Child::wait` builds on this.
+pub async fn wait_child(handle: u64) -> u64 {
+    let token = next_token();
+    with_reactor(|r| r.set_wait(handle, token));
+    park_on(token).await;
+    with_reactor(|r| r.wait_result())
+}
+
 /// Drive `root` (and every strand it spawns) to completion, servicing the
 /// queue whenever no strand is ready. The userland event loop: run ready
 /// strands; when they have all parked, ring the doorbell + drain + wake; and if
@@ -169,6 +267,10 @@ pub fn block_on<F: Future<Output = ()> + 'static>(root: F) {
             guard = 0; // queue completions woke strands: progress
         } else if with_reactor(|r| r.service_console()) {
             guard = 0; // blocked for console input and woke its strand: progress
+        } else if with_reactor(|r| r.service_timer()) {
+            guard = 0; // armed a one-shot deadline and woke its strand: progress
+        } else if with_reactor(|r| r.service_wait()) {
+            guard = 0; // blocked in SYS_WAIT for a child and woke its strand
         } else {
             // No completion, no console read: allow a few settling iterations
             // (join hand-offs), then declare no progress.
