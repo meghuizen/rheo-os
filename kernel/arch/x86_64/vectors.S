@@ -142,6 +142,44 @@ common_trap:
     jz return_to_kernel_asm
     jmp sysret_resume            /* rax = frame; resume (handler or resumed pc) */
 
+/* Hardware-interrupt stubs (docs/LIBRHEO.md Phase F). These fire in ring 0
+ * (the kernel's sti;hlt idle idiom), so there is no privilege/stack switch -
+ * the CPU pushes the 5-word long-mode frame onto the current kernel stack. Save
+ * the 9 SysV caller-saved registers (which also 16-aligns rsp for the call),
+ * run the Rust handler, restore, iretq. Callee-saved regs are preserved by the
+ * C handler, so they need no save here. */
+.macro IRQ_STUB name, handler
+.global \name
+\name:
+    push %rax
+    push %rcx
+    push %rdx
+    push %rsi
+    push %rdi
+    push %r8
+    push %r9
+    push %r10
+    push %r11
+    call \handler
+    pop %r11
+    pop %r10
+    pop %r9
+    pop %r8
+    pop %rdi
+    pop %rsi
+    pop %rdx
+    pop %rcx
+    pop %rax
+    iretq
+.endm
+
+IRQ_STUB timer_irq_stub, x86_timer_irq
+
+/* The LAPIC spurious vector requires no EOI and does no work: just return. */
+.global spurious_irq_stub
+spurious_irq_stub:
+    iretq
+
 /* Stub address table consumed by trap_init() in Rust. */
 .section .rodata
 .align 8

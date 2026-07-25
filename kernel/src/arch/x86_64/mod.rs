@@ -120,36 +120,156 @@ pub fn serial_read_byte() -> Option<u8> {
     }
 }
 
-// -------------------------------------------- console input wakeup seam
-// docs/LIBRHEO.md Phase D. Poll build: no 16550 RX interrupt is wired (the
-// IOAPIC RTE for ISA IRQ4 + LAPIC + IER path is the documented next step), so
-// the portable input path (kernel/src/input.rs) polls COM1.
+// ----------------------------------- console input + timer interrupt seam
+// docs/LIBRHEO.md Phase D/F. **Timer: interrupt-driven** (the kernel's second
+// interrupt). q35's per-CPU LAPIC, driven in **x2APIC** mode (MSR access, 0x800+
+// - no MMIO mapping, and EOI works regardless of which page-table root is active
+// during the interrupt), delivers a one-shot **LVT timer** on vector 0x20. Cells
+// run with IF clear (their TrapFrame RFLAGS has no IF); the kernel sets IF only
+// inside the `sti; hlt` idle idiom, so `SYS_ARM_TIMER` is a genuine 0%-CPU park.
+//
+// **UART RX: poll** (honest). q35 routes COM1's ISA IRQ4 through the emulated
+// IOAPIC, but under QEMU's TCG + `kernel-irqchip=split` the LAPIC's ISR/IRR are
+// not modeled (they read 0) and IPIs are not delivered, so an IOAPIC-routed line
+// delivers the first byte but does not reliably re-trigger, and the self-IPI the
+// RISC-V port uses as its deterministic-test analog does not fire at all. Rather
+// than fake it, x86-64 keeps the poll path (kernel/src/input.rs). The GICv3-style
+// per-source ack the RISC-V AIA gives is what makes RISC-V's UART RX reliable;
+// the honest x86-64 result is timer-only. Opt-in (`enable_timer_irq`, called only
+// by the Phase F test), so no other kernel is affected.
 
-/// Whether the UART RX interrupt is wired (false = poll path).
+/// x2APIC MSRs (Intel SDM vol 3): APIC base, spurious-vector, EOI, and the
+/// LVT-timer trio.
+const MSR_APIC_BASE: u32 = 0x1B;
+const MSR_X2APIC_SVR: u32 = 0x80F;
+const MSR_X2APIC_EOI: u32 = 0x80B;
+const MSR_X2APIC_LVT_TIMER: u32 = 0x832;
+const MSR_X2APIC_TIMER_INIT: u32 = 0x838;
+const MSR_X2APIC_TIMER_CUR: u32 = 0x839;
+const MSR_X2APIC_TIMER_DIV: u32 = 0x83E;
+
+/// Chosen interrupt vectors: LAPIC timer 0x20, LAPIC spurious 0xFF (above the 32
+/// CPU-exception vectors).
+const VEC_TIMER: usize = 0x20;
+const VEC_SPURIOUS: usize = 0xFF;
+
+static mut TIMER_ENABLED: bool = false;
+
+unsafe extern "C" {
+    fn timer_irq_stub();
+    fn spurious_irq_stub();
+}
+
+/// Whether the UART RX interrupt is wired (false = poll path). x86-64 polls (see
+/// the seam comment: the QEMU TCG IOAPIC/LAPIC does not re-deliver reliably).
 pub fn uart_irq_enabled() -> bool {
     false
 }
-/// Bring up the UART RX interrupt (IOAPIC/LAPIC + IER) - not yet on x86-64, so
-/// this leaves the poll path in place. Called only by the Phase D test.
+/// Bring up the UART RX interrupt - x86-64 stays on the poll path (see the seam
+/// comment). Called only by the Phase D test.
 pub fn enable_uart_rx_irq() {}
-/// Halt until an interrupt (only called when `uart_irq_enabled`).
+/// Halt until the UART RX interrupt (only called when `uart_irq_enabled`, i.e.
+/// never on x86-64).
 pub fn idle_wait() {}
-/// Deliver a scripted byte through the real UART RX interrupt then halt until it
-/// is taken (only called when `uart_irq_enabled`).
+/// Deliver a scripted byte through the UART RX interrupt (only called when
+/// `uart_irq_enabled`, i.e. never on x86-64).
 pub fn uart_inject_and_wait(_b: u8) {}
 
-// ------------------------------------------------- timer interrupt (Phase F)
-// Poll build: no LAPIC timer is wired yet (the documented next step), so the
-// portable `time::arm_timer` busy-waits on the TSC.
-
-/// Whether the timer interrupt is wired (false = busy-wait path).
+/// Whether the LAPIC timer interrupt is wired (false = busy-wait path).
 pub fn timer_irq_enabled() -> bool {
-    false
+    // SAFETY: single CPU; set once before any cell runs.
+    unsafe { *core::ptr::addr_of!(TIMER_ENABLED) }
 }
-/// Bring up the timer interrupt (LAPIC timer) - not yet on x86-64.
-pub fn enable_timer_irq() {}
-/// Arm the timer and halt until it fires (only called when `timer_irq_enabled`).
-pub fn timer_wait(_deadline_ns: u64) {}
+
+/// Enable the LAPIC in x2APIC mode (MSR access) + set the spurious vector. Shared
+/// bring-up for the timer path.
+fn lapic_init() {
+    // SAFETY: kernel context; plain MSR writes.
+    unsafe {
+        // Enable x2APIC: IA32_APIC_BASE |= EN (11) | EXTD (10).
+        let base = paging_rdmsr(MSR_APIC_BASE) | (1 << 11) | (1 << 10);
+        paging_wrmsr(MSR_APIC_BASE, base);
+        // Software-enable the LAPIC + set the spurious vector (SVR bit 8 + 0xFF).
+        paging_wrmsr(MSR_X2APIC_SVR, 0x100 | VEC_SPURIOUS as u64);
+        set_idt_gate(VEC_SPURIOUS, spurious_irq_stub as *const () as u64);
+    }
+}
+
+/// Bring up the LAPIC one-shot timer interrupt (vector 0x20). Called only by the
+/// Phase F timer test.
+pub fn enable_timer_irq() {
+    lapic_init();
+    set_idt_gate(VEC_TIMER, timer_irq_stub as *const () as u64);
+    // SAFETY: kernel context; x2APIC enabled by lapic_init.
+    unsafe {
+        // Divide config = 1 (bits: 0b1011 -> divide by 1).
+        paging_wrmsr(MSR_X2APIC_TIMER_DIV, 0b1011);
+        // LVT timer: vector 0x20, one-shot (bits 17-18 = 0), unmasked.
+        paging_wrmsr(MSR_X2APIC_LVT_TIMER, VEC_TIMER as u64);
+        paging_wrmsr(MSR_X2APIC_TIMER_INIT, 0); // disarmed until timer_wait
+        *core::ptr::addr_of_mut!(TIMER_ENABLED) = true;
+    }
+}
+
+/// The LAPIC timer interrupt handler (called from `timer_irq_stub`): the
+/// one-shot has fired, so just EOI; the waiter in `timer_wait` observes the
+/// elapsed deadline and returns.
+#[unsafe(no_mangle)]
+extern "C" fn x86_timer_irq() {
+    // SAFETY: kernel context; x2APIC EOI is a plain MSR write.
+    unsafe { paging_wrmsr(MSR_X2APIC_EOI, 0) };
+}
+
+/// Arm the LAPIC one-shot timer for `deadline_ns` from now and halt at `hlt`
+/// until it fires (a genuine 0%-CPU park). The LAPIC timer counts the APIC bus
+/// clock; we calibrate its rate against the TSC (`cycles()` + `ticks_to_ns`)
+/// once, then convert. Called only when [`timer_irq_enabled`].
+pub fn timer_wait(deadline_ns: u64) {
+    let count = lapic_timer_count(deadline_ns);
+    // SAFETY: kernel context; x2APIC timer MSRs, one-shot, IF via the idle idiom.
+    unsafe {
+        paging_wrmsr(MSR_X2APIC_TIMER_INIT, count as u64); // arm (starts counting down)
+        // The one-shot fires once (current count hits 0); wake hlt and EOI. Loop
+        // guards against an unrelated interrupt waking hlt early.
+        while paging_rdmsr(MSR_X2APIC_TIMER_CUR) != 0 {
+            asm!("sti; hlt; cli", options(nomem, nostack));
+        }
+        paging_wrmsr(MSR_X2APIC_TIMER_INIT, 0); // disarm
+    }
+}
+
+/// Calibrate the LAPIC timer's tick rate against the TSC and return the initial
+/// count for `deadline_ns`. Done once (the ratio is stable under QEMU), cached.
+fn lapic_timer_count(deadline_ns: u64) -> u32 {
+    static CAL_PPN: AtomicU64 = AtomicU64::new(0); // LAPIC ticks per 1e6 ns, *1024
+    let mut ppn = CAL_PPN.load(Ordering::Relaxed);
+    if ppn == 0 {
+        // Run the LAPIC timer for a known TSC span and count its ticks.
+        // SAFETY: kernel context; timer MSRs + TSC.
+        unsafe {
+            paging_wrmsr(MSR_X2APIC_TIMER_INIT, 0xFFFF_FFFF);
+            let tsc0 = cycles();
+            let lc0 = paging_rdmsr(MSR_X2APIC_TIMER_CUR);
+            // Busy-spin a bounded TSC interval (~calibration window).
+            while cycles().wrapping_sub(tsc0) < 2_000_000 {
+                core::hint::spin_loop();
+            }
+            let lc1 = paging_rdmsr(MSR_X2APIC_TIMER_CUR);
+            let tsc1 = cycles();
+            paging_wrmsr(MSR_X2APIC_TIMER_INIT, 0);
+            let lapic_ticks = lc0.wrapping_sub(lc1); // counts down
+            let ns = ticks_to_ns(tsc1.wrapping_sub(tsc0)).max(1);
+            // LAPIC ticks per ns, scaled by 1<<20 for integer precision.
+            ppn = (((lapic_ticks as u128) << 20) / ns as u128) as u64;
+            if ppn == 0 {
+                ppn = 1;
+            }
+            CAL_PPN.store(ppn, Ordering::Relaxed);
+        }
+    }
+    let count = ((deadline_ns as u128 * ppn as u128) >> 20).max(1);
+    count.min(0xFFFF_FFFF) as u32
+}
 
 // ----------------------------------------------------------------- traps
 
@@ -165,16 +285,23 @@ struct IdtEntry {
     reserved: u32,
 }
 
-const IDT_ENTRIES: usize = 32; // CPU exceptions only, for now
+const VECTOR_COUNT: usize = 32; // CPU exception stubs emitted by vectors.S
+/// Full 256-entry IDT so hardware-interrupt vectors (the LAPIC timer at 0x20, the
+/// spurious vector 0xFF) can be installed alongside the 32 CPU-exception gates
+/// (docs/LIBRHEO.md Phase F). Entries past the exceptions stay not-present until
+/// `set_idt_gate` fills them.
+const IDT_ENTRIES: usize = 256;
 
-static mut IDT: [IdtEntry; IDT_ENTRIES] = [IdtEntry {
+const IDT_EMPTY: IdtEntry = IdtEntry {
     offset_low: 0,
     selector: 0,
     ist_and_flags: 0,
     offset_mid: 0,
     offset_high: 0,
     reserved: 0,
-}; IDT_ENTRIES];
+};
+
+static mut IDT: [IdtEntry; IDT_ENTRIES] = [IDT_EMPTY; IDT_ENTRIES];
 
 #[repr(C, packed)]
 struct IdtPointer {
@@ -183,23 +310,38 @@ struct IdtPointer {
 }
 
 unsafe extern "C" {
-    // Table of the 32 stub addresses, emitted by vectors.S.
-    static VECTOR_STUBS: [u64; IDT_ENTRIES];
+    // Table of the 32 exception stub addresses, emitted by vectors.S.
+    static VECTOR_STUBS: [u64; VECTOR_COUNT];
+}
+
+/// Build one present interrupt gate (DPL 0, IF cleared on entry) for `handler`.
+fn idt_gate(handler: u64) -> IdtEntry {
+    IdtEntry {
+        offset_low: handler as u16,
+        selector: 0x08,        // boot GDT 64-bit code segment
+        ist_and_flags: 0x8E00, // present, interrupt gate, DPL 0
+        offset_mid: (handler >> 16) as u16,
+        offset_high: (handler >> 32) as u32,
+        reserved: 0,
+    }
+}
+
+/// Install an interrupt gate for `vector` (used by the interrupt bring-up to add
+/// the UART RX / timer / spurious vectors after the exception gates are set).
+fn set_idt_gate(vector: usize, handler: u64) {
+    // SAFETY: single CPU; the IDT is uniquely owned and already loaded (a live
+    // edit of a not-present slot is safe - no interrupt targets it until the
+    // controller is programmed to).
+    unsafe {
+        (*core::ptr::addr_of_mut!(IDT))[vector] = idt_gate(handler);
+    }
 }
 
 pub fn trap_init() {
     unsafe {
         let idt = &mut *core::ptr::addr_of_mut!(IDT);
-        for (i, entry) in idt.iter_mut().enumerate() {
-            let handler = VECTOR_STUBS[i];
-            *entry = IdtEntry {
-                offset_low: handler as u16,
-                selector: 0x08,        // boot GDT 64-bit code segment
-                ist_and_flags: 0x8E00, // present, interrupt gate, DPL 0
-                offset_mid: (handler >> 16) as u16,
-                offset_high: (handler >> 32) as u32,
-                reserved: 0,
-            };
+        for (i, entry) in idt.iter_mut().take(VECTOR_COUNT).enumerate() {
+            *entry = idt_gate(VECTOR_STUBS[i]);
         }
         let pointer = IdtPointer {
             limit: (core::mem::size_of::<IdtEntry>() * IDT_ENTRIES - 1) as u16,
