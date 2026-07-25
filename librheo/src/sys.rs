@@ -15,6 +15,11 @@ use core::sync::atomic::{AtomicU32, Ordering};
 /// Process the calling cell's queue pair; returns the number of entries
 /// completed. The doorbell.
 pub const SYS_DOORBELL: u64 = 1;
+/// Directed switch to the peer cell (`cur ^ 1`). On the single-CPU cooperative
+/// runtime this hands the CPU between the two ends of a cross-cell channel
+/// (docs/LIBRHEO.md Phase E): the producer submits then switches so the consumer
+/// runs, and vice-versa. Resumes the caller where it last switched.
+pub const SYS_SWITCH: u64 = 2;
 /// Next per-cell random u64 (the kernel DRBG; used once to seed librheo's own
 /// DRBG at startup - see `rng`).
 pub const SYS_RANDOM: u64 = 8;
@@ -51,6 +56,12 @@ pub const SYS_RESERVE_RELEASE: u64 = 41;
 /// copy up to `len` bytes to `buf` and return the count (0 = end of input).
 /// The OS's first block-and-wake (docs/LIBRHEO.md Phase D); `term` builds on it.
 pub const SYS_WAIT_INPUT: u64 = 42;
+/// connect_info(out_va) -> 0 or u64::MAX. Fills a `ChannelInfo` with the cell's
+/// cross-cell shared-channel end (docs/LIBRHEO.md Phase E); `ipc` builds on it.
+pub const SYS_CONNECT: u64 = 43;
+/// grant_share(grant_cap_id, out_va) -> 0 or u64::MAX. Delegate a sealed grant
+/// to the peer cell; fills a `ShareInfo` (peer VA + cap). Zero-copy buffer pass.
+pub const SYS_GRANT_SHARE: u64 = 44;
 
 // ---- raw syscall stubs (from libc/src/sys.rs) ----
 
@@ -282,6 +293,27 @@ pub fn exit(code: u64) -> ! {
     unsafe { syscall1(SYS_EXIT_GROUP, code) };
     loop {}
 }
+/// Hand the CPU to the peer cell (docs/LIBRHEO.md Phase E). Resumes here once the
+/// peer switches back. The cross-cell channel's cooperative handoff.
+pub fn switch() {
+    unsafe { syscall1(SYS_SWITCH, 0) };
+}
+/// Discover this cell's cross-cell shared-channel end. `Some(ChannelInfo)` or
+/// `None` if no channel is wired.
+pub fn connect() -> Option<ChannelInfo> {
+    let mut info = ChannelInfo {
+        chan_va: 0,
+        cap_id: 0,
+        role: 0,
+    };
+    let r = unsafe { syscall1(SYS_CONNECT, &mut info as *mut ChannelInfo as u64) };
+    if r == u64::MAX { None } else { Some(info) }
+}
+/// Delegate a sealed grant (`cap_id`) to the peer cell; fills a `ShareInfo` at
+/// `out_va`. Returns 0 or `u64::MAX`.
+pub fn grant_share(cap_id: u32, out_va: u64) -> u64 {
+    unsafe { syscall2(SYS_GRANT_SHARE, cap_id as u64, out_va) }
+}
 pub fn write(fd: u64, buf_va: u64, len: u64) -> i64 {
     unsafe { syscall3(SYS_WRITE_FD, fd, buf_va, len) as i64 }
 }
@@ -354,6 +386,24 @@ pub const STATUS_IO: u32 = 6;
 pub struct GrantInfo {
     pub base: u64,
     pub cap_id: u64,
+}
+
+/// The `SYS_CONNECT` result block (kernel/src/abi.rs `ChannelInfo`).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ChannelInfo {
+    pub chan_va: u64,
+    pub cap_id: u64,
+    /// 0 = initiator (client), 1 = acceptor (server).
+    pub role: u64,
+}
+
+/// The `SYS_GRANT_SHARE` result block (kernel/src/abi.rs `ShareInfo`).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ShareInfo {
+    pub peer_va: u64,
+    pub peer_cap_id: u64,
 }
 
 /// The `SYS_ENGINE_INFO` result block (kernel/src/abi.rs `EngineInfo`).
@@ -504,6 +554,45 @@ impl Qp {
             core::ptr::write_volatile(slot, e);
         }
         sq_head.store(head.wrapping_add(1), Ordering::Release);
+        true
+    }
+
+    /// Pop one submission from the SQ - the **consumer** side of a cross-cell
+    /// channel (the server end; docs/LIBRHEO.md Phase E). None if the SQ is
+    /// empty. The client uses [`submit`](Self::submit) (producer); over one
+    /// shared region the two drive opposite sides of the SPSC ring.
+    pub fn sq_pop(&self) -> Option<SqEntry> {
+        let h = self.header();
+        // SAFETY: the header lives at the region base for the overlay's life.
+        let (sq_head, sq_tail) = unsafe { (&(*h).sq_head, &(*h).sq_tail) };
+        let tail = sq_tail.load(Ordering::Relaxed);
+        let head = sq_head.load(Ordering::Acquire);
+        if tail == head {
+            return None;
+        }
+        let idx = (tail & (self.depth - 1)) as usize;
+        // SAFETY: idx in-bounds; volatile read matches the producer's writer.
+        let e = unsafe { core::ptr::read_volatile(self.sq_entries().add(idx)) };
+        sq_tail.store(tail.wrapping_add(1), Ordering::Release);
+        Some(e)
+    }
+
+    /// Push one completion onto the CQ - the **producer** side of a cross-cell
+    /// channel (the server end; docs/LIBRHEO.md Phase E). false if the CQ is
+    /// full. The client uses [`reap`](Self::reap) (consumer).
+    pub fn cq_push(&self, e: CqEntry) -> bool {
+        let h = self.header();
+        // SAFETY: the header lives at the region base for the overlay's life.
+        let (cq_head, cq_tail) = unsafe { (&(*h).cq_head, &(*h).cq_tail) };
+        let head = cq_head.load(Ordering::Relaxed);
+        let tail = cq_tail.load(Ordering::Acquire);
+        if head.wrapping_sub(tail) >= self.depth {
+            return false;
+        }
+        let idx = (head & (self.depth - 1)) as usize;
+        // SAFETY: idx in-bounds; the ring is shared, mapped memory.
+        unsafe { core::ptr::write_volatile(self.cq_entries().add(idx), e) };
+        cq_head.store(head.wrapping_add(1), Ordering::Release);
         true
     }
 

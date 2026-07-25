@@ -12,13 +12,15 @@
 //! synchronous, so there is no concurrent access to guard against.
 
 use crate::abi::{
-    GrantInfo, QueueInfo, ReserveInfo, SYS_COMMIT, SYS_CYCLES, SYS_DECOMMIT, SYS_DOORBELL,
-    SYS_EXIT, SYS_EXIT_GROUP, SYS_GRANT, SYS_MMAP, SYS_MMAP_FILE, SYS_MUNMAP, SYS_QUEUE_INFO,
-    SYS_RESERVE_ADMIT, SYS_RESERVE_QUERY, SYS_RESERVE_RELEASE, SYS_SEAL, SYS_SWITCH,
-    SYS_WAIT_INPUT,
+    ChannelInfo, GrantInfo, QueueInfo, ReserveInfo, SYS_COMMIT, SYS_CONNECT, SYS_CYCLES,
+    SYS_DECOMMIT, SYS_DOORBELL, SYS_EXIT, SYS_EXIT_GROUP, SYS_GRANT, SYS_GRANT_SHARE, SYS_MMAP,
+    SYS_MMAP_FILE, SYS_MUNMAP, SYS_QUEUE_INFO, SYS_RESERVE_ADMIT, SYS_RESERVE_QUERY,
+    SYS_RESERVE_RELEASE, SYS_SEAL, SYS_SWITCH, SYS_WAIT_INPUT, ShareInfo,
 };
 use crate::arch::{self, FaultCause, MapPerm, TrapFrame, TrapKind};
-use crate::capability::{BUDGET_UNLIMITED, CapTable, MAP, ObjectKind, ObjectTable, READ, WRITE};
+use crate::capability::{
+    BUDGET_UNLIMITED, CapTable, DELEGATE, MAP, ObjectKind, ObjectTable, READ, WRITE,
+};
 use crate::mm::{AddressSpace, frames};
 use crate::queue::{self, QueuePair};
 use crate::sched::{Admission, AdmitError, Reservation};
@@ -67,6 +69,13 @@ struct RunCell {
     grant_next: usize,
     /// Next free VA for a file mmap (`SYS_MMAP_FILE`).
     filemmap_next: usize,
+    /// Base VA of the cell's mapped cross-cell shared channel, reported by
+    /// `SYS_CONNECT` (docs/LIBRHEO.md Phase E). 0 = no channel wired.
+    chan_va: u64,
+    /// 32-bit ABI id of the cell's QueuePair capability for the channel.
+    chan_cap_id: u32,
+    /// Channel role: 0 = initiator (client), 1 = acceptor (server).
+    chan_role: u64,
 }
 
 const EMPTY: RunCell = RunCell {
@@ -82,6 +91,9 @@ const EMPTY: RunCell = RunCell {
     qp_cap_id: 0,
     grant_next: GRANT_BASE,
     filemmap_next: FILEMMAP_BASE,
+    chan_va: 0,
+    chan_cap_id: 0,
+    chan_role: 0,
 };
 
 /// Base VA of a native cell's typed memory-grant reservations (docs/LIBRHEO.md
@@ -351,18 +363,25 @@ fn grant_create(cur: usize, out_va: u64, len: usize, kind: u64, _flags: u64) -> 
     if cell.caps.is_null() || cell.objects.is_null() {
         return u64::MAX;
     }
-    // Mint a real MemoryGrant capability (READ|WRITE|MAP) so commit/decommit/
-    // seal are capability-gated. SAFETY: single CPU, synchronous trap; the
-    // cell's tables are uniquely owned for the trap. `objects` is installed as
-    // `*const` but the test kernel owns it as a mutable static; creating a new
-    // object here needs `&mut`, which this cast recovers.
+    // Mint a real MemoryGrant capability (READ|WRITE|MAP|DELEGATE) so commit/
+    // decommit/seal are capability-gated and the grant can be *delegated* to a
+    // peer once sealed (`SYS_GRANT_SHARE`, docs/LIBRHEO.md Phase E). SAFETY:
+    // single CPU, synchronous trap; the cell's tables are uniquely owned for the
+    // trap. `objects` is installed as `*const` but the test kernel owns it as a
+    // mutable static; creating a new object here needs `&mut`, which this cast
+    // recovers.
     let cap_id = unsafe {
         let objects = &mut *(cell.objects as *mut ObjectTable);
         let caps = &mut *cell.caps;
         let Ok(obj) = objects.create(ObjectKind::MemoryGrant) else {
             return u64::MAX;
         };
-        match caps.mint(objects, obj, READ | WRITE | MAP, BUDGET_UNLIMITED) {
+        match caps.mint(
+            objects,
+            obj,
+            READ | WRITE | MAP | DELEGATE,
+            BUDGET_UNLIMITED,
+        ) {
             Ok(h) => h.raw_low32(),
             Err(_) => return u64::MAX,
         }
@@ -456,6 +475,98 @@ fn grant_seal(cur: usize, cap_id: u32) -> u64 {
         .find(|s| s.in_use && s.cap_id == cap_id)
     {
         slot.sealed = true;
+    }
+    0
+}
+
+/// `SYS_GRANT_SHARE`: delegate a **sealed** memory grant to the peer cell
+/// (`cur ^ 1`) - zero-copy cross-cell buffer passing, the dmabuf equivalent
+/// (docs/LIBRHEO.md Phase E, docs/ARCHITECTURE.md 3 objects 2/5). The client's
+/// grant capability must carry DELEGATE (object 2 delegate/revoke) and the grant
+/// must be sealed (object 5 seal -> immutable = shareable). The kernel maps the
+/// grant's frames into the peer **read-only** at the peer's next grant VA, mints
+/// a MemoryGrant capability there referencing the **same** kernel object (so an
+/// epoch revoke on the client's object kills the peer's copy too - revocable),
+/// records a peer grant slot (its frames owned by the client, so never freed
+/// twice), and writes `ShareInfo { peer_va, peer_cap_id }` at `out_va`. Returns
+/// 0 or `u64::MAX`.
+fn grant_share(cur: usize, cap_id: u32, out_va: u64) -> u64 {
+    let peer = cur ^ 1;
+    let cell = cells()[cur];
+    let peer_cell = cells()[peer];
+    if cell.caps.is_null()
+        || cell.objects.is_null()
+        || !peer_cell.present
+        || peer_cell.caps.is_null()
+        || peer_cell.aspace.is_null()
+    {
+        return u64::MAX;
+    }
+    // Grant-check the client's capability for the DELEGATE right, recovering the
+    // kernel object id (revocation / budget enforced here). SAFETY: single CPU,
+    // synchronous trap; tables uniquely owned.
+    let obj = unsafe {
+        let objects = &*cell.objects;
+        let caps = &mut *cell.caps;
+        match caps.grant_check_low32(objects, cap_id, DELEGATE) {
+            Ok(o) => o,
+            Err(_) => return u64::MAX,
+        }
+    };
+    // Only a *sealed* (immutable) grant is shareable - the object-5 doctrine.
+    let Some(slot) = cell_grants(cur)
+        .iter()
+        .find(|s| s.in_use && s.cap_id == cap_id)
+        .copied()
+    else {
+        return u64::MAX;
+    };
+    if !slot.sealed {
+        return u64::MAX;
+    }
+    // Map the grant's frames into the peer read-only at its next grant VA.
+    let peer_base = peer_cell.grant_next;
+    // SAFETY: single CPU; the client's address space is read (page-table walk,
+    // no active requirement) and the peer's is edited (published when the peer is
+    // switched to). Both are uniquely owned for the trap.
+    let nframes = unsafe {
+        let client_aspace = &*cell.aspace;
+        let peer_aspace = &mut *(peer_cell.aspace as *mut AddressSpace);
+        client_aspace.share_ro_into(peer_aspace, slot.base, slot.len, peer_base)
+    };
+    if nframes == 0 {
+        return u64::MAX;
+    }
+    cells()[peer].grant_next = peer_base + slot.len;
+    // Mint a READ capability in the peer referencing the SAME object (so revoke
+    // by epoch kills it too). SAFETY: as above.
+    let peer_cap = unsafe {
+        let objects = &*cell.objects;
+        let caps = &mut *peer_cell.caps;
+        match caps.mint(objects, obj, READ, BUDGET_UNLIMITED) {
+            Ok(h) => h.raw_low32(),
+            Err(_) => return u64::MAX,
+        }
+    };
+    // Record a peer grant slot: sealed (read-only) and its frames owned by the
+    // client, so the peer never decommits/frees them (no double free).
+    if let Some(pslot) = cell_grants(peer).iter_mut().find(|s| !s.in_use) {
+        *pslot = GrantSlot {
+            in_use: true,
+            base: peer_base,
+            len: slot.len,
+            kind: slot.kind,
+            sealed: true,
+            cap_id: peer_cap,
+        };
+    }
+    // SAFETY: `out_va` is a user VA in the running (client) cell's active address
+    // space, sized for a `ShareInfo` (the cell passes its own stack slot).
+    unsafe {
+        (out_va as *mut ShareInfo).write(ShareInfo {
+            peer_va: peer_base as u64,
+            peer_cap_id: peer_cap as u64,
+        });
     }
     0
 }
@@ -625,6 +736,9 @@ pub unsafe fn install(
         qp_cap_id: 0,
         grant_next: GRANT_BASE,
         filemmap_next: FILEMMAP_BASE,
+        chan_va: 0,
+        chan_cap_id: 0,
+        chan_role: 0,
     };
     *cell_grants(idx) = [EMPTY_GRANT; MAX_GRANTS_PER_CELL];
 }
@@ -636,6 +750,18 @@ pub fn set_queue_info(idx: usize, qp_va: u64, cap_id: u32) {
     assert!(cells()[idx].present, "set_queue_info on empty slot {idx}");
     cells()[idx].qp_va = qp_va;
     cells()[idx].qp_cap_id = cap_id;
+}
+
+/// Record the mapped cross-cell shared channel for cell `idx` (docs/LIBRHEO.md
+/// Phase E). `SYS_CONNECT` reports `(chan_va, cap_id, role)` so a librheo cell
+/// binds its channel end. Call after `install`, before `run`; the two peers of a
+/// connection get the *same* frames (see `load::map_channel_into`) at the same
+/// VA but opposite roles (0 = client, 1 = server).
+pub fn set_channel_info(idx: usize, chan_va: u64, cap_id: u32, role: u64) {
+    assert!(cells()[idx].present, "set_channel_info on empty slot {idx}");
+    cells()[idx].chan_va = chan_va;
+    cells()[idx].chan_cap_id = cap_id;
+    cells()[idx].chan_role = role;
 }
 
 /// Tag an installed cell with a syscall personality (call after `install`,
@@ -765,6 +891,9 @@ pub unsafe fn install_forked(
         qp_cap_id: 0,
         grant_next: GRANT_BASE,
         filemmap_next: FILEMMAP_BASE,
+        chan_va: 0,
+        chan_cap_id: 0,
+        chan_role: 0,
     };
 }
 
@@ -848,6 +977,35 @@ pub fn on_user_trap(
                 0
             };
             arch::set_syscall_ret(unsafe { &mut *frame }, ret);
+            frame
+        }
+        // Cross-cell connect: report this cell's shared-channel end (docs/
+        // LIBRHEO.md Phase E). The two peers share one ring region; the kernel
+        // never drains it - they drive the SPSC rings directly over the frames.
+        SYS_CONNECT => {
+            let cell = cells()[cur];
+            let ret = if cell.chan_va == 0 {
+                u64::MAX
+            } else {
+                // SAFETY: `arg` is a user VA in the running cell's active address
+                // space, sized for a `ChannelInfo` (24 bytes); the cell passes
+                // its own stack slot.
+                unsafe {
+                    (arg as *mut ChannelInfo).write(ChannelInfo {
+                        chan_va: cell.chan_va,
+                        cap_id: cell.chan_cap_id as u64,
+                        role: cell.chan_role,
+                    });
+                }
+                0
+            };
+            arch::set_syscall_ret(unsafe { &mut *frame }, ret);
+            frame
+        }
+        // Delegate a sealed grant to the peer cell (zero-copy buffer passing).
+        SYS_GRANT_SHARE => {
+            let r = grant_share(cur, args[0] as u32, args[1]);
+            arch::set_syscall_ret(unsafe { &mut *frame }, r);
             frame
         }
         SYS_CYCLES => {

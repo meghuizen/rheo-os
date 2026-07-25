@@ -54,6 +54,47 @@ pub fn map_queue(aspace: &mut AddressSpace) -> QueuePair {
     }
 }
 
+/// Base VA of a loaded cell's **cross-cell shared channel** region
+/// (docs/LIBRHEO.md Phase E): 24 GiB, between the file-mmap (20 GiB) and grant
+/// (32 GiB) regions, free in every cell root. `SYS_CONNECT` reports it. The two
+/// cells of a connection map the *same* frames here at this VA, so the SPSC ring
+/// they overlay drives one set of physical words (a typed queue pair whose two
+/// ends live in two cells, IO.md 6).
+pub const USER_CHANNEL_VA: usize = 0x6_0000_0000;
+
+/// Pages a shared channel region occupies (a full queue-pair region).
+pub const CHANNEL_PAGES: usize = QueuePair::REGION_SIZE / FRAME_SIZE;
+
+/// Allocate the frames for a cross-cell shared channel and write a fresh ring
+/// header into them (docs/LIBRHEO.md Phase E). Returns the frame list; the
+/// caller maps it into *each* peer with [`map_channel_into`] (so the same frames
+/// back both ends) and each cell overlays its own [`QueuePair`] at
+/// [`USER_CHANNEL_VA`]. The header is written once through the kernel linear map
+/// (no cell is active during setup). The kernel never drains this ring - the two
+/// cells drive the SQ/CQ directly over the shared frames.
+pub fn alloc_channel() -> [usize; CHANNEL_PAGES] {
+    let mut framelist = [0usize; CHANNEL_PAGES];
+    for (i, slot) in framelist.iter_mut().enumerate() {
+        let pa = frames::alloc(); // zeroed
+        *slot = pa;
+        if i == 0 {
+            // SAFETY: `pa` is a freshly allocated frame reached through the
+            // kernel linear map; the header fits well within one page.
+            unsafe { QueuePair::init_header(arch::phys_to_virt(pa) as *mut u8) };
+        }
+    }
+    framelist
+}
+
+/// Map the frames of a shared channel into `aspace` at [`USER_CHANNEL_VA`], RW so
+/// the cell can drive its side of the SPSC rings. Called once per peer with the
+/// **same** `framelist` from [`alloc_channel`], so both cells share the frames.
+pub fn map_channel_into(aspace: &mut AddressSpace, framelist: &[usize; CHANNEL_PAGES]) {
+    for (i, &pa) in framelist.iter().enumerate() {
+        aspace.map_user_frame(USER_CHANNEL_VA + i * FRAME_SIZE, pa, MapPerm::UserRw);
+    }
+}
+
 /// Load `image` into `aspace`; returns the entry-point VA. The caller then
 /// builds a trap frame at that entry with a stack from `map_stack`.
 pub fn load_elf(image: &[u8], aspace: &mut AddressSpace) -> Option<usize> {

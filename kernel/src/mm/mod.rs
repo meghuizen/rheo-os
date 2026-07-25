@@ -102,6 +102,31 @@ impl AddressSpace {
         child
     }
 
+    /// Map every committed user frame of `self` in `[base, base+len)` into `dst`
+    /// **read-only** at `dst_base + (va - base)`, returning the number of frames
+    /// shared - the cross-cell sealed-buffer share (docs/LIBRHEO.md Phase E). The
+    /// same physical frames back both spaces, so the peer reads the buffer with
+    /// no copy (the dmabuf equivalent). Neither space need be active: leaves are
+    /// read from `self`'s page table and mapped into `dst`'s (published when
+    /// `dst` is next activated). The source stays sealed read-only; the peer gets
+    /// read-only, so the shared bytes are immutable on both sides.
+    pub fn share_ro_into(
+        &self,
+        dst: &mut AddressSpace,
+        base: usize,
+        len: usize,
+        dst_base: usize,
+    ) -> usize {
+        let mut n = 0usize;
+        arch::paging_for_each_user_leaf(&self.root, &mut |va, pa, _perm| {
+            if va >= base && va < base + len {
+                dst.map_user_frame(dst_base + (va - base), pa, MapPerm::UserRo);
+                n += 1;
+            }
+        });
+        n
+    }
+
     /// Return every committed user leaf frame of this space to the pool - the
     /// child-reap / `execve` / process-exit teardown (docs/LINUX-COMPAT.md L6).
     /// Intermediate page-table frames are intentionally NOT reclaimed (a small,

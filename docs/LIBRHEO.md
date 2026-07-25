@@ -474,7 +474,117 @@ above); x86-64 and ARM64 are on the poll path (their interrupt-controller bring-
 single-CPU model is unchanged: this is "wake on input", not preemptive scheduling
 (SMP/preemption is task #27).
 
+## Phase E - services & IPC, a Wayland-class compositor (this milestone)
+
+Phase E makes librheo the substrate for **services and a Wayland-class
+compositor**: two cells that share a **typed cross-cell queue pair** and pass
+**ownership of a sealed buffer grant** (zero-copy), with a **flip/present
+completion**. The proof is the `librheowl` test kernel: a client cell and a
+compositor cell exchange a sealed buffer over a shared queue pair; the client
+"commits" a frame, the compositor composites it and returns a flip completion,
+and the client asserts the compositor's checksum equals its own known value -
+proving zero-copy cross-cell sharing - on all three ISAs.
+
+This closes docs/IO.md 6 ("Cross-cell calls are the same ABI: connect =
+capability exchange yielding a typed queue pair") and the compositor primitives
+of docs/GRAPHICS.md / docs/DISPLAY.md (a surface + a present/flip queue; buffer
+grants = the dmabuf equivalent; a HID event stream).
+
+### Kernel surface added (Phase E)
+
+Both additions **expose an existing kernel object** - none is a new object (they
+pass the docs/ARCHITECTURE.md 6 admission rule as mechanism / exposure of
+objects 2/3/5). A cross-cell queue pair is the queue object (3) mapped into two
+cells; buffer passing is capability delegation (2) of a sealed grant (5).
+
+- **`SYS_CONNECT` (43)** - `connect_info(out_va) -> 0 | u64::MAX`. Writes a
+  `ChannelInfo { chan_va, cap_id, role }`: the base VA of the cell's mapped
+  **shared-channel** region, its minted QueuePair capability id, and its role (0
+  = initiator/client, 1 = acceptor/server) so one binary serves both ends. A
+  cross-cell channel is **one ring region mapped into two cells** at the same
+  channel VA (`load::USER_CHANNEL_VA`, 24 GiB); the kernel writes the ring header
+  once (`load::alloc_channel` + `map_channel_into`) but **never drains it** - the
+  two cells drive the SPSC rings directly over the shared frames (the client is
+  the SQ producer + CQ consumer, the server the reverse), so a message is a pure
+  shared-memory write, not a kernel round trip. This is the IO.md-6 typed queue
+  pair whose two ends live in two cells.
+- **`SYS_GRANT_SHARE` (44)** - `grant_share(grant_cap_id, out_va) -> 0 |
+  u64::MAX`. **Delegate a sealed grant to the peer cell** (`cur ^ 1`): the kernel
+  maps the grant's frames into the peer **read-only** at the peer's next grant VA
+  (`AddressSpace::share_ro_into`, portable over the existing per-ISA leaf walk),
+  mints a MemoryGrant capability there referencing the **same** kernel object (so
+  an epoch revoke on the client's object kills the peer's copy too - revocable),
+  and writes a `ShareInfo { peer_va, peer_cap_id }`. It requires the grant
+  capability to carry **DELEGATE** (object 2) and the grant to be **sealed**
+  (object 5 seal -> immutable = shareable). This is **zero-copy shared memory**:
+  the same physical frames back both cells, so the compositor reads the client's
+  buffer with no copy (the dmabuf equivalent). `SYS_GRANT` now mints grants with
+  `READ|WRITE|MAP|DELEGATE` so a cell can share its own buffers.
+
+The native-cell VA map gains the **shared channel at 24 GiB**
+(`load::USER_CHANNEL_VA`), between the file mmap (20 GiB) and grant (32 GiB)
+regions.
+
+### librheo modules (Phase E)
+
+| module | role |
+| --- | --- |
+| `ipc` (new) | `Channel` - a typed cross-cell queue pair over the shared ring (`open` discovers this cell's end + role via `SYS_CONNECT`; client `send`/`await_completion`, server `recv`/`complete`, both over `SqEntry`/`CqEntry`), the cooperative `switch_to_peer` hand-off, and **buffer passing**: `share(&Grant) -> SharedBuffer` (delegate a sealed grant to the peer) + `recv_buffer(peer_va, len)` (view the delegated frames read-only, zero-copy). |
+| `display` (new) | the compositor primitives: `Surface` (a client drawable backed by a sealed buffer grant; `commit` seals + delegates the buffer, sends the handle + geometry, and awaits the flip completion), `Compositor` (an in-memory framebuffer; `present` receives a frame, composites the shared buffer, and replies with the flip completion), and `InputEvent` (the Phase D `term::input::Key`, delivered over the same typed channel - the HID event-stream shape). |
+
+### The proof: the compositor demo (`librheowl`)
+
+`librheo-wl` is **one binary run as two cells** (the test kernel installs both,
+gives each its own kernel queue pair, wires one shared channel into both, and
+sets roles - like the harness wires `.user` cells; Phase E proves the connect
+mechanism, spawn-driven connect is Phase F). Which cell is which is decided by
+the role `SYS_CONNECT` reports (cell 0 = client, cell 1 = compositor):
+
+1. **client** - allocates a 64x64 buffer grant, draws a known pattern into it,
+   computes its checksum, then `commit`s: **seals** the buffer, **shares** it to
+   the compositor (`SYS_GRANT_SHARE` - the same frames mapped read-only into the
+   compositor), sends the buffer handle + geometry over the shared channel, and
+   awaits the flip completion.
+2. **compositor** - receives the buffer handle over the channel, maps the sealed
+   grant read-only (**zero-copy** - the same frames), composites it into its own
+   framebuffer (the one compositing copy), checksums the framebuffer, and sends
+   the **flip/present completion** back over the channel carrying that checksum.
+3. **client** - reaps the flip completion (the frame callback) and asserts the
+   compositor's checksum **equals its own known value** - which it can only do if
+   the compositor read the exact client bytes over the shared mapping - then
+   exits `0x42`.
+
+The test asserts the client exits `0x42` on all three ISAs. Because the
+compositor's checksum matches the client's (observed identical -
+`0x3eb4f800` for the demo pattern), the buffer share is genuinely **zero-copy**:
+the compositor reads the client's frames directly, no bounce buffer, no copy of
+the client's bytes into the kernel or the compositor's own memory (the single
+copy is the compositor's *own* composite into its framebuffer, exactly as a real
+server blends a surface into the scanout).
+
+### Honest accounting (Phase E)
+
+- **Zero-copy is real.** `SYS_GRANT_SHARE` maps the client's sealed frames into
+  the compositor; the shared queue pair is shared memory the kernel never
+  touches. The only copy is the compositor's deliberate composite into its
+  framebuffer.
+- **The channel is synchronous with an explicit peer hand-off.** On the
+  single-CPU cooperative runtime a producer submits then `switch`es so the
+  consumer runs (and vice-versa). Folding the channel into the strand reactor as
+  a park-on-channel-completion (a fully symmetric async `Sender<T>`/`Receiver<T>`)
+  is the documented refinement; the mechanism (typed shared queue pair + sealed
+  buffer + flip completion) is the deliverable.
+- **Spawn-driven connect is Phase F.** Here the test kernel wires the two cells
+  and their shared channel; a cell spawning its peer and exchanging the channel
+  capability at runtime waits for native `SYS_SPAWN` (Phase F).
+- **Real GPU is deferred** (docs/DISPLAY.md). The framebuffer is in-memory, not a
+  virtio-gpu scanout. The compositor mechanism - shared sealed buffer, typed
+  present queue, flip completion, input-event shape - is the deliverable; a real
+  display engine is future work.
+- **Single frame, single buffer.** A `Surface` commits once; double-buffering
+  with a per-frame buffer pool is a documented refinement.
+
 ## Later phases (planned, not in this milestone)
 
-E - services & IPC (cross-cell connect, a Wayland-class compositor demo). F -
-process/time/net + a librheo-native shell. See the plan for the full sequence.
+F - process/time/net + a librheo-native shell. See the plan for the full
+sequence.

@@ -208,6 +208,63 @@ pub const SYS_RESERVE_RELEASE: u64 = 41;
 /// not lost. librheo's `term` builds its async input on this.
 pub const SYS_WAIT_INPUT: u64 = 42;
 
+// ---- services & IPC: cross-cell connect + buffer-grant passing
+// (docs/LIBRHEO.md Phase E, docs/IO.md 6, docs/ARCHITECTURE.md 3 objects 2/3/5) ----
+//
+// These EXPOSE the existing queue-pair (object 3) and memory-grant (object 5)
+// kernel objects as the Wayland-class services substrate; they add no new object
+// (they pass the ARCHITECTURE.md 6 admission rule as mechanism). A *cross-cell*
+// queue pair is one shared ring region mapped into two cells at the same channel
+// VA (the two ends of an IO.md-6 typed connection); the kernel initialises the
+// header once and reports each cell's end, but never drains it - the two cells
+// drive the SPSC rings directly over the shared frames (no kernel_process). A
+// buffer grant is passed by *delegating* a sealed grant (object 2 delegate,
+// object 5 seal->immutable/shareable): the kernel maps the same frames into the
+// peer read-only and mints a MemoryGrant capability there - zero-copy shared
+// memory, the dmabuf equivalent.
+
+/// connect_info(out_va) -> 0, or u64::MAX if the cell has no cross-cell channel.
+/// Writes a `ChannelInfo { chan_va, cap_id, role }`: the base VA of the cell's
+/// mapped shared-channel region, the 32-bit ABI id of its minted QueuePair
+/// capability for the channel, and its role (0 = initiator/client, 1 =
+/// acceptor/server) so one binary can serve both ends. librheo's `ipc::Channel`
+/// calls this once to bind the shared ring (IO.md 6: connect = capability
+/// exchange yielding a typed queue pair).
+pub const SYS_CONNECT: u64 = 43;
+/// grant_share(grant_cap_id, out_va) -> 0, or u64::MAX on failure. Delegate a
+/// **sealed** memory grant to the peer cell: the kernel maps the grant's frames
+/// into the peer read-only, mints a MemoryGrant capability there referencing the
+/// same kernel object (so an epoch revoke kills the peer's copy too), and writes
+/// a `ShareInfo { peer_va, peer_cap_id }` at `out_va`. Requires the grant cap to
+/// carry DELEGATE and the grant to be sealed (immutable = shareable, object 5).
+/// This is zero-copy cross-cell buffer passing (the dmabuf equivalent): the
+/// client fills+seals a buffer, shares it, sends the handle over the channel;
+/// the server reads the same frames with no copy.
+pub const SYS_GRANT_SHARE: u64 = 44;
+
+/// The `SYS_CONNECT` result block (kept in sync with librheo's `ipc` arm).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ChannelInfo {
+    /// Base VA of the cell's mapped shared-channel region (the `QueueHeader`).
+    pub chan_va: u64,
+    /// 32-bit ABI id of the cell's QueuePair capability for the channel.
+    pub cap_id: u64,
+    /// 0 = initiator (client: SQ producer, CQ consumer); 1 = acceptor (server:
+    /// SQ consumer, CQ producer). The two ends drive opposite sides of the SPSC.
+    pub role: u64,
+}
+
+/// The `SYS_GRANT_SHARE` result block (kept in sync with librheo's `ipc` arm).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ShareInfo {
+    /// Base VA at which the grant's frames were mapped read-only in the peer.
+    pub peer_va: u64,
+    /// 32-bit ABI id of the MemoryGrant capability minted in the peer's table.
+    pub peer_cap_id: u64,
+}
+
 /// The `SYS_ENGINE_INFO` result block (kept in sync with librheo's `compute`
 /// arm). `kind`: 0=CPU (the only real engine in QEMU; GPU/NPU are attested-
 /// firmware future work). `preemption`: 0=per-instruction, 1=per-op-boundary.

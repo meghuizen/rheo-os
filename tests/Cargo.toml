@@ -89,6 +89,10 @@ name = "librheoterm"
 path = "src/librheoterm.rs"
 
 [[bin]]
+name = "librheowl"
+path = "src/librheowl.rs"
+
+[[bin]]
 name = "coreutils"
 path = "src/coreutils.rs"
 

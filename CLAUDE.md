@@ -392,8 +392,44 @@ loopback does not drive the APLIC line, so the deterministic test raises the UAR
 MSI in the IMSIC directly - exactly the MSI the configured APLIC would send; the
 byte is genuinely received and a genuine S external interrupt genuinely wakes `wfi`,
 docs/LIBRHEO.md Phase D). This is "wake on input", not preemptive scheduling
-(SMP/#27). Phases E-F (IPC/compositor, process/time/net) are planned in
-docs/LIBRHEO.md.
+(SMP/#27).
+
+**Phase E** makes librheo the substrate for **services and a Wayland-class
+compositor**: two cells share a **typed cross-cell queue pair** and pass
+ownership of a **sealed buffer grant** (zero-copy), with a **flip/present
+completion**. Two kernel additions, both **exposing** existing objects (no new
+object): **`SYS_CONNECT` (43)** reports a cell's shared-channel end
+(`ChannelInfo { chan_va, cap_id, role }`) - a cross-cell channel is **one ring
+region mapped into two cells** at 24 GiB (`load::alloc_channel` +
+`map_channel_into`), whose header the kernel writes once but **never drains**:
+the two cells drive the SPSC rings directly over the shared frames (IO.md 6, the
+queue object 3), so a message is a pure shared-memory write. **`SYS_GRANT_SHARE`
+(44)** delegates a **sealed** grant to the peer cell (objects 2/5): the kernel
+maps its frames **read-only** into the peer (`AddressSpace::share_ro_into`, over
+the existing per-ISA leaf walk), mints a MemoryGrant cap there on the **same**
+object (epoch-revocable), and reports `ShareInfo { peer_va, peer_cap_id }` -
+**zero-copy shared memory, the dmabuf equivalent** (requires DELEGATE + sealed;
+`SYS_GRANT` now mints `READ|WRITE|MAP|DELEGATE`). librheo gained **`ipc`**
+(`Channel` - a typed cross-cell queue pair with client `send`/`await_completion`
++ server `recv`/`complete` over `SqEntry`/`CqEntry`, the cooperative
+`switch_to_peer` hand-off, and `share`/`recv_buffer` for zero-copy buffer
+passing) and **`display`** (`Surface` - a client drawable backed by a sealed
+buffer grant, `commit` seals+delegates+sends+awaits the flip; `Compositor` - an
+in-memory framebuffer, `present` composites the shared buffer + replies with the
+flip completion; `InputEvent` reuses the Phase D `term::input::Key` as the HID
+event-stream shape). The `librheowl` test runs **one binary as two cells** (the
+test kernel wires both + the shared channel + roles): the client draws a 64x64
+buffer, seals + shares it, commits a frame; the compositor maps the shared grant
+read-only (zero-copy - same frames), composites it, and returns a flip completion
+carrying its checksum; the client asserts that checksum **equals its own known
+value** (`0x3eb4f800`) - proving zero-copy cross-cell sharing - and exits `0x42`
+on **all three ISAs**. Honest: zero-copy is real (the only copy is the
+compositor's own composite into its framebuffer); the channel is synchronous with
+an explicit peer hand-off (a fully-symmetric async `Sender`/`Receiver` parking on
+the reactor is the documented refinement); spawn-driven connect is Phase F; real
+GPU (virtio-gpu scanout) is deferred - the mechanism (shared sealed buffer + typed
+present queue + flip completion + input-event shape) is the deliverable. Phase F
+(process/time/net + a librheo-native shell) is planned in docs/LIBRHEO.md.
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
@@ -477,6 +513,9 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               CPU engine + reservation admission), librheoterm (librheo Phase D:
               the first interrupt-driven console wakeup + the term byte-stream
               discipline - scripted editing/history/escape, idle-park on RISC-V),
+              librheowl (librheo Phase E: the Wayland-class compositor demo -
+              two cells share a typed cross-cell queue pair + pass a sealed
+              buffer grant zero-copy + a flip completion, checksum-verified),
               coreutils (the coreutils multicall cell, with
               argv + std::fs over the VFS), linuxrun (Personality::Linux:
               bare Linux-ABI programs plus, at L2, unpatched static-glibc
@@ -513,9 +552,12 @@ librheo/      the native userspace foundation library (docs/LIBRHEO.md):
               File/read_at/write_at/Contract)/store (Dataset)/compute
               (map_reduce/parallel_for/scan strand workers + Engine::info +
               GraphBuilder)/sched (Reservation + lattice-rt Priority/PeriodicTask/
-              TimingReport) + crt0 + the librheo-demo (Phase A), librheo-data
-              (Phase B mini-DuckDB scan), and librheo-compute (Phase C parallel
-              compute + graph + QoS) programs
+              TimingReport)/term (Phase D byte-stream input/edit/render)/ipc
+              (Phase E cross-cell Channel + sealed-buffer share)/display (Phase E
+              Surface/Compositor/InputEvent) + crt0 + the librheo-demo (Phase A),
+              librheo-data (Phase B mini-DuckDB scan), librheo-compute (Phase C
+              parallel compute + graph + QoS), librheo-term (Phase D terminal),
+              and librheo-wl (Phase E compositor demo) programs
 json/         rheo-json: a dependency-free, zero-copy JSON parser (scalar +
               SSE2 string-scan), no_std, host-tested + benchmarked
               (docs/JSON.md, comparison/json/)
