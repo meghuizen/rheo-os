@@ -33,7 +33,7 @@ use kernel::mm::AddressSpace;
 use kernel::queue::QueuePair;
 use kernel::svc;
 use kernel::user::{self, Outcome};
-use kernel::{arch, elf, input, load, println};
+use kernel::{arch, elf, input, load, println, time};
 use posix::{RamFs, fs, mount, sys};
 
 #[path = "vfs_personality.rs"]
@@ -192,10 +192,33 @@ extern "C" fn kernel_main() -> ! {
         EMBED.len()
     );
 
+    // Bring up the timer interrupt where this ISA supports it (a no-op that
+    // leaves the busy-wait fallback elsewhere), so the orchestrator's
+    // `time::sleep` parks at WFI and wakes on the hardware timer IRQ.
+    arch::enable_timer_irq();
+
     // --- scenario 1: direct spawn / wait / timer proof ---
     vfs_personality::clear_stdout();
     expect_exit("librheo-orch", run_cell(ORCH, true, None));
-    println!("librheoproc: orch OK (spawn+wait+map/reduce+timer)");
+    println!(
+        "librheoproc: orch OK (spawn+wait+map/reduce+timer; timer mode: {})",
+        if time::timer_interrupt_driven() {
+            "interrupt-driven (WFI idle)"
+        } else {
+            "cooperative busy-wait"
+        }
+    );
+
+    // Idle-park proof: where the timer interrupt is wired, the orchestrator's
+    // `time::sleep` must have genuinely idled at WFI (0% CPU, not a spin). In
+    // the busy-wait build this is skipped (documented, honest).
+    if time::timer_interrupt_driven() {
+        assert!(
+            time::timer_did_idle(),
+            "interrupt-driven timer but the kernel never idled at WFI"
+        );
+        println!("librheoproc: timer idle-park proven (kernel idled at WFI, woke on timer IRQ)");
+    }
 
     // --- scenario 2: the librheo-native shell ---
     vfs_personality::clear_stdout();

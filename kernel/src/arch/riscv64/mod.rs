@@ -224,6 +224,74 @@ pub fn idle_wait() {
     }
 }
 
+// ------------------------------------------------- timer interrupt (Sstc)
+// docs/LIBRHEO.md Phase F: the kernel's second interrupt. QEMU `virt` with
+// `-cpu max` implements **Sstc**, so S-mode can arm its own timer by writing
+// the `stimecmp` CSR (0x14D); when the `time` counter reaches it the machine
+// raises `sip.STIP` (`scause` = interrupt | 5). We enable `sie.STIE` (bit 5)
+// and, like the UART path, keep `sstatus.SIE` clear - `wfi` still wakes on the
+// pending enabled interrupt, and we set SIE only briefly to service it. That
+// makes `SYS_ARM_TIMER` a genuine 0%-CPU park (POWER.md: armed only when a real
+// deadline exists). OpenSBI leaves `menvcfg.STCE` set on this QEMU config, so
+// the S-mode `stimecmp` write does not trap; this is opt-in (`enable_timer_irq`,
+// called only by the Phase F timer test), so no other kernel is affected.
+
+/// `scause` for a supervisor timer interrupt: interrupt bit | cause 5.
+const SCAUSE_S_TIMER: u64 = (1 << 63) | 5;
+/// The QEMU `virt` timebase (the `time` CSR / `stimecmp` run at 10 MHz).
+const TIMEBASE_HZ: u64 = 10_000_000;
+
+static mut TIMER_ENABLED: bool = false;
+
+/// Whether the S-mode timer interrupt (Sstc) is wired on this ISA (set by
+/// [`enable_timer_irq`]). While false the portable timer path busy-waits.
+pub fn timer_irq_enabled() -> bool {
+    // SAFETY: single CPU; set once before any cell runs.
+    unsafe { *core::ptr::addr_of!(TIMER_ENABLED) }
+}
+
+/// Read the `time` CSR (0xC01): the S-mode wall counter at `TIMEBASE_HZ`.
+#[inline(always)]
+fn rdtime() -> u64 {
+    let t: u64;
+    // SAFETY: `time` is a read-only counter CSR, readable in S-mode here.
+    unsafe { asm!("csrr {0}, time", out(reg) t) };
+    t
+}
+
+/// Enable the S-mode timer interrupt (Sstc): push `stimecmp` far out (so nothing
+/// is pending) and set `sie.STIE`. Idempotent; call once before a cell that arms
+/// a timer. If Sstc were absent the `stimecmp` write would trap - this is called
+/// only by the Phase F timer test, so no other kernel is affected.
+pub fn enable_timer_irq() {
+    // SAFETY: kernel context; Sstc is present on `-cpu max` with menvcfg.STCE set.
+    unsafe {
+        asm!("csrw 0x14d, {0}", in(reg) u64::MAX); // stimecmp = never
+        asm!("csrrs x0, sie, {0}", in(reg) 1u64 << 5); // sie.STIE
+        *core::ptr::addr_of_mut!(TIMER_ENABLED) = true;
+    }
+}
+
+/// Arm the S-mode timer for `deadline_ns` from now and halt at `wfi` until it
+/// fires (a genuine 0%-CPU park). The timer runs in the `time`/`stimecmp` domain
+/// (10 MHz), distinct from `cycles()` (the retired-instruction counter), so the
+/// deadline is converted here. Called only when [`timer_irq_enabled`].
+pub fn timer_wait(deadline_ns: u64) {
+    let delta = ((deadline_ns as u128 * TIMEBASE_HZ as u128) / 1_000_000_000) as u64;
+    let target = rdtime().wrapping_add(delta.max(1));
+    // SAFETY: kernel context; `stimecmp` is writable (Sstc), SIE toggled around
+    // a single serviced interrupt.
+    unsafe {
+        asm!("csrw 0x14d, {0}", in(reg) target); // stimecmp = deadline
+        while rdtime() < target {
+            asm!("wfi"); // wakes on the pending STI (SIE clear, not yet taken)
+            asm!("csrrsi x0, sstatus, 2"); // take + service it (handler disarms)
+            asm!("csrrci x0, sstatus, 2"); // clear SIE
+        }
+        asm!("csrw 0x14d, {0}", in(reg) u64::MAX); // disarm
+    }
+}
+
 /// Deliver a scripted byte through the real UART RX interrupt (16550 loopback),
 /// halting at `wfi` until the interrupt is taken - the same path a live keystroke
 /// takes. Used by the deterministic Phase D test.
@@ -275,6 +343,13 @@ extern "C" fn riscv_trap_handler(scause: u64, sepc: u64, stval: u64) -> u64 {
         // The kernel's first hardware interrupt (docs/LIBRHEO.md Phase D): the
         // UART RX line, delivered via the AIA. Drain it and resume where we were.
         handle_uart_irq();
+        return sepc;
+    }
+    if scause == SCAUSE_S_TIMER {
+        // The kernel's second interrupt (docs/LIBRHEO.md Phase F): the S-mode
+        // timer (Sstc). Disarm by pushing stimecmp far out (clears STIP); the
+        // waiter in `timer_wait` observes the elapsed deadline and returns.
+        unsafe { asm!("csrw 0x14d, {0}", in(reg) u64::MAX) };
         return sepc;
     }
     if scause == SCAUSE_BREAKPOINT {

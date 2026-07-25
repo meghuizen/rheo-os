@@ -105,6 +105,19 @@ pub fn idle_wait() {}
 /// is taken (only called when `uart_irq_enabled`).
 pub fn uart_inject_and_wait(_b: u8) {}
 
+// ------------------------------------------------- timer interrupt (Phase F)
+// Poll build: no CNTV timer is wired yet (the documented next step), so the
+// portable `time::arm_timer` busy-waits on the virtual counter.
+
+/// Whether the timer interrupt is wired (false = busy-wait path).
+pub fn timer_irq_enabled() -> bool {
+    false
+}
+/// Bring up the timer interrupt (CNTV virtual timer + its PPI) - not yet on ARM64.
+pub fn enable_timer_irq() {}
+/// Arm the timer and halt until it fires (only called when `timer_irq_enabled`).
+pub fn timer_wait(_deadline_ns: u64) {}
+
 // ----------------------------------------------------------------- traps
 
 unsafe extern "C" {
