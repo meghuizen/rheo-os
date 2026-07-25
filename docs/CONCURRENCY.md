@@ -59,16 +59,20 @@ RT-reservation mutexes in the L4 suite), and multiple *vcores* (real SMP
 parallelism) still awaits secondary-core bring-up. The native strand runtime
 (sections 1-3) remains the single-vcore userspace scheduler.
 
-**The first real wakeup (docs/LIBRHEO.md Phase D).** Until Phase D, "park on a
+**The first real wakeups (docs/LIBRHEO.md Phase D/F).** Until Phase D, "park on a
 token" was closed only by a synchronous doorbell drain - a reactor with nothing
 ready could only spin, because the kernel had **no interrupts on any ISA**. Phase
 D adds the OS's **first block-and-wake**: a librheo `term` cell whose strand parks
 on console input drives the reactor to block in `SYS_WAIT_INPUT`, and the kernel
-**idles at `wfi` until the UART RX interrupt delivers a byte** (RISC-V, S-mode
-external via the AIA IMSIC) instead of spinning - a genuine 0%-CPU park, one
-wakeup resuming the parked strand. x86-64/ARM64 still poll (their
-interrupt-controller bring-up is pending); the general completion-queue IRQ and
-the preemption doorbell (section 4) remain future work.
+**idles until the UART RX interrupt delivers a byte** (RISC-V S-mode external via
+the AIA IMSIC; ARM64 PL011 SPI via the GICv3) instead of spinning - a genuine
+0%-CPU park. Phase F adds the **second interrupt**, the **timer**: a strand
+parking on a deadline (`time::sleep`/`SYS_ARM_TIMER`) idles until the per-ISA timer
+interrupt fires - **interrupt-driven on all three ISAs** (RISC-V Sstc `stimecmp`;
+ARM64 CNTV virtual timer via the GICv3; x86-64 LAPIC LVT one-shot). x86-64's UART
+RX still polls (its QEMU TCG split-irqchip IOAPIC/LAPIC does not re-deliver
+reliably, documented). The general completion-queue IRQ and the preemption
+doorbell (section 4) remain future work.
 
 ## 2. Both stack disciplines
 

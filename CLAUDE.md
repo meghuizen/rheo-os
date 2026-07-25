@@ -372,14 +372,20 @@ Bytes land in a portable kernel-side **RX ring** (`kernel/src/input.rs`); the
 reactor gains a console-read slot (`rt::read_console`) that parks a strand and, when
 no queue completion is ready, blocks in `SYS_WAIT_INPUT`. The interrupt path is
 boot-critical and opt-in (`arch::enable_uart_rx_irq`, called only by the Phase D
-test, so the other 26 kernels are untouched): **on RISC-V it is interrupt-driven** -
-the 16550 UART's IRQ (source 10) is routed through the **AIA** (S-mode APLIC in
-MSI mode -> S-mode IMSIC via the `siselect`/`sireg`/`stopei` CSRs -> `sip.SEIP`),
-and the kernel takes the S external interrupt to drain the UART, halting at `wfi`
-(cells run with `sstatus.SIE` clear; SIE is set only to service a pending SEI after
-`wfi` woke on it) - a genuine 0%-CPU park. **x86-64 and ARM64 poll** (their
-IOAPIC/LAPIC and GICv3+PL011 bring-up is the documented next step; honest, not
-0%-idle). On top of the raw byte substrate, librheo gained **`term`** - the
+test, so the other kernels are untouched): **interrupt-driven on RISC-V and
+ARM64**. RISC-V routes the 16550 UART's IRQ (source 10) through the **AIA** (S-mode
+APLIC in MSI mode -> S-mode IMSIC via the `siselect`/`sireg`/`stopei` CSRs ->
+`sip.SEIP`) and takes the S external interrupt to drain the UART, halting at `wfi`
+(cells run with `sstatus.SIE` clear; SIE set only to service a pending SEI after
+`wfi` woke on it). ARM64 routes the PL011 UART's IRQ (SPI 33) through the **GICv3**
+(GICD + the boot CPU's GICR, CPU interface via `ICC_*_EL1`) and takes it in the
+current-EL-SPx vector slot, draining the byte and EOI'ing via `ICC_EOIR1_EL1`;
+cells run at EL0 with IRQ masked and the kernel unmasks (`daifclr`) only after
+`wfi`. Both are genuine 0%-CPU parks. **x86-64 stays a poll** - under QEMU's TCG +
+`kernel-irqchip=split` the LAPIC ISR/IRR are not modeled and IOAPIC-routed lines do
+not re-deliver reliably, so faking it would be dishonest (its *timer* IS
+interrupt-driven; only the IOAPIC-routed UART is affected). On top of the raw byte
+substrate, librheo gained **`term`** - the
 byte-stream terminal discipline: `input` (a decoder: CSI/SS3 escape sequences ->
 typed `Key`s, UTF-8, control chars, async `next_key().await`), `edit` (a line
 editor with insertion, cursor moves, word/line kill, history recall, completion
@@ -387,11 +393,13 @@ hook), and `render` (a buffered, minimal-diff renderer, batched writes). The
 `librheoterm` test drives a read-eval loop with scripted keystrokes (typing,
 backspace, cursor-left + insert, an arrow-key escape, Up-arrow history) and asserts
 the exact committed lines + exit on **all three ISAs**, plus the idle-park (kernel
-idled at `wfi`) on RISC-V. Honest: only RISC-V is interrupt-driven (and QEMU's 16550
-loopback does not drive the APLIC line, so the deterministic test raises the UART's
-MSI in the IMSIC directly - exactly the MSI the configured APLIC would send; the
-byte is genuinely received and a genuine S external interrupt genuinely wakes `wfi`,
-docs/LIBRHEO.md Phase D). This is "wake on input", not preemptive scheduling
+idled at `wfi`) on **RISC-V and ARM64**. Honest: RISC-V and ARM64 are
+interrupt-driven, each with a device-loopback caveat (QEMU's 16550/PL011 loopback
+does not drive the interrupt-controller line, so the deterministic test raises the
+controller line directly - RISC-V the IMSIC MSI, ARM64 `GICD_ISPENDR` for SPI 33 -
+exactly the interrupt the device would raise; the byte is genuinely delivered and a
+genuine interrupt genuinely wakes `wfi`, docs/LIBRHEO.md Phase D). This is "wake on
+input", not preemptive scheduling
 (SMP/#27).
 
 **Phase E** makes librheo the substrate for **services and a Wayland-class
@@ -442,8 +450,11 @@ from the caller's argv/envp, and returns a child handle; **`SYS_WAIT` (46)** blo
 the parent cooperatively (generalizing the L6 cross-cell run loop), runs the child,
 and reaps its exit code (a faulted native child is reaped with `FAULT_EXIT`=139 -
 native cells have no signals); **`SYS_ARM_TIMER` (47)** is a one-shot deadline,
-**cooperative on every ISA** (a deadline check against the monotonic clock; honest,
-not a 0%-CPU idle - a per-ISA timer IRQ is the OS's documented second interrupt).
+now the OS's **second interrupt**, **interrupt-driven on all three ISAs** (the
+kernel arms the per-ISA timer and halts at `wfi`/`hlt` until it fires - a genuine
+0%-CPU park: RISC-V Sstc `stimecmp`, ARM64 CNTV virtual timer via the GICv3, x86-64
+LAPIC LVT one-shot in x2APIC mode; opt-in via `arch::enable_timer_irq`, with a
+cooperative deadline-check fallback where not wired).
 librheo gained **`proc`** (`spawn`/`Child::wait().await`/`args`/`env`/`identity`),
 **`time`** (monotonic `Instant`/`now` + async `sleep`/`timeout`/`interval` over the
 reactor's timer slot), and a **`net`** stub (deferred - networking is a service).
@@ -453,14 +464,17 @@ queue round-trip and is **~9x smaller** loadable than a full binary. **`lrsh`** 
 the librheo-native shell (builtins + `spawn`/`wait` of native coreutils over the
 Phase D console path). The `librheoproc` test proves it on **all three ISAs**: an
 orchestrator spawns `/bin/echo` + three `/bin/child` cells (argv fan-out), reduces
-exit codes to 12, and a `time::sleep` wakes on the timer; `lrsh` runs a scripted
+exit codes to 12, and a `time::sleep` wakes on the timer (asserting a genuine
+`wfi`/`hlt` idle-park on all three ISAs); `lrsh` runs a scripted
 session (exact transcript + exit `0x42`); and the spine-only `librheo-embed`
 round-trips. Benchmarks (icount, per TOOLING.md): full async round-trip ~1,433
 (x86-64) / ~2,048 (riscv64) instructions, spawn+wait ~263k (x86-64) / ~539k
 (riscv64) - process create is dominated by ELF stream-load + child crt0, the honest
 price of a new address space. Honest deferrals: cross-cell stdout pipelines between
 spawned cells (reuses Phase E channels), full `term` editor wired into `lrsh`, the
-timer/x86-arm-UART IRQs, and the `net` stack - docs/LIBRHEO.md has the full A-F
+**x86-64 UART RX interrupt** (poll fallback - its QEMU TCG split-irqchip
+IOAPIC/LAPIC does not re-deliver reliably; the timer + the riscv/arm UART RX are
+all interrupt-driven), and the `net` stack - docs/LIBRHEO.md has the full A-F
 accounting. **librheo A-F is complete.**
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
@@ -545,8 +559,9 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               columnar scan off a live virtio-blk disk), librheocompute (librheo
               Phase C: parallel map_reduce + a userspace graph submitted to the
               CPU engine + reservation admission), librheoterm (librheo Phase D:
-              the first interrupt-driven console wakeup + the term byte-stream
-              discipline - scripted editing/history/escape, idle-park on RISC-V),
+              the interrupt-driven console wakeup + the term byte-stream
+              discipline - scripted editing/history/escape, idle-park on RISC-V +
+              ARM64; x86-64 poll),
               librheowl (librheo Phase E: the Wayland-class compositor demo -
               two cells share a typed cross-cell queue pair + pass a sealed
               buffer grant zero-copy + a flip completion, checksum-verified),

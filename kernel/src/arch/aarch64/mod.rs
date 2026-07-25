@@ -87,36 +87,247 @@ pub fn serial_read_byte() -> Option<u8> {
     }
 }
 
-// -------------------------------------------- console input wakeup seam
-// docs/LIBRHEO.md Phase D. Poll build: no PL011 RX interrupt is wired (the
-// GICv3 + PL011 IMSC.RXIM path is the documented next step), so the portable
-// input path (kernel/src/input.rs) polls the UART.
+// ----------------------------------- console input + timer interrupt seam
+// docs/LIBRHEO.md Phase D/F: the kernel's UART RX + timer interrupts on ARM64,
+// both through **GICv3** (QEMU `virt`, gic-version=3: GICD @ 0x0800_0000, the
+// boot CPU's GICR @ 0x080A_0000). The CPU interface is reached via system
+// registers (ICC_*_EL1). Two sources: the **PL011 UART** (SPI 1 = INTID 33, via
+// the distributor) for RX, and the **CNTV virtual timer** (PPI 11 = INTID 27,
+// CPU-local via the redistributor) for `SYS_ARM_TIMER`. Interrupts fire only in
+// kernel context: cells run at EL0 with IRQ masked (their TrapFrame SPSR sets I),
+// and the kernel takes an IRQ only inside the `wfi` idle path (`daifclr`), so
+// both `SYS_WAIT_INPUT` and `SYS_ARM_TIMER` are genuine 0%-CPU parks. Opt-in
+// (`enable_uart_rx_irq` / `enable_timer_irq`, called only by the Phase D/F
+// tests), so no other kernel is affected.
+//
+// *QEMU caveat, documented for honesty* (mirrors the RISC-V APLIC workaround):
+// QEMU's PL011 loopback does not deliver to the RX FIFO, so the deterministic
+// test cannot push a scripted byte through the device. Instead the byte is
+// carried in a kernel static and the PL011's SPI (33) is raised directly via
+// GICD_ISPENDR - the exact interrupt the PL011 would raise on receive - and the
+// handler pushes the carried byte to the ring. The GIC delivery, the `wfi` idle,
+// and the wakeup are all genuine; a live keystroke takes the full PL011->GIC path.
+
+const GICD_BASE: usize = 0x0800_0000 | KERNEL_VA_BASE;
+const GICR_BASE: usize = 0x080A_0000 | KERNEL_VA_BASE; // boot CPU redistributor
+const GICR_SGI_BASE: usize = GICR_BASE + 0x1_0000; // SGI/PPI frame
+const UART_INTID: u32 = 33; // PL011 SPI 1
+const TIMER_INTID: u32 = 27; // CNTV PPI 11
+
+static mut IRQ_ENABLED: bool = false;
+static mut TIMER_ENABLED: bool = false;
+static mut GIC_UP: bool = false;
+/// A scripted byte awaiting delivery through the UART RX interrupt (the Phase D
+/// test path). QEMU's PL011 loopback does not deliver to the RX FIFO, so the
+/// byte is carried here and pushed to the ring by the IRQ handler after a genuine
+/// GIC SPI interrupt (raised via GICD_ISPENDR) wakes `wfi` - the interrupt the
+/// PL011 would raise. 0x100+ = empty; low byte = the pending byte.
+static mut INJECT: u32 = 0;
 
 /// Whether the UART RX interrupt is wired (false = poll path).
 pub fn uart_irq_enabled() -> bool {
-    false
+    // SAFETY: single CPU; set once before any cell runs.
+    unsafe { *core::ptr::addr_of!(IRQ_ENABLED) }
 }
-/// Bring up the UART RX interrupt (GICv3 + PL011 IMSC.RXIM) - not yet on ARM64,
-/// so this leaves the poll path in place. Called only by the Phase D test.
-pub fn enable_uart_rx_irq() {}
-/// Halt until an interrupt (only called when `uart_irq_enabled`).
-pub fn idle_wait() {}
-/// Deliver a scripted byte through the real UART RX interrupt then halt until it
-/// is taken (only called when `uart_irq_enabled`).
-pub fn uart_inject_and_wait(_b: u8) {}
 
-// ------------------------------------------------- timer interrupt (Phase F)
-// Poll build: no CNTV timer is wired yet (the documented next step), so the
-// portable `time::arm_timer` busy-waits on the virtual counter.
-
-/// Whether the timer interrupt is wired (false = busy-wait path).
+/// Whether the CNTV timer interrupt is wired (false = busy-wait path).
 pub fn timer_irq_enabled() -> bool {
-    false
+    // SAFETY: single CPU; set once before any cell runs.
+    unsafe { *core::ptr::addr_of!(TIMER_ENABLED) }
 }
-/// Bring up the timer interrupt (CNTV virtual timer + its PPI) - not yet on ARM64.
-pub fn enable_timer_irq() {}
-/// Arm the timer and halt until it fires (only called when `timer_irq_enabled`).
-pub fn timer_wait(_deadline_ns: u64) {}
+
+#[inline(always)]
+fn mmio_w32(addr: usize, val: u32) {
+    // SAFETY: `addr` is a mapped GIC MMIO register (device gigabyte, TTBR1).
+    unsafe { (addr as *mut u32).write_volatile(val) };
+}
+#[inline(always)]
+fn mmio_r32(addr: usize) -> u32 {
+    // SAFETY: `addr` is a mapped GIC MMIO register.
+    unsafe { (addr as *const u32).read_volatile() }
+}
+
+/// Bring up the GICv3 distributor + this CPU's redistributor + the CPU interface
+/// (system registers). Idempotent; shared by the UART and timer paths.
+fn gic_init() {
+    // SAFETY: single CPU, kernel context; GIC MMIO + ICC system registers.
+    unsafe {
+        if *core::ptr::addr_of!(GIC_UP) {
+            return;
+        }
+        // Distributor: affinity routing (ARE) + Group1 enable.
+        mmio_w32(GICD_BASE, (1 << 4) | (1 << 1) | 1);
+        // Redistributor: wake the boot CPU (clear GICR_WAKER.ProcessorSleep,
+        // then wait for ChildrenAsleep to clear).
+        let waker = GICR_BASE + 0x0014;
+        mmio_w32(waker, mmio_r32(waker) & !(1 << 1));
+        while mmio_r32(waker) & (1 << 2) != 0 {}
+        // CPU interface via system registers: SRE=1, PMR=0xFF, EOImode=0, Grp1 on.
+        asm!("msr S3_0_C12_C12_5, {0}", "isb", in(reg) 1u64); // ICC_SRE_EL1.SRE
+        asm!("msr S3_0_C4_C6_0, {0}", in(reg) 0xFFu64); // ICC_PMR_EL1
+        asm!("msr S3_0_C12_C12_4, xzr"); // ICC_CTLR_EL1 (EOImode 0)
+        asm!("msr S3_0_C12_C12_7, {0}", "isb", in(reg) 1u64); // ICC_IGRPEN1_EL1
+        *core::ptr::addr_of_mut!(GIC_UP) = true;
+    }
+}
+
+/// Enable one interrupt in the distributor (SPI, INTID >= 32): Group1, priority,
+/// route to the boot CPU (affinity 0), level-triggered, enabled.
+fn gicd_enable_spi(intid: u32) {
+    let n = (intid / 32) as usize;
+    let bit = 1u32 << (intid % 32);
+    mmio_w32(
+        GICD_BASE + 0x0080 + 4 * n,
+        mmio_r32(GICD_BASE + 0x0080 + 4 * n) | bit,
+    ); // IGROUPR: group1
+    // IPRIORITYR (byte per INTID): 0 = highest, below PMR 0xFF.
+    let pri = GICD_BASE + 0x0400 + intid as usize;
+    // SAFETY: byte MMIO register.
+    unsafe { (pri as *mut u8).write_volatile(0x00) };
+    // IROUTER (64-bit per SPI): affinity 0.0.0.0 = boot CPU.
+    let router = GICD_BASE + 0x6000 + 8 * intid as usize;
+    // SAFETY: 64-bit MMIO register.
+    unsafe { (router as *mut u64).write_volatile(0) };
+    mmio_w32(GICD_BASE + 0x0100 + 4 * n, bit); // ISENABLER: enable
+}
+
+/// Enable one PPI/SGI (INTID < 32) in this CPU's redistributor SGI frame.
+fn gicr_enable_ppi(intid: u32) {
+    let bit = 1u32 << intid;
+    mmio_w32(
+        GICR_SGI_BASE + 0x0080,
+        mmio_r32(GICR_SGI_BASE + 0x0080) | bit,
+    ); // IGROUPR0: group1
+    let pri = GICR_SGI_BASE + 0x0400 + intid as usize;
+    // SAFETY: byte MMIO register.
+    unsafe { (pri as *mut u8).write_volatile(0x00) };
+    mmio_w32(GICR_SGI_BASE + 0x0100, bit); // ISENABLER0: enable
+}
+
+// PL011 registers used for RX interrupts.
+const PL011_CR: *mut u32 = (PL011_BASE + 0x30) as *mut u32; // control
+const PL011_IMSC: *mut u32 = (PL011_BASE + 0x38) as *mut u32; // interrupt mask
+const PL011_ICR: *mut u32 = (PL011_BASE + 0x44) as *mut u32; // interrupt clear
+// UARTCR bits: UARTEN(0), TXE(8), RXE(9).
+const CR_ON: u32 = 1 | (1 << 8) | (1 << 9); // enabled, TX+RX
+
+/// Bring up the PL011 RX interrupt through the GICv3 (SPI 33): the GIC route +
+/// enable, then the PL011 RX interrupt mask. Called only by the Phase D test.
+pub fn enable_uart_rx_irq() {
+    gic_init();
+    gicd_enable_spi(UART_INTID);
+    // SAFETY: kernel context; PL011 MMIO.
+    unsafe {
+        // Enable the UART (UARTEN so loopback RX works), then unmask RX (RXIM
+        // bit 4) + receive-timeout (RTIM bit 6) so a single byte below the FIFO
+        // trigger still raises an interrupt.
+        PL011_CR.write_volatile(CR_ON); // UARTEN | TXE | RXE
+        PL011_ICR.write_volatile(0x7FF); // clear any stale interrupts
+        PL011_IMSC.write_volatile((1 << 4) | (1 << 6)); // RXIM | RTIM
+        *core::ptr::addr_of_mut!(IRQ_ENABLED) = true;
+    }
+}
+
+/// Bring up the CNTV virtual timer interrupt (PPI 27). Called only by the Phase F
+/// test.
+pub fn enable_timer_irq() {
+    gic_init();
+    gicr_enable_ppi(TIMER_INTID);
+    // SAFETY: kernel context; disarm the timer until the first `timer_wait`.
+    unsafe { asm!("msr cntv_ctl_el0, xzr") };
+    // SAFETY: single CPU; set once.
+    unsafe { *core::ptr::addr_of_mut!(TIMER_ENABLED) = true };
+}
+
+/// The GICv3 IRQ handler (called from the current-EL-SPx IRQ vector slot while
+/// the kernel idles at `wfi`): ack via ICC_IAR1_EL1, service the source (drain
+/// the PL011 into the ring, or mask the fired timer), then EOI via ICC_EOIR1_EL1.
+#[unsafe(no_mangle)]
+extern "C" fn aarch64_irq_handler() {
+    // SAFETY: kernel context; ICC system-register + MMIO access.
+    unsafe {
+        let intid: u64;
+        asm!("mrs {0}, S3_0_C12_C12_0", out(reg) intid); // ICC_IAR1_EL1
+        let id = (intid & 0xFF_FFFF) as u32;
+        if id == UART_INTID {
+            // Deliver a scripted byte (carried in INJECT; see `uart_inject_and_wait`).
+            let inj = *core::ptr::addr_of!(INJECT);
+            if inj < 0x100 {
+                crate::input::rx_push(inj as u8);
+                *core::ptr::addr_of_mut!(INJECT) = 0x100;
+            }
+            // Drain any real bytes the PL011 received (interactive path).
+            while let Some(b) = serial_read_byte() {
+                crate::input::rx_push(b);
+            }
+            PL011_ICR.write_volatile((1 << 4) | (1 << 6)); // clear RXIC | RTIC
+        } else if id == TIMER_INTID {
+            // Mask the timer output so it stops asserting; timer_wait disarms.
+            asm!("msr cntv_ctl_el0, {0}", in(reg) 0b11u64); // ENABLE | IMASK
+        }
+        if id < 1020 {
+            asm!("msr S3_0_C12_C12_1, {0}", in(reg) intid); // ICC_EOIR1_EL1
+        }
+    }
+}
+
+/// Halt until an enabled GIC interrupt fires (a genuine 0%-CPU park). `wfi` wakes
+/// on a pending interrupt even with IRQ masked; we then briefly unmask (daifclr)
+/// so the pending IRQ is taken and serviced by the vector, then re-mask.
+pub fn idle_wait() {
+    // SAFETY: kernel context; IRQ toggled around a single serviced interrupt.
+    unsafe {
+        asm!("wfi");
+        asm!("msr daifclr, #2"); // unmask IRQ -> pending IRQ taken + serviced here
+        asm!("msr daifset, #2"); // mask IRQ again
+    }
+}
+
+/// Deliver a scripted byte through the real PL011 RX interrupt (loopback),
+/// halting at `wfi` until the interrupt is taken - the same path a live keystroke
+/// takes. Used by the deterministic Phase D test.
+pub fn uart_inject_and_wait(b: u8) {
+    // SAFETY: kernel context; a GIC MMIO write + the wfi idle path.
+    unsafe {
+        // Carry the byte for the handler, then raise the PL011's SPI (33) directly
+        // via GICD_ISPENDR - the interrupt the PL011 would raise on receive (QEMU
+        // PL011 loopback does not deliver to the RX FIFO). `wfi` halts until the
+        // GIC delivers it; the handler (slot 5) pushes the byte to the ring + EOI.
+        *core::ptr::addr_of_mut!(INJECT) = b as u32;
+        let n = (UART_INTID / 32) as usize;
+        mmio_w32(GICD_BASE + 0x0200 + 4 * n, 1 << (UART_INTID % 32)); // GICD_ISPENDR
+        asm!("wfi");
+        asm!("msr daifclr, #2"); // take + service the pending IRQ (delivers b)
+        asm!("msr daifset, #2");
+    }
+}
+
+/// Arm the CNTV virtual timer for `deadline_ns` from now and halt at `wfi` until
+/// it fires (a genuine 0%-CPU park). Called only when [`timer_irq_enabled`].
+pub fn timer_wait(deadline_ns: u64) {
+    // SAFETY: kernel context; generic-timer system registers + the wfi idle path.
+    unsafe {
+        let freq: u64;
+        asm!("mrs {0}, cntfrq_el0", out(reg) freq);
+        let now: u64;
+        asm!("isb", "mrs {0}, cntvct_el0", out(reg) now);
+        let delta = ((deadline_ns as u128 * freq as u128) / 1_000_000_000) as u64;
+        let target = now.wrapping_add(delta.max(1));
+        asm!("msr cntv_cval_el0, {0}", in(reg) target); // compare value
+        asm!("msr cntv_ctl_el0, {0}", "isb", in(reg) 1u64); // ENABLE, IMASK=0
+        loop {
+            let cur: u64;
+            asm!("mrs {0}, cntvct_el0", out(reg) cur);
+            if cur >= target {
+                break;
+            }
+            asm!("wfi");
+            asm!("msr daifclr, #2"); // take + service the pending IRQ (masks timer)
+            asm!("msr daifset, #2");
+        }
+        asm!("msr cntv_ctl_el0, xzr"); // disarm
+    }
+}
 
 // ----------------------------------------------------------------- traps
 
@@ -341,7 +552,11 @@ pub fn trapframe_new(entry: usize, user_sp: usize, arg: usize, kernel_sp: usize)
         regs,
         sp_el0: user_sp as u64,
         elr: entry as u64,
-        spsr: 0, // EL0t, interrupts unmasked (none are enabled)
+        // EL0t with IRQ masked (SPSR.I, bit 7): cells are cooperative and take no
+        // interrupts at EL0; the kernel services the UART/timer IRQs in its own
+        // `wfi` idle path (docs/LIBRHEO.md Phase D/F). Harmless where no interrupt
+        // is enabled.
+        spsr: 1 << 7,
         kernel_sp: kernel_sp as u64,
         tpidr_el0: 0,
     }

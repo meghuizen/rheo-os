@@ -417,8 +417,10 @@ finally closed by a real wakeup.
 
 This is the kernel's first hardware interrupt, and it is boot-critical, so it was
 brought up one ISA at a time behind an explicit, opt-in enable
-(`arch::enable_uart_rx_irq`, called only by the Phase D test) - the other 26 test
-kernels never touch it and run exactly as before.
+(`arch::enable_uart_rx_irq`, called only by the Phase D test) - the other test
+kernels never touch it and run exactly as before. **UART RX is now
+interrupt-driven on RISC-V and ARM64**; x86-64 stays on the poll fallback (its
+QEMU TCG interrupt controller does not re-deliver reliably - see below).
 
 - **RISC-V 64 - interrupt-driven.** QEMU `virt` with `aia=aplic-imsic` routes the
   16550 UART's IRQ (source 10) through the **AIA**: the S-mode APLIC
@@ -441,11 +443,31 @@ kernels never touch it and run exactly as before.
   S external interrupt genuinely fires, and the CPU genuinely halts at `wfi` until
   it does; the full UART->APLIC->IMSIC wiring is configured but not exercised
   end-to-end by loopback in this harness.
-- **x86-64 - poll.** The IOAPIC RTE for ISA IRQ4 + LAPIC + the 16550 IER path is
-  the documented next step; today `SYS_WAIT_INPUT` polls COM1 (the CPU spins -
-  honest, not 0%-idle). `input::interrupt_driven()` reports false.
-- **ARM64 - poll.** The GICv3 (GICD/GICR) + PL011 `IMSC.RXIM` path is the
-  documented next step; today `SYS_WAIT_INPUT` polls the PL011.
+- **ARM64 - interrupt-driven.** QEMU `virt` with `gic-version=3` routes the PL011
+  UART's IRQ (SPI 1 = INTID 33) through the **GICv3**: the distributor (GICD @
+  0x0800_0000, affinity routing + Group1) and the boot CPU's redistributor (GICR @
+  0x080A_0000), with the CPU interface reached by system registers (`ICC_SRE_EL1`,
+  `ICC_PMR_EL1`, `ICC_IGRPEN1_EL1`). The kernel routes + enables SPI 33, enables
+  the PL011 RX interrupt, and takes the IRQ in the current-EL-SPx vector slot,
+  acking via `ICC_IAR1_EL1`, draining the byte into the ring, and EOI'ing via
+  `ICC_EOIR1_EL1`. Cells run at EL0 with IRQ masked (`SPSR.I`); the kernel unmasks
+  (`daifclr`) only after `wfi` woke on the pending IRQ - a **genuine 0%-CPU park**.
+  *QEMU caveat, documented for honesty* (mirrors the RISC-V APLIC workaround):
+  QEMU's PL011 loopback does not deliver to the RX FIFO, so the deterministic test
+  cannot push a scripted byte through the device; the byte is carried in a kernel
+  static and the PL011's SPI is raised directly via **`GICD_ISPENDR`** - the exact
+  interrupt the PL011 would raise on receive - and the handler pushes the carried
+  byte to the ring. The GIC delivery, the `wfi` idle, and the wakeup are all
+  genuine; a live keystroke takes the full PL011->GIC path.
+- **x86-64 - poll (honest).** q35 routes COM1's ISA IRQ4 through the emulated
+  IOAPIC, but under QEMU's TCG + `kernel-irqchip=split` the LAPIC's ISR/IRR are
+  not modeled (they read 0) and IPIs are not delivered, so an IOAPIC-routed line
+  delivers the first byte but does not reliably re-trigger, and the self-IPI the
+  RISC-V/ARM ports use as their deterministic-test analog does not fire at all.
+  Rather than fake it, `SYS_WAIT_INPUT` polls COM1 (the CPU spins - honest, not
+  0%-idle). `input::interrupt_driven()` reports false. (The x86-64 **timer** IS
+  interrupt-driven - the LAPIC LVT timer, a CPU-local source, works fine; only the
+  IOAPIC-routed UART line is affected.)
 
 `input::interrupt_driven()` reports which mode an ISA is in; the test asserts the
 idle-park only where it is interrupt-driven, and prints the mode either way.
@@ -469,15 +491,19 @@ keystrokes `"worlq"<BS>"d"<CR>` -> `world`, `"helo"<Left>"l"<CR>` -> `hello`,
 `<Up><Up><CR>` -> `world` (recall the older history entry). It exercises typing,
 backspace, cursor-left + insert, an escape sequence (arrows), and history recall,
 verifies the three committed lines exactly, and exits `0x42`. The test asserts the
-exit code on all three ISAs, and on RISC-V additionally asserts the kernel idled at
-`wfi` (interrupt-driven), printing the input mode (interrupt-driven / poll) either
-way.
+exit code on all three ISAs, and on RISC-V + ARM64 additionally asserts the kernel
+idled at `wfi` (interrupt-driven), printing the input mode (interrupt-driven /
+poll) either way.
 
-Honest accounting: RISC-V is interrupt-driven (with the loopback/APLIC caveat
-above); x86-64 and ARM64 are on the poll path (their interrupt-controller bring-up
-- IOAPIC/LAPIC, GICv3+PL011 - is the documented next step). The cooperative,
-single-CPU model is unchanged: this is "wake on input", not preemptive scheduling
-(SMP/preemption is task #27).
+Honest accounting: RISC-V (AIA) and ARM64 (GICv3) are interrupt-driven, each with
+the device-loopback caveat above (the byte is genuinely received / the interrupt
+genuinely raised, but the deterministic harness raises the controller line
+directly rather than through the emulated UART's loopback). x86-64 stays on the
+poll path: under QEMU's TCG + `kernel-irqchip=split` the LAPIC ISR/IRR are not
+modeled and IOAPIC-routed lines do not re-deliver reliably, so faking it would be
+dishonest (its **timer** IS interrupt-driven - a CPU-local LAPIC source; only the
+IOAPIC-routed UART is affected). The cooperative, single-CPU model is unchanged:
+this is "wake on input", not preemptive scheduling (SMP/preemption is task #27).
 
 ## Phase E - services & IPC, a Wayland-class compositor (this milestone)
 
@@ -628,15 +654,20 @@ mirroring the Linux personality's `linux::proc` (docs/LINUX-COMPAT.md L6) for
   code (`FAULT_EXIT` = 139) - native cells have **no signal delivery** (that is
   the Linux personality's job, L5); a native fault is terminal for the child.
 - **`SYS_ARM_TIMER` (47)** - `arm_timer(deadline_ns)`. Blocks until `deadline_ns`
-  of monotonic time elapse. The "arm timer" verb, a one-shot deadline. It is a
-  **cooperative deadline check** against the monotonic cycle counter on **every
-  ISA today** (honest: not a 0%-CPU idle) - deterministic under QEMU `-icount`
-  (each spin advances the instruction count, which advances the counter). A true
-  per-ISA **timer interrupt** (x86 TSC-deadline/LAPIC, aarch64 CNTV_* + its PPI,
-  riscv sstc `stimecmp`) is the OS's **second interrupt** and is documented
-  future work (after Phase D's UART RX, the first). Honors docs/POWER.md: the
-  kernel waits here only when a real deadline was requested (librheo arms a timer
-  only for an actual `sleep`/`timeout`).
+  of monotonic time elapse. The "arm timer" verb, a one-shot deadline - now the
+  OS's **second interrupt**, **interrupt-driven on all three ISAs** (the kernel
+  arms the per-ISA timer and halts at `wfi`/`hlt` until it fires - a **genuine
+  0%-CPU park**): **riscv** the Sstc `stimecmp` CSR (S timer interrupt,
+  `scause` = int | 5); **aarch64** the CNTV virtual timer (`CNTV_CVAL_EL0` /
+  `CNTV_CTL_EL0`, PPI 27 through the GICv3 redistributor); **x86-64** the LAPIC
+  one-shot LVT timer (vector 0x20, rate calibrated once against the TSC), driven in
+  x2APIC mode. Where the timer IRQ is not wired it falls back to a cooperative
+  deadline check against the monotonic counter (deterministic under QEMU `-icount`).
+  Opt-in (`arch::enable_timer_irq`, called only by the Phase F test). Honors
+  docs/POWER.md: the kernel arms the timer only when a real deadline was requested
+  (librheo arms a timer only for an actual `sleep`/`timeout`). The `librheoproc`
+  test asserts the orchestrator's `time::sleep` genuinely idled at `wfi`/`hlt`
+  (`time::timer_did_idle`) on all three ISAs.
 
 `MAX_CELLS` stays 16; a spawned child reuses a slot once reaped. Kernel-owned
 per-child storage (address space, queue-pair overlay, trap frame) lives in fixed
@@ -766,15 +797,16 @@ What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
   console block-and-wake (**a genuine 0%-CPU WFI park on riscv64**), `Child::wait`
   and `time::sleep` as reactor-serviced parks (the parent's other strands run
   until quiescent, then the cell blocks).
-- **Sync-translated / cooperative** (single-CPU, honest): the timer is a
-  **cooperative deadline check on every ISA** (no timer IRQ yet); the cross-cell
-  IPC channel is synchronous with an explicit peer hand-off (a fully symmetric
-  async `Sender`/`Receiver` is the documented refinement); parallel `compute`
-  strands **interleave** on one CPU rather than run on separate cores; reservations
-  are **admitted** (the EDF math is real and refuses over-commit) but not yet
-  **scheduled** (run-queue enforcement is SMP work); the console idle on **x86-64
-  and aarch64 is a poll** (their IOAPIC/LAPIC and GICv3+PL011 bring-up is the
-  documented next step - riscv64 is interrupt-driven).
+- **Sync-translated / cooperative** (single-CPU, honest): the **timer is now
+  interrupt-driven on all three ISAs** (riscv Sstc, aarch64 CNTV, x86-64 LAPIC LVT
+  - a genuine 0%-CPU park); the cross-cell IPC channel is synchronous with an
+  explicit peer hand-off (a fully symmetric async `Sender`/`Receiver` is the
+  documented refinement); parallel `compute` strands **interleave** on one CPU
+  rather than run on separate cores; reservations are **admitted** (the EDF math is
+  real and refuses over-commit) but not yet **scheduled** (run-queue enforcement is
+  SMP work); the **console UART RX is interrupt-driven on riscv64 (AIA) and aarch64
+  (GICv3)** - a genuine `wfi` park - and stays a **poll on x86-64** (its QEMU TCG +
+  split-irqchip IOAPIC/LAPIC does not re-deliver reliably; documented, honest).
 - **Deferred (documented)**: a **real GPU** (virtio-gpu scanout; the compositor
   framebuffer is in-memory), a **full network stack** (`net` is a stub;
   networking is a service over virtio-net), **SMP** secondary-core bring-up +
