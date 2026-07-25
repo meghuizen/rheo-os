@@ -11,13 +11,13 @@
 
 use kernel::capability::{BUDGET_UNLIMITED, ObjectKind, ObjectTable, READ, WRITE};
 use kernel::cell::Cell;
-use kernel::queue::{
-    self, CqEntry, OP_ECHO, QueuePair, RING_DEPTH, STATUS_DENIED, STATUS_OK, SqEntry,
-};
+use kernel::queue::{self, OP_ECHO, QueuePair, STATUS_DENIED, STATUS_OK, SqEntry};
 use kernel::{arch, println};
 
-static mut SQ_STORAGE: [SqEntry; RING_DEPTH] = [SqEntry::ZERO; RING_DEPTH];
-static mut CQ_STORAGE: [CqEntry; RING_DEPTH] = [CqEntry::ZERO; RING_DEPTH];
+/// The shared queue-pair region (header + SQ + CQ), page-aligned.
+#[repr(C, align(4096))]
+struct Region([u8; QueuePair::REGION_SIZE]);
+static mut REGION: Region = Region([0; QueuePair::REGION_SIZE]);
 
 const BATCH: usize = 16;
 
@@ -35,12 +35,7 @@ extern "C" fn kernel_main() -> ! {
         .mint(&objects, qp_object, READ | WRITE, BUDGET_UNLIMITED)
         .unwrap();
 
-    let qp = unsafe {
-        QueuePair::new(
-            core::ptr::addr_of_mut!(SQ_STORAGE) as *mut SqEntry,
-            core::ptr::addr_of_mut!(CQ_STORAGE) as *mut CqEntry,
-        )
-    };
+    let qp = unsafe { QueuePair::init(core::ptr::addr_of_mut!(REGION) as *mut u8) };
 
     // Submit a batch of echo ops, each with its own flow id; ring the
     // doorbell once for the whole batch.

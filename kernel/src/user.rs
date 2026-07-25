@@ -11,7 +11,10 @@
 //! per-CPU scheduler, there is one CPU at this stage, and traps are
 //! synchronous, so there is no concurrent access to guard against.
 
-use crate::abi::{SYS_CYCLES, SYS_DOORBELL, SYS_EXIT, SYS_EXIT_GROUP, SYS_MMAP, SYS_SWITCH};
+use crate::abi::{
+    QueueInfo, SYS_CYCLES, SYS_DOORBELL, SYS_EXIT, SYS_EXIT_GROUP, SYS_MMAP, SYS_QUEUE_INFO,
+    SYS_SWITCH,
+};
 use crate::arch::{self, FaultCause, MapPerm, TrapFrame, TrapKind};
 use crate::capability::{CapTable, ObjectTable};
 use crate::mm::{AddressSpace, frames};
@@ -51,6 +54,11 @@ struct RunCell {
     outcome: Option<Outcome>,
     present: bool,
     personality: Personality,
+    /// Base VA of the cell's mapped queue-pair region, reported by
+    /// `SYS_QUEUE_INFO` (docs/LIBRHEO.md). 0 = the cell has no mapped queue.
+    qp_va: u64,
+    /// 32-bit ABI id of the cell's QueuePair capability, reported alongside.
+    qp_cap_id: u32,
 }
 
 const EMPTY: RunCell = RunCell {
@@ -62,6 +70,8 @@ const EMPTY: RunCell = RunCell {
     outcome: None,
     present: false,
     personality: Personality::Native,
+    qp_va: 0,
+    qp_cap_id: 0,
 };
 
 /// Number of runnable cell slots. Bumped 8 -> 16 for the Linux personality's
@@ -249,7 +259,18 @@ pub unsafe fn install(
         outcome: None,
         present: true,
         personality: Personality::Native,
+        qp_va: 0,
+        qp_cap_id: 0,
     };
+}
+
+/// Record the mapped queue-pair region VA and capability id for cell `idx`
+/// (docs/LIBRHEO.md). `SYS_QUEUE_INFO` reports these so a loaded librheo cell
+/// can bind its ring. Call after `install`, before `run`.
+pub fn set_queue_info(idx: usize, qp_va: u64, cap_id: u32) {
+    assert!(cells()[idx].present, "set_queue_info on empty slot {idx}");
+    cells()[idx].qp_va = qp_va;
+    cells()[idx].qp_cap_id = cap_id;
 }
 
 /// Tag an installed cell with a syscall personality (call after `install`,
@@ -375,6 +396,8 @@ pub unsafe fn install_forked(
         outcome: None,
         present: true,
         personality: Personality::Linux,
+        qp_va: 0,
+        qp_cap_id: 0,
     };
 }
 
@@ -434,10 +457,30 @@ pub fn on_user_trap(
     match nr {
         SYS_DOORBELL => {
             let cell = cells()[cur];
-            // SAFETY: the pointers were validated at install time.
-            unsafe {
-                queue::kernel_process(&*cell.qp, &mut *cell.caps, &*cell.objects);
-            }
+            // SAFETY: the pointers were validated at install time. During the
+            // trap the cell's address space is active, so a queue mapped at a
+            // user VA (a loaded librheo cell) is reachable here.
+            let n = unsafe { queue::kernel_process(&*cell.qp, &mut *cell.caps, &*cell.objects) };
+            arch::set_syscall_ret(unsafe { &mut *frame }, n as u64);
+            frame
+        }
+        SYS_QUEUE_INFO => {
+            let cell = cells()[cur];
+            let ret = if cell.qp_va == 0 {
+                u64::MAX
+            } else {
+                // SAFETY: `arg` is a user VA in the running cell's active
+                // address space, sized for a `QueueInfo` (16 bytes); the cell
+                // passes the address of its own stack slot.
+                unsafe {
+                    (arg as *mut QueueInfo).write(QueueInfo {
+                        qp_va: cell.qp_va,
+                        cap_id: cell.qp_cap_id as u64,
+                    });
+                }
+                0
+            };
+            arch::set_syscall_ret(unsafe { &mut *frame }, ret);
             frame
         }
         SYS_CYCLES => {

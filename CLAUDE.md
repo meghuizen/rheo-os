@@ -293,6 +293,34 @@ unpatched Rust `std`, and the real upstream uutils/coreutils all run as cells,
 kernel-resident like `svc.rs` and adding no kernel object (`execve` of a *dynamic*
 binary and a dynamic Rust/uutils-0.9.x fixture are the documented next steps).
 
+**librheo** (`librheo/`, docs/LIBRHEO.md) is the greenfield **native userspace
+foundation library** - the role a libc plays, rebuilt for this kernel:
+async-first, capability-native, built ON `runtime/` (not a POSIX threading
+port, and distinct from `libc/`'s C/POSIX compat role). **Phase A** ships the
+spine: a `no_std`+`alloc` crate (a loaded ELF cell for the bare targets) with
+`mem` (a grow-on-demand global allocator over `runtime::Heap` + `SYS_MMAP`,
+which added `Heap::add_region`), `rng` (a ChaCha20 fast-key-erasure DRBG as a
+**library call**, seeded once over `SYS_RANDOM` - realizing TIME-IDENTITY.md 4
+in a cell), `cap` (capability-typed handles over `runtime::rights` + a
+startup `CapSet`), and `rt` (the strand executor + a **userland reactor**:
+submit -> `SYS_DOORBELL` -> drain CQ -> `complete(user_data)`, so a strand
+parked on a token wakes on its completion). To make a loaded cell actually own
+a queue pair, the **queue ABI was redesigned to a stable on-wire layout**
+(`kernel/src/queue/mod.rs`): a `repr(C)` `QueueHeader` (version, depth, the four
+ring indices at fixed offsets, sq/cq offsets) followed by the SQ/CQ arrays, with
+`QueuePair` now an overlay over a single region (`init`/`attach`) rather than
+head/tail atomics inside the Rust struct - unified, so bench-core/queue-pipeline/
+runtime/isolation-hw stay green. The loader gained `map_queue` (maps the ring at
+**16 GiB** = `USER_QUEUE_VA` into a loaded cell, mints a `QueuePair` cap, records
+`(qp_va, cap_id)`), `submit` carries args + `reap` returns the full `CqEntry` +
+`SYS_DOORBELL` returns the processed count, and **`SYS_QUEUE_INFO` (31)** reports
+`(qp_va, cap_id)` to the cell. The `librhearun` test loads `librheo-demo` into a
+cell with a real mapped queue pair and asserts it exits `0x42` - reached only if
+heap+rng+cap and an **async queue round-trip** (8 strands each `submit_and_await`
+an `OP_ECHO` and verify the echo) all pass, on **all three ISAs**. Phases B-F
+(typed grants + async I/O opcodes, compute/QoS, the kernel's first interrupt +
+terminal, IPC/compositor, process/time/net) are planned in docs/LIBRHEO.md.
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
 proofs, and the hardware-lab performance numbers. **SMP secondary-core
@@ -364,7 +392,9 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               ELF), posixrun (native program over the POSIX syscalls),
               libcrun (a program linked against rheo-libc), jsonrun (a
               program parsing JSON with rheo-json on-OS), stdrun (a real-std
-              program on-OS), coreutils (the coreutils multicall cell, with
+              program on-OS), librhearun (librheo Phase A: a loaded cell with
+              a real mapped queue pair does heap+rng+cap + an async queue
+              round-trip, docs/LIBRHEO.md), coreutils (the coreutils multicall cell, with
               argv + std::fs over the VFS), linuxrun (Personality::Linux:
               bare Linux-ABI programs plus, at L2, unpatched static-glibc
               Rust + C hellos), linuxtools (L3: the unmodified upstream
@@ -393,6 +423,11 @@ userland/     native U-mode programs built for a bare target and loaded
 libc/         rheo-libc: the Rust libc translation layer (crt0, heap +
               allocator, malloc, fd I/O, println) + the libcdemo/jsondemo
               programs
+librheo/      the native userspace foundation library (docs/LIBRHEO.md):
+              no_std+alloc, mem (grow heap)/rng (per-cell DRBG)/cap (typed
+              handles)/rt (strand executor + userland queue reactor)/sys
+              (syscall + on-wire queue ABI) + crt0 + the librheo-demo program.
+              Phase A
 json/         rheo-json: a dependency-free, zero-copy JSON parser (scalar +
               SSE2 string-scan), no_std, host-tested + benchmarked
               (docs/JSON.md, comparison/json/)

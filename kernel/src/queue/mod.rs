@@ -7,8 +7,16 @@
 //! BUILD-ORDER.md step 5); the mechanism - fixed-layout entries, grant
 //! checks per entry, flow-context propagation, doorbell batching - is the
 //! real one, and it is what the P2 benchmark measures.
+//!
+//! **On-wire layout (docs/IO.md 1, docs/LIBRHEO.md).** A queue pair is a
+//! single contiguous shared region a separately-compiled library (librheo)
+//! can bind to: a `repr(C)` [`QueueHeader`] with the ring indices at fixed
+//! offsets, followed by the SQ entry array and the CQ entry array. Both the
+//! kernel and a loaded cell overlay a [`QueuePair`] on the region (from the
+//! same physical frames, at their own VAs); the head/tail atomics live *in*
+//! the region, not in the Rust struct, so the two overlays share them.
 
-use core::ptr;
+use core::ptr::{self, addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::capability::{CapTable, Handle, ObjectTable, WRITE};
@@ -28,14 +36,18 @@ pub use sealed::DmaSafe;
 
 /// Submission opcodes understood by the current kernel side.
 pub const OP_NOP: u8 = 0;
-/// Echo `payload[0..8]` back through the completion's `result` field
-/// (truncated to 32 bits) - the null round trip with a data touch.
+/// Echo `payload[0..4]` back through the completion's `result` field - the
+/// null round trip with a data touch, used by the librheo async proof.
 pub const OP_ECHO: u8 = 1;
 
 /// Completion status codes.
 pub const STATUS_OK: u32 = 0;
 pub const STATUS_BAD_OPCODE: u32 = 1;
 pub const STATUS_DENIED: u32 = 2;
+
+/// On-wire ABI version carried in the ring header (docs/IO.md 1). A cell
+/// binding the region checks this before trusting the layout.
+pub const QUEUE_ABI_VERSION: u32 = 1;
 
 /// A submission queue entry - exactly 64 bytes, one cache line, so
 /// producer and consumer never false-share (docs/KERNEL-RUST.md 3).
@@ -110,15 +122,48 @@ fn cap_index(handle: Handle) -> u32 {
     handle.raw_low32()
 }
 
-/// A single-producer, single-consumer ring over DMA-safe memory.
-/// N must be a power of two for the index masking to work.
+/// The shared ring header (docs/IO.md 1): version + geometry + the four ring
+/// indices, at fixed `repr(C)` offsets so an independently-compiled cell
+/// binds to the same words the kernel does. Exactly one cache line (64 B).
+#[repr(C)]
+pub struct QueueHeader {
+    /// ABI version ([`QUEUE_ABI_VERSION`]).
+    pub version: u32,
+    /// Ring depth (entries per ring); [`RING_DEPTH`].
+    pub depth: u32,
+    /// Byte offset of the SQ entry array from the region base.
+    pub sq_off: u32,
+    /// Byte offset of the CQ entry array from the region base.
+    pub cq_off: u32,
+    pub sq_head: AtomicU32,
+    pub sq_tail: AtomicU32,
+    pub cq_head: AtomicU32,
+    pub cq_tail: AtomicU32,
+    _reserved: [u32; 8],
+}
+const _: () = assert!(core::mem::size_of::<QueueHeader>() == 64);
+
+pub const RING_DEPTH: usize = 64;
+
+const HEADER_SIZE: usize = 64;
+const SQ_OFF: usize = HEADER_SIZE;
+const SQ_BYTES: usize = RING_DEPTH * core::mem::size_of::<SqEntry>();
+const CQ_OFF: usize = SQ_OFF + SQ_BYTES;
+const CQ_BYTES: usize = RING_DEPTH * core::mem::size_of::<CqEntry>();
+
+/// A single-producer, single-consumer ring overlaid on the shared region.
+/// N must be a power of two for the index masking to work. The head/tail
+/// live in the region's [`QueueHeader`] (raw pointers here), so both endpoint
+/// overlays - kernel and cell - drive the *same* indices.
 pub struct Ring<T: DmaSafe, const N: usize> {
     /// Ring storage. *Not* held as a Rust reference on the hot path - the
-    /// other side (kernel, or later hardware) also reads/writes it, so all
-    /// access is through volatile primitives.
+    /// other side (kernel, cell, or later hardware) also reads/writes it, so
+    /// all access is through volatile primitives.
     entries: *mut T,
-    head: AtomicU32,
-    tail: AtomicU32,
+    /// The producer index, in the shared header.
+    head: *const AtomicU32,
+    /// The consumer index, in the shared header.
+    tail: *const AtomicU32,
 }
 
 // SAFETY: the ring's memory is owned uniquely by the pair of endpoints.
@@ -128,25 +173,25 @@ impl<T: DmaSafe, const N: usize> Ring<T, N> {
     const MASK: usize = N - 1;
     const POWER_OF_TWO: () = assert!(N.is_power_of_two());
 
-    /// # Safety
-    /// `entries` must point at N valid, uniquely-owned slots of T that
-    /// outlive the ring.
-    pub unsafe fn new(entries: *mut T) -> Ring<T, N> {
-        #[allow(clippy::let_unit_value)]
-        let _ = Self::POWER_OF_TWO;
-        Ring {
-            entries,
-            head: AtomicU32::new(0),
-            tail: AtomicU32::new(0),
-        }
+    #[inline(always)]
+    fn head(&self) -> &AtomicU32 {
+        // SAFETY: `head` points into the live shared header for the ring's life.
+        unsafe { &*self.head }
+    }
+    #[inline(always)]
+    fn tail(&self) -> &AtomicU32 {
+        // SAFETY: as above.
+        unsafe { &*self.tail }
     }
 
     /// Push one entry. Returns false if the ring is full.
     /// Hot path: one volatile write + one atomic store.
     #[inline(always)]
     pub fn push(&self, entry: T) -> bool {
-        let head = self.head.load(Ordering::Relaxed);
-        let tail = self.tail.load(Ordering::Acquire);
+        #[allow(clippy::let_unit_value)]
+        let _ = Self::POWER_OF_TWO;
+        let head = self.head().load(Ordering::Relaxed);
+        let tail = self.tail().load(Ordering::Acquire);
         if head.wrapping_sub(tail) as usize >= N {
             return false; // full
         }
@@ -154,56 +199,124 @@ impl<T: DmaSafe, const N: usize> Ring<T, N> {
         // SAFETY: idx is in-bounds by the capacity check above. Volatile
         // because the other endpoint reads this memory.
         unsafe { ptr::write_volatile(self.entries.add(idx), entry) };
-        self.head.store(head.wrapping_add(1), Ordering::Release);
+        self.head().store(head.wrapping_add(1), Ordering::Release);
         true
     }
 
     /// Pop one entry. Returns None if empty.
     #[inline(always)]
     pub fn pop(&self) -> Option<T> {
-        let tail = self.tail.load(Ordering::Relaxed);
-        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail().load(Ordering::Relaxed);
+        let head = self.head().load(Ordering::Acquire);
         if tail == head {
             return None; // empty
         }
         let idx = (tail as usize) & Self::MASK;
         // SAFETY: idx is in-bounds; volatile read matches volatile write.
         let entry = unsafe { ptr::read_volatile(self.entries.add(idx)) };
-        self.tail.store(tail.wrapping_add(1), Ordering::Release);
+        self.tail().store(tail.wrapping_add(1), Ordering::Release);
         Some(entry)
     }
 }
 
-pub const RING_DEPTH: usize = 64;
-
-/// A queue pair: submission ring in, completion ring out.
+/// A queue pair: submission ring in, completion ring out. An overlay over a
+/// single shared region (see the module header); construct it with
+/// [`QueuePair::init`]/[`QueuePair::attach`] rather than by field.
 pub struct QueuePair {
     pub sq: Ring<SqEntry, RING_DEPTH>,
     pub cq: Ring<CqEntry, RING_DEPTH>,
+    base: *mut u8,
 }
 
 impl QueuePair {
+    /// Total bytes a queue-pair region occupies, rounded up to a page so the
+    /// kernel can map it into a loaded cell. header + SQ array + CQ array.
+    pub const REGION_SIZE: usize = (CQ_OFF + CQ_BYTES + 0xFFF) & !0xFFF;
+
+    /// Bytes of the region actually used (before page rounding). For asserts.
+    pub const USED_SIZE: usize = CQ_OFF + CQ_BYTES;
+
+    /// Write a fresh header at `base` (version, geometry, zeroed indices).
+    ///
     /// # Safety
-    /// Both backing arrays must be valid, uniquely owned, and outlive the
-    /// pair.
-    pub unsafe fn new(sq_storage: *mut SqEntry, cq_storage: *mut CqEntry) -> QueuePair {
+    /// `base` must point at [`REGION_SIZE`](Self::REGION_SIZE) writable bytes,
+    /// 64-byte aligned, uniquely owned for the pair's life.
+    pub unsafe fn init_header(base: *mut u8) {
+        let h = base as *mut QueueHeader;
+        // Field-wise so nothing lowers to a struct memcpy (the U-mode rule);
+        // and the atomics start at 0.
+        unsafe {
+            addr_of_mut!((*h).version).write(QUEUE_ABI_VERSION);
+            addr_of_mut!((*h).depth).write(RING_DEPTH as u32);
+            addr_of_mut!((*h).sq_off).write(SQ_OFF as u32);
+            addr_of_mut!((*h).cq_off).write(CQ_OFF as u32);
+            addr_of_mut!((*h).sq_head).write(AtomicU32::new(0));
+            addr_of_mut!((*h).sq_tail).write(AtomicU32::new(0));
+            addr_of_mut!((*h).cq_head).write(AtomicU32::new(0));
+            addr_of_mut!((*h).cq_tail).write(AtomicU32::new(0));
+            addr_of_mut!((*h)._reserved).write([0; 8]);
+        }
+    }
+
+    /// Overlay a queue pair on an already-initialised region at `base`. Reads
+    /// nothing; ring pointers are computed from the fixed layout (this crate
+    /// owns the geometry). librheo's independent overlay reads the header's
+    /// `sq_off`/`cq_off` instead - both agree because the layout is the ABI.
+    ///
+    /// # Safety
+    /// `base` must be a region previously prepared by [`init_header`](Self::init_header)
+    /// (here or on the shared frames), valid for the pair's life.
+    pub unsafe fn attach(base: *mut u8) -> QueuePair {
+        let h = base as *const QueueHeader;
+        // SAFETY: base is a valid region; the header lies at its start and the
+        // arrays at the fixed offsets.
         unsafe {
             QueuePair {
-                sq: Ring::new(sq_storage),
-                cq: Ring::new(cq_storage),
+                sq: Ring {
+                    entries: base.add(SQ_OFF) as *mut SqEntry,
+                    head: addr_of!((*h).sq_head),
+                    tail: addr_of!((*h).sq_tail),
+                },
+                cq: Ring {
+                    entries: base.add(CQ_OFF) as *mut CqEntry,
+                    head: addr_of!((*h).cq_head),
+                    tail: addr_of!((*h).cq_tail),
+                },
+                base,
             }
         }
+    }
+
+    /// Initialise a header at `base` and overlay a pair on it - for the case
+    /// where the region is reachable at one VA (identity-mapped `.user`
+    /// cells, host tests). For a loaded cell the kernel calls `init_header`
+    /// through its linear map, then `attach` at the cell's VA.
+    ///
+    /// # Safety
+    /// See [`init_header`](Self::init_header).
+    pub unsafe fn init(base: *mut u8) -> QueuePair {
+        unsafe {
+            Self::init_header(base);
+            Self::attach(base)
+        }
+    }
+
+    /// The region base this overlay binds to.
+    pub fn base(&self) -> *mut u8 {
+        self.base
     }
 
     /// User-side submit: push one entry writing its fields individually.
     /// `#[inline(always)]` and field-wise on purpose - it inlines into
     /// U-mode code, where a whole-struct 64-byte write could lower to a
     /// `memcpy` call into unmapped kernel `.text` and fault. Mirrors
-    /// `Ring::push`; the SPSC ordering is identical.
+    /// `Ring::push`; the SPSC ordering is identical. Leaves `payload` as
+    /// whatever the slot last held (OP_NOP ignores it); use
+    /// [`submit_args`](Self::submit_args) to carry data.
     #[inline(always)]
     pub fn submit(&self, opcode: u8, cap_id: u32, flow_id: u128, user_data: u64) -> bool {
-        let head = self.sq.head.load(Ordering::Relaxed);
-        let tail = self.sq.tail.load(Ordering::Acquire);
+        let head = self.sq.head().load(Ordering::Relaxed);
+        let tail = self.sq.tail().load(Ordering::Acquire);
         if head.wrapping_sub(tail) as usize >= RING_DEPTH {
             return false;
         }
@@ -211,28 +324,74 @@ impl QueuePair {
         // SAFETY: idx is in-bounds; the ring memory is shared and mapped.
         unsafe {
             let slot = self.sq.entries.add(idx);
-            ptr::addr_of_mut!((*slot).opcode).write_volatile(opcode);
-            ptr::addr_of_mut!((*slot).cap_id).write_volatile(cap_id);
-            ptr::addr_of_mut!((*slot).flow_id).write_volatile(flow_id);
-            ptr::addr_of_mut!((*slot).user_data).write_volatile(user_data);
+            addr_of_mut!((*slot).opcode).write_volatile(opcode);
+            addr_of_mut!((*slot).cap_id).write_volatile(cap_id);
+            addr_of_mut!((*slot).flow_id).write_volatile(flow_id);
+            addr_of_mut!((*slot).user_data).write_volatile(user_data);
         }
-        self.sq.head.store(head.wrapping_add(1), Ordering::Release);
+        self.sq
+            .head()
+            .store(head.wrapping_add(1), Ordering::Release);
+        true
+    }
+
+    /// Submit carrying up to 24 bytes of opcode arguments in `payload`. For
+    /// loaded (self-contained) cells, which have their own `mem*`; the
+    /// hand-written `.user` cells use [`submit`](Self::submit) instead.
+    #[inline]
+    pub fn submit_args(
+        &self,
+        opcode: u8,
+        cap_id: u32,
+        flow_id: u128,
+        user_data: u64,
+        args: &[u8],
+    ) -> bool {
+        let head = self.sq.head().load(Ordering::Relaxed);
+        let tail = self.sq.tail().load(Ordering::Acquire);
+        if head.wrapping_sub(tail) as usize >= RING_DEPTH {
+            return false;
+        }
+        let idx = (head as usize) & (RING_DEPTH - 1);
+        let n = args.len().min(24);
+        // SAFETY: idx is in-bounds; the ring memory is shared and mapped.
+        unsafe {
+            let slot = self.sq.entries.add(idx);
+            addr_of_mut!((*slot).opcode).write_volatile(opcode);
+            addr_of_mut!((*slot).flags).write_volatile(0);
+            addr_of_mut!((*slot).engine_id).write_volatile(0);
+            addr_of_mut!((*slot).cap_id).write_volatile(cap_id);
+            addr_of_mut!((*slot).flow_id).write_volatile(flow_id);
+            addr_of_mut!((*slot).user_data).write_volatile(user_data);
+            let pl = addr_of_mut!((*slot).payload) as *mut u8;
+            for (i, &b) in args[..n].iter().enumerate() {
+                pl.add(i).write_volatile(b);
+            }
+            for i in n..24 {
+                pl.add(i).write_volatile(0);
+            }
+        }
+        self.sq
+            .head()
+            .store(head.wrapping_add(1), Ordering::Release);
         true
     }
 
     /// User-side reap: pop one completion, returning its status, or None.
     #[inline(always)]
     pub fn reap(&self) -> Option<u32> {
-        let tail = self.cq.tail.load(Ordering::Relaxed);
-        let head = self.cq.head.load(Ordering::Acquire);
+        let tail = self.cq.tail().load(Ordering::Relaxed);
+        let head = self.cq.head().load(Ordering::Acquire);
         if tail == head {
             return None;
         }
         let idx = (tail as usize) & (RING_DEPTH - 1);
         // SAFETY: idx is in-bounds; matches the volatile writer in the
         // kernel completion path.
-        let status = unsafe { ptr::addr_of!((*self.cq.entries.add(idx)).status).read_volatile() };
-        self.cq.tail.store(tail.wrapping_add(1), Ordering::Release);
+        let status = unsafe { addr_of!((*self.cq.entries.add(idx)).status).read_volatile() };
+        self.cq
+            .tail()
+            .store(tail.wrapping_add(1), Ordering::Release);
         Some(status)
     }
 }

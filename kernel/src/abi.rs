@@ -109,6 +109,25 @@ pub const SYS_FSTAT: u64 = 29;
 /// by the std `ReadDir`. `kind`: 0 regular, 1 dir, 2 symlink, 3 other.
 pub const SYS_GETDENTS: u64 = 30;
 
+// ---- librheo native foundation (docs/LIBRHEO.md, Phase A) ----
+
+/// queue_info(out_va) -> 0, or u64::MAX if the cell has no queue pair. Writes
+/// a `QueueInfo { qp_va, cap_id }` at `out_va`: the base VA of the cell's
+/// mapped queue-pair region and the 32-bit ABI id of its minted QueuePair
+/// capability. librheo's reactor calls this once at startup to bind the ring
+/// and address the doorbell (a native, explicit alternative to an auxv entry).
+pub const SYS_QUEUE_INFO: u64 = 31;
+
+/// The `SYS_QUEUE_INFO` result block (kept in sync with librheo's `sys` arm).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct QueueInfo {
+    /// Base VA of the cell's queue-pair region (the `QueueHeader`).
+    pub qp_va: u64,
+    /// 32-bit ABI id of the cell's QueuePair capability (`Handle::raw_low32`).
+    pub cap_id: u64,
+}
+
 /// The `stat`/`fstat` result block (kept in sync with the std `fs` arm in
 /// targets/std-rheo/fs.rs). `kind`: 0 regular, 1 dir, 2 symlink, 3 other.
 #[repr(C)]

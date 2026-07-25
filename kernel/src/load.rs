@@ -13,12 +13,46 @@ use crate::arch::{self, MapPerm};
 use crate::elf::{self, Elf, PF_W, PF_X, Segment};
 use crate::mm::AddressSpace;
 use crate::mm::frames::{self, FRAME_SIZE};
+use crate::queue::QueuePair;
 
 /// Top of the initial user stack (docs/USERLAND.md): 8 GiB, free in every
 /// cell root. The stack grows down from here.
 pub const USER_STACK_TOP: usize = 0x2_0000_0000;
 /// Initial stack size: 32 KiB.
 pub const USER_STACK_PAGES: usize = 8;
+
+/// Base VA of a loaded cell's queue-pair region (docs/LIBRHEO.md): 16 GiB,
+/// above the image (1-4 GiB), stack (8 GiB), and anon mmap (12 GiB and up),
+/// free in every cell root. `SYS_QUEUE_INFO` reports it to the cell.
+pub const USER_QUEUE_VA: usize = 0x4_0000_0000;
+
+/// Map a fresh queue-pair region into `aspace` at [`USER_QUEUE_VA`], write its
+/// on-wire header, and return a [`QueuePair`] overlay bound to the **user** VA
+/// (docs/LIBRHEO.md). The header is written through the kernel linear map (the
+/// cell's address space is not active during load); the returned overlay's
+/// pointers are user VAs, valid when the kernel drains the ring during the
+/// cell's `SYS_DOORBELL` trap (its address space active). The caller mints the
+/// QueuePair capability and records `(USER_QUEUE_VA, cap_id)` via
+/// `user::set_queue_info`.
+pub fn map_queue(aspace: &mut AddressSpace) -> QueuePair {
+    let pages = QueuePair::REGION_SIZE / FRAME_SIZE;
+    let mut first_pa = 0usize;
+    for i in 0..pages {
+        let pa = frames::alloc(); // zeroed
+        if i == 0 {
+            first_pa = pa;
+        }
+        aspace.map_user_frame(USER_QUEUE_VA + i * FRAME_SIZE, pa, MapPerm::UserRw);
+    }
+    // The header lives in the first page; write it through the linear map.
+    // SAFETY: `first_pa` is a freshly allocated frame reached through the
+    // kernel linear map; the header fits well within one page.
+    unsafe {
+        QueuePair::init_header(arch::phys_to_virt(first_pa) as *mut u8);
+        // The overlay used at doorbell time binds to the cell's VA.
+        QueuePair::attach(USER_QUEUE_VA as *mut u8)
+    }
+}
 
 /// Load `image` into `aspace`; returns the entry-point VA. The caller then
 /// builds a trap frame at that entry with a stack from `map_stack`.

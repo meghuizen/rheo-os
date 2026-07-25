@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 23] = [
+const TEST_KERNELS: [&str; 24] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -38,6 +38,7 @@ const TEST_KERNELS: [&str; 23] = [
     "libcrun",
     "jsonrun",
     "stdrun",
+    "librhearun",
     "coreutils",
     "linuxrun",
     "linuxtools",
@@ -291,6 +292,8 @@ fn build_userland(arch: Arch) -> bool {
         "userland",
         "-p",
         "rheo-libc",
+        "-p",
+        "librheo",
         "--release",
         "--target",
         arch.target(),

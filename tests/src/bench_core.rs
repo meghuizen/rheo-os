@@ -26,7 +26,7 @@ use kernel::arch::{self, Context};
 use kernel::capability::{BUDGET_UNLIMITED, CapTable, ObjectKind, ObjectTable, READ, WRITE};
 use kernel::cell::Cell;
 use kernel::println;
-use kernel::queue::{self, CqEntry, OP_NOP, QueuePair, RING_DEPTH, SqEntry};
+use kernel::queue::{self, OP_NOP, QueuePair, RING_DEPTH, SqEntry};
 use kernel::rng::Drbg;
 use kernel::user;
 use kernel::user_progs::{user_pong, user_worker};
@@ -35,8 +35,10 @@ const CAL_ITERS: u64 = 100_000;
 const BATCHES: usize = 32;
 const BATCH_OPS: usize = 1024;
 
-static mut SQ_STORAGE: [SqEntry; RING_DEPTH] = [SqEntry::ZERO; RING_DEPTH];
-static mut CQ_STORAGE: [CqEntry; RING_DEPTH] = [CqEntry::ZERO; RING_DEPTH];
+/// The shared queue-pair region (header + SQ + CQ), page-aligned.
+#[repr(C, align(4096))]
+struct Region([u8; QueuePair::REGION_SIZE]);
+static mut REGION: Region = Region([0; QueuePair::REGION_SIZE]);
 
 static mut MAIN_CTX: Context = Context { sp: 0 };
 static mut WORKER_CTX: Context = Context { sp: 0 };
@@ -159,12 +161,7 @@ extern "C" fn kernel_main() -> ! {
     });
 
     // ---------------------------------------------------------------- P2
-    let qp = unsafe {
-        QueuePair::new(
-            core::ptr::addr_of_mut!(SQ_STORAGE) as *mut SqEntry,
-            core::ptr::addr_of_mut!(CQ_STORAGE) as *mut CqEntry,
-        )
-    };
+    let qp = unsafe { QueuePair::init(core::ptr::addr_of_mut!(REGION) as *mut u8) };
 
     // Ring transport alone (no kernel work): push one, pop one.
     bench("p2_ring_push_pop", || {

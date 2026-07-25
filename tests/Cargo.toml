@@ -73,6 +73,10 @@ name = "stdrun"
 path = "src/stdrun.rs"
 
 [[bin]]
+name = "librhearun"
+path = "src/librhearun.rs"
+
+[[bin]]
 name = "coreutils"
 path = "src/coreutils.rs"
 
