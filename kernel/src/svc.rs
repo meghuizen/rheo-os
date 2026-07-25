@@ -71,6 +71,25 @@ pub fn handle(nr: u64, args: &[u64; 6]) -> Option<u64> {
             let lease = Lease::acquire(1 << 40, 0);
             Some(lease.token)
         }
+        SYS_ENGINE_INFO => {
+            // Engine introspection (docs/LIBRHEO.md Phase C, object 4): report the
+            // CPU engine's kind, attach-time MEASURED cost, and preemption contract.
+            let engine = unsafe { &*core::ptr::addr_of!(ENGINE) };
+            let info = EngineInfo {
+                kind: 0, // CPU (the only real engine here)
+                measured_cost_ticks: engine.measured_cost_ticks(),
+                preemption: match engine.preemption {
+                    crate::engine::Preemption::Instruction => 0,
+                    crate::engine::Preemption::OpBoundary => 1,
+                },
+            };
+            // SAFETY: `arg` is a user VA in the running cell's active address
+            // space, sized for an `EngineInfo` (the cell passes its own slot).
+            unsafe {
+                (arg as *mut EngineInfo).write(info);
+            }
+            Some(0)
+        }
         SYS_CPUINFO => {
             print_cpuinfo();
             Some(0)
@@ -311,6 +330,64 @@ fn write(io_va: u64) -> u64 {
         }
     }
     0
+}
+
+/// Run a **userspace-built** dependency graph on the CPU engine (docs/LIBRHEO.md
+/// Phase C, docs/ARCHITECTURE.md 3 objects 4/6). `nodes_va` points at `count`
+/// [`GraphNode`]s in the submitting cell's own memory (its address space is
+/// active during the drain, so the VAs are directly readable); the graph is
+/// validated (topological edges, node cap), executed, and each node's `u64`
+/// result written back to `results_va`. Returns `(status, count)` on success or
+/// a `(STATUS_*, 0)` failure - the queue completion the reactor delivers.
+///
+/// # Safety
+/// `nodes_va`/`results_va` are trusted to be the calling cell's mapped buffers;
+/// the caller (`queue::run_opcode`) invokes this only during that cell's trap.
+pub fn graph_submit(nodes_va: u64, count: u32, results_va: u64) -> (u32, u32) {
+    use crate::queue::{STATUS_BAD_OPCODE, STATUS_DENIED, STATUS_OK};
+    let count = count as usize;
+    if count == 0 || count > crate::graph::MAX_NODES {
+        return (STATUS_BAD_OPCODE, 0);
+    }
+    let mut g = Graph::new();
+    for i in 0..count {
+        // SAFETY: `nodes_va` is the cell's mapped buffer; each 32-byte node is
+        // read unaligned to tolerate any buffer alignment.
+        let node = unsafe { (nodes_va as *const GraphNode).add(i).read_unaligned() };
+        let op = match node.op {
+            0 => Op::Const(node.a),
+            1 => Op::Add,
+            2 => Op::Mul,
+            3 => Op::Select,
+            _ => return (STATUS_BAD_OPCODE, 0),
+        };
+        let a = wire_input(node.a_is_node, node.a);
+        let b = wire_input(node.b_is_node, node.b);
+        if g.push(op, a, b).is_err() {
+            // BadEdge (a forward reference) or Full - a malformed graph.
+            return (STATUS_DENIED, 0);
+        }
+    }
+    let mut results = [0u64; crate::graph::MAX_NODES];
+    let engine = unsafe { &*core::ptr::addr_of!(ENGINE) };
+    g.run(engine, &mut results);
+    for (i, &r) in results.iter().take(count).enumerate() {
+        // SAFETY: `results_va` is the cell's mapped buffer, `count` u64s wide.
+        unsafe {
+            (results_va as *mut u64).add(i).write_unaligned(r);
+        }
+    }
+    (STATUS_OK, count as u32)
+}
+
+/// Decode one graph-node input: an immediate value or a reference to an earlier
+/// node's result (validated as topological by `Graph::push`).
+fn wire_input(is_node: u32, val: u64) -> Input {
+    if is_node != 0 {
+        Input::Node(val as usize)
+    } else {
+        Input::Imm(val)
+    }
 }
 
 /// A small dependency graph run on the compute engine, modelling

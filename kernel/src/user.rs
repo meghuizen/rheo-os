@@ -12,14 +12,15 @@
 //! synchronous, so there is no concurrent access to guard against.
 
 use crate::abi::{
-    GrantInfo, QueueInfo, SYS_COMMIT, SYS_CYCLES, SYS_DECOMMIT, SYS_DOORBELL, SYS_EXIT,
-    SYS_EXIT_GROUP, SYS_GRANT, SYS_MMAP, SYS_MMAP_FILE, SYS_MUNMAP, SYS_QUEUE_INFO, SYS_SEAL,
-    SYS_SWITCH,
+    GrantInfo, QueueInfo, ReserveInfo, SYS_COMMIT, SYS_CYCLES, SYS_DECOMMIT, SYS_DOORBELL,
+    SYS_EXIT, SYS_EXIT_GROUP, SYS_GRANT, SYS_MMAP, SYS_MMAP_FILE, SYS_MUNMAP, SYS_QUEUE_INFO,
+    SYS_RESERVE_ADMIT, SYS_RESERVE_QUERY, SYS_RESERVE_RELEASE, SYS_SEAL, SYS_SWITCH,
 };
 use crate::arch::{self, FaultCause, MapPerm, TrapFrame, TrapKind};
 use crate::capability::{BUDGET_UNLIMITED, CapTable, MAP, ObjectKind, ObjectTable, READ, WRITE};
 use crate::mm::{AddressSpace, frames};
 use crate::queue::{self, QueuePair};
+use crate::sched::{Admission, AdmitError, Reservation};
 
 /// Base VA of the per-cell anonymous mmap region (docs/USERLAND.md M2): 12 GiB,
 /// above the image (1-4 GiB) and stack (8 GiB), free in every cell root.
@@ -128,6 +129,43 @@ fn cell_grants(cur: usize) -> &'static mut [GrantSlot; MAX_GRANTS_PER_CELL] {
     unsafe { &mut (*core::ptr::addr_of_mut!(CELL_GRANTS))[cur] }
 }
 
+/// One admitted CPU reservation a native cell holds (docs/LIBRHEO.md Phase C,
+/// docs/ARCHITECTURE.md 3 object 7). Fixed per-cell table, like the grant
+/// table. The admission MATH (EDF utilization) is real and enforced at admit;
+/// actual run-queue enforcement is SMP/preemption work (task #27), documented.
+#[derive(Copy, Clone)]
+struct ResSlot {
+    in_use: bool,
+    /// The admitted reservation (carries the util to free on release).
+    res: Reservation,
+    cap_id: u32,
+}
+
+const EMPTY_RES: ResSlot = ResSlot {
+    in_use: false,
+    res: Reservation::ZERO,
+    cap_id: 0,
+};
+
+const MAX_RES_PER_CELL: usize = 8;
+static mut CELL_RES: [[ResSlot; MAX_RES_PER_CELL]; MAX_CELLS] =
+    [[EMPTY_RES; MAX_RES_PER_CELL]; MAX_CELLS];
+
+/// Per-cell EDF admission controller (docs/SCHEDULING.md 4): tracks the cell's
+/// committed CPU utilization and refuses a set it cannot guarantee.
+const EMPTY_ADMISSION: Admission = Admission::new();
+static mut CELL_ADMISSION: [Admission; MAX_CELLS] = [EMPTY_ADMISSION; MAX_CELLS];
+
+fn cell_res(cur: usize) -> &'static mut [ResSlot; MAX_RES_PER_CELL] {
+    // SAFETY: single CPU, synchronous traps; no concurrent access.
+    unsafe { &mut (*core::ptr::addr_of_mut!(CELL_RES))[cur] }
+}
+
+fn cell_admission(cur: usize) -> &'static mut Admission {
+    // SAFETY: single CPU, synchronous traps; no concurrent access.
+    unsafe { &mut (*core::ptr::addr_of_mut!(CELL_ADMISSION))[cur] }
+}
+
 /// Number of runnable cell slots. Bumped 8 -> 16 for the Linux personality's
 /// **processes** (docs/LINUX-COMPAT.md L6): a shell plus several concurrent
 /// pipeline stages (each `fork` claims a slot until it is reaped). The native
@@ -154,6 +192,8 @@ pub fn reset() {
     unsafe {
         *core::ptr::addr_of_mut!(MMAP_NEXT) = MMAP_BASE;
         *core::ptr::addr_of_mut!(CELL_GRANTS) = [[EMPTY_GRANT; MAX_GRANTS_PER_CELL]; MAX_CELLS];
+        *core::ptr::addr_of_mut!(CELL_RES) = [[EMPTY_RES; MAX_RES_PER_CELL]; MAX_CELLS];
+        *core::ptr::addr_of_mut!(CELL_ADMISSION) = [EMPTY_ADMISSION; MAX_CELLS];
     }
     crate::linux::reset();
 }
@@ -453,6 +493,108 @@ fn mmap_file(cur: usize, fd: u64, offset: u64, len: usize) -> usize {
         }
     });
     base
+}
+
+/// `SYS_RESERVE_ADMIT`: run the EDF schedulability test for a CPU reservation
+/// (budget/period/deadline) plus an advisory memory floor, and on success mint a
+/// Reservation capability into the cell's table and write `ReserveInfo { handle,
+/// committed_ppm }` at `out_va` (docs/LIBRHEO.md Phase C, object 7). Returns 0 on
+/// success or a rejection code (1=BadParams, 2=Overcommit, 3=MemoryFloor) - a
+/// refused reservation returns cleanly, never faults. The admission MATH is real
+/// and enforced here; run-queue enforcement is SMP/preemption work (task #27).
+fn reserve_admit(
+    cur: usize,
+    out_va: u64,
+    budget: u64,
+    period: u64,
+    deadline: u64,
+    mem_floor_pages: u64,
+) -> u64 {
+    let cell = cells()[cur];
+    if cell.caps.is_null() || cell.objects.is_null() {
+        return 1; // no capability tables - treat as bad params
+    }
+    // Advisory memory floor: the reservation is honored only if the pool can
+    // currently cover it (QEMU has no bandwidth/IO backend, so CPU is the real
+    // guarantee; the floor is a documented advisory check, not a hold).
+    let (free, _) = frames::stats();
+    if mem_floor_pages > free as u64 {
+        return 3;
+    }
+    // Find a free reservation slot before mutating the admission total.
+    if cell_res(cur).iter().all(|s| s.in_use) {
+        return 1;
+    }
+    let res = match cell_admission(cur).admit(budget, period, deadline) {
+        Ok(r) => r,
+        Err(AdmitError::BadParams) => return 1,
+        Err(AdmitError::Overcommit) => return 2,
+    };
+    // Mint a Reservation capability (READ) so query/release are capability-gated,
+    // mirroring the grant path. SAFETY: single CPU, synchronous trap; the cell's
+    // tables are uniquely owned for the trap (the `*const` objects table is owned
+    // mutably by the test kernel, recovered here to create a new object).
+    let cap_id = unsafe {
+        let objects = &mut *(cell.objects as *mut ObjectTable);
+        let caps = &mut *cell.caps;
+        let Ok(obj) = objects.create(ObjectKind::Reservation) else {
+            cell_admission(cur).release(&res);
+            return 1;
+        };
+        match caps.mint(objects, obj, READ, BUDGET_UNLIMITED) {
+            Ok(h) => h.raw_low32(),
+            Err(_) => {
+                cell_admission(cur).release(&res);
+                return 1;
+            }
+        }
+    };
+    let slot = cell_res(cur).iter_mut().find(|s| !s.in_use).unwrap();
+    *slot = ResSlot {
+        in_use: true,
+        res,
+        cap_id,
+    };
+    let committed = cell_admission(cur).committed_ppm();
+    // SAFETY: `out_va` is a user VA in the running cell's active address space,
+    // sized for a `ReserveInfo` (the cell passes its own stack slot).
+    unsafe {
+        (out_va as *mut ReserveInfo).write(ReserveInfo {
+            handle: cap_id as u64,
+            committed_ppm: committed,
+        });
+    }
+    0
+}
+
+/// `SYS_RESERVE_RELEASE`: free an admitted reservation, returning its
+/// utilization to the cell's admission controller (the RAII drop path). Returns
+/// 0, or `u64::MAX` if the handle names no live reservation. Grant-checks the
+/// Reservation capability (READ) so a forged/revoked handle is rejected.
+fn reserve_release(cur: usize, cap_id: u32) -> u64 {
+    let cell = cells()[cur];
+    if cell.caps.is_null() || cell.objects.is_null() {
+        return u64::MAX;
+    }
+    // SAFETY: single CPU, synchronous trap; tables uniquely owned.
+    let ok = unsafe {
+        let objects = &*cell.objects;
+        let caps = &mut *cell.caps;
+        caps.grant_check_low32(objects, cap_id, READ).is_ok()
+    };
+    if !ok {
+        return u64::MAX;
+    }
+    let Some(slot) = cell_res(cur)
+        .iter_mut()
+        .find(|s| s.in_use && s.cap_id == cap_id)
+    else {
+        return u64::MAX;
+    };
+    let res = slot.res;
+    slot.in_use = false;
+    cell_admission(cur).release(&res);
+    0
 }
 
 /// Register a runnable cell in slot `idx`. The pointers must outlive the
@@ -756,6 +898,22 @@ pub fn on_user_trap(
         SYS_MMAP_FILE => {
             let base = mmap_file(cur, args[0], args[1], args[2] as usize);
             arch::set_syscall_ret(unsafe { &mut *frame }, base as u64);
+            frame
+        }
+        // Reservations exposed to the cell (docs/LIBRHEO.md Phase C, object 7).
+        SYS_RESERVE_ADMIT => {
+            let r = reserve_admit(cur, args[0], args[1], args[2], args[3], args[4]);
+            arch::set_syscall_ret(unsafe { &mut *frame }, r);
+            frame
+        }
+        SYS_RESERVE_QUERY => {
+            let ppm = cell_admission(cur).committed_ppm();
+            arch::set_syscall_ret(unsafe { &mut *frame }, ppm);
+            frame
+        }
+        SYS_RESERVE_RELEASE => {
+            let r = reserve_release(cur, args[0] as u32);
+            arch::set_syscall_ret(unsafe { &mut *frame }, r);
             frame
         }
         // Shell / resource / file syscalls are handled by the system-service

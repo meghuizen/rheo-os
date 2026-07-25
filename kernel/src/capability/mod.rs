@@ -101,6 +101,11 @@ pub enum ObjectKind {
     File,
     /// A byte stream (console/pipe/socket) - reserved alongside `File`.
     Stream,
+    /// An admission-checked CPU/memory reservation (docs/ARCHITECTURE.md 3
+    /// object 7, docs/LIBRHEO.md Phase C). A cell holds this capability for a
+    /// reservation admitted by the per-cell EDF controller; commit/query/release
+    /// grant-check it.
+    Reservation,
 }
 
 #[derive(Copy, Clone)]

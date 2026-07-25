@@ -274,10 +274,110 @@ single-node; durability/latency contracts are advisory (no durable/RT backend in
 QEMU); a first-class file capability and a real block/object `store` transport
 are deferred.
 
+## Phase C - compute & QoS (this milestone)
+
+Phase C makes librheo the substrate for **parallel / accelerated compute with
+QoS guarantees** (DuckDB parallel+SIMD, ML, warehouse rollups): strands as M:N
+parallel workers, **userspace-built dependency graphs submitted to the compute
+engine**, engine introspection, and **admission-checked reservations**. The
+proof is the `librheocompute` test kernel: a librheo cell runs a parallel
+aggregation, submits a real graph to the CPU engine, admits and rejects
+reservations, and reports the engine's measured throughput - on all three ISAs.
+
+### Kernel surface added (Phase C)
+
+All additions **expose an existing kernel object** or **extend the queue
+object** - none is a new object (they pass the docs/ARCHITECTURE.md 6 admission
+rule as mechanism / exposure of objects 4/6/7).
+
+Graph submission over the queue (extends the queue object, docs/IO.md 1):
+
+- **`OP_GRAPH_SUBMIT` (7)** - a queue opcode (so it rides the async model and
+  the Phase A reactor, completing with the strand token). Payload
+  `[nodes_va u64][count u32][results_va u64]`: `count` `abi::GraphNode`s live in
+  one of the cell's own buffers. The kernel reads them (the cell's address space
+  is active during the `SYS_DOORBELL` drain, so the VAs are directly readable -
+  no bounce), builds a `graph::Graph`, **validates the edges** (an input may only
+  reference an earlier node - topological), runs it on the CPU engine
+  (`kernel/src/engine.rs`), and writes each node's `u64` result back to
+  `results_va`. The completion carries the node count. A malformed edge / empty /
+  oversized graph completes with a distinct status (not a fault). Node ops are the
+  arithmetic set `graph.rs` already has (Const/Add/Mul/Select - a conditional edge
+  for MoE routing / speculative decoding); a **buffer-reduce / map node kind** (a
+  graph node that reduces a mapped buffer) is a documented next step - it needs
+  object 6's node model to carry buffer references, a larger change. The parallel
+  *aggregation* is served today by the strand `map_reduce` path below.
+
+Engine introspection + reservations (expose objects 4 / 7):
+
+- **`SYS_ENGINE_INFO` (38)** - `engine_info(out_va) -> 0`. Writes an
+  `EngineInfo { kind, measured_cost_ticks, preemption }`: the CPU engine's kind
+  (0 = CPU), the throughput **measured at attach** (attest-by-measurement, object
+  4 - the engine benchmarks a known op stream in `Engine::attach` and records the
+  per-op cost; it is a measurement, never a vendor claim), and its preemption
+  contract. Answers librheo `compute`'s "what executor am I on?".
+- **`SYS_RESERVE_ADMIT` (39)** - `reserve_admit(out_va, budget, period, deadline,
+  mem_floor_pages) -> 0 | 1=BadParams | 2=Overcommit | 3=MemoryFloor`. Runs the
+  **EDF schedulability test** (`sched::Admission`, object 7): a per-cell admission
+  controller tracks committed utilization (`sum(budget_i/period_i) <= 1`, integer
+  parts-per-million) and refuses a set it cannot guarantee. On success it mints a
+  **Reservation capability** (`ObjectKind::Reservation`, READ) into the cell's
+  table - the reservation the cell holds - and writes a `ReserveInfo { handle,
+  committed_ppm }`. A refused reservation returns a code **cleanly, never faults**.
+  The memory floor is an advisory check against the current free-frame pool
+  (QEMU has no bandwidth/IO backend, so CPU is the real guarantee).
+- **`SYS_RESERVE_QUERY` (40)** - the cell's committed CPU utilization (ppm).
+- **`SYS_RESERVE_RELEASE` (41)** - `reserve_release(cap_id) -> 0 | u64::MAX`.
+  Grant-checks the Reservation capability, returns its utilization to the
+  admission controller, and frees the slot (the RAII drop path).
+
+**Honest accounting - admission is real, enforcement is SMP-gated.** The
+admission **math** (EDF utilization, over-commit refusal, memory-floor check) is
+real and enforced *at admit time* - an over-committed set is refused, exactly
+like a real-time system that says no rather than accepting a lie. But the runtime
+is single-CPU **cooperative** today, so a reservation is an *admitted guarantee*,
+not yet a *scheduled* one: actual run-queue enforcement (a reserved cell getting
+its budget, priority-driven preemption) lands with SMP/preemption (task #27).
+The **CPU engine is the only real engine**; GPU/NPU accelerators run behind the
+same graph/engine API as attested-firmware future work (docs/ACCELERATORS.md).
+Priority bands are carried but advisory.
+
+### librheo modules (Phase C)
+
+| module | role |
+| --- | --- |
+| `compute` (new) | **strands as M:N parallel workers** - `map_reduce` (partitioned map + reduce, the parallel aggregation), `parallel_for` (disjoint-block loop), `scan` (blocked parallel prefix sum), all over the Phase A executor; **engine introspection** (`Engine::info` -> kind + measured throughput + preemption); and **`GraphBuilder`** - build a dependency graph (`constant`/`add`/`mul`/`select`) in userspace and `submit().await` it to the CPU engine over `OP_GRAPH_SUBMIT`, reading back the result. SIMD-friendly aligned buffers come from `mem` (`Grant`/`Arena`). |
+| `sched` (new) | **`Reservation`** (`request(budget, period, deadline, mem_floor)` -> an admitted, RAII handle or a typed `ReserveError::{BadParams,Overcommit,MemoryFloor}`); the `lattice-rt`-shaped surface - `Priority`, a `PeriodicTask` builder whose `.build()` runs admission, and a `TimingReport` (committed utilization + headroom). |
+
+On the single-CPU cooperative runtime the parallel strands **interleave** rather
+than run on separate cores (SMP work-stealing is task #27); the surface is the
+parallel *decomposition*, and every aggregate is exact.
+
+### The proof: parallel compute + graph + reservations (`librheocompute`)
+
+The `librheocompute` test kernel loads `librheo-compute` into a cell with a real
+mapped queue pair + minted capability (like `librhearun`), attaches/measures the
+CPU engine (`svc::init`), and asserts the cell exits `0x42` - which it reaches
+only if every stage passed:
+
+1. **parallel aggregation** - `compute::map_reduce` fans a columnar
+   `SUM WHERE odd` over an in-memory dataset (`col[i] = i`) across 8 strands and
+   asserts the exact closed-form value (`SUM = (LEN/2)^2 = 4194304`). `scan` and
+   `parallel_for` are also verified.
+2. **graph submission** - `GraphBuilder` builds `n0=const(6); n1=n0+1; n2=n1*n0`
+   and submits it to the CPU engine over the async queue; the result `42` is
+   asserted (userspace-built graph, run in the kernel, completed through the ring).
+3. **reservations** - a feasible reservation (30% CPU) is admitted (committed
+   ppm > 0); an infeasible one (`budget > period`) is cleanly rejected
+   (`BadParams`); an over-commit (another 80% on the held 30%) is rejected
+   (`Overcommit`); the `PeriodicTask`/`TimingReport` builder path is exercised,
+   and RAII release returns the CPU to fully uncommitted.
+4. **engine info** - the engine kind + measured throughput are printed (visible,
+   not asserted-exact).
+
 ## Later phases (planned, not in this milestone)
 
-C - compute & QoS (engine/graph submit, reservations). D - the kernel's
-**first interrupt** (UART RX IRQ + park-until-completion + 0%-CPU idle) and the
-`term` byte-stream terminal. E - services & IPC (cross-cell connect, a
-Wayland-class compositor demo). F - process/time/net + a librheo-native shell.
-See the plan for the full sequence.
+D - the kernel's **first interrupt** (UART RX IRQ + park-until-completion +
+0%-CPU idle) and the `term` byte-stream terminal. E - services & IPC (cross-cell
+connect, a Wayland-class compositor demo). F - process/time/net + a
+librheo-native shell. See the plan for the full sequence.

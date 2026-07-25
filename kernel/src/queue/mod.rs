@@ -62,6 +62,14 @@ pub const OP_WRITE: u8 = 4;
 pub const OP_CLOSE: u8 = 5;
 /// `fstat(fd, statbuf_va)`: payload `[statbuf_va u64@0][fd u32@8]`.
 pub const OP_FSTAT: u8 = 6;
+/// Submit a userspace-built dependency graph to the CPU engine (docs/LIBRHEO.md
+/// Phase C, docs/ARCHITECTURE.md 3 objects 4/6). Payload `[nodes_va u64@0]
+/// [count u32@8][results_va u64@12]`: `count` `abi::GraphNode`s live at
+/// `nodes_va`; the kernel validates the edges, runs the graph on the CPU
+/// engine, writes each node's `u64` result to `results_va`, and completes with
+/// `result` = the node count. Both VAs are the cell's own mapped memory (its
+/// address space is active during the `SYS_DOORBELL` trap), so no bounce.
+pub const OP_GRAPH_SUBMIT: u8 = 7;
 
 /// `SqEntry.flags` bit: the op's data rides inline in the payload rather than
 /// by reference at `buf_va` (docs/IO.md 1 - the inline-vs-by-reference
@@ -562,6 +570,14 @@ fn run_opcode(entry: &SqEntry) -> (u32, u32) {
             let statbuf_va = rd_u64(p, 0);
             let fd = rd_u32(p, 8) as u64;
             io_result(crate::svc::file_ops().map(|o| (o.fstat)(fd, statbuf_va)))
+        }
+        OP_GRAPH_SUBMIT => {
+            let nodes_va = rd_u64(p, 0);
+            let count = rd_u32(p, 8);
+            let results_va = rd_u64(p, 12);
+            // SAFETY: both VAs are the submitting cell's own mapped memory,
+            // reachable because its address space is active during the drain.
+            crate::svc::graph_submit(nodes_va, count, results_va)
         }
         _ => (STATUS_BAD_OPCODE, 0),
     }

@@ -172,6 +172,71 @@ pub struct GrantInfo {
     pub cap_id: u64,
 }
 
+// ---- compute & QoS exposed to userspace (docs/LIBRHEO.md Phase C,
+// docs/ARCHITECTURE.md 3 objects 4/6/7) ----
+//
+// These EXPOSE the existing engine, dependency-graph, and reservation kernel
+// objects to a native cell as mechanism (ARCHITECTURE.md 6 admission rule);
+// they add no new object. Graph submission rides the queue pair (opcode
+// `OP_GRAPH_SUBMIT`, docs/IO.md 1); engine introspection and reservation
+// admission are plain syscalls.
+
+/// engine_info(out_va) -> 0. Writes an `EngineInfo` describing the CPU compute
+/// engine the kernel runs graphs on: its kind, the throughput MEASURED at
+/// attach (attest-by-measurement, object 4), and its preemption contract.
+pub const SYS_ENGINE_INFO: u64 = 38;
+/// reserve_admit(out_va, budget, period, deadline, mem_floor_pages) -> 0 on
+/// success, else a rejection code (1=BadParams, 2=Overcommit, 3=MemoryFloor).
+/// Runs the EDF schedulability test (object 7); on success mints a Reservation
+/// capability and writes a `ReserveInfo { handle, committed_ppm }` at `out_va`.
+pub const SYS_RESERVE_ADMIT: u64 = 39;
+/// reserve_query() -> the cell's committed CPU utilization in parts-per-million.
+pub const SYS_RESERVE_QUERY: u64 = 40;
+/// reserve_release(cap_id) -> 0. Releases an admitted reservation, freeing its
+/// utilization (the RAII drop path). `u64::MAX` if the handle is not live.
+pub const SYS_RESERVE_RELEASE: u64 = 41;
+
+/// The `SYS_ENGINE_INFO` result block (kept in sync with librheo's `compute`
+/// arm). `kind`: 0=CPU (the only real engine in QEMU; GPU/NPU are attested-
+/// firmware future work). `preemption`: 0=per-instruction, 1=per-op-boundary.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct EngineInfo {
+    pub kind: u64,
+    pub measured_cost_ticks: u64,
+    pub preemption: u64,
+}
+
+/// The `SYS_RESERVE_ADMIT` success block (kept in sync with librheo's `sched`
+/// arm). `handle` is the 32-bit ABI id of the minted Reservation capability;
+/// `committed_ppm` is the cell's total committed utilization after admission.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ReserveInfo {
+    pub handle: u64,
+    pub committed_ppm: u64,
+}
+
+/// One node of a userspace-built dependency graph (docs/LIBRHEO.md Phase C,
+/// docs/ARCHITECTURE.md 3 object 6), kept in sync with librheo's `compute` arm.
+/// A cell writes an array of these into one of its buffers and submits it with
+/// `OP_GRAPH_SUBMIT`; the kernel validates the edges (topological), runs it on
+/// the CPU engine, and writes each node's `u64` result back. `op`: 0=Const
+/// (value in `a`), 1=Add, 2=Mul, 3=Select. For Add/Mul/Select each input is an
+/// immediate (`*_is_node == 0`, value in `a`/`b`) or an earlier node's result
+/// (`*_is_node == 1`, node index in `a`/`b`).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct GraphNode {
+    pub op: u32,
+    pub a_is_node: u32,
+    pub b_is_node: u32,
+    pub _pad: u32,
+    pub a: u64,
+    pub b: u64,
+}
+const _: () = assert!(core::mem::size_of::<GraphNode>() == 32);
+
 /// The `stat`/`fstat` result block (kept in sync with the std `fs` arm in
 /// targets/std-rheo/fs.rs). `kind`: 0 regular, 1 dir, 2 symlink, 3 other.
 #[repr(C)]

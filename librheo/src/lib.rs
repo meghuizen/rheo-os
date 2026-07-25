@@ -23,10 +23,12 @@
 extern crate alloc;
 
 pub mod cap;
+pub mod compute;
 pub mod io;
 pub mod mem;
 pub mod rng;
 pub mod rt;
+pub mod sched;
 mod start;
 pub mod store;
 pub mod sys;

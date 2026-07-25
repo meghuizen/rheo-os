@@ -38,6 +38,15 @@ pub const SYS_SEAL: u64 = 35;
 pub const SYS_MUNMAP: u64 = 36;
 /// mmap_file(fd, offset, len, flags) -> base VA (0 fails).
 pub const SYS_MMAP_FILE: u64 = 37;
+/// engine_info(out_va) -> 0. Fills an `EngineInfo` (docs/LIBRHEO.md Phase C).
+pub const SYS_ENGINE_INFO: u64 = 38;
+/// reserve_admit(out_va, budget, period, deadline, mem_floor_pages) -> 0 |
+/// 1=BadParams | 2=Overcommit | 3=MemoryFloor. Fills a `ReserveInfo` on success.
+pub const SYS_RESERVE_ADMIT: u64 = 39;
+/// reserve_query() -> committed CPU utilization (parts-per-million).
+pub const SYS_RESERVE_QUERY: u64 = 40;
+/// reserve_release(cap_id) -> 0 | u64::MAX. Frees an admitted reservation.
+pub const SYS_RESERVE_RELEASE: u64 = 41;
 
 // ---- raw syscall stubs (from libc/src/sys.rs) ----
 
@@ -78,6 +87,16 @@ unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     }
     ret
 }
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    let ret;
+    unsafe {
+        asm!("ecall", in("a7") nr, inlateout("a0") a0 => ret,
+             in("a1") a1, in("a2") a2, in("a3") a3, in("a4") a4, options(nostack));
+    }
+    ret
+}
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -113,6 +132,16 @@ unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     unsafe {
         asm!("svc #0", in("x8") nr, inlateout("x0") a0 => ret,
              in("x1") a1, in("x2") a2, in("x3") a3, options(nostack));
+    }
+    ret
+}
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    let ret;
+    unsafe {
+        asm!("svc #0", in("x8") nr, inlateout("x0") a0 => ret,
+             in("x1") a1, in("x2") a2, in("x3") a3, in("x4") a4, options(nostack));
     }
     ret
 }
@@ -160,6 +189,18 @@ unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     }
     ret
 }
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    // Native arg5 is r8 (matching the kernel's x86-64 decode: rdi, rsi, rdx,
+    // r10, r8, r9).
+    let ret;
+    unsafe {
+        asm!("syscall", inlateout("rax") nr => ret, in("rdi") a0, in("rsi") a1, in("rdx") a2,
+             in("r10") a3, in("r8") a4, out("rcx") _, out("r11") _, options(nostack));
+    }
+    ret
+}
 
 // ---- typed wrappers ----
 
@@ -191,6 +232,47 @@ pub fn munmap(va: usize, len: usize) {
 /// the base VA (0 fails).
 pub fn mmap_file(fd: u64, offset: u64, len: usize, flags: u64) -> usize {
     unsafe { syscall4(SYS_MMAP_FILE, fd, offset, len as u64, flags) as usize }
+}
+/// Read the CPU engine's introspection block (kind + measured throughput +
+/// preemption contract). See `compute::Engine::info`.
+pub fn engine_info() -> EngineInfo {
+    let mut info = EngineInfo {
+        kind: 0,
+        measured_cost_ticks: 0,
+        preemption: 0,
+    };
+    unsafe {
+        syscall1(SYS_ENGINE_INFO, &mut info as *mut EngineInfo as u64);
+    }
+    info
+}
+/// Admit a reservation. Fills a `ReserveInfo` at `out_va` on success; returns
+/// 0 or a rejection code (1=BadParams, 2=Overcommit, 3=MemoryFloor).
+pub fn reserve_admit(
+    out_va: u64,
+    budget: u64,
+    period: u64,
+    deadline: u64,
+    mem_floor_pages: u64,
+) -> u64 {
+    unsafe {
+        syscall5(
+            SYS_RESERVE_ADMIT,
+            out_va,
+            budget,
+            period,
+            deadline,
+            mem_floor_pages,
+        )
+    }
+}
+/// Query the cell's committed CPU utilization (parts-per-million).
+pub fn reserve_query() -> u64 {
+    unsafe { syscall1(SYS_RESERVE_QUERY, 0) }
+}
+/// Release an admitted reservation. 0 on success, `u64::MAX` if not live.
+pub fn reserve_release(cap_id: u32) -> u64 {
+    unsafe { syscall1(SYS_RESERVE_RELEASE, cap_id as u64) }
 }
 pub fn exit(code: u64) -> ! {
     unsafe { syscall1(SYS_EXIT_GROUP, code) };
@@ -236,6 +318,9 @@ pub const OP_READ: u8 = 3;
 pub const OP_WRITE: u8 = 4;
 pub const OP_CLOSE: u8 = 5;
 pub const OP_FSTAT: u8 = 6;
+/// Submit a userspace-built dependency graph to the CPU engine (docs/LIBRHEO.md
+/// Phase C). See `compute::GraphBuilder`.
+pub const OP_GRAPH_SUBMIT: u8 = 7;
 /// `SqEntry.flags` bit: the op's data rides inline in the payload (IO.md 1).
 pub const FLAG_INLINE: u8 = 1 << 0;
 /// Durability-class flag bits (docs/IO.md). Advisory: the kernel ignores them
@@ -260,6 +345,39 @@ pub struct GrantInfo {
     pub base: u64,
     pub cap_id: u64,
 }
+
+/// The `SYS_ENGINE_INFO` result block (kernel/src/abi.rs `EngineInfo`).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct EngineInfo {
+    pub kind: u64,
+    pub measured_cost_ticks: u64,
+    pub preemption: u64,
+}
+
+/// The `SYS_RESERVE_ADMIT` success block (kernel/src/abi.rs `ReserveInfo`).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ReserveInfo {
+    pub handle: u64,
+    pub committed_ppm: u64,
+}
+
+/// One node of a userspace-built dependency graph (kernel/src/abi.rs
+/// `GraphNode`). `op`: 0=Const (value in `a`), 1=Add, 2=Mul, 3=Select. Each
+/// Add/Mul/Select input is an immediate (`*_is_node == 0`) or an earlier node's
+/// result (`*_is_node == 1`, node index in `a`/`b`).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct GraphNode {
+    pub op: u32,
+    pub a_is_node: u32,
+    pub b_is_node: u32,
+    pub _pad: u32,
+    pub a: u64,
+    pub b: u64,
+}
+const _: () = assert!(core::mem::size_of::<GraphNode>() == 32);
 
 /// A submission entry - 64 bytes, one cache line.
 #[repr(C, align(64))]
