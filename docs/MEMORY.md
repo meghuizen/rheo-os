@@ -30,6 +30,22 @@ and `Buffer<Ddr>` are distinct types (ARCHITECTURE.md 4.1, ACCELERATORS.md
 5). Placement and migration are explicit; migration is a scheduled DMA graph
 node, never a transparent page fault.
 
+### Userspace grant syscalls (librheo Phase B)
+
+The memory-grant object is exposed to a native cell as mechanism (no new
+object; ARCHITECTURE.md 6): `SYS_GRANT(len, kind, flags) -> (base VA, cap_id)`
+reserves typed address space and mints a MemoryGrant capability;
+`SYS_COMMIT`/`SYS_DECOMMIT` back/unback a sub-range with frames (demand paging
+via **explicit commit**, no fault handler); `SYS_SEAL` makes a grant immutable
+(read-only, shareable - the zero-copy-buffer precursor); `SYS_MMAP_FILE` maps a
+VFS file range into the cell; `SYS_MUNMAP` frees a range's frames. Grants are
+per-cell state (a fixed static table), and every commit/decommit/seal is
+grant-checked (MAP right). **Only DDR is backed for real in QEMU**; HBM/CXL/
+PMEM/remote are backed by DDR frames (emulated, honest); device-BAR has no
+backing and is refused. NUMA placement is single-node here (the hint is
+recorded, not acted on). See docs/LIBRHEO.md Phase B and librheo's `mem`
+module (`Grant`/`Arena`/`Mapping`).
+
 ## 3. Stacks
 
 - Stackful strand: reserve ~1 MB virtual, commit nothing, first-touch commits

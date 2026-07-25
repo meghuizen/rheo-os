@@ -152,10 +152,131 @@ admission rule as mechanism/exposure):
 The VA convention for a loaded cell is now: image 1-4 GiB, stack 8 GiB, anon
 mmap 12 GiB and up, **queue region 16 GiB** (`load::USER_QUEUE_VA`).
 
+## Phase B - memory & data at scale (this milestone)
+
+Phase B makes librheo the substrate for terabytes-of-data / analytical-DB /
+warehouse workloads: **real typed memory** and **real async bulk I/O**, proven
+by a **zero-copy columnar scan off the live virtio-blk disk** on all three ISAs.
+The proof is the `librheodata` test kernel: a librheo cell reads a columnar
+dataset off a live disk, runs a mini-DuckDB scan across strands, and asserts the
+exact aggregate.
+
+### Kernel surface added (Phase B)
+
+All additions **expose an existing kernel object** or **extend the queue
+object** - none is a new object (they pass the docs/ARCHITECTURE.md 6 admission
+rule as mechanism / exposure). Typed memory grants are per-cell state (a fixed
+static table, like the Linux fd table); each grant also mints a real MemoryGrant
+capability, and every commit/decommit/seal is grant-checked (MAP right).
+
+Typed memory-grant syscalls (expose object 5, docs/MEMORY.md):
+
+- **`SYS_GRANT` (32)** - `grant(out_va, len, kind, flags) -> 0 | u64::MAX`.
+  Reserves `len` bytes of typed address space (no frames - demand commit), mints
+  a MemoryGrant capability, and writes a `GrantInfo { base, cap_id }`. `kind` is
+  a `MemKind` (DDR/HBM/CXL/PMEM/DeviceBar/Remote). **Only DDR is real in QEMU**;
+  HBM/CXL/PMEM/Remote are **backed by DDR frames** (emulated, honest); DeviceBar
+  has no backing and is **refused**. Reservations are pure 48-bit address space,
+  so a multi-GiB grant costs nothing until committed.
+- **`SYS_COMMIT` (33)** / **`SYS_DECOMMIT` (34)** - back / unback a sub-range of
+  a grant with frames (demand paging **without a fault handler** - explicit
+  commit; generalizes the L4 `mprotect`-commit path to a native syscall).
+- **`SYS_SEAL` (35)** - make a grant immutable (its committed pages become
+  read-only, shareable) - the zero-copy-buffer / dmabuf precursor (Phase E IPC).
+- **`SYS_MUNMAP` (36)** - real unmap for native cells: frees the frames of
+  `[va, va+len)`. Fixes the anon-`SYS_MMAP` frame leak (that path had a global,
+  never-freed cursor and no unmap). The anon VA *cursor* stays monotonic (a
+  benign, documented address-space-only leak at 48-bit VA scale).
+- **`SYS_MMAP_FILE` (37)** - `mmap_file(fd, offset, len, flags) -> base VA`.
+  Maps a file range into the cell (read into fresh frames, MAP_PRIVATE, mapped
+  read-only) - the substrate for mmap-ing a dataset. Reads through the same
+  `svc::FileOps`/VFS the POSIX personality uses.
+
+Real async I/O opcodes over the queue (extend the queue object, docs/IO.md 1):
+
+- **`OP_OPEN`/`OP_READ`/`OP_WRITE`/`OP_CLOSE`/`OP_FSTAT` (2-6)** - each reads its
+  arguments from the `SqEntry.payload`, performs the op via `svc::FileOps`, and
+  pushes a `CqEntry` carrying `user_data` (the strand token). The Phase A
+  file/console I/O was a *separate synchronous fd path*; these bridge it to
+  `kernel_process` so it completes through the completion ring - the reactor's
+  strand-park-on-completion model now covers real I/O.
+- **Per-opcode rights** - reads require READ, mutating ops require WRITE (the
+  hardcoded-WRITE of Phase A is gone; a narrowed read-only queue cap would now
+  enforce it).
+- **Distinct completion statuses** - each `CapError` gets its own status
+  (`STATUS_BAD_HANDLE`/`REVOKED`/`EXHAUSTED`/`DENIED`), not a collapsed deny, so
+  a cell can tell why an op was refused.
+- **Contract fields on the submission** (docs/IO.md): `SqEntry.flags` carries an
+  inline-vs-by-reference bit (`FLAG_INLINE`) and a durability class. **Inline vs
+  by-reference threshold**: a write at or below `INLINE_MAX` (16 bytes) rides in
+  the submission payload; a larger read/write is **by reference** at a buffer /
+  grant VA. Above the threshold, I/O is **zero-copy**: because the submitting
+  cell's address space is active during its `SYS_DOORBELL` trap, the read/write
+  lands directly in the cell's mapped grant pages - no kernel bounce. Durability
+  (`FLAG_DUR_FLUSH`/`FUA`) and the latency window are **advisory today** (QEMU
+  has no durable / real-time backend); they are recorded on the op, honored
+  best-effort, and documented as such.
+
+The native-cell VA map gains: file mmap **20 GiB** (`FILEMMAP_BASE`), grant
+reservations **32 GiB** (`GRANT_BASE`), above image (1-4), stack (8), anon mmap
+(12+), and queue (16).
+
+### librheo modules (Phase B)
+
+| module | role |
+| --- | --- |
+| `mem` (extended) | `Grant` (typed, `reserve`/`commit`/`decommit`/`seal`, RAII), `Arena` (bump over a committed grant), `Mapping` (a file mmap), and a NUMA-hint API (`reserve_on(kind, len, node)` - single-node in QEMU, honest). |
+| `io` (new) | async `File` (`open`/`read_at`/`write_at`/`close`/`size` over the OP_* opcodes + reactor), `read_into` (zero-copy read straight into a `Grant`), batched submit (N ops, one doorbell, await all), a `Contract` (durability class + latency window), and a `Stream`. |
+| `store` (new, thin) | async dataset access over `io` + `mem` for the bulk path - `Dataset::open`/`map_all`/`map`. Folded together with `io` for now (the block/object transport underneath is the kernel's `BlockDevice`/virtio-blk seam; documented). |
+
+### The proof: the mini-DuckDB scan (`librheodata`)
+
+The dataset is a raw columnar blob - a 16-byte header then column A
+(`col_a[i] = i`) then column B (`col_b[i] = i & 1`), 65536 rows x 2 u32 columns
+(~512 KiB) - **generated fresh by xtask into `target/` (never committed)** and
+attached to the `librheodata` kernel as a **live virtio-blk disk** (virtio-mmio
+on arm/riscv `virt`, virtio-pci on x86 q35, exactly like `blockfs`). The kernel
+reads the whole disk off the live device and serves it to the librheo cell
+through a single-file `FileOps` (`/data.col`), so both the async-I/O path and
+the mmap path reach the real disk bytes.
+
+The librheo cell then exercises the whole Phase B surface and exits `0x42` only
+if it all passed and the aggregate is exact:
+
+1. **typed grants** - reserve+commit a DDR grant, write/read a pattern,
+   decommit+recommit a page (demand paging), seal it (a later commit is
+   refused), request an emulated HBM grant (succeeds), confirm a device-BAR
+   grant is refused.
+2. **async I/O** - open the dataset, `fstat` its size, async-read the 16-byte
+   header into a committed grant (each an OP_* submission parked on a
+   completion), parse `nrows`/`ncols`.
+3. **batched async read** - N=8 strands async-read the 8 partitions of column A
+   into a grant concurrently; **one doorbell drains all 8 completions**, landing
+   straight in the grant (zero-copy read into a grant). The async-read column
+   must match the mmap'd column.
+4. **zero-copy mmap scan** - mmap the dataset, fan the columnar scan across N=8
+   strands (each partition computes a partial `SUM`/`COUNT`/`MAX` of `col_a`
+   where `col_b == 1` over mapped memory - **no syscall per access**), reduce,
+   and assert the exact closed-form aggregate (for 65536 rows:
+   `SUM = 1073741824`, `COUNT = 32768`, `MAX = 65535`).
+5. an inline `OP_WRITE` console marker (the sub-threshold write path).
+
+Zero-copy is **real**: the mmap scan touches mapped memory with no syscall per
+access, and OP_READ / OP_MMAP_FILE land bytes directly in the cell's mapped
+frames with no kernel bounce buffer. The one unavoidable copy is the
+filesystem's backing store -> the mapped frames, done once at map/read time (the
+FS owns those bytes). Promoting an open fd to a **first-class file capability**
+(`ObjectKind::File`, added but not yet wired) is a documented next step; today
+fds remain `svc::FileOps` handles carried in the payload.
+
+Honest accounting: HBM/CXL/PMEM/Remote grants are emulated on DDR; NUMA is
+single-node; durability/latency contracts are advisory (no durable/RT backend in
+QEMU); a first-class file capability and a real block/object `store` transport
+are deferred.
+
 ## Later phases (planned, not in this milestone)
 
-B - memory & data at scale (typed grants, async I/O opcodes, a mini-DuckDB
-scan). C - compute & QoS (engine/graph submit, reservations). D - the kernel's
+C - compute & QoS (engine/graph submit, reservations). D - the kernel's
 **first interrupt** (UART RX IRQ + park-until-completion + 0%-CPU idle) and the
 `term` byte-stream terminal. E - services & IPC (cross-cell connect, a
 Wayland-class compositor demo). F - process/time/net + a librheo-native shell.

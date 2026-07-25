@@ -77,6 +77,10 @@ name = "librhearun"
 path = "src/librhearun.rs"
 
 [[bin]]
+name = "librheodata"
+path = "src/librheodata.rs"
+
+[[bin]]
 name = "coreutils"
 path = "src/coreutils.rs"
 

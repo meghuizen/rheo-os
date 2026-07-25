@@ -19,7 +19,7 @@
 use core::ptr::{self, addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::capability::{CapTable, Handle, ObjectTable, WRITE};
+use crate::capability::{CapError, CapTable, Handle, ObjectTable, READ, WRITE};
 
 mod sealed {
     /// Sealed: only types explicitly marked can live in DMA-visible rings.
@@ -39,11 +39,62 @@ pub const OP_NOP: u8 = 0;
 /// Echo `payload[0..4]` back through the completion's `result` field - the
 /// null round trip with a data touch, used by the librheo async proof.
 pub const OP_ECHO: u8 = 1;
+// ---- async I/O opcodes (docs/LIBRHEO.md Phase B, docs/IO.md 1) ----
+// Each reads its arguments from the `SqEntry.payload` (24 bytes) and completes
+// through the CQ carrying the submission's `user_data` (the strand token). File
+// work is performed via the registered `svc::FileOps` (the same VFS the POSIX
+// personality uses), so the kernel stays filesystem-free. During a cell's
+// `SYS_DOORBELL` trap its address space is active, so a `buf_va` in the payload
+// is the cell's own mapped memory: the read/write lands there directly (no
+// kernel bounce), which is the IO.md zero-copy-by-reference path.
+/// `open(path_va, path_len, flags)`: payload `[path_va u64@0][path_len u32@8]
+/// [flags u32@12]`; `result` = fd (or an I/O error status).
+pub const OP_OPEN: u8 = 2;
+/// `read(fd, buf_va, len, offset)`: payload `[buf_va u64@0][offset u64@8]
+/// [len u32@16][fd u32@20]`; `result` = bytes read.
+pub const OP_READ: u8 = 3;
+/// `write(fd, buf_va, len, offset)`: same layout as `OP_READ`. With
+/// [`FLAG_INLINE`] and `len <= INLINE_MAX`, the bytes ride in the payload
+/// instead of a `buf_va` (the IO.md sub-threshold inline path): payload
+/// `[fd u32@0][len u32@4][data @8..8+len]`. `result` = bytes written.
+pub const OP_WRITE: u8 = 4;
+/// `close(fd)`: payload `[fd u32@0]`.
+pub const OP_CLOSE: u8 = 5;
+/// `fstat(fd, statbuf_va)`: payload `[statbuf_va u64@0][fd u32@8]`.
+pub const OP_FSTAT: u8 = 6;
+
+/// `SqEntry.flags` bit: the op's data rides inline in the payload rather than
+/// by reference at `buf_va` (docs/IO.md 1 - the inline-vs-by-reference
+/// threshold). librheo sets it for writes at or below [`INLINE_MAX`] bytes.
+pub const FLAG_INLINE: u8 = 1 << 0;
+/// Largest inline write payload: what fits after the `[fd u32][len u32]` header
+/// in the 24-byte payload. Above this, an op is by-reference (zero-copy).
+pub const INLINE_MAX: usize = 16;
 
 /// Completion status codes.
 pub const STATUS_OK: u32 = 0;
 pub const STATUS_BAD_OPCODE: u32 = 1;
 pub const STATUS_DENIED: u32 = 2;
+/// The capability's object epoch was revoked (docs/SECURITY-IDENTITY.md 3).
+pub const STATUS_REVOKED: u32 = 3;
+/// The capability's metered budget is exhausted.
+pub const STATUS_EXHAUSTED: u32 = 4;
+/// The submission's `cap_id` names no live capability in the cell's table.
+pub const STATUS_BAD_HANDLE: u32 = 5;
+/// The file op failed (no personality handler, or the handler returned -errno).
+pub const STATUS_IO: u32 = 6;
+
+/// Distinct completion status for each capability-check failure, so a cell can
+/// tell revoked from exhausted from denied (docs/LIBRHEO.md Phase B) rather
+/// than collapsing every `CapError` to `STATUS_DENIED`.
+fn cap_status(e: CapError) -> u32 {
+    match e {
+        CapError::BadHandle => STATUS_BAD_HANDLE,
+        CapError::Revoked => STATUS_REVOKED,
+        CapError::Exhausted => STATUS_EXHAUSTED,
+        _ => STATUS_DENIED,
+    }
+}
 
 /// On-wire ABI version carried in the ring header (docs/IO.md 1). A cell
 /// binding the region checks this before trusting the layout.
@@ -396,27 +447,38 @@ impl QueuePair {
     }
 }
 
+/// The right a given opcode's capability must carry (docs/LIBRHEO.md Phase B):
+/// reads need READ, mutating ops need WRITE - the hardcoded-WRITE of Phase A is
+/// gone. The queue capability itself is minted READ|WRITE, so both pass; the
+/// per-opcode gate is what a *narrowed* (read-only) queue cap would enforce.
+fn opcode_right(opcode: u8) -> u32 {
+    match opcode {
+        OP_READ | OP_FSTAT | OP_OPEN | OP_CLOSE => READ,
+        _ => WRITE, // OP_NOP, OP_ECHO, OP_WRITE, unknown
+    }
+}
+
 /// The kernel side of the doorbell: drain the submission ring, grant-check
-/// every entry against the submitting cell's capability table, execute,
-/// and push completions. Flow context propagates unchanged - observability
-/// the system cannot fail to produce (docs/ARCHITECTURE.md 3, object 10).
+/// every entry against the submitting cell's capability table (with the right
+/// the opcode requires), execute, and push completions. Flow context
+/// propagates unchanged - observability the system cannot fail to produce
+/// (docs/ARCHITECTURE.md 3, object 10).
+///
+/// The async I/O opcodes (`OP_OPEN`/`READ`/`WRITE`/`CLOSE`/`FSTAT`,
+/// docs/LIBRHEO.md Phase B) run their file work through the registered
+/// `svc::FileOps`. They take user VAs from the payload, valid here because the
+/// submitting cell's address space is active during its `SYS_DOORBELL` trap -
+/// so a large read/write lands directly in the cell's mapped pages (zero-copy).
 ///
 /// Returns the number of entries processed.
 pub fn kernel_process(qp: &QueuePair, caps: &mut CapTable, objects: &ObjectTable) -> usize {
     let mut processed = 0;
     while let Some(entry) = qp.sq.pop() {
-        let (status, result) = match caps.grant_check_low32(objects, entry.cap_id, WRITE) {
-            Err(_) => (STATUS_DENIED, 0),
-            Ok(_object) => match entry.opcode {
-                OP_NOP => (STATUS_OK, 0),
-                OP_ECHO => {
-                    let mut value = [0u8; 4];
-                    value.copy_from_slice(&entry.payload[..4]);
-                    (STATUS_OK, u32::from_le_bytes(value))
-                }
-                _ => (STATUS_BAD_OPCODE, 0),
-            },
-        };
+        let (status, result) =
+            match caps.grant_check_low32(objects, entry.cap_id, opcode_right(entry.opcode)) {
+                Err(e) => (cap_status(e), 0),
+                Ok(_object) => run_opcode(&entry),
+            };
         qp.cq.push(CqEntry {
             flow_id: entry.flow_id,
             user_data: entry.user_data,
@@ -426,4 +488,92 @@ pub fn kernel_process(qp: &QueuePair, caps: &mut CapTable, objects: &ObjectTable
         processed += 1;
     }
     processed
+}
+
+/// Read a little-endian u32 at constant offset `o` in a 24-byte payload.
+/// Fixed offsets on a `[u8; 24]` let the compiler prove the reads in-bounds,
+/// so no panic path is emitted (the U-mode / kernel out-of-line-call rule).
+#[inline(always)]
+fn rd_u32(p: &[u8; 24], o: usize) -> u32 {
+    u32::from_le_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]])
+}
+#[inline(always)]
+fn rd_u64(p: &[u8; 24], o: usize) -> u64 {
+    u64::from_le_bytes([
+        p[o],
+        p[o + 1],
+        p[o + 2],
+        p[o + 3],
+        p[o + 4],
+        p[o + 5],
+        p[o + 6],
+        p[o + 7],
+    ])
+}
+
+/// Execute one grant-checked submission and return `(status, result)`.
+fn run_opcode(entry: &SqEntry) -> (u32, u32) {
+    let p = &entry.payload;
+    match entry.opcode {
+        OP_NOP => (STATUS_OK, 0),
+        OP_ECHO => (STATUS_OK, rd_u32(p, 0)),
+        OP_OPEN => {
+            let path_va = rd_u64(p, 0);
+            let path_len = rd_u32(p, 8) as u64;
+            let flags = rd_u32(p, 12) as u64;
+            io_result(crate::svc::file_ops().map(|o| (o.open)(path_va, path_len, flags)))
+        }
+        OP_READ => {
+            let buf_va = rd_u64(p, 0);
+            let offset = rd_u64(p, 8);
+            let len = rd_u32(p, 16) as u64;
+            let fd = rd_u32(p, 20) as u64;
+            io_result(crate::svc::file_ops().map(|o| {
+                (o.lseek)(fd, offset as i64, 0); // SEEK_SET (positional)
+                (o.read)(fd, buf_va, len)
+            }))
+        }
+        OP_WRITE => {
+            let r = if entry.flags & FLAG_INLINE != 0 {
+                // Sub-threshold: the bytes ride in the payload after
+                // `[fd u32][len u32]`. Pass the payload address as `buf_va`
+                // (a kernel VA readable during the drain) - no user buffer.
+                let fd = rd_u32(p, 0) as u64;
+                let len = (rd_u32(p, 4) as usize).min(INLINE_MAX);
+                let src = p[8..].as_ptr() as u64;
+                crate::svc::file_ops().map(|o| (o.write)(fd, src, len as u64))
+            } else {
+                let buf_va = rd_u64(p, 0);
+                let offset = rd_u64(p, 8);
+                let len = rd_u32(p, 16) as u64;
+                let fd = rd_u32(p, 20) as u64;
+                crate::svc::file_ops().map(|o| {
+                    (o.lseek)(fd, offset as i64, 0);
+                    (o.write)(fd, buf_va, len)
+                })
+            };
+            io_result(r)
+        }
+        OP_CLOSE => {
+            let fd = rd_u32(p, 0) as u64;
+            io_result(crate::svc::file_ops().map(|o| (o.close)(fd)))
+        }
+        OP_FSTAT => {
+            let statbuf_va = rd_u64(p, 0);
+            let fd = rd_u32(p, 8) as u64;
+            io_result(crate::svc::file_ops().map(|o| (o.fstat)(fd, statbuf_va)))
+        }
+        _ => (STATUS_BAD_OPCODE, 0),
+    }
+}
+
+/// Map a file op's `Option<i64>` (None = no personality handler) into a
+/// completion `(status, result)`: a non-negative result is `STATUS_OK` with the
+/// value (fd / byte count); a negative errno or a missing handler is
+/// `STATUS_IO`.
+fn io_result(r: Option<i64>) -> (u32, u32) {
+    match r {
+        Some(n) if n >= 0 => (STATUS_OK, n as u32),
+        _ => (STATUS_IO, 0),
+    }
 }

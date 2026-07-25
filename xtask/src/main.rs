@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 24] = [
+const TEST_KERNELS: [&str; 25] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -39,6 +39,7 @@ const TEST_KERNELS: [&str; 24] = [
     "jsonrun",
     "stdrun",
     "librhearun",
+    "librheodata",
     "coreutils",
     "linuxrun",
     "linuxtools",
@@ -70,8 +71,58 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "-device",
             "virtio-blk-pci,drive=blk0,disable-legacy=on",
         ],
+        // librheodata (docs/LIBRHEO.md Phase B): the columnar dataset on a live
+        // virtio-blk disk, generated fresh by `gen_columnar_dataset` into
+        // target/ (gitignored, never committed). Same transports as blockfs.
+        ("librheodata", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-drive",
+            "file=target/librheodata.bin,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-device,drive=blk0",
+        ],
+        ("librheodata", Arch::X86_64) => &[
+            "-drive",
+            "file=target/librheodata.bin,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-pci,drive=blk0,disable-legacy=on",
+        ],
         _ => &[],
     }
+}
+
+/// Path of the generated columnar dataset (gitignored).
+const COLUMNAR_DATASET: &str = "target/librheodata.bin";
+
+/// Generate the librheo Phase B columnar dataset (docs/LIBRHEO.md): a 16-byte
+/// header `[magic u32][nrows u32][ncols u32][reserved u32]` then column A
+/// (`col_a[i] = i`) then column B (`col_b[i] = i & 1`), each `nrows` little-
+/// endian u32, padded to a 512-byte sector. Deterministic, so the scan's exact
+/// aggregate is a closed form. Written to `target/` (never committed - the "no
+/// artifacts staged" rule) before the `librheodata` kernel boots.
+fn gen_columnar_dataset() -> bool {
+    const NROWS: u32 = 65536;
+    const NCOLS: u32 = 2;
+    let mut out: Vec<u8> = Vec::with_capacity(16 + (NROWS * NCOLS * 4) as usize + 512);
+    out.extend_from_slice(&0x314C_4F43u32.to_le_bytes()); // magic "COL1"
+    out.extend_from_slice(&NROWS.to_le_bytes());
+    out.extend_from_slice(&NCOLS.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    for i in 0..NROWS {
+        out.extend_from_slice(&i.to_le_bytes()); // col_a[i] = i
+    }
+    for i in 0..NROWS {
+        out.extend_from_slice(&(i & 1).to_le_bytes()); // col_b[i] = i & 1
+    }
+    while !out.len().is_multiple_of(512) {
+        out.push(0);
+    }
+    if let Err(e) = std::fs::write(COLUMNAR_DATASET, &out) {
+        eprintln!("[xtask] writing {COLUMNAR_DATASET}: {e}");
+        return false;
+    }
+    true
 }
 const BENCH_KERNEL: &str = "bench-core";
 
@@ -594,6 +645,10 @@ fn build_coreutils_fixture(arch: Arch) -> bool {
 
 fn build(arch: Arch, release: bool) -> bool {
     if !build_userland(arch) {
+        return false;
+    }
+    // The librheodata (Phase B) dataset the test kernel reads off the live disk.
+    if !gen_columnar_dataset() {
         return false;
     }
     if !build_linux_fixtures(arch) {

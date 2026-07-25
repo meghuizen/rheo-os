@@ -12,11 +12,12 @@
 //! synchronous, so there is no concurrent access to guard against.
 
 use crate::abi::{
-    QueueInfo, SYS_CYCLES, SYS_DOORBELL, SYS_EXIT, SYS_EXIT_GROUP, SYS_MMAP, SYS_QUEUE_INFO,
+    GrantInfo, QueueInfo, SYS_COMMIT, SYS_CYCLES, SYS_DECOMMIT, SYS_DOORBELL, SYS_EXIT,
+    SYS_EXIT_GROUP, SYS_GRANT, SYS_MMAP, SYS_MMAP_FILE, SYS_MUNMAP, SYS_QUEUE_INFO, SYS_SEAL,
     SYS_SWITCH,
 };
 use crate::arch::{self, FaultCause, MapPerm, TrapFrame, TrapKind};
-use crate::capability::{CapTable, ObjectTable};
+use crate::capability::{BUDGET_UNLIMITED, CapTable, MAP, ObjectKind, ObjectTable, READ, WRITE};
 use crate::mm::{AddressSpace, frames};
 use crate::queue::{self, QueuePair};
 
@@ -59,6 +60,11 @@ struct RunCell {
     qp_va: u64,
     /// 32-bit ABI id of the cell's QueuePair capability, reported alongside.
     qp_cap_id: u32,
+    /// Next free VA for a typed memory-grant reservation (`SYS_GRANT`,
+    /// docs/LIBRHEO.md Phase B). Per-cell so two cells' grants never collide.
+    grant_next: usize,
+    /// Next free VA for a file mmap (`SYS_MMAP_FILE`).
+    filemmap_next: usize,
 }
 
 const EMPTY: RunCell = RunCell {
@@ -72,7 +78,55 @@ const EMPTY: RunCell = RunCell {
     personality: Personality::Native,
     qp_va: 0,
     qp_cap_id: 0,
+    grant_next: GRANT_BASE,
+    filemmap_next: FILEMMAP_BASE,
 };
+
+/// Base VA of a native cell's typed memory-grant reservations (docs/LIBRHEO.md
+/// Phase B): 32 GiB, above the image (1-4), stack (8), anon mmap (12+), and
+/// queue (16) regions, free in every cell root. Reservations are pure address
+/// space (48-bit VA), so multi-GiB grants cost nothing until committed.
+const GRANT_BASE: usize = 0x8_0000_0000;
+/// Base VA of a native cell's file mmaps (`SYS_MMAP_FILE`): 20 GiB.
+const FILEMMAP_BASE: usize = 0x5_0000_0000;
+
+/// Typed memory grants a native cell holds (docs/LIBRHEO.md Phase B). Fixed
+/// per-cell table, like the Linux fd table - no allocation. A grant is a typed
+/// address-space reservation + the minted MemoryGrant capability that gates
+/// commit/decommit/seal.
+#[derive(Copy, Clone)]
+struct GrantSlot {
+    in_use: bool,
+    base: usize,
+    len: usize,
+    /// `mm::grant::MemKind` discriminant (0=DDR..5=Remote), validated and
+    /// recorded at `SYS_GRANT`. Only DDR is real in QEMU; HBM/CXL/PMEM/Remote
+    /// are backed by DDR frames (emulated, honest); DeviceBar has no backing and
+    /// is refused. Recorded for future NUMA/placement differentiation; the
+    /// commit path treats every backed kind as DDR today.
+    #[allow(dead_code)]
+    kind: u8,
+    sealed: bool,
+    cap_id: u32,
+}
+
+const EMPTY_GRANT: GrantSlot = GrantSlot {
+    in_use: false,
+    base: 0,
+    len: 0,
+    kind: 0,
+    sealed: false,
+    cap_id: 0,
+};
+
+const MAX_GRANTS_PER_CELL: usize = 16;
+static mut CELL_GRANTS: [[GrantSlot; MAX_GRANTS_PER_CELL]; MAX_CELLS] =
+    [[EMPTY_GRANT; MAX_GRANTS_PER_CELL]; MAX_CELLS];
+
+fn cell_grants(cur: usize) -> &'static mut [GrantSlot; MAX_GRANTS_PER_CELL] {
+    // SAFETY: single CPU, synchronous traps; no concurrent access.
+    unsafe { &mut (*core::ptr::addr_of_mut!(CELL_GRANTS))[cur] }
+}
 
 /// Number of runnable cell slots. Bumped 8 -> 16 for the Linux personality's
 /// **processes** (docs/LINUX-COMPAT.md L6): a shell plus several concurrent
@@ -99,6 +153,7 @@ pub fn reset() {
     // SAFETY: single CPU, between runs.
     unsafe {
         *core::ptr::addr_of_mut!(MMAP_NEXT) = MMAP_BASE;
+        *core::ptr::addr_of_mut!(CELL_GRANTS) = [[EMPTY_GRANT; MAX_GRANTS_PER_CELL]; MAX_CELLS];
     }
     crate::linux::reset();
 }
@@ -236,6 +291,170 @@ fn mmap_anon(cur: usize, len: usize) -> usize {
     base
 }
 
+fn page_up(x: usize) -> usize {
+    (x + frames::FRAME_SIZE - 1) & !(frames::FRAME_SIZE - 1)
+}
+
+/// `SYS_GRANT`: reserve `len` bytes of typed grant address space, mint a
+/// MemoryGrant capability into the cell's table, and write `GrantInfo { base,
+/// cap_id }` at `out_va`. Returns 0, or `u64::MAX` on failure. The reservation
+/// costs no frames (demand commit); `kind` names the memory type
+/// (`mm::grant::MemKind` discriminant). DeviceBar (4) has no backing here and is
+/// refused; the other non-DDR kinds are emulated on DDR (documented).
+fn grant_create(cur: usize, out_va: u64, len: usize, kind: u64, _flags: u64) -> u64 {
+    if len == 0 || kind > 5 || kind == 4 {
+        return u64::MAX; // empty / unknown kind / device-BAR (no backing)
+    }
+    let bytes = page_up(len);
+    let cell = cells()[cur];
+    if cell.caps.is_null() || cell.objects.is_null() {
+        return u64::MAX;
+    }
+    // Mint a real MemoryGrant capability (READ|WRITE|MAP) so commit/decommit/
+    // seal are capability-gated. SAFETY: single CPU, synchronous trap; the
+    // cell's tables are uniquely owned for the trap. `objects` is installed as
+    // `*const` but the test kernel owns it as a mutable static; creating a new
+    // object here needs `&mut`, which this cast recovers.
+    let cap_id = unsafe {
+        let objects = &mut *(cell.objects as *mut ObjectTable);
+        let caps = &mut *cell.caps;
+        let Ok(obj) = objects.create(ObjectKind::MemoryGrant) else {
+            return u64::MAX;
+        };
+        match caps.mint(objects, obj, READ | WRITE | MAP, BUDGET_UNLIMITED) {
+            Ok(h) => h.raw_low32(),
+            Err(_) => return u64::MAX,
+        }
+    };
+    // Record the reservation in the per-cell grant table.
+    let table = cell_grants(cur);
+    let Some(slot) = table.iter_mut().find(|s| !s.in_use) else {
+        return u64::MAX;
+    };
+    let base = cells()[cur].grant_next;
+    cells()[cur].grant_next = base + bytes;
+    *slot = GrantSlot {
+        in_use: true,
+        base,
+        len: bytes,
+        kind: kind as u8,
+        sealed: false,
+        cap_id,
+    };
+    // SAFETY: `out_va` is a user VA in the running cell's active address space,
+    // sized for a `GrantInfo` (the cell passes its own stack slot).
+    unsafe {
+        (out_va as *mut GrantInfo).write(GrantInfo {
+            base: base as u64,
+            cap_id: cap_id as u64,
+        });
+    }
+    0
+}
+
+/// Find the grant slot addressed by `cap_id` after grant-checking that the cell
+/// still holds a valid MemoryGrant capability with the MAP right (revocation /
+/// budget enforced here). Returns `(base, len, sealed)` or None.
+fn grant_resolve(cur: usize, cap_id: u32) -> Option<(usize, usize, bool)> {
+    let cell = cells()[cur];
+    if cell.caps.is_null() || cell.objects.is_null() {
+        return None;
+    }
+    // SAFETY: single CPU, synchronous trap; tables uniquely owned.
+    let ok = unsafe {
+        let objects = &*cell.objects;
+        let caps = &mut *cell.caps;
+        caps.grant_check_low32(objects, cap_id, MAP).is_ok()
+    };
+    if !ok {
+        return None;
+    }
+    let slot = cell_grants(cur)
+        .iter()
+        .find(|s| s.in_use && s.cap_id == cap_id)?;
+    Some((slot.base, slot.len, slot.sealed))
+}
+
+/// `SYS_COMMIT`: back `[offset, offset+len)` of the grant with fresh zeroed RW
+/// frames. Refused on a sealed grant or an out-of-range span. Returns 0 or
+/// `u64::MAX`.
+fn grant_commit(cur: usize, cap_id: u32, offset: usize, len: usize) -> u64 {
+    let Some((base, glen, sealed)) = grant_resolve(cur, cap_id) else {
+        return u64::MAX;
+    };
+    if sealed || offset.saturating_add(len) > glen {
+        return u64::MAX;
+    }
+    commit_range(base + offset, len, MapPerm::UserRw);
+    0
+}
+
+/// `SYS_DECOMMIT`: free the frames backing `[offset, offset+len)`; the
+/// reservation and capability remain. Refused on a sealed grant.
+fn grant_decommit(cur: usize, cap_id: u32, offset: usize, len: usize) -> u64 {
+    let Some((base, glen, sealed)) = grant_resolve(cur, cap_id) else {
+        return u64::MAX;
+    };
+    if sealed || offset.saturating_add(len) > glen {
+        return u64::MAX;
+    }
+    unmap_range(base + offset, len);
+    0
+}
+
+/// `SYS_SEAL`: make the grant immutable - its committed pages become read-only
+/// (shareable), and further commit/decommit are refused. Returns 0 or
+/// `u64::MAX`.
+fn grant_seal(cur: usize, cap_id: u32) -> u64 {
+    let Some((base, glen, _)) = grant_resolve(cur, cap_id) else {
+        return u64::MAX;
+    };
+    protect_range(base, glen, MapPerm::UserRo);
+    if let Some(slot) = cell_grants(cur)
+        .iter_mut()
+        .find(|s| s.in_use && s.cap_id == cap_id)
+    {
+        slot.sealed = true;
+    }
+    0
+}
+
+/// `SYS_MMAP_FILE`: map `len` bytes of the file open on `fd` into the current
+/// cell at a fresh file-mmap VA, reading the file range page-by-page into fresh
+/// frames (MAP_PRIVATE; a short read leaves the page tail zero). The bytes are
+/// read through the registered `svc::FileOps` (the same VFS the POSIX
+/// personality uses) into each frame via the kernel linear map, then the frame
+/// is mapped read-only. Returns the base VA, or 0 on failure.
+fn mmap_file(cur: usize, fd: u64, offset: u64, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let Some(ops) = crate::svc::file_ops() else {
+        return 0;
+    };
+    let bytes = page_up(len);
+    let base = cells()[cur].filemmap_next;
+    cells()[cur].filemmap_next = base + bytes;
+    let pages = bytes / frames::FRAME_SIZE;
+    with_current_aspace(|aspace| {
+        for i in 0..pages {
+            let va = base + i * frames::FRAME_SIZE;
+            let pa = frames::alloc(); // zeroed
+            let file_off = offset as i64 + (i * frames::FRAME_SIZE) as i64;
+            let want = (len - i * frames::FRAME_SIZE).min(frames::FRAME_SIZE);
+            // Read into the frame through the kernel linear map (the frame is
+            // not yet user-mapped, so this cannot alias user memory). A short
+            // read (EOF) leaves the tail zero. The VFS handler runs in kernel
+            // context, so a kernel VA is a valid destination.
+            let kva = arch::phys_to_virt(pa) as u64;
+            (ops.lseek)(fd, file_off, 0); // SEEK_SET
+            (ops.read)(fd, kva, want as u64);
+            aspace.map_user_frame(va, pa, MapPerm::UserRo);
+        }
+    });
+    base
+}
+
 /// Register a runnable cell in slot `idx`. The pointers must outlive the
 /// run (the test kernels own the backing storage as statics).
 ///
@@ -261,7 +480,10 @@ pub unsafe fn install(
         personality: Personality::Native,
         qp_va: 0,
         qp_cap_id: 0,
+        grant_next: GRANT_BASE,
+        filemmap_next: FILEMMAP_BASE,
     };
+    *cell_grants(idx) = [EMPTY_GRANT; MAX_GRANTS_PER_CELL];
 }
 
 /// Record the mapped queue-pair region VA and capability id for cell `idx`
@@ -398,6 +620,8 @@ pub unsafe fn install_forked(
         personality: Personality::Linux,
         qp_va: 0,
         qp_cap_id: 0,
+        grant_next: GRANT_BASE,
+        filemmap_next: FILEMMAP_BASE,
     };
 }
 
@@ -500,6 +724,37 @@ pub fn on_user_trap(
         SYS_EXIT | SYS_EXIT_GROUP => finish(Outcome::Exited(arg)),
         SYS_MMAP => {
             let base = mmap_anon(cur, args[0] as usize);
+            arch::set_syscall_ret(unsafe { &mut *frame }, base as u64);
+            frame
+        }
+        // Typed memory grants exposed to the cell (docs/LIBRHEO.md Phase B).
+        SYS_GRANT => {
+            let r = grant_create(cur, args[0], args[1] as usize, args[2], args[3]);
+            arch::set_syscall_ret(unsafe { &mut *frame }, r);
+            frame
+        }
+        SYS_COMMIT => {
+            let r = grant_commit(cur, args[0] as u32, args[1] as usize, args[2] as usize);
+            arch::set_syscall_ret(unsafe { &mut *frame }, r);
+            frame
+        }
+        SYS_DECOMMIT => {
+            let r = grant_decommit(cur, args[0] as u32, args[1] as usize, args[2] as usize);
+            arch::set_syscall_ret(unsafe { &mut *frame }, r);
+            frame
+        }
+        SYS_SEAL => {
+            let r = grant_seal(cur, args[0] as u32);
+            arch::set_syscall_ret(unsafe { &mut *frame }, r);
+            frame
+        }
+        SYS_MUNMAP => {
+            unmap_range(args[0] as usize, args[1] as usize);
+            arch::set_syscall_ret(unsafe { &mut *frame }, 0);
+            frame
+        }
+        SYS_MMAP_FILE => {
+            let base = mmap_file(cur, args[0], args[1], args[2] as usize);
             arch::set_syscall_ret(unsafe { &mut *frame }, base as u64);
             frame
         }

@@ -30,10 +30,10 @@ pub struct Reactor {
 }
 
 impl Reactor {
-    /// Submit `op` with `args` (up to 24 bytes), tagged with `token`. Spins
-    /// through a doorbell drain if the ring is momentarily full.
-    fn submit(&mut self, op: u8, args: &[u8], token: u64) {
-        while !self.qp.submit(op, self.cap_id, 0, token, args) {
+    /// Submit `op` with `args` (up to 24 bytes) and `flags`, tagged with
+    /// `token`. Spins through a doorbell drain if the ring is momentarily full.
+    fn submit(&mut self, op: u8, flags: u8, args: &[u8], token: u64) {
+        while !self.qp.submit(op, flags, self.cap_id, 0, token, args) {
             self.pump();
         }
     }
@@ -91,8 +91,14 @@ fn with_reactor<R>(f: impl FnOnce(&mut Reactor) -> R) -> R {
 /// (`status`, `result`, ...). The async replacement for a blocking syscall:
 /// the vcore runs other strands while this one is parked.
 pub async fn submit_and_await(op: u8, args: [u8; 24]) -> CqEntry {
+    submit_and_await_flags(op, 0, args).await
+}
+
+/// Like [`submit_and_await`] but carrying op `flags` (e.g.
+/// [`sys::FLAG_INLINE`](crate::sys::FLAG_INLINE) for a sub-threshold write).
+pub async fn submit_and_await_flags(op: u8, flags: u8, args: [u8; 24]) -> CqEntry {
     let token = next_token();
-    with_reactor(|r| r.submit(op, &args, token));
+    with_reactor(|r| r.submit(op, flags, &args, token));
     park_on(token).await;
     with_reactor(|r| r.take(token)).expect("librheo: completion missing after wake")
 }

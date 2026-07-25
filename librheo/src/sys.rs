@@ -26,6 +26,18 @@ pub const SYS_EXIT_GROUP: u64 = 22;
 pub const SYS_WRITE_FD: u64 = 26;
 /// queue_info(out_va) -> 0 or u64::MAX. Fills a `QueueInfo` at `out_va`.
 pub const SYS_QUEUE_INFO: u64 = 31;
+/// grant(out_va, len, kind, flags) -> 0 or u64::MAX. Fills a `GrantInfo`.
+pub const SYS_GRANT: u64 = 32;
+/// commit(cap_id, offset, len) -> 0 or non-zero on error.
+pub const SYS_COMMIT: u64 = 33;
+/// decommit(cap_id, offset, len) -> 0 or non-zero on error.
+pub const SYS_DECOMMIT: u64 = 34;
+/// seal(cap_id) -> 0 or non-zero on error.
+pub const SYS_SEAL: u64 = 35;
+/// munmap(va, len) -> 0. Unmaps whole pages and frees their frames.
+pub const SYS_MUNMAP: u64 = 36;
+/// mmap_file(fd, offset, len, flags) -> base VA (0 fails).
+pub const SYS_MMAP_FILE: u64 = 37;
 
 // ---- raw syscall stubs (from libc/src/sys.rs) ----
 
@@ -47,6 +59,26 @@ unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     ret
 }
 
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> u64 {
+    let ret;
+    unsafe {
+        asm!("ecall", in("a7") nr, inlateout("a0") a0 => ret, in("a1") a1, options(nostack));
+    }
+    ret
+}
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    let ret;
+    unsafe {
+        asm!("ecall", in("a7") nr, inlateout("a0") a0 => ret,
+             in("a1") a1, in("a2") a2, in("a3") a3, options(nostack));
+    }
+    ret
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn syscall1(nr: u64, a0: u64) -> u64 {
@@ -61,6 +93,26 @@ unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     unsafe {
         asm!("svc #0", in("x8") nr, inlateout("x0") a0 => ret,
              in("x1") a1, in("x2") a2, options(nostack));
+    }
+    ret
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> u64 {
+    let ret;
+    unsafe {
+        asm!("svc #0", in("x8") nr, inlateout("x0") a0 => ret, in("x1") a1, options(nostack));
+    }
+    ret
+}
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    let ret;
+    unsafe {
+        asm!("svc #0", in("x8") nr, inlateout("x0") a0 => ret,
+             in("x1") a1, in("x2") a2, in("x3") a3, options(nostack));
     }
     ret
 }
@@ -86,10 +138,59 @@ unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     ret
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> u64 {
+    let ret;
+    unsafe {
+        asm!("syscall", inlateout("rax") nr => ret, in("rdi") a0, in("rsi") a1,
+             out("rcx") _, out("r11") _, options(nostack));
+    }
+    ret
+}
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    // Native arg4 is r10 (the `syscall` instruction clobbers rcx), matching the
+    // kernel's x86-64 `decode_syscall` (rdi, rsi, rdx, r10, ...).
+    let ret;
+    unsafe {
+        asm!("syscall", inlateout("rax") nr => ret, in("rdi") a0, in("rsi") a1, in("rdx") a2,
+             in("r10") a3, out("rcx") _, out("r11") _, options(nostack));
+    }
+    ret
+}
+
 // ---- typed wrappers ----
 
 pub fn mmap(len: usize) -> usize {
     unsafe { syscall1(SYS_MMAP, len as u64) as usize }
+}
+/// Reserve a typed memory grant. Fills a `GrantInfo` at `out_va`; returns 0 or
+/// `u64::MAX` on failure.
+pub fn grant(out_va: u64, len: usize, kind: u64, flags: u64) -> u64 {
+    unsafe { syscall4(SYS_GRANT, out_va, len as u64, kind, flags) }
+}
+/// Back `[offset, offset+len)` of a grant with frames. 0 on success.
+pub fn commit(cap_id: u32, offset: usize, len: usize) -> u64 {
+    unsafe { syscall3(SYS_COMMIT, cap_id as u64, offset as u64, len as u64) }
+}
+/// Free the frames backing `[offset, offset+len)` of a grant. 0 on success.
+pub fn decommit(cap_id: u32, offset: usize, len: usize) -> u64 {
+    unsafe { syscall3(SYS_DECOMMIT, cap_id as u64, offset as u64, len as u64) }
+}
+/// Seal a grant immutable. 0 on success.
+pub fn seal(cap_id: u32) -> u64 {
+    unsafe { syscall1(SYS_SEAL, cap_id as u64) }
+}
+/// Unmap `[va, va+len)` and free the frames.
+pub fn munmap(va: usize, len: usize) {
+    unsafe { syscall2(SYS_MUNMAP, va as u64, len as u64) };
+}
+/// Map `len` bytes of the file open on `fd` at `offset` into the cell; returns
+/// the base VA (0 fails).
+pub fn mmap_file(fd: u64, offset: u64, len: usize, flags: u64) -> usize {
+    unsafe { syscall4(SYS_MMAP_FILE, fd, offset, len as u64, flags) as usize }
 }
 pub fn exit(code: u64) -> ! {
     unsafe { syscall1(SYS_EXIT_GROUP, code) };
@@ -129,8 +230,36 @@ pub struct QueueInfo {
 /// Submission opcodes.
 pub const OP_NOP: u8 = 0;
 pub const OP_ECHO: u8 = 1;
+/// Async I/O opcodes (docs/LIBRHEO.md Phase B). See `io` for the typed layer.
+pub const OP_OPEN: u8 = 2;
+pub const OP_READ: u8 = 3;
+pub const OP_WRITE: u8 = 4;
+pub const OP_CLOSE: u8 = 5;
+pub const OP_FSTAT: u8 = 6;
+/// `SqEntry.flags` bit: the op's data rides inline in the payload (IO.md 1).
+pub const FLAG_INLINE: u8 = 1 << 0;
+/// Durability-class flag bits (docs/IO.md). Advisory: the kernel ignores them
+/// today (no durable backend in QEMU); recorded on the op for honesty.
+pub const FLAG_DUR_FLUSH: u8 = 1 << 4;
+pub const FLAG_DUR_FUA: u8 = 1 << 5;
+/// Largest inline write payload (bytes after the `[fd u32][len u32]` header).
+pub const INLINE_MAX: usize = 16;
 /// Completion status codes.
 pub const STATUS_OK: u32 = 0;
+pub const STATUS_BAD_OPCODE: u32 = 1;
+pub const STATUS_DENIED: u32 = 2;
+pub const STATUS_REVOKED: u32 = 3;
+pub const STATUS_EXHAUSTED: u32 = 4;
+pub const STATUS_BAD_HANDLE: u32 = 5;
+pub const STATUS_IO: u32 = 6;
+
+/// The `SYS_GRANT` result block (kernel/src/abi.rs `GrantInfo`).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct GrantInfo {
+    pub base: u64,
+    pub cap_id: u64,
+}
 
 /// A submission entry - 64 bytes, one cache line.
 #[repr(C, align(64))]
@@ -210,11 +339,12 @@ impl Qp {
         unsafe { self.base.add((*self.header()).cq_off as usize) as *mut CqEntry }
     }
 
-    /// Push one submission carrying up to 24 bytes of args. Returns false if
-    /// the ring is full.
+    /// Push one submission carrying up to 24 bytes of args and the op `flags`
+    /// (e.g. [`FLAG_INLINE`]). Returns false if the ring is full.
     pub fn submit(
         &self,
         opcode: u8,
+        flags: u8,
         cap_id: u32,
         flow_id: u128,
         user_data: u64,
@@ -235,7 +365,7 @@ impl Qp {
             let slot = self.sq_entries().add(idx);
             let mut e = SqEntry {
                 opcode,
-                flags: 0,
+                flags,
                 engine_id: 0,
                 cap_id,
                 flow_id,

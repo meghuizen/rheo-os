@@ -11,7 +11,9 @@
 
 use kernel::capability::{BUDGET_UNLIMITED, ObjectKind, ObjectTable, READ, WRITE};
 use kernel::cell::Cell;
-use kernel::queue::{self, OP_ECHO, QueuePair, STATUS_DENIED, STATUS_OK, SqEntry};
+use kernel::queue::{
+    self, OP_ECHO, QueuePair, STATUS_BAD_HANDLE, STATUS_OK, STATUS_REVOKED, SqEntry,
+};
 use kernel::{arch, println};
 
 /// The shared queue-pair region (header + SQ + CQ), page-aligned.
@@ -65,20 +67,23 @@ extern "C" fn kernel_main() -> ! {
     assert!(qp.cq.pop().is_none());
     println!("queue-pipeline: batched submit + flow-context propagation OK");
 
-    // A forged cap_id in an otherwise valid entry is denied per entry.
+    // A forged cap_id in an otherwise valid entry is denied per entry. The
+    // completion carries the distinct `STATUS_BAD_HANDLE` (docs/LIBRHEO.md
+    // Phase B: each CapError gets its own status, not a collapsed deny).
     let mut forged = SqEntry::new(OP_ECHO, cap, 0x77, 0x77);
     forged.cap_id = 0xFFFF_1234;
     qp.sq.push(forged);
     queue::kernel_process(&qp, &mut producer.caps, &objects);
-    assert_eq!(qp.cq.pop().unwrap().status, STATUS_DENIED);
+    assert_eq!(qp.cq.pop().unwrap().status, STATUS_BAD_HANDLE);
     println!("queue-pipeline: forged capability denied on data path OK");
 
-    // Revoke mid-stream: the same capability that just worked goes dark.
+    // Revoke mid-stream: the same capability that just worked goes dark, now
+    // reporting the distinct `STATUS_REVOKED`.
     objects.revoke_epoch(qp_object);
     qp.sq.push(SqEntry::new(OP_ECHO, cap, 0x88, 0x88));
     queue::kernel_process(&qp, &mut producer.caps, &objects);
     let denied = qp.cq.pop().unwrap();
-    assert_eq!(denied.status, STATUS_DENIED);
+    assert_eq!(denied.status, STATUS_REVOKED);
     assert_eq!(denied.flow_id, 0x88, "flow context lost on the deny path");
     println!("queue-pipeline: mid-stream revocation enforced OK");
 

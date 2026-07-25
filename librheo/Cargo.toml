@@ -21,3 +21,7 @@ name = "librheo"
 [[bin]]
 name = "librheo-demo"
 path = "src/bin/librheo-demo.rs"
+
+[[bin]]
+name = "librheo-data"
+path = "src/bin/librheo-data.rs"

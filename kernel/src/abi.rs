@@ -128,6 +128,50 @@ pub struct QueueInfo {
     pub cap_id: u64,
 }
 
+// ---- typed memory grants exposed to userspace (docs/LIBRHEO.md Phase B,
+// docs/MEMORY.md, docs/ARCHITECTURE.md 3 object 5) ----
+//
+// These EXPOSE the existing memory-grant kernel object to a native cell as
+// mechanism (ARCHITECTURE.md 6 admission rule); they add no new object. A grant
+// is a typed reservation of address space that is demand-committed with frames.
+// The reservation, the typed kind, and the seal flag are per-cell state (a fixed
+// static table, like the Linux fd table); each SYS_GRANT also mints a real
+// MemoryGrant capability into the cell's table, and commit/decommit/seal
+// grant-check it (MAP right) before touching pages.
+
+/// grant(out_va, len, kind, flags) -> 0, or u64::MAX on failure. Reserves
+/// `len` bytes of address space of typed `kind` (no frames yet - demand
+/// commit), mints a MemoryGrant capability, and writes a `GrantInfo { base,
+/// cap_id }` at `out_va`. `kind` is a [`MemKind`] discriminant.
+pub const SYS_GRANT: u64 = 32;
+/// commit(cap_id, offset, len) -> 0 or -errno. Backs `[offset, offset+len)` of
+/// the grant with fresh zeroed RW frames (demand paging without a fault
+/// handler). Refused on a sealed grant.
+pub const SYS_COMMIT: u64 = 33;
+/// decommit(cap_id, offset, len) -> 0 or -errno. Returns the frames backing
+/// `[offset, offset+len)` to the pool (the reservation and cap stay).
+pub const SYS_DECOMMIT: u64 = 34;
+/// seal(cap_id) -> 0 or -errno. Makes the grant immutable (its committed pages
+/// become read-only, shareable) - the zero-copy-buffer / dmabuf precursor.
+pub const SYS_SEAL: u64 = 35;
+/// munmap(va, len) -> 0. Unmaps whole pages in `[va, va+len)` and frees their
+/// frames (the real unmap the anon `SYS_MMAP` lacked - fixes the frame leak).
+pub const SYS_MUNMAP: u64 = 36;
+/// mmap_file(fd, offset, len, flags) -> base VA (0 fails). Maps `len` bytes of
+/// the file open on `fd` (via the registered `svc::FileOps`) into the cell,
+/// read into fresh frames (MAP_PRIVATE semantics), for mmap-ing a dataset.
+pub const SYS_MMAP_FILE: u64 = 37;
+
+/// The `SYS_GRANT` result block (kept in sync with librheo's `mem` arm).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct GrantInfo {
+    /// Base VA of the reserved grant region.
+    pub base: u64,
+    /// 32-bit ABI id of the minted MemoryGrant capability.
+    pub cap_id: u64,
+}
+
 /// The `stat`/`fstat` result block (kept in sync with the std `fs` arm in
 /// targets/std-rheo/fs.rs). `kind`: 0 regular, 1 dir, 2 symlink, 3 other.
 #[repr(C)]

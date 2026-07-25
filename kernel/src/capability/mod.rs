@@ -94,6 +94,13 @@ impl Handle {
 pub enum ObjectKind {
     MemoryGrant,
     QueuePair,
+    /// An open file (docs/LIBRHEO.md Phase B). The async I/O layer will promote
+    /// an fd to a first-class capability of this kind; today fds remain
+    /// `svc::FileOps` handles carried in the queue-entry payload, so this kind
+    /// is reserved for that promotion (a documented next step).
+    File,
+    /// A byte stream (console/pipe/socket) - reserved alongside `File`.
+    Stream,
 }
 
 #[derive(Copy, Clone)]
