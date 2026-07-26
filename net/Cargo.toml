@@ -73,3 +73,13 @@ path = "src/bin/nettrace-demo.rs"
 [[bin]]
 name = "netlocal-demo"
 path = "src/bin/netlocal-demo.rs"
+
+# The N2a proof cell: the native TCP state machine + the timer wheel. Two TCP
+# endpoints in one cell over a virtual link drive the full lifecycle
+# deterministically (handshake, bidirectional data, a dropped segment recovered by
+# RTO, teardown), plus the checksum/segment-encode oracles and the timer-wheel
+# multiplex over the single reactor slot. Loaded by the `nettcp` test kernel; needs
+# no netdev - it is entirely in-cell.
+[[bin]]
+name = "nettcp-demo"
+path = "src/bin/nettcp-demo.rs"

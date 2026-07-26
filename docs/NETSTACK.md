@@ -149,7 +149,16 @@ kernels stay green.
     cross-cell ring - the first slice of the "L8" socket surface (§10,
     docs/LINUX-COMPAT.md L8).
 - **N2 - TCP + congestion control + the two transports** (native sharded + the
-  smoltcp cell); proof: a TCP echo / HTTP GET to SLIRP.
+  smoltcp cell); proof: a TCP echo / HTTP GET to SLIRP. Split into slices:
+  - **N2a (done): the native TCP core + a timer wheel.** `tcp` (the RFC 793 state
+    machine + RFC 6298 RTO/RTT + Karn, sliding-window flow control, cumulative-ack
+    retransmission, FIN teardown + TIME-WAIT, the TCP checksum, a `CongestionControl`
+    trait seam) and `timer` (a timer wheel multiplexing many logical timers onto the
+    reactor's single one-shot). Proven **deterministically in-cell** - two endpoints
+    over a virtual link drive the full lifecycle incl. a drop/RTO recovery (§11).
+  - **N2b (next): congestion control + the two transports.** CUBIC/BBR as
+    `CongestionControl` impls (the N2a seam), the smoltcp blessed correctness cell,
+    and the native sharded/zero-copy transport; a live TCP echo / HTTP GET to SLIRP.
 - **N3 - TLS 1.3 + HTTPS.** Crypto crates wired; keys-as-capabilities.
 - **N4 - Service-cell model + fan-out + host services** (DHCP + zeroconf + NTP).
 - **N5 - App protocols.** HTTP/2, gRPC, Arrow Flight (warehouse), Kafka.
@@ -546,3 +555,126 @@ preservation is not implemented. **`accept` is non-blocking** (the loopback proo
 connects before accepting); a blocking cross-cell accept server is a later
 refinement. The **wire** side of the datapath selector is a stub until the TCP/IP
 transport lands (N2). `getpeername` reports family-only for an unnamed peer.
+
+## 11. Phase N2a (done): the native TCP core + a timer wheel
+
+TCP is the meat of the transport layer. N2a builds the **state machine** and the
+**timer wheel** it needs, over `net::ip` + the N1a `Checksum` accumulator (the TCP
+checksum uses the same pseudo-header shape as UDP) - portable userspace, **no
+kernel object**, **no reactor/ABI change**, **no new dependency**, **no
+`cfg(target_arch)`**. Congestion control, the smoltcp cell, and the sharded
+transport are **N2b**; N2a wires the CC **seam** so N2b is a drop-in.
+
+### The state machine (`net::tcp`)
+
+- **`Connection<C>`** (`net/src/tcp.rs`) is a **poll-driven, synchronous,
+  deterministic** state machine - no I/O and no async inside (the smoltcp lesson:
+  an ambient stack is unprovable). A driver feeds it received segments
+  (`on_segment` / `on_wire_segment`, the latter decoding + **verifying the TCP
+  checksum** first) and a monotonic `now` (nanoseconds), and pulls the next segment
+  to transmit from `poll(now)`; `poll_at()` reports when it next needs attention
+  (its RTO / TIME-WAIT deadline). This is exactly what makes it provable **without a
+  live peer**.
+- **Full state set** (RFC 793): CLOSED / LISTEN / SYN_SENT / SYN_RCVD / ESTABLISHED
+  / FIN_WAIT_1 / FIN_WAIT_2 / CLOSING / CLOSE_WAIT / LAST_ACK / TIME_WAIT. The
+  three-way handshake (active `connect` + passive `listen`), FIN teardown (active,
+  passive, and simultaneous close), and the `2*MSL` TIME-WAIT dwell.
+- **Sliding window + flow control**: a send queue with `snd_una`/`snd_nxt`, the
+  effective send window = `min(peer_advertised_window, cwnd)`, MSS-bounded
+  segmentation, cumulative-ACK processing that drops acked bytes, and an advertised
+  receive window = free receive-buffer space. In-order receive delivery.
+- **The TCP checksum** (`checksum_v4` / `verify_checksum_v4`) reuses the N1a
+  `Checksum` accumulator with the `src, dst, zero, proto=6, tcp_len` pseudo-header
+  and the segment (checksum field zeroed for compute, in place for verify).
+
+### Sequence-number arithmetic (correctness-critical)
+
+Sequence numbers are 32-bit and **wrap**; every window/ack comparison goes through
+the RFC 1323 serial-number helpers (`tcp::seq`): `a` is before `b` iff `(a - b)` as
+a signed 32-bit value is negative. This lives in one place with a **wrap oracle**
+(the proof asserts `0xFFFF_FFFF < 0`) - getting it wrong is the classic TCP bug.
+
+### RTO / RTT (RFC 6298) + Karn's algorithm
+
+The retransmission timeout is estimated per RFC 6298: a smoothed RTT (`SRTT`) and
+its variance (`RTTVAR`), `RTO = SRTT + max(G, 4*RTTVAR)` clamped to
+`[RTO_MIN, RTO_MAX]`. **Karn's algorithm**: an RTT sample is never taken from a
+retransmitted segment (the ack is ambiguous), and the RTO **backs off
+exponentially** (doubles, capped) on each timeout until a fresh ack re-measures it.
+Unacked data is retransmitted from `snd_una` when the RTO fires.
+
+### The congestion-control seam (N2b slots in here)
+
+`trait CongestionControl { on_ack(bytes, rtt); on_loss(); cwnd(); }` is the seam.
+N2a ships only **`FixedWindow`** (a large fixed cwnd, so the peer's advertised
+window - flow control - dominates). CUBIC/BBR are **N2b**, a drop-in
+`impl CongestionControl`; `Connection` is generic over `C` so swapping the
+controller is a type parameter, not a rewrite.
+
+### The socket-shaped API
+
+`TcpStream` (`connect`/`read`/`write`/`close`) and `TcpListener` (`bind`/`accept`)
+are the socket vocabulary over `Connection`; the segment transport - the in-cell
+`VirtualLink` in the proof, a wire link in N2b - is driven by the owner via
+`poll`/`on_wire_segment`.
+
+### The timer wheel (`net::timer`) over the single reactor slot
+
+The reactor exposes **one** `timer_req` slot (`rt::sleep_ns` over `SYS_ARM_TIMER`),
+but TCP needs several concurrent timers (per-connection RTO, TIME-WAIT, and -
+deferred in N2a - delayed-ACK, keepalive). `TimerWheel` multiplexes them: a
+`BTreeSet<(deadline, id)>` (ordered nearest-deadline) + a `BTreeMap<id, deadline>`
+(cancel/re-arm by id), all `O(log n)` - the **simple sorted-set** variant, not a
+hashed/hierarchical wheel (that is the N2b optimization once the sharded transport
+drives thousands of connections). The reactor's one-shot is **relative** (it fires
+after a *duration*, and a cell has no userspace ticks->ns reading), so the wheel
+owns a monotonic `now_ns`: deadlines are absolute in that frame, and `run_once`
+sleeps the **delta** `(nearest - now)` on the single slot then advances `now` and
+expires. Only the nearest deadline is ever armed; firing it re-arms for the new
+nearest. **No kernel or reactor ABI change** - pure userspace bookkeeping over the
+existing slot.
+
+### The proof (`nettcp` test kernel, all 3 ISAs)
+
+A cell (`nettcp-demo`) runs **two TCP endpoints in one cell** connected by an
+in-cell `VirtualLink` (each endpoint's output segments are fed to the other's
+input), driven through the full lifecycle by a logical clock the `TimerWheel`
+advances - **deterministic and network-free** (no NIC, no SLIRP, no live peer, the
+same philosophy as the traceroute/DNS deterministic proofs). It asserts, exiting
+`0x42` only if every step passes:
+
+1. **Checksum + segment-encode oracles** (in memory): a fixed SYN-ACK-with-MSS
+   segment encodes to a known-good byte string and checksums (over the IPv4
+   pseudo-header) to the independently computed `0x613C`, decodes back, and
+   self-verifies; plus the RFC 1323 wrap oracle.
+2. **The full lifecycle**: the three-way handshake completes (both ESTABLISHED); a
+   known payload transfers **both directions** with the received bytes **exactly
+   equal** to the sent bytes; a **dropped data segment is retransmitted after the
+   RTO** and delivered (the link drops one segment, the wheel advances the clock
+   past the RTO, recovery is asserted - and the link dropped exactly once); and a
+   clean FIN/FIN-ACK teardown reaches CLOSE_WAIT -> TIME_WAIT -> CLOSED.
+3. **The socket-shaped API**: `TcpStream`/`TcpListener` drive a second full
+   handshake + byte + close.
+4. **The timer-wheel multiplex**: four timers armed out of order fire in **deadline
+   order** off the reactor's single one-shot (`run_once` behind `rt::sleep_ns`).
+
+**Live path (honest):** a live TCP handshake to SLIRP was **skipped with reason** -
+SLIRP has no built-in TCP echo/responder, so there is no deterministic live peer to
+handshake against (unlike the ARP/DNS/ICMP proofs, where SLIRP answers). Faking a
+live connection would be dishonest; the in-cell loopback lifecycle is the real
+proof. A live TCP echo / HTTP GET is an **N2b** deliverable (over a real service or
+an external peer at the hardware lab).
+
+### What N2a simplifies / defers (honest)
+
+- **No SACK, no window scaling, no timestamps option** - only the MSS option is
+  emitted/parsed. Large bandwidth-delay products and selective repair are N2b.
+- **No out-of-order reassembly**: an out-of-order segment is dropped and the
+  receiver re-acks `rcv_nxt`, relying on retransmission (correct, not optimal).
+- **Immediate ACKs** (no delayed-ACK timer) and **no keepalive**; the wheel
+  supports both as more logical timers - wired in a later slice.
+- **Zero-window** handling is minimal: a zero advertised window stalls the sender
+  until a window update arrives (no persist-timer probe yet).
+- **RST handling is minimal**: a received RST drops the connection to CLOSED.
+- **Congestion control itself** (only the `FixedWindow` seam ships) and **ECN** are
+  N2b.

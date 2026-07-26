@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 41] = [
+const TEST_KERNELS: [&str; 42] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -62,6 +62,7 @@ const TEST_KERNELS: [&str; 41] = [
     "netdns",
     "nettrace",
     "netlocal",
+    "nettcp",
     "linuxunix",
 ];
 

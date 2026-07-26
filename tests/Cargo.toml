@@ -187,6 +187,15 @@ path = "src/nettrace.rs"
 name = "netlocal"
 path = "src/netlocal.rs"
 
+# rheo-net Phase N2a (docs/NETSTACK.md §11): the native TCP state machine + the
+# timer wheel. Two TCP endpoints in one cell over a virtual link drive the full
+# lifecycle deterministically (handshake, bidirectional data, drop/RTO recovery,
+# teardown), plus the checksum/segment oracles and the timer-wheel multiplex over
+# the single reactor slot. Needs no netdev - entirely in-cell.
+[[bin]]
+name = "nettcp"
+path = "src/nettcp.rs"
+
 # Linux-personality L8 (docs/LINUX-COMPAT.md L8): AF_UNIX sockets - an unmodified
 # static-glibc C fixture doing socketpair+fork and bind/listen/connect/accept.
 [[bin]]

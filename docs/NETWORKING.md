@@ -38,7 +38,7 @@ requires - the kernel owns the queue plumbing, not the protocols.
   grants (section 1), header/payload split (section 1), a device RX interrupt, and
   everything in sections 4-7 (eBPF dataplane, DDoS staging, DPU offload).
 
-## 0a. What is built (rheo-net Phase N1a/N1b/N1c/N1e): the L2/L3/L4 core + caching DNS + traceroute
+## 0a. What is built (rheo-net Phase N1a-N1e + N2a): the L2/L3/L4 core + caching DNS + traceroute + native TCP
 
 The **greenfield network stack** begins here as **portable userspace** - a new
 `net/` workspace crate (`no_std` + alloc, no per-ISA code) built for the three
@@ -90,9 +90,23 @@ decrement primitive (checksum oracle `0xB961`, drop signal at TTL 0/1), the Time
 Exceeded oracles (`0xF4FF` v4, `0x1936` v6), and the **traceroute state machine
 fed synthetic responses** reconstructing an exact 4-hop path (multi-hop discovery
 without real routers), plus a **bonus live** 1-hop trace to the gateway `10.0.2.2`
-that tolerates a timeout - exiting `0x42`. Still deferred: the local/AF_UNIX
-zero-copy path and the Linux AF_UNIX personality; the *live* ICMPv6 path + IGMP/MLD
-are N7 (docs/NETSTACK.md 5-9).
+that tolerates a timeout - exiting `0x42`. Still deferred: the *live* ICMPv6 path +
+IGMP/MLD are N7 (docs/NETSTACK.md 5-9).
+
+**Phase N2a** adds the native **TCP** transport: `net::tcp` (the RFC 793 state
+machine - handshake, sliding-window flow control, RFC 6298 RTO/RTT + Karn,
+cumulative-ack retransmission, FIN teardown + TIME-WAIT, the TCP checksum, and a
+`CongestionControl` trait seam for the N2b CUBIC/BBR drop-in) and `net::timer` (a
+timer wheel multiplexing many logical timers - per-connection RTO / TIME-WAIT -
+onto the reactor's **single** one-shot deadline, pure userspace, no ABI change).
+Proof: the `nettcp` test kernel (all three ISAs), **deterministic + network-free** -
+two TCP endpoints in one cell over a virtual link drive the full lifecycle
+(three-way handshake, bidirectional data with exact bytes, a **dropped segment
+recovered by RTO**, clean teardown to CLOSED/TIME-WAIT), plus the checksum/segment
+oracles (`0x613C`) and the timer-wheel multiplex - exiting `0x42`. A **live** TCP
+handshake to SLIRP is **skipped with reason** (SLIRP has no TCP responder to make
+it deterministic); congestion control itself, the smoltcp cell, the sharded
+transport, SACK/window-scaling/ECN are **N2b** (docs/NETSTACK.md 11).
 
 ## 1. NIC queues are the primitive
 

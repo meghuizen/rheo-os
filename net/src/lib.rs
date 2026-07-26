@@ -47,7 +47,18 @@
 //! - [`trace`]: the TTL-increment traceroute state machine (deterministic core +
 //!   a thin live driver), ICMP-echo probes correlated by sequence number.
 //!
-//! Still deferred (per docs/NETSTACK.md): `local` (the AF_UNIX-equivalent
+//! **Phase N2a** adds the native TCP transport over that L3/L4 core:
+//! - [`tcp`]: the RFC 793 state machine ([`tcp::Connection`] +
+//!   [`tcp::TcpStream`]/[`tcp::TcpListener`]) - three-way handshake, a sliding
+//!   send/receive window with flow control, RFC 6298 RTO/RTT + Karn's algorithm,
+//!   cumulative-ack retransmission, FIN teardown + TIME-WAIT, the TCP checksum via
+//!   the N1a [`ip::Checksum`] accumulator, and a [`tcp::CongestionControl`] trait
+//!   seam ([`tcp::FixedWindow`] for N2a; CUBIC/BBR are the N2b drop-in).
+//! - [`timer`]: a [`timer::TimerWheel`] multiplexing many logical timers (per-
+//!   connection RTO / TIME-WAIT) onto the reactor's single one-shot deadline.
+//!
+//! Still deferred (per docs/NETSTACK.md): the smoltcp blessed cell + the sharded
+//! transport + real congestion control (N2b); `local` (the AF_UNIX-equivalent
 //! zero-copy transport), the Linux AF_UNIX personality, negative caching, and the
 //! *live* ICMPv6 path (the v6 codec is unit-proven; SLIRP cannot generate v6
 //! errors).
@@ -62,6 +73,8 @@ pub mod eth;
 pub mod icmp;
 pub mod ip;
 pub mod local;
+pub mod tcp;
+pub mod timer;
 pub mod trace;
 pub mod udp;
 pub mod wire;
