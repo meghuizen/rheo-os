@@ -116,6 +116,61 @@ pub fn build_client_hello(
     cipher_suites: &[u16],
     key_share_pub: &[u8; 32],
 ) -> Vec<u8> {
+    build_client_hello_alpn(random, session_id, cipher_suites, key_share_pub, &[])
+}
+
+/// The ALPN extension type (RFC 7301 §3.1): `application_layer_protocol_negotiation`.
+pub const EXT_ALPN: u16 = 0x0010;
+
+/// Encode an ALPN `ProtocolNameList`: a 2-byte total length, then each protocol as
+/// a 1-byte length + its bytes (RFC 7301 §3.1).
+pub fn build_alpn_list(protocols: &[&[u8]]) -> Vec<u8> {
+    let mut inner = Vec::new();
+    for p in protocols {
+        inner.push(p.len() as u8);
+        inner.extend_from_slice(p);
+    }
+    let mut out = Vec::with_capacity(2 + inner.len());
+    out.extend_from_slice(&(inner.len() as u16).to_be_bytes());
+    out.extend_from_slice(&inner);
+    out
+}
+
+/// Parse an ALPN `ProtocolNameList` into its protocol names. Bounded reads; a
+/// malformed list yields an empty vector rather than an error, which is what a
+/// server that simply declines to negotiate needs.
+pub fn parse_alpn_list(data: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    if data.len() < 2 {
+        return out;
+    }
+    let total = u16::from_be_bytes([data[0], data[1]]) as usize;
+    let body = &data[2..];
+    if total > body.len() {
+        return out;
+    }
+    let mut i = 0;
+    while i < total {
+        let l = body[i] as usize;
+        if i + 1 + l > total {
+            break;
+        }
+        out.push(body[i + 1..i + 1 + l].to_vec());
+        i += 1 + l;
+    }
+    out
+}
+
+/// Build a ClientHello that also offers ALPN (RFC 7301) when `alpn` is non-empty.
+/// With an empty list this is byte-for-byte [`build_client_hello`], so the RFC 8448
+/// known-answer test and the existing handshake are unaffected.
+pub fn build_client_hello_alpn(
+    random: &[u8; 32],
+    session_id: &[u8],
+    cipher_suites: &[u16],
+    key_share_pub: &[u8; 32],
+    alpn: &[&[u8]],
+) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(&[0x03, 0x03]); // legacy_version
     b.extend_from_slice(random);
@@ -145,6 +200,11 @@ pub fn build_client_hello(
     ks_list.extend_from_slice(&(ks.len() as u16).to_be_bytes());
     ks_list.extend_from_slice(&ks);
     push_ext(&mut ext, 0x0033, &ks_list);
+    // ALPN (0x0010), only when the caller offers protocols - so an empty list
+    // reproduces the original ClientHello bytes exactly.
+    if !alpn.is_empty() {
+        push_ext(&mut ext, EXT_ALPN, &build_alpn_list(alpn));
+    }
 
     b.extend_from_slice(&(ext.len() as u16).to_be_bytes());
     b.extend_from_slice(&ext);
@@ -193,6 +253,9 @@ pub struct ClientHelloInfo {
     pub cipher_suites: Vec<u16>,
     pub key_share_x25519: Option<[u8; 32]>,
     pub session_id: Vec<u8>,
+    /// The ALPN protocol names offered (RFC 7301), empty if the extension was
+    /// absent. A server picks the first of these it supports.
+    pub alpn: Vec<Vec<u8>>,
 }
 
 /// Parse a ClientHello body far enough to pick a suite and read the peer's X25519
@@ -213,12 +276,40 @@ pub fn parse_client_hello(body: &[u8]) -> Result<ClientHelloInfo, TlsError> {
     }
     let comp_len = c.u8()? as usize;
     c.skip(comp_len)?;
-    let key_share_x25519 = parse_key_share_extensions(&mut c, true)?;
+    let (key_share_x25519, alpn) = parse_extensions(&mut c, true)?;
     Ok(ClientHelloInfo {
         cipher_suites,
         key_share_x25519,
         session_id,
+        alpn,
     })
+}
+
+/// Read the server's selected ALPN protocol out of an EncryptedExtensions body
+/// (RFC 7301 §3.2: a single-entry `ProtocolNameList`). `None` if the server did
+/// not negotiate one.
+pub fn parse_encrypted_extensions_alpn(body: &[u8]) -> Option<Vec<u8>> {
+    if body.len() < 2 {
+        return None;
+    }
+    let total = u16::from_be_bytes([body[0], body[1]]) as usize;
+    let ext = &body[2..];
+    if total > ext.len() {
+        return None;
+    }
+    let mut i = 0;
+    while i + 4 <= total {
+        let ty = u16::from_be_bytes([ext[i], ext[i + 1]]);
+        let len = u16::from_be_bytes([ext[i + 2], ext[i + 3]]) as usize;
+        if i + 4 + len > total {
+            return None;
+        }
+        if ty == EXT_ALPN {
+            return parse_alpn_list(&ext[i + 4..i + 4 + len]).into_iter().next();
+        }
+        i += 4 + len;
+    }
+    None
 }
 
 /// Parse a ServerHello body: return `(selected_suite, server_x25519_share)`.
@@ -230,30 +321,34 @@ pub fn parse_server_hello(body: &[u8]) -> Result<(u16, [u8; 32]), TlsError> {
     c.skip(sid_len)?;
     let suite = c.u16()?;
     c.skip(1)?; // legacy_compression_method
-    let share = parse_key_share_extensions(&mut c, false)?.ok_or(TlsError::MissingKeyShare)?;
-    Ok((suite, share))
+    let (share, _alpn) = parse_extensions(&mut c, false)?;
+    Ok((suite, share.ok_or(TlsError::MissingKeyShare)?))
 }
 
-/// Walk the extensions block and return the X25519 key share if present. For a
-/// ClientHello the key_share is a list of entries; for a ServerHello it is a
-/// single entry.
-fn parse_key_share_extensions(
-    c: &mut Cursor,
-    is_client_hello: bool,
-) -> Result<Option<[u8; 32]>, TlsError> {
+/// What the extension walk extracts: the peer's X25519 key share (if any) and the
+/// ALPN protocol list (empty when the extension is absent).
+type ExtensionInfo = (Option<[u8; 32]>, Vec<Vec<u8>>);
+
+/// Walk the extensions block, returning the X25519 key share and any ALPN
+/// protocol list. For a ClientHello the key_share is a list of entries; for a
+/// ServerHello it is a single entry.
+fn parse_extensions(c: &mut Cursor, is_client_hello: bool) -> Result<ExtensionInfo, TlsError> {
     let ext_total = c.u16()? as usize;
     let ext_bytes = c.take(ext_total)?;
     let mut e = Cursor::new(ext_bytes);
     let mut found = None;
+    let mut alpn = Vec::new();
     while e.remaining() >= 4 {
         let ext_type = e.u16()?;
         let ext_len = e.u16()? as usize;
         let data = e.take(ext_len)?;
         if ext_type == 0x0033 {
             found = parse_key_share_body(data, is_client_hello);
+        } else if ext_type == EXT_ALPN {
+            alpn = parse_alpn_list(data);
         }
     }
-    Ok(found)
+    Ok((found, alpn))
 }
 
 fn parse_key_share_body(data: &[u8], is_client_hello: bool) -> Option<[u8; 32]> {

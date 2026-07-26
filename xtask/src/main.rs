@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 50] = [
+const TEST_KERNELS: [&str; 51] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -72,6 +72,7 @@ const TEST_KERNELS: [&str; 50] = [
     "linuxinet",
     "linuxnet",
     "netservice",
+    "nethttp",
 ];
 
 /// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
@@ -773,6 +774,47 @@ fn build_tls_demo(arch: Arch) -> bool {
     matches!(cmd.status().map(|s| s.success()), Ok(true))
 }
 
+/// Build the `nethttp-demo` bin with the `tls` feature (docs/NETSTACK.md §19,
+/// Phase N5a). The HTTP codec itself needs no feature at all - it is in the
+/// always-compiled half of rheo-net - but the proof cell also runs one HTTP/1.1
+/// exchange **through the TLS 1.3 record layer**, so it is gated on `tls` and needs
+/// the same force-soft AES / GHASH / curve25519 backend cfgs as `build_tls_demo`
+/// (the intrinsics backends miscompile under LLVM on `x86_64-unknown-none`). Like
+/// the crypto/TLS demos, `build_userland` (default features) skips it via
+/// `required-features = ["tls"]`, so this dedicated step builds just that bin into
+/// the release path the `nethttp` test kernel `include_bytes!`s. Must run after
+/// `build_userland`.
+fn build_http_demo(arch: Arch) -> bool {
+    println!(
+        "[xtask] building nethttp-demo (--features tls, soft backends) for {}",
+        arch.name()
+    );
+    let mut rustflags = String::from(
+        "--cfg aes_force_soft --cfg polyval_force_soft \
+         --cfg curve25519_dalek_backend=\"serial\"",
+    );
+    if arch == Arch::X86_64 {
+        rustflags.push_str(" -C relocation-model=static -C code-model=small");
+    }
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "build",
+        "-p",
+        "rheo-net",
+        "--bin",
+        "nethttp-demo",
+        "--features",
+        "tls",
+        "--release",
+        "--target",
+        arch.target(),
+        "-Zbuild-std=core,alloc,compiler_builtins",
+        "-Zbuild-std-features=compiler-builtins-mem",
+    ]);
+    cmd.env("RUSTFLAGS", rustflags);
+    matches!(cmd.status().map(|s| s.success()), Ok(true))
+}
+
 /// Build a real-std program (`manifest`) for the rheo-os target of `arch`, so
 /// a test can embed the ELF (docs/USERLAND.md M4/M5). Applies the rust-src std
 /// patch first (idempotent) and uses `-Zbuild-std=std` against the custom JSON
@@ -1099,6 +1141,12 @@ fn build(arch: Arch, release: bool) -> bool {
     // feature (implies `crypto`) + the same force-soft backend cfgs (build_userland
     // skips it via required-features).
     if !build_tls_demo(arch) {
+        return false;
+    }
+    // The N5a HTTP cell (docs/NETSTACK.md §19): built separately with the `tls`
+    // feature (its HTTPS composition needs the record layer) + the same
+    // force-soft backend cfgs (build_userland skips it via required-features).
+    if !build_http_demo(arch) {
         return false;
     }
     // The librheodata (Phase B) dataset the test kernel reads off the live disk.

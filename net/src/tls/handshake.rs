@@ -49,6 +49,11 @@ pub struct HandshakeOutput {
     pub client_finished_ok: bool,
     /// Both sides derived identical client/server application traffic secrets.
     pub keys_match: bool,
+    /// The ALPN protocol the server selected and the client observed in
+    /// EncryptedExtensions (RFC 7301), or `None` when no ALPN was offered. This is
+    /// what makes `h2` over TLS a **negotiated** protocol rather than an assumed
+    /// one (docs/NETSTACK.md §19).
+    pub alpn: Option<Vec<u8>>,
 }
 
 /// The RFC 8446 §4.4.3 CertificateVerify signed content: 64 `0x20` octets, the
@@ -80,6 +85,21 @@ pub fn run_handshake(
     suite: CipherSuite,
     server: &ServerIdentity,
 ) -> Result<HandshakeOutput, TlsError> {
+    run_handshake_alpn(suite, server, &[], &[])
+}
+
+/// Run the same 1-RTT handshake with **ALPN** (RFC 7301): the client offers
+/// `client_alpn` in its ClientHello, the server picks the first entry that also
+/// appears in `server_alpn` and echoes it in EncryptedExtensions, and the client
+/// reads the selection back into [`HandshakeOutput::alpn`]. With two empty lists
+/// this is byte-for-byte the original handshake, which is why
+/// [`run_handshake`] just forwards to it.
+pub fn run_handshake_alpn(
+    suite: CipherSuite,
+    server: &ServerIdentity,
+    client_alpn: &[&[u8]],
+    server_alpn: &[&[u8]],
+) -> Result<HandshakeOutput, TlsError> {
     // Fixed ephemerals so the in-cell handshake is deterministic (not the RFC 8448
     // keys - those drive the KAT; these just have to be a valid pair each side).
     let client_eph_priv: [u8; 32] = [0x11; 32];
@@ -91,7 +111,7 @@ pub fn run_handshake(
     let mut server_ts = Transcript::new();
 
     // --- ClientHello ---
-    let ch_body = msg::build_client_hello(
+    let ch_body = msg::build_client_hello_alpn(
         &[0xAA; 32],
         &[],
         &[
@@ -99,6 +119,7 @@ pub fn run_handshake(
             CipherSuite::ChaCha20Poly1305Sha256.to_u16(),
         ],
         &client_eph_pub,
+        client_alpn,
     );
     let ch = msg::handshake_message(HandshakeType::ClientHello, &ch_body);
     client_ts.add(&ch);
@@ -149,9 +170,31 @@ pub fn run_handshake(
     let mut client_hs_write = record_keys(suite, &c_hs_secret);
     let mut server_hs_read = record_keys(suite, &c_hs_secret);
 
+    // --- ALPN selection (server side): the first client offer we also support ---
+    let selected_alpn: Option<Vec<u8>> = ch_info
+        .alpn
+        .iter()
+        .find(|p| server_alpn.contains(&p.as_slice()))
+        .cloned();
+
     // --- Server's authenticated flight (each message its own record) ---
-    // EncryptedExtensions (empty).
-    let ee = msg::handshake_message(HandshakeType::EncryptedExtensions, &[0x00, 0x00]);
+    // EncryptedExtensions: empty, unless an ALPN protocol was selected, in which
+    // case it carries the single-entry ProtocolNameList (RFC 7301 §3.2).
+    let ee_body = match &selected_alpn {
+        None => alloc::vec![0x00, 0x00],
+        Some(p) => {
+            let list = msg::build_alpn_list(&[p.as_slice()]);
+            let mut ext = Vec::new();
+            ext.extend_from_slice(&msg::EXT_ALPN.to_be_bytes());
+            ext.extend_from_slice(&(list.len() as u16).to_be_bytes());
+            ext.extend_from_slice(&list);
+            let mut body = Vec::with_capacity(2 + ext.len());
+            body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+            body.extend_from_slice(&ext);
+            body
+        }
+    };
+    let ee = msg::handshake_message(HandshakeType::EncryptedExtensions, &ee_body);
     server_ts.add(&ee);
     let ee_rec = server_hs_write.encrypt(ContentType::Handshake, &ee);
 
@@ -176,6 +219,15 @@ pub fn run_handshake(
 
     // --- Client receives and verifies the flight ---
     let (_, ee_pt) = client_hs_read.decrypt(&ee_rec)?;
+    // The client learns the negotiated ALPN protocol here, inside the encrypted
+    // flight - which is where RFC 8446 moved it.
+    let client_alpn_seen = {
+        let (kind, body) = msg::parse_handshake(&ee_pt)?;
+        if kind != HandshakeType::EncryptedExtensions {
+            return Err(TlsError::Decode);
+        }
+        msg::parse_encrypted_extensions_alpn(body)
+    };
     client_ts.add(&ee_pt);
 
     let (_, cert_pt) = client_hs_read.decrypt(&cert_rec)?;
@@ -244,6 +296,13 @@ pub fn run_handshake(
         server_finished_ok,
         client_finished_ok,
         keys_match,
+        // Both sides must agree: the server's choice and what the client read out
+        // of EncryptedExtensions.
+        alpn: if client_alpn_seen == selected_alpn {
+            selected_alpn
+        } else {
+            return Err(TlsError::Decode);
+        },
     })
 }
 

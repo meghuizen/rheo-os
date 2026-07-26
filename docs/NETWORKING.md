@@ -301,3 +301,16 @@ pretends the hardware feature matrix is uniform.
 - NIC offload heterogeneity is real; the feature matrix differs per hardware
   generation and the grant layer surfaces it honestly (typed-hardware
   doctrine, again).
+
+## 9. Application protocols on the NIC path (rheo-net N5a)
+
+The raw-frame NIC path (Phase G) carries IP/TCP (N2), TLS 1.3 (N3), and now
+**HTTP/1.1 + HTTP/2** (N5a, docs/NETSTACK.md §19). Both HTTP versions are pure
+userspace codec plus a synchronous state machine - the same shape as `net::tcp`,
+so they are provable in-cell with no live peer and they add **no kernel object and
+no per-ISA code**. HTTP/1.1 parses zero-copy (header names and values borrow the
+receive buffer, which is what the WAF/DPI dataplane of section 8 needs) and rejects
+every request-smuggling shape in the parser itself. HTTP/2 carries the frame layer,
+the stream state machine, connection- and stream-level flow control, and HPACK with
+the RFC 7541 Appendix B Huffman code. `h2` over TLS is negotiated by a minimal
+RFC 7301 ALPN added to the N3b handshake, not assumed. HTTP/3 waits on QUIC (N7).

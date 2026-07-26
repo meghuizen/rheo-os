@@ -29,7 +29,7 @@ pub mod msg;
 pub mod record;
 pub mod x509;
 
-pub use handshake::{HandshakeOutput, ServerIdentity, run_handshake};
+pub use handshake::{HandshakeOutput, ServerIdentity, run_handshake, run_handshake_alpn};
 pub use record::{ContentType, RecordKeys};
 
 /// The TLS 1.3 cipher suites this slice supports (RFC 8446 §B.4). Both are

@@ -667,6 +667,69 @@ unrelated cells is the genuinely new capability and a documented follow-on); the
 protocol is word-wide (bigger requests ride a shared sealed grant, the Phase E
 mechanism); and 4 clients is the fixed-array ceiling.
 
+**rheo-net N5a** (docs/NETSTACK.md 19) adds the first **application protocols** -
+**HTTP/1.1 + HTTP/2, client and server** - the gateway most remaining scenarios ride
+on (WAF/DPI inspects HTTP, S3-style storage *is* HTTP, Arrow Flight is gRPC over
+HTTP/2). Both live in the crate's **always-compiled** half (HTTP is parsing plus
+synchronous state machines, so it needs neither librheo nor the NIC and links in
+either posture); **no kernel change, no new object/verb, no new dependency, no
+`cfg(target_arch)`**. **`net::http1`** parses **zero-copy** - method, target, reason
+phrase and every header name/value are `&[u8]` slices *of the caller's buffer* (the
+rheo-json `Cow::Borrowed` discipline; case-insensitivity applied at compare time), so
+a WAF datapath classifies a request without allocating per header; the owned
+`OwnedRequest`/`OwnedResponse` the `Client`/`Server` helpers return are the *only*
+copy. Framing covers `Content-Length` + **chunked** both directions, bodiless
+statuses, and the RFC 9112 persistence rule. **Request smuggling is a parser
+property, not a filter**: `Content-Length` *and* `Transfer-Encoding` (either order),
+duplicate `Content-Length` (even when equal), `5, 5` / `+5` / `0x5`, a non-`chunked`
+final coding, bare LF, `Host : x`, obs-fold, non-token names, control bytes in
+values, oversized/too-many headers, a double space in the request line and a
+non-1.x version are each rejected **with their own error** - 22 shapes asserted,
+plus 4 chunked-framing rejections (a non-empty trailer is refused, not dropped).
+`http1::scan` reuses the `json/src/scan.rs` idiom - scalar oracle + a branchless
+wide path + fuzz equivalence - but the wide path is **SWAR** (`u64` load/compare/
+mask/ctz, 8 bytes per step) rather than SSE2, so it stays portable with no
+`cfg(target_arch)`; a target-specific SIMD kernel is deferred. **`net::http2`** ships
+the frame layer (DATA/HEADERS/SETTINGS/WINDOW_UPDATE/PING/RST_STREAM/GOAWAY/
+CONTINUATION, PRIORITY parsed-and-ignored), the preface, the stream state machine,
+**connection- and stream-level flow control** (a send is bounded by
+`min(conn, stream, max_frame)`, the remainder queued until a WINDOW_UPDATE credits
+it; the *connection* window correctly starts at 65535 and is changed only by
+WINDOW_UPDATE, never by `SETTINGS_INITIAL_WINDOW_SIZE`), and **HPACK** - static
+table, dynamic table with size updates, and the RFC 7541 Appendix B **Huffman code
+generated mechanically from the authoritative RFC text** (blob-hash cross-checked;
+the generator asserted prefix-freedom + canonicality, which is what lets the decoder
+be a per-length canonical lookup rather than a tree), with the padding/EOS rules
+enforced. `conn` has the **same synchronous seam as `net::tcp`** (`on_bytes` /
+`take_out` / `next_event`, no I/O inside), which is what makes h2 provable with no
+live peer and transport-agnostic. For h2 over TLS, N5a added a **minimal RFC 7301
+ALPN** to the N3b handshake (offer in ClientHello, selection echoed in
+EncryptedExtensions, both sides must agree) - with an empty list the ClientHello is
+byte-for-byte N3b's, so the RFC 8448 KAT is untouched; `h2` is therefore
+**negotiated, not assumed**. The `nethttp` test kernel proves it all on **all three
+ISAs** (pure compute, no netdev): the h1 codec with the **zero-copy borrow asserted
+by pointer range**, the 22 smuggling rejections, the **SWAR == scalar** oracle over
+20,000 fuzz buffers, an **h1 client talking to our h1 server over real `net::tcp`**
+across the in-cell `VirtualLink` (POST+body byte-exact, a chunked response
+reassembled exactly, a **second request on the same never-closed connection**, a
+404), **HPACK against RFC 7541 Appendix C** - C.1 integers, C.2.1-C.2.4, and the
+**C.3.1-C.3.3 / C.4.1-C.4.3 sequences** (C.4 Huffman) decoded to the RFC's exact
+header lists *and* re-encoded to the RFC's exact bytes with the dynamic table sizes
+**55/57/110/164** checked (indices 62/63 are only reachable if both tables evolve
+identically), Huffman edge cases, **h2** (preface + SETTINGS acked both ways,
+HEADERS+DATA, a **flow-control-gated body** - 16 of 39 bytes arrive, the remainder
+asserted still queued, the server's WINDOW_UPDATE releases it - a second concurrent
+stream, RST_STREAM/PING-ACK/GOAWAY, and four protocol errors asserted to fail), and
+**HTTPS**: one h1 exchange through the N3b TLS record layer with the plaintext
+asserted absent from the ciphertext, a tampered record still rejected, and ALPN
+negotiating `http/1.1` and `h2`. The **live GET is skipped with a reason** - SLIRP
+has no HTTP server, so there is nothing deterministic to fetch and nothing is faked.
+Deferred: **HTTP/3** (it is HTTP over QUIC = N7), trailers, server push, PRIORITY as
+a scheduler, `CONNECT`/`Upgrade` (incl. `h2c` upgrade), `100-continue`, content
+codings, a resumable chunked decoder (the one-shot re-scan is O(n^2) per body), a
+bound-to-port server *cell* (that composes N4a fan-out with the N6 inbound
+steering), and gRPC / Arrow Flight / Kafka (N5b/N5c) on top of this h2.
+
 **rheo-net N4b** (docs/NETSTACK.md 18, docs/LINUX-COMPAT.md L8-INET-REMOTE) is
 **real remote networking for unmodified Linux binaries** - the biggest functional
 unlock left. L8-INET gave `AF_INET`/`AF_INET6` sockets but **loopback only**: a
@@ -866,7 +929,15 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               remote INET for unmodified Linux binaries - an unmodified
               static-glibc C binary does a real DNS round trip to SLIRP's
               resolver 10.0.2.3:53 and a real remote TCP connect over the NIC,
-              through the svc::SocketOps bridge + inet_personality.rs),
+              through the svc::SocketOps bridge + inet_personality.rs), nethttp
+              (rheo-net N5a: HTTP/1.1 + HTTP/2 - the zero-copy h1 codec with its
+              22 request-smuggling rejections + the SWAR-vs-scalar scan oracle, an
+              h1 client<->server exchange over the in-cell TCP VirtualLink
+              (POST+body, chunked, keep-alive, 404), the RFC 7541 Appendix C HPACK
+              known-answer vectors incl. Huffman, the h2 connection (preface,
+              SETTINGS, concurrent streams, WINDOW_UPDATE-gated body, RST/PING/
+              GOAWAY), and one h1 exchange through the TLS 1.3 record layer with
+              ALPN; pure compute, live GET skipped-with-reason),
               bench-core, and the interactive
               lsh bin (+ harness.rs, vfs_personality.rs, inet_personality.rs -
               the N4b remote-INET datapath registered as svc::SocketOps);
@@ -927,16 +998,20 @@ net/          rheo-net: the greenfield network stack as portable userspace
               librheo's raw-frame path: eth/arp/ip (N1a), udp/icmp/wire (N1b),
               dns caching resolver (N1c), trace (N1e), local fast path (N1d),
               tcp + timer wheel (N2a), cc Reno/CUBIC (N2b), smoltcp_cell +
-              shard (N2c), crypto (N3a) + tls (N3b, both feature-gated), and
+              shard (N2c), crypto (N3a) + tls (N3b, both feature-gated),
               service (N4a: the service-cell framework - one channel end +
               one strand per client, so one service cell serves many clients
-              concurrently). Two postures: `hosted` (default - the
+              concurrently), and http1 + http2 (N5a: HTTP/1.1 - a zero-copy,
+              smuggling-hardened codec + chunked framing + a transport-agnostic
+              Client/Server; HTTP/2 - frames, streams, both flow-control levels,
+              and HPACK with the RFC-generated Appendix B Huffman table - both in
+              the always-compiled half, docs/NETSTACK.md 19). Two postures: `hosted` (default - the
               librheo-driven async endpoints) and the librheo-free **codec**
               posture (`--no-default-features`: eth/ip/arp/udp/tcp/cc/shard/wire
               only), which is what links beside a *kernel* for the N4b
               SocketOps bridge (docs/NETSTACK.md 18).
               Plus the netcore/netl4/netdns/nettrace/netlocal/
-              nettcp/nettcpcc/netsmoltcp/netcrypto/nettls demo bins and
+              nettcp/nettcpcc/netsmoltcp/netcrypto/nettls/nethttp demo bins and
               netsvc-demo + netsvc-client (the N4a service + its clients)
 json/         rheo-json: a dependency-free, zero-copy JSON parser (scalar +
               SSE2 string-scan), no_std, host-tested + benchmarked

@@ -1760,3 +1760,221 @@ Observed on all three ISAs: `dns answers yes` + `tcp refused`, exit 0.
   `SO_RCVTIMEO`/`O_NONBLOCK` (one documented 2 s receive / 3 s connect bound);
   **DHCP** (the SLIRP identity is fixed); non-blocking readiness for a remote TCP
   socket in `epoll`.
+
+## 19. Phase N5a (done): HTTP/1.1 + HTTP/2
+
+HTTP is the gateway for most of the scenarios still on the roadmap - the WAF /
+DPI dataplane inspects HTTP, S3-style object storage *is* HTTP, Arrow Flight is
+gRPC over HTTP/2, and a Kafka-adjacent REST surface is HTTP. N5a therefore builds
+both live versions of the protocol - **HTTP/1.1 and HTTP/2, client and server** -
+over the transports N2/N3 already proved, and proves them with no live peer.
+
+Both modules live in the crate's **always-compiled** half (see the `hosted` vs
+codec posture note in N4b): HTTP is parsing plus synchronous state machines, so it
+needs neither librheo nor the NIC and links into a *kernel* binary as happily as
+into a cell. Nothing about N5a touches the kernel - **no new object, no new verb,
+no new dependency, no `cfg(target_arch)`**.
+
+### 19.1 `net::http1` - the codec, and why it borrows
+
+`http1::parse_request` / `parse_response` return **views**: the method, the
+request target, the reason phrase, and every header name and value are `&[u8]`
+slices **of the caller's buffer**. Nothing is copied, nothing is lowercased in
+place; case-insensitivity is applied at compare time (`scan::eq_ignore_case`).
+This is the rheo-json discipline (`Cow::Borrowed`) applied to HTTP, and it is what
+a firewall / WAF datapath needs: classify a request without allocating per header.
+
+The one place a copy is unavoidable is the convenience layer. `http1::Client` and
+`http1::Server` hand back `OwnedResponse` / `OwnedRequest`, because a message
+outlives the socket buffer it arrived in. That boundary is the *only* copy, and it
+is documented at the type: borrowed `Request`/`Response` for inspection, owned
+`OwnedRequest`/`OwnedResponse` for handling.
+
+Framing is complete for the shapes that matter: `Content-Length` and **chunked**
+in both directions (`chunked::decode` / `chunked::encode`), bodiless statuses
+(1xx / 204 / 304 / a HEAD response), close-delimited responses, and the RFC 9112
+§9.3 persistence rule (HTTP/1.1 persists unless `Connection: close`; HTTP/1.0 does
+not unless `Connection: keep-alive`).
+
+`Client`/`Server` are deliberately **transport-agnostic**: they turn messages into
+bytes and bytes into messages. That is what lets one implementation serve
+plaintext over the synchronous `tcp::Connection` seam *and* HTTPS over the N3b TLS
+record layer - the transport is simply not visible from inside them.
+
+### 19.2 Request smuggling is a parser property, not a filter
+
+A WAF that sits behind a parser which tolerates a desync shape is worthless, so
+every smuggling shape is rejected **inside the parser**, each with its own error
+value (nothing is collapsed into a generic "bad request"):
+
+| shape | error |
+|---|---|
+| `Content-Length` **and** `Transfer-Encoding` on one message (either order) | `BothLengthAndEncoding` |
+| two `Content-Length` fields - **even when they agree** | `DuplicateContentLength` |
+| `Content-Length: 5, 5`, `+5`, `0x5`, any non-digit | `BadContentLength` |
+| `Transfer-Encoding` whose final coding is not `chunked`; two `Transfer-Encoding` fields | `BadTransferEncoding` |
+| a bare LF where CRLF is required (request line or field line) | `BareLf` |
+| `Host : value` - whitespace before the colon | `SpaceBeforeColon` |
+| an obs-fold continuation line | `ObsFold` |
+| a non-token byte in a header name, or an empty name | `BadHeaderName` |
+| a control byte inside a field value | `BadHeaderValue` |
+| a header block over 16 KiB / more than 64 fields | `HeaderBlockTooLarge` / `TooManyHeaders` |
+| a double space in the request line, or a start line without three fields | `BadRequestLine` |
+| a version token other than `HTTP/1.0` / `HTTP/1.1` | `BadVersion` |
+
+The framing headers are validated even on a message that **cannot** have a body
+(a 204), so a smuggling attempt there is rejected rather than ignored. The chunked
+decoder is equally strict: the size must be 1..=16 plain hex digits (no sign, no
+`0x`, no leading whitespace), each chunk must be followed by exactly CRLF, and the
+terminating `0` chunk must be followed by an **empty** trailer section - a
+non-empty trailer is `ChunkTrailerUnsupported`, because silently dropping trailers
+through a proxy is itself a desync. Bodies are capped at 1 MiB.
+
+### 19.3 Scanning: branchless, and portable
+
+`http1::scan` follows the `json/src/scan.rs` idiom - a scalar loop that is the
+**oracle**, plus a wide branchless path, plus a fuzz-equivalence proof - with one
+deliberate difference. json accelerates with SSE2 behind `cfg(target_arch =
+"x86_64")`; rheo-net may not carry per-ISA code (docs/TARGET-ARCHITECTURES.md 4),
+so the wide path here is **SWAR**: the same load / compare / mask /
+count-trailing-zeros pipeline expressed in `u64` arithmetic, 8 bytes per step,
+branchless, portable to all three ISAs with no `cfg` and no runtime feature
+detection. The word is loaded with `u64::from_le_bytes`, so lane 0 is the first
+byte on any host endianness. A target-specific SIMD kernel behind a measured
+dispatch stays **deferred** - SWAR is the portable floor every ISA gets.
+
+### 19.4 `net::http2` - frames, streams, flow control, HPACK
+
+- **`frame`**: the 9-octet header plus DATA, HEADERS, SETTINGS, WINDOW_UPDATE,
+  PING, RST_STREAM, GOAWAY, CONTINUATION, and PRIORITY parsed-and-ignored (RFC
+  9113 §5.3.1 deprecates the priority scheme). Padding and the HEADERS priority
+  block are stripped defensively.
+- **`hpack`**: the Appendix A static table, a size-bounded dynamic table with
+  eviction, prefix integers, string literals, and an encoder + decoder. Three
+  details that silently desync a naive implementation are handled in one place
+  each: indexing is 1-based with `1..=61` static and `62..` dynamic **counted from
+  the newest** entry; an entry costs `name + value + 32` bytes of accounting, not
+  its wire size; and a dynamic table size update is legal only before the first
+  field of a block and never above the decoder's advertised maximum.
+- **`huffman`**: the RFC 7541 Appendix B code. The 257-row table is
+  **generated** from the authoritative RFC text (fetched, blob-hash cross-checked
+  against several independent mirrors, then parsed row by row) - hand-typing 257
+  codes is exactly how a Huffman implementation acquires a silent bug in one rare
+  symbol. The generator asserted three properties before emitting: every code fits
+  its stated length, the code is prefix-free, and codes of one length are
+  consecutive integers. That last property is what lets the decoder be canonical
+  (a per-length `first_code` / `count` / `first_index` lookup, at most 30 steps per
+  symbol) instead of a tree. Padding rules are enforced, not assumed: padding
+  longer than 7 bits, padding that is not all ones, and a literal EOS symbol are
+  each a decode error, because tolerating them lets two peers disagree about a
+  header value - the HPACK analogue of a smuggling desync.
+- **`conn`**: the connection. Its shape is the **same synchronous seam as
+  `net::tcp`** - bytes in via `on_bytes`, bytes out via `take_out`, semantics out
+  via `next_event` - with no I/O and no async inside. That is what makes h2
+  provable with no live peer, and it is also why h2 runs unchanged over TCP, over a
+  TLS record layer, or over the local fast path.
+
+**Flow control is real at both levels** (RFC 9113 §5.2, §6.9). `send_data` queues
+the caller's bytes on the stream and emits only what
+`min(connection window, stream window, peer max frame size)` allows; a peer's
+WINDOW_UPDATE credits the window and the queued remainder flows on the next
+`flush`. Receiving DATA debits both of our windows (charged on the whole payload
+including padding), and an overrun is `FLOW_CONTROL_ERROR`. A window that would
+pass 2^31-1 is an error, not a wrap. One subtlety worth naming because getting it
+wrong is invisible until load: the **connection** window always starts at 65535
+and is only ever changed by WINDOW_UPDATE - `SETTINGS_INITIAL_WINDOW_SIZE` governs
+per-**stream** windows only, so tying the connection window to that setting would
+let a small advertised stream window silently cap the whole connection.
+
+### 19.5 h2 over TLS: ALPN is negotiated, not assumed
+
+N3b's handshake had no ALPN, so N5a added a **minimal RFC 7301 ALPN** to it: the
+ClientHello offers a `ProtocolNameList`, the server picks the first offer it also
+supports and echoes it in **EncryptedExtensions** (where RFC 8446 moved it), and
+the client reads the selection back into `HandshakeOutput::alpn`. Both sides must
+agree or the handshake fails. With an empty protocol list the ClientHello is
+**byte-for-byte** what N3b built, which is why `run_handshake` simply forwards to
+`run_handshake_alpn` and the RFC 8448 known-answer test is untouched. So `h2` over
+TLS is genuinely negotiated. The HTTP/1.1 `Upgrade: h2c` dance is **not**
+implemented (RFC 9113 §3.1 deprecates it); prior-knowledge h2c is what the
+plaintext path uses.
+
+### 19.6 The proof (`nethttp` test kernel, all 3 ISAs)
+
+`nethttp-demo` is a cell (built with the `tls` feature so the HTTPS composition is
+available) that exits `0x42` only if **every** check below passes; the kernel
+asserts exactly that exit code, so the exit code is the proof. It is entirely
+deterministic and **network-free** - no netdev is attached.
+
+1. **h1 codec + the zero-copy borrow asserted, not assumed.** A known request
+   parses to the exact method / target / version / four headers; lookup is
+   case-insensitive both ways; and every parsed name, value, method and target
+   **pointer is checked to lie inside the input buffer**. A response, a
+   reason-phrase-less `204`, and an `Incomplete` partial buffer are also checked.
+2. **22 smuggling / robustness shapes**, each rejected with its **specific** error
+   (the table in 19.2), plus 4 chunked-framing rejections and a chunked
+   encode/decode round trip with a chunk extension accepted and ignored.
+3. **The scan oracle**: SWAR and scalar agree on **20,000** pseudo-random buffers
+   for three different needles, plus the token / OWS / case helpers.
+4. **An h1 client talking to our h1 server over real TCP** - two `net::tcp`
+   connections in one cell across the in-cell `VirtualLink`, driven by a logical
+   clock: a POST with four headers and a JSON body (received byte-exactly), a
+   `Content-Length` response, a **chunked** response reassembled byte-exactly, a
+   **second request on the same never-closed connection** (keep-alive), a **404**
+   error path, then a clean teardown.
+5. **HPACK against RFC 7541 Appendix C** - the RFC's own hex for C.1.1-C.1.3
+   (integers 10 / 1337 / 42), C.2.1-C.2.4 (all four representations, including
+   never-indexed), the **C.3.1-C.3.3 sequence** and the **C.4.1-C.4.3 sequence**
+   (Huffman-coded literals) is **decoded to exactly the RFC's header lists and
+   re-encoded to exactly the RFC's bytes**, with the dynamic table's reported size
+   checked against the RFC's printed **55 / 57 / 110 / 164** at each step. Indices
+   62 and 63 are only reachable if encoder and decoder tables evolve identically,
+   so the sequence tests that too. Bad indices, an oversized table size update, and
+   a shrink-to-zero eviction are also asserted.
+6. **Huffman edges**: a round trip over all 256 byte values, the C.4 values
+   (`www.example.com` -> 12 octets, `no-cache` -> 6), non-all-ones padding
+   rejected, >7 bits of padding rejected, a decoded EOS rejected.
+7. **h2 over the same TCP pair**: the preface + a **SETTINGS exchange
+   acknowledged both ways**; HEADERS + DATA on stream 1; a **flow-control-gated
+   body** - the server advertises a 16-byte initial stream window, exactly 16 bytes
+   of a 39-byte body arrive, the remainder is asserted still queued with the stream
+   window at 0, and the server's WINDOW_UPDATE releases it so the body reassembles
+   byte-exactly with END_STREAM; a response on stream 1; a **second concurrent
+   stream** (id 3) served on the same connection; RST_STREAM observed with its
+   error code; PING auto-acknowledged; GOAWAY observed. Four protocol errors are
+   asserted to **fail**: a bad client preface, a zero WINDOW_UPDATE, a
+   PUSH_PROMISE, and (accepted-and-ignored) a PRIORITY frame that produces no event.
+8. **HTTPS composes**: one full HTTP/1.1 exchange runs **through the N3b TLS 1.3
+   record layer** - our client and our server, real AEAD both ways - with the
+   plaintext asserted **absent** from the ciphertext, a tampered record still
+   rejected, and **ALPN** negotiating `http/1.1`; `h2` is negotiated on a second
+   handshake, a non-overlapping offer negotiates nothing, and the no-ALPN handshake
+   is unchanged.
+9. **The live GET is skipped with a reason.** QEMU's SLIRP provides DNS
+   (10.0.2.3), TFTP and a gateway (10.0.2.2) but **no HTTP server**, so there is no
+   deterministic, network-free endpoint to fetch. The cell prints why. Nothing is
+   faked and nothing is asserted about a live fetch.
+
+### What N5a defers (explicit)
+
+- **HTTP/3** - it is HTTP over QUIC, which is N7.
+- **Trailers** (rejected, not ignored), **server push** (`PUSH_PROMISE` refused),
+  **PRIORITY** as a scheduler (parsed and ignored), **`CONNECT`/`Upgrade`**
+  tunnelling, **`100-continue`**, **content codings** (`gzip`), multipart, and
+  cookie parsing.
+- **`Upgrade: h2c`** - prior-knowledge h2c or ALPN `h2` only.
+- **The HPACK never-indexed bit on decode**: a field can be *emitted*
+  never-indexed (`Mode::NeverIndex`), but the decoder does not report that a field
+  arrived never-indexed, so an intermediary built on this cannot yet guarantee it
+  re-emits such a field never-indexed (RFC 7541 §7.1.3).
+- **A resumable chunked decoder**: `chunked::decode` is one-shot over a complete
+  buffer and is re-run as more bytes arrive, which is O(n^2) in the number of feeds
+  for one body. The signature is drop-in replaceable.
+- **A close-delimited response body streamed**: the byte-stream `Client` has no
+  close signal, so `Body::Eof` yields whatever has arrived and never reports
+  keep-alive.
+- **A real HTTP server *cell***: N5a ships the codec + the byte-stream
+  client/server, not a bound-to-port service; that composes the N4a service-cell
+  framework with the N4b/N6 inbound path (a remote listener needs the NIC
+  flow-steering grants).
+- **gRPC, Arrow Flight and the Kafka client** (N5b/N5c) ride on this h2.

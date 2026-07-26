@@ -226,3 +226,17 @@ path = "src/bin/netsvc-demo.rs"
 [[bin]]
 name = "netsvc-client"
 path = "src/bin/netsvc-client.rs"
+
+# The N5a proof cell (docs/NETSTACK.md §19): HTTP/1.1 + HTTP/2. The h1 codec +
+# zero-copy borrow proof, 18 request-smuggling rejections, the SWAR-vs-scalar scan
+# oracle, an h1 client<->server exchange over the in-cell TCP VirtualLink
+# (POST+body, chunked, keep-alive, 404), the RFC 7541 Appendix C HPACK known-answer
+# vectors (C.1/C.2/C.3/C.4 incl. Huffman), the h2 connection (preface, SETTINGS,
+# concurrent streams, WINDOW_UPDATE-gated body, RST/PING/GOAWAY), and one HTTP/1.1
+# exchange through the N3b TLS record layer with ALPN. Pure compute (no netdev).
+# Requires the `tls` feature (built separately by xtask with the force-soft
+# backends); loaded by the `nethttp` test kernel.
+[[bin]]
+name = "nethttp-demo"
+path = "src/bin/nethttp-demo.rs"
+required-features = ["tls"]

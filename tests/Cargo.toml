@@ -245,6 +245,17 @@ path = "src/netcrypto.rs"
 name = "nettls"
 path = "src/nettls.rs"
 
+# rheo-net N5a (docs/NETSTACK.md §19): HTTP/1.1 + HTTP/2 - the zero-copy h1 codec
+# with its request-smuggling rejections, an h1 client<->server exchange over the
+# in-cell TCP VirtualLink (POST+body, chunked, keep-alive, 404), the RFC 7541
+# Appendix C HPACK known-answer vectors (incl. Huffman), the h2 connection
+# (preface, SETTINGS, concurrent streams, WINDOW_UPDATE-gated body, RST/PING/
+# GOAWAY), and one h1 exchange through the TLS 1.3 record layer with ALPN. Pure
+# compute - needs no netdev.
+[[bin]]
+name = "nethttp"
+path = "src/nethttp.rs"
+
 # Linux-personality L8 (docs/LINUX-COMPAT.md L8): AF_UNIX sockets - an unmodified
 # static-glibc C fixture doing socketpair+fork and bind/listen/connect/accept.
 [[bin]]

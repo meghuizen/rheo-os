@@ -92,6 +92,27 @@
 //!   task #27), plus the thin [`service::Client`] a spawned cell uses. Fan-out
 //!   composes over librheo Phase J spawn/channel inheritance.
 //!
+//! **Phase N5a** adds the first **application protocols** over that transport
+//! (docs/NETSTACK.md §19) - the gateway every remaining scenario (WAF/DPI,
+//! S3-style storage, Arrow Flight, Kafka) rides on:
+//! - [`http1`]: HTTP/1.1 - a **zero-copy** request/response codec (header names and
+//!   values borrow the input buffer), `Content-Length` + **chunked** framing both
+//!   directions, keep-alive, and a **smuggling-hardened** parser (both
+//!   `Content-Length` and `Transfer-Encoding`, duplicate `Content-Length`, bare LF,
+//!   whitespace before the colon, obs-fold, non-token names and oversized header
+//!   blocks are each rejected with their own error), plus a transport-agnostic
+//!   [`http1::Client`]/[`http1::Server`] pair driven over the synchronous
+//!   [`tcp::Connection`] seam - or over the TLS record layer, which is how HTTPS
+//!   composes.
+//! - [`http2`]: HTTP/2 - the frame layer, the connection preface, the stream state
+//!   machine, **connection- and stream-level flow control**, and **HPACK** (static
+//!   table, dynamic table with size updates, and the RFC 7541 Appendix B Huffman
+//!   code generated from the RFC text), proven against the RFC 7541 Appendix C
+//!   known-answer vectors.
+//!
+//! Both live in the **always-compiled** (posture-independent) half of the crate:
+//! HTTP is parsing and state machines, so it needs neither librheo nor the NIC.
+//!
 //! Still deferred (per docs/NETSTACK.md): TLS 1.3 (N3b); full NewReno partial-ACK
 //! recovery, CUBIC HyStart / fast-convergence, and BBR; negative caching; and the
 //! *live* ICMPv6 path (the v6 codec is unit-proven; SLIRP cannot generate v6
@@ -104,6 +125,8 @@ extern crate alloc;
 pub mod arp;
 pub mod cc;
 pub mod eth;
+pub mod http1;
+pub mod http2;
 pub mod ip;
 pub mod shard;
 pub mod tcp;
