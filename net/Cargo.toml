@@ -79,6 +79,11 @@ crypto = [
     "dep:x25519-dalek",
     "dep:ed25519-dalek",
 ]
+# N3b: the TLS 1.3 stack (docs/NETSTACK.md §15) - from-scratch over the N3a
+# primitives, so it just implies `crypto` (no new dependency). Off by default;
+# built separately by xtask with the same force-soft backend cfgs as the crypto
+# demo. The key schedule / record layer / handshake / minimal X.509 are pure Rust.
+tls = ["crypto"]
 
 [lib]
 name = "rheo_net"
@@ -179,3 +184,14 @@ required-features = ["smoltcp"]
 name = "netcrypto-demo"
 path = "src/bin/netcrypto-demo.rs"
 required-features = ["crypto"]
+
+# The N3b TLS 1.3 proof cell (docs/NETSTACK.md §15): the RFC 8448 §3 known-answer
+# key-schedule check (early/handshake/master secrets, traffic secrets, write
+# keys+IVs, Finished MACs - byte-for-byte), an in-cell full 1-RTT handshake with
+# an app-data round trip + tamper-reject, and the minimal-X.509 verify/reject.
+# Pure compute (no netdev). Requires the `tls` feature (built separately by xtask
+# with the force-soft cfgs); loaded by the `nettls` test kernel.
+[[bin]]
+name = "nettls-demo"
+path = "src/bin/nettls-demo.rs"
+required-features = ["tls"]

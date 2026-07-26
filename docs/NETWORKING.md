@@ -38,6 +38,14 @@ requires - the kernel owns the queue plumbing, not the protocols.
   grants (section 1), header/payload split (section 1), a device RX interrupt, and
   everything in sections 4-7 (eBPF dataplane, DDoS staging, DPU offload).
 
+> **Security transports update (N3a/N3b, docs/NETSTACK.md §14-15):** the crypto
+> primitive layer (N3a - ChaCha20-Poly1305 + RustCrypto SHA-2/HKDF/X25519/
+> Ed25519/AES-GCM) and a from-scratch **TLS 1.3** handshake + record layer +
+> minimal X.509 (N3b) are built and proven byte-for-byte against the RFC 8448
+> known-answer trace. Both are userspace-only, feature-gated, and add no kernel
+> object - consistent with §9 (TLS lives in userspace; keys are non-extractable
+> handles, the seam for the per-queue inline-crypto offload of §9).
+
 ## 0a. What is built (rheo-net Phase N1a-N1e + N2a/N2b): the L2/L3/L4 core + caching DNS + traceroute + native TCP + congestion control
 
 The **greenfield network stack** begins here as **portable userspace** - a new

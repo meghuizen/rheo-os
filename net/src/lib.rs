@@ -118,3 +118,12 @@ pub mod smoltcp_cell;
 /// it is off (the default). Present only when a cell opts in.
 #[cfg(feature = "crypto")]
 pub mod crypto;
+
+/// The N3b TLS 1.3 stack (docs/NETSTACK.md §15): the HKDF key schedule, the AEAD
+/// record layer, the handshake state machine, and a minimal X.509 - all
+/// from-scratch on the N3a `crypto` primitives. Gated behind the `tls` feature
+/// (which implies `crypto`) so the base stack + every existing test are
+/// unaffected when it is off (the default). Proven byte-for-byte against the RFC
+/// 8448 known-answer trace.
+#[cfg(feature = "tls")]
+pub mod tls;

@@ -70,6 +70,23 @@ pub fn hkdf_expand(prk: &Prk, info: &[u8], out: &mut [u8]) -> Result<(), OutputT
     prk.0.expand(info, out).map_err(|_| OutputTooLong)
 }
 
+/// Build the structured `HkdfLabel` (TLS 1.3, RFC 8446 §7.1):
+/// `struct { uint16 length; opaque label<7..255> = "tls13 " || label; opaque
+/// context<0..255> = context; }`. This is the exact byte layout an
+/// HKDF-Expand-Label feeds to HKDF-Expand; `length` is the requested output size.
+pub fn hkdf_label_bytes(label: &[u8], context: &[u8], length: u16) -> Vec<u8> {
+    let mut full = Vec::with_capacity(6 + label.len());
+    full.extend_from_slice(b"tls13 ");
+    full.extend_from_slice(label);
+    let mut hkdf_label = Vec::with_capacity(2 + 1 + full.len() + 1 + context.len());
+    hkdf_label.extend_from_slice(&length.to_be_bytes());
+    hkdf_label.push(full.len() as u8);
+    hkdf_label.extend_from_slice(&full);
+    hkdf_label.push(context.len() as u8);
+    hkdf_label.extend_from_slice(context);
+    hkdf_label
+}
+
 /// HKDF-Expand-Label (TLS 1.3, RFC 8446 §7.1): expand with a structured
 /// `HkdfLabel { length, "tls13 " || label, context }`. The transcript hash is
 /// the `context` - this is how a TLS 1.3 key schedule binds keys to the
@@ -80,14 +97,23 @@ pub fn hkdf_expand_label(
     context: &[u8],
     out: &mut [u8],
 ) -> Result<(), OutputTooLong> {
-    let mut full = Vec::with_capacity(6 + label.len());
-    full.extend_from_slice(b"tls13 ");
-    full.extend_from_slice(label);
-    let mut hkdf_label = Vec::with_capacity(2 + 1 + full.len() + 1 + context.len());
-    hkdf_label.extend_from_slice(&(out.len() as u16).to_be_bytes());
-    hkdf_label.push(full.len() as u8);
-    hkdf_label.extend_from_slice(&full);
-    hkdf_label.push(context.len() as u8);
-    hkdf_label.extend_from_slice(context);
+    let hkdf_label = hkdf_label_bytes(label, context, out.len() as u16);
     hkdf_expand(prk, &hkdf_label, out)
+}
+
+/// HKDF-Expand-Label directly from raw secret bytes. In the TLS 1.3 key schedule
+/// a derived secret is itself the PRK for the next Expand-Label (e.g. the
+/// handshake secret expands the client/server traffic secrets), so the caller
+/// holds a 32-byte secret rather than a [`Prk`] carrying HKDF-Extract state. Same
+/// structured label as [`hkdf_expand_label`]. Fails if `secret` is shorter than
+/// `HashLen` or `out` exceeds `255 * HashLen`.
+pub fn hkdf_expand_label_secret(
+    secret: &[u8],
+    label: &[u8],
+    context: &[u8],
+    out: &mut [u8],
+) -> Result<(), OutputTooLong> {
+    let hk = Hkdf::<Sha256>::from_prk(secret).map_err(|_| OutputTooLong)?;
+    let hkdf_label = hkdf_label_bytes(label, context, out.len() as u16);
+    hk.expand(&hkdf_label, out).map_err(|_| OutputTooLong)
 }

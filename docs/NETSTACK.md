@@ -6,9 +6,11 @@ local sockets** (native `net::local` + Linux AF_UNIX), **N2a's native TCP core**
 **N2b's congestion control** (Reno + CUBIC), **N2c's two transports** (the smoltcp
 blessed cell + the native sharded framing - §13), the **L8-INET** personality
 slice (AF_INET/AF_INET6 sockets + a minimal epoll over the **loopback** interface -
-§10(C), docs/LINUX-COMPAT.md), and **N3a's crypto primitive layer** (from-scratch
+§10(C), docs/LINUX-COMPAT.md), **N3a's crypto primitive layer** (from-scratch
 ChaCha20-Poly1305 + doc-named RustCrypto SHA-2/HKDF/X25519/Ed25519/AES-GCM, each
-RFC/NIST-vector-proven - §14) are done; the full
+RFC/NIST-vector-proven - §14), and **N3b's TLS 1.3** (a from-scratch handshake +
+record layer + minimal X.509 over N3a, proven byte-for-byte against the RFC 8448
+known-answer trace - §15) are done; the full
 roadmap (N1-N8) is below. This document is the architecture + roadmap + crypto posture;
 `docs/NETWORKING.md` holds the doctrine (the kernel owns queue plumbing + grant
 checks + steering, and no network stack).
@@ -123,6 +125,10 @@ surface.
   `polyval_force_soft`, `curve25519_dalek_backend="serial"`, applied uniformly on
   all three ISAs) - the scalar portable path this posture wants anyway. No crate
   needed a from-scratch fallback; all five are crate-backed as named.
+- **TLS 1.3 (N3b, §15) added no new pinned crate**: the handshake, key schedule,
+  record layer, and minimal X.509 are **from-scratch over the N3a primitives**
+  (the architecture choice, §15) - rustls was evaluated and set aside. So the
+  pinned inventory above is unchanged by N3b.
 - **Two randomness classes, never conflated** (mixing them is a silent
   nonce-reuse break): the ChaCha20 fast DRBG is for **non-secret** randomness only
   (cookies, DNS transaction ids, hash seeds, backoff jitter). **Protocol key
@@ -202,8 +208,10 @@ kernels stay green.
     against its RFC/NIST test vector on 3 ISAs: from-scratch ChaCha20-Poly1305 +
     doc-named RustCrypto SHA-2 / HKDF / X25519 / Ed25519 / AES-GCM, the
     two-randomness-class API, and the nonce-reuse guard.
-  - **N3b: the TLS 1.3 handshake + record layer + X.509** over N3a's primitives,
-    then an HTTPS GET.
+  - **N3b (done): the TLS 1.3 handshake + record layer + minimal X.509** over
+    N3a's primitives (§15). From-scratch (not rustls); the key schedule / record
+    layer / handshake / Ed25519-X.509 are proven byte-for-byte against the RFC
+    8448 known-answer trace. HTTPS-live is deferred (N3c/N4).
 - **N4 - Service-cell model + fan-out + host services** (DHCP + zeroconf + NTP).
 - **N5 - App protocols.** HTTP/2, gRPC, Arrow Flight (warehouse), Kafka.
 - **N6 - Perf substrate.** NIC RX IRQ, zero-copy DMA + offload/multiqueue/RSS,
@@ -1090,3 +1098,170 @@ layer (§3). Constant-time review of the from-scratch Poly1305/ChaCha20 against 
 hardware side-channel model, and the arch crypto-instruction dispatch
 (AES-NI/VAES/ARM-CE/RISC-V-vector, with the scalar path as the always-present
 fallback and benchmark), ride with the perf substrate (N6/N8).
+
+## 15. Phase N3b (done): TLS 1.3 - handshake + record layer + minimal X.509
+
+N3b builds a working **TLS 1.3** (RFC 8446) client - and enough server side to
+prove an in-cell handshake - on the N3a crypto primitives (§14). It adds **no
+kernel object, no verb, no kernel change** (TLS is pure userspace), **no
+`cfg(target_arch)`**, and **no new dependency** (it is from-scratch over N3a, so
+the pinned crate inventory in §3 is unchanged). Everything is behind the `net`
+crate's `tls` feature (which implies `crypto`), off by default and built
+separately by xtask with the same force-soft backend cfgs as the crypto demo, so
+the base stack + every existing test are unaffected.
+
+### The architecture choice: from-scratch, not rustls (documented)
+
+The plan named two paths - lean on `rustls` `no_std`, or build a minimal TLS 1.3
+from scratch. A bounded rustls probe was run first: **rustls `=0.23.42` does build
+`no_std`** for `riscv64gc-unknown-none-elf` with
+`default-features = false, features = ["tls12","hashbrown","custom-provider"]`
+(its transitive tree - `rustls-pki-types`/`rustls-webpki`/`hashbrown`/`zeroize`/
+`subtle`/`untrusted` - is all `no_std`, and with `custom-provider` **`ring` is
+not pulled** into the target build). So rustls itself is not the blocker.
+
+It was set aside for three concrete reasons, all fatal to *this phase's proof*:
+
+1. **The RFC 8448 KAT needs the intermediate key-schedule secrets**, and rustls'
+   public API does not expose the early/handshake/master or per-stage traffic
+   secrets - the very values the known-answer test checks. A from-scratch key
+   schedule *is* what the KAT proves.
+2. **rustls generates its own ephemerals**, so it cannot be driven with RFC 8448's
+   fixed X25519 private keys to reproduce the trace.
+3. **A full custom `CryptoProvider`** (cipher suites, key exchange, AEAD, HKDF,
+   signature verify) would be needed to wire N3a's primitives into rustls - a
+   large trait-glue surface for no proof benefit.
+
+Given N3a already proved every primitive builds `no_std` and vector-matches, a
+focused from-scratch TLS 1.3 over them gives full control and directly exercises
+the key schedule the KAT pins. rustls (or a rustls-class stack) remains a
+doc-named option for a *later* full client/server with session resumption / the
+whole extension surface - N3c/N4.
+
+### What the `net` crate adds (`net::tls`, feature `tls`)
+
+- **`keyschedule`** - the RFC 8446 §7.1 key schedule over N3a's HKDF: `early_secret`
+  -> `handshake_secret` (salt = `Derive-Secret(Early,"derived","")`, IKM = the
+  X25519 ECDHE) -> `master_secret`; `derive_secret` = HKDF-Expand-Label over the
+  transcript hash; `traffic_key`/`traffic_iv` (the `"key"`/`"iv"` labels);
+  `finished_key` + `verify_data` (`"finished"` + an **HMAC-SHA256 built from
+  scratch** over the audited `sha2` - the only MAC beyond HKDF and Poly1305).
+  SHA-256 suites only (`HASH_LEN = 32`); a SHA-384 suite is deferred.
+- **`record`** - the RFC 8446 §5 record layer: `RecordKeys` owns the AEAD + write
+  IV + a per-direction **sequence counter**, and constructs the **per-record nonce
+  = write_iv XOR (0-left-padded 64-bit seq)** (the classic footgun, done in one
+  place). It frames `TLSCiphertext { opaque_type=23, 0x0303, length,
+  AEAD(inner_plaintext) }` with the 5-byte header as AEAD additional data, and the
+  `content || real_content_type || padding` inner-plaintext discipline. Both AEADs
+  ride through the N3a `Aead` seam (a `Box<dyn Aead>`).
+- **`msg`** - ClientHello/ServerHello build + parse (`key_share` X25519,
+  `supported_versions` TLS 1.3, `supported_groups`, `signature_algorithms`), the
+  generic handshake-message header framing, and the running `Transcript` (the
+  SHA-256 over the concatenated handshake messages - kept as raw bytes so any
+  prefix hash is one `sha256`, clearer than snapshotting an incremental hasher).
+- **`x509`** - a from-scratch minimal DER walk: it extracts the signed
+  `tbsCertificate` bytes, the **Ed25519 SubjectPublicKeyInfo** (OID 1.3.101.112),
+  and the outer `signatureValue`, and verifies the certificate's Ed25519 signature
+  (constant-time via `ed25519-dalek`'s strict verify). **Full chain / path / name
+  validation is DEFERRED** (see below).
+- **`handshake`** - `run_handshake(suite, ServerIdentity)`: a full 1-RTT handshake
+  driven in-cell (client + server endpoints) - ClientHello/ServerHello, matching
+  handshake + application traffic keys via the key schedule, then the authenticated
+  flight (EncryptedExtensions / Certificate / CertificateVerify (Ed25519) / server
+  Finished) over the record AEAD, the client verifying the cert signature, the
+  CertificateVerify signature, and the server Finished, then its own Finished for
+  the server to verify.
+
+### Cipher suites / groups / signatures
+
+- **Cipher suites**: `TLS_AES_128_GCM_SHA256` (0x1301) and
+  `TLS_CHACHA20_POLY1305_SHA256` (0x1303) - the two mandatory-to-implement
+  SHA-256 suites, both riding the N3a AEADs.
+- **Groups**: `x25519` (0x001d).
+- **Signatures**: `ed25519` (0x0807) for CertificateVerify and the certificate.
+  ECDSA (`secp256r1`) and RSA are deferred (no RSA/ECDSA-verify primitive in N3a).
+
+### The per-record nonce (correctness-critical)
+
+RFC 8446 §5.3: the 64-bit record sequence number is encoded big-endian, **left-
+padded with zeros to the 12-byte IV length**, and **XORed into the static write
+IV**; the sequence resets to 0 when the keys change (handshake -> application).
+`RecordKeys::nonce` does exactly this (the IV's high 4 bytes are never touched),
+and the sequence advances per record - and, on decrypt, **only on a successful
+open**, so a rejected record does not desynchronise the counter. Getting this
+wrong is a classic silent break; it is pinned indirectly by the RFC 8448 write
+keys/IVs matching and directly by the in-cell round trip + tamper test.
+
+### keys-as-capabilities (API-level)
+
+The negotiated traffic keys live inside `record::RecordKeys` (and the N3a
+`aead::SealingKey`) with **no getter that returns the raw key bytes** - the
+application seals/opens through the object but cannot extract the key material.
+This is the *API shape* of keys-as-capabilities. The full mechanism - a key
+**programmed into a NIC TX/RX queue as a capability, never readable back**, with
+encrypted zero-copy fetch - is **N8** (§5); N3b establishes the non-extractable
+key handle as the seam N8 hardens.
+
+### Minimal X.509 scope + why it is enough here (documented)
+
+`x509::parse` does a **minimal** DER walk - `tbsCertificate` + Ed25519 SPKI +
+`signatureValue` + a signature verify. **Deferred (explicit)**: issuer-chain / path
+building, validity-date checks, name / SAN matching, basicConstraints / EKU /
+key-usage enforcement, and ECDSA/RSA SPKIs. This is **sufficient for the downstream
+Tor/onion consumer**, which validates peer identity **out of band** (the onion
+descriptor's own signature over the service identity key), so a full PKI path is
+not the trust anchor on that route - only that the CertificateVerify was signed by
+the presented key, which N3b proves.
+
+### The proof (`nettls` test kernel, all 3 ISAs)
+
+A `nettls-demo` cell (loaded like `netcrypto` - pure compute, **no netdev**) proves
+TLS 1.3 three ways, exiting `0x42` only if all pass:
+
+1. **RFC 8448 §3 known-answer test (the authoritative TLS 1.3 oracle).** Fed the
+   RFC's own ClientHello/ServerHello bytes + X25519 private/public keys, the key
+   schedule derives the RFC's values **byte-for-byte**: the ECDHE secret (both
+   directions), the transcript hashes (`SHA-256(CH‖SH)` and `SHA-256(CH‖SH‖server
+   flight)`, computed from the message bytes, not taken from the RFC), the Early /
+   Handshake / Master secrets, the client & server **handshake** and **application**
+   traffic secrets, the exporter-master secret, the handshake + application **write
+   keys and IVs**, and both Finished **verify_data** MACs. Every expected value was
+   fetched from the authoritative RFC 8448 text (not recalled) and is hardcoded as
+   the answer, never computed by the code under test.
+2. **In-cell full 1-RTT handshake**, for **both** cipher suites: a client and
+   server endpoint complete a handshake, derive **matching** traffic keys
+   (asserted equal on both sides), exchange an encrypted application record **both
+   directions** (plaintext round-trips exactly), and a **tampered record fails**
+   the AEAD (returns an error, does not decrypt). The server authenticates with a
+   real Ed25519 certificate; the client verifies the cert signature, the
+   CertificateVerify signature, and the server Finished, then sends its own
+   Finished which the server verifies.
+3. **Minimal X.509**: a known Ed25519 self-signed test certificate (generated once
+   by `openssl req -x509 -newkey ed25519`, hardcoded as DER - a real cert, not
+   committed as a fixture) is parsed, its subject public key extracted and its
+   Ed25519 signature **verified (pass)**, and a **tampered tbsCertificate is
+   rejected (fail)**.
+
+No kernel object / verb / kernel change; TLS is a doc-named-crate-free from-scratch
+userspace layer (the N3a crates it reuses were already pinned); no
+`cfg(target_arch)`. On x86-64 the `tls` build uses the same force-soft AES/GHASH/
+curve25519 backend cfgs as the crypto demo (the intrinsics backends miscompile
+under LLVM on `x86_64-unknown-none`, §3).
+
+### Deferred past N3b (explicit)
+
+- **TLS 1.2** (a separate handshake + record construction) - not built.
+- **Full X.509 chain / path / name validation** (above) and ECDSA/RSA cert
+  signatures - deferred; minimal Ed25519 signature verify is the deliverable.
+- **Live HTTPS over the network** - deferred (N3c/N4): SLIRP has no deterministic
+  TLS server to handshake against (the same reason N2a/N2b deferred a live TCP
+  peer), so a live handshake would be non-deterministic; faking one would be
+  dishonest. The in-cell handshake + the RFC 8448 KAT are the real proof. A live
+  HTTPS GET rides in with the N4 service-cell model / an external peer at the
+  hardware lab.
+- **Key update** (`KeyUpdate` post-handshake rekey), **0-RTT / early data**,
+  **session resumption / PSK / tickets**, **HelloRetryRequest**, client
+  authentication, and the wider extension surface (ALPN, SNI parsing, etc.) - all
+  deferred; N3b is the 1-RTT handshake + record layer + minimal X.509 slice.
+- **WireGuard / IPsec** remain the N7 security-transport work (the N3a primitives
+  and this key-schedule/record machinery are the shared foundation).
