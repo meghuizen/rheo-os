@@ -94,7 +94,7 @@ async fn run() {
     // 3. Poll for the ARP reply (skipping any unrelated broadcast traffic).
     let mut buf = [0u8; 1600];
     for _ in 0..RX_RETRIES {
-        match net::recv(&mut buf).await {
+        match net::try_recv(&mut buf).await {
             Ok(0) => continue, // nothing yet - poll again
             Ok(n) if is_gateway_arp_reply(&buf[..n]) => {
                 println!(

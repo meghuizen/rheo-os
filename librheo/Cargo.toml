@@ -68,6 +68,13 @@ path = "src/bin/lrsh.rs"
 name = "librheo-net"
 path = "src/bin/librheo-net.rs"
 
+# rheo-net N2d (docs/NETSTACK.md, the async-receive path): true async receive -
+# the receiving strand parks on the reactor's network slot and the kernel idles at
+# WFI until the NIC's RX interrupt delivers a real frame.
+[[bin]]
+name = "librheo-netwait"
+path = "src/bin/librheo-netwait.rs"
+
 # Phase H: a real GPU scanout over a virtio-gpu 2D driver (present round trip).
 [[bin]]
 name = "librheo-gpu"

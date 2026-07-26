@@ -69,6 +69,12 @@ pub const SYS_SPAWN: u64 = 45;
 pub const SYS_WAIT: u64 = 46;
 /// arm_timer(deadline_ns) -> 0. Block until `deadline_ns` monotonic ns elapse.
 pub const SYS_ARM_TIMER: u64 = 47;
+/// wait_net(buf_va, len, timeout_ns) -> frame_len. Block until a received Ethernet
+/// frame is available; copy up to `len` bytes into `buf` and return the frame
+/// length (0 = gave up / timed out). `timeout_ns` 0 waits indefinitely. The network
+/// twin of [`SYS_WAIT_INPUT`] (docs/NETSTACK.md, the async-receive path / rheo-net
+/// N2d); `net::recv` builds on it.
+pub const SYS_WAIT_NET: u64 = 48;
 /// uptime() -> monotonic tick reading (SYS_UPTIME). `time` converts to ns.
 pub const SYS_UPTIME: u64 = 7;
 
@@ -354,6 +360,14 @@ pub fn random_u64() -> u64 {
 /// (WFI where the UART RX interrupt is wired, poll otherwise) while blocked.
 pub fn wait_input(buf: *mut u8, len: usize) -> usize {
     unsafe { syscall2(SYS_WAIT_INPUT, buf as u64, len as u64) as usize }
+}
+/// Block until a received Ethernet frame is available; copy up to `len` bytes of
+/// it into `buf` and return the frame length (0 = the kernel gave up: no NIC, the
+/// `timeout_ns` deadline elapsed, or the bounded poll fallback expired).
+/// `timeout_ns` 0 waits indefinitely. The kernel idles at WFI where the NIC's RX
+/// interrupt is wired, and polls otherwise (docs/NETSTACK.md per-ISA table).
+pub fn wait_net(buf: *mut u8, len: usize, timeout_ns: u64) -> usize {
+    unsafe { syscall3(SYS_WAIT_NET, buf as u64, len as u64, timeout_ns) as usize }
 }
 /// Ring the doorbell; returns the number of completions produced.
 pub fn doorbell() -> usize {

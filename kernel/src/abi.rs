@@ -208,6 +208,25 @@ pub const SYS_RESERVE_RELEASE: u64 = 41;
 /// not lost. librheo's `term` builds its async input on this.
 pub const SYS_WAIT_INPUT: u64 = 42;
 
+/// wait_net(buf_va, len, timeout_ns) -> frame_len. **Block** until a received
+/// Ethernet frame is available on the NIC, copy up to `len` bytes of it into the
+/// cell buffer at `buf_va`, and return the frame length (0 = the wait gave up: no
+/// NIC, the timeout elapsed, or the bounded poll fallback expired). `timeout_ns`
+/// of 0 waits indefinitely; a non-zero deadline is what a transport needs for a
+/// retransmission timeout ("a frame, or the RTO, whichever comes first") - where
+/// both the NIC and the timer interrupt are wired the kernel arms the deadline and
+/// halts once, waking on either. The network twin of [`SYS_WAIT_INPUT`]
+/// (docs/NETSTACK.md the async-receive path, rheo-net N2d): a cell whose only
+/// pending work is "a packet arrives" parks here and the kernel idles at WFI
+/// until the NIC's RX interrupt fires, instead of the cell re-submitting
+/// `OP_NET_RX` in a spin.
+///
+/// Mechanism only - it adds **no kernel object** (ARCHITECTURE.md 6): it exposes
+/// the same virtio-net driver the `OP_NET_*` queue opcodes bridge to, with the
+/// `SYS_WAIT_INPUT` block-and-wake shape. The per-ISA interrupt wiring lives in
+/// `kernel/src/arch`; the portable wait + the counters are `kernel/src/net_rx.rs`.
+pub const SYS_WAIT_NET: u64 = 48;
+
 // ---- services & IPC: cross-cell connect + buffer-grant passing
 // (docs/LIBRHEO.md Phase E, docs/IO.md 6, docs/ARCHITECTURE.md 3 objects 2/3/5) ----
 //

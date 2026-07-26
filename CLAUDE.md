@@ -578,6 +578,42 @@ attach, set-scanout, transfer, flush). No claim of visible output; the 2D scanou
 command round-trip + compositor present wiring is the deliverable. **librheo A-H
 is complete.**
 
+**rheo-net N2d** (docs/NETSTACK.md 16) makes the network **receive** side as async
+as the send side - the OS's **third interrupt source**. Before it,
+`librheo::net::recv` was a re-poll (`OP_NET_RX` returned "nothing available" and the
+cell submitted it again), and the reactor had no network slot, so a cell waiting for
+a packet **spun a core**. Three pieces: **`SYS_WAIT_NET` (48)** - a park-until-frame
+verb in the shape of `SYS_WAIT_INPUT` (`kernel/src/net_rx.rs`, portable), mechanism
+only, **no new kernel object** (it exposes the same virtio-net driver the `OP_NET_*`
+opcodes bridge to), taking a `timeout_ns` deadline so a transport can wait for "a
+frame **or** the RTO, whichever comes first" (the per-ISA timer gained
+`timer_arm`/`timer_expired`/`timer_disarm`, and `timer_wait` is now built on them);
+a **NIC RX interrupt**, wired from the virtio-mmio slot the driver records
+(`arch::enable_virtio_net_irq`, opt-in like the Phase D UART IRQ, so the other 47
+kernels boot unchanged) - the handler ACKs the device
+(`InterruptStatus`/`InterruptACK`) and counts the arrival, the TX ring now sets
+`VRING_AVAIL_F_NO_INTERRUPT` (transmit stays polled), and on RISC-V
+`riscv_user_trap` now services a device interrupt taken **in U-mode** (S-mode
+interrupts are always enabled there) instead of reading it as a fault; and a
+**reactor network slot** (`net_rx_req` beside console/timer/wait/channel) so
+`net::recv`/`recv_timeout` **park** and wake on the frame, with `net::try_recv`
+keeping the non-blocking drain a batching transport needs. The kernel's RX ring
+*is* the receive virtqueue's 16 pre-posted device-DMA'd buffers (a second ring would
+only add a copy - documented). The `netwait` test proves it on **all three ISAs**: a
+cell parks on `net::recv`, is woken by SLIRP's **ARP reply**, parks again for a **TCP
+reset**, and finally parks with a 20 ms deadline on an empty queue; asserted are one
+reactor wakeup **per** receive (`rt::net_wakeups()` - one park + one wake, never N
+re-polls), a witness strand that ran **while** the receiver was parked, and
+kernel-side `net_rx::irq_count() > 0` + `did_idle()` on the interrupt-driven ISAs.
+Per-ISA honesty: **riscv64** (APLIC-S source `1+slot` in MSI mode -> IMSIC -> `sip.SEIP`)
+and **aarch64** (GICv3 SPI `16+slot`) are genuinely interrupt-driven and halt at
+`wfi` - a real 0%-CPU park; **x86-64 falls back to a bounded kernel poll** (its NIC
+is virtio-*pci* driven through the `VIRTIO_PCI_CAP_PCI_CFG` tunnel with no mapped
+BAR for an MSI-X table, and legacy INTx rides the same QEMU-TCG IOAPIC path that
+does not re-deliver - the cell still parks once, but the CPU spins, and both
+`interrupt_driven()`/`did_idle()` report false). MSI-X through the config tunnel,
+interrupt coalescing, and zero-copy receive are the documented next steps.
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
 proofs, and the hardware-lab performance numbers. **SMP** (docs/SMP.md,
@@ -647,7 +683,9 @@ kernel/       the no_std kernel library + boot demo bin
               (per-CPU state + a kernel SpinLock + RISC-V SBI-HSM secondary-hart
               bring-up - docs/SMP.md), input
               (kernel RX ring + the SYS_WAIT_INPUT park-until-input primitive -
-              docs/LIBRHEO.md Phase D), svc
+              docs/LIBRHEO.md Phase D), net_rx (the SYS_WAIT_NET
+              park-until-frame primitive + the NIC RX interrupt sink -
+              docs/NETSTACK.md 16), svc
               (shell/resource/POSIX-file syscalls), hw (ACPI/FDT/PCIe
               discovery + the machine Inventory; block BlockDevice trait +
               virtio_blk driver; virtio_net raw-frame NIC driver -
@@ -700,7 +738,11 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               F: native spawn/wait + one-shot timer + the lrsh shell + the
               embedded spine-only cell), librheonet (librheo Phase G: raw-frame
               networking - virtio-net driver + net::send/recv/mac, an ARP round
-              trip via SLIRP), librheogpu (librheo Phase H: a real GPU -
+              trip via SLIRP), netwait (rheo-net N2d: true async receive - the NIC
+              RX interrupt + SYS_WAIT_NET park; a cell parks on net::recv, wakes on
+              SLIRP's ARP reply + a TCP reset, then parks on a deadline, with one
+              reactor wakeup per receive and a genuine kernel idle-park on
+              riscv64/aarch64), librheogpu (librheo Phase H: a real GPU -
               virtio-gpu 2D driver + display::Scanout present, the create-2d/
               attach/set-scanout/transfer/flush round trip, headless-honest),
               librheoipc (librheo Phase J: symmetric async IPC - two cells
@@ -740,7 +782,8 @@ librheo/      the native userspace foundation library (docs/LIBRHEO.md):
               env + Phase J spawn_piped: a spawned child inherits the parent's
               channel as its stdout pipe)/time (Phase F clock + async
               sleep/timeout)/net (Phase G raw-frame
-              send/recv/mac over OP_NET_* - docs/NETWORKING.md) +
+              send/try_recv/mac over OP_NET_* + the N2d parking recv/recv_timeout
+              over SYS_WAIT_NET - docs/NETWORKING.md, docs/NETSTACK.md 16) +
               crt0 (feature-gated: default=full, --no-default-features=embedded
               spine) + the librheo-demo (Phase A), librheo-data (Phase B
               mini-DuckDB scan), librheo-compute (Phase C parallel compute + graph
@@ -748,7 +791,9 @@ librheo/      the native userspace foundation library (docs/LIBRHEO.md):
               compositor demo), Phase F: librheo-orch (spawn/wait/timer proof),
               lrsh (the librheo-native shell), librheo-echo/librheo-child (native
               coreutils it spawns), librheo-embed (the embedded spine-only cell),
-              librheo-net (Phase G ARP round trip over virtio-net), librheo-gpu
+              librheo-net (Phase G ARP round trip over virtio-net), librheo-netwait
+              (rheo-net N2d parked receive: woken by a real frame, then by a
+              deadline), librheo-gpu
               (Phase H virtio-gpu 2D present round trip), librheo-ipc (Phase J
               two-cell async Sender/Receiver ping-pong), and librheo-pipe/
               librheo-pipesrc (Phase J cross-cell stdout pipeline: a spawned

@@ -231,6 +231,56 @@ pub fn enable_uart_rx_irq() {
     }
 }
 
+// ------------------------------------------------- NIC receive interrupt
+// docs/NETSTACK.md (rheo-net N2d): the kernel's third interrupt source. QEMU arm
+// `virt` gives each of its 32 virtio-mmio transport slots an SPI (hw/arm/virt.c
+// irqmap `[VIRT_MMIO] = 16`, so slot i is SPI 16+i = INTID 48+i). The driver
+// records the slot it bound to; this enables that SPI in the same GICv3 the UART
+// and timer use. Opt-in (called only by the `netwait` test), so no other kernel is
+// affected.
+
+/// SPI of virtio-mmio slot 0 on QEMU arm `virt` (irqmap `[VIRT_MMIO] = 16`).
+const VIRTIO_MMIO_SPI_BASE: u32 = 16;
+
+static mut NET_IRQ_ENABLED: bool = false;
+static mut NET_INTID: u32 = 0;
+
+/// Whether the NIC receive interrupt is wired (false = the kernel's poll
+/// fallback, docs/NETSTACK.md).
+pub fn net_irq_enabled() -> bool {
+    // SAFETY: single CPU; set once before any cell runs.
+    unsafe { *core::ptr::addr_of!(NET_IRQ_ENABLED) }
+}
+
+/// Whether the NIC's interrupt is already pending in the distributor (so
+/// `idle_wait` services it without halting).
+pub fn net_irq_pending() -> bool {
+    if !net_irq_enabled() {
+        return false;
+    }
+    // SAFETY: single CPU; GICD_ISPENDR is a mapped GIC MMIO register.
+    let intid = unsafe { *core::ptr::addr_of!(NET_INTID) };
+    let n = (intid / 32) as usize;
+    mmio_r32(GICD_BASE + 0x0200 + 4 * n) & (1 << (intid % 32)) != 0
+}
+
+/// Bring up the virtio-net RX interrupt for transport `slot` (SPI 16+slot) in the
+/// GICv3. Returns whether it is wired. Called only by the `netwait` test path.
+pub fn enable_virtio_net_irq(slot: usize) -> bool {
+    if slot >= VIRTIO_MMIO_COUNT {
+        return false;
+    }
+    gic_init();
+    let intid = 32 + VIRTIO_MMIO_SPI_BASE + slot as u32;
+    gicd_enable_spi(intid);
+    // SAFETY: single CPU; set once before any cell runs.
+    unsafe {
+        *core::ptr::addr_of_mut!(NET_INTID) = intid;
+        *core::ptr::addr_of_mut!(NET_IRQ_ENABLED) = true;
+    }
+    true
+}
+
 /// Bring up the CNTV virtual timer interrupt (PPI 27). Called only by the Phase F
 /// test.
 pub fn enable_timer_irq() {
@@ -267,6 +317,11 @@ extern "C" fn aarch64_irq_handler() {
         } else if id == TIMER_INTID {
             // Mask the timer output so it stops asserting; timer_wait disarms.
             asm!("msr cntv_ctl_el0, {0}", in(reg) 0b11u64); // ENABLE | IMASK
+        } else if *core::ptr::addr_of!(NET_IRQ_ENABLED) && id == *core::ptr::addr_of!(NET_INTID) {
+            // The NIC's receive line (docs/NETSTACK.md, rheo-net N2d): acknowledge
+            // the device (its line drops) + record the arrival. The frame stays in
+            // the receive virtqueue for the wait path to copy out.
+            crate::net_rx::on_irq();
         }
         if id < 1020 {
             asm!("msr S3_0_C12_C12_1, {0}", in(reg) intid); // ICC_EOIR1_EL1
@@ -305,10 +360,14 @@ pub fn uart_inject_and_wait(b: u8) {
     }
 }
 
-/// Arm the CNTV virtual timer for `deadline_ns` from now and halt at `wfi` until
-/// it fires (a genuine 0%-CPU park). Called only when [`timer_irq_enabled`].
-pub fn timer_wait(deadline_ns: u64) {
-    // SAFETY: kernel context; generic-timer system registers + the wfi idle path.
+/// The CNTVCT deadline the timer is currently armed for (0 = disarmed).
+static mut TIMER_TARGET: u64 = 0;
+
+/// Arm the CNTV virtual timer for `deadline_ns` from now, without waiting. Pair
+/// with [`timer_expired`] + [`timer_disarm`] to halt on the timer *and* another
+/// interrupt source (docs/NETSTACK.md: a receive with a deadline).
+pub fn timer_arm(deadline_ns: u64) {
+    // SAFETY: kernel context; generic-timer system registers.
     unsafe {
         let freq: u64;
         asm!("mrs {0}, cntfrq_el0", out(reg) freq);
@@ -318,18 +377,34 @@ pub fn timer_wait(deadline_ns: u64) {
         let target = now.wrapping_add(delta.max(1));
         asm!("msr cntv_cval_el0, {0}", in(reg) target); // compare value
         asm!("msr cntv_ctl_el0, {0}", "isb", in(reg) 1u64); // ENABLE, IMASK=0
-        loop {
-            let cur: u64;
-            asm!("mrs {0}, cntvct_el0", out(reg) cur);
-            if cur >= target {
-                break;
-            }
-            asm!("wfi");
-            asm!("msr daifclr, #2"); // take + service the pending IRQ (masks timer)
-            asm!("msr daifset, #2");
-        }
-        asm!("msr cntv_ctl_el0, xzr"); // disarm
+        *core::ptr::addr_of_mut!(TIMER_TARGET) = target;
     }
+}
+
+/// Whether the armed deadline has passed.
+pub fn timer_expired() -> bool {
+    // SAFETY: kernel context; reads the virtual counter + the recorded deadline.
+    unsafe {
+        let cur: u64;
+        asm!("mrs {0}, cntvct_el0", out(reg) cur);
+        cur >= *core::ptr::addr_of!(TIMER_TARGET)
+    }
+}
+
+/// Disarm the CNTV timer (its output stops asserting).
+pub fn timer_disarm() {
+    // SAFETY: kernel context; generic-timer control register.
+    unsafe { asm!("msr cntv_ctl_el0, xzr") };
+}
+
+/// Arm the CNTV virtual timer for `deadline_ns` from now and halt at `wfi` until
+/// it fires (a genuine 0%-CPU park). Called only when [`timer_irq_enabled`].
+pub fn timer_wait(deadline_ns: u64) {
+    timer_arm(deadline_ns);
+    while !timer_expired() {
+        idle_wait(); // wfi, then take + service the pending IRQ (masks the timer)
+    }
+    timer_disarm();
 }
 
 // ----------------------------------------------------------------- traps

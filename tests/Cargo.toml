@@ -140,6 +140,10 @@ name = "librheonet"
 path = "src/librheonet.rs"
 
 [[bin]]
+name = "netwait"
+path = "src/netwait.rs"
+
+[[bin]]
 name = "librheogpu"
 path = "src/librheogpu.rs"
 

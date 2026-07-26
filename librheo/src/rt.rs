@@ -44,6 +44,18 @@ pub struct Reactor {
     /// completion is ready, by arming the kernel's one-shot deadline. Honors
     /// docs/POWER.md - the kernel waits only when a real deadline was requested.
     timer_req: Option<(u64, u64)>,
+    /// A pending network receive: `(buf_va, len, timeout_ns, token)` (docs/NETSTACK.md, the
+    /// async-receive path / rheo-net N2d). One reader at a time - a cell drives one
+    /// NIC receive queue. Serviced by `block_on` when no queue completion is ready,
+    /// by blocking in the kernel (`SYS_WAIT_NET`) until a frame arrives: where the
+    /// NIC's RX interrupt is wired the kernel idles at WFI, so a cell waiting for a
+    /// packet costs 0% CPU instead of re-submitting `OP_NET_RX` in a spin.
+    net_rx_req: Option<(u64, usize, u64, u64)>,
+    /// Frame length the last serviced network receive returned.
+    net_rx_n: usize,
+    /// Count of network receives the reactor delivered by a genuine park -> kernel
+    /// block -> wake. One per `net::recv`, never N re-polls: the no-spin proof.
+    net_wakeups: u64,
     /// A pending child wait: `(handle, token)` (docs/LIBRHEO.md Phase F). One
     /// outstanding at a time (a shell waits its children in sequence); serviced
     /// by `block_on` by blocking the parent in `SYS_WAIT` while its other strands
@@ -162,6 +174,30 @@ impl Reactor {
         self.wait_code
     }
 
+    /// Register a pending network receive (the strand parks on `token`).
+    fn set_net_rx(&mut self, buf: u64, len: usize, timeout_ns: u64, token: u64) {
+        self.net_rx_req = Some((buf, len, timeout_ns, token));
+    }
+
+    /// Service a pending network receive by **blocking in the kernel** until a
+    /// frame arrives, then wake its strand. Returns false if none was pending.
+    /// This is where a networked cell idles: the kernel halts at WFI (where the
+    /// NIC RX interrupt is wired) while every strand is parked.
+    fn service_net_rx(&mut self) -> bool {
+        if let Some((buf, len, timeout_ns, token)) = self.net_rx_req.take() {
+            self.net_rx_n = sys::wait_net(buf as *mut u8, len, timeout_ns);
+            self.net_wakeups += 1;
+            complete(token);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn net_rx_result(&self) -> usize {
+        self.net_rx_n
+    }
+
     /// Enqueue `(tag, val)` on this end's producer ring (the client's SQ, the
     /// server's CQ). `false` if the ring is momentarily full.
     fn chan_produce(&self, tag: u64, val: u32) -> bool {
@@ -269,6 +305,9 @@ pub fn init(caps: &CapSet, qp_va: u64) {
         timer_req: None,
         wait_req: None,
         wait_code: 0,
+        net_rx_req: None,
+        net_rx_n: 0,
+        net_wakeups: 0,
         chan: None,
         chan_recv_req: None,
         chan_recv_msg: None,
@@ -390,6 +429,33 @@ pub async fn chan_recv() -> (u64, u32) {
     with_reactor(|r| r.chan_recv_msg.take()).expect("librheo: channel recv woke with no message")
 }
 
+/// Block-and-wake network receive: register a request, park until the reactor
+/// services it (the kernel idles at WFI until the NIC's RX interrupt fires where
+/// it is wired, and polls otherwise), and return the frame length (0 = the wait
+/// gave up / the `timeout_ns` deadline elapsed - 0 waits indefinitely). The async
+/// receive substrate under `net::recv` (docs/NETSTACK.md, the
+/// async-receive path / rheo-net N2d): while this strand is parked the vcore runs
+/// the others, and only when they have all parked does the reactor block in the
+/// kernel for a frame - **one park and one wake per frame**, never a re-poll spin.
+///
+/// # Safety
+/// `buf` must point at `len` writable bytes that outlive the await (the kernel
+/// writes them during `SYS_WAIT_NET`).
+pub async fn recv_frame(buf: *mut u8, len: usize, timeout_ns: u64) -> usize {
+    let token = next_token();
+    with_reactor(|r| r.set_net_rx(buf as u64, len, timeout_ns, token));
+    park_on(token).await;
+    with_reactor(|r| r.net_rx_result())
+}
+
+/// How many network receives the reactor delivered by a genuine park -> kernel
+/// block -> wake (docs/NETSTACK.md, the async-receive path). A re-poll spin would
+/// register many `OP_NET_RX` submissions and never touch this; one wakeup per
+/// received frame is the proof that `net::recv` parks.
+pub fn net_wakeups() -> u64 {
+    with_reactor(|r| r.net_wakeups)
+}
+
 /// Async wait for a spawned child (docs/LIBRHEO.md Phase F): register the wait,
 /// park until the reactor blocks the parent in `SYS_WAIT` and the child exits,
 /// and return the child's exit code. While parked the vcore runs the other
@@ -422,6 +488,8 @@ pub fn block_on<F: Future<Output = ()> + 'static>(root: F) {
             guard = 0; // armed a one-shot deadline and woke its strand: progress
         } else if with_reactor(|r| r.service_wait()) {
             guard = 0; // blocked in SYS_WAIT for a child and woke its strand
+        } else if with_reactor(|r| r.service_net_rx()) {
+            guard = 0; // blocked in SYS_WAIT_NET for a frame and woke its strand
         } else if with_reactor(|r| r.service_channel()) {
             guard = 0; // delivered a channel message or handed the CPU to the peer
         } else {

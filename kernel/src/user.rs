@@ -15,7 +15,8 @@ use crate::abi::{
     ChannelInfo, GrantInfo, QueueInfo, ReserveInfo, SYS_ARM_TIMER, SYS_COMMIT, SYS_CONNECT,
     SYS_CYCLES, SYS_DECOMMIT, SYS_DOORBELL, SYS_EXIT, SYS_EXIT_GROUP, SYS_GRANT, SYS_GRANT_SHARE,
     SYS_MMAP, SYS_MMAP_FILE, SYS_MUNMAP, SYS_QUEUE_INFO, SYS_RESERVE_ADMIT, SYS_RESERVE_QUERY,
-    SYS_RESERVE_RELEASE, SYS_SEAL, SYS_SPAWN, SYS_SWITCH, SYS_WAIT, SYS_WAIT_INPUT, ShareInfo,
+    SYS_RESERVE_RELEASE, SYS_SEAL, SYS_SPAWN, SYS_SWITCH, SYS_WAIT, SYS_WAIT_INPUT, SYS_WAIT_NET,
+    ShareInfo,
 };
 use crate::arch::{self, FaultCause, MapPerm, TrapFrame, TrapKind};
 use crate::capability::{
@@ -1175,6 +1176,14 @@ pub fn on_user_trap(
         // RX interrupt is wired, poll otherwise) until a byte arrives.
         SYS_WAIT_INPUT => {
             let n = crate::input::wait_input(args[0], args[1] as usize);
+            arch::set_syscall_ret(unsafe { &mut *frame }, n as u64);
+            frame
+        }
+        // Block until a received Ethernet frame is available (docs/NETSTACK.md,
+        // rheo-net N2d) - the network twin of SYS_WAIT_INPUT. The kernel idles at
+        // WFI where the NIC's RX interrupt is wired, and polls (bounded) otherwise.
+        SYS_WAIT_NET => {
+            let n = crate::net_rx::wait_frame(args[0], args[1] as usize, args[2]);
             arch::set_syscall_ret(unsafe { &mut *frame }, n as u64);
             frame
         }

@@ -786,8 +786,9 @@ its queue; a transport library layers on top.
   `VIRTIO_NET_F_MAC`; no mergeable-rx-buffers, no checksum/GSO offload), an **RX**
   and a **TX** split virtqueue, the 12-byte v1 `virtio_net_hdr`, and the MAC read
   from device config. DMA uses **physical** addresses (`virt_to_phys`) - the rings
-  and buffers live in kernel RAM reached through the linear map. Polled (a device
-  RX interrupt is a later refinement, like virtio-blk).
+  and buffers live in kernel RAM reached through the linear map. Polled at Phase G;
+  the **device RX interrupt landed later** in rheo-net N2d (docs/NETSTACK.md §16) -
+  receive is interrupt-driven on riscv/arm, a kernel-side poll on x86-64.
 - Three **queue opcodes** (`OP_NET_TX`/`OP_NET_RX`/`OP_NET_MAC`, no new kernel
   object) bridge a cell's async submissions to the driver in `kernel_process`,
   completing with the strand token - the same async model as the Phase B `io`
@@ -797,9 +798,13 @@ its queue; a transport library layers on top.
 
 ### librheo module (Phase G)
 
-`net` is now a real async surface: `mac()`, `send(frame)`, `recv(buf) -> len`
-(len 0 = no packet, the polled RX path - a device-IRQ wake is the refinement).
+`net` is now a real async surface: `mac()`, `send(frame)`, `try_recv(buf) -> len`
+(len 0 = no packet - the non-blocking drain a batching transport uses).
 `connect`/`listen` stay `Unsupported` stubs - a socket/IP/TCP layer is a service.
+Phase G's receive was a re-poll; **rheo-net N2d** (docs/NETSTACK.md §16) added the
+NIC RX interrupt, the `SYS_WAIT_NET` park verb and a reactor network slot, so
+`recv`/`recv_timeout` now **park** and are woken by the frame (or a deadline) -
+the receive side is as async as the send side.
 
 ### Proof + honesty (Phase G)
 
@@ -809,8 +814,9 @@ MAC, sends a **broadcast ARP request** for the SLIRP gateway `10.0.2.2`, and
 QEMU `-netdev user` - asserting the reply's ethertype + opcode + sender IP and
 exiting `0x42`. Honest deferrals: the **full transport stack** (IP/ARP-cache/TCP/
 QUIC/TLS as a library in a cell), a first-class **socket** `ObjectKind` + steering
-grants, **header/payload split**, and the **device RX interrupt** - all documented
-in docs/NETWORKING.md. The mechanism (a NIC driver + typed async raw-frame queue
+grants and **header/payload split** - documented in docs/NETWORKING.md. (The
+**device RX interrupt**, deferred here, was built in rheo-net N2d, §16 of
+docs/NETSTACK.md: interrupt-driven on riscv/arm, poll on x86-64.) The mechanism (a NIC driver + typed async raw-frame queue
 opcodes) is the deliverable; the stack rides on it.
 
 ## Phase H - a real GPU: virtio-gpu 2D driver + compositor scanout
@@ -1002,7 +1008,10 @@ What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
   console block-and-wake (**a genuine 0%-CPU WFI park on riscv64**), `Child::wait`
   and `time::sleep` as reactor-serviced parks (the parent's other strands run
   until quiescent, then the cell blocks), and the Phase G `net` **raw-frame
-  send/recv** (`OP_NET_*` completions over a real virtio-net NIC; RX is polled).
+  send/recv** (`OP_NET_*` completions over a real virtio-net NIC) - whose
+  **receive now parks too** (rheo-net N2d: the NIC RX interrupt + `SYS_WAIT_NET` +
+  a reactor network slot; a genuine WFI park on riscv64/aarch64, a bounded kernel
+  poll on x86-64 - docs/NETSTACK.md §16).
 - **Sync-translated / cooperative** (single-CPU, honest): the **timer is now
   interrupt-driven on all three ISAs** (riscv Sstc, aarch64 CNTV, x86-64 LAPIC LVT
   - a genuine 0%-CPU park); the cross-cell IPC channel now has a **fully symmetric
@@ -1013,7 +1022,11 @@ What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
   real and refuses over-commit) but not yet **scheduled** (run-queue enforcement is
   SMP work); the **console UART RX is interrupt-driven on riscv64 (AIA) and aarch64
   (GICv3)** - a genuine `wfi` park - and stays a **poll on x86-64** (its QEMU TCG +
-  split-irqchip IOAPIC/LAPIC does not re-deliver reliably; documented, honest).
+  split-irqchip IOAPIC/LAPIC does not re-deliver reliably; documented, honest); the
+  **NIC receive line** (rheo-net N2d) is the third interrupt source and splits the
+  same way - interrupt-driven on riscv64 (APLIC->IMSIC) and aarch64 (GICv3 SPI),
+  a bounded kernel poll on x86-64 (its virtio-pci NIC is driven through the config
+  tunnel with no mapped BAR for an MSI-X table).
 - **Deferred (documented)**: **real VIRGL/3D + the full display pipeline** (Phase
   H lands the virtio-gpu 2D scanout round-trip - create-2d/attach/set-scanout/
   transfer/flush + `display::Scanout` present; the cursor plane, multi-scanout,

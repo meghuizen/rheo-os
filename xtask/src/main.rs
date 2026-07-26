@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 47] = [
+const TEST_KERNELS: [&str; 48] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -54,6 +54,7 @@ const TEST_KERNELS: [&str; 47] = [
     "linuxdyn",
     "librheoproc",
     "librheonet",
+    "netwait",
     "librheogpu",
     "librheoipc",
     "librheopipe",
@@ -125,6 +126,25 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "virtio-net-device,netdev=n0",
         ],
         ("librheonet", Arch::X86_64) => &[
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-pci,netdev=n0,disable-legacy=on",
+        ],
+        // netwait (docs/NETSTACK.md, the async-receive path / rheo-net N2d): the
+        // same SLIRP + virtio-net setup as librheonet - the ARP reply is now the
+        // wake event for a *parked* receive (the cell blocks in SYS_WAIT_NET and,
+        // on riscv/arm, the kernel idles at WFI until the NIC's RX interrupt
+        // fires). Deterministic + network-free. Same two transports.
+        ("netwait", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-device,netdev=n0",
+        ],
+        ("netwait", Arch::X86_64) => &[
             "-netdev",
             "user,id=n0",
             "-device",

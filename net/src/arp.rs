@@ -178,7 +178,7 @@ impl ArpCache {
     }
 }
 
-/// The retry budget for [`resolve`]'s RX poll. Each `net::recv` is a doorbell (a
+/// The retry budget for [`resolve`]'s RX poll. Each `net::try_recv` is a doorbell (a
 /// VM exit that lets QEMU's SLIRP backend run), so a reply lands within a handful
 /// of iterations; the cap only guards a wholly non-delivering backend. Bounded
 /// retries keep the proof deterministic under QEMU; a wall-clock timeout via
@@ -196,7 +196,7 @@ pub enum ResolveError {
 
 /// Resolve `target_ip` to a MAC on the local link (docs/NETSTACK.md L2). Returns
 /// a cached entry immediately; otherwise broadcasts an ARP request through
-/// [`build_request`] + `librheo::net::send`, polls `net::recv` for the reply
+/// [`build_request`] + `librheo::net::send`, polls `net::try_recv` for the reply
 /// (parsing via [`eth::Frame`] + [`ArpPacket::parse`]), inserts it into `cache`,
 /// and returns the MAC. Bounded by [`RESOLVE_RETRIES`].
 pub async fn resolve(
@@ -214,7 +214,9 @@ pub async fn resolve(
 
     let mut buf = [0u8; 1600];
     for _ in 0..RESOLVE_RETRIES {
-        let n = net::recv(&mut buf).await.map_err(|_| ResolveError::Net)?;
+        let n = net::try_recv(&mut buf)
+            .await
+            .map_err(|_| ResolveError::Net)?;
         if n == 0 {
             continue; // nothing yet - poll again
         }

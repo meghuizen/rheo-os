@@ -54,6 +54,12 @@ const QUEUE_DRIVER_HIGH: usize = 0x094;
 const QUEUE_DEVICE_LOW: usize = 0x0a0;
 const QUEUE_DEVICE_HIGH: usize = 0x0a4;
 const CONFIG: usize = 0x100;
+// Interrupt status / acknowledge (virtio-mmio 4.2.2). Bit 0 = "used buffer
+// notification" - the device raised its line because a queue completed. The
+// handler must write the bits back to ACK, or the (level-triggered) line stays
+// asserted (docs/NETSTACK.md, rheo-net N2d).
+const INTERRUPT_STATUS: usize = 0x060;
+const INTERRUPT_ACK: usize = 0x064;
 
 const MAGIC_VALUE: u32 = 0x7472_6976; // "virt"
 const DEV_NET: u32 = 1; // virtio device type 1 = network
@@ -67,6 +73,13 @@ const S_FEATURES_OK: u32 = 8;
 // Descriptor flags. Both RX and TX use single (unchained) descriptors, so only
 // the device-writable flag is needed (no VRING_DESC_F_NEXT).
 const VRING_DESC_F_WRITE: u16 = 2;
+
+/// `avail.flags`: "do not interrupt me when you consume these" (virtio 2.7.7).
+/// Set on the **TX** ring - transmit completions are polled in `send_frame`, so
+/// their interrupts would only be spurious wakeups. The **RX** ring leaves it
+/// clear, which is what asks the device to raise its line on a received frame
+/// (docs/NETSTACK.md, rheo-net N2d).
+const VRING_AVAIL_F_NO_INTERRUPT: u16 = 1;
 
 // Feature bits we drive. VIRTIO_NET_F_MAC = bit 5 (feature select 0);
 // VIRTIO_F_VERSION_1 = bit 32 (feature select 1, bit 0).
@@ -231,7 +244,13 @@ impl PciXport {
 /// How a discovered device is reached (transport-specific register access +
 /// per-queue notify).
 enum Transport {
-    Mmio { base: usize },
+    /// virtio-mmio, with the transport-bus **slot** the device was found in.
+    /// The slot is a portable fact; turning it into an interrupt id is per-ISA
+    /// (`arch::enable_virtio_net_irq`), which is why it is carried here.
+    Mmio {
+        base: usize,
+        slot: usize,
+    },
     Pci(PciXport),
 }
 
@@ -240,9 +259,26 @@ impl Transport {
     fn notify(&self, qidx: u16) {
         match self {
             // SAFETY: `base` matched the virtio-mmio magic during probe.
-            Transport::Mmio { base } => unsafe { w32(*base, QUEUE_NOTIFY, qidx as u32) },
+            Transport::Mmio { base, .. } => unsafe { w32(*base, QUEUE_NOTIFY, qidx as u32) },
             // Modern notify: write the virtqueue index at the queue's notify off.
             Transport::Pci(p) => p.write(p.notify_bar, p.notify_off[qidx as usize], 2, qidx as u32),
+        }
+    }
+
+    /// Acknowledge a device interrupt: read the pending status and write it back
+    /// (virtio-mmio 4.2.2), which drops the device's interrupt line. virtio-pci
+    /// here is driven through the config tunnel with no interrupt wired
+    /// (docs/NETSTACK.md per-ISA table), so there is nothing to acknowledge.
+    fn ack_irq(&self) {
+        match self {
+            // SAFETY: `base` matched the virtio-mmio magic during probe.
+            Transport::Mmio { base, .. } => unsafe {
+                let status = r32(*base, INTERRUPT_STATUS);
+                if status != 0 {
+                    w32(*base, INTERRUPT_ACK, status);
+                }
+            },
+            Transport::Pci(_) => {}
         }
     }
 }
@@ -311,7 +347,7 @@ fn probe_mmio() -> Option<VirtioNet> {
             if r32(base, DEVICE_ID) != DEV_NET {
                 continue;
             }
-            if let Some(dev) = init_mmio(base) {
+            if let Some(dev) = init_mmio(base, slot) {
                 return Some(dev);
             }
         }
@@ -321,7 +357,7 @@ fn probe_mmio() -> Option<VirtioNet> {
 
 /// # Safety
 /// `base` must be a virtio-mmio net device that magic/version/id matched.
-unsafe fn init_mmio(base: usize) -> Option<VirtioNet> {
+unsafe fn init_mmio(base: usize, slot: usize) -> Option<VirtioNet> {
     unsafe {
         w32(base, STATUS, 0); // reset
         let mut status = S_ACK;
@@ -356,7 +392,7 @@ unsafe fn init_mmio(base: usize) -> Option<VirtioNet> {
         w32(base, STATUS, status);
 
         let mut dev = VirtioNet {
-            transport: Transport::Mmio { base },
+            transport: Transport::Mmio { base, slot },
             mac,
             rx_vq,
             tx_vq,
@@ -557,6 +593,16 @@ impl VirtioNet {
         self.mac
     }
 
+    /// The virtio-mmio transport-bus slot this device sits in, or `None` for a
+    /// virtio-pci device. `net_rx::enable_irq` turns it into a per-ISA interrupt
+    /// id (docs/NETSTACK.md, rheo-net N2d).
+    pub fn mmio_slot(&self) -> Option<usize> {
+        match self.transport {
+            Transport::Mmio { slot, .. } => Some(slot),
+            Transport::Pci(_) => None,
+        }
+    }
+
     #[inline]
     fn rx(&self) -> *mut VirtQueue {
         self.rx_vq as *mut VirtQueue
@@ -584,6 +630,12 @@ impl VirtioNet {
                 };
                 (*vq).avail.ring[i] = i as u16;
             }
+            // RX leaves avail.flags clear: that is what asks the device to raise
+            // its interrupt line when a frame lands (rheo-net N2d). TX sets
+            // NO_INTERRUPT - `send_frame` polls its completion, so a transmit
+            // interrupt would only be a spurious wakeup for the RX wait.
+            (*vq).avail.flags = 0;
+            (*self.tx()).avail.flags = VRING_AVAIL_F_NO_INTERRUPT;
             fence(Ordering::SeqCst);
             (*vq).avail.idx = QSIZE as u16;
             fence(Ordering::SeqCst);
@@ -742,6 +794,36 @@ pub fn rx(buf_va: u64, len: u64) -> (u32, u32) {
         Some(frame_len) => (STATUS_OK, frame_len as u32),
         None => (STATUS_OK, 0),
     }
+}
+
+/// The installed NIC's virtio-mmio transport slot, or `None` if there is no NIC
+/// or it is a virtio-pci device. `net_rx::enable_irq` uses it to wire the per-ISA
+/// RX interrupt (docs/NETSTACK.md, rheo-net N2d).
+pub fn mmio_slot() -> Option<usize> {
+    net_mut().and_then(|d| d.mmio_slot())
+}
+
+/// Acknowledge a pending device interrupt (drops its line). Called from
+/// `net_rx::on_irq`, i.e. from the per-ISA interrupt vector - which the kernel
+/// takes only inside its idle path, so this never re-enters a driver operation.
+pub fn ack_irq() {
+    if let Some(dev) = net_mut() {
+        dev.transport.ack_irq();
+    }
+}
+
+/// Try to receive one frame into the cell buffer at `buf_va` (up to `len`) for
+/// the `SYS_WAIT_NET` wait loop: `Some(frame_len)` (0 = queue empty), or `None`
+/// if no NIC is installed. Same one-copy path as [`rx`], without the queue
+/// completion wrapper.
+///
+/// # Safety
+/// `buf_va` is the calling cell's mapped buffer; called only during its trap.
+pub fn drain_frame(buf_va: u64, len: usize) -> Option<usize> {
+    let dev = net_mut()?;
+    // SAFETY: the cell passes a VA of `len` writable bytes in its own memory.
+    let out = unsafe { core::slice::from_raw_parts_mut(buf_va as *mut u8, len) };
+    Some(dev.recv_frame(out).unwrap_or(0))
 }
 
 /// `OP_NET_MAC`: write the 6-byte MAC to the cell buffer at `buf_va`. Returns

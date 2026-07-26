@@ -21,12 +21,15 @@ requires - the kernel owns the queue plumbing, not the protocols.
   (`VIRTIO_F_VERSION_1` + `VIRTIO_NET_F_MAC`; no mergeable-rx-buffers or
   checksum/GSO offload), an RX and a TX **split virtqueue**, and the 12-byte v1
   `virtio_net_hdr`. DMA uses **physical** addresses (`virt_to_phys`) since the
-  kernel moved to the higher half. Polled (no device IRQ yet - a later refinement,
-  like virtio-blk).
+  kernel moved to the higher half. Transmit is polled; **receive is now
+  interrupt-driven on riscv/arm** (rheo-net N2d, docs/NETSTACK.md §16 - x86-64's
+  virtio-pci NIC has no usable interrupt line here and keeps a kernel-side poll).
 - librheo's **`net`** is now a real async surface: `mac()`, `send(frame)`,
-  `recv(buf)` over three queue opcodes (`OP_NET_TX`/`OP_NET_RX`/`OP_NET_MAC`)
+  `try_recv(buf)` over three queue opcodes (`OP_NET_TX`/`OP_NET_RX`/`OP_NET_MAC`)
   bridged to the driver in `kernel_process`, completing with the strand token -
-  the same async model as the Phase B `io` opcodes. `connect`/`listen` stay
+  the same async model as the Phase B `io` opcodes - plus `recv`/`recv_timeout`,
+  which **park** on the reactor's network slot and are woken by the NIC's receive
+  interrupt through `SYS_WAIT_NET` (rheo-net N2d, docs/NETSTACK.md §16). `connect`/`listen` stay
   `Unsupported` stubs: a socket/IP/TCP layer is a **service** (section 2).
 - Proof: the `librheonet` test kernel (all three ISAs) - a librheo cell asks the
   NIC for its MAC, sends a **broadcast ARP request** for the SLIRP gateway
@@ -35,8 +38,10 @@ requires - the kernel owns the queue plumbing, not the protocols.
   + opcode + sender IP and exiting `0x42`.
 - Deferred (documented): the full transport stack (IP/ARP-cache/TCP/QUIC/TLS as a
   library in a cell, section 2), a first-class socket `ObjectKind` + steering-table
-  grants (section 1), header/payload split (section 1), a device RX interrupt, and
-  everything in sections 4-7 (eBPF dataplane, DDoS staging, DPU offload).
+  grants (section 1), header/payload split (section 1), and everything in sections
+  4-7 (eBPF dataplane, DDoS staging, DPU offload). The **device RX interrupt** is
+  **done** for riscv/arm (rheo-net N2d, docs/NETSTACK.md §16); x86-64 MSI-X through
+  the PCI config tunnel, interrupt coalescing, and zero-copy receive remain.
 
 > **Security transports update (N3a/N3b, docs/NETSTACK.md §14-15):** the crypto
 > primitive layer (N3a - ChaCha20-Poly1305 + RustCrypto SHA-2/HKDF/X25519/

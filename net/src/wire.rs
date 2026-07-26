@@ -142,8 +142,11 @@ pub async fn send_frame(frame: &[u8]) -> Result<(), WireError> {
         .map_err(|_| WireError::Net)
 }
 
-/// Poll for one raw Ethernet frame into `buf` (a single `net::recv`). Returns the
-/// frame length (`0` if nothing is ready - the caller re-polls).
+/// Poll for one raw Ethernet frame into `buf` (a single non-blocking
+/// `net::try_recv`). Returns the frame length (`0` if nothing is ready - the
+/// caller re-polls). The parking receive is `librheo::net::recv` (docs/NETSTACK.md,
+/// the async-receive path); this stays the non-blocking drain the poll loops and
+/// batching transports above it expect.
 pub async fn recv_frame(buf: &mut [u8]) -> Result<usize, WireError> {
-    net::recv(buf).await.map_err(|_| WireError::Net)
+    net::try_recv(buf).await.map_err(|_| WireError::Net)
 }

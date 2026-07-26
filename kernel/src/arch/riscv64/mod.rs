@@ -145,7 +145,9 @@ pub fn enable_uart_rx_irq() {
         // enable the UART's EIID. ---
         imsic_write(0x70, 1); // eidelivery = 1
         imsic_write(0x72, 0); // eithreshold = 0 (deliver all enabled)
-        imsic_write(0xC0, 1 << UART_EIID); // eie0 |= bit(EIID) (EIID < 64)
+        // eie0 |= bit(EIID) (EIID < 64) - read-modify-write, so wiring a second
+        // source later (the NIC, rheo-net N2d) does not clear this one.
+        imsic_write(0xC0, imsic_read(0xC0) | (1 << UART_EIID));
 
         // --- APLIC S-domain (MSI-delivery mode) ---
         let aplic = APLIC_S_BASE as *mut u32;
@@ -187,15 +189,33 @@ unsafe fn imsic_write(sel: u64, val: u64) {
     }
 }
 
-/// Drain the UART RX FIFO into the kernel ring and claim the interrupt in the
-/// IMSIC S-file. Called from the kernel trap handler on a supervisor external
-/// interrupt. Draining first (level low) then claiming avoids a re-assert.
-fn handle_uart_irq() {
-    // Drain the UART.
+/// Read the IMSIC S-file register selected by `sel` (via siselect/sireg).
+///
+/// # Safety
+/// The AIA S-mode CSRs must be accessible (Ssaia + M-mode delegation).
+unsafe fn imsic_read(sel: u64) -> u64 {
+    let v: u64;
+    unsafe {
+        asm!(
+            "csrw 0x150, {s}", // siselect
+            "csrr {v}, 0x151", // sireg
+            s = in(reg) sel, v = out(reg) v,
+        );
+    }
+    v
+}
+
+/// Service a supervisor external interrupt: drain the UART RX FIFO into the
+/// kernel ring, then claim each pending source in the IMSIC S-file, dispatching
+/// the NIC's identity to the portable receive path (rheo-net N2d). Called from the
+/// kernel trap handler. Servicing a source first (its level drops) and claiming
+/// after avoids a re-assert.
+fn handle_ext_irq() {
+    // Drain the UART (the Phase D path).
     while let Some(b) = serial_read_byte() {
         crate::input::rx_push(b);
     }
-    // Claim the top external interrupt (a write to stopei clears its pending bit).
+    // Claim each pending external interrupt (a write to stopei clears the top).
     // SAFETY: stopei is an S-mode AIA CSR, accessible once the AIA is up.
     unsafe {
         let mut top: u64;
@@ -204,8 +224,14 @@ fn handle_uart_irq() {
             if top == 0 {
                 break;
             }
+            // stopei layout: identity in bits 26:16, priority in 10:0.
+            let id = ((top >> 16) & 0x7FF) as u32;
+            if *core::ptr::addr_of!(NET_IRQ_ENABLED) && id == *core::ptr::addr_of!(NET_EIID) {
+                // The NIC's RX line: acknowledge the device + record the arrival.
+                crate::net_rx::on_irq();
+            }
             asm!("csrw 0x15c, x0"); // write stopei -> claim/clear the top
-            // Drain anything that arrived meanwhile.
+            // Drain anything the UART received meanwhile.
             while let Some(b) = serial_read_byte() {
                 crate::input::rx_push(b);
             }
@@ -223,6 +249,88 @@ pub fn idle_wait() {
         asm!("csrrsi x0, sstatus, 2"); // set SIE -> pending SEI taken here
         asm!("csrrci x0, sstatus, 2"); // clear SIE
     }
+}
+
+// ------------------------------------------------- NIC receive interrupt
+// docs/NETSTACK.md (rheo-net N2d): the kernel's third interrupt source. QEMU
+// riscv `virt` gives each of its 8 virtio-mmio transport slots an APLIC source
+// (`VIRTIO_IRQ = 1`, so slot i is source 1+i - hw/riscv/virt.c). The driver
+// records the slot it bound to, and this routes that source through the same AIA
+// path the UART uses (APLIC-S in MSI mode -> this hart's IMSIC S-file -> sip.SEIP),
+// with a distinct external-interrupt identity so the handler can tell them apart.
+// Opt-in (called only by the `netwait` test), so no other kernel is affected.
+
+/// APLIC source of virtio-mmio slot 0 (QEMU riscv `virt`: `VIRTIO_IRQ = 1`).
+const VIRTIO_SOURCE_BASE: usize = 1;
+/// IMSIC external-interrupt identity base for the virtio-mmio slots. Offset well
+/// clear of [`UART_EIID`] (10) so the two sources stay distinguishable.
+const VIRTIO_EIID_BASE: u32 = 16;
+
+static mut NET_IRQ_ENABLED: bool = false;
+static mut NET_EIID: u32 = 0;
+
+/// Whether the NIC receive interrupt is wired (false = the kernel's poll
+/// fallback, docs/NETSTACK.md).
+pub fn net_irq_enabled() -> bool {
+    // SAFETY: single CPU; set once before any cell runs.
+    unsafe { *core::ptr::addr_of!(NET_IRQ_ENABLED) }
+}
+
+/// Whether a NIC interrupt is already pending (so `idle_wait` will service it
+/// without halting). `sip.SEIP` (bit 9) plus the IMSIC's pending bit for the NIC's
+/// identity, so a UART byte is not mistaken for a frame.
+pub fn net_irq_pending() -> bool {
+    if !net_irq_enabled() {
+        return false;
+    }
+    // SAFETY: `sip` is an S-mode CSR; the IMSIC S-file is up once the NIC IRQ is.
+    unsafe {
+        let sip: u64;
+        asm!("csrr {0}, sip", out(reg) sip);
+        if sip & (1 << 9) == 0 {
+            return false;
+        }
+        let eip0 = imsic_read(0x80); // eip0: pending identities 0..63
+        eip0 & (1 << *core::ptr::addr_of!(NET_EIID)) != 0
+    }
+}
+
+/// Bring up the virtio-net RX interrupt for transport `slot` through the AIA
+/// (APLIC-S source + this hart's IMSIC S-file). Returns whether it is wired.
+/// Called only by the `netwait` test path, so no other kernel is affected.
+pub fn enable_virtio_net_irq(slot: usize) -> bool {
+    if slot >= VIRTIO_MMIO_COUNT {
+        return false;
+    }
+    let source = VIRTIO_SOURCE_BASE + slot;
+    let eiid = VIRTIO_EIID_BASE + slot as u32;
+    let hart = boot_hartid();
+    // SAFETY: kernel context; the AIA S-mode CSRs + APLIC MMIO (mapped high) are
+    // present on this QEMU config (`-machine virt,aia=aplic-imsic`).
+    unsafe {
+        // IMSIC S-file: delivery on, no threshold, enable this identity (RMW so
+        // the UART's identity, if wired, stays enabled).
+        imsic_write(0x70, 1); // eidelivery = 1
+        imsic_write(0x72, 0); // eithreshold = 0
+        imsic_write(0xC0, imsic_read(0xC0) | (1 << eiid));
+
+        // APLIC S-domain, MSI-delivery mode (idempotent with the UART path).
+        let aplic = APLIC_S_BASE as *mut u32;
+        aplic.write_volatile((1 << 8) | (1 << 2)); // domaincfg: IE=1, DM=1 (MSI)
+        aplic.byte_add(0x0004 + (source - 1) * 4).write_volatile(6); // Level1
+        aplic
+            .byte_add(0x3000 + source * 4)
+            .write_volatile(((hart as u32) << 18) | eiid); // target
+        aplic.byte_add(0x1EDC).write_volatile(source as u32); // setienum
+
+        // S external interrupts enabled (sie.SEIE); sstatus.SIE stays clear so the
+        // interrupt is taken only inside the idle path.
+        asm!("csrrs x0, sie, {0}", in(reg) 1u64 << 9);
+
+        *core::ptr::addr_of_mut!(NET_EIID) = eiid;
+        *core::ptr::addr_of_mut!(NET_IRQ_ENABLED) = true;
+    }
+    true
 }
 
 // ------------------------------------------------- timer interrupt (Sstc)
@@ -273,24 +381,44 @@ pub fn enable_timer_irq() {
     }
 }
 
-/// Arm the S-mode timer for `deadline_ns` from now and halt at `wfi` until it
-/// fires (a genuine 0%-CPU park). The timer runs in the `time`/`stimecmp` domain
-/// (10 MHz), distinct from `cycles()` (the retired-instruction counter), so the
-/// deadline is converted here. Called only when [`timer_irq_enabled`].
-pub fn timer_wait(deadline_ns: u64) {
+/// The `time`-domain deadline the timer is currently armed for (0 = disarmed).
+static mut TIMER_TARGET: u64 = 0;
+
+/// Arm the S-mode timer for `deadline_ns` from now, without waiting. The timer
+/// runs in the `time`/`stimecmp` domain (10 MHz), distinct from `cycles()` (the
+/// retired-instruction counter), so the deadline is converted here. Pair with
+/// [`timer_expired`] + [`timer_disarm`] to halt on the timer *and* another
+/// interrupt source (docs/NETSTACK.md: a receive with a deadline).
+pub fn timer_arm(deadline_ns: u64) {
     let delta = ((deadline_ns as u128 * TIMEBASE_HZ as u128) / 1_000_000_000) as u64;
     let target = rdtime().wrapping_add(delta.max(1));
-    // SAFETY: kernel context; `stimecmp` is writable (Sstc), SIE toggled around
-    // a single serviced interrupt.
+    // SAFETY: kernel context; `stimecmp` is writable (Sstc).
     unsafe {
         asm!("csrw 0x14d, {0}", in(reg) target); // stimecmp = deadline
-        while rdtime() < target {
-            asm!("wfi"); // wakes on the pending STI (SIE clear, not yet taken)
-            asm!("csrrsi x0, sstatus, 2"); // take + service it (handler disarms)
-            asm!("csrrci x0, sstatus, 2"); // clear SIE
-        }
-        asm!("csrw 0x14d, {0}", in(reg) u64::MAX); // disarm
+        *core::ptr::addr_of_mut!(TIMER_TARGET) = target;
     }
+}
+
+/// Whether the armed deadline has passed.
+pub fn timer_expired() -> bool {
+    // SAFETY: single CPU; plain read of the recorded deadline.
+    rdtime() >= unsafe { *core::ptr::addr_of!(TIMER_TARGET) }
+}
+
+/// Disarm the timer (push `stimecmp` out of reach, clearing STIP).
+pub fn timer_disarm() {
+    // SAFETY: kernel context; `stimecmp` is writable (Sstc).
+    unsafe { asm!("csrw 0x14d, {0}", in(reg) u64::MAX) };
+}
+
+/// Arm the S-mode timer for `deadline_ns` from now and halt at `wfi` until it
+/// fires (a genuine 0%-CPU park). Called only when [`timer_irq_enabled`].
+pub fn timer_wait(deadline_ns: u64) {
+    timer_arm(deadline_ns);
+    while !timer_expired() {
+        idle_wait(); // wfi, then take + service the pending interrupt
+    }
+    timer_disarm();
 }
 
 /// Deliver a scripted byte through the real UART RX interrupt (16550 loopback),
@@ -341,9 +469,10 @@ const SCAUSE_BREAKPOINT: u64 = 3;
 #[unsafe(no_mangle)]
 extern "C" fn riscv_trap_handler(scause: u64, sepc: u64, stval: u64) -> u64 {
     if scause == SCAUSE_S_EXT {
-        // The kernel's first hardware interrupt (docs/LIBRHEO.md Phase D): the
-        // UART RX line, delivered via the AIA. Drain it and resume where we were.
-        handle_uart_irq();
+        // A supervisor external interrupt, delivered via the AIA: the UART RX line
+        // (docs/LIBRHEO.md Phase D) or the NIC's receive line (docs/NETSTACK.md,
+        // rheo-net N2d). Service it and resume where we were.
+        handle_ext_irq();
         return sepc;
     }
     if scause == SCAUSE_S_TIMER {
@@ -829,6 +958,22 @@ pub fn return_to_kernel() -> ! {
 /// frame to resume (or diverges via return_to_kernel).
 #[unsafe(no_mangle)]
 extern "C" fn riscv_user_trap(scause: u64, stval: u64, frame: *mut TrapFrame) -> *mut TrapFrame {
+    // A *device interrupt* taken while the cell was running in U-mode. RISC-V
+    // always enables S-mode interrupts while executing in U-mode (`sstatus.SIE`
+    // gates them only in S-mode), so once a device IRQ is wired - the NIC's
+    // receive line, docs/NETSTACK.md rheo-net N2d - a frame arriving mid-cell
+    // lands here. It is not a cell event: service the device and resume the cell
+    // at exactly the instruction it was interrupted at.
+    if scause & (1 << 63) != 0 {
+        match scause {
+            SCAUSE_S_EXT => handle_ext_irq(),
+            // Disarm the timer (pushing stimecmp out clears STIP); a kernel-side
+            // `timer_wait` observes the elapsed deadline itself.
+            SCAUSE_S_TIMER => unsafe { asm!("csrw 0x14d, {0}", in(reg) u64::MAX) },
+            _ => {}
+        }
+        return frame;
+    }
     let kind = if scause == SCAUSE_ECALL_U {
         // Resume after the 4-byte ecall.
         unsafe { (*frame).sepc += 4 };

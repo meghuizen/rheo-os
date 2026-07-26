@@ -29,6 +29,7 @@ pub mod lease;
 pub mod linux;
 pub mod load;
 pub mod mm;
+pub mod net_rx;
 pub mod nproc;
 mod panic;
 pub mod pty;

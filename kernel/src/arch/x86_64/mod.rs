@@ -175,6 +175,31 @@ pub fn idle_wait() {}
 /// `uart_irq_enabled`, i.e. never on x86-64).
 pub fn uart_inject_and_wait(_b: u8) {}
 
+/// Whether the virtio-net RX interrupt is wired - **false on x86-64** (honest).
+/// The NIC here is virtio-*pci* driven entirely through PCI config space (the
+/// `VIRTIO_PCI_CAP_PCI_CFG` tunnel, because PVH boot has no firmware to program
+/// BARs), so there is no mapped BAR to hold an MSI-X table, and legacy INTx would
+/// ride the same IOAPIC path that does not re-deliver reliably under QEMU TCG +
+/// `kernel-irqchip=split` (see the seam comment above). `SYS_WAIT_NET` therefore
+/// falls back to the kernel's bounded poll loop (kernel/src/net_rx.rs): the cell
+/// still parks once instead of re-submitting, but the CPU spins - not a 0%-CPU
+/// idle, and reported as such (docs/NETSTACK.md per-ISA table). Programming MSI-X
+/// through the config tunnel is the documented next step.
+pub fn net_irq_enabled() -> bool {
+    false
+}
+
+/// Whether a NIC interrupt is pending - never on x86-64 (no NIC IRQ wired).
+pub fn net_irq_pending() -> bool {
+    false
+}
+
+/// Bring up the virtio-net RX interrupt - x86-64 stays on the poll path (see
+/// [`net_irq_enabled`]). Returns false: not wired.
+pub fn enable_virtio_net_irq(_slot: usize) -> bool {
+    false
+}
+
 /// Whether the LAPIC timer interrupt is wired (false = busy-wait path).
 pub fn timer_irq_enabled() -> bool {
     // SAFETY: single CPU; set once before any cell runs.
@@ -225,17 +250,35 @@ extern "C" fn x86_timer_irq() {
 /// clock; we calibrate its rate against the TSC (`cycles()` + `ticks_to_ns`)
 /// once, then convert. Called only when [`timer_irq_enabled`].
 pub fn timer_wait(deadline_ns: u64) {
-    let count = lapic_timer_count(deadline_ns);
-    // SAFETY: kernel context; x2APIC timer MSRs, one-shot, IF via the idle idiom.
-    unsafe {
-        paging_wrmsr(MSR_X2APIC_TIMER_INIT, count as u64); // arm (starts counting down)
-        // The one-shot fires once (current count hits 0); wake hlt and EOI. Loop
-        // guards against an unrelated interrupt waking hlt early.
-        while paging_rdmsr(MSR_X2APIC_TIMER_CUR) != 0 {
-            asm!("sti; hlt; cli", options(nomem, nostack));
-        }
-        paging_wrmsr(MSR_X2APIC_TIMER_INIT, 0); // disarm
+    timer_arm(deadline_ns);
+    // The one-shot fires once (current count hits 0); wake hlt and EOI. The loop
+    // guards against an unrelated interrupt waking hlt early.
+    while !timer_expired() {
+        // SAFETY: kernel context; the standard enable-halt-disable idle idiom.
+        unsafe { asm!("sti; hlt; cli", options(nomem, nostack)) };
     }
+    timer_disarm();
+}
+
+/// Arm the LAPIC one-shot timer for `deadline_ns` from now, without waiting. Pair
+/// with [`timer_expired`] + [`timer_disarm`] to halt on the timer *and* another
+/// interrupt source (docs/NETSTACK.md: a receive with a deadline).
+pub fn timer_arm(deadline_ns: u64) {
+    let count = lapic_timer_count(deadline_ns);
+    // SAFETY: kernel context; x2APIC timer MSR (one-shot, starts counting down).
+    unsafe { paging_wrmsr(MSR_X2APIC_TIMER_INIT, count as u64) };
+}
+
+/// Whether the armed one-shot has fired (its current count reached 0).
+pub fn timer_expired() -> bool {
+    // SAFETY: kernel context; plain MSR read.
+    unsafe { paging_rdmsr(MSR_X2APIC_TIMER_CUR) == 0 }
+}
+
+/// Disarm the LAPIC one-shot timer.
+pub fn timer_disarm() {
+    // SAFETY: kernel context; plain MSR write.
+    unsafe { paging_wrmsr(MSR_X2APIC_TIMER_INIT, 0) };
 }
 
 /// Calibrate the LAPIC timer's tick rate against the TSC and return the initial

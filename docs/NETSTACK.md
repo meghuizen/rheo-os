@@ -147,7 +147,7 @@ surface.
 
 Build N1-N5 over existing surface. Add substrate **only as a phase earns it**,
 each docs-first per ARCHITECTURE.md 6 and reusing prior work: NIC **RX interrupt**
-(build on the Phase D IRQ path), **zero-copy grant DMA to the wire** +
+(built on the Phase D IRQ path - **done in N2d**, §16), **zero-copy grant DMA to the wire** +
 header/payload split, virtio-net **offload + multiqueue** negotiation with
 **attach-time offload validation** (run correctness vectors and **silently disable
 broken offloads**, falling back to the CPU path), **larger/elastic grants** (raise
@@ -202,6 +202,12 @@ kernels stay green.
     (integrated over the raw-frame NIC path, a live smoltcp UDP round trip to
     SLIRP's DNS) and the native sharded transport framing (connections hashed to
     shards, shared-nothing). §13.
+  - **N2d (done): true async receive.** The **NIC RX interrupt** + a
+    park-until-frame kernel verb (`SYS_WAIT_NET`) + a reactor network slot, so
+    `librheo::net::recv` **parks** instead of re-polling `OP_NET_RX` - a cell
+    waiting for a packet no longer burns a core. Pulled forward from N6 because
+    the transports of N2a-N2c are the first code that genuinely waits on the wire
+    (§16).
 - **N3 - TLS 1.3 + HTTPS.** Crypto crates wired; keys-as-capabilities. Split:
   - **N3a (done): the crypto primitive layer** (§14). The AEAD/hash/KDF/
     key-exchange/signature primitives the security transports need, each proven
@@ -214,7 +220,7 @@ kernels stay green.
     8448 known-answer trace. HTTPS-live is deferred (N3c/N4).
 - **N4 - Service-cell model + fan-out + host services** (DHCP + zeroconf + NTP).
 - **N5 - App protocols.** HTTP/2, gRPC, Arrow Flight (warehouse), Kafka.
-- **N6 - Perf substrate.** NIC RX IRQ, zero-copy DMA + offload/multiqueue/RSS,
+- **N6 - Perf substrate.** (NIC RX IRQ landed early in **N2d**, §16.) Zero-copy DMA + offload/multiqueue/RSS,
   timer wheel; the socket/steering kernel object if earned; DDoS-isolation proof.
 - **N7 - WireGuard + IPsec + QUIC/HTTP3 + multicast/IGMP + ICMP polish** (core
   traceroute + TTL/hop-limit landed early in **N1e**, §9; N7 keeps IGMP/MLD, PMTU,
@@ -1265,3 +1271,147 @@ under LLVM on `x86_64-unknown-none`, §3).
   deferred; N3b is the 1-RTT handshake + record layer + minimal X.509 slice.
 - **WireGuard / IPsec** remain the N7 security-transport work (the N3a primitives
   and this key-schedule/record machinery are the shared foundation).
+
+## 16. Phase N2d (done): true async receive - the NIC RX interrupt + a park
+
+Everything from N1 to N3 could *send* asynchronously but not *wait*. `librheo::net::
+send`/`mac` were genuine async submissions (park the strand on the completion token,
+wake on the CQ entry), while **`recv` was a busy re-poll**: `OP_NET_RX` returned
+"nothing available" and the cell submitted it again. The reactor had slots for the
+console, the timer, a child wait and the cross-cell channel - but **no network
+slot** - so a strand waiting for a packet was always "ready", `block_on` never
+reached its idle path, and a cell waiting for a frame **spun a whole core**. The
+OS's 0%-CPU-idle story (docs/LIBRHEO.md Phase D/F) was true for the console and the
+timer but not for the network. N2d closes that.
+
+### The three pieces
+
+**1. The kernel wait (`kernel/src/net_rx.rs`, portable).** `SYS_WAIT_NET (48)`:
+`wait_net(buf_va, len, timeout_ns) -> frame_len`. Blocks until a received frame is
+available, copies it into the cell's buffer (the cell's address space is active
+during the trap, so **one copy**, straight from the virtqueue buffer the device
+DMA'd into), and returns its length. `timeout_ns = 0` waits indefinitely; a
+non-zero deadline is the "**a frame, or the RTO, whichever comes first**" primitive
+every transport needs - where both the NIC and the timer interrupt are wired the
+kernel arms the deadline and halts **once**, waking on either source.
+
+Mechanism only, **no new kernel object** (ARCHITECTURE.md 6): it exposes the same
+virtio-net driver the `OP_NET_*` opcodes already bridge to, in the shape of the
+existing `SYS_WAIT_INPUT` block-and-wake (docs/LIBRHEO.md Phase D) - the direct
+precedent. The alternative considered was a *blocking flag* on the `OP_NET_RX`
+submission; it was rejected because the queue drain runs inside the cell's
+`SYS_DOORBELL` trap and processes the **whole** submission ring, so a blocking
+opcode would stall every other strand's completions behind one packet. Keeping the
+block in a wait verb leaves the decision *when to block* with the reactor, which
+only blocks after every strand has parked - exactly the console/timer model.
+
+**Where the received frames are buffered.** `input.rs` needs its own byte ring
+because the 16550's 16-byte FIFO is the only other buffer. A NIC does not: the
+driver pre-posts **16 RX buffers of 2 KiB** on the receive virtqueue, the device
+DMAs each arriving frame into one of them, and the used ring records the arrival.
+That *is* the kernel-side RX ring - frame-pool memory written by the device, so a
+frame arriving while a cell computes is not lost. A second kernel ring would only
+add a copy, so `net_rx.rs` deliberately does not add one: the interrupt handler
+records the arrival, the wait path copies once into the cell.
+
+**2. The NIC RX interrupt (per-ISA, `kernel/src/arch/*`).** The driver
+(`hw/virtio_net.rs`) records the **virtio-mmio transport slot** it bound to - a
+portable fact - and `net_rx::enable_irq()` hands it to `arch::enable_virtio_net_irq
+(slot)`, which turns it into that ISA's interrupt id. The RX virtqueue leaves
+`avail.flags` clear (that is what asks the device to raise its line on a received
+frame); the TX ring now sets `VRING_AVAIL_F_NO_INTERRUPT`, since transmit
+completions are polled and their interrupts would only be spurious wakeups. The
+handler (`net_rx::on_irq`) acknowledges the device through virtio-mmio's
+`InterruptStatus`/`InterruptACK` (so its level-triggered line drops) and counts the
+arrival. Interrupt bring-up is **opt-in** - only the `netwait` test kernel calls
+`net_rx::enable_irq()`, so every other kernel boots byte-for-byte as before.
+
+RISC-V needed one more thing: S-mode interrupts are **always enabled while
+executing in U-mode** (`sstatus.SIE` gates them only in S-mode), so once a device
+IRQ is wired a frame arriving mid-cell traps in the U-mode path. `riscv_user_trap`
+now recognises an interrupt cause, services the device, and resumes the cell at the
+interrupted instruction (before, it would have been read as a fault). ARM64 cells
+run at EL0 with IRQ masked, so the interrupt simply stays pending until the kernel's
+next idle - the wait takes it there.
+
+**3. The reactor network slot (`librheo/src/rt.rs`).** `net_rx_req` joins
+`console_req`/`timer_req`/`wait_req`/`chan_recv_req`, serviced in `block_on`'s idle
+path: `rt::recv_frame(buf, len, timeout_ns)` parks the strand on a token, and when
+every strand has parked the reactor blocks in `SYS_WAIT_NET` and wakes the parked
+one with the frame. `rt::net_wakeups()` counts the deliveries - **one park and one
+wake per frame**, which is the no-spin evidence the test asserts.
+
+`librheo::net` becomes symmetric: **`recv`** parks until a frame arrives,
+**`recv_timeout`** parks with a deadline, and **`try_recv`** is the non-blocking
+drain a batching transport uses (`net::wire::recv_frame`, `net::arp::resolve`'s poll
+loop, and the smoltcp cell's RX batch all use `try_recv`, so their behaviour is
+unchanged - the last frame of a burst must not block).
+
+### Per-ISA interrupt status (honest)
+
+| ISA | NIC transport | RX interrupt path | Receive wait |
+|---|---|---|---|
+| **RISC-V 64** | virtio-mmio (slot 7 on QEMU `virt`) | APLIC-S source `1+slot` in MSI mode -> this hart's IMSIC S-file (identity `16+slot`) -> `sip.SEIP`; dispatched by identity in `handle_ext_irq` | **interrupt-driven**, halts at `wfi` - genuine 0%-CPU park |
+| **ARM64** | virtio-mmio (slot 31 on QEMU `virt`) | GICv3 SPI `16+slot` (INTID `48+slot`) -> GICD -> `ICC_IAR1_EL1`, EOI via `ICC_EOIR1_EL1` | **interrupt-driven**, halts at `wfi` - genuine 0%-CPU park |
+| **x86-64** | virtio-**pci** (q35, driven through the `VIRTIO_PCI_CAP_PCI_CFG` tunnel) | **none wired** - see below | **kernel poll** (bounded): the cell still parks once, but the CPU spins |
+
+x86-64 is a documented fallback, not a claim. The NIC there is driven *entirely
+through PCI configuration space* because PVH boot has no firmware to program BARs -
+so there is no mapped BAR to hold an MSI-X table - and legacy INTx would ride the
+same IOAPIC path that, under QEMU TCG + `kernel-irqchip=split`, does not re-deliver
+reliably (the same reason the x86-64 UART RX line stays a poll, docs/LIBRHEO.md
+Phase D; its *timer* LAPIC path does work). The honest x86-64 result is therefore:
+the userspace re-submit storm is gone (one park per receive, the real improvement),
+but the kernel-side wait is a bounded spin, and `net_rx::interrupt_driven()` /
+`did_idle()` both report false there. **Programming the MSI-X table through the
+config tunnel** (the table lives in a BAR the tunnel can reach) is the specific
+next step.
+
+### The proof (`netwait` test kernel, all 3 ISAs)
+
+`librheo-netwait` runs as a cell over a real virtio-net device on QEMU's SLIRP user
+netdev (deterministic, network-free - the same setup as `librheonet`):
+
+1. read the MAC, then **drain** the receive queue with `try_recv` so the waits start
+   empty; spawn a **witness** strand that counts its own resumptions;
+2. send a broadcast **ARP request** for the gateway `10.0.2.2` and `net::recv().await`
+   - the strand **parks**; SLIRP's ARP reply is the wake, asserted to be a reply
+   whose sender IP is the gateway;
+3. send a **TCP SYN** to a closed port on the gateway and park again - SLIRP's reset
+   is a second real frame through the same blocking path;
+4. park once more with a **20 ms deadline** on an empty queue with nothing in
+   flight: no frame can arrive, so the kernel arms the deadline and **halts the
+   CPU** until it fires, returning 0.
+
+Asserted: the cell exits `0x42` only if both frames are the expected replies, the
+witness advanced **while the receiver was parked** (so the receive genuinely
+suspended instead of holding the vcore), the bounded wait returned empty at its
+deadline, and `rt::net_wakeups()` equals the number of receives - **exactly one
+park + one wake each, never N re-polls**. The kernel then asserts, on the
+interrupt-driven ISAs, `net_rx::irq_count() > 0` - the count is only incremented
+from the ISA's interrupt vector, so it cannot be faked; two genuine NIC interrupts
+are taken per run - and `net_rx::did_idle()`, that the wait really halted the CPU.
+On x86-64 the kernel prints the poll-fallback line instead of asserting either.
+
+One nuance, stated plainly: under SLIRP both replies are queued **during** the
+guest's transmit (SLIRP answers ARP and refuses the SYN inside the TX handler), so
+the frame is already there when the wait begins - the interrupt is genuinely
+delivered and taken, but the wait does not have to halt for it. The halt is proven
+by the bounded phase, which cannot be satisfied by any frame. Both properties are
+real; neither is dressed up as the other.
+
+### What N2d defers (explicit)
+
+- **x86-64 MSI-X** (above) - the remaining ISA gap.
+- **Interrupt coalescing / NAPI-style batching**: every received frame raises an
+  interrupt today. The sDDF armed-doorbell + deferred-notify protocol (§1) is where
+  batching belongs, and rides with the N6 offload/multiqueue work.
+- **Waking a *different* cell on a frame**: the wait blocks the calling cell's
+  vcore (its strands are all parked by then). A frame steering to another cell needs
+  the multi-cell scheduler / steering grants (SMP, task #27; §4).
+- **Racing a receive against other reactor sources** (a channel message, console
+  input) in one halt: the reactor services one idle source per pass, and the
+  deadline is the only second wake source the kernel wait itself arms.
+- **Zero-copy receive**: the wait still copies from the virtqueue buffer into the
+  cell's buffer. Landing payloads directly in a cell's arena pages (header/payload
+  split + grant DMA) is N6.
