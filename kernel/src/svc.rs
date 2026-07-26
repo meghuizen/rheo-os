@@ -155,6 +155,86 @@ pub fn file_ops() -> Option<&'static FileOps> {
     unsafe { (*core::ptr::addr_of!(FILE_OPS)).as_ref() }
 }
 
+// ----------------------------------------------------- the remote-INET bridge
+//
+// rheo-net **N4b** (docs/NETSTACK.md N4b, docs/LINUX-COMPAT.md L8-INET remote).
+// `FileOps` above keeps the kernel **filesystem-free** while still serving the
+// POSIX file syscalls: a service registers function pointers, policy lives
+// outside. `SocketOps` is that pattern applied to the network, and for exactly the
+// same reason: doctrine (docs/ARCHITECTURE.md 6, docs/NETWORKING.md) puts IP/UDP/
+// TCP in **userspace**, and the kernel is allocation-free, so it can hold no
+// network stack. The Linux personality's INET sockets therefore keep their
+// loopback fast path in-kernel (a reliable local byte stream is just the L6 ring,
+// `linux::inetsock`) and forward every **non-loopback** operation to whatever
+// registered this table.
+//
+// Adds **no kernel object**: a socket is still a per-cell synthesized fd, and the
+// bridge is a table of `fn` pointers - the same mechanism-only shape as `FileOps`.
+// Today the registrant is a test kernel (`tests/src/inet_personality.rs`) that
+// links the `rheo-net` **codec** posture and drives `hw::virtio_net`; the
+// documented end state is a network **service cell** reached over a queue pair
+// (rheo-net N4a), which this table is deliberately shaped to accept.
+
+/// The remote (NIC-backed) INET datapath's operations. Every handler runs in
+/// kernel context during the calling cell's trap, so buffer arguments are raw VAs
+/// in the active address space - the `FileOps` convention. A negative return is
+/// `-errno`. `timeout_ns` of 0 means "do not block".
+#[derive(Copy, Clone)]
+pub struct SocketOps {
+    /// The local IPv4 address the datapath sends from (for `getsockname`).
+    pub local_ip: fn() -> [u8; 4],
+    /// Bind a remote UDP endpoint on local `port` (never 0 - the personality
+    /// allocates an ephemeral port first). Returns an opaque handle or `-errno`.
+    pub udp_bind: fn(port: u16) -> i64,
+    /// Release a UDP endpoint handle.
+    pub udp_close: fn(ep: u64),
+    /// Send `len` bytes at `buf_va` to `dst_ip:dst_port`. Returns bytes or `-errno`.
+    pub udp_send: fn(ep: u64, dst_ip: [u8; 4], dst_port: u16, buf_va: u64, len: u64) -> i64,
+    /// Receive one datagram into `buf_va` (up to `len`), blocking up to
+    /// `timeout_ns`. Writes the sender's IPv4 to `src_ip_va` (4 bytes) and its port
+    /// to `src_port_va` (a `u16`), when non-zero. Returns bytes or `-errno`
+    /// (`-EAGAIN` when nothing arrived).
+    pub udp_recv: fn(
+        ep: u64,
+        buf_va: u64,
+        len: u64,
+        src_ip_va: u64,
+        src_port_va: u64,
+        timeout_ns: u64,
+    ) -> i64,
+    /// Whether a datagram is already queued for `ep` (poll/epoll readiness).
+    pub udp_pending: fn(ep: u64) -> bool,
+    /// Active-open a TCP connection to `dst_ip:dst_port` from `src_port`, waiting
+    /// up to `timeout_ns` for the handshake. Returns an opaque handle, or
+    /// `-ECONNREFUSED` / `-ETIMEDOUT` / another `-errno`.
+    pub tcp_connect: fn(dst_ip: [u8; 4], dst_port: u16, src_port: u16, timeout_ns: u64) -> i64,
+    /// Send `len` bytes at `buf_va` on a connected handle. Returns bytes or `-errno`.
+    pub tcp_send: fn(h: u64, buf_va: u64, len: u64) -> i64,
+    /// Receive up to `len` bytes into `buf_va`, blocking up to `timeout_ns`.
+    /// Returns bytes (0 = peer closed) or `-errno`.
+    pub tcp_recv: fn(h: u64, buf_va: u64, len: u64, timeout_ns: u64) -> i64,
+    /// Close a connected handle (sends a FIN, releases the slot).
+    pub tcp_close: fn(h: u64),
+}
+
+static mut SOCKET_OPS: Option<SocketOps> = None;
+
+/// Install the remote-INET datapath (called once at boot by the cell/test kernel
+/// that owns the network stack). Without it, a non-loopback destination keeps
+/// returning `ENETUNREACH` exactly as before N4b.
+pub fn set_socket_ops(ops: SocketOps) {
+    unsafe {
+        *core::ptr::addr_of_mut!(SOCKET_OPS) = Some(ops);
+    }
+}
+
+/// The installed remote-INET datapath, if any. Read by the Linux personality's
+/// socket calls (`linux::fd`) for non-loopback addresses.
+pub fn socket_ops() -> Option<&'static SocketOps> {
+    // SAFETY: set once at boot, read-only afterwards.
+    unsafe { (*core::ptr::addr_of!(SOCKET_OPS)).as_ref() }
+}
+
 /// Copy `len` bytes from a loaded program's buffer to the console
 /// (docs/USERLAND.md M1). The kernel runs in the cell's address space during
 /// the trap with supervisor access to user pages enabled, so the user VAs are

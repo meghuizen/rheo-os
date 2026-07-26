@@ -67,7 +67,7 @@ requires - the kernel owns the queue plumbing, not the protocols.
 > object - consistent with §9 (TLS lives in userspace; keys are non-extractable
 > handles, the seam for the per-queue inline-crypto offload of §9).
 
-## 0a. What is built (rheo-net Phase N1a-N1e + N2a/N2b): the L2/L3/L4 core + caching DNS + traceroute + native TCP + congestion control
+## 0a. What is built (rheo-net Phase N1a-N1e + N2a/N2b + N4b): the L2/L3/L4 core + caching DNS + traceroute + native TCP + congestion control + remote INET for Linux binaries
 
 The **greenfield network stack** begins here as **portable userspace** - a new
 `net/` workspace crate (`no_std` + alloc, no per-ISA code) built for the three
@@ -149,6 +149,30 @@ the in-cell virtual link, exiting `0x42`. A **live** TCP handshake is again
 **skipped with reason**. The smoltcp cell + the sharded transport + a live handshake
 are **N2c**; SACK/window-scaling/ECN, NewReno partial-ACK recovery, CUBIC
 HyStart/fast-convergence, and BBR are deferred (docs/NETSTACK.md 11-12).
+
+**rheo-net N4b** makes the stack reachable by **unmodified Linux binaries over the
+real NIC** (docs/NETSTACK.md §18, docs/LINUX-COMPAT.md L8-INET-REMOTE). The kernel
+gains **a bridge, not a stack**: `svc::SocketOps`, a table of function pointers a
+service registers - the exact `svc::FileOps` pattern that keeps the kernel
+**filesystem-free** while still serving `open`/`read`/`write`. The Linux
+personality's INET sockets keep their in-kernel **loopback** fast path (a local byte
+stream is just the L6 ring) and forward every **non-loopback** operation to that
+table; with no table registered the answer stays `-ENETUNREACH`, so nothing else
+changes. **No kernel object** is added and the kernel stays **allocation-free and
+network-stack-free** - the datapath is `rheo-net` linked in a new **codec** posture
+(`--no-default-features`, no librheo, so it links beside a kernel) driving
+`hw::virtio_net`; the frame path is the stack's own `eth`/`arp`/`ip`/`udp` code and
+the full RFC 793 `tcp::Connection`, whose synchronous
+`poll`/`on_wire_segment` seam drives straight from a syscall trap. A remote receive
+**parks** on the N2d `SYS_WAIT_NET` primitive (a genuine WFI idle on riscv64/aarch64,
+the documented bounded poll on x86-64). Proof: the `linuxnet` test kernel - an
+**unmodified static-glibc C binary** does a real DNS round trip to SLIRP's resolver
+`10.0.2.3:53` and a real remote TCP connect to a closed gateway port (SLIRP's reset
+becomes `ECONNREFUSED`), on all three ISAs. Honest scope: **UDP remote is complete**;
+**TCP connect is real and proven** while TCP *data transfer* is implemented but
+unproven under QEMU (SLIRP has no TCP responder); IPv6 remote, a remote listener
+(which needs the §1 steering grants), and moving the datapath into the N4a **service
+cell** are the documented next steps.
 
 ## 1. NIC queues are the primitive
 

@@ -157,6 +157,16 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 | dup2 | full | (x86-64 legacy) == `dup3(old, new, 0)`; a pipe end is refcounted |
 | setpgid / setsid | recorded | returns 0 (single-session model, no job control); the shell queries process groups but does not depend on the effect |
 | getpgid / getsid | partial | returns the caller's pid (one group/session per process) |
+| socket / socketpair | partial | AF_UNIX (L8) and AF_INET/AF_INET6 (L8-INET), SOCK_STREAM + SOCK_DGRAM (AF_UNIX SOCK_DGRAM deferred); other families -EAFNOSUPPORT |
+| bind / listen / accept / accept4 | partial | per-cell synthesized registries; **local only** - a remote listener needs NIC flow-steering grants (L8-INET-REMOTE deferral). `accept` is non-blocking (-EAGAIN on an empty backlog) |
+| connect | partial | AF_UNIX + **loopback** INET over the L6 ring pair; a **non-loopback IPv4** destination is handed to the registered `svc::SocketOps` bridge - a real remote TCP handshake over the NIC, reporting 0 / -ECONNREFUSED / -ETIMEDOUT (L8-INET-REMOTE). Non-loopback **IPv6** → -ENETUNREACH. With no bridge registered, every non-loopback address → -ENETUNREACH |
+| sendto / recvfrom | partial | datagram sockets: **loopback** over the in-kernel queue, **non-loopback IPv4** over the `svc::SocketOps` bridge (real UDP on the wire: ARP next hop, IPv4+UDP checksums, source-address reporting; the receive **parks** on `net_rx::wait_frame`). A stream socket ignores the address and routes to read/write. No `MSG_*` flags |
+| send / recv / read / write on a socket | partial | loopback/AF_UNIX over the L6 rings; a connected **remote** TCP socket forwards to `SocketOps::tcp_send`/`tcp_recv` - implemented but **unproven in QEMU** (SLIRP has no TCP responder), see L8-INET-REMOTE |
+| sendmsg / recvmsg | partial | gather/scatter over `msg_iov`, non-blocking; **no SCM_RIGHTS** ancillary data (L8 deferral) |
+| getsockname / getpeername | full | real `sockaddr_in`/`sockaddr_in6`/`sockaddr_un`; a remote socket reports the datapath's own IPv4 and the true peer address |
+| setsockopt / shutdown | recorded | returns 0, stores nothing (SO_REUSEADDR/TCP_NODELAY succeed as no-ops) |
+| getsockopt | partial | zero-filled answer (SO_ERROR reads as 0) |
+| epoll_create1 / epoll_ctl / epoll_wait / epoll_pwait | partial | level-triggered EPOLLIN/EPOLLOUT only, non-blocking; remote UDP readiness is real, a remote TCP socket always reports readable (L8-INET-REMOTE deferral) |
 
 ### Planned identity/constants
 
@@ -464,17 +474,17 @@ syscalls).
   family is handled inside); epoll adds a few numbers to the two `arch/*/linux_abi`
   tables (x86-64 legacy `epoll_create1`=291.. / asm-generic `epoll_create1`=20..;
   per-ISA ABI).
-  - **Loopback-only scope (the load-bearing honesty).** The kernel is
-    **allocation-free**; the native transports (`net::tcp`/`net::udp`) are
-    `no_std`+**alloc** userspace crates and **cannot** be linked kernel-resident.
-    For **loopback** a TCP connection between two local endpoints reduces to a
-    **reliable, in-order byte stream** - exactly the L6 ring pair that already
-    backs AF_UNIX SOCK_STREAM - and UDP to an in-order **datagram queue**. So INET
-    sockets run over loopback deterministically and network-free, keying the
-    address namespace by `(is_v6, port)`. This proves the socket **ABI**; it is
-    **not** internet networking. **NIC-backed remote INET** (driving the full
-    `net::tcp` segment/RTO/congestion state machine over virtio-net) is a **named
-    later phase** - a non-loopback destination is refused `-ENETUNREACH`.
+  - **Loopback scope at L8-INET (superseded for remote by L8-INET-REMOTE, below).**
+    The kernel is **allocation-free**; the native transports (`net::tcp`/`net::udp`)
+    are `no_std`+**alloc** userspace crates and **cannot** be linked into the
+    `kernel/` library. For **loopback** a TCP connection between two local endpoints
+    reduces to a **reliable, in-order byte stream** - exactly the L6 ring pair that
+    already backs AF_UNIX SOCK_STREAM - and UDP to an in-order **datagram queue**.
+    So INET sockets run over loopback deterministically and network-free, keying the
+    address namespace by `(is_v6, port)`. This proves the socket **ABI**. At L8-INET
+    a non-loopback destination was refused `-ENETUNREACH`; **L8-INET-REMOTE** lifts
+    that over a bridge, and the loopback path below is **unchanged byte-for-byte**
+    (`linuxinet` still asserts the same transcript).
   - **Syscalls**: `socket(AF_INET|AF_INET6, SOCK_STREAM|SOCK_DGRAM)`, `bind`,
     `listen`, `accept`/`accept4`, `connect`, `send`/`recv`/`read`/`write` on a
     connected stream (via the same cross-cell block + SIGPIPE path as pipes),
@@ -505,6 +515,80 @@ syscalls).
     namespaces (no IPV4_MAPPED). UDP is best-effort (a datagram to an unbound
     port is dropped, `sendto` still reports success). Stream `accept` is
     non-blocking (as in AF_UNIX).
+
+- **L8-INET-REMOTE [done]** - **real remote networking: an unmodified Linux binary
+  reaches the network over the NIC** (rheo-net **N4b**, docs/NETSTACK.md N4b). This
+  lifts the L8-INET `-ENETUNREACH` refusal for non-loopback addresses, and again
+  adds **no kernel object** and **no new syscall**: the socket numbers, the fd
+  table and the per-cell synthesized state are all as before.
+  - **The mechanism: a bridge, not a stack (`svc::SocketOps`).** Doctrine
+    (docs/ARCHITECTURE.md 6, docs/NETWORKING.md) puts IP/UDP/TCP in **userspace**,
+    and `kernel/` is allocation-free, so the kernel can hold **no network stack** -
+    exactly the constraint that keeps it holding no filesystem. The answer is the
+    same one `svc::FileOps` already uses: a table of **function pointers a service
+    registers**, with all policy outside. `kernel/src/svc.rs` gains
+    **`SocketOps`** + `set_socket_ops`/`socket_ops` (10 entries: `local_ip`,
+    `udp_bind`/`udp_close`/`udp_send`/`udp_recv`/`udp_pending`,
+    `tcp_connect`/`tcp_send`/`tcp_recv`/`tcp_close`), and
+    `kernel/src/linux/fd.rs` forwards **non-loopback** operations to it. Two new
+    `FdKind` variants carry the bridge handles (`InetUdpRemote`,
+    `InetTcpRemote`); **loopback keeps `InetDgram`/`InetConn` and the L6 ring
+    fast path untouched**. With no bridge registered the answer is still
+    `-ENETUNREACH`, so every other Linux kernel behaves exactly as before.
+  - **Who registers it.** Today `tests/src/inet_personality.rs` (the sibling of
+    `vfs_personality.rs`, the same pattern): it links **`rheo-net`** in its
+    librheo-free **codec posture** (`--no-default-features`) and drives
+    `hw::virtio_net` directly. The protocol work is entirely the stack's -
+    `eth` framing, `arp` request/reply, `ip` headers + checksum, `udp`
+    build/parse + pseudo-header checksum, and the full RFC 793
+    `tcp::Connection` state machine (its synchronous
+    `poll(now)`/`on_wire_segment(now, bytes)` seam drives cleanly from kernel
+    context). The documented end state is a network **service cell** reached
+    over a queue pair (rheo-net N4a); the table is shaped to accept that
+    substitution.
+  - **Blocking.** A remote receive **parks**: the bridge blocks in
+    `net_rx::wait_frame_slice` - the N2d park-until-frame primitive - so on
+    riscv64/aarch64 the kernel genuinely halts at WFI until the NIC's RX
+    interrupt fires, and on x86-64 it falls back to the same documented bounded
+    kernel poll (no MSI-X through the virtio-pci config tunnel). Never a
+    re-submit spin.
+  - **Proof (`linuxnet`, all three ISAs, exact stdout + exit 0)**: an unmodified
+    static-glibc C fixture (`inetremote.c`, built from source by xtask, never
+    committed) (1) hand-builds a **DNS query** and `sendto`s it to QEMU SLIRP's
+    built-in responder at **10.0.2.3:53**, then `recvfrom`s the reply and checks
+    its **structure** - our transaction id echoed, the QR bit set, the sender
+    being 10.0.2.3:53 (never a specific resolved address: SLIRP proxies to the
+    host resolver, so an A record's value is not deterministic); and (2)
+    `connect()`s to a **closed port on the gateway** (10.0.2.2:9) - a real
+    three-way handshake goes out and SLIRP's **reset** comes back, which
+    `tcp::Connection` turns into `ECONNREFUSED`. The kernel additionally asserts
+    the receive really parked (`net_rx::irq_count() > 0` + `did_idle()` on the
+    interrupt-driven ISAs). With no netdev attached the kernel
+    skips-with-reason.
+  - **What works remotely, precisely.** **UDP: fully** - `sendto`/`recvfrom`,
+    `connect`+`send`/`recv`, source-address reporting, real ARP next-hop
+    resolution (the destination on our own /24, else the gateway), real IPv4 +
+    UDP checksums, a blocking receive that parks. **TCP: connect is real and
+    proven** (SYN on the wire, RTO retransmit inside the budget, a real reset
+    turned into `ECONNREFUSED`, `ETIMEDOUT` at the deadline). TCP **data
+    transfer is implemented** (`tcp_send`/`tcp_recv` over the same
+    `tcp::Connection`, `read`/`write` on the fd) but **not proven in QEMU**:
+    SLIRP offers no TCP responder to talk to, so no deterministic
+    network-free data round trip can be arranged. Treat remote TCP data as
+    untested code until a phase adds a responder (a `guestfwd`ed listener, or
+    the N4a service cell talking to a peer cell).
+  - **Deferred, disclosed**: **IPv6 remote** (`AF_INET6` to a non-loopback
+    address is still `-ENETUNREACH` - the N4b datapath is IPv4); no remote
+    **listener**/`accept` (an inbound connection needs NIC flow-steering
+    grants, docs/NETWORKING.md); remote handles are **not reference-counted**
+    across `dup`/`fork` (the first close releases them); one datapath instance
+    for the whole machine, with fixed-size registries (4 UDP endpoints, 4 TCP
+    connections, a 4-entry ARP cache); no `SO_RCVTIMEO`/`O_NONBLOCK` tracking -
+    one documented receive bound (2 s) and connect bound (3 s) apply; no DHCP
+    (the SLIRP identity 10.0.2.15/gateway 10.0.2.2 is fixed - DHCP as a
+    userspace service is a later phase); `epoll` on a remote TCP socket reports
+    "always readable" (the N4b datapath has no non-blocking readiness probe),
+    while remote UDP readiness is real.
 
 ## 6. Fixture build matrix (reproducibility)
 

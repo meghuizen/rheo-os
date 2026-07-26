@@ -20,9 +20,12 @@
 //! transmitted as `0xFFFF` (both fold to the same ones-complement value, and
 //! `0x0000` is reserved to mean "absent").
 
+#[cfg(feature = "hosted")]
 use crate::arp::ArpCache;
+#[cfg(feature = "hosted")]
 use crate::eth::Mac;
 use crate::ip::{self, Checksum, Ipv4Addr, Ipv6Addr};
+#[cfg(feature = "hosted")]
 use crate::wire::{self, WireError};
 
 /// The UDP header length in bytes.
@@ -33,6 +36,7 @@ pub const HEADER_LEN: usize = 8;
 /// reply lands within a handful of iterations; the cap only guards a wholly
 /// non-delivering backend). A wall-clock `librheo::time::timeout` is the option
 /// for a real deployment.
+#[cfg(feature = "hosted")]
 pub const RECV_RETRIES: u32 = 200_000;
 
 /// A parsed UDP header (the 8 bytes before the payload).
@@ -219,6 +223,7 @@ pub fn verify_checksum_v4(src: Ipv4Addr, dst: Ipv4Addr, datagram: &[u8]) -> bool
 
 /// A datagram received by [`UdpEndpoint::recv_from`]: who it came from and how
 /// much of the caller's buffer holds the payload.
+#[cfg(feature = "hosted")]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Received {
     pub src_ip: Ipv4Addr,
@@ -233,6 +238,7 @@ pub struct Received {
 /// the IPv4 TTL to stamp on sent packets. Datagrams go out through
 /// `net::udp` -> `net::wire` (eth/ip framing) -> `librheo::net`, resolving the
 /// next hop via `net::arp`.
+#[cfg(feature = "hosted")]
 pub struct UdpEndpoint {
     src_mac: Mac,
     src_ip: Ipv4Addr,
@@ -240,6 +246,7 @@ pub struct UdpEndpoint {
     cache: ArpCache,
 }
 
+#[cfg(feature = "hosted")]
 impl UdpEndpoint {
     /// A new endpoint for `src_ip` reachable at `src_mac`, TTL defaulting to
     /// [`wire::DEFAULT_TTL`].

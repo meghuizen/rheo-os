@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 49] = [
+const TEST_KERNELS: [&str; 50] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -70,6 +70,7 @@ const TEST_KERNELS: [&str; 49] = [
     "nettls",
     "linuxunix",
     "linuxinet",
+    "linuxnet",
     "netservice",
 ];
 
@@ -165,6 +166,27 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "virtio-net-device,netdev=n0",
         ],
         ("netservice", Arch::X86_64) => &[
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-pci,netdev=n0,disable-legacy=on",
+        ],
+        // linuxnet (docs/NETSTACK.md N4b, docs/LINUX-COMPAT.md L8-INET remote): the
+        // same SLIRP + virtio-net setup as netcore, now driven by an *unmodified
+        // static-glibc Linux binary* through the `svc::SocketOps` bridge - a DNS
+        // query to SLIRP's built-in responder (10.0.2.3:53) and a TCP connect to a
+        // closed gateway port (10.0.2.2:9, answered with a reset). Deterministic +
+        // network-free. Same two transports: virtio-mmio on arm/riscv, virtio-pci
+        // on x86 (disable-legacy=on pins the modern layout the driver expects).
+        ("linuxnet", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-device,netdev=n0",
+        ],
+        ("linuxnet", Arch::X86_64) => &[
             "-netdev",
             "user,id=n0",
             "-device",
@@ -890,6 +912,10 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         // AF_INET/AF_INET6 loopback (L8-INET, docs/LINUX-COMPAT.md): TCP+UDP+epoll
         // over 127.0.0.1 and TCP over ::1, the `linuxinet` proof.
         ("inet.c", "inet"),
+        // Remote INET over the NIC (rheo-net N4b, docs/NETSTACK.md N4b): a real
+        // DNS round trip to SLIRP's resolver + a real remote TCP connect, the
+        // `linuxnet` proof.
+        ("inetremote.c", "inetremote"),
     ] {
         let mut sc = Command::new(cc);
         sc.arg("-static").arg("-no-pie");

@@ -103,18 +103,34 @@ extern crate alloc;
 
 pub mod arp;
 pub mod cc;
-pub mod dns;
 pub mod eth;
-pub mod icmp;
 pub mod ip;
-pub mod local;
-pub mod service;
 pub mod shard;
 pub mod tcp;
-pub mod timer;
-pub mod trace;
 pub mod udp;
 pub mod wire;
+
+// The **librheo-hosted** modules (feature `hosted`, on by default): every layer
+// that reaches the NIC or the clock through librheo's async surface. Gating them
+// out (`--no-default-features`) leaves the **codec posture** - pure parsing,
+// framing, checksums and synchronous state machines - which is what makes the
+// stack linkable into a *kernel* binary for the rheo-net N4b `svc::SocketOps`
+// bridge (docs/NETSTACK.md N4b). librheo supplies a cell's `_start`, panic
+// handler and global allocator, so a kernel cannot link it; the codec posture
+// carries none of that. Nothing here is duplicated - the same `eth`/`ip`/`udp`/
+// `tcp` code serves both postures.
+#[cfg(feature = "hosted")]
+pub mod dns;
+#[cfg(feature = "hosted")]
+pub mod icmp;
+#[cfg(feature = "hosted")]
+pub mod local;
+#[cfg(feature = "hosted")]
+pub mod service;
+#[cfg(feature = "hosted")]
+pub mod timer;
+#[cfg(feature = "hosted")]
+pub mod trace;
 
 /// The smoltcp blessed transport cell (docs/NETSTACK.md §13, N2c). Gated behind
 /// the `smoltcp` feature so the from-scratch stack + every existing test are

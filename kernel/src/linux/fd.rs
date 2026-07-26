@@ -122,12 +122,46 @@ enum FdKind {
         bound: bool,
         peer_port: u16,
     },
+    /// A UDP socket on the **remote** (NIC-backed) datapath (rheo-net N4b,
+    /// docs/LINUX-COMPAT.md L8-INET remote): `ep` is the opaque handle the
+    /// registered `svc::SocketOps` bridge returned, `port` the local port the
+    /// personality allocated, and `peer_ip`/`peer_port` a `connect`-set default
+    /// destination. A UDP socket becomes remote the first time it names a
+    /// **non-loopback** address; a loopback one keeps `InetDgram` unchanged.
+    InetUdpRemote {
+        ep: u8,
+        port: u16,
+        peer_ip: [u8; 4],
+        peer_port: u16,
+    },
+    /// A connected TCP socket on the **remote** datapath (rheo-net N4b): `h` is the
+    /// `svc::SocketOps` connection handle; `read`/`write` forward to it. Loopback
+    /// TCP keeps `InetConn` (the L6 ring pair) unchanged.
+    InetTcpRemote {
+        h: u8,
+        local_port: u16,
+        peer_ip: [u8; 4],
+        peer_port: u16,
+    },
     /// An epoll instance (docs/LINUX-COMPAT.md L8-INET): `ep` indexes the
     /// per-personality epoll registry (`linux::epoll`).
     Epoll {
         ep: u8,
     },
 }
+
+/// How long a **remote** (NIC-backed) blocking receive waits for a frame before
+/// reporting `EAGAIN` (rheo-net N4b). The personality tracks no `O_NONBLOCK` or
+/// `SO_RCVTIMEO`, so one documented bound serves every remote receive: long enough
+/// that a real reply from the network always lands, short enough that a lost packet
+/// cannot wedge a cell. The wait itself is a genuine park (`net_rx::wait_frame`),
+/// not a spin, on the ISAs where the NIC RX interrupt is wired.
+const REMOTE_RECV_TIMEOUT_NS: u64 = 2_000_000_000;
+
+/// The handshake budget for a **remote** TCP `connect` (rheo-net N4b): the SYN is
+/// retransmitted inside this window by the transport's own RTO, and the call
+/// reports `ETIMEDOUT` at the deadline.
+const REMOTE_CONNECT_TIMEOUT_NS: u64 = 3_000_000_000;
 
 /// Room for the serialized auxv served through `/proc/self/auxv` (matches
 /// `linux::stack::AUXV_BYTES_MAX`).
@@ -332,11 +366,18 @@ impl FdTable {
                     pipe::ReadNb::WouldBlock => -EAGAIN,
                 }
             }
+            // A connected **remote** TCP socket (rheo-net N4b): the byte stream lives
+            // in the registered `svc::SocketOps` datapath, not in a local ring.
+            FdKind::InetTcpRemote { h, .. } => match svc::socket_ops() {
+                Some(o) => (o.tcp_recv)(h as u64, buf_va, count, REMOTE_RECV_TIMEOUT_NS),
+                None => -ENETUNREACH,
+            },
             FdKind::SockFresh
             | FdKind::SockListen { .. }
             | FdKind::InetStreamFresh { .. }
             | FdKind::InetListen { .. }
-            | FdKind::InetDgram { .. } => -ENOTCONN,
+            | FdKind::InetDgram { .. }
+            | FdKind::InetUdpRemote { .. } => -ENOTCONN,
             FdKind::Epoll { .. } => -EINVAL,
             FdKind::Vfs { vfs_fd, .. } => match svc::file_ops() {
                 Some(o) => (o.read)(vfs_fd as u64, buf_va, count),
@@ -380,11 +421,17 @@ impl FdTable {
                     pipe::WriteNb::Epipe => -EPIPE,
                 }
             }
+            // A connected **remote** TCP socket (rheo-net N4b).
+            FdKind::InetTcpRemote { h, .. } => match svc::socket_ops() {
+                Some(o) => (o.tcp_send)(h as u64, buf_va, count),
+                None => -ENETUNREACH,
+            },
             FdKind::SockFresh
             | FdKind::SockListen { .. }
             | FdKind::InetStreamFresh { .. }
             | FdKind::InetListen { .. }
-            | FdKind::InetDgram { .. } => -ENOTCONN,
+            | FdKind::InetDgram { .. }
+            | FdKind::InetUdpRemote { .. } => -ENOTCONN,
             FdKind::Epoll { .. } => -EINVAL,
             FdKind::Vfs { vfs_fd, .. } => match svc::file_ops() {
                 Some(o) => (o.write)(vfs_fd as u64, buf_va, count),
@@ -485,6 +532,20 @@ impl FdTable {
             FdKind::InetDgram {
                 ep, bound: true, ..
             } => inetsock::close_dgram(ep),
+            // Remote (NIC-backed) sockets: release the bridge's handle. These are
+            // NOT reference-counted across `dup`/`fork` - a duplicated remote
+            // socket aliases one handle and the first close releases it (a
+            // documented N4b deferral, docs/LINUX-COMPAT.md L8-INET remote).
+            FdKind::InetUdpRemote { ep, .. } => {
+                if let Some(o) = svc::socket_ops() {
+                    (o.udp_close)(ep as u64);
+                }
+            }
+            FdKind::InetTcpRemote { h, .. } => {
+                if let Some(o) = svc::socket_ops() {
+                    (o.tcp_close)(h as u64);
+                }
+            }
             FdKind::Epoll { ep } => epoll::close(ep),
             _ => {}
         }
@@ -593,6 +654,8 @@ impl FdTable {
             | FdKind::InetListen { .. }
             | FdKind::InetConn { .. }
             | FdKind::InetDgram { .. }
+            | FdKind::InetUdpRemote { .. }
+            | FdKind::InetTcpRemote { .. }
             | FdKind::Epoll { .. } => -ESPIPE,
             FdKind::Closed => -EBADF,
         }
@@ -635,6 +698,8 @@ impl FdTable {
             | FdKind::InetListen { .. }
             | FdKind::InetConn { .. }
             | FdKind::InetDgram { .. }
+            | FdKind::InetUdpRemote { .. }
+            | FdKind::InetTcpRemote { .. }
             | FdKind::Epoll { .. } => {
                 Stat::new(S_IFSOCK | 0o600, 0, 1, 1, 1000, 1000, 0, 4096, 0, 0)
             }
@@ -680,6 +745,8 @@ impl FdTable {
             | FdKind::InetListen { .. }
             | FdKind::InetConn { .. }
             | FdKind::InetDgram { .. }
+            | FdKind::InetUdpRemote { .. }
+            | FdKind::InetTcpRemote { .. }
             | FdKind::Epoll { .. } => Ok((S_IFSOCK | 0o600, 0)),
             FdKind::Vfs { vfs_fd, .. } => {
                 let Some(o) = svc::file_ops() else {
@@ -963,7 +1030,7 @@ impl FdTable {
             }
             // AF_INET stream: record the local port; `listen` registers it.
             FdKind::InetStreamFresh { v6, .. } => {
-                let Some((av6, port, _)) = read_inaddr(addr_va, addrlen) else {
+                let Some((av6, port, _, _)) = read_inaddr(addr_va, addrlen) else {
                     return -EINVAL;
                 };
                 if av6 != v6 {
@@ -979,7 +1046,7 @@ impl FdTable {
             FdKind::InetDgram {
                 v6, bound: false, ..
             } => {
-                let Some((av6, port, _)) = read_inaddr(addr_va, addrlen) else {
+                let Some((av6, port, _, _)) = read_inaddr(addr_va, addrlen) else {
                     return -EINVAL;
                 };
                 if av6 != v6 {
@@ -1038,20 +1105,69 @@ impl FdTable {
             return -EBADF;
         };
         match self.fds[slot] {
-            FdKind::SockConn { .. } | FdKind::InetConn { .. } => return -EISCONN,
-            FdKind::SockFresh | FdKind::InetStreamFresh { .. } | FdKind::InetDgram { .. } => {}
+            FdKind::SockConn { .. } | FdKind::InetConn { .. } | FdKind::InetTcpRemote { .. } => {
+                return -EISCONN;
+            }
+            FdKind::SockFresh
+            | FdKind::InetStreamFresh { .. }
+            | FdKind::InetDgram { .. }
+            | FdKind::InetUdpRemote { .. } => {}
             _ => return -EINVAL,
+        }
+        // A UDP socket already on the remote datapath: just re-point its default
+        // destination (a `connect` on a datagram socket sets no state on the wire).
+        if let FdKind::InetUdpRemote { ep, port, .. } = self.fds[slot] {
+            let Some((_, dport, dst, loop_ok)) = read_inaddr(addr_va, addrlen) else {
+                return -EINVAL;
+            };
+            if loop_ok {
+                return -EINVAL; // cannot fall back to loopback once remote
+            }
+            self.fds[slot] = FdKind::InetUdpRemote {
+                ep,
+                port,
+                peer_ip: dst,
+                peer_port: dport,
+            };
+            return 0;
         }
         // AF_INET stream: look up the loopback listener, allocate the ring pair.
         if let FdKind::InetStreamFresh { v6, local_port } = self.fds[slot] {
-            let Some((av6, port, loop_ok)) = read_inaddr(addr_va, addrlen) else {
+            let Some((av6, port, dst, loop_ok)) = read_inaddr(addr_va, addrlen) else {
                 return -EINVAL;
             };
             if av6 != v6 {
                 return -EAFNOSUPPORT;
             }
             if !loop_ok {
-                return -ENETUNREACH; // NIC-backed remote INET is a later phase
+                // A **remote** destination (rheo-net N4b): hand the active open to
+                // the registered datapath. The kernel runs no TCP state machine -
+                // the bridge does the handshake over the NIC and reports the
+                // outcome; without a bridge the answer stays ENETUNREACH, exactly
+                // as before N4b. IPv6 remote is a documented deferral (the N4b
+                // datapath is IPv4).
+                if v6 {
+                    return -ENETUNREACH;
+                }
+                let Some(o) = svc::socket_ops() else {
+                    return -ENETUNREACH;
+                };
+                let src_port = if local_port != 0 {
+                    local_port
+                } else {
+                    inetsock::ephemeral_port()
+                };
+                let h = (o.tcp_connect)(dst, port, src_port, REMOTE_CONNECT_TIMEOUT_NS);
+                if h < 0 {
+                    return h;
+                }
+                self.fds[slot] = FdKind::InetTcpRemote {
+                    h: h as u8,
+                    local_port: src_port,
+                    peer_ip: dst,
+                    peer_port: port,
+                };
+                return 0;
             }
             let client_port = if local_port != 0 {
                 local_port
@@ -1076,14 +1192,16 @@ impl FdTable {
         }
         // AF_INET datagram: record a default peer (and ephemeral-bind if needed).
         if let FdKind::InetDgram { v6, ep, bound, .. } = self.fds[slot] {
-            let Some((av6, port, loop_ok)) = read_inaddr(addr_va, addrlen) else {
+            let Some((av6, port, dst, loop_ok)) = read_inaddr(addr_va, addrlen) else {
                 return -EINVAL;
             };
             if av6 != v6 {
                 return -EAFNOSUPPORT;
             }
             if !loop_ok {
-                return -ENETUNREACH;
+                // Remote UDP (rheo-net N4b): move the socket onto the registered
+                // datapath, recording the default destination.
+                return self.go_remote_udp(slot, v6, ep, bound, dst, port);
             }
             let (ep, bound) = if bound {
                 (ep, true)
@@ -1206,6 +1324,36 @@ impl FdTable {
                 write_inaddr(addr_va, addrlen_va, v6, if peer { peer_port } else { port });
                 return 0;
             }
+            // Remote sockets report the datapath's own IPv4 address, not loopback
+            // (rheo-net N4b): the bridge owns the local identity.
+            FdKind::InetUdpRemote {
+                port,
+                peer_ip,
+                peer_port,
+                ..
+            } => {
+                let (ip, p) = if peer {
+                    (peer_ip, peer_port)
+                } else {
+                    (local_ipv4(), port)
+                };
+                write_inaddr_v4(addr_va, addrlen_va, ip, p);
+                return 0;
+            }
+            FdKind::InetTcpRemote {
+                local_port,
+                peer_ip,
+                peer_port,
+                ..
+            } => {
+                let (ip, p) = if peer {
+                    (peer_ip, peer_port)
+                } else {
+                    (local_ipv4(), local_port)
+                };
+                write_inaddr_v4(addr_va, addrlen_va, ip, p);
+                return 0;
+            }
             _ => {}
         }
         // AF_UNIX.
@@ -1238,6 +1386,32 @@ impl FdTable {
         let Some(slot) = usize_fd(fd) else {
             return -EBADF;
         };
+        // Already on the remote datapath (rheo-net N4b): send straight over it.
+        if let FdKind::InetUdpRemote {
+            ep,
+            peer_ip,
+            peer_port,
+            ..
+        } = self.fds[slot]
+        {
+            let Some(o) = svc::socket_ops() else {
+                return -ENETUNREACH;
+            };
+            let (dst, dport) = if dest_addr != 0 {
+                let Some((_, port, ip, loop_ok)) = read_inaddr(dest_addr, addrlen) else {
+                    return -EINVAL;
+                };
+                if loop_ok {
+                    return -ENETUNREACH; // a remote socket cannot address loopback
+                }
+                (ip, port)
+            } else if peer_port != 0 {
+                (peer_ip, peer_port)
+            } else {
+                return -EINVAL;
+            };
+            return (o.udp_send)(ep as u64, dst, dport, buf, len);
+        }
         let FdKind::InetDgram {
             v6,
             ep,
@@ -1265,11 +1439,17 @@ impl FdTable {
             }
         };
         let (dv6, dport) = if dest_addr != 0 {
-            let Some((av6, port, loop_ok)) = read_inaddr(dest_addr, addrlen) else {
+            let Some((av6, port, dst, loop_ok)) = read_inaddr(dest_addr, addrlen) else {
                 return -EINVAL;
             };
             if !loop_ok {
-                return -ENETUNREACH;
+                // First non-loopback destination: promote the socket onto the
+                // registered remote datapath, then send there (rheo-net N4b).
+                let r = self.go_remote_udp(slot, v6, ep, true, dst, port);
+                if r < 0 {
+                    return r;
+                }
+                return self.sendto(fd, buf, len, dest_addr, addrlen);
             }
             (av6, port)
         } else if peer_port != 0 {
@@ -1292,6 +1472,27 @@ impl FdTable {
         let Some(slot) = usize_fd(fd) else {
             return -EBADF;
         };
+        // The remote datapath (rheo-net N4b): the bridge blocks on the wire (a
+        // genuine `net_rx` park, not a spin) and fills in the sender's address.
+        if let FdKind::InetUdpRemote { ep, .. } = self.fds[slot] {
+            let Some(o) = svc::socket_ops() else {
+                return -ENETUNREACH;
+            };
+            let mut src_ip = [0u8; 4];
+            let mut src_port: u16 = 0;
+            let n = (o.udp_recv)(
+                ep as u64,
+                buf,
+                len,
+                core::ptr::addr_of_mut!(src_ip) as u64,
+                core::ptr::addr_of_mut!(src_port) as u64,
+                REMOTE_RECV_TIMEOUT_NS,
+            );
+            if n >= 0 && src_addr != 0 {
+                write_inaddr_v4(src_addr, addrlen_va, src_ip, src_port);
+            }
+            return n;
+        }
         let FdKind::InetDgram { v6, ep, bound, .. } = self.fds[slot] else {
             return -ENOTSOCK;
         };
@@ -1331,7 +1532,56 @@ impl FdTable {
     /// True if `fd` is a datagram (UDP) socket - `sendto`/`recvfrom` route to the
     /// datagram path (`linux::inetsock`) rather than the stream write/read path.
     pub fn is_dgram(&self, fd: i64) -> bool {
-        usize_fd(fd).is_some_and(|s| matches!(self.fds[s], FdKind::InetDgram { .. }))
+        usize_fd(fd).is_some_and(|s| {
+            matches!(
+                self.fds[s],
+                FdKind::InetDgram { .. } | FdKind::InetUdpRemote { .. }
+            )
+        })
+    }
+
+    /// Move a UDP socket from the loopback registry onto the **remote**
+    /// (NIC-backed) datapath (rheo-net N4b), recording `peer_ip:peer_port` as its
+    /// default destination. The local port carries over when the socket was already
+    /// bound, so a `bind`-then-`sendto` program keeps its chosen source port; an
+    /// unbound socket gets an ephemeral one. Returns 0 or `-errno`.
+    fn go_remote_udp(
+        &mut self,
+        slot: usize,
+        v6: bool,
+        ep: u8,
+        bound: bool,
+        peer_ip: [u8; 4],
+        peer_port: u16,
+    ) -> i64 {
+        // The N4b datapath is IPv4; a v6 remote destination stays ENETUNREACH.
+        if v6 {
+            return -ENETUNREACH;
+        }
+        let Some(o) = svc::socket_ops() else {
+            return -ENETUNREACH;
+        };
+        let port = if bound {
+            let (_, p) = inetsock::dgram_addr(ep);
+            p
+        } else {
+            inetsock::ephemeral_port()
+        };
+        let h = (o.udp_bind)(port);
+        if h < 0 {
+            return h;
+        }
+        // Release the loopback endpoint - this socket now lives on the wire.
+        if bound {
+            inetsock::close_dgram(ep);
+        }
+        self.fds[slot] = FdKind::InetUdpRemote {
+            ep: h as u8,
+            port,
+            peer_ip,
+            peer_port,
+        };
+        0
     }
 
     /// POLLIN readiness for `fd` (used by epoll, level-triggered). A socket is
@@ -1352,6 +1602,14 @@ impl FdTable {
             FdKind::InetDgram {
                 ep, bound: true, ..
             } => inetsock::dgram_has_data(ep),
+            // Remote sockets (rheo-net N4b): UDP readiness is a question for the
+            // bridge; a connected remote TCP socket is reported readable so a
+            // poll-then-read caller reaches the blocking `tcp_recv` (there is no
+            // non-blocking readiness probe on the N4b datapath - documented).
+            FdKind::InetUdpRemote { ep, .. } => {
+                svc::socket_ops().is_some_and(|o| (o.udp_pending)(ep as u64))
+            }
+            FdKind::InetTcpRemote { .. } => true,
             FdKind::Console(0)
             | FdKind::Vfs { .. }
             | FdKind::Null
@@ -1380,9 +1638,20 @@ impl FdTable {
             | FdKind::Vfs { .. }
             | FdKind::Null
             | FdKind::Zero
-            | FdKind::InetDgram { bound: true, .. } => true,
+            | FdKind::InetDgram { bound: true, .. }
+            | FdKind::InetUdpRemote { .. }
+            | FdKind::InetTcpRemote { .. } => true,
             _ => false,
         }
+    }
+}
+
+/// The remote datapath's local IPv4 address (rheo-net N4b), or `0.0.0.0` with no
+/// bridge installed.
+fn local_ipv4() -> [u8; 4] {
+    match svc::socket_ops() {
+        Some(o) => (o.local_ip)(),
+        None => [0; 4],
     }
 }
 
@@ -1427,7 +1696,10 @@ fn read_sun_key(addr_va: u64, addrlen: u64, out: &mut [u8; NAME_MAX]) -> Option<
 ///
 /// Layout: `sin_family` u16 @0, `sin_port` big-endian u16 @2, then the address
 /// (v4: 4 bytes @4; v6: 16 bytes @8 after a 4-byte flowinfo).
-fn read_inaddr(addr_va: u64, addrlen: u64) -> Option<(bool, u16, bool)> {
+///
+/// The third tuple element is the **IPv4 octets** (all zero for a v6 address) -
+/// what the rheo-net N4b remote datapath needs to address the peer.
+fn read_inaddr(addr_va: u64, addrlen: u64) -> Option<(bool, u16, [u8; 4], bool)> {
     let len = addrlen as usize;
     if addr_va == 0 || len < 4 {
         return None;
@@ -1445,7 +1717,7 @@ fn read_inaddr(addr_va: u64, addrlen: u64) -> Option<(bool, u16, bool)> {
             let a = unsafe { core::slice::from_raw_parts((addr_va + 4) as *const u8, 4) };
             let oct = [a[0], a[1], a[2], a[3]];
             let is_local = inetsock::is_loopback_v4(oct) || oct == [0, 0, 0, 0];
-            Some((false, port, is_local))
+            Some((false, port, oct, is_local))
         }
         AF_INET6 => {
             if len < 24 {
@@ -1456,7 +1728,7 @@ fn read_inaddr(addr_va: u64, addrlen: u64) -> Option<(bool, u16, bool)> {
             let mut oct = [0u8; 16];
             oct.copy_from_slice(a);
             let is_local = inetsock::is_loopback_v6(oct) || oct == [0u8; 16];
-            Some((true, port, is_local))
+            Some((true, port, [0; 4], is_local))
         }
         _ => None,
     }
@@ -1492,6 +1764,26 @@ fn write_inaddr(addr_va: u64, addrlen_va: u64, v6: bool, port: u16) {
             if addrlen_va != 0 {
                 (addrlen_va as *mut u32).write(16);
             }
+        }
+    }
+}
+
+/// Write a `sockaddr_in` for a **real** IPv4 address + port (rheo-net N4b): the
+/// remote datapath's peers are not loopback, so `getsockname`/`getpeername`/
+/// `recvfrom` on a remote socket report the genuine address rather than 127.0.0.1.
+fn write_inaddr_v4(addr_va: u64, addrlen_va: u64, ip: [u8; 4], port: u16) {
+    if addr_va == 0 {
+        return;
+    }
+    let pbe = port.to_be();
+    // SAFETY: caller-provided sockaddr buffer (>= 16 bytes) + socklen_t out-param.
+    unsafe {
+        core::ptr::write_bytes(addr_va as *mut u8, 0, 16);
+        (addr_va as *mut u16).write_unaligned(inetsock::AF_INET as u16);
+        ((addr_va + 2) as *mut u16).write_unaligned(pbe);
+        core::ptr::copy_nonoverlapping(ip.as_ptr(), (addr_va + 4) as *mut u8, 4);
+        if addrlen_va != 0 {
+            (addrlen_va as *mut u32).write(16);
         }
     }
 }

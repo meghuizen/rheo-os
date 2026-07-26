@@ -15,7 +15,18 @@ edition = "2024"
 # The raw-frame NIC path, the async reactor, the heap, and the one-shot timer -
 # rheo-net is a layer over librheo, not a peer of it. `full` (librheo default)
 # provides `net`/`time`/`mem`/`rt`.
-librheo = { path = "../librheo" }
+#
+# **Optional**, behind the `hosted` feature (on by default). librheo supplies a
+# cell's `_start`, `#[panic_handler]` and `#[global_allocator]`, so a *kernel*
+# binary cannot link it (duplicate lang items). rheo-net N4b needs the stack's
+# pure codec + state machines available kernel-side (the `svc::SocketOps` bridge,
+# docs/NETSTACK.md N4b), so `--no-default-features` drops librheo and compiles the
+# **codec** posture: eth/ip/arp-packet/udp-codec/tcp/cc/shard/wire-framing, with
+# every async librheo-driven endpoint gated out. `qemu-tests` depends on rheo-net
+# that way. NOTE: never build `-p qemu-tests` and `-p rheo-net` in ONE cargo
+# invocation - feature unification would turn `hosted` back on and the test kernel
+# would fail to link. xtask keeps them in separate invocations.
+librheo = { path = "../librheo", optional = true }
 
 # The blessed pure-Rust `no_std` transport (docs/NETSTACK.md 3, §13, Phase N2c) -
 # Redox's stack, correctness-first, single-poll. Pinned. `default-features = false`
@@ -57,7 +68,13 @@ ed25519-dalek = { version = "=2.1.1", default-features = false, optional = true 
 # (UDP/TCP/TLS/app protocols) can be attached per profile without a churn of the
 # public surface. `default = ["edge"]` is the general-purpose profile.
 [features]
-default = ["edge"]
+default = ["edge", "hosted"]
+# The librheo-**hosted** posture: the async endpoints/services that drive the NIC
+# and the reactor through librheo (`arp::resolve`, `udp::UdpEndpoint`, `icmp`,
+# `dns`, `timer`, `local`, `service`). On by default - every cell build wants it.
+# Turning it OFF (`--no-default-features`) yields the **codec** posture, which
+# links into a kernel binary (docs/NETSTACK.md N4b).
+hosted = ["dep:librheo"]
 # A tiny subset: raw frames + minimal UDP (future). Smallest datapath.
 embedded = []
 # General host / firewall / WAF: the full L2-L4 core (future TCP/TLS).
@@ -68,11 +85,12 @@ hft = []
 warehouse = []
 # N2c: the smoltcp blessed transport cell (docs/NETSTACK.md 13). Off by default
 # so the from-scratch stack + every existing test are unaffected.
-smoltcp = ["dep:smoltcp"]
+smoltcp = ["dep:smoltcp", "hosted"]
 # N3a: the crypto primitive layer (docs/NETSTACK.md §3). ChaCha20-Poly1305 is
 # from-scratch; the audited RustCrypto crates supply the rest. Off by default so
 # the base stack + every existing test are unaffected; built separately by xtask.
 crypto = [
+    "hosted",
     "dep:sha2",
     "dep:hkdf",
     "dep:aes-gcm",

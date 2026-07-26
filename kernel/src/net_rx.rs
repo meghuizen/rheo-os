@@ -183,6 +183,16 @@ pub fn wait_frame(buf_va: u64, len: usize, timeout_ns: u64) -> usize {
     result
 }
 
+/// Kernel-side twin of [`wait_frame`] over a **kernel-owned** slice: the
+/// rheo-net N4b remote-INET bridge (a registered `svc::SocketOps` table) runs its
+/// datapath in kernel context, so it parks on frames into its own buffer rather
+/// than a cell VA (docs/NETSTACK.md N4b). Same primitive, same interrupt/idle
+/// path - only the destination differs.
+pub fn wait_frame_slice(out: &mut [u8], timeout_ns: u64) -> usize {
+    let len = out.len();
+    wait_frame(out.as_mut_ptr() as u64, len, timeout_ns)
+}
+
 /// Whether the requested deadline has passed: the armed hardware timer where one
 /// is available, else the monotonic cycle counter.
 fn timed_out(timeout_ns: u64, use_timer: bool, start: u64) -> bool {

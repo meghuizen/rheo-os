@@ -224,10 +224,14 @@ kernels stay green.
     keystone. One long-lived service cell holds **one cross-cell channel per
     client** and runs **one strand per client**, serving N clients concurrently.
     Everything later rides here.
-  - **N4b: the remote-INET bridge for the personality** - route a Linux cell's
-    `AF_INET` connect/send/recv to the N4a service cell, so an unmodified Linux
-    binary reaches the real network (today's L8-INET is loopback-only,
-    docs/LINUX-COMPAT.md L8-INET).
+  - **N4b (done): the remote-INET bridge for the personality** (§18) - a Linux
+    cell's non-loopback `AF_INET` connect/send/recv is forwarded to a registered
+    **`svc::SocketOps`** table (the `svc::FileOps` precedent - a bridge, no kernel
+    object), whose datapath is `rheo-net` in a new librheo-free **codec** posture
+    driving virtio-net. An **unmodified static-glibc binary** does a real DNS round
+    trip to SLIRP's resolver and a real remote TCP connect on all three ISAs.
+    Routing it to the **N4a service cell** instead is the documented end state,
+    blocked on N4a's name-based rendezvous.
   - **N4c: host services** - DHCP + zeroconf + NTP clients as service cells.
 - **N5 - App protocols.** HTTP/2, gRPC, Arrow Flight (warehouse), Kafka.
 - **N6 - Perf substrate.** (NIC RX IRQ landed early in **N2d**, §16.) Zero-copy DMA + offload/multiqueue/RSS,
@@ -1584,3 +1588,175 @@ run still passes. On all three ISAs under SLIRP it does resolve, and the log say
   strand parked; supervision (and channel teardown on reap) is future work.
 - **Steering**: a received frame still wakes the *calling* cell. Waking the service
   cell on a frame destined for a client needs the N6 steering grants.
+
+## 18. Phase N4b (done): remote INET for unmodified Linux binaries
+
+The single biggest functional unlock left. **L8-INET** (§10) gave Linux cells
+`AF_INET`/`AF_INET6` sockets, but **loopback only**: `kernel/src/linux/inetsock.rs`
+refused every non-loopback destination with `-ENETUNREACH`, because a TCP connection
+between two *local* endpoints degenerates to the L6 ring pair the kernel already has,
+while a *remote* one needs the real segment/RTO/congestion machinery. N4b makes real
+remote destinations work, so an **unmodified static-glibc binary does a real DNS
+query, a real UDP round trip, and a real TCP connect over the NIC**.
+
+### The blocker, and why it was only half true
+
+L8-INET documented the obstacle as: *"the kernel is allocation-free, so the
+alloc-based `net::tcp`/`net::udp` cannot be linked kernel-resident."* That is true of
+the **`kernel/` library** - and it must stay true. It is **not** true of a *kernel
+binary*: `tests/src/*.rs` kernels declare their own `#[global_allocator]`
+(`runtime::Heap`) and already link alloc-using crates (`posix`). So the stack can be
+linked *beside* the kernel by whoever owns the machine's network - which is exactly
+the shape doctrine wants.
+
+One real obstacle remained: `rheo-net` depended unconditionally on **librheo**, which
+supplies a *cell's* `_start`, `#[panic_handler]` and `#[global_allocator]`. Linking
+that into a kernel binary is a duplicate-lang-item error. N4b therefore gives the
+crate two **postures** (one code base, no duplication):
+
+- **hosted** (`hosted` feature, on by default - every existing cell build): the
+  librheo-driven async endpoints and services - `arp::resolve`, `udp::UdpEndpoint`,
+  `icmp`, `dns`, `timer`, `local`, `service`, `smoltcp_cell`, `crypto`/`tls`.
+- **codec** (`--no-default-features`): the pure, synchronous layers - `eth`, `ip`,
+  `arp` packet build/parse, `udp` build/parse + checksum, `tcp` (the whole RFC 793
+  state machine), `cc`, `shard`, and `wire`'s framing/parsing. No librheo, so it
+  links into a kernel binary. The only duplicated item is `eth::Mac`, a six-byte
+  newtype declared locally when librheo is absent.
+
+`tcp::Connection`'s seam is what makes this work: `poll(now) -> Option<Vec<u8>>` and
+`on_wire_segment(now, bytes)` are **synchronous and transport-independent** (they were
+written that way for the N2a in-cell virtual link), so the same state machine drives
+from kernel context with no async runtime at all.
+
+*Build caveat (recorded because it is a real trap):* never build `-p qemu-tests` and
+`-p rheo-net` in **one** cargo invocation - feature unification would re-enable
+`hosted` and the test kernel would fail to link. xtask and CI keep them separate.
+
+### The architecture: `svc::SocketOps`, the `FileOps` precedent
+
+The kernel gains **a bridge, not a network stack**, and **no kernel object**:
+
+- `kernel/src/svc.rs` gains **`SocketOps`** - a table of `fn` pointers
+  (`local_ip`, `udp_bind`/`udp_close`/`udp_send`/`udp_recv`/`udp_pending`,
+  `tcp_connect`/`tcp_send`/`tcp_recv`/`tcp_close`) plus `set_socket_ops` /
+  `socket_ops`, mirroring `FileOps`/`set_file_ops` line for line.
+- `kernel/src/linux/fd.rs` forwards **non-loopback** socket operations to it. Two new
+  `FdKind` variants hold the bridge handles (`InetUdpRemote`, `InetTcpRemote`); a UDP
+  socket migrates onto the remote datapath the first time it names a non-loopback
+  address. **Loopback is untouched** - `InetDgram`/`InetConn` and the L6 ring path are
+  byte-for-byte as before, and `linuxinet` still asserts its exact transcript.
+- With **no bridge registered** every non-loopback address still answers
+  `-ENETUNREACH`, so all 49 pre-existing kernels behave identically.
+
+This is the same doctrine that keeps the kernel **filesystem-free** while serving
+`open`/`read`/`write`: mechanism in the kernel, policy in a registered service.
+Alternative considered and rejected for now: forwarding to the **N4a service cell over
+a channel**. It is the better end state (and the table is deliberately shaped to accept
+that substitution unchanged), but it needs a *name-based rendezvous* so an arbitrary
+Linux cell can reach a service it did not spawn - explicitly deferred by N4a §17. The
+`FileOps` parallel is proven, synchronous-friendly and doctrine-clean, so it lands
+first.
+
+### Driving the NIC kernel-side
+
+`net::udp`/`net::tcp`'s hosted endpoints reach the NIC through `librheo::net`
+(`OP_NET_*`), which is the **cell** path. Kernel-side the bridge drives the driver
+directly, through three small documented accessors added to
+`kernel/src/hw/virtio_net.rs` - `send_frame_slice`, `recv_frame_slice`, `mac_addr`.
+They are the same one-copy paths as the existing `tx`/`rx`/`mac` opcode bridges with
+the queue-completion wrapper removed: **mechanism only, no new object**. A
+`net_rx::wait_frame_slice` twin of `wait_frame` lets the bridge park on a
+kernel-owned buffer.
+
+A `Device`-trait refactor of the `net` transports (the N2c `smoltcp_cell`
+`phy::Device` precedent) was the alternative. It was not taken: the hosted endpoints
+are `async fn`s all the way down, so a trait seam alone would not make them callable
+from a synchronous trap - the *codec posture plus a driver loop* is the smaller,
+honest change. A device seam remains the right move when the datapath moves into a
+service cell.
+
+### Blocking: a park, not a spin
+
+A remote receive blocks in **`net_rx::wait_frame_slice`** - the N2d
+park-until-frame primitive with a deadline. On **riscv64/aarch64** the kernel
+genuinely halts at WFI until the NIC's RX interrupt fires; on **x86-64** it falls
+back to the documented bounded kernel poll (its NIC is virtio-pci through the
+config tunnel: no mapped BAR for an MSI-X table, and legacy INTx rides the QEMU-TCG
+IOAPIC path that does not re-deliver). Identical honesty to §16.
+
+### What is on the wire
+
+Everything is the stack's own code, driven by `tests/src/inet_personality.rs` (the
+sibling of `vfs_personality.rs`):
+
+| Layer | Code | Notes |
+|---|---|---|
+| L2 | `net::eth` | frame build/parse |
+| ARP | `net::arp` | request build + reply parse; next hop = the destination on our own /24, else the gateway (a real routing decision), cached (4 entries) |
+| L3 | `net::ip` + `net::wire` | IPv4 header + the ones-complement checksum, TTL 64 |
+| UDP | `net::udp` | build/parse + the pseudo-header checksum, verified on receive |
+| TCP | `net::tcp::Connection<FixedWindow>` | the full RFC 793 state machine: SYN, RTO retransmit, RST → CLOSED |
+| identity | fixed | SLIRP's `10.0.2.15`, gateway `10.0.2.2` (DHCP as a userspace service is a later phase) |
+
+### Scope: what works remotely, precisely
+
+- **UDP: fully.** `sendto`/`recvfrom`, `connect`+`send`/`recv`, source-address
+  reporting, ARP next-hop resolution, real IPv4+UDP checksums, and a receive that
+  parks on the wire.
+- **TCP: connect is real and proven.** The SYN goes out over the NIC, the RTO
+  retransmits inside the budget, and SLIRP's **real reset** is turned by
+  `tcp::Connection` into `ECONNREFUSED`; the deadline yields `ETIMEDOUT`. TCP **data
+  transfer is implemented** (`tcp_send`/`tcp_recv` over the same `Connection`,
+  reached by `read`/`write` on the fd) but is **not proven in QEMU**: SLIRP offers no
+  TCP responder, so there is no deterministic network-free data round trip to assert.
+  It is therefore honestly **untested code** until a phase adds a responder (a
+  `guestfwd`ed listener, or the N4a service cell talking to a peer cell).
+
+### The proof: the `linuxnet` test kernel
+
+`tests/src/linuxnet.rs` + `tests/linux-fixtures/inetremote.c` - an **unmodified
+static-glibc C binary** (built from source by xtask, gitignored, the `inet.c`/
+`af_unix.c`/`hello.c` recipe) running as a `Personality::Linux` cell:
+
+1. hand-build a DNS query (`A example.com`, txid `0x1234`) and `sendto` it to
+   SLIRP's built-in responder **10.0.2.3:53**, then `recvfrom` the reply and assert
+   its **structure**: the transaction id echoed, the QR bit set, and the sender being
+   `10.0.2.3:53`. **Never** a specific resolved address - SLIRP proxies to the host
+   resolver, so an A record's value is not deterministic.
+2. `connect()` to **10.0.2.2:9** (a closed port on the gateway) and assert
+   `ECONNREFUSED`.
+
+Each phase prints one line from a small fixed set, so the transcript stays **exact**
+while the program never fabricates a result: the accepted UDP lines are
+`dns answers yes` / `dns answers none` / `dns no reply`, and the accepted TCP lines
+`tcp refused` / `tcp timeout` / `tcp connected`. The kernel enumerates the accepted
+products, reports which occurred, and requires that a structurally valid DNS reply
+did arrive. It additionally asserts the receive genuinely parked
+(`net_rx::irq_count() > 0` and `did_idle()` on the interrupt-driven ISAs). With no
+netdev attached it skips-with-reason (loopback coverage lives in `linuxinet`).
+Observed on all three ISAs: `dns answers yes` + `tcp refused`, exit 0.
+
+### Invariants held
+
+- **No new kernel object, no new syscall verb.** `SocketOps` is a bridge, the
+  `FileOps` precedent; sockets remain per-cell synthesized fds.
+- **The kernel stays network-stack-free and allocation-free.** The stack lives in the
+  linked `net` crate on the registrant's side; `kernel/` gained three driver
+  accessors and one wait twin, nothing else.
+- **Loopback INET is unchanged** and `linuxinet` passes byte-for-byte.
+- **No new external dependency**; **no `cfg(target_arch)` outside
+  `kernel/src/arch/`**; `unsafe` stays in small documented blocks.
+
+### What N4b defers (explicit)
+
+- **IPv6 remote** - `AF_INET6` to a non-loopback address is still `-ENETUNREACH`.
+- **A remote listener / `accept`** - an inbound connection needs the N6 NIC
+  flow-steering grants (docs/NETWORKING.md).
+- **A proven remote TCP data round trip** (above).
+- **The datapath as a service cell** rather than a registered kernel-side table -
+  blocked on N4a's name-based rendezvous.
+- **Reference-counted remote handles** across `dup`/`fork`; **per-cell** datapath
+  instances; larger registries (4 UDP endpoints, 4 TCP connections, 4 ARP entries);
+  `SO_RCVTIMEO`/`O_NONBLOCK` (one documented 2 s receive / 3 s connect bound);
+  **DHCP** (the SLIRP identity is fixed); non-blocking readiness for a remote TCP
+  socket in `epoll`.

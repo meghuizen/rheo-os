@@ -826,6 +826,38 @@ pub fn drain_frame(buf_va: u64, len: usize) -> Option<usize> {
     Some(dev.recv_frame(out).unwrap_or(0))
 }
 
+// ------------------------------------------- kernel-side (SocketOps) accessors
+//
+// The rheo-net **N4b** remote-INET bridge (docs/NETSTACK.md N4b,
+// docs/LINUX-COMPAT.md L8-INET remote) runs its datapath in *kernel context* -
+// it is a registered `svc::SocketOps` table, the `svc::FileOps` precedent - so it
+// needs the driver over plain slices rather than cell VAs. These three are the
+// same one-copy paths as [`tx`]/[`rx`]/[`mac`] with the queue-completion wrapper
+// removed: **mechanism only, no new kernel object**, and the kernel still holds
+// no network stack (that lives in the registered bridge over the `rheo-net`
+// codec).
+
+/// Send one Ethernet frame from a kernel-owned slice. `false` if no NIC is
+/// installed or the device never completed the descriptor.
+pub fn send_frame_slice(frame: &[u8]) -> bool {
+    match net_mut() {
+        Some(dev) => dev.send_frame(frame),
+        None => false,
+    }
+}
+
+/// Poll for one received frame into a kernel-owned slice. `Some(len)` (0 = the
+/// receive queue is empty) or `None` if no NIC is installed.
+pub fn recv_frame_slice(out: &mut [u8]) -> Option<usize> {
+    let dev = net_mut()?;
+    Some(dev.recv_frame(out).unwrap_or(0))
+}
+
+/// The installed NIC's MAC address, or `None` if there is no NIC.
+pub fn mac_addr() -> Option<[u8; 6]> {
+    net_mut().map(|d| d.mac())
+}
+
 /// `OP_NET_MAC`: write the 6-byte MAC to the cell buffer at `buf_va`. Returns
 /// `(STATUS_OK, 6)`.
 ///

@@ -12,6 +12,17 @@ kernel = { path = "../kernel" }
 runtime = { path = "../runtime" }
 posix = { path = "../posix" }
 
+# rheo-net in its librheo-free **codec** posture (docs/NETSTACK.md N4b): the
+# `linuxnet` kernel registers a `svc::SocketOps` bridge whose datapath is the
+# stack's own eth/arp/ip/udp/tcp code, so a Linux cell can reach real remote
+# addresses while the kernel itself stays network-stack-free and allocation-free.
+# `default-features = false` drops librheo - it supplies a *cell's* `_start`,
+# panic handler and global allocator, which a kernel binary cannot link.
+# NOTE: never build `-p qemu-tests` together with `-p rheo-net` in one cargo
+# invocation; feature unification would re-enable `hosted` and the link would
+# fail. xtask keeps them in separate invocations.
+rheo-net = { path = "../net", default-features = false }
+
 [features]
 # The `smp` test kernel needs kernel/smp (docs/SMP.md). Kept out of the default
 # set + gated on the bin via required-features so the other 31 test kernels build
@@ -246,6 +257,14 @@ path = "src/linuxunix.rs"
 [[bin]]
 name = "linuxinet"
 path = "src/linuxinet.rs"
+
+# rheo-net Phase N4b (docs/NETSTACK.md N4b, docs/LINUX-COMPAT.md L8-INET remote):
+# **real remote networking for unmodified Linux binaries** - a static-glibc C
+# fixture does a live DNS round trip to SLIRP's resolver and a real remote TCP
+# connect, over a `svc::SocketOps` bridge backed by rheo-net + virtio-net.
+[[bin]]
+name = "linuxnet"
+path = "src/linuxnet.rs"
 
 # rheo-net Phase N4a (docs/NETSTACK.md the service-cell section): the network
 # service cell + concurrent client fan-out - one service cell serves three client
