@@ -21,8 +21,10 @@
 //! silent hang.
 
 pub mod dirent;
+pub mod epoll;
 pub mod errno;
 pub mod fd;
+pub mod inetsock;
 pub mod mem;
 pub mod pipe;
 pub mod proc;
@@ -114,6 +116,8 @@ pub fn reset() {
     pipe::reset();
     proc::reset();
     unixsock::reset();
+    inetsock::reset();
+    epoll::reset();
 }
 
 /// Deep-copy cell `from`'s Linux state into cell `to` (the `fork` inheritance
@@ -295,13 +299,37 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
         // accept4's flags (arg3) are accepted + ignored (SOCK_CLOEXEC/NONBLOCK).
         nr::ACCEPT | nr::ACCEPT4 => ret(st.fds.accept(args[0] as i64, args[1], args[2])),
         nr::CONNECT => ret(st.fds.connect(args[0] as i64, args[1], args[2])),
-        nr::GETSOCKNAME | nr::GETPEERNAME => {
-            ret(st.fds.getsockname(args[0] as i64, args[1], args[2]))
+        nr::GETSOCKNAME => ret(st.fds.getsockname(args[0] as i64, args[1], args[2], false)),
+        nr::GETPEERNAME => ret(st.fds.getsockname(args[0] as i64, args[1], args[2], true)),
+        // sendto/recvfrom: a UDP datagram socket routes to the loopback datagram
+        // path (with addresses); a connected stream socket ignores the address and
+        // routes to the blocking write/read path (cross-cell wake + SIGPIPE).
+        nr::SENDTO => {
+            if st.fds.is_dgram(args[0] as i64) {
+                ret(st
+                    .fds
+                    .sendto(args[0] as i64, args[1], args[2], args[4], args[5]))
+            } else {
+                sys_write(cur, st, args[0] as i64, args[1], args[2], frame)
+            }
         }
-        // sendto/recvfrom on a connected stream socket ignore the address; route
-        // to the blocking write/read path (cross-cell wake + SIGPIPE).
-        nr::SENDTO => sys_write(cur, st, args[0] as i64, args[1], args[2], frame),
-        nr::RECVFROM => sys_read(cur, st, args[0] as i64, args[1], args[2]),
+        nr::RECVFROM => {
+            if st.fds.is_dgram(args[0] as i64) {
+                ret(st
+                    .fds
+                    .recvfrom(args[0] as i64, args[1], args[2], args[4], args[5]))
+            } else {
+                sys_read(cur, st, args[0] as i64, args[1], args[2])
+            }
+        }
+        // epoll (L8-INET): a minimal level-triggered readiness surface.
+        nr::EPOLL_CREATE | nr::EPOLL_CREATE1 => ret(st.fds.epoll_create()),
+        nr::EPOLL_CTL => ret(st
+            .fds
+            .epoll_ctl(args[0] as i64, args[1], args[2] as i64, args[3])),
+        nr::EPOLL_WAIT | nr::EPOLL_PWAIT => {
+            ret(st.fds.epoll_wait(args[0] as i64, args[1], args[2] as usize))
+        }
         // sendmsg/recvmsg: gather/scatter over msg_iov (non-blocking; the fixture
         // uses read/write). SCM_RIGHTS ancillary data is deferred (L8).
         nr::SENDMSG => ret(sys_sendmsg(st, args[0] as i64, args[1], true)),

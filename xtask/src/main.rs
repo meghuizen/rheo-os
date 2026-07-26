@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 42] = [
+const TEST_KERNELS: [&str; 43] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -64,6 +64,7 @@ const TEST_KERNELS: [&str; 42] = [
     "netlocal",
     "nettcp",
     "linuxunix",
+    "linuxinet",
 ];
 
 /// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
@@ -707,6 +708,9 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         // AF_UNIX (L8, docs/LINUX-COMPAT.md): socketpair+fork + bind/listen/
         // connect/accept, the `linuxunix` proof.
         ("af_unix.c", "af_unix"),
+        // AF_INET/AF_INET6 loopback (L8-INET, docs/LINUX-COMPAT.md): TCP+UDP+epoll
+        // over 127.0.0.1 and TCP over ::1, the `linuxinet` proof.
+        ("inet.c", "inet"),
     ] {
         let mut sc = Command::new(cc);
         sc.arg("-static").arg("-no-pie");

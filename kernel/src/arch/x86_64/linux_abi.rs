@@ -108,7 +108,21 @@ pub mod nr {
     pub const RSEQ: u64 = 334;
     pub const CLONE3: u64 = 435;
     pub const FACCESSAT2: u64 = 439;
+
+    // epoll (docs/LINUX-COMPAT.md L8-INET). x86-64 legacy numbers.
+    pub const EPOLL_CREATE: u64 = 213;
+    pub const EPOLL_WAIT: u64 = 232;
+    pub const EPOLL_CTL: u64 = 233;
+    pub const EPOLL_PWAIT: u64 = 281;
+    pub const EPOLL_CREATE1: u64 = 291;
 }
+
+/// The x86-64 `struct epoll_event` is `__attribute__((packed))` (12 bytes; the
+/// `data` u64 follows the `events` u32 with no padding). ARM64/RISC-V leave it
+/// naturally aligned (docs/LINUX-COMPAT.md L8-INET). Per-ISA ABI, so it lives in
+/// the arch layer.
+pub const EPOLL_EVENT_SIZE: usize = 12;
+pub const EPOLL_EVENT_DATA_OFFSET: usize = 4;
 
 /// The x86-64 `struct stat` (docs/LINUX-COMPAT.md L2). 144 bytes; layout per
 /// Linux v6.6 `arch/x86/include/uapi/asm/stat.h`. ARM64/RISC-V use the smaller

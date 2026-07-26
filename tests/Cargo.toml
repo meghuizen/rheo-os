@@ -202,6 +202,13 @@ path = "src/nettcp.rs"
 name = "linuxunix"
 path = "src/linuxunix.rs"
 
+# Linux-personality L8-INET (docs/LINUX-COMPAT.md L8-INET): AF_INET/AF_INET6
+# sockets over loopback - a static-glibc C fixture doing TCP+UDP+epoll over
+# 127.0.0.1 and TCP over ::1.
+[[bin]]
+name = "linuxinet"
+path = "src/linuxinet.rs"
+
 [[bin]]
 name = "smp"
 path = "src/smp.rs"

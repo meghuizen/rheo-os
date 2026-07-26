@@ -10,7 +10,9 @@
 
 use crate::arch::{self, linux_abi::Stat};
 use crate::linux::dirent;
+use crate::linux::epoll;
 use crate::linux::errno::*;
+use crate::linux::inetsock::{self, AF_INET, AF_INET6};
 use crate::linux::pipe;
 use crate::linux::unixsock::{self, AF_UNIX, NAME_MAX, SOCK_DGRAM, SOCK_STREAM, SOCK_TYPE_MASK};
 use crate::svc;
@@ -85,6 +87,45 @@ enum FdKind {
     SockConn {
         rx: u8,
         tx: u8,
+    },
+    /// An AF_INET/AF_INET6 **stream** socket created by `socket()`, not yet
+    /// listening or connected (docs/LINUX-COMPAT.md L8-INET). `local_port` is 0
+    /// until `bind`; loopback-only.
+    InetStreamFresh {
+        v6: bool,
+        local_port: u16,
+    },
+    /// A bound + listening AF_INET/AF_INET6 stream socket: `lst` indexes the INET
+    /// listener registry (`linux::inetsock`).
+    InetListen {
+        lst: u8,
+        v6: bool,
+        port: u16,
+    },
+    /// A connected AF_INET/AF_INET6 stream socket (from `connect`/`accept`): the
+    /// transport is the same L6 ring pair as AF_UNIX (`rx`/`tx`); the ports are
+    /// kept for `getsockname`/`getpeername`.
+    InetConn {
+        rx: u8,
+        tx: u8,
+        local_port: u16,
+        peer_port: u16,
+        v6: bool,
+    },
+    /// An AF_INET/AF_INET6 **datagram** (UDP) socket. `ep` indexes the INET
+    /// datagram registry once `bound` (an explicit `bind`, or an implicit
+    /// ephemeral bind on the first `sendto`); `peer_port` is a `connect`-set
+    /// default destination.
+    InetDgram {
+        v6: bool,
+        ep: u8,
+        bound: bool,
+        peer_port: u16,
+    },
+    /// An epoll instance (docs/LINUX-COMPAT.md L8-INET): `ep` indexes the
+    /// per-personality epoll registry (`linux::epoll`).
+    Epoll {
+        ep: u8,
     },
 }
 
@@ -187,11 +228,16 @@ impl FdTable {
             match *f {
                 FdKind::Pipe { idx, writer } => pipe::add_end(idx as usize, writer),
                 // A connected socket is two ring ends (rx = reader, tx = writer).
-                FdKind::SockConn { rx, tx } => {
+                FdKind::SockConn { rx, tx } | FdKind::InetConn { rx, tx, .. } => {
                     pipe::add_end(rx as usize, false);
                     pipe::add_end(tx as usize, true);
                 }
                 FdKind::SockListen { lst } => unixsock::addref(lst),
+                FdKind::InetListen { lst, .. } => inetsock::addref_listener(lst),
+                FdKind::InetDgram {
+                    ep, bound: true, ..
+                } => inetsock::addref_dgram(ep),
+                FdKind::Epoll { ep } => epoll::addref(ep),
                 _ => {}
             }
         }
@@ -277,14 +323,21 @@ impl FdTable {
                 pipe::ReadNb::WouldBlock => -EAGAIN,
             },
             FdKind::Pipe { writer: true, .. } => -EBADF, // write end not readable
-            // Connected socket: read this end's rx ring (non-blocking; the
-            // cross-cell blocking path is `proc`/`sys_read`, docs/LINUX-COMPAT.md
-            // L8). readv/recvmsg fall through to here.
-            FdKind::SockConn { rx, .. } => match pipe::read(rx as usize, buf_va, count) {
-                pipe::ReadNb::Done(n) => n,
-                pipe::ReadNb::WouldBlock => -EAGAIN,
-            },
-            FdKind::SockFresh | FdKind::SockListen { .. } => -ENOTCONN,
+            // Connected socket (AF_UNIX or AF_INET loopback): read this end's rx
+            // ring (non-blocking; the cross-cell blocking path is
+            // `proc`/`sys_read`, docs/LINUX-COMPAT.md L8). readv/recvmsg fall here.
+            FdKind::SockConn { rx, .. } | FdKind::InetConn { rx, .. } => {
+                match pipe::read(rx as usize, buf_va, count) {
+                    pipe::ReadNb::Done(n) => n,
+                    pipe::ReadNb::WouldBlock => -EAGAIN,
+                }
+            }
+            FdKind::SockFresh
+            | FdKind::SockListen { .. }
+            | FdKind::InetStreamFresh { .. }
+            | FdKind::InetListen { .. }
+            | FdKind::InetDgram { .. } => -ENOTCONN,
+            FdKind::Epoll { .. } => -EINVAL,
             FdKind::Vfs { vfs_fd, .. } => match svc::file_ops() {
                 Some(o) => (o.read)(vfs_fd as u64, buf_va, count),
                 None => -EBADF,
@@ -317,15 +370,22 @@ impl FdTable {
                 pipe::WriteNb::WouldBlock => -EAGAIN,
                 pipe::WriteNb::Epipe => -EPIPE,
             },
-            // Connected socket: write this end's tx ring (non-blocking; the
-            // cross-cell blocking + SIGPIPE path is `sys_write`). writev/sendmsg
-            // fall through to here.
-            FdKind::SockConn { tx, .. } => match pipe::write(tx as usize, buf_va, count) {
-                pipe::WriteNb::Done(n) => n,
-                pipe::WriteNb::WouldBlock => -EAGAIN,
-                pipe::WriteNb::Epipe => -EPIPE,
-            },
-            FdKind::SockFresh | FdKind::SockListen { .. } => -ENOTCONN,
+            // Connected socket (AF_UNIX or AF_INET loopback): write this end's tx
+            // ring (non-blocking; the cross-cell blocking + SIGPIPE path is
+            // `sys_write`). writev/sendmsg fall through to here.
+            FdKind::SockConn { tx, .. } | FdKind::InetConn { tx, .. } => {
+                match pipe::write(tx as usize, buf_va, count) {
+                    pipe::WriteNb::Done(n) => n,
+                    pipe::WriteNb::WouldBlock => -EAGAIN,
+                    pipe::WriteNb::Epipe => -EPIPE,
+                }
+            }
+            FdKind::SockFresh
+            | FdKind::SockListen { .. }
+            | FdKind::InetStreamFresh { .. }
+            | FdKind::InetListen { .. }
+            | FdKind::InetDgram { .. } => -ENOTCONN,
+            FdKind::Epoll { .. } => -EINVAL,
             FdKind::Vfs { vfs_fd, .. } => match svc::file_ops() {
                 Some(o) => (o.write)(vfs_fd as u64, buf_va, count),
                 None => -EBADF,
@@ -420,6 +480,12 @@ impl FdTable {
             }
             FdKind::SockConn { rx, tx } => unixsock::drop_conn(rx, tx),
             FdKind::SockListen { lst } => unixsock::close(lst),
+            FdKind::InetConn { rx, tx, .. } => inetsock::drop_conn(rx, tx),
+            FdKind::InetListen { lst, .. } => inetsock::close_listener(lst),
+            FdKind::InetDgram {
+                ep, bound: true, ..
+            } => inetsock::close_dgram(ep),
+            FdKind::Epoll { ep } => epoll::close(ep),
             _ => {}
         }
         self.fds[slot] = FdKind::Closed;
@@ -464,11 +530,16 @@ impl FdTable {
     fn bump_if_pipe(&self, slot: usize) {
         match self.fds[slot] {
             FdKind::Pipe { idx, writer } => pipe::add_end(idx as usize, writer),
-            FdKind::SockConn { rx, tx } => {
+            FdKind::SockConn { rx, tx } | FdKind::InetConn { rx, tx, .. } => {
                 pipe::add_end(rx as usize, false);
                 pipe::add_end(tx as usize, true);
             }
             FdKind::SockListen { lst } => unixsock::addref(lst),
+            FdKind::InetListen { lst, .. } => inetsock::addref_listener(lst),
+            FdKind::InetDgram {
+                ep, bound: true, ..
+            } => inetsock::addref_dgram(ep),
+            FdKind::Epoll { ep } => epoll::addref(ep),
             _ => {}
         }
     }
@@ -515,7 +586,14 @@ impl FdTable {
             },
             FdKind::Console(_) | FdKind::Null | FdKind::Zero | FdKind::Urandom => -ESPIPE,
             FdKind::ProcAuxv { .. } | FdKind::Pipe { .. } => -ESPIPE,
-            FdKind::SockFresh | FdKind::SockListen { .. } | FdKind::SockConn { .. } => -ESPIPE,
+            FdKind::SockFresh
+            | FdKind::SockListen { .. }
+            | FdKind::SockConn { .. }
+            | FdKind::InetStreamFresh { .. }
+            | FdKind::InetListen { .. }
+            | FdKind::InetConn { .. }
+            | FdKind::InetDgram { .. }
+            | FdKind::Epoll { .. } => -ESPIPE,
             FdKind::Closed => -EBADF,
         }
     }
@@ -550,7 +628,14 @@ impl FdTable {
             FdKind::Pipe { .. } => {
                 Stat::new(dirent::S_IFIFO | 0o600, 0, 1, 1, 1000, 1000, 0, 4096, 0, 0)
             }
-            FdKind::SockFresh | FdKind::SockListen { .. } | FdKind::SockConn { .. } => {
+            FdKind::SockFresh
+            | FdKind::SockListen { .. }
+            | FdKind::SockConn { .. }
+            | FdKind::InetStreamFresh { .. }
+            | FdKind::InetListen { .. }
+            | FdKind::InetConn { .. }
+            | FdKind::InetDgram { .. }
+            | FdKind::Epoll { .. } => {
                 Stat::new(S_IFSOCK | 0o600, 0, 1, 1, 1000, 1000, 0, 4096, 0, 0)
             }
             FdKind::Vfs { vfs_fd, .. } => {
@@ -588,9 +673,14 @@ impl FdTable {
             }
             FdKind::ProcAuxv { .. } => Ok((dirent::S_IFREG | 0o444, self.auxv_len as u64)),
             FdKind::Pipe { .. } => Ok((dirent::S_IFIFO | 0o600, 0)),
-            FdKind::SockFresh | FdKind::SockListen { .. } | FdKind::SockConn { .. } => {
-                Ok((S_IFSOCK | 0o600, 0))
-            }
+            FdKind::SockFresh
+            | FdKind::SockListen { .. }
+            | FdKind::SockConn { .. }
+            | FdKind::InetStreamFresh { .. }
+            | FdKind::InetListen { .. }
+            | FdKind::InetConn { .. }
+            | FdKind::InetDgram { .. }
+            | FdKind::Epoll { .. } => Ok((S_IFSOCK | 0o600, 0)),
             FdKind::Vfs { vfs_fd, .. } => {
                 let Some(o) = svc::file_ops() else {
                     return Err(-EBADF);
@@ -705,16 +795,119 @@ impl FdTable {
         }
     }
 
-    /// socket(domain, type, protocol): an unbound AF_UNIX stream socket (L8).
+    /// socket(domain, type, protocol): an unbound socket. AF_UNIX stream (L8) or
+    /// an AF_INET/AF_INET6 loopback stream/datagram socket (L8-INET). The type's
+    /// high bits (SOCK_CLOEXEC/SOCK_NONBLOCK) are accepted + ignored.
     pub fn socket(&mut self, domain: u64, ty: u64) -> i64 {
-        if let Err(e) = Self::check_stream(domain, ty) {
-            return e;
+        match domain {
+            AF_UNIX => {
+                if let Err(e) = Self::check_stream(domain, ty) {
+                    return e;
+                }
+                let Some(slot) = self.free_slot(3) else {
+                    return -EMFILE;
+                };
+                self.fds[slot] = FdKind::SockFresh;
+                slot as i64
+            }
+            AF_INET | AF_INET6 => {
+                let v6 = domain == AF_INET6;
+                let Some(slot) = self.free_slot(3) else {
+                    return -EMFILE;
+                };
+                self.fds[slot] = match ty & SOCK_TYPE_MASK {
+                    SOCK_STREAM => FdKind::InetStreamFresh { v6, local_port: 0 },
+                    SOCK_DGRAM => FdKind::InetDgram {
+                        v6,
+                        ep: 0,
+                        bound: false,
+                        peer_port: 0,
+                    },
+                    _ => return -EPROTONOSUPPORT,
+                };
+                slot as i64
+            }
+            _ => -EAFNOSUPPORT,
         }
+    }
+
+    /// epoll_create1(flags): an epoll instance as a new fd (L8-INET). Flags
+    /// (EPOLL_CLOEXEC) are accepted + ignored.
+    pub fn epoll_create(&mut self) -> i64 {
+        let Some(ep) = epoll::create() else {
+            return -ENFILE;
+        };
         let Some(slot) = self.free_slot(3) else {
+            epoll::close(ep);
             return -EMFILE;
         };
-        self.fds[slot] = FdKind::SockFresh;
+        self.fds[slot] = FdKind::Epoll { ep };
         slot as i64
+    }
+
+    /// epoll_ctl(epfd, op, fd, event): register/modify/remove a watched fd. Reads
+    /// the `struct epoll_event` (`events` u32, then `data` u64 at the per-ISA
+    /// offset - x86-64 packs it, ARM64/RISC-V align it).
+    pub fn epoll_ctl(&mut self, epfd: i64, op: u64, fd: i64, event_va: u64) -> i64 {
+        let Some(slot) = usize_fd(epfd) else {
+            return -EBADF;
+        };
+        let FdKind::Epoll { ep } = self.fds[slot] else {
+            return -EINVAL;
+        };
+        let (events, data) = if event_va != 0 {
+            // SAFETY: `event_va` is a caller-provided `struct epoll_event`.
+            unsafe {
+                let ev = (event_va as *const u32).read_unaligned();
+                let d = ((event_va + arch::linux_abi::EPOLL_EVENT_DATA_OFFSET as u64)
+                    as *const u64)
+                    .read_unaligned();
+                (ev, d)
+            }
+        } else {
+            (0, 0)
+        };
+        epoll::ctl(ep, op, fd as i32, events, data)
+    }
+
+    /// epoll_wait/epoll_pwait(epfd, events, maxevents, ...): report level-triggered
+    /// readiness for the watched fds. Non-blocking (readiness is computed now); see
+    /// `linux::epoll`.
+    pub fn epoll_wait(&mut self, epfd: i64, events_va: u64, maxevents: usize) -> i64 {
+        let Some(slot) = usize_fd(epfd) else {
+            return -EBADF;
+        };
+        let FdKind::Epoll { ep } = self.fds[slot] else {
+            return -EINVAL;
+        };
+        let mut snap = [(0i32, 0u32, 0u64); epoll::MAX_WATCH];
+        let n = epoll::snapshot(ep, &mut snap);
+        let size = arch::linux_abi::EPOLL_EVENT_SIZE as u64;
+        let doff = arch::linux_abi::EPOLL_EVENT_DATA_OFFSET as u64;
+        let mut out = 0usize;
+        for &(wfd, wevents, data) in snap[..n].iter() {
+            if out >= maxevents {
+                break;
+            }
+            let mut re = 0u32;
+            if wevents & epoll::EPOLLIN != 0 && self.pollin_ready(wfd as i64) {
+                re |= epoll::EPOLLIN;
+            }
+            if wevents & epoll::EPOLLOUT != 0 && self.pollout_ready(wfd as i64) {
+                re |= epoll::EPOLLOUT;
+            }
+            if re != 0 {
+                let base = events_va + out as u64 * size;
+                // SAFETY: `events_va` is a caller-provided array of `maxevents`
+                // `struct epoll_event`; `out < maxevents`.
+                unsafe {
+                    (base as *mut u32).write_unaligned(re);
+                    ((base + doff) as *mut u64).write_unaligned(data);
+                }
+                out += 1;
+            }
+        }
+        out as i64
     }
 
     /// socketpair(domain, type, protocol, sv): two connected AF_UNIX sockets
@@ -754,31 +947,85 @@ impl FdTable {
         let Some(slot) = usize_fd(fd) else {
             return -EBADF;
         };
-        if !matches!(self.fds[slot], FdKind::SockFresh) {
-            return -EINVAL;
-        }
-        let mut key = [0u8; NAME_MAX];
-        let Some(klen) = read_sun_key(addr_va, addrlen, &mut key) else {
-            return -EINVAL;
-        };
-        match unixsock::bind(&key[..klen]) {
-            Some(lst) => {
-                self.fds[slot] = FdKind::SockListen { lst };
+        match self.fds[slot] {
+            FdKind::SockFresh => {
+                let mut key = [0u8; NAME_MAX];
+                let Some(klen) = read_sun_key(addr_va, addrlen, &mut key) else {
+                    return -EINVAL;
+                };
+                match unixsock::bind(&key[..klen]) {
+                    Some(lst) => {
+                        self.fds[slot] = FdKind::SockListen { lst };
+                        0
+                    }
+                    None => -EADDRINUSE,
+                }
+            }
+            // AF_INET stream: record the local port; `listen` registers it.
+            FdKind::InetStreamFresh { v6, .. } => {
+                let Some((av6, port, _)) = read_inaddr(addr_va, addrlen) else {
+                    return -EINVAL;
+                };
+                if av6 != v6 {
+                    return -EINVAL;
+                }
+                self.fds[slot] = FdKind::InetStreamFresh {
+                    v6,
+                    local_port: port,
+                };
                 0
             }
-            None => -EADDRINUSE,
+            // AF_INET datagram: register the UDP endpoint now.
+            FdKind::InetDgram {
+                v6, bound: false, ..
+            } => {
+                let Some((av6, port, _)) = read_inaddr(addr_va, addrlen) else {
+                    return -EINVAL;
+                };
+                if av6 != v6 {
+                    return -EINVAL;
+                }
+                match inetsock::register_dgram(v6, port) {
+                    Some(ep) => {
+                        self.fds[slot] = FdKind::InetDgram {
+                            v6,
+                            ep,
+                            bound: true,
+                            peer_port: 0,
+                        };
+                        0
+                    }
+                    None => -EADDRINUSE,
+                }
+            }
+            _ => -EINVAL,
         }
     }
 
     /// listen(fd, backlog): a bound socket is accept-ready (the registry already
-    /// carries its backlog); `backlog` is advisory here.
-    pub fn listen(&self, fd: i64) -> i64 {
+    /// carries its backlog); `backlog` is advisory here. For an AF_INET stream the
+    /// listener is registered now (auto-binding an ephemeral port if unbound).
+    pub fn listen(&mut self, fd: i64) -> i64 {
         let Some(slot) = usize_fd(fd) else {
             return -EBADF;
         };
         match self.fds[slot] {
-            FdKind::SockListen { .. } => 0,
+            FdKind::SockListen { .. } | FdKind::InetListen { .. } => 0,
             FdKind::SockFresh => -EINVAL, // not bound
+            FdKind::InetStreamFresh { v6, local_port } => {
+                let port = if local_port != 0 {
+                    local_port
+                } else {
+                    inetsock::ephemeral_port()
+                };
+                match inetsock::register_listener(v6, port) {
+                    Some(lst) => {
+                        self.fds[slot] = FdKind::InetListen { lst, v6, port };
+                        0
+                    }
+                    None => -EADDRINUSE,
+                }
+            }
             _ => -ENOTSOCK,
         }
     }
@@ -791,9 +1038,68 @@ impl FdTable {
             return -EBADF;
         };
         match self.fds[slot] {
-            FdKind::SockFresh => {}
-            FdKind::SockConn { .. } => return -EISCONN,
+            FdKind::SockConn { .. } | FdKind::InetConn { .. } => return -EISCONN,
+            FdKind::SockFresh | FdKind::InetStreamFresh { .. } | FdKind::InetDgram { .. } => {}
             _ => return -EINVAL,
+        }
+        // AF_INET stream: look up the loopback listener, allocate the ring pair.
+        if let FdKind::InetStreamFresh { v6, local_port } = self.fds[slot] {
+            let Some((av6, port, loop_ok)) = read_inaddr(addr_va, addrlen) else {
+                return -EINVAL;
+            };
+            if av6 != v6 {
+                return -EAFNOSUPPORT;
+            }
+            if !loop_ok {
+                return -ENETUNREACH; // NIC-backed remote INET is a later phase
+            }
+            let client_port = if local_port != 0 {
+                local_port
+            } else {
+                inetsock::ephemeral_port()
+            };
+            return match inetsock::connect_stream(v6, port, client_port) {
+                Ok((rx, tx)) => {
+                    self.fds[slot] = FdKind::InetConn {
+                        rx,
+                        tx,
+                        local_port: client_port,
+                        peer_port: port,
+                        v6,
+                    };
+                    0
+                }
+                Err(inetsock::ConnectErr::NoListener) => -ECONNREFUSED,
+                Err(inetsock::ConnectErr::Backlog) => -EAGAIN,
+                Err(inetsock::ConnectErr::NoRing) => -ENFILE,
+            };
+        }
+        // AF_INET datagram: record a default peer (and ephemeral-bind if needed).
+        if let FdKind::InetDgram { v6, ep, bound, .. } = self.fds[slot] {
+            let Some((av6, port, loop_ok)) = read_inaddr(addr_va, addrlen) else {
+                return -EINVAL;
+            };
+            if av6 != v6 {
+                return -EAFNOSUPPORT;
+            }
+            if !loop_ok {
+                return -ENETUNREACH;
+            }
+            let (ep, bound) = if bound {
+                (ep, true)
+            } else {
+                match inetsock::register_dgram(v6, 0) {
+                    Some(e) => (e, true),
+                    None => return -EAGAIN,
+                }
+            };
+            self.fds[slot] = FdKind::InetDgram {
+                v6,
+                ep,
+                bound,
+                peer_port: port,
+            };
+            return 0;
         }
         let mut key = [0u8; NAME_MAX];
         let Some(klen) = read_sun_key(addr_va, addrlen, &mut key) else {
@@ -818,6 +1124,25 @@ impl FdTable {
         let Some(slot) = usize_fd(fd) else {
             return -EBADF;
         };
+        // AF_INET stream: dequeue a pending connection, report the client's addr.
+        if let FdKind::InetListen { lst, v6, port } = self.fds[slot] {
+            let Some((rx, tx, client_port)) = inetsock::accept_stream(lst) else {
+                return -EAGAIN;
+            };
+            let Some(nslot) = self.free_slot(3) else {
+                inetsock::drop_conn(rx, tx);
+                return -EMFILE;
+            };
+            self.fds[nslot] = FdKind::InetConn {
+                rx,
+                tx,
+                local_port: port,
+                peer_port: client_port,
+                v6,
+            };
+            write_inaddr(addr_va, addrlen_va, v6, client_port);
+            return nslot as i64;
+        }
         let FdKind::SockListen { lst } = self.fds[slot] else {
             return -EINVAL;
         };
@@ -840,12 +1165,50 @@ impl FdTable {
         nslot as i64
     }
 
-    /// getsockname/getpeername(fd, addr, addrlen): report a bound listener's name
-    /// (or family-only for unnamed sockets).
-    pub fn getsockname(&self, fd: i64, addr_va: u64, addrlen_va: u64) -> i64 {
+    /// getsockname/getpeername(fd, addr, addrlen, peer): for AF_UNIX report the
+    /// bound name (or family-only); for AF_INET report the `sockaddr_in`/`_in6`
+    /// (loopback IP + the local or, with `peer`, the remote port).
+    pub fn getsockname(&self, fd: i64, addr_va: u64, addrlen_va: u64, peer: bool) -> i64 {
         let Some(slot) = usize_fd(fd) else {
             return -EBADF;
         };
+        // AF_INET variants report a sockaddr_in/_in6.
+        match self.fds[slot] {
+            FdKind::InetListen { v6, port, .. } => {
+                write_inaddr(addr_va, addrlen_va, v6, port);
+                return 0;
+            }
+            FdKind::InetStreamFresh { v6, local_port } => {
+                write_inaddr(addr_va, addrlen_va, v6, local_port);
+                return 0;
+            }
+            FdKind::InetConn {
+                v6,
+                local_port,
+                peer_port,
+                ..
+            } => {
+                write_inaddr(
+                    addr_va,
+                    addrlen_va,
+                    v6,
+                    if peer { peer_port } else { local_port },
+                );
+                return 0;
+            }
+            FdKind::InetDgram {
+                v6,
+                ep,
+                bound: true,
+                peer_port,
+            } => {
+                let (_, port) = inetsock::dgram_addr(ep);
+                write_inaddr(addr_va, addrlen_va, v6, if peer { peer_port } else { port });
+                return 0;
+            }
+            _ => {}
+        }
+        // AF_UNIX.
         let (name, nlen) = match self.fds[slot] {
             FdKind::SockListen { lst } => unixsock::name_of(lst),
             FdKind::SockConn { .. } | FdKind::SockFresh => ([0u8; NAME_MAX], 0),
@@ -867,11 +1230,92 @@ impl FdTable {
         0
     }
 
+    /// sendto(fd, buf, len, dest_addr, addrlen): a UDP datagram over loopback
+    /// (L8-INET). Ephemeral-binds the socket if unbound. Best-effort: reports the
+    /// whole datagram accepted even if no endpoint is bound at the destination
+    /// (UDP semantics). Stream sockets never reach here (routed to `write`).
+    pub fn sendto(&mut self, fd: i64, buf: u64, len: u64, dest_addr: u64, addrlen: u64) -> i64 {
+        let Some(slot) = usize_fd(fd) else {
+            return -EBADF;
+        };
+        let FdKind::InetDgram {
+            v6,
+            ep,
+            bound,
+            peer_port,
+        } = self.fds[slot]
+        else {
+            return -ENOTSOCK;
+        };
+        // Ensure a source port (ephemeral bind on first send).
+        let ep = if bound {
+            ep
+        } else {
+            match inetsock::register_dgram(v6, 0) {
+                Some(e) => {
+                    self.fds[slot] = FdKind::InetDgram {
+                        v6,
+                        ep: e,
+                        bound: true,
+                        peer_port,
+                    };
+                    e
+                }
+                None => return -EAGAIN,
+            }
+        };
+        let (dv6, dport) = if dest_addr != 0 {
+            let Some((av6, port, loop_ok)) = read_inaddr(dest_addr, addrlen) else {
+                return -EINVAL;
+            };
+            if !loop_ok {
+                return -ENETUNREACH;
+            }
+            (av6, port)
+        } else if peer_port != 0 {
+            (v6, peer_port)
+        } else {
+            return -EINVAL; // no destination (would be EDESTADDRREQ)
+        };
+        let (_, src_port) = inetsock::dgram_addr(ep);
+        let n = (len as usize).min(inetsock::DGRAM_MAX);
+        // SAFETY: `buf` is a readable range of `n` bytes in the active cell.
+        let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, n) };
+        inetsock::send_dgram(dv6, dport, src_port, bytes);
+        len as i64
+    }
+
+    /// recvfrom(fd, buf, len, src_addr, addrlen): dequeue one UDP datagram over
+    /// loopback (L8-INET), filling `src_addr` with the sender's loopback address +
+    /// port. Non-blocking: `-EAGAIN` when the queue is empty.
+    pub fn recvfrom(&mut self, fd: i64, buf: u64, len: u64, src_addr: u64, addrlen_va: u64) -> i64 {
+        let Some(slot) = usize_fd(fd) else {
+            return -EBADF;
+        };
+        let FdKind::InetDgram { v6, ep, bound, .. } = self.fds[slot] else {
+            return -ENOTSOCK;
+        };
+        if !bound {
+            return -EAGAIN; // never bound: nothing can have arrived
+        }
+        // SAFETY: `buf` is a writable range of `len` bytes in the active cell.
+        let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
+        match inetsock::recv_dgram(ep, out) {
+            Some((src_port, n)) => {
+                if src_addr != 0 {
+                    write_inaddr(src_addr, addrlen_va, v6, src_port);
+                }
+                n as i64
+            }
+            None => -EAGAIN,
+        }
+    }
+
     /// If `fd` is a connected socket, its read ring (`rx`). The `sys_read`
     /// blocking path routes a socket read through the L6 pipe scheduler on it.
     pub fn sock_rx(&self, fd: i64) -> Option<usize> {
         match self.fds[usize_fd(fd)?] {
-            FdKind::SockConn { rx, .. } => Some(rx as usize),
+            FdKind::SockConn { rx, .. } | FdKind::InetConn { rx, .. } => Some(rx as usize),
             _ => None,
         }
     }
@@ -879,8 +1323,65 @@ impl FdTable {
     /// If `fd` is a connected socket, its write ring (`tx`).
     pub fn sock_tx(&self, fd: i64) -> Option<usize> {
         match self.fds[usize_fd(fd)?] {
-            FdKind::SockConn { tx, .. } => Some(tx as usize),
+            FdKind::SockConn { tx, .. } | FdKind::InetConn { tx, .. } => Some(tx as usize),
             _ => None,
+        }
+    }
+
+    /// True if `fd` is a datagram (UDP) socket - `sendto`/`recvfrom` route to the
+    /// datagram path (`linux::inetsock`) rather than the stream write/read path.
+    pub fn is_dgram(&self, fd: i64) -> bool {
+        usize_fd(fd).is_some_and(|s| matches!(self.fds[s], FdKind::InetDgram { .. }))
+    }
+
+    /// POLLIN readiness for `fd` (used by epoll, level-triggered). A socket is
+    /// readable when its rx ring holds data, its writers all closed (EOF), a
+    /// listener has a pending connection, or a datagram is queued.
+    pub fn pollin_ready(&self, fd: i64) -> bool {
+        let Some(slot) = usize_fd(fd) else {
+            return false;
+        };
+        match self.fds[slot] {
+            FdKind::SockConn { rx, .. } | FdKind::InetConn { rx, .. } => {
+                pipe::has_data(rx as usize) || pipe::writers(rx as usize) == 0
+            }
+            FdKind::Pipe { idx, writer: false } => {
+                pipe::has_data(idx as usize) || pipe::writers(idx as usize) == 0
+            }
+            FdKind::InetListen { lst, .. } => inetsock::listener_has_pending(lst),
+            FdKind::InetDgram {
+                ep, bound: true, ..
+            } => inetsock::dgram_has_data(ep),
+            FdKind::Console(0)
+            | FdKind::Vfs { .. }
+            | FdKind::Null
+            | FdKind::Zero
+            | FdKind::Urandom
+            | FdKind::ProcAuxv { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// POLLOUT readiness for `fd`: a stream socket is writable while its tx ring
+    /// has space (or its readers closed); regular/console/datagram fds always are.
+    pub fn pollout_ready(&self, fd: i64) -> bool {
+        let Some(slot) = usize_fd(fd) else {
+            return false;
+        };
+        match self.fds[slot] {
+            FdKind::SockConn { tx, .. } | FdKind::InetConn { tx, .. } => {
+                pipe::has_space(tx as usize) || pipe::readers(tx as usize) == 0
+            }
+            FdKind::Pipe { idx, writer: true } => {
+                pipe::has_space(idx as usize) || pipe::readers(idx as usize) == 0
+            }
+            FdKind::Console(1)
+            | FdKind::Console(2)
+            | FdKind::Vfs { .. }
+            | FdKind::Null
+            | FdKind::Zero
+            | FdKind::InetDgram { bound: true, .. } => true,
+            _ => false,
         }
     }
 }
@@ -916,6 +1417,83 @@ fn read_sun_key(addr_va: u64, addrlen: u64, out: &mut [u8; NAME_MAX]) -> Option<
     }
     out[..key_len].copy_from_slice(&src[..key_len]);
     Some(key_len)
+}
+
+/// Parse a `sockaddr_in` (AF_INET) or `sockaddr_in6` (AF_INET6) at `addr_va`
+/// (`addrlen` bytes) into `(is_v6, port, dest_is_loopback)` (docs/LINUX-COMPAT.md
+/// L8-INET). `port` is host-order; `dest_is_loopback` is true for 127.0.0.0/8 or
+/// ::1 (and for the wildcard 0.0.0.0 / ::, treated as loopback for a local
+/// connect). `None` on an unknown family or a short buffer.
+///
+/// Layout: `sin_family` u16 @0, `sin_port` big-endian u16 @2, then the address
+/// (v4: 4 bytes @4; v6: 16 bytes @8 after a 4-byte flowinfo).
+fn read_inaddr(addr_va: u64, addrlen: u64) -> Option<(bool, u16, bool)> {
+    let len = addrlen as usize;
+    if addr_va == 0 || len < 4 {
+        return None;
+    }
+    // SAFETY: caller-provided sockaddr of `len` bytes in the active cell.
+    let fam = unsafe { (addr_va as *const u16).read_unaligned() } as u64;
+    // SAFETY: the port immediately follows the 2-byte family (big-endian).
+    let port = u16::from_be(unsafe { ((addr_va + 2) as *const u16).read_unaligned() });
+    match fam {
+        AF_INET => {
+            if len < 8 {
+                return None;
+            }
+            // SAFETY: `sin_addr` (4 bytes) at offset 4.
+            let a = unsafe { core::slice::from_raw_parts((addr_va + 4) as *const u8, 4) };
+            let oct = [a[0], a[1], a[2], a[3]];
+            let is_local = inetsock::is_loopback_v4(oct) || oct == [0, 0, 0, 0];
+            Some((false, port, is_local))
+        }
+        AF_INET6 => {
+            if len < 24 {
+                return None;
+            }
+            // SAFETY: `sin6_addr` (16 bytes) at offset 8.
+            let a = unsafe { core::slice::from_raw_parts((addr_va + 8) as *const u8, 16) };
+            let mut oct = [0u8; 16];
+            oct.copy_from_slice(a);
+            let is_local = inetsock::is_loopback_v6(oct) || oct == [0u8; 16];
+            Some((true, port, is_local))
+        }
+        _ => None,
+    }
+}
+
+/// Write a loopback `sockaddr_in`/`sockaddr_in6` for `(v6, port)` into `addr_va`,
+/// setting `*addrlen_va` to the struct size (docs/LINUX-COMPAT.md L8-INET). The
+/// caller passes a `sockaddr_storage`-sized buffer (glibc always does), so the
+/// full 16/28 bytes are written.
+fn write_inaddr(addr_va: u64, addrlen_va: u64, v6: bool, port: u16) {
+    if addr_va == 0 {
+        return;
+    }
+    let pbe = port.to_be();
+    // SAFETY: caller-provided sockaddr buffer (>= 28 bytes) + socklen_t out-param.
+    unsafe {
+        if v6 {
+            core::ptr::write_bytes(addr_va as *mut u8, 0, 28);
+            (addr_va as *mut u16).write_unaligned(inetsock::AF_INET6 as u16);
+            ((addr_va + 2) as *mut u16).write_unaligned(pbe);
+            // sin6_addr = ::1 at offset 8 (15 zero bytes then 1).
+            *((addr_va + 8 + 15) as *mut u8) = 1;
+            if addrlen_va != 0 {
+                (addrlen_va as *mut u32).write(28);
+            }
+        } else {
+            core::ptr::write_bytes(addr_va as *mut u8, 0, 16);
+            (addr_va as *mut u16).write_unaligned(inetsock::AF_INET as u16);
+            ((addr_va + 2) as *mut u16).write_unaligned(pbe);
+            // sin_addr = 127.0.0.1 at offset 4.
+            let ip = [127u8, 0, 0, 1];
+            core::ptr::copy_nonoverlapping(ip.as_ptr(), (addr_va + 4) as *mut u8, 4);
+            if addrlen_va != 0 {
+                (addrlen_va as *mut u32).write(16);
+            }
+        }
+    }
 }
 
 /// Validate a raw fd and narrow it to a table slot.

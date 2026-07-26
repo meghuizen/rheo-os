@@ -1,9 +1,11 @@
 # rheo-net: the greenfield network stack
 
 **Status:** Building. Phase **N1a** (the L2/L3 core), **N1b's L4** (UDP + ICMP),
-**N1c's caching DNS client**, **N1e's TTL / hop-limit + traceroute**, and **N1d's
-local sockets** (native `net::local` + Linux AF_UNIX) are done; the full roadmap
-(N1-N8) is below. This document is the architecture + roadmap + crypto posture;
+**N1c's caching DNS client**, **N1e's TTL / hop-limit + traceroute**, **N1d's
+local sockets** (native `net::local` + Linux AF_UNIX), **N2a's native TCP core**,
+and the **L8-INET** personality slice (AF_INET/AF_INET6 sockets + a minimal epoll
+over the **loopback** interface - §10(C), docs/LINUX-COMPAT.md) are done; the full
+roadmap (N1-N8) is below. This document is the architecture + roadmap + crypto posture;
 `docs/NETWORKING.md` holds the doctrine (the kernel owns queue plumbing + grant
 checks + steering, and no network stack).
 
@@ -550,11 +552,38 @@ transcript and exiting 0.
 ### Deferred past N1d (explicit)
 
 **SCM_RIGHTS fd-passing** is deferred (the seam is `sendmsg`'s `msg_control`; it
-is not faked). **SOCK_DGRAM** is refused (`-EPROTONOSUPPORT`) - datagram boundary
-preservation is not implemented. **`accept` is non-blocking** (the loopback proof
-connects before accepting); a blocking cross-cell accept server is a later
-refinement. The **wire** side of the datapath selector is a stub until the TCP/IP
-transport lands (N2). `getpeername` reports family-only for an unnamed peer.
+is not faked). **AF_UNIX SOCK_DGRAM** is refused (`-EPROTONOSUPPORT`) - datagram
+boundary preservation is not implemented for the Unix domain. **`accept` is
+non-blocking** (the loopback proof connects before accepting); a blocking
+cross-cell accept server is a later refinement. `getpeername` reports family-only
+for an unnamed AF_UNIX peer.
+
+### (C) Linux AF_INET / AF_INET6 loopback (the L8-INET slice)
+
+The socket surface extends from AF_UNIX to the **internet domain** so *unmodified
+networked Linux binaries run* (docs/LINUX-COMPAT.md L8-INET). Architecture
+decision, forced by doctrine: the kernel is **allocation-free**, so the native
+`net::tcp`/`net::udp` (`no_std`+**alloc** userspace crates) **cannot** be linked
+kernel-resident. For the **loopback** interface (127.0.0.1 / ::1) a TCP connection
+between two local endpoints reduces to a **reliable, in-order byte stream** -
+precisely the L6 ring pair that already backs AF_UNIX SOCK_STREAM - and UDP to an
+in-order **datagram queue**. So AF_INET/AF_INET6 sockets run over loopback
+in-personality, deterministic and network-free (`kernel/src/linux/inetsock.rs`,
+keyed by `(is_v6, port)`), adding **no kernel object**. This proves the socket
+**ABI**; **NIC-backed remote INET** - driving the full `net::tcp` segment/RTO/
+congestion state machine (§11) over the virtio-net raw-frame path - is a **named
+later phase** (a non-loopback destination is refused `-ENETUNREACH`). Landed:
+`socket(AF_INET|AF_INET6, SOCK_STREAM|SOCK_DGRAM)`, `bind`/`listen`/`accept`/
+`connect`, stream `read`/`write`/`send`/`recv` (over the L6 block+SIGPIPE path),
+`sendto`/`recvfrom` (loopback datagrams with source-address reporting), real
+`sockaddr_in`/`sockaddr_in6` `getsockname`/`getpeername`, no-op
+`setsockopt`/`getsockopt`, and a minimal **level-triggered epoll**
+(`epoll_create1`/`epoll_ctl`/`epoll_wait`/`epoll_pwait`, `EPOLLIN`/`EPOLLOUT`,
+`kernel/src/linux/epoll.rs`). **Proof (`linuxinet`, all 3 ISAs, exact stdout +
+exit)**: an unmodified static-glibc C fixture (`inet.c`) does a TCP client/server
++ epoll readiness + UDP over 127.0.0.1 and a TCP exchange over ::1. Deferred:
+NIC-backed remote INET (above), edge-triggered/oneshot epoll, blocking
+`epoll_wait`, IPV4_MAPPED dual-stack, and effectful socket options.
 
 ## 11. Phase N2a (done): the native TCP core + a timer wheel
 

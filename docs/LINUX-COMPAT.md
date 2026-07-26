@@ -455,6 +455,57 @@ syscalls).
     unnamed peer. `bind` implies the name is connectable (the registry carries
     the backlog); `listen` validates the socket is bound.
 
+- **L8-INET [done]** - **AF_INET / AF_INET6 sockets over the loopback interface**
+  (127.0.0.1 / ::1). This extends the socket surface from AF_UNIX to the
+  internet domain so **unmodified networked Linux binaries run**, and - like every
+  prior milestone - adds **no kernel object**: INET sockets are per-cell fds and
+  the byte transport reuses the L6 cross-cell ring (`kernel/src/linux/inetsock.rs`).
+  The socket **syscall numbers are the same** as AF_UNIX (`socket`/`bind`/... - the
+  family is handled inside); epoll adds a few numbers to the two `arch/*/linux_abi`
+  tables (x86-64 legacy `epoll_create1`=291.. / asm-generic `epoll_create1`=20..;
+  per-ISA ABI).
+  - **Loopback-only scope (the load-bearing honesty).** The kernel is
+    **allocation-free**; the native transports (`net::tcp`/`net::udp`) are
+    `no_std`+**alloc** userspace crates and **cannot** be linked kernel-resident.
+    For **loopback** a TCP connection between two local endpoints reduces to a
+    **reliable, in-order byte stream** - exactly the L6 ring pair that already
+    backs AF_UNIX SOCK_STREAM - and UDP to an in-order **datagram queue**. So INET
+    sockets run over loopback deterministically and network-free, keying the
+    address namespace by `(is_v6, port)`. This proves the socket **ABI**; it is
+    **not** internet networking. **NIC-backed remote INET** (driving the full
+    `net::tcp` segment/RTO/congestion state machine over virtio-net) is a **named
+    later phase** - a non-loopback destination is refused `-ENETUNREACH`.
+  - **Syscalls**: `socket(AF_INET|AF_INET6, SOCK_STREAM|SOCK_DGRAM)`, `bind`,
+    `listen`, `accept`/`accept4`, `connect`, `send`/`recv`/`read`/`write` on a
+    connected stream (via the same cross-cell block + SIGPIPE path as pipes),
+    `sendto`/`recvfrom` (datagrams over loopback, with source-address reporting),
+    `getsockname`/`getpeername` (real `sockaddr_in`/`sockaddr_in6`),
+    `setsockopt`/`getsockopt` (accept-and-ignore / zeroed - SO_REUSEADDR,
+    TCP_NODELAY succeed as no-ops), `shutdown` (no-op). A minimal **epoll** -
+    `epoll_create1`, `epoll_ctl` (ADD/MOD/DEL), `epoll_wait`/`epoll_pwait` -
+    reports **level-triggered** `EPOLLIN`/`EPOLLOUT` readiness on socket/pipe fds.
+    The `struct epoll_event` layout is per-ISA (x86-64 packs it, ARM64/RISC-V
+    align it: `arch::linux_abi::EPOLL_EVENT_{SIZE,DATA_OFFSET}`).
+  - **Proof (`linuxinet`, all three ISAs, exact stdout + exit)**: an unmodified
+    static-glibc C fixture (`inet.c`, built from source by xtask, never committed):
+    (1) a TCP `socket`/`bind`/`listen`/`accept` server + `socket`/`connect` client
+    over **127.0.0.1** exchanging "hello"/"world"; (2) an **epoll** watch on the
+    client socket reporting `EPOLLIN` ready once the server has written; (3) a UDP
+    `sendto`/`recvfrom` over 127.0.0.1; (4) a TCP exchange over **::1**
+    (AF_INET6). Prints exactly `tcp4: hello` / `epoll: ready` / `tcp4: world` /
+    `udp4: ping` / `tcp6: hi` / `inet OK`, exit 0.
+  - **Accommodations, disclosed**: **loopback only** (remote INET is a later
+    phase, above). **epoll is level-triggered only** - `EPOLLET`, `EPOLLONESHOT`,
+    `EPOLLEXCLUSIVE`, `EPOLLRDHUP`/`EPOLLPRI` are not implemented (masked to
+    `EPOLLIN|EPOLLOUT`), and `epoll_wait` is **non-blocking** (readiness computed
+    at call time; a blocking cross-cell wait is a later refinement, like the
+    AF_UNIX blocking `accept`). `setsockopt`/`getsockopt` **store nothing** - the
+    common options are accepted so glibc proceeds; TCP_NODELAY/SO_REUSEADDR have no
+    observable effect on loopback. **No dual-stack**: v4 and v6 are separate port
+    namespaces (no IPV4_MAPPED). UDP is best-effort (a datagram to an unbound
+    port is dropped, `sendto` still reports success). Stream `accept` is
+    non-blocking (as in AF_UNIX).
+
 ## 6. Fixture build matrix (reproducibility)
 
 All Linux test binaries are built **from source** by xtask/CI - no binaries
@@ -490,6 +541,12 @@ from the VFS), and `rsh` (a minimal from-scratch POSIX-ish shell - pipelines +
 `&&`/`||` over fork/execve/wait4/pipe2/dup2 - for the P11 gate). `rsh` execs the
 L3 `coreutils` 0.0.29 multicall (already in the fixture matrix) from a ramfs, so
 the P11 suite is the real upstream Rust coreutils driven by a shell.
+
+The **L8 socket fixtures** (`tests/linux-fixtures/{af_unix,inet}.c`, static-glibc
+ET_EXEC via the same recipe as `chello`): `af_unix.c` (the `linuxunix` proof -
+socketpair+fork + bind/listen/connect/accept over AF_UNIX) and `inet.c` (the
+`linuxinet` proof - TCP + UDP + epoll over 127.0.0.1 and TCP over ::1, the
+loopback AF_INET/AF_INET6 surface).
 
 The **L7 dynamic fixture** (`tests/linux-fixtures/dhello.c`, the `linuxdyn`
 proof) is the one binary built **dynamically** - stock ET_DYN/PIE, no

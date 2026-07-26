@@ -104,6 +104,19 @@ pub mod nr {
     pub const CLONE3: u64 = 435;
     pub const FACCESSAT2: u64 = 439;
 
+    // epoll (docs/LINUX-COMPAT.md L8-INET). asm-generic has create1/ctl/pwait
+    // only (no legacy create/wait; those are named as unreachable sentinels
+    // below so portable dispatch can list them).
+    pub const EPOLL_CREATE1: u64 = 20;
+    pub const EPOLL_CTL: u64 = 21;
+    pub const EPOLL_PWAIT: u64 = 22;
+
+    /// Not part of this table: x86-64's legacy `epoll_create`/`epoll_wait`
+    /// (asm-generic ISAs use `epoll_create1`/`epoll_pwait`). Named as unreachable
+    /// sentinels so portable dispatch can list them (docs/LINUX-COMPAT.md L8-INET).
+    pub const EPOLL_CREATE: u64 = u64::MAX - 7;
+    pub const EPOLL_WAIT: u64 = u64::MAX - 8;
+
     /// Not part of this table: x86-64's `arch_prctl`. Present on every ISA's
     /// `nr` so portable dispatch can name it; a number no program can issue
     /// here (the table tops out below it), so it can never collide.
@@ -129,6 +142,13 @@ pub mod nr {
     /// no program can issue this number here (docs/LINUX-COMPAT.md L7).
     pub const ACCESS: u64 = u64::MAX - 6;
 }
+
+/// The asm-generic `struct epoll_event` is naturally aligned (16 bytes; the
+/// `data` u64 sits at offset 8 after 4 bytes of padding). x86-64 packs it to 12
+/// bytes (docs/LINUX-COMPAT.md L8-INET). Per-ISA ABI, so it lives in the arch
+/// layer, shared by ARM64 and RISC-V.
+pub const EPOLL_EVENT_SIZE: usize = 16;
+pub const EPOLL_EVENT_DATA_OFFSET: usize = 8;
 
 /// The asm-generic `struct stat` (docs/LINUX-COMPAT.md L2), shared by ARM64
 /// and RISC-V. 128 bytes; layout per Linux v6.6

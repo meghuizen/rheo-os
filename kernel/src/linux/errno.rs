@@ -41,6 +41,7 @@ pub const EAFNOSUPPORT: i64 = 97;
 pub const EADDRINUSE: i64 = 98;
 pub const EISCONN: i64 = 106;
 pub const ENOTCONN: i64 = 107;
+pub const ENETUNREACH: i64 = 101;
 pub const ECONNREFUSED: i64 = 111;
 
 // The `posix` VFS crate (outside the kernel) already returns these exact
