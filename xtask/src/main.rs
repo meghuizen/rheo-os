@@ -423,6 +423,31 @@ impl Arch {
         }
     }
 
+    /// Target for **hard-float cells** (librheo): the kernel stays soft-float
+    /// (`target()`), but a cell that wants the vector units compiles hard-float
+    /// so it can emit SSE/NEON (and, via runtime `#[target_feature]` dispatch,
+    /// AVX/AVX-512/VNNI). x86 needs a custom JSON (the bare target forces
+    /// soft-float); ARM64 uses the builtin hard-float (`+neon`) triple; RISC-V's
+    /// bare target is already `lp64d` hard-float, so it is unchanged. See
+    /// docs/LIBRHEO.md / docs/TILES.md 4.
+    fn cell_target(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "targets/rheo_cell-x86_64.json",
+            Arch::Aarch64 => "aarch64-unknown-none",
+            Arch::Riscv64 => "riscv64gc-unknown-none-elf",
+        }
+    }
+
+    /// Output directory stem for `cell_target()` (the `target/<stem>/` cargo
+    /// writes to). For x86 this is the JSON file stem, not the triple.
+    fn cell_target_dir(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "rheo_cell-x86_64",
+            Arch::Aarch64 => "aarch64-unknown-none",
+            Arch::Riscv64 => "riscv64gc-unknown-none-elf",
+        }
+    }
+
     fn qemu(self) -> &'static str {
         match self {
             Arch::X86_64 => "qemu-system-x86_64",
@@ -607,6 +632,8 @@ fn std_patch() -> bool {
 /// before the test kernels, which `include_bytes!` the built ELFs.
 fn build_userland(arch: Arch) -> bool {
     println!("[xtask] building userspace for {}", arch.name());
+    // The soft-float cells (userland/libc/net) build for the kernel's bare
+    // target: they do no vector work, so hard-float buys them nothing.
     let mut cmd = Command::new("cargo");
     cmd.args([
         "build",
@@ -615,8 +642,6 @@ fn build_userland(arch: Arch) -> bool {
         "-p",
         "rheo-libc",
         "-p",
-        "librheo",
-        "-p",
         "rheo-net",
         "--release",
         "--target",
@@ -624,7 +649,68 @@ fn build_userland(arch: Arch) -> bool {
         "-Zbuild-std=core,alloc,compiler_builtins",
         "-Zbuild-std-features=compiler-builtins-mem",
     ]);
+    if !matches!(cmd.status().map(|s| s.success()), Ok(true)) {
+        return false;
+    }
+    // librheo builds **hard-float** (docs/LIBRHEO.md / docs/TILES.md 4): its
+    // tile executor and any SIMD path need real vector registers. Built for the
+    // cell target, then staged into the kernel target's release dir the test
+    // kernels `include_bytes!` from (a build-orchestration copy - the loader is
+    // unchanged; the kernel remains soft-float and just loads the hard-float
+    // ELF, with FP state saved/restored across cell switches).
+    if !build_librheo(arch, false) {
+        return false;
+    }
+    stage_cell_bins(arch)
+}
+
+/// Build the librheo cell binaries for `arch`'s hard-float cell target. When
+/// `embedded`, rebuild only `librheo-embed` with `--no-default-features` (the
+/// minimal spine, docs/LIBRHEO.md Phase F).
+fn build_librheo(arch: Arch, embedded: bool) -> bool {
+    let mut cmd = Command::new("cargo");
+    cmd.args(["build", "-p", "librheo"]);
+    if embedded {
+        cmd.args(["--bin", "librheo-embed", "--no-default-features"]);
+    }
+    cmd.args([
+        "--release",
+        "--target",
+        arch.cell_target(),
+        "-Zbuild-std=core,alloc,compiler_builtins",
+        "-Zbuild-std-features=compiler-builtins-mem",
+        "-Zjson-target-spec",
+    ]);
     matches!(cmd.status().map(|s| s.success()), Ok(true))
+}
+
+/// Stage the hard-float librheo cell binaries into the kernel target's release
+/// dir, where the test kernels `include_bytes!` them. A no-op on RISC-V, whose
+/// cell target IS the kernel target (already `lp64d` hard-float). Copies the
+/// top-level executables (extensionless files) only, not `deps/` or depfiles.
+fn stage_cell_bins(arch: Arch) -> bool {
+    if arch.cell_target_dir() == arch.target() {
+        return true; // same dir - nothing to stage (RISC-V)
+    }
+    let src = PathBuf::from(format!("target/{}/release", arch.cell_target_dir()));
+    let dst = PathBuf::from(format!("target/{}/release", arch.target()));
+    let Ok(entries) = std::fs::read_dir(&src) else {
+        eprintln!("error: cannot read {}", src.display());
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Executables have no extension; skip .d depfiles, dirs, and the
+        // build/deps/incremental subdirs.
+        if path.is_file() && path.extension().is_none() {
+            let name = entry.file_name();
+            if let Err(e) = std::fs::copy(&path, dst.join(&name)) {
+                eprintln!("error: staging {}: {e}", name.to_string_lossy());
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Rebuild only the `librheo-embed` bin with `--no-default-features` (the
@@ -637,21 +723,9 @@ fn build_librheo_embedded(arch: Arch) -> bool {
         "[xtask] building librheo-embed (no-default-features) for {}",
         arch.name()
     );
-    let mut cmd = Command::new("cargo");
-    cmd.args([
-        "build",
-        "-p",
-        "librheo",
-        "--bin",
-        "librheo-embed",
-        "--no-default-features",
-        "--release",
-        "--target",
-        arch.target(),
-        "-Zbuild-std=core,alloc,compiler_builtins",
-        "-Zbuild-std-features=compiler-builtins-mem",
-    ]);
-    matches!(cmd.status().map(|s| s.success()), Ok(true))
+    // Built for the hard-float cell target and staged like the full build, so
+    // the librheo-embed the `librheoproc` kernel embeds is the minimal spine.
+    build_librheo(arch, true) && stage_cell_bins(arch)
 }
 
 /// Build the `netsmoltcp-demo` bin with the `smoltcp` feature (docs/NETSTACK.md
