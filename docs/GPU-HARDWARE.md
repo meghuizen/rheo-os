@@ -666,8 +666,10 @@ kernel that CI runs:
   inventory); and a **Bochs dispi register handshake** (the 16-bit ID
   register at MMIO-BAR + 0x500 answers 0xB0C5), so every GPU device model
   QEMU has is genuinely driven at some level: virtio-gpu by the Phase H
-  2D driver, AMD through its framebuffer aperture, Bochs through its
-  register file. MSI-X *routing* (vectors to vcores) is not in stage 1;
+  2D driver, AMD through its framebuffer aperture, and the Bochs display
+  by a **real 2D modeset** (`hw/gpu.rs::bochs_modeset` over the DISPI/VBE
+  register interface - program 640x480x32 + LFB, render into the linear
+  framebuffer, read pixels back, on all three ISAs). MSI-X *routing* (vectors to vcores) is not in stage 1;
   only capability presence is recorded.
 - **Stage 2 - IOMMU:** domains + the grant-to-mapping path + fault events
   against `intel-iommu` (x86-64) and `smmuv3` (ARM64), both already on

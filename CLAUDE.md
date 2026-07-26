@@ -79,9 +79,12 @@ real vendor-GPU MMIO: the AMD framebuffer aperture mapped via
 the missing 1..2 GiB gigapage on RISC-V; `phys_to_virt` on ARM64), written
 through and read back on all three ISAs; plus opt-in **attach measurement**
 (`hw::gpu_attach_measure`: ticks/KiB streamed through each aperture - a
-transport measurement, reported live by `SYS_ENGINE_INFO`) and a **Bochs
-dispi register handshake** (ID 0xB0C5), so every GPU device model QEMU has
-is genuinely driven at some level.
+transport measurement, reported live by `SYS_ENGINE_INFO`) and a **real Bochs
+2D modeset** (`hw/gpu.rs::bochs_modeset` over the DISPI/VBE interface:
+640x480x32 + LFB, framebuffer render + pixel read-back on all three ISAs),
+so every GPU device model QEMU has is genuinely driven - virtio-gpu by the
+Phase H 2D driver, AMD through its framebuffer aperture, Bochs by a working
+2D modeset.
 
 The **strand runtime** (`runtime/`, BUILD-ORDER.md step 7,
 docs/CONCURRENCY.md) is the userspace library that brings native async and

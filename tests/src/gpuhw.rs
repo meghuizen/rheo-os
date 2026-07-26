@@ -261,6 +261,33 @@ extern "C" fn kernel_main() -> ! {
         "bochs dispi interface ID handshake failed"
     );
 
+    // --- Real 2D modeset: drive the Bochs display to a mode + render ---
+    // Beyond the register handshake: program a real VBE mode via the DISPI
+    // interface, render a pattern into the linear framebuffer, and read it
+    // back - a working 2D driver bring-up on a real QEMU device model
+    // (docs/GPU-HARDWARE.md 12).
+    let bochs = inv.gpus[..inv.ngpu]
+        .iter()
+        .find(|g| g.vendor == gpu::GpuVendor::QemuBochs)
+        .unwrap();
+    let fb = gpu::bochs_modeset(inv, bochs, 640, 480).expect("bochs 640x480 modeset");
+    println!(
+        "gpuhw: bochs modeset {}x{}x{} stride={}",
+        fb.width, fb.height, fb.bpp, fb.stride
+    );
+    // Render a diagonal of known pixels and read them back through the LFB.
+    for i in 0..64u32 {
+        fb.put(i, i, 0x00FF_0000 | i); // red channel + a marker in blue
+    }
+    for i in 0..64u32 {
+        assert_eq!(
+            fb.get(i, i),
+            0x00FF_0000 | i,
+            "bochs framebuffer pixel read-back mismatch"
+        );
+    }
+    println!("gpuhw: bochs 2D framebuffer render + read-back OK");
+
     // --- Engine registration: CPU + every recognised GPU ---------------
     let n = svc::engine_count();
     println!("gpuhw: engines registered = {}", n);

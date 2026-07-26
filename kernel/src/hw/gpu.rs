@@ -431,3 +431,112 @@ pub fn print_summary(inv: &Inventory) {
         );
     }
 }
+
+// ---- Bochs DISPI / VBE 2D modeset driver (docs/GPU-HARDWARE.md 12) ------
+// A minimal but real 2D display driver over the Bochs DISPI (VBE) register
+// interface, which `bochs-display` (and QEMU's standard VGA) implement in
+// their MMIO BAR at offset 0x500 (16-bit registers indexed by DISPI_INDEX).
+// This is genuine driving, not a handshake: it programs a mode (xres, yres,
+// bpp, enable + LFB flag), renders into the linear framebuffer BAR, and the
+// caller reads pixels back. It is the 2D bring-up for the Bochs-class device
+// the same way virtio_gpu.rs is for virtio - vendor-shaped only in that a
+// real AMD/NVIDIA/Intel part would program its own register file from a
+// driver cell (GPU-HARDWARE.md 5).
+
+const DISPI_MMIO_OFF: usize = 0x500;
+const DISPI_INDEX_XRES: usize = 1;
+const DISPI_INDEX_YRES: usize = 2;
+const DISPI_INDEX_BPP: usize = 3;
+const DISPI_INDEX_ENABLE: usize = 4;
+const DISPI_ENABLED: u16 = 0x01;
+const DISPI_LFB_ENABLED: u16 = 0x40;
+
+/// A configured Bochs framebuffer: the linear-framebuffer VA (mapped through
+/// the per-ISA MMIO window) and the mode geometry.
+#[derive(Copy, Clone)]
+pub struct Framebuffer {
+    pub fb_va: usize,
+    pub width: u32,
+    pub height: u32,
+    pub bpp: u32,
+    pub stride: u32,
+}
+
+impl Framebuffer {
+    /// Write a 32-bit pixel (X8R8G8B8) at (x, y). Bounds are the caller's.
+    pub fn put(&self, x: u32, y: u32, argb: u32) {
+        let off = (y * self.stride + x * 4) as usize;
+        // SAFETY: off is inside the framebuffer BAR the caller sized; MMIO.
+        unsafe { ((self.fb_va + off) as *mut u32).write_volatile(argb) };
+    }
+    /// Read back a 32-bit pixel at (x, y).
+    pub fn get(&self, x: u32, y: u32) -> u32 {
+        let off = (y * self.stride + x * 4) as usize;
+        // SAFETY: as above.
+        unsafe { ((self.fb_va + off) as *const u32).read_volatile() }
+    }
+}
+
+/// Bring up a `bochs-display`-class GPU in a real 2D mode: program the DISPI
+/// registers (`width` x `height` x 32bpp, LFB enabled) and map its linear
+/// framebuffer, returning a `Framebuffer` the caller renders into. Returns
+/// `None` for a device without a usable DISPI register + framebuffer BAR
+/// pair. Honest: this drives the Bochs VBE interface QEMU models; it is not
+/// a modeset for a real vendor's proprietary register file.
+pub fn bochs_modeset(
+    inv: &Inventory,
+    g: &GpuDevice,
+    width: u32,
+    height: u32,
+) -> Option<Framebuffer> {
+    let d = &inv.pci[g.pci];
+    // The MMIO register BAR (non-prefetchable) and the framebuffer BAR
+    // (largest memory BAR - bochs-display's BAR0 LFB is prefetchable).
+    let mut reg_bar: Option<super::PciBar> = None;
+    let mut fb_bar: Option<super::PciBar> = None;
+    for b in d.bars.iter() {
+        if b.io || b.size == 0 || b.base == 0 {
+            continue;
+        }
+        if b.prefetch || b.size >= (width * height * 4) as u64 {
+            match fb_bar {
+                Some(cur) if cur.size >= b.size => {}
+                _ => fb_bar = Some(*b),
+            }
+        }
+        if !b.prefetch {
+            match reg_bar {
+                Some(cur) if cur.size >= b.size => {}
+                _ => reg_bar = Some(*b),
+            }
+        }
+    }
+    let reg = reg_bar?;
+    let fb = fb_bar?;
+
+    let reg_va = crate::arch::mmio_map_window(reg.base as usize, reg.size as usize);
+    let dispi = |index: usize| (reg_va + DISPI_MMIO_OFF + index * 2) as *mut u16;
+    // SAFETY: reg_va maps the sized MMIO BAR; the DISPI window is inside it.
+    unsafe {
+        // Disable before reprogramming (Bochs VBE protocol).
+        dispi(DISPI_INDEX_ENABLE).write_volatile(0);
+        dispi(DISPI_INDEX_XRES).write_volatile(width as u16);
+        dispi(DISPI_INDEX_YRES).write_volatile(height as u16);
+        dispi(DISPI_INDEX_BPP).write_volatile(32);
+        dispi(DISPI_INDEX_ENABLE).write_volatile(DISPI_ENABLED | DISPI_LFB_ENABLED);
+        // Read the geometry back: the device echoes the accepted mode.
+        let xr = dispi(DISPI_INDEX_XRES).read_volatile() as u32;
+        let yr = dispi(DISPI_INDEX_YRES).read_volatile() as u32;
+        if xr != width || yr != height {
+            return None; // the device did not accept the mode
+        }
+    }
+    let fb_va = crate::arch::mmio_map_window(fb.base as usize, fb.size as usize);
+    Some(Framebuffer {
+        fb_va,
+        width,
+        height,
+        bpp: 32,
+        stride: width * 4,
+    })
+}
