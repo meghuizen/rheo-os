@@ -257,6 +257,13 @@ pub fn detect() {
     }
     // The boot CPU is online by definition.
     inv.cpus[0].online = true;
+
+    // If firmware surfaced a persistent-memory region (a real QEMU nvdimm - the
+    // NFIT SPA range on x86-64), bring up the separate pmem frame allocator over
+    // it so a `MemKind::Pmem` grant is genuinely nvdimm-backed (docs/MEMORY.md
+    // real-PMEM path). Inert on every machine without an nvdimm, so the DDR path
+    // is unchanged.
+    crate::mm::frames_pmem::init_from_inventory(inv);
 }
 
 /// Print the discovered inventory to the console.

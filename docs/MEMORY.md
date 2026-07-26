@@ -40,11 +40,63 @@ via **explicit commit**, no fault handler); `SYS_SEAL` makes a grant immutable
 (read-only, shareable - the zero-copy-buffer precursor); `SYS_MMAP_FILE` maps a
 VFS file range into the cell; `SYS_MUNMAP` frees a range's frames. Grants are
 per-cell state (a fixed static table), and every commit/decommit/seal is
-grant-checked (MAP right). **Only DDR is backed for real in QEMU**; HBM/CXL/
-PMEM/remote are backed by DDR frames (emulated, honest); device-BAR has no
+grant-checked (MAP right). **DDR is always backed for real**, and **PMEM is now
+real where the platform exposes an nvdimm** (see section 2.1); HBM/CXL/remote
+have no QEMU device model and stay honestly DDR-emulated; device-BAR has no
 backing and is refused. NUMA placement is single-node here (the hint is
 recorded, not acted on). See docs/LIBRHEO.md Phase B and librheo's `mem`
 module (`Grant`/`Arena`/`Mapping`).
+
+## 2.1 Real persistent memory (PMEM), where tractable
+
+A `MemKind::Pmem` grant is backed by frames from a **real QEMU nvdimm's
+physical region** - distinct from the DDR frame pool - on the ISA where the
+emulator and firmware map actually expose one. This replaces the old
+"PMEM emulated-as-DDR" caveat with real nvdimm backing where it is tractable,
+and an honest skip-with-reason (DDR-backed, unchanged) where it is not.
+
+**Discovery.** A real nvdimm's persistent span is reported by firmware, not the
+ordinary RAM map. On x86-64 QEMU surfaces it **only** through the ACPI **NFIT**
+(the SPA Range Structure, GUID `66F0D379-...-8CDB`) - it is absent from the PVH
+E820 memmap - so `kernel/src/hw/acpi.rs` parses the NFIT and adds the region as
+`MemKind::Pmem` to the machine `Inventory`. (No DT `pmem` node parse was needed
+on arm/riscv - see the per-ISA status below - so `hw/fdt.rs` is unchanged.)
+
+**Allocation.** A **separate** frame allocator (`kernel/src/mm/frames_pmem.rs`,
+a bitmap over the discovered region) backs pmem grants, distinct from the DDR
+`frames` pool. `Grant::commit` for `MemKind::Pmem` draws from it; if no nvdimm
+was discovered it falls back to a DDR frame with a one-time logged note, so
+machines without an nvdimm are unchanged. Two differences from the DDR pool:
+(1) a pmem frame is **not zeroed** on allocation - persistent memory retains its
+contents, which is the point of it; (2) QEMU places the nvdimm's physical span
+at 4 GiB, **above the kernel's top-2 GiB linear map** on x86-64 (the "kernel"
+code-model constraint), so the kernel reaches pmem frames through a dedicated
+supervisor **mapping window** (`arch::pmem_map_window`, a fresh x86-64 PML4 slot)
+rather than `phys_to_virt`. Only firmware parsing and this window are per-ISA
+(both under the arch/hw layers); `frames_pmem` and the grant path are portable.
+
+**Per-ISA status (honest):**
+
+- **x86-64 (q35):** genuinely nvdimm-backed. `-machine nvdimm=on` + a
+  `memory-backend-file` + an `nvdimm` device; discovered via NFIT; a `Pmem`
+  grant's committed frames fall inside the real nvdimm region (proven by the
+  `pmem` test kernel) with a write/read round-trip.
+- **ARM64 (virt):** skip-with-reason, DDR-backed, unchanged. QEMU's arm `virt`
+  refuses an nvdimm without an ACPI **GED** device ("memory hotplug is not
+  enabled: missing acpi-ged device"), and this kernel uses a built-in DT-less
+  machine profile with no ACPI/NFIT parser, so no pmem region is surfaced.
+- **RISC-V (virt):** skip-with-reason, DDR-backed, unchanged. QEMU 8.2's riscv
+  `virt` machine has **no** nvdimm support (`Property 'virt-machine.nvdimm' not
+  found`), so there is no nvdimm to discover.
+
+**Persistence caveat.** Cross-reboot persistence (bytes surviving a power cycle)
+is a property of the real backing DIMM and is **not** headlessly assertable in a
+single QEMU boot; it is not claimed. The proof here is that the grant is backed
+by the real persistent-memory **physical range** plus a write/read round-trip
+(the `pmem` test kernel, all three ISAs - real on x86-64, skip-with-reason on
+arm/riscv). This adds no kernel object or verb: `MemKind::Pmem` already flows
+through the existing grant syscalls, so this is backing an existing typed object
+with real frames (mechanism), passing ARCHITECTURE.md 6 with nothing new.
 
 ## 3. Stacks
 

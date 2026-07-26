@@ -296,6 +296,42 @@ pub fn paging_activate_kernel() {
     paging_activate(&PagingRoot { pml4_pa }, 0);
 }
 
+/// Kernel VA base of the persistent-memory mapping window (docs/MEMORY.md
+/// real-PMEM path). A real QEMU nvdimm's physical span is placed at 4 GiB,
+/// **above** the kernel's top-2 GiB linear map (`phys_to_virt` cannot reach it -
+/// the x86-64 "kernel" code-model constraint), so pmem frames are reached
+/// through this dedicated window instead. It occupies a fresh PML4 slot (384,
+/// canonical, distinct from the kernel high half at 511 and the low identity at
+/// 0); only the `pmem` test kernel installs it (via `frames_pmem::init` on an
+/// nvdimm machine), so every other kernel leaves PML4[384] empty and the DDR
+/// path is byte-for-byte unchanged.
+const PMEM_WINDOW_VA: usize = 0xFFFF_C000_0000_0000;
+
+/// Map the persistent-memory region `[base_pa, base_pa+len)` into the kernel
+/// working root at `PMEM_WINDOW_VA` with 2 MiB supervisor (RW, NX) pages, and
+/// return that VA. `base_pa` must be 2 MiB aligned (the nvdimm SPA base is);
+/// `len` is rounded up to a 2 MiB multiple. Idempotent tables are created on
+/// demand; the TLB is flushed by reloading CR3 (the kernel root is active).
+pub fn pmem_map_window(base_pa: usize, len: usize) -> usize {
+    assert!(
+        base_pa.is_multiple_of(MIB2),
+        "pmem base {base_pa:#x} not 2 MiB"
+    );
+    let pml4_pa = core::ptr::addr_of!(boot_page_tables) as usize;
+    let npages = len.div_ceil(MIB2);
+    for p in 0..npages {
+        let va = PMEM_WINDOW_VA + p * MIB2;
+        let pa = base_pa + p * MIB2;
+        let pml4 = table_mut(pml4_pa);
+        let pdpt = table_mut(ensure_table(pml4, pml4_index(va)));
+        let pd = table_mut(ensure_table(pdpt, pdpt_index(va)));
+        // 2 MiB supervisor page: present, writable, size, global, non-executable.
+        pd[pd_index(va)] = addr_bits(pa) | P | RW | PS | G | NX;
+    }
+    paging_activate_kernel(); // flush the TLB (reload CR3)
+    PMEM_WINDOW_VA
+}
+
 /// Finish paging bring-up. The MMU and the kernel working root are already
 /// configured by the boot trampoline, which enabled paging and jumped the
 /// kernel to its high VAs before any Rust ran. All that is left is the frame

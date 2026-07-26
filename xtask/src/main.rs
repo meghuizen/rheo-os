@@ -21,12 +21,13 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 34] = [
+const TEST_KERNELS: [&str; 35] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
     "isolation-hw",
     "resources",
+    "pmem",
     "smp",
     "shell-smoke",
     "hwinfo",
@@ -130,6 +131,25 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "virtio-gpu-device",
         ],
         ("librheogpu", Arch::X86_64) => &["-device", "virtio-gpu-pci,disable-legacy=on"],
+        // pmem (docs/MEMORY.md real-PMEM path): a real QEMU nvdimm whose
+        // persistent span the kernel discovers via the ACPI NFIT and backs a
+        // `MemKind::Pmem` grant with. Only x86-64 q35 exposes one here: the
+        // appended `-machine nvdimm=on` + `-m ...,slots,maxmem` enable memory
+        // devices, the memory-backend-file is the backing store (a zeroed 16 MiB
+        // file generated into target/ by `gen_pmem_backing`, never committed),
+        // and the nvdimm device attaches it. arm/riscv `virt` do not accept an
+        // nvdimm (arm needs an ACPI GED device; riscv has no nvdimm support), so
+        // the pmem kernel runs there with no extra args and skips-with-reason.
+        ("pmem", Arch::X86_64) => &[
+            "-machine",
+            "nvdimm=on",
+            "-m",
+            "1G,slots=2,maxmem=4G",
+            "-object",
+            "memory-backend-file,id=pm0,share=on,mem-path=target/pmem.img,size=16M,pmem=on",
+            "-device",
+            "nvdimm,memdev=pm0,id=nv0",
+        ],
         _ => &[],
     }
 }
@@ -166,6 +186,27 @@ fn gen_columnar_dataset() -> bool {
     }
     true
 }
+/// Path of the generated nvdimm backing file (gitignored).
+const PMEM_BACKING: &str = "target/pmem.img";
+
+/// Generate a zeroed 16 MiB backing file for the `pmem` test kernel's QEMU
+/// nvdimm (docs/MEMORY.md real-PMEM path). Written to `target/` before boot
+/// (never committed - the "no artifacts staged" rule). A fresh nvdimm starts
+/// zeroed, which is what the write/read round-trip proof expects.
+fn gen_pmem_backing() -> bool {
+    const SIZE: usize = 16 * 1024 * 1024;
+    if let Ok(meta) = std::fs::metadata(PMEM_BACKING)
+        && meta.len() as usize == SIZE
+    {
+        return true; // already staged at the right size
+    }
+    if let Err(e) = std::fs::write(PMEM_BACKING, vec![0u8; SIZE]) {
+        eprintln!("[xtask] writing {PMEM_BACKING}: {e}");
+        return false;
+    }
+    true
+}
+
 const BENCH_KERNEL: &str = "bench-core";
 
 #[derive(Clone, Copy, PartialEq)]
@@ -726,6 +767,10 @@ fn build(arch: Arch, release: bool) -> bool {
     }
     // The librheodata (Phase B) dataset the test kernel reads off the live disk.
     if !gen_columnar_dataset() {
+        return false;
+    }
+    // The pmem (real-PMEM path) nvdimm backing file.
+    if !gen_pmem_backing() {
         return false;
     }
     if !build_linux_fixtures(arch) {

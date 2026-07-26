@@ -291,6 +291,16 @@ pub fn paging_activate_kernel() {
     paging_activate(&PagingRoot { l2_pa }, 0);
 }
 
+/// Persistent-memory mapping window (docs/MEMORY.md real-PMEM path). QEMU's
+/// riscv `virt` machine has **no** nvdimm support (the `virt-machine.nvdimm`
+/// property does not exist in QEMU 8.2), so no `MemKind::Pmem` region is ever
+/// discovered on RISC-V and this is never called at runtime (pmem skips-with-
+/// reason here). The Sv39 high-half linear map covers the physical range, so the
+/// inert fallback is simply `phys_to_virt`.
+pub fn pmem_map_window(base_pa: usize, _len: usize) -> usize {
+    super::phys_to_virt(base_pa)
+}
+
 /// Finish paging bring-up. The MMU and the kernel working root are already
 /// configured by the boot trampoline, which enabled paging and jumped the
 /// kernel to its high VAs before any Rust ran. All that is left is the frame

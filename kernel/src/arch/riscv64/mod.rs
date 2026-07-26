@@ -10,6 +10,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 #[path = "../linux_abi_generic.rs"]
 pub mod linux_abi;
 mod paging;
+pub use paging::pmem_map_window;
 pub use paging::{
     PagingRoot, paging_activate, paging_activate_kernel, paging_for_each_user_leaf,
     paging_kernel_init, paging_map, paging_map_frame, paging_new_root, paging_protect,

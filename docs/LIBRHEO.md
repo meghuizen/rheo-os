@@ -179,10 +179,16 @@ Typed memory-grant syscalls (expose object 5, docs/MEMORY.md):
 - **`SYS_GRANT` (32)** - `grant(out_va, len, kind, flags) -> 0 | u64::MAX`.
   Reserves `len` bytes of typed address space (no frames - demand commit), mints
   a MemoryGrant capability, and writes a `GrantInfo { base, cap_id }`. `kind` is
-  a `MemKind` (DDR/HBM/CXL/PMEM/DeviceBar/Remote). **Only DDR is real in QEMU**;
-  HBM/CXL/PMEM/Remote are **backed by DDR frames** (emulated, honest); DeviceBar
-  has no backing and is **refused**. Reservations are pure 48-bit address space,
-  so a multi-GiB grant costs nothing until committed.
+  a `MemKind` (DDR/HBM/CXL/PMEM/DeviceBar/Remote). **DDR is always real**, and
+  **PMEM is now real where the platform exposes an nvdimm** - on x86-64 QEMU q35
+  a `MemKind::Pmem` grant is backed by frames from a real nvdimm's physical
+  region (discovered via the ACPI NFIT, allocated from a separate pmem
+  allocator, distinct from the DDR pool; docs/MEMORY.md 2.1). Where no nvdimm is
+  exposed (arm/riscv `virt` in QEMU 8.2 - see docs/MEMORY.md) PMEM falls back to
+  DDR frames, honest and documented. HBM/CXL/Remote have no QEMU device model
+  and stay **DDR-emulated**; DeviceBar has no backing and is **refused**.
+  Reservations are pure 48-bit address space, so a multi-GiB grant costs nothing
+  until committed.
 - **`SYS_COMMIT` (33)** / **`SYS_DECOMMIT` (34)** - back / unback a sub-range of
   a grant with frames (demand paging **without a fault handler** - explicit
   commit; generalizes the L4 `mprotect`-commit path to a native syscall).
@@ -274,7 +280,9 @@ FS owns those bytes). Promoting an open fd to a **first-class file capability**
 (`ObjectKind::File`, added but not yet wired) is a documented next step; today
 fds remain `svc::FileOps` handles carried in the payload.
 
-Honest accounting: HBM/CXL/PMEM/Remote grants are emulated on DDR; NUMA is
+Honest accounting: PMEM grants are **real nvdimm-backed where a QEMU nvdimm is
+exposed** (x86-64 q35; arm/riscv skip-with-reason to DDR - Phase J,
+docs/MEMORY.md 2.1); HBM/CXL/Remote grants are emulated on DDR; NUMA is
 single-node; durability/latency contracts are advisory (no durable/RT backend in
 QEMU); a first-class file capability and a real block/object `store` transport
 are deferred.
@@ -1015,7 +1023,8 @@ What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
   stays a service/transport-library in a cell, plus a socket object + a device RX
   interrupt), **SMP** secondary-core bring-up +
   work-stealing + reservation enforcement + **priority-inheritance** locks (task
-  #27), real **HBM/CXL/PMEM** (emulated on DDR)
+  #27), real **HBM/CXL** (emulated on DDR; PMEM is now real nvdimm-backed on
+  x86-64 - Phase J, docs/MEMORY.md 2.1)
   and NUMA (single-node), durability/latency **contracts** (advisory - no durable/
   RT backend in QEMU), a **first-class file/socket capability** (fds are `FileOps`
   handles today), the **timer IRQ** and the **x86/arm UART RX IRQ**. These are

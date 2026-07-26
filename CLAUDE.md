@@ -323,9 +323,13 @@ substrate: **typed memory grants exposed to a cell** (`SYS_GRANT`/`COMMIT`/
 `DECOMMIT`/`SEAL`/`MMAP_FILE`/`MUNMAP` - object 5 as mechanism: reserve typed
 address space + mint a MemoryGrant cap, demand-commit frames without a fault
 handler, seal immutable, mmap a VFS file, and a real unmap that fixes the anon-
-`SYS_MMAP` frame leak; only DDR is real, HBM/CXL/PMEM emulated-as-DDR, device-BAR
-refused, NUMA single-node - all honest/documented, per-cell grant tables as fixed
-statics, every commit/decommit/seal grant-checked), and **real async I/O opcodes
+`SYS_MMAP` frame leak; DDR always real and **PMEM real where a QEMU nvdimm is
+exposed** (Phase J: x86-64 q35 via the ACPI NFIT + a separate pmem allocator,
+distinct from the DDR pool; arm/riscv `virt` expose no nvdimm so PMEM
+skips-with-reason to DDR - docs/MEMORY.md 2.1), HBM/CXL/Remote emulated-as-DDR,
+device-BAR refused, NUMA single-node - all honest/documented, per-cell grant
+tables as fixed statics, every commit/decommit/seal grant-checked), and **real
+async I/O opcodes
 over the queue** (`OP_OPEN`/`READ`/`WRITE`/`CLOSE`/`FSTAT` bridged to
 `kernel_process` via `svc::FileOps`, completing through the CQ with the strand
 token; per-opcode rights replacing hardcoded-WRITE; distinct CapError statuses;
@@ -628,7 +632,7 @@ QEMU 8.x system emulators must be installed to run or test.
 docs/         the design documents (the spec - keep code consistent with it)
 kernel/       the no_std kernel library + boot demo bin
   src/        ISA-independent: capability core, queue ABI, cells, mm
-              (frames + grants), time (clock), rng (ChaCha20 DRBG +
+              (frames + frames_pmem real-nvdimm allocator + grants), time (clock), rng (ChaCha20 DRBG +
               hwrng seeding), event streams,
               sched (reservations), lease, engine, graph, pty, smp
               (per-CPU state + a kernel SpinLock + RISC-V SBI-HSM secondary-hart
@@ -650,7 +654,9 @@ kernel/       the no_std kernel library + boot demo bin
   arch/       per-ISA assembly (boot, vectors/traps, context switch, user)
   link/       linker scripts per ISA (incl. the .user text/rodata/data window)
 tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
-              isolation-hw, resources, smp (per-CPU state + kernel spinlock +
+              isolation-hw, resources, pmem (Phase J: a MemKind::Pmem grant
+              backed by a real QEMU nvdimm - x86-64 via the ACPI NFIT; arm/riscv
+              skip-with-reason - docs/MEMORY.md 2.1), smp (per-CPU state + kernel spinlock +
               a real RISC-V secondary hart; ARM64/x86-64 skip-with-reason -
               docs/SMP.md), shell-smoke, hwinfo, rng, runtime,
               posix, blockfs (live virtio-blk disk), elfrun (load a native

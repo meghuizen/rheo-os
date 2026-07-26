@@ -40,6 +40,10 @@ name = "resources"
 path = "src/resources.rs"
 
 [[bin]]
+name = "pmem"
+path = "src/pmem.rs"
+
+[[bin]]
 name = "hwinfo"
 path = "src/hwinfo.rs"
 

@@ -109,8 +109,49 @@ fn walk_sdt(sdt: u64, is_xsdt: bool, inv: &mut Inventory) {
             b"APIC" => parse_madt(table, inv),
             b"MCFG" => parse_mcfg(table, inv),
             b"SRAT" => parse_srat(table, inv),
+            b"NFIT" => parse_nfit(table, inv),
             _ => {}
         }
+    }
+}
+
+/// The ACPI GUID for "byte-addressable persistent memory" SPA ranges
+/// (NFIT SPA Range Structure), stored in the mixed-endian GUID layout QEMU
+/// writes for an nvdimm: {66F0D379-B4F3-4074-AC43-0D3318B78CDB}.
+const NFIT_PM_GUID: [u8; 16] = [
+    0x79, 0xD3, 0xF0, 0x66, 0xF3, 0xB4, 0x74, 0x40, 0xAC, 0x43, 0x0D, 0x33, 0x18, 0xB7, 0x8C, 0xDB,
+];
+
+/// NFIT -> persistent-memory regions (docs/MEMORY.md real-PMEM path). A real
+/// QEMU nvdimm's physical span is reported **only** here (the SPA Range
+/// Structure), not in the PVH E820 memmap, so this is the discovery path that
+/// turns a `MemKind::Pmem` grant into genuinely nvdimm-backed frames rather than
+/// DDR. Each SPA Range Structure (type 0) whose address-range-type GUID is the
+/// persistent-memory GUID contributes its `[base, base+len)` as a `Pmem` region.
+fn parse_nfit(nfit: u64, inv: &mut Inventory) {
+    let len = rd32(nfit + 4) as u64;
+    // Header(36) + reserved(4); sub-structures follow.
+    let mut off = 40;
+    while off + 4 <= len {
+        let stype = rd8(nfit + off) as u16 | ((rd8(nfit + off + 1) as u16) << 8);
+        let slen = (rd8(nfit + off + 2) as u16 | ((rd8(nfit + off + 3) as u16) << 8)) as u64;
+        if slen == 0 {
+            break;
+        }
+        // Type 0 = System Physical Address Range Structure: GUID@16, base@32,
+        // length@40 (ACPI 6.x table 5-132).
+        if stype == 0 && slen >= 48 {
+            let mut guid = [0u8; 16];
+            for (i, b) in guid.iter_mut().enumerate() {
+                *b = rd8(nfit + off + 16 + i as u64);
+            }
+            if guid == NFIT_PM_GUID {
+                let base = rd64(nfit + off + 32);
+                let size = rd64(nfit + off + 40);
+                inv.add_mem(base, size, MemKind::Pmem, 0);
+            }
+        }
+        off += slen;
     }
 }
 

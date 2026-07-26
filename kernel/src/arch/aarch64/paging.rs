@@ -268,6 +268,17 @@ pub fn paging_activate_kernel() {
     paging_activate(&PagingRoot { l0_pa }, 0);
 }
 
+/// Persistent-memory mapping window (docs/MEMORY.md real-PMEM path). QEMU's
+/// arm `virt` machine does **not** expose an nvdimm without an ACPI GED device,
+/// and this kernel uses a built-in DT-less machine profile with no ACPI/NFIT
+/// parser, so no `MemKind::Pmem` region is ever discovered on ARM64 and this is
+/// never called at runtime (pmem skips-with-reason here). The kernel's
+/// 48-bit-wide linear map covers any physical address, so the inert fallback is
+/// simply `phys_to_virt`.
+pub fn pmem_map_window(base_pa: usize, _len: usize) -> usize {
+    super::phys_to_virt(base_pa)
+}
+
 /// Finish paging bring-up. The MMU, TCR, MAIR, TTBR0/TTBR1 and SCTLR are
 /// already configured by the boot trampoline (kernel/arch/aarch64/boot.S),
 /// which enabled the MMU and jumped the kernel to its high (TTBR1) VAs before

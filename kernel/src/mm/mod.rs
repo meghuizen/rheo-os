@@ -7,6 +7,7 @@
 //! elastic grants, reclaim, and pressure events are later steps.
 
 pub mod frames;
+pub mod frames_pmem;
 pub mod grant;
 
 use crate::arch::{self, MapPerm};
