@@ -190,6 +190,22 @@ them bit-exact). VNNI's `dpbusd` wants the packed-B dot-product layout;
 the strided-B tile executor uses the widening-multiply AVX2/AVX-512 path.
 ARM SVE/SME and RISC-V V are the equivalent future tiers (NEON/F+D are the
 current ARM/RISC-V baseline).
+
+**Heterogeneous cores (P/E-cores, big.LITTLE) - SMP-gated (#27).** Core
+types can differ in *ISA* (Alder Lake P-cores had AVX-512, E-cores did
+not - Intel fused it off so CPUID stays uniform; ARMv8 requires the OS to
+expose "sanitised" ID registers = the minimum across cores) and in
+*throughput* (a P-core and an E-core run the same SIMD instruction at
+different speeds). Today this does not bite: the runtime is single-CPU
+cooperative, so a cell only ever runs on the boot CPU - its feature report
+and its benchmark both describe the one core it runs on, with no migration
+and no wrong-ISA `#UD` risk. When SMP lands, the correct handling is (a)
+the kernel feature report must be the **cross-core intersection**, not the
+boot core's alone; (b) the probe must be **per-core-class** (or the cell
+pinned to a class); and (c) **core class becomes a scheduler placement
+input** alongside the NUMA hint, expressed through the reservation/EDF
+layer (a compute reservation can ask for a performance core). All three
+need real secondary cores running cells, which is task #27.
 - **EngineExecutor** - lowers the SAME program to dependency-graph nodes
   (section 6) and submits over the queue (`OP_GRAPH_SUBMIT`). This is the
   device-portable artifact: engine 0 (the CPU engine) executes it today;
