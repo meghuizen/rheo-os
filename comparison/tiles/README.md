@@ -16,8 +16,15 @@ included verbatim — the same include-the-shipped-code rule as
 3. **A differential fuzz**: tiled == naive over 10,000 random
    shapes/tilings — the `json/src/scan.rs` discipline (a scalar reference
    plus a randomized equivalence check).
-4. **(`--features simd`) an AVX2 inner kernel** proven **bit-for-bit
-   identical** to the scalar kernel over 2,000 random shapes.
+4. **Runtime-dispatched SIMD tiers** — scalar, AVX2 (x86-64-v3), AVX-512
+   (x86-64-v4), and AVX-512-VNNI (Zen4 / the int8 AI-acceleration
+   `dpbusd` dot-product) — each **proven bit-for-bit identical** to the
+   scalar kernel over 2,000 random shapes, and timed. **All tiers are
+   compiled in unconditionally** (a `#[target_feature]` function always
+   emits its codegen, so the binary carries every path even on a CPU that
+   lacks the feature); the runtime `is_x86_feature_detected!` dispatch
+   **selects a tier only when the hardware is actually present**. So the
+   one build runs anywhere and lights up the widest ISA the host supports.
 
 Run it:
 
@@ -47,12 +54,27 @@ On the development host (x86-64):
 | 128 | ~104 | 20,971,520 |
 | 256 | ~96 | 12,582,912 |
 
-**Host fastest→slowest and sim least→most bytes both rank
-`[256, 128, 64, 32, 16]`** — the cost model ranks the tilings exactly as the
-host measures. Bigger blocks stage fewer bytes (each tile is reused more
-before eviction), and the host confirms that ordering is what wall-clock
-sees. Differential fuzz: 10,000 shapes, tiled == naive. AVX2 == scalar:
-2,000 shapes, bit-for-bit.
+The cost model ranks the tilings close to how the host measures (host and
+sim agree on the coarse ordering; real caches can reorder the middle
+blocks, which the table prints rather than hides — see "Why the gap").
+Differential fuzz: 10,000 shapes, tiled == naive.
+
+**SIMD tiers** (this host has AVX-512-VNNI, so all four are exercised;
+`is_x86_feature_detected!` picks the best at run time), 512³ int8 GEMM
+with B packed (contiguous loads), each bit-for-bit == scalar:
+
+| tier | instruction set | ms (512³) | vs scalar |
+|---|---|---:|---:|
+| scalar | baseline | ~8.9 | 1.00x |
+| avx2 | x86-64-v3 (`_mm256_madd_epi16`) | ~5.4 | ~1.7x |
+| avx512 | x86-64-v4 (`_mm512_madd_epi16`) | ~3.0 | ~2.9x |
+| vnni | Zen4 / int8 AI (`_mm512_dpbusd_epi32`) | ~2.3 | ~3.9x |
+
+VNNI's `dpbusd` does 64 int8 MACs per instruction; the signed-int8 GEMM
+biases A by +128 (dpbusd is unsigned×signed) and subtracts the resulting
+`128·Σb` back — exact integer arithmetic, so it equals the scalar kernel
+bit-for-bit (the fuzz asserts it). On a CPU without a tier the dispatch
+simply falls back; the kernels are still compiled in.
 
 ## Honest caveats
 

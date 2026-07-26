@@ -130,10 +130,47 @@ A `TileProgram` is built once and lowered per engine:
 - **CpuExecutor** - the library-call lowering (the TIME-IDENTITY.md 4
   "library call, not syscall" pattern applied to compute): the program
   runs in the cell, strand-parallel over disjoint output row-bands, with
-  scalar inner kernels today and SIMD (AVX2/SVE/SME/AMX) when U-mode
-  vector-state save/restore exists - until then the on-OS build stays
-  scalar and the SIMD inner kernel lives in the host comparison behind a
-  feature flag with a differential fuzz proof (the rheo-json precedent).
+  scalar inner kernels today and SIMD when U-mode vector-state
+  save/restore exists (see the optimization-path note below).
+
+### Optimization paths - the widest ISA the hardware actually has
+
+The inner GEMM kernel has **runtime-dispatched tiers**, selected only when
+the running CPU reports the feature - never assumed at compile time:
+
+| Tier | Instruction set | Kernel |
+|---|---|---|
+| scalar | every CPU | the portable reference |
+| AVX2 | x86-64-v3 | widen i8->i16, `_mm256_madd_epi16` |
+| AVX-512 | x86-64-v4 | 32-wide `_mm512_madd_epi16` |
+| VNNI | AVX-512-VNNI / **Zen4 int8 AI** | `_mm512_dpbusd_epi32` (64 int8 MACs/instr) |
+
+Two rules make this honest:
+
+- **All tiers are compiled in unconditionally.** A `#[target_feature]`
+  function always emits its codegen, so the binary carries every path even
+  on a CPU that lacks the feature; the runtime dispatch
+  (`is_x86_feature_detected!` on the host; the kernel's own CPUID/`ID_AA64*`
+  feature bitmask on-OS) only *selects* a tier when the hardware is
+  present. The code builds and runs on any CPU - it just lights up more on
+  a wider one. ARM SVE/SME and RISC-V V are the equivalent future tiers.
+- **Every tier is proven bit-for-bit identical to scalar** by a
+  differential fuzz (the rheo-json `scan.rs` discipline). The VNNI path is
+  the interesting case: `dpbusd` is unsigned x signed, so a signed-int8
+  GEMM biases A by +128 and subtracts the resulting `128*sum(b)` back -
+  exact integer arithmetic, verified against the scalar kernel.
+
+Where each runs, honestly: the tiers are **exercised and measured on the
+host** (`comparison/tiles` - VNNI ~3.9x, AVX-512 ~2.9x, AVX2 ~1.7x over
+scalar on a 512^3 int8 GEMM with B packed), because that is where real
+vector units and caches exist. **On-OS, a cell's CpuExecutor stays scalar
+until U-mode vector-state save/restore is implemented** (no ISA saves it
+across a cell trap yet, so a cell using wide vectors would corrupt state -
+the json/src/scan.rs precedent). The kernel already *detects* the features
+(`arch::cpu_feature_names`, the inventory's CPU report), so the dispatch's
+input exists; only the safe-execution seam is missing. The day U-mode
+vector state lands, the same dispatch selects the wide kernels in a cell
+with no API change.
 - **EngineExecutor** - lowers the SAME program to dependency-graph nodes
   (section 6) and submits over the queue (`OP_GRAPH_SUBMIT`). This is the
   device-portable artifact: engine 0 (the CPU engine) executes it today;

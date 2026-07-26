@@ -5,14 +5,17 @@
 // hierarchy, which QEMU (the in-tree librheotile/bench-core) does not model,
 // so the locality win is only visible here.
 //
-// Three things measured:
+// Four things measured:
 //   1. tiled vs naive at a real projection shape - the wall-clock speedup
 //      from cache-friendly blocking (real caches, honest ns).
 //   2. the SIM-vs-HOST table: TileSim's bytes-staged ordering across block
-//      sizes must rank the tilings the same way host wall-clock does. A
-//      divergence is printed, never hidden - the model is falsifiable.
-//   3. (feature = "simd") an AVX2 inner kernel + a differential check that
-//      it matches the scalar kernel bit-for-bit.
+//      sizes vs how host wall-clock ranks the tilings - the model is
+//      falsifiable, so a divergence is printed, never hidden.
+//   3. the differential fuzz: tiled == naive over 10k random shapes.
+//   4. the runtime-dispatched SIMD tiers (scalar / AVX2=x86-64-v3 /
+//      AVX-512=v4 / VNNI=Zen4 int8 AI accel) - all compiled in
+//      unconditionally, selected only when `is_x86_feature_detected!`
+//      confirms the CPU, each proven bit-for-bit == scalar and timed.
 
 use std::time::Instant;
 
@@ -83,8 +86,7 @@ fn sim_bytes_staged(m: usize, n: usize, k: usize, block: usize) -> u64 {
     let mt = m.div_ceil(block) as u64;
     let nt = n.div_ceil(block) as u64;
     let kt = k.div_ceil(block) as u64;
-    mt * nt * kt * ((block * block + block * block) as u64)
-        + mt * nt * ((block * block) as u64) * 4
+    mt * nt * kt * ((block * block + block * block) as u64) + mt * nt * ((block * block) as u64) * 4
 }
 
 fn fill(buf: &mut [i8], seed: usize) {
@@ -124,7 +126,10 @@ fn main() {
     assert_eq!(c, cref, "tiled != naive");
     println!("shape {m}x{n}x{k}:");
     println!("  naive:      {naive_ms:.2} ms");
-    println!("  tiled(64):  {tiled_ms:.2} ms   ({:.2}x)", naive_ms / tiled_ms);
+    println!(
+        "  tiled(64):  {tiled_ms:.2} ms   ({:.2}x)",
+        naive_ms / tiled_ms
+    );
     println!("  (correctness: tiled == naive, asserted)");
 
     // ---- SIM-vs-HOST ordering table ----
@@ -197,24 +202,35 @@ fn main() {
     }
     println!("  {cases} random shapes/tilings: tiled == naive, all OK");
 
-    #[cfg(feature = "simd")]
     simd::run(&mut next);
-    #[cfg(not(feature = "simd"))]
-    println!("\n(built without --features simd: the AVX2 inner kernel + its\ndifferential check are skipped; scalar path shown above)");
 }
 
-// The AVX2 inner kernel is host-only (in-cell SIMD waits on U-mode vector
-// state, json/src/scan.rs precedent). It is proven bit-identical to the
-// scalar kernel by a differential fuzz - the same discipline rheo-json uses.
-#[cfg(feature = "simd")]
+// Runtime-dispatched SIMD inner kernels (docs/TILES.md "optimization paths").
+// ALL tiers are compiled unconditionally - `#[target_feature]` functions
+// always emit codegen, so the binary carries every path even on a host that
+// lacks the feature; the runtime `is_x86_feature_detected!` dispatch only
+// SELECTS a tier when the CPU actually supports it. So this builds and runs
+// on any x86-64 (falling to AVX2 or scalar), and lights up AVX-512 / VNNI
+// where present:
+//   scalar  - baseline, every CPU
+//   AVX2    - x86-64-v3 (widen i8->i16, `_mm256_madd_epi16`)
+//   AVX-512 - x86-64-v4 (32-wide, `_mm512_madd_epi16`)
+//   VNNI    - AVX-512-VNNI / Zen4 int8 AI acceleration
+//             (`_mm512_dpbusd_epi32`, the int8 dot-product-accumulate)
+// Each is proven bit-for-bit identical to the scalar kernel by the
+// differential fuzz - the json/src/scan.rs discipline. Host-only: in-cell
+// use waits on U-mode vector-state save/restore (see the framework's
+// `tile::dispatch`, which keeps on-OS execution scalar until then).
+#[cfg(target_arch = "x86_64")]
 mod simd {
     use super::kernels;
+    use std::arch::x86_64::*;
 
-    /// AVX2 int8 GEMM inner block: widen i8->i16, multiply-add via
-    /// `_mm256_madd_epi16` over pairs. Accumulates into C like the scalar
-    /// kernel.
+    /// AVX2 (x86-64-v3): widen 16 i8->i16, `_mm256_madd_epi16`, accumulate.
+    /// A/B loaded via a temp (B is strided) - a demonstration kernel, not a
+    /// packed microkernel; the widening MAC is the real instruction.
     #[target_feature(enable = "avx2")]
-    unsafe fn gemm_i8_i32_avx2(
+    unsafe fn gemm_avx2(
         a: *const i8,
         as_: usize,
         b: *const i8,
@@ -225,73 +241,354 @@ mod simd {
         n: usize,
         k: usize,
     ) {
-        use std::arch::x86_64::*;
-        // SAFETY: caller guarantees a/b/c are valid for the strided m/n/k
-        // accesses; every offset below stays inside those bounds.
         unsafe {
-        for i in 0..m {
-            for j in 0..n {
-                let mut acc = _mm256_setzero_si256();
-                let mut p = 0;
-                while p + 16 <= k {
-                    // Load 16 i8 from A row and B column (gather-free only if
-                    // B is row-major; here we walk B with stride, so load
-                    // scalarly into a temp - still exercises the widening MAC).
-                    let mut atmp = [0i16; 16];
-                    let mut btmp = [0i16; 16];
-                    for t in 0..16 {
-                        atmp[t] = *a.add(i * as_ + p + t) as i16;
-                        btmp[t] = *b.add((p + t) * bs + j) as i16;
+            for i in 0..m {
+                for j in 0..n {
+                    let mut acc = _mm256_setzero_si256();
+                    let mut p = 0;
+                    while p + 16 <= k {
+                        let mut at = [0i16; 16];
+                        let mut bt = [0i16; 16];
+                        for t in 0..16 {
+                            at[t] = *a.add(i * as_ + p + t) as i16;
+                            bt[t] = *b.add((p + t) * bs + j) as i16;
+                        }
+                        let av = _mm256_loadu_si256(at.as_ptr() as *const __m256i);
+                        let bv = _mm256_loadu_si256(bt.as_ptr() as *const __m256i);
+                        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(av, bv));
+                        p += 16;
                     }
-                    let av = _mm256_loadu_si256(atmp.as_ptr() as *const __m256i);
-                    let bv = _mm256_loadu_si256(btmp.as_ptr() as *const __m256i);
-                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(av, bv));
-                    p += 16;
+                    let mut lanes = [0i32; 8];
+                    _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, acc);
+                    let mut sum: i32 = lanes.iter().sum();
+                    while p < k {
+                        sum += (*a.add(i * as_ + p) as i32) * (*b.add(p * bs + j) as i32);
+                        p += 1;
+                    }
+                    *c.add(i * cs + j) += sum;
                 }
-                // Horizontal sum of the 8 i32 lanes.
-                let mut lanes = [0i32; 8];
-                _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, acc);
-                let mut sum: i32 = lanes.iter().sum();
-                // Tail.
-                while p < k {
-                    sum += (*a.add(i * as_ + p) as i32) * (*b.add(p * bs + j) as i32);
-                    p += 1;
-                }
-                *c.add(i * cs + j) += sum;
             }
         }
+    }
+
+    /// AVX-512 (x86-64-v4): 32-wide widen + `_mm512_madd_epi16`.
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn gemm_avx512(
+        a: *const i8,
+        as_: usize,
+        b: *const i8,
+        bs: usize,
+        c: *mut i32,
+        cs: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        unsafe {
+            for i in 0..m {
+                for j in 0..n {
+                    let mut acc = _mm512_setzero_si512();
+                    let mut p = 0;
+                    while p + 32 <= k {
+                        let mut at = [0i16; 32];
+                        let mut bt = [0i16; 32];
+                        for t in 0..32 {
+                            at[t] = *a.add(i * as_ + p + t) as i16;
+                            bt[t] = *b.add((p + t) * bs + j) as i16;
+                        }
+                        let av = _mm512_loadu_si512(at.as_ptr() as *const _);
+                        let bv = _mm512_loadu_si512(bt.as_ptr() as *const _);
+                        acc = _mm512_add_epi32(acc, _mm512_madd_epi16(av, bv));
+                        p += 32;
+                    }
+                    let mut sum = _mm512_reduce_add_epi32(acc);
+                    while p < k {
+                        sum += (*a.add(i * as_ + p) as i32) * (*b.add(p * bs + j) as i32);
+                        p += 1;
+                    }
+                    *c.add(i * cs + j) += sum;
+                }
+            }
+        }
+    }
+
+    /// AVX-512-VNNI (Zen4 / int8 AI acceleration): `_mm512_dpbusd_epi32`,
+    /// the int8 dot-product-accumulate - 64 int8 MACs per instruction.
+    /// dpbusd is unsigned(a) x signed(b), so signed A is biased by +128
+    /// (a_u = a + 128) and the resulting `128 * sum(b)` over-count is
+    /// subtracted back - the standard signed-int8-on-VNNI correction. Exact
+    /// integer arithmetic, so it equals the scalar kernel bit-for-bit
+    /// (asserted by the fuzz).
+    #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+    unsafe fn gemm_vnni(
+        a: *const i8,
+        as_: usize,
+        b: *const i8,
+        bs: usize,
+        c: *mut i32,
+        cs: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        unsafe {
+            let bias = _mm512_set1_epi8(-128i8); // +128 mod 256 = the u8 bias
+            for i in 0..m {
+                for j in 0..n {
+                    let mut acc = _mm512_setzero_si512();
+                    let mut bsum = 0i32; // sum of the b bytes, for the -128 fixup
+                    let mut p = 0;
+                    while p + 64 <= k {
+                        let av = _mm512_loadu_si512(a.add(i * as_ + p) as *const _);
+                        let a_u = _mm512_add_epi8(av, bias); // signed a -> biased u8
+                        let mut bt = [0i8; 64];
+                        for t in 0..64 {
+                            let v = *b.add((p + t) * bs + j);
+                            bt[t] = v;
+                            bsum += v as i32;
+                        }
+                        let bv = _mm512_loadu_si512(bt.as_ptr() as *const _);
+                        acc = _mm512_dpbusd_epi32(acc, a_u, bv);
+                        p += 64;
+                    }
+                    // sum(a*b) = sum((a_u-128)*b) = dpbusd_total - 128*sum(b).
+                    let mut sum = _mm512_reduce_add_epi32(acc) - 128 * bsum;
+                    while p < k {
+                        sum += (*a.add(i * as_ + p) as i32) * (*b.add(p * bs + j) as i32);
+                        p += 1;
+                    }
+                    *c.add(i * cs + j) += sum;
+                }
+            }
+        }
+    }
+
+    /// The tiers the running CPU actually supports, best first (docs/TILES.md).
+    fn tiers() -> &'static [&'static str] {
+        // Detected at RUN time - "only when the hardware is actually
+        // available". A CPU lacking a feature simply never returns its name.
+        if is_x86_feature_detected!("avx512vnni") && is_x86_feature_detected!("avx512bw") {
+            &["vnni", "avx512", "avx2", "scalar"]
+        } else if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+            &["avx512", "avx2", "scalar"]
+        } else if is_x86_feature_detected!("avx2") {
+            &["avx2", "scalar"]
+        } else {
+            &["scalar"]
+        }
+    }
+
+    fn run_tier(tier: &str, a: &[i8], b: &[i8], c: &mut [i32], m: usize, n: usize, k: usize) {
+        for ci in c.iter_mut() {
+            *ci = 0;
+        }
+        // SAFETY: buffers are m*k / k*n / m*n; the tier was confirmed
+        // available by `tiers()` before being named here.
+        unsafe {
+            match tier {
+                "scalar" => {
+                    kernels::gemm_i8_i32(a.as_ptr(), k, b.as_ptr(), n, c.as_mut_ptr(), n, m, n, k)
+                }
+                "avx2" => gemm_avx2(a.as_ptr(), k, b.as_ptr(), n, c.as_mut_ptr(), n, m, n, k),
+                "avx512" => gemm_avx512(a.as_ptr(), k, b.as_ptr(), n, c.as_mut_ptr(), n, m, n, k),
+                "vnni" => gemm_vnni(a.as_ptr(), k, b.as_ptr(), n, c.as_mut_ptr(), n, m, n, k),
+                _ => unreachable!(),
+            }
         }
     }
 
     pub fn run(next: &mut impl FnMut() -> u64) {
-        println!("\n== AVX2 inner kernel: differential vs scalar ==");
-        if !is_x86_feature_detected!("avx2") {
-            println!("  (avx2 not available on this host; skipped)");
-            return;
+        use std::time::Instant;
+        let tiers = tiers();
+        println!("\n== SIMD dispatch: tiers available on this host ==");
+        println!("  detected best->fallback: {tiers:?}");
+        println!("  (x86-64-v3=avx2, v4=avx512, Zen4/int8-AI=vnni; all compiled");
+        println!("   in unconditionally, selected only when detected)");
+
+        // Differential: every available tier == scalar, bit-for-bit.
+        println!("\n== each tier vs scalar (differential fuzz) ==");
+        for &tier in tiers {
+            if tier == "scalar" {
+                continue;
+            }
+            let mut cases = 0;
+            for _ in 0..2000 {
+                let m = 1 + (next() % 16) as usize;
+                let n = 1 + (next() % 16) as usize;
+                let k = 1 + (next() % 200) as usize; // spans the 16/32/64 vector widths
+                let mut a = vec![0i8; m * k];
+                let mut b = vec![0i8; k * n];
+                for v in a.iter_mut() {
+                    *v = (next() & 0xFF) as i8;
+                }
+                for v in b.iter_mut() {
+                    *v = (next() & 0xFF) as i8;
+                }
+                let mut cs = vec![0i32; m * n];
+                let mut cv = vec![0i32; m * n];
+                run_tier("scalar", &a, &b, &mut cs, m, n, k);
+                run_tier(tier, &a, &b, &mut cv, m, n, k);
+                assert_eq!(cs, cv, "{tier} != scalar at {m}x{n}x{k}");
+                cases += 1;
+            }
+            println!("  {tier:>7}: {cases} random shapes == scalar, bit-for-bit OK");
         }
-        let mut cases = 0;
-        for _ in 0..2000 {
-            let m = 1 + (next() % 20) as usize;
-            let n = 1 + (next() % 20) as usize;
-            let k = 1 + (next() % 40) as usize;
-            let mut a = vec![0i8; m * k];
-            let mut b = vec![0i8; k * n];
-            for v in a.iter_mut() {
-                *v = (next() & 0xFF) as i8;
-            }
-            for v in b.iter_mut() {
-                *v = (next() & 0xFF) as i8;
-            }
-            let mut cs = vec![0i32; m * n];
-            let mut cv = vec![0i32; m * n];
-            // SAFETY: buffers sized m*k, k*n, m*n; strides k/n/n.
-            unsafe {
-                kernels::gemm_i8_i32(a.as_ptr(), k, b.as_ptr(), n, cs.as_mut_ptr(), n, m, n, k);
-                gemm_i8_i32_avx2(a.as_ptr(), k, b.as_ptr(), n, cv.as_mut_ptr(), n, m, n, k);
-            }
-            assert_eq!(cs, cv, "avx2 != scalar at {m}x{n}x{k}");
-            cases += 1;
+
+        // Throughput: a 512^3 int8 GEMM with B PRE-TRANSPOSED (Bt[j][:]
+        // contiguous in k) so the vector loads are real, not scalar gathers.
+        // This is the fair showcase of the instructions themselves - the
+        // strided kernels above prove correctness against the general GEMM
+        // signature; these contiguous kernels show what dpbusd / madd
+        // actually deliver when B is packed (a real microkernel packs B; the
+        // strided demo does not, which is why it is gather-bound - stated in
+        // README.md). The scalar baseline here is the SAME scalar kernel over
+        // transposed B, so the ratio is apples-to-apples.
+        let (m, n, k) = (512usize, 512usize, 512usize);
+        let mut a = vec![0i8; m * k];
+        let mut bt = vec![0i8; n * k]; // transposed: row j is column j of B
+        for (i, v) in a.iter_mut().enumerate() {
+            *v = ((i * 31 + 7) & 0x7F) as i8;
         }
-        println!("  {cases} random shapes: AVX2 == scalar, bit-for-bit OK");
+        for (i, v) in bt.iter_mut().enumerate() {
+            *v = ((i * 17 + 3) & 0x7F) as i8;
+        }
+        let mut c = vec![0i32; m * n];
+        println!("\n== per-tier throughput ({m}^3 int8 GEMM, B packed, host wall-clock) ==");
+        // Measure all tiers first (correctness-checking each against the
+        // contiguous scalar dot), then print ratios against scalar.
+        let mut cref = vec![0i32; m * n];
+        gemm_bt("scalar", &a, &bt, &mut cref, m, n, k);
+        let mut timings: Vec<(&str, f64)> = Vec::new();
+        for &tier in tiers {
+            gemm_bt(tier, &a, &bt, &mut c, m, n, k); // warm
+            if tier != "scalar" {
+                assert_eq!(c, cref, "{tier} (packed) != scalar (packed)");
+            }
+            let t = Instant::now();
+            let reps = 5;
+            for _ in 0..reps {
+                gemm_bt(tier, &a, &bt, &mut c, m, n, k);
+            }
+            timings.push((tier, t.elapsed().as_secs_f64() / reps as f64 * 1e3));
+        }
+        let scalar_ms = timings
+            .iter()
+            .find(|(t, _)| *t == "scalar")
+            .map(|(_, ms)| *ms)
+            .unwrap();
+        for (tier, ms) in &timings {
+            println!(
+                "  {tier:>7}: {ms:7.2} ms   ({:.2}x vs scalar)",
+                scalar_ms / ms
+            );
+        }
+    }
+
+    /// Dispatch a packed-B GEMM: C[i][j] = dot(A[i][:], Bt[j][:]), both
+    /// contiguous in k. Zeroes C first.
+    fn gemm_bt(tier: &str, a: &[i8], bt: &[i8], c: &mut [i32], m: usize, n: usize, k: usize) {
+        for i in 0..m {
+            for j in 0..n {
+                let ap = unsafe { a.as_ptr().add(i * k) };
+                let bp = unsafe { bt.as_ptr().add(j * k) };
+                // SAFETY: ap/bp point at k contiguous i8; the tier was
+                // confirmed available by `tiers()`.
+                c[i * n + j] = unsafe {
+                    match tier {
+                        "scalar" => dot_scalar(ap, bp, k),
+                        "avx2" => dot_avx2(ap, bp, k),
+                        "avx512" => dot_avx512(ap, bp, k),
+                        "vnni" => dot_vnni(ap, bp, k),
+                        _ => unreachable!(),
+                    }
+                };
+            }
+        }
+    }
+
+    unsafe fn dot_scalar(a: *const i8, b: *const i8, k: usize) -> i32 {
+        let mut s = 0i32;
+        for p in 0..k {
+            s += unsafe { (*a.add(p) as i32) * (*b.add(p) as i32) };
+        }
+        s
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn dot_avx2(a: *const i8, b: *const i8, k: usize) -> i32 {
+        unsafe {
+            let mut acc = _mm256_setzero_si256();
+            let mut p = 0;
+            while p + 16 <= k {
+                let av = _mm256_cvtepi8_epi16(_mm_loadu_si128(a.add(p) as *const __m128i));
+                let bv = _mm256_cvtepi8_epi16(_mm_loadu_si128(b.add(p) as *const __m128i));
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(av, bv));
+                p += 16;
+            }
+            let mut lanes = [0i32; 8];
+            _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, acc);
+            let mut s: i32 = lanes.iter().sum();
+            while p < k {
+                s += (*a.add(p) as i32) * (*b.add(p) as i32);
+                p += 1;
+            }
+            s
+        }
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn dot_avx512(a: *const i8, b: *const i8, k: usize) -> i32 {
+        unsafe {
+            let mut acc = _mm512_setzero_si512();
+            let mut p = 0;
+            while p + 32 <= k {
+                let av = _mm512_cvtepi8_epi16(_mm256_loadu_si256(a.add(p) as *const __m256i));
+                let bv = _mm512_cvtepi8_epi16(_mm256_loadu_si256(b.add(p) as *const __m256i));
+                acc = _mm512_add_epi32(acc, _mm512_madd_epi16(av, bv));
+                p += 32;
+            }
+            let mut s = _mm512_reduce_add_epi32(acc);
+            while p < k {
+                s += (*a.add(p) as i32) * (*b.add(p) as i32);
+                p += 1;
+            }
+            s
+        }
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+    unsafe fn dot_vnni(a: *const i8, b: *const i8, k: usize) -> i32 {
+        unsafe {
+            // dpbusd is u8 x i8: bias signed a by +128, accumulate the b sum
+            // in parallel (dpbusd of all-ones u8 x b), correct by -128*sum(b).
+            let bias = _mm512_set1_epi8(-128i8);
+            let ones = _mm512_set1_epi8(1i8); // u8 1 in each lane
+            let mut acc = _mm512_setzero_si512();
+            let mut bacc = _mm512_setzero_si512();
+            let mut p = 0;
+            while p + 64 <= k {
+                let av = _mm512_loadu_si512(a.add(p) as *const _);
+                let a_u = _mm512_add_epi8(av, bias);
+                let bv = _mm512_loadu_si512(b.add(p) as *const _);
+                acc = _mm512_dpbusd_epi32(acc, a_u, bv);
+                bacc = _mm512_dpbusd_epi32(bacc, ones, bv); // sum of b bytes
+                p += 64;
+            }
+            let mut s = _mm512_reduce_add_epi32(acc) - 128 * _mm512_reduce_add_epi32(bacc);
+            while p < k {
+                s += (*a.add(p) as i32) * (*b.add(p) as i32);
+                p += 1;
+            }
+            s
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+mod simd {
+    pub fn run(_next: &mut impl FnMut() -> u64) {
+        println!(
+            "\n(SIMD tiers are x86-64 only; this host is another ISA - scalar path shown above.\nARM SVE/SME and RISC-V V are the equivalent future tiers.)"
+        );
     }
 }
