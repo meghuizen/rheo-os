@@ -22,13 +22,68 @@ static mut ADMISSION: Admission = Admission::new();
 static mut ENGINE: Engine = Engine::cpu();
 static mut READY: bool = false;
 
-/// One-time init: seed the per-cell DRBG and attach (measure) the engine.
+/// One introspection row of the engine table (docs/GPU-HARDWARE.md 9):
+/// engine 0 is the executable CPU engine above; the rest are GPUs
+/// enumerated from PCIe - registered with the accelerator's declared
+/// op-boundary preemption contract and an honest zero measured cost until
+/// a driver cell can execute on them (attach-benchmark future work).
+#[derive(Copy, Clone)]
+struct EngineEntry {
+    kind: u64,   // abi::EngineInfo kind: 0=CPU, 1=GPU
+    vendor: u64, // PCI vendor id, 0 for the CPU
+    measured_cost_ticks: u64,
+    preemption: u64, // 0=Instruction, 1=OpBoundary
+}
+
+const MAX_ENGINES: usize = 1 + crate::hw::MAX_GPUS;
+static mut ENGINES: [EngineEntry; MAX_ENGINES] = [EngineEntry {
+    kind: 0,
+    vendor: 0,
+    measured_cost_ticks: 0,
+    preemption: 0,
+}; MAX_ENGINES];
+static mut NENGINES: usize = 0;
+
+/// One-time init: seed the per-cell DRBG, attach (measure) the CPU engine,
+/// and register every GPU the hardware inventory recognised as an engine.
 pub fn init() {
     unsafe {
         *core::ptr::addr_of_mut!(DRBG) = rng::derive_cell_drbg();
         (*core::ptr::addr_of_mut!(ENGINE)).attach();
+
+        let engines = &mut *core::ptr::addr_of_mut!(ENGINES);
+        let cpu = &*core::ptr::addr_of!(ENGINE);
+        engines[0] = EngineEntry {
+            kind: 0,
+            vendor: 0,
+            measured_cost_ticks: cpu.measured_cost_ticks(),
+            preemption: match cpu.preemption {
+                crate::engine::Preemption::Instruction => 0,
+                crate::engine::Preemption::OpBoundary => 1,
+            },
+        };
+        let mut n = 1;
+        let inv = crate::hw::inventory();
+        for g in &inv.gpus[..inv.ngpu] {
+            if n == MAX_ENGINES {
+                break;
+            }
+            engines[n] = EngineEntry {
+                kind: 1, // GPU
+                vendor: g.vendor_id as u64,
+                measured_cost_ticks: 0, // not benchmarked: no execution path yet
+                preemption: 1,          // OpBoundary - the declared accelerator contract
+            };
+            n += 1;
+        }
+        *core::ptr::addr_of_mut!(NENGINES) = n;
         *core::ptr::addr_of_mut!(READY) = true;
     }
+}
+
+/// Registered engine count (CPU + recognised GPUs). For the test kernels.
+pub fn engine_count() -> usize {
+    unsafe { *core::ptr::addr_of!(NENGINES) }
 }
 
 fn events() -> &'static mut EventStream {
@@ -72,23 +127,28 @@ pub fn handle(nr: u64, args: &[u64; 6]) -> Option<u64> {
             Some(lease.token)
         }
         SYS_ENGINE_INFO => {
-            // Engine introspection (docs/LIBRHEO.md Phase C, object 4): report the
-            // CPU engine's kind, attach-time MEASURED cost, and preemption contract.
-            let engine = unsafe { &*core::ptr::addr_of!(ENGINE) };
-            let info = EngineInfo {
-                kind: 0, // CPU (the only real engine here)
-                measured_cost_ticks: engine.measured_cost_ticks(),
-                preemption: match engine.preemption {
-                    crate::engine::Preemption::Instruction => 0,
-                    crate::engine::Preemption::OpBoundary => 1,
-                },
-            };
-            // SAFETY: `arg` is a user VA in the running cell's active address
-            // space, sized for an `EngineInfo` (the cell passes its own slot).
-            unsafe {
-                (arg as *mut EngineInfo).write(info);
+            // Engine introspection (docs/LIBRHEO.md Phase C, object 4;
+            // docs/GPU-HARDWARE.md 9): report engine `args[1]` from the
+            // table (0 = the CPU engine, then the PCIe-enumerated GPUs)
+            // and return the engine count so a cell can enumerate.
+            let idx = args[1] as usize;
+            let n = unsafe { *core::ptr::addr_of!(NENGINES) };
+            if idx < n {
+                let e = unsafe { (*core::ptr::addr_of!(ENGINES))[idx] };
+                let info = EngineInfo {
+                    kind: e.kind,
+                    measured_cost_ticks: e.measured_cost_ticks,
+                    preemption: e.preemption,
+                    vendor: e.vendor,
+                };
+                // SAFETY: `arg` is a user VA in the running cell's active
+                // address space, sized for an `EngineInfo` (the cell passes
+                // its own slot).
+                unsafe {
+                    (arg as *mut EngineInfo).write(info);
+                }
             }
-            Some(0)
+            Some(n as u64)
         }
         SYS_CPUINFO => {
             print_cpuinfo();

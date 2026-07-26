@@ -622,6 +622,14 @@ pub fn pci_cfg_write32(_ecam: u64, bus: u8, dev: u8, func: u8, off: u16, val: u3
     }
 }
 
+/// The host bridge's 32-bit MMIO window for BAR assignment
+/// (docs/GPU-HARDWARE.md 3). On q35 the PCI hole below 4 GiB spans
+/// ~0xB000_0000..0xFEC0_0000; 0xE000_0000..0xF000_0000 sits safely inside
+/// it, above the 0xB000_0000 ECAM and below the LAPIC/IOAPIC pages.
+pub fn pci_mmio_window() -> (u64, u64) {
+    (0xE000_0000, 0x1000_0000)
+}
+
 // -------------------------------------------------------------- user mode
 
 /// Saved ring-3 register state. Layout matches the offsets in user.S.

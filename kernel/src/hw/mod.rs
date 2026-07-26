@@ -19,6 +19,7 @@
 pub mod acpi;
 pub mod block;
 pub mod fdt;
+pub mod gpu;
 pub mod pci;
 pub mod virtio_blk;
 pub mod virtio_gpu;
@@ -30,6 +31,7 @@ pub const MAX_CPUS: usize = 64;
 pub const MAX_MEM_REGIONS: usize = 24;
 pub const MAX_NUMA_NODES: usize = 8;
 pub const MAX_PCI_DEVICES: usize = 48;
+pub const MAX_GPUS: usize = 8;
 
 /// Typed physical memory (docs/MEMORY.md). QEMU mostly reports DDR; the
 /// other tiers appear on hardware that has them, classified from the
@@ -72,6 +74,29 @@ pub enum EngineKind {
     Other,
 }
 
+/// One sized Base Address Register (docs/GPU-HARDWARE.md 3). `base` is what
+/// the register held at enumeration (0 on PVH boots, where no firmware
+/// programs BARs) or what `pci::assign_bars` later wrote; `size` comes from
+/// the write-ones mask probe. `size == 0` means the BAR is unimplemented.
+#[derive(Copy, Clone)]
+pub struct PciBar {
+    pub base: u64,
+    pub size: u64,
+    pub io: bool,
+    pub is64: bool,
+    pub prefetch: bool,
+}
+
+impl PciBar {
+    pub const EMPTY: PciBar = PciBar {
+        base: 0,
+        size: 0,
+        io: false,
+        is64: false,
+        prefetch: false,
+    };
+}
+
 #[derive(Copy, Clone)]
 pub struct PciDevice {
     pub seg: u16,
@@ -84,6 +109,17 @@ pub struct PciDevice {
     pub subclass: u8,
     pub prog_if: u8,
     pub engine: EngineKind,
+    /// Header type (0 = endpoint, 1 = PCI-PCI bridge), multifunction bit
+    /// stripped.
+    pub header: u8,
+    /// The six type-0 BARs, sized by the mask probe (bridges: first two).
+    pub bars: [PciBar; 6],
+    /// Capabilities found on the standard capability list.
+    pub msi: bool,
+    pub msix: bool,
+    /// PCIe capability present; `flr` is its DevCap FLR bit.
+    pub pcie: bool,
+    pub flr: bool,
 }
 
 /// Where the machine description came from.
@@ -124,6 +160,8 @@ pub struct Inventory {
     pub ecam_base: u64,
     pub npci: usize,
     pub pci: [PciDevice; MAX_PCI_DEVICES],
+    pub ngpu: usize,
+    pub gpus: [gpu::GpuDevice; MAX_GPUS],
 }
 
 impl Inventory {
@@ -158,7 +196,15 @@ impl Inventory {
                 subclass: 0,
                 prog_if: 0,
                 engine: EngineKind::Other,
+                header: 0,
+                bars: [PciBar::EMPTY; 6],
+                msi: false,
+                msix: false,
+                pcie: false,
+                flr: false,
             }; MAX_PCI_DEVICES],
+            ngpu: 0,
+            gpus: [gpu::GpuDevice::EMPTY; MAX_GPUS],
         }
     }
 
@@ -246,6 +292,9 @@ pub fn detect() {
 
     if inv.ecam_base != 0 {
         pci::enumerate(inv.ecam_base, inv);
+        // Classify every display-class function into the GPU inventory
+        // (vendor recognition + BAR topology; docs/GPU-HARDWARE.md).
+        gpu::probe(inv);
     }
 
     // Fallback: if firmware gave us no CPU, we are at least running on one.
@@ -264,6 +313,15 @@ pub fn detect() {
     // real-PMEM path). Inert on every machine without an nvdimm, so the DDR path
     // is unchanged.
     crate::mm::frames_pmem::init_from_inventory(inv);
+}
+
+/// Opt-in BAR assignment (docs/GPU-HARDWARE.md 3): write addresses from
+/// the host bridge's MMIO window into every sized, unassigned memory BAR
+/// and enable decode. Called by the kernels that need reachable BARs (the
+/// `enable_uart_rx_irq` precedent); everything else leaves devices exactly
+/// as firmware (or nobody, on PVH) left them. Returns BARs assigned.
+pub fn assign_pci_bars() -> usize {
+    pci::assign_bars(inventory_mut())
 }
 
 /// Print the discovered inventory to the console.

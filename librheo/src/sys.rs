@@ -260,15 +260,39 @@ pub fn mmap_file(fd: u64, offset: u64, len: usize, flags: u64) -> usize {
 /// Read the CPU engine's introspection block (kind + measured throughput +
 /// preemption contract). See `compute::Engine::info`.
 pub fn engine_info() -> EngineInfo {
+    engine_info_at(0).1
+}
+
+/// Read engine `index` from the kernel's engine table (0 = CPU, then the
+/// PCIe-enumerated GPUs; docs/GPU-HARDWARE.md 9). Returns
+/// `(engine_count, info)`; for an out-of-range index the info block is
+/// zeroed and only the count is meaningful.
+pub fn engine_info_at(index: u64) -> (u64, EngineInfo) {
     let mut info = EngineInfo {
         kind: 0,
         measured_cost_ticks: 0,
         preemption: 0,
+        vendor: 0,
+    };
+    let n = unsafe { syscall2(SYS_ENGINE_INFO, &mut info as *mut EngineInfo as u64, index) };
+    (n, info)
+}
+
+/// Number of engines the kernel has registered (CPU + recognised GPUs).
+pub fn engine_count() -> u64 {
+    let mut info = EngineInfo {
+        kind: 0,
+        measured_cost_ticks: 0,
+        preemption: 0,
+        vendor: 0,
     };
     unsafe {
-        syscall1(SYS_ENGINE_INFO, &mut info as *mut EngineInfo as u64);
+        syscall2(
+            SYS_ENGINE_INFO,
+            &mut info as *mut EngineInfo as u64,
+            u64::MAX,
+        )
     }
-    info
 }
 /// Admit a reservation. Fills a `ReserveInfo` at `out_va` on success; returns
 /// 0 or a rejection code (1=BadParams, 2=Overcommit, 3=MemoryFloor).
@@ -452,12 +476,15 @@ pub struct ShareInfo {
 }
 
 /// The `SYS_ENGINE_INFO` result block (kernel/src/abi.rs `EngineInfo`).
+/// `kind`: 0=CPU, 1=GPU; `vendor` is the PCI vendor ID for a device engine
+/// (0 for the CPU).
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct EngineInfo {
     pub kind: u64,
     pub measured_cost_ticks: u64,
     pub preemption: u64,
+    pub vendor: u64,
 }
 
 /// The `SYS_RESERVE_ADMIT` success block (kernel/src/abi.rs `ReserveInfo`).

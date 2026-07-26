@@ -56,7 +56,21 @@ split at node boundaries), and PCIe enumeration through the ECAM/config
 space, classifying each function into an engine kind - GPU, NIC, NVMe, or a
 processing accelerator (NPU/TPU, PCI base class 0x12). The `hwinfo` test
 kernel asserts the basics on all three ISAs; `cargo xtask run --bin hwinfo`
-prints the full inventory.
+prints the full inventory. **Real-GPU stage 1 is done** (docs/GPU-HARDWARE.md
+12): PCIe enumeration now recurses bridges (programming secondary bus numbers
+where firmware left them zero - the bare arm/riscv boots have no firmware to
+do it; x86 q35's `-kernel` path runs SeaBIOS, which got there first), sizes
+every BAR by the mask probe, walks the capability list (MSI/MSI-X/PCIe/FLR),
+and offers opt-in BAR assignment from a per-ISA host-bridge window
+(`hw::assign_pci_bars`, invisible to boots that skip it); `kernel/src/hw/gpu.rs`
+recognises every display-class function by vendor - NVIDIA / AMD / Intel /
+virtio / Bochs - into the inventory, and each recognised GPU registers in the
+engine table behind `SYS_ENGINE_INFO(out_va, index)` enumeration (kind + PCI
+vendor ID + declared op-boundary preemption, an honest zero measured cost -
+recognised and registered, not yet driven). The `gpuhw` test proves it on all
+three ISAs against QEMU's real `ati-vga` (AMD, 0x1002), a Bochs display, and
+a virtio-gpu behind a `pcie-root-port`; NVIDIA/Intel have no QEMU device
+model and report skip-with-reason.
 
 The **strand runtime** (`runtime/`, BUILD-ORDER.md step 7,
 docs/CONCURRENCY.md) is the userspace library that brings native async and
@@ -707,7 +721,12 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               ping-pong typed messages over the async Sender/Receiver, each recv
               a genuine reactor park), librheopipe (librheo Phase J: a cross-cell
               stdout pipeline - an orchestrator spawns a producer child that
-              inherits its channel and streams its output back), bench-core, and
+              inherits its channel and streams its output back), gpuhw
+              (real-GPU stage 1, docs/GPU-HARDWARE.md 12: PCIe bridge
+              recursion + BAR sizing/assignment + capability walk + vendor
+              recognition - a real AMD ati-vga, Bochs, virtio-gpu behind a
+              root port; NVIDIA/Intel skip-with-reason - + GPU engine
+              registration), bench-core, and
               the interactive
               lsh bin (+ harness.rs, vfs_personality.rs); fixtures/ holds the
               ext4 test image (+ gen-ext4.sh); linux-fixtures/ holds the

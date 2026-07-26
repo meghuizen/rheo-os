@@ -156,38 +156,58 @@ pub enum Preemption {
 }
 
 /// What the kernel MEASURED for the engine at attach: its kind, its per-op cost
-/// in kernel ticks (a measurement, never a vendor claim), and its preemption
-/// contract.
+/// in kernel ticks (a measurement, never a vendor claim), its preemption
+/// contract, and - for a device engine - its PCI vendor ID (0x10DE NVIDIA,
+/// 0x1002 AMD, 0x8086 Intel, 0x1AF4 virtio; 0 for the CPU). A GPU engine's
+/// measured cost is 0 until a driver cell can execute on it - enumerated
+/// and registered, honestly not benchmarked (docs/GPU-HARDWARE.md 9).
 #[derive(Copy, Clone, Debug)]
 pub struct EngineInfo {
     pub kind: EngineKind,
     pub measured_cost_ticks: u64,
     pub preemption: Preemption,
+    pub vendor: u16,
 }
 
-/// A handle to the compute engine a cell offloads graphs to. Today this is
-/// always the kernel's CPU engine; the same handle names an accelerator later.
+fn decode(raw: sys::EngineInfo) -> EngineInfo {
+    EngineInfo {
+        kind: match raw.kind {
+            0 => EngineKind::Cpu,
+            1 => EngineKind::Gpu,
+            2 => EngineKind::Npu,
+            _ => EngineKind::Other,
+        },
+        measured_cost_ticks: raw.measured_cost_ticks,
+        preemption: if raw.preemption == 0 {
+            Preemption::Instruction
+        } else {
+            Preemption::OpBoundary
+        },
+        vendor: raw.vendor as u16,
+    }
+}
+
+/// A handle to the compute engine a cell offloads graphs to. Engine 0 is
+/// the kernel's CPU engine; the rest are the PCIe-enumerated GPUs.
 pub struct Engine;
 
 impl Engine {
     /// Report the engine's measured throughput + kind + preemption contract
     /// (`SYS_ENGINE_INFO`). "What executor am I on?" answered by measurement.
     pub fn info() -> EngineInfo {
-        let raw = sys::engine_info();
-        EngineInfo {
-            kind: match raw.kind {
-                0 => EngineKind::Cpu,
-                1 => EngineKind::Gpu,
-                2 => EngineKind::Npu,
-                _ => EngineKind::Other,
-            },
-            measured_cost_ticks: raw.measured_cost_ticks,
-            preemption: if raw.preemption == 0 {
-                Preemption::Instruction
-            } else {
-                Preemption::OpBoundary
-            },
-        }
+        decode(sys::engine_info())
+    }
+
+    /// How many engines the kernel registered (CPU + recognised GPUs).
+    pub fn count() -> u64 {
+        sys::engine_count()
+    }
+
+    /// Report engine `index` from the kernel's table, or `None` when the
+    /// index is out of range.
+    pub fn info_at(index: u64) -> Option<EngineInfo> {
+        let (n, raw) = sys::engine_info_at(index);
+        if index < n { Some(decode(raw)) } else { None }
     }
 }
 

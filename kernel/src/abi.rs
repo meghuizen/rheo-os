@@ -181,9 +181,13 @@ pub struct GrantInfo {
 // `OP_GRAPH_SUBMIT`, docs/IO.md 1); engine introspection and reservation
 // admission are plain syscalls.
 
-/// engine_info(out_va) -> 0. Writes an `EngineInfo` describing the CPU compute
-/// engine the kernel runs graphs on: its kind, the throughput MEASURED at
-/// attach (attest-by-measurement, object 4), and its preemption contract.
+/// engine_info(out_va, index) -> engine count. Writes an `EngineInfo` for
+/// engine `index`: index 0 is the CPU engine the kernel runs graphs on
+/// (throughput MEASURED at attach - attest-by-measurement, object 4);
+/// indices beyond it are GPUs enumerated from PCIe (docs/GPU-HARDWARE.md),
+/// registered with their declared op-boundary preemption contract and a
+/// zero measured cost until a driver cell can execute on them. Out-of-range
+/// indices write nothing; the returned count is the enumeration bound.
 pub const SYS_ENGINE_INFO: u64 = 38;
 /// reserve_admit(out_va, budget, period, deadline, mem_floor_pages) -> 0 on
 /// success, else a rejection code (1=BadParams, 2=Overcommit, 3=MemoryFloor).
@@ -307,14 +311,21 @@ pub struct ShareInfo {
 }
 
 /// The `SYS_ENGINE_INFO` result block (kept in sync with librheo's `compute`
-/// arm). `kind`: 0=CPU (the only real engine in QEMU; GPU/NPU are attested-
-/// firmware future work). `preemption`: 0=per-instruction, 1=per-op-boundary.
+/// arm). `kind`: 0=CPU, 1=GPU (enumerated from PCIe - recognised and
+/// registered, executable only via its future driver cell,
+/// docs/GPU-HARDWARE.md 5). `preemption`: 0=per-instruction,
+/// 1=per-op-boundary (the declared accelerator contract). `vendor` is the
+/// PCI vendor ID for a device engine (0x10DE NVIDIA, 0x1002 AMD, 0x8086
+/// Intel, 0x1AF4 virtio), 0 for the CPU. The syscall takes
+/// `(out_va, index)` and returns the engine count; index 0 is always the
+/// CPU engine, so the old single-engine call is unchanged.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct EngineInfo {
     pub kind: u64,
     pub measured_cost_ticks: u64,
     pub preemption: u64,
+    pub vendor: u64,
 }
 
 /// The `SYS_RESERVE_ADMIT` success block (kept in sync with librheo's `sched`

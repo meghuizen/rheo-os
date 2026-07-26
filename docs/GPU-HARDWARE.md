@@ -1,10 +1,16 @@
 # Real GPU Hardware - PCIe, IOMMU, VRAM, and the Contained Driver Cell
 
-**Status:** Draft v0.1. Expands ARCHITECTURE.md objects 4 (engine) and 5
-(memory grant) and the section 5 allowance "queue/IOMMU/reset plumbing";
-makes ACCELERATORS.md 1-2 concrete for physical PCIe GPUs. Relates to
-GRAPHICS.md, DISPLAY.md 12, MEMORY.md 2, AI-ARCHITECTURE.md 3-4, BOOT.md,
-and BUILD-ORDER.md steps 12 and 18.
+**Status:** Building. Section 12 **stage 1 is done** (the `gpuhw` test, all
+three ISAs): PCIe bridge recursion with kernel-programmed bus numbers, BAR
+sizing + opt-in assignment, the capability walk (MSI/MSI-X/PCIe/FLR),
+vendor recognition across the major GPU vendors (`kernel/src/hw/gpu.rs` -
+AMD proven against QEMU's real `ati-vga` device model; NVIDIA/Intel
+recognised by ID, skip-with-reason), and GPU engine registration behind
+`SYS_ENGINE_INFO` enumeration. The rest is design. Expands ARCHITECTURE.md
+objects 4 (engine) and 5 (memory grant) and the section 5 allowance
+"queue/IOMMU/reset plumbing"; makes ACCELERATORS.md 1-2 concrete for
+physical PCIe GPUs. Relates to GRAPHICS.md, DISPLAY.md 12, MEMORY.md 2,
+AI-ARCHITECTURE.md 3-4, BOOT.md, and BUILD-ORDER.md steps 12 and 18.
 
 Position: a real GPU is not a new kind of thing. It is an **engine**
 (object 4) plus **typed memory grants** (object 5) plus the negative
@@ -58,29 +64,35 @@ the tree.
 
 | Claimed (docs) | Built (tree) |
 |---|---|
-| Engines attested + benchmarked at attach (ACCELERATORS.md 1) | One static CPU `Engine` (`svc.rs`), attach = a 4096-iteration integer-Add micro-benchmark (`engine.rs`) |
-| Declared preemption contract | `Preemption::{Instruction, OpBoundary}` declared; `OpBoundary` never produced |
+| Engines attested + benchmarked at attach (ACCELERATORS.md 1) | The CPU `Engine` attach = a 4096-iteration integer-Add micro-benchmark (`engine.rs`); GPU engines register with an honest zero measured cost (no execution path yet) |
+| Declared preemption contract | `Preemption::{Instruction, OpBoundary}` declared; a registered GPU engine declares `OpBoundary` (the accelerator contract) |
 | Graphs execute across engines (object 6) | `graph.rs` runs up to 32 nodes sequentially on one `&Engine`; `SqEntry.engine_id` is in the ABI but read nowhere |
-| GPUs enumerated as engines | `hw/pci.rs` classifies class 0x03/0x02 as `EngineKind::Gpu` (0x12 as `Accelerator`); nothing consumes it except `lspci`; bus 0 only, no bridge recursion; `PciDevice` captures no BARs, no MSI-X |
+| GPUs enumerated as engines | **Stage 1, built:** `hw/pci.rs` recurses bridges (programming secondary bus numbers where firmware left them zero), sizes BARs by the mask probe, walks capabilities (MSI/MSI-X/PCIe/FLR), and offers opt-in BAR assignment (`assign_pci_bars`); `hw/gpu.rs` classifies every display-class function by vendor (NVIDIA/AMD/Intel/virtio/Bochs) into the machine inventory; each recognised GPU registers in the engine table. Proven by the `gpuhw` test on all three ISAs |
 | Every engine DMA mediated and grant-checked (ACCELERATORS.md 1, doctrine 1) | **Zero IOMMU code.** All device DMA is a raw `virt_to_phys` handed to the device (virtio-blk/net/gpu) |
 | Device memory as typed kinds (MEMORY.md 2) | `MemKind::{Hbm, Cxl}` silently DDR-backed; `MemKind::DeviceBar` refused by a literal `kind == 4` check at the syscall boundary (`kernel/src/user.rs`) |
-| Engine introspection | `SYS_ENGINE_INFO` hardcodes `kind = 0` (CPU) |
+| Engine introspection | `SYS_ENGINE_INFO(out_va, index)` enumerates the engine table - the CPU, then every recognised GPU with its PCI vendor ID - and returns the count |
 | A real GPU device round-trip | virtio-gpu 2D driver (`hw/virtio_gpu.rs`, DISPLAY.md 12): kernel-resident, test-installed, synchronous busy-poll, `OP_GPU_PRESENT` is a CPU memcpy into a fixed 128x128 framebuffer |
 
-Two facts in that table are assets, not gaps: the classification already
-lands on `Gpu`, and the queue ABI already carries `engine_id` - the wire
-format needs nothing new for multi-engine routing.
+Two facts in that table were assets from the start: the classification
+already landed on `Gpu`, and the queue ABI already carries `engine_id` -
+the wire format needs nothing new for multi-engine routing. What stage 1
+did NOT change is just as load-bearing: no IOMMU, no VRAM backing, no
+vendor command submission - a recognised NVIDIA/AMD/Intel GPU is
+enumerated, sized, and registered, honestly not driven (sections 4-6 are
+the design for driving one).
 
 ---
 
 ## 3. PCIe for real devices
 
-The virtio drivers deliberately avoid BARs: PVH boot has no firmware to
-program them, and the `VIRTIO_PCI_CAP_PCI_CFG` config-space tunnel made that
-avoidance honest (DISPLAY.md 12). A real GPU ends that option - its
+The virtio drivers deliberately avoid BARs via the `VIRTIO_PCI_CAP_PCI_CFG`
+config-space tunnel (DISPLAY.md 12). A real GPU ends that option - its
 registers, doorbells, and VRAM aperture live behind BARs, and its
-completions arrive by MSI-X. The kernel therefore grows real PCIe plumbing,
-all of it mechanism:
+completions arrive by MSI-X. Who programs BARs turns out to be per-boot
+(measured, stage 1): on x86-64 q35 the `-kernel` loader path runs SeaBIOS,
+which does PCI init before the kernel boots; the bare arm/riscv `virt`
+boots run nobody, and every BAR reads zero. The kernel therefore grows
+real PCIe plumbing that works in both worlds, all of it mechanism:
 
 - **Bridge recursion.** Enumeration walks root ports and switches (today:
   bus 0 only). Each discovered function gets a `PciFunction` record; the
@@ -614,11 +626,20 @@ kernel that CI runs:
 - **Stage 0 (exists):** the virtio-gpu 2D command round-trip
   (`librheogpu`, DISPLAY.md 12) - proves the transport and the queue
   opcode seam.
-- **Stage 1 - PCIe:** bridge recursion, BAR sizing/assignment, capability
-  walks against q35's PCIe hierarchy (root ports + a testdev-class
-  device); a `pcireal` test kernel asserts assigned BARs are readable and
-  MSI-X vectors deliver. arm/riscv `virt` exercise the same code over
-  their PCIe host bridges.
+- **Stage 1 - PCIe (done):** bridge recursion (the kernel programs
+  secondary bus numbers where firmware left them zero), BAR sizing by the
+  mask probe, the capability walk (MSI/MSI-X/PCIe/FLR), opt-in BAR
+  assignment from the per-ISA host-bridge window (`assign_pci_bars` -
+  invisible to every boot that does not call it), vendor recognition
+  (`hw/gpu.rs`), and engine registration. The `gpuhw` test proves it on
+  **all three ISAs** with the same three GPU functions: a real AMD/ATI
+  vendor device (QEMU's `ati-vga`, 0x1002 - a 16 MiB framebuffer aperture
+  and a 16 KiB register window, sized by the probe), a Bochs display, and
+  a virtio-gpu placed *behind* a `pcie-root-port` - reachable only through
+  the kernel's own bridge programming. On arm/riscv the kernel assigns 6
+  BARs and reads them back; on x86 SeaBIOS got there first and the
+  read-back proves agreement. MSI-X *routing* (vectors to vcores) is not
+  in stage 1; only capability presence is recorded.
 - **Stage 2 - IOMMU:** domains + the grant-to-mapping path + fault events
   against `intel-iommu` (x86-64) and `smmuv3` (ARM64), both already on
   the DEVELOPMENT.md launch lines; an `iommu` test kernel proves a device
@@ -645,7 +666,7 @@ proof this design has.
 
 | Capability | QEMU-provable (model) | Lab-gated | Per-ISA notes |
 |---|---|---|---|
-| PCIe walk, BAR assign, MSI-X | yes (q35 hierarchy; virt PCIe bridge) | timing only | all three ISAs |
+| PCIe walk, BAR assign, vendor recognition | **proven** (`gpuhw`: ati-vga + bochs + virtio behind a root port) | timing only | all three ISAs |
 | IOMMU domains, out-of-grant fault | yes (`intel-iommu`, `smmuv3`) | ATS/PRI | **riscv skip-with-reason: no QEMU IOMMU model** |
 | Driver-cell BAR containment | yes (stage 3, virtio-gpu re-homed) | vendor blob | all three ISAs |
 | VRAM (`Hbm`) real backing | no VRAM device model - honest DDR stand-in, labeled | yes | - |

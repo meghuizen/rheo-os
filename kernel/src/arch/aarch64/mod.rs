@@ -599,6 +599,13 @@ pub fn pci_cfg_write32(ecam: u64, bus: u8, dev: u8, func: u8, off: u16, val: u32
     unsafe { (phys_to_virt(a as usize) as *mut u32).write_volatile(val) }
 }
 
+/// The host bridge's 32-bit MMIO window for BAR assignment
+/// (docs/GPU-HARDWARE.md 3). QEMU `virt` puts PCIe MMIO at
+/// 0x1000_0000..0x3EFF_0000 (below the 0x3F00_0000 ECAM).
+pub fn pci_mmio_window() -> (u64, u64) {
+    (0x1000_0000, 0x2E00_0000)
+}
+
 // -------------------------------------------------------------- user mode
 
 /// Saved EL0 register state. Layout matches the offsets in vectors.S:

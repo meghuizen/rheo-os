@@ -227,6 +227,14 @@ path = "src/linuxunix.rs"
 name = "linuxinet"
 path = "src/linuxinet.rs"
 
+# Real-GPU hardware plumbing (docs/GPU-HARDWARE.md 3, 12 stage 1): PCIe
+# bridge recursion + BAR sizing/assignment + capability walk + vendor
+# recognition (AMD real via QEMU's ati-vga; NVIDIA/Intel skip-with-reason)
+# + GPU engine registration.
+[[bin]]
+name = "gpuhw"
+path = "src/gpuhw.rs"
+
 [[bin]]
 name = "smp"
 path = "src/smp.rs"

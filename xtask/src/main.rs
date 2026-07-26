@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 45] = [
+const TEST_KERNELS: [&str; 46] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -67,6 +67,7 @@ const TEST_KERNELS: [&str; 45] = [
     "netsmoltcp",
     "linuxunix",
     "linuxinet",
+    "gpuhw",
 ];
 
 /// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
@@ -238,6 +239,23 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "virtio-gpu-device",
         ],
         ("librheogpu", Arch::X86_64) => &["-device", "virtio-gpu-pci,disable-legacy=on"],
+        // gpuhw (docs/GPU-HARDWARE.md 3, 12 stage 1): the same three GPU
+        // functions on every ISA - a real AMD/ATI vendor device (ati-vga,
+        // 0x1002), the Bochs display (0x1234), and a virtio-gpu placed
+        // BEHIND a pcie-root-port, reachable only if enumeration programs
+        // the bridge's secondary bus (PVH boots have no firmware to do it).
+        // NVIDIA/Intel have no QEMU GPU model - the kernel prints their
+        // skip-with-reason lines and the test asserts their absence.
+        ("gpuhw", _) => &[
+            "-device",
+            "pcie-root-port,id=rp1,chassis=1,slot=1",
+            "-device",
+            "virtio-gpu-pci,bus=rp1,disable-legacy=on",
+            "-device",
+            "ati-vga",
+            "-device",
+            "bochs-display",
+        ],
         // pmem (docs/MEMORY.md real-PMEM path): a real QEMU nvdimm whose
         // persistent span the kernel discovers via the ACPI NFIT and backs a
         // `MemKind::Pmem` grant with. Only x86-64 q35 exposes one here: the
