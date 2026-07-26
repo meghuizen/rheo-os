@@ -219,6 +219,47 @@ are cheap relative to the engineering already done, and the EU
 regulatory framing EuroOS targets (CRA) will apply to any OS shipped
 into that market.
 
+## Case study: the two RNG implementations
+
+A close-up on one subsystem both projects built carefully, because they
+made opposite choices on almost every axis. Sources: `kernel/src/rng/`
+here; EuroOS `kernel/src/entropy.rs` + `crates/euroentropy` (read
+2026-07-26).
+
+| Axis | rheo-os | EuroOS |
+|---|---|---|
+| Generator | ChaCha20 DRBG, fast key erasure (Linux-CRNG-style) | HMAC-DRBG with SHA-256 (SP 800-90A) |
+| Entropy sources | Hardware RNG: RDSEED/RDRAND (x86), RNDR (ARM64); none reachable on RISC-V S-mode | CPU timing jitter (RDTSC deltas) + TPM 2.0 RNG; deliberately no RDRAND/RDSEED |
+| Source vetting | SP 800-90B-style health tests on the raw words (repetition count, adaptive proportion, stuck-at) | No health tests on the raw source; conservative crediting instead (1/4 bit per noisy jitter delta) + SHA-256 conditioning |
+| Unseeded behavior | Never blocks: falls back to a cycle-counter floor, records `SeedSource::Fallback`; the *design* says such a host fails attestation | Hard gate: `fill()` refuses to emit a single byte until 256 credited bits arrive |
+| State architecture | Root DRBG -> derived per-cell DRBGs; random bytes are a library call over the cell's own state, no lock, no syscall (primitive proven on host; the lsh builtin still draws via `SYS_RANDOM` until the `.user` heap lands) | One global pool behind a kernel mutex; `getrandom` is kernel-internal (consumers: FDE, TPM sealing, ML-KEM keygen) |
+| Forward secrecy | Explicit fast key erasure per refill + volatile wipe of the old key | SP 800-90A state update gives backtracking resistance; no explicit zeroization |
+| Reseeding | `reseed_root()` folds fresh hwrng entropy through health tests; restore-always-reseeds is a design rule | `reseed()` on new noise arrival; counter tracked, no interval enforced |
+| Verification | ChaCha20 core checked against the RFC 8439 vector; `rng` test kernel on 3 ISAs; host benchmark vs Linux getrandom (comparison/rng/) | HMAC vs RFC 4231, NIST ACVP known-answer tests, host tests incl. determinism and blocking-gate checks |
+| Performance | ~110 cycles per 32-byte draw, ~610 MB/s scalar (measured, 4.8x faster than Linux `getrandom` on small draws) | Unmeasured; HMAC-DRBG costs several SHA-256 compressions per 32-byte block - the cost profile Linux left behind when its CRNG moved to ChaCha20 |
+
+What EuroOS could take: the ChaCha20 fast-key-erasure output stage
+(keep HMAC-DRBG for conditioning if the NIST paper trail matters -
+that is exactly Linux's split), per-consumer derived states instead of
+one mutex-guarded pool, continuous health tests on the running noise
+source, explicit zeroization, and mixing RDSEED in as one input -
+distrusting an opaque vendor RNG argues for not relying on it *alone*,
+never for discarding free entropy, since mixing into a pool cannot
+reduce it.
+
+What rheo-os could take - and this is the strongest EuroOS-to-rheo
+lesson in this whole document: **jitter entropy with conservative
+crediting is the real fix for the no-hwrng fallback.** The RISC-V
+S-mode path today seeds from a cycle-counter loop that is flagged in
+the code as deterministic under QEMU icount - a structural floor, not
+entropy - and TIME-IDENTITY.md already says such a board needs a
+genuine jitter source. EuroOS built exactly that, host-tested, with
+under-crediting (1/4 bit per noisy sample) and a hard refuse-until-
+threshold gate. The gate semantics are worth copying too: recording
+`SeedSource::Fallback` for attestation is honest, but locally refusing
+to emit key material from a known-weak seed is stronger than labeling
+it. TPM RNG as a supplementary source rounds out the same lesson.
+
 ## A measured comparison is possible
 
 EuroOS boots headless in QEMU x86-64 with a scripted test entry point
