@@ -43,9 +43,10 @@ per-cell state (a fixed static table), and every commit/decommit/seal is
 grant-checked (MAP right). **DDR is always backed for real**, and **PMEM is now
 real where the platform exposes an nvdimm** (see section 2.1); HBM/CXL/remote
 have no QEMU device model and stay honestly DDR-emulated; device-BAR has no
-backing and is refused. NUMA placement is single-node here (the hint is
-recorded, not acted on). See docs/LIBRHEO.md Phase B and librheo's `mem`
-module (`Grant`/`Arena`/`Mapping`).
+backing and is refused (real backing design: GPU-HARDWARE.md 5-6). NUMA
+placement is single-node here (the hint is recorded, not acted on). See
+docs/LIBRHEO.md Phase B and librheo's `mem` module
+(`Grant`/`Arena`/`Mapping`).
 
 ## 2.1 Real persistent memory (PMEM), where tractable
 

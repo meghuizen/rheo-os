@@ -20,9 +20,13 @@ pub const SYS_DOORBELL: u64 = 1;
 /// (docs/LIBRHEO.md Phase E): the producer submits then switches so the consumer
 /// runs, and vice-versa. Resumes the caller where it last switched.
 pub const SYS_SWITCH: u64 = 2;
+/// Monotonic cycle counter (see `cycles`).
+pub const SYS_CYCLES: u64 = 4;
 /// Next per-cell random u64 (the kernel DRBG; used once to seed librheo's own
 /// DRBG at startup - see `rng`).
 pub const SYS_RANDOM: u64 = 8;
+/// cpuinfo(out_va) -> 0; fills a `CpuFeatures` at `out_va` (see `cpu_features`).
+pub const SYS_CPUINFO: u64 = 17;
 /// mmap_anon(len) -> base VA of `len` zeroed RW bytes (0 fails).
 pub const SYS_MMAP: u64 = 21;
 /// exit_group(code): leave U-mode.
@@ -278,15 +282,39 @@ pub fn mmap_file(fd: u64, offset: u64, len: usize, flags: u64) -> usize {
 /// Read the CPU engine's introspection block (kind + measured throughput +
 /// preemption contract). See `compute::Engine::info`.
 pub fn engine_info() -> EngineInfo {
+    engine_info_at(0).1
+}
+
+/// Read engine `index` from the kernel's engine table (0 = CPU, then the
+/// PCIe-enumerated GPUs; docs/GPU-HARDWARE.md 9). Returns
+/// `(engine_count, info)`; for an out-of-range index the info block is
+/// zeroed and only the count is meaningful.
+pub fn engine_info_at(index: u64) -> (u64, EngineInfo) {
     let mut info = EngineInfo {
         kind: 0,
         measured_cost_ticks: 0,
         preemption: 0,
+        vendor: 0,
+    };
+    let n = unsafe { syscall2(SYS_ENGINE_INFO, &mut info as *mut EngineInfo as u64, index) };
+    (n, info)
+}
+
+/// Number of engines the kernel has registered (CPU + recognised GPUs).
+pub fn engine_count() -> u64 {
+    let mut info = EngineInfo {
+        kind: 0,
+        measured_cost_ticks: 0,
+        preemption: 0,
+        vendor: 0,
     };
     unsafe {
-        syscall1(SYS_ENGINE_INFO, &mut info as *mut EngineInfo as u64);
+        syscall2(
+            SYS_ENGINE_INFO,
+            &mut info as *mut EngineInfo as u64,
+            u64::MAX,
+        )
     }
-    info
 }
 /// Admit a reservation. Fills a `ReserveInfo` at `out_va` on success; returns
 /// 0 or a rejection code (1=BadParams, 2=Overcommit, 3=MemoryFloor).
@@ -414,6 +442,41 @@ pub fn uptime() -> u64 {
 pub fn random_u64() -> u64 {
     unsafe { syscall1(SYS_RANDOM, 0) }
 }
+/// Monotonic cycle counter (raw ticks) for in-cell micro-benchmarks (the SIMD
+/// probe times tiers with this). Under QEMU icount this is not wall-clock, so
+/// it is honest only for relative ordering on real hardware (docs/TILES.md 4).
+pub fn cycles() -> u64 {
+    unsafe { syscall1(SYS_CYCLES, 0) }
+}
+
+/// This cell's CPU feature report (docs/TILES.md 4): the raw CPUID bitmask, the
+/// portable `SIMD_*` tier mask of kernel-enabled+validated widths, and the
+/// vendor string. The `tile::simd` probe reads `simd` to choose its dispatch.
+pub fn cpu_features() -> CpuFeatures {
+    let mut f = CpuFeatures {
+        features: 0,
+        simd: 0,
+        vendor: [0; 16],
+    };
+    unsafe { syscall1(SYS_CPUINFO, &mut f as *mut CpuFeatures as u64) };
+    f
+}
+
+/// The `SYS_CPUINFO(out_va)` result block (kernel/src/abi.rs `CpuFeatures`).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CpuFeatures {
+    pub features: u64,
+    pub simd: u64,
+    pub vendor: [u8; 16],
+}
+
+/// Portable SIMD-tier bits in `CpuFeatures::simd` (kernel/src/abi.rs).
+pub const SIMD_SSE2: u64 = 1 << 0;
+pub const SIMD_AVX2: u64 = 1 << 1;
+pub const SIMD_AVX512F: u64 = 1 << 2;
+pub const SIMD_AVX512VNNI: u64 = 1 << 3;
+pub const SIMD_NEON: u64 = 1 << 4;
 /// Block until at least one console input byte is available; copy up to `len`
 /// bytes into `buf` and return the count (0 = end of input). The kernel idles
 /// (WFI where the UART RX interrupt is wired, poll otherwise) while blocked.
@@ -528,12 +591,15 @@ pub struct ShareInfo {
 }
 
 /// The `SYS_ENGINE_INFO` result block (kernel/src/abi.rs `EngineInfo`).
+/// `kind`: 0=CPU, 1=GPU; `vendor` is the PCI vendor ID for a device engine
+/// (0 for the CPU).
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct EngineInfo {
     pub kind: u64,
     pub measured_cost_ticks: u64,
     pub preemption: u64,
+    pub vendor: u64,
 }
 
 /// The `SYS_RESERVE_ADMIT` success block (kernel/src/abi.rs `ReserveInfo`).
@@ -559,6 +625,40 @@ pub struct GraphNode {
     pub b: u64,
 }
 const _: () = assert!(core::mem::size_of::<GraphNode>() == 32);
+
+/// Graph-node op 4 (BufReduce) descriptor (kernel/src/abi.rs, docs/TILES.md
+/// 6): `node.a` = the cell VA of this struct; the engine returns the
+/// wrapping u64 sum. dtype: 0=I8, 1=U8, 2=I32.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct BufReduceDesc {
+    pub va: u64,
+    pub elems: u64,
+    pub dtype: u32,
+    pub _pad: u32,
+}
+const _: () = assert!(core::mem::size_of::<BufReduceDesc>() == 24);
+
+/// Graph-node op 5 (TileGemm) descriptor (kernel/src/abi.rs, docs/TILES.md
+/// 6): the engine zeroes C, runs the int8->i32 GEMM whole, and returns the
+/// FNV-1a receipt of C's logical window. Strides in elements. Kernel caps:
+/// `1 <= m,n,k <= 256`, strides >= dims, dtypes exactly (I8=0, I32=2).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct TileGemmDesc {
+    pub a_va: u64,
+    pub b_va: u64,
+    pub c_va: u64,
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub a_stride: u32,
+    pub b_stride: u32,
+    pub c_stride: u32,
+    pub dtype_in: u32,
+    pub dtype_acc: u32,
+}
+const _: () = assert!(core::mem::size_of::<TileGemmDesc>() == 56);
 
 /// A submission entry - 64 bytes, one cache line.
 #[repr(C, align(64))]

@@ -22,13 +22,22 @@ static mut ADMISSION: Admission = Admission::new();
 static mut ENGINE: Engine = Engine::cpu();
 static mut READY: bool = false;
 
-/// One-time init: seed the per-cell DRBG and attach (measure) the engine.
+/// One-time init: seed the per-cell DRBG and attach (measure) the CPU
+/// engine. GPU engines need no registration step - the engine table IS the
+/// hardware inventory (engine 0 = the CPU, then every recognised GPU),
+/// read live at query time, so a later `gpu_attach_measure` is reflected
+/// without a refresh (docs/GPU-HARDWARE.md 9).
 pub fn init() {
     unsafe {
         *core::ptr::addr_of_mut!(DRBG) = rng::derive_cell_drbg();
         (*core::ptr::addr_of_mut!(ENGINE)).attach();
         *core::ptr::addr_of_mut!(READY) = true;
     }
+}
+
+/// Engine count: the CPU plus every recognised GPU. For the test kernels.
+pub fn engine_count() -> usize {
+    1 + crate::hw::inventory().ngpu
 }
 
 fn events() -> &'static mut EventStream {
@@ -72,26 +81,67 @@ pub fn handle(nr: u64, args: &[u64; 6]) -> Option<u64> {
             Some(lease.token)
         }
         SYS_ENGINE_INFO => {
-            // Engine introspection (docs/LIBRHEO.md Phase C, object 4): report the
-            // CPU engine's kind, attach-time MEASURED cost, and preemption contract.
-            let engine = unsafe { &*core::ptr::addr_of!(ENGINE) };
-            let info = EngineInfo {
-                kind: 0, // CPU (the only real engine here)
-                measured_cost_ticks: engine.measured_cost_ticks(),
-                preemption: match engine.preemption {
-                    crate::engine::Preemption::Instruction => 0,
-                    crate::engine::Preemption::OpBoundary => 1,
-                },
+            // Engine introspection (docs/LIBRHEO.md Phase C, object 4;
+            // docs/GPU-HARDWARE.md 9): report engine `args[1]` - index 0 is
+            // the CPU engine, then every PCIe-recognised GPU straight from
+            // the hardware inventory - and return the engine count so a
+            // cell can enumerate. A GPU's measured cost is the aperture
+            // transport measurement `gpu_attach_measure` recorded (0 =
+            // unmeasured); its preemption is the declared accelerator
+            // contract (op boundary).
+            let idx = args[1] as usize;
+            let inv = crate::hw::inventory();
+            let n = 1 + inv.ngpu;
+            let info = if idx == 0 {
+                let engine = unsafe { &*core::ptr::addr_of!(ENGINE) };
+                Some(EngineInfo {
+                    kind: 0,
+                    measured_cost_ticks: engine.measured_cost_ticks(),
+                    preemption: match engine.preemption {
+                        crate::engine::Preemption::Instruction => 0,
+                        crate::engine::Preemption::OpBoundary => 1,
+                    },
+                    vendor: 0,
+                })
+            } else if idx < n {
+                let g = &inv.gpus[idx - 1];
+                Some(EngineInfo {
+                    kind: 1,
+                    measured_cost_ticks: g.measured_cost_ticks,
+                    preemption: 1,
+                    vendor: g.vendor_id as u64,
+                })
+            } else {
+                None
             };
-            // SAFETY: `arg` is a user VA in the running cell's active address
-            // space, sized for an `EngineInfo` (the cell passes its own slot).
-            unsafe {
-                (arg as *mut EngineInfo).write(info);
+            if let Some(info) = info {
+                // SAFETY: `arg` is a user VA in the running cell's active
+                // address space, sized for an `EngineInfo` (the cell passes
+                // its own slot).
+                unsafe {
+                    (arg as *mut EngineInfo).write(info);
+                }
             }
-            Some(0)
+            Some(n as u64)
         }
         SYS_CPUINFO => {
-            print_cpuinfo();
+            // out_va == 0: print for the shell. out_va != 0: write a
+            // machine-readable CpuFeatures a cell reads to pick its SIMD path
+            // (docs/TILES.md 4). Mechanism only - exposes the discovered CPU
+            // report + the FP widths the kernel validated at boot.
+            if arg == 0 {
+                print_cpuinfo();
+            } else {
+                let inv = crate::hw::inventory();
+                let feats = crate::abi::CpuFeatures {
+                    features: inv.cpu.features,
+                    simd: crate::arch::fp_simd_tiers(),
+                    vendor: inv.cpu.vendor,
+                };
+                // SAFETY: `arg` is a writable VA in the calling cell; the cell
+                // provides a buffer of at least size_of::<CpuFeatures>().
+                unsafe { (arg as *mut crate::abi::CpuFeatures).write(feats) };
+            }
             Some(0)
         }
         SYS_LSPCI => {
@@ -439,6 +489,44 @@ pub fn graph_submit(nodes_va: u64, count: u32, results_va: u64) -> (u32, u32) {
             1 => Op::Add,
             2 => Op::Mul,
             3 => Op::Select,
+            // The buffer-carrying tile ops (docs/TILES.md 6): node.a is the
+            // cell VA of a #[repr(C)] descriptor - the same trust contract
+            // as `nodes_va` itself - validated here with hard caps; any
+            // violation completes STATUS_DENIED, never a fault.
+            4 => {
+                if node.a_is_node != 0 || node.a == 0 {
+                    return (STATUS_DENIED, 0);
+                }
+                // SAFETY: `node.a` is the cell's mapped descriptor buffer.
+                let d = unsafe { (node.a as *const BufReduceDesc).read_unaligned() };
+                if d.va == 0 || d.elems == 0 || d.elems > (1 << 20) || d.dtype > 2 {
+                    return (STATUS_DENIED, 0);
+                }
+                Op::BufReduce(d)
+            }
+            5 => {
+                if node.a_is_node != 0 || node.a == 0 {
+                    return (STATUS_DENIED, 0);
+                }
+                // SAFETY: `node.a` is the cell's mapped descriptor buffer.
+                let d = unsafe { (node.a as *const TileGemmDesc).read_unaligned() };
+                let dims_ok = (1..=256).contains(&d.m)
+                    && (1..=256).contains(&d.n)
+                    && (1..=256).contains(&d.k);
+                let strides_ok = d.a_stride >= d.k && d.b_stride >= d.n && d.c_stride >= d.n;
+                if d.a_va == 0
+                    || d.b_va == 0
+                    || d.c_va == 0
+                    || !dims_ok
+                    || !strides_ok
+                    || d.dtype_in != 0 // I8 in ...
+                    || d.dtype_acc != 2
+                // ... i32 accumulate, exactly
+                {
+                    return (STATUS_DENIED, 0);
+                }
+                Op::TileGemm(d)
+            }
             _ => return (STATUS_BAD_OPCODE, 0),
         };
         let a = wire_input(node.a_is_node, node.a);

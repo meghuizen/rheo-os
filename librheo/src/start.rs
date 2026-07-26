@@ -11,12 +11,36 @@ unsafe extern "C" {
     fn main() -> i32;
 }
 
+// x86-64: the SysV ABI enters `_start` with RSP **16-byte aligned** (pointing
+// at argc), but a compiled C function assumes the 8-byte-offset alignment of a
+// post-`CALL` stack. A hard-float cell spills SSE registers with `movaps`,
+// which faults (`#GP`) on a misaligned address - invisible while the cell was
+// soft-float. This asm entry aligns RSP and `call`s the Rust body, so it sees
+// the alignment the compiler assumed. The initial-stack pointer is already in
+// RDI (the kernel's arg0), untouched here. ARM64/RISC-V put the return address
+// in a register (no `CALL` push) and keep SP 16-aligned, so they enter the Rust
+// body directly.
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    ".global _start",
+    "_start:",
+    "and rsp, -16",
+    "call {start_rust}",
+    start_rust = sym start_rust,
+);
+
+#[cfg(not(target_arch = "x86_64"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(arg: u64) -> ! {
+    start_rust(arg)
+}
+
+/// The Rust crt0 body. `arg` is the initial-stack pointer (the SysV `argc`
+/// block) the kernel entered with (docs/LIBRHEO.md Phase F); 0 for a top cell
+/// with no arguments.
+extern "C" fn start_rust(arg: u64) -> ! {
     // SAFETY: runs once at process start, before any allocation, on a fresh
-    // stack the kernel set up; `main` is provided by the linked program. `arg`
-    // is the initial-stack pointer (the SysV `argc` block) the kernel entered
-    // with (docs/LIBRHEO.md Phase F); 0 for a top cell with no arguments.
+    // stack the kernel set up; `main` is provided by the linked program.
     unsafe {
         mem::init_heap();
         rt::set_args(arg);

@@ -55,6 +55,8 @@ pub mod store;
 #[cfg(feature = "full")]
 pub mod term;
 #[cfg(feature = "full")]
+pub mod tile;
+#[cfg(feature = "full")]
 pub mod time;
 
 #[panic_handler]

@@ -56,7 +56,53 @@ split at node boundaries), and PCIe enumeration through the ECAM/config
 space, classifying each function into an engine kind - GPU, NIC, NVMe, or a
 processing accelerator (NPU/TPU, PCI base class 0x12). The `hwinfo` test
 kernel asserts the basics on all three ISAs; `cargo xtask run --bin hwinfo`
-prints the full inventory.
+prints the full inventory. **Real-GPU stage 1 is done** (docs/GPU-HARDWARE.md
+12): PCIe enumeration now recurses bridges (programming secondary bus numbers
+where firmware left them zero - the bare arm/riscv boots have no firmware to
+do it; x86 q35's `-kernel` path runs SeaBIOS, which got there first), sizes
+every BAR by the mask probe, walks the capability list (MSI/MSI-X/PCIe/FLR),
+and offers opt-in BAR assignment from a per-ISA host-bridge window
+(`hw::assign_pci_bars`, invisible to boots that skip it); `kernel/src/hw/gpu.rs`
+recognises every display-class function by vendor (NVIDIA, AMD, Intel, virtio,
+Bochs, Cirrus, VMware, Red Hat/QXL) AND silicon family (NVIDIA
+Pascal/Turing/Ampere/Ada/Hopper/Blackwell, AMD GCN/RDNA/CDNA, Intel Xe) into
+the inventory, resolves a per-vendor driver front-end (`vendor_driver`
+declaring each vendor's lowering path per ACCELERATORS.md 4), drives **every
+GPU QEMU models** (AMD/Bochs/Cirrus/VMware/QXL via a framebuffer-aperture
+write+read-back, virtio-gpu via its 2D command driver - six vendors on
+x86-64, four on arm/riscv where VMware+QXL are x86-only), and each registers
+in the engine table behind `SYS_ENGINE_INFO(out_va, index)` enumeration (kind + PCI
+vendor ID + declared op-boundary preemption, an honest zero measured cost -
+recognised and registered, not yet driven). The `gpuhw` test proves it on all
+three ISAs against QEMU's real `ati-vga` (AMD, 0x1002), a Bochs display, and
+a virtio-gpu behind a `pcie-root-port`; NVIDIA/Intel have no QEMU device
+model and report skip-with-reason. The stage closes with the tree's first
+real vendor-GPU MMIO: the AMD framebuffer aperture mapped via
+`arch::mmio_map_window` (a second x86-64 fixed window beside the pmem one;
+the missing 1..2 GiB gigapage on RISC-V; `phys_to_virt` on ARM64), written
+through and read back on all three ISAs; plus opt-in **attach measurement**
+(`hw::gpu_attach_measure`: ticks/KiB streamed through each aperture - a
+transport measurement, reported live by `SYS_ENGINE_INFO`) and a **real Bochs
+2D modeset** (`hw/gpu.rs::bochs_modeset` over the DISPI/VBE interface:
+640x480x32 + LFB, framebuffer render + pixel read-back on all three ISAs),
+so every GPU device model QEMU has is genuinely driven - virtio-gpu by the
+Phase H 2D driver, AMD through its framebuffer aperture, Bochs by a working
+2D modeset. **Real-GPU stage 2 (the IOMMU) is done on x86-64 AND ARM64**
+(docs/GPU-HARDWARE.md 4, BUILD-ORDER step 12): two backends, both proven by
+the `iommu` test with a real device (virtio-blk negotiating
+`VIRTIO_F_ACCESS_PLATFORM`) - a read succeeds through an identity domain,
+then FAULTS once the domain is revoked. **x86-64 VT-d**
+(`kernel/src/hw/iommu.rs`): DMAR-discovered register base, root/context/
+second-level page tables, queued invalidation (QEMU's caching-mode IOMMU
+only tears down device shadow mappings via QI), fault read from the
+fault-recording register. **ARM64 SMMUv3** (`kernel/src/hw/smmuv3.rs`):
+linear stream table + Context Descriptor + LPAE stage-1 page tables (QEMU
+models stage-1 only), a command queue for STE/TLB invalidation, fault read
+from the event queue. (Fixing this also fixed a real latent bug: the
+virtio-blk PCI path passed a hardcoded 0 ECAM base to the config accessor,
+which x86 ignores but ARM/RISC-V use as the MMIO base - so virtio-blk-pci
+never worked on ARM; now it uses the discovered ECAM base.) RISC-V
+skips-with-reason (no QEMU IOMMU model in 8.2).
 
 The **strand runtime** (`runtime/`, BUILD-ORDER.md step 7,
 docs/CONCURRENCY.md) is the userspace library that brings native async and
@@ -149,8 +195,10 @@ soft-float) build std via a repo-held, idempotent rust-src patch
 routes rheo to the single-threaded portable fallbacks (SMP deferred) with real
 rheo arms for the heap (a hole-list allocator over `SYS_MMAP`), non-blocking
 `stdio` (fds over the M2 syscalls), and `process::exit` (`SYS_EXIT_GROUP`); a
-crt0 (`rheo-rt`) provides `_start`. Float-heavy programs await U-mode FP/SIMD
-enablement. Also built
+crt0 (`rheo-rt`) provides `_start`. The `rheo_os-*` std targets stay soft-float
+(the kernel now enables U-mode FP/SIMD and saves it across switches, and
+**librheo** cells build hard-float - see the tile framework below; flipping the
+std targets to hard-float is a follow-on). Also built
 alongside as an M4-prep workload: **rheo-json** (`json/`), a dependency-free
 zero-copy JSON parser that runs on the OS and is benchmarked against simdjson
 (docs/JSON.md).
@@ -951,6 +999,51 @@ concurrent timer waiters in one cell (the reactor still has one timer slot - a p
 limit), and byte-rate admission. Wall-clock throughput/jitter remain hardware-lab
 numbers; only integer state and icount are reported here.
 
+A **unified tile framework** (`librheo/src/tile/`, docs/TILES.md) makes
+tile-centric compute (the TileLang/cuTile/Triton direction; SME/AMX; NPU/TPU
+systolic; FPGA) a **library discipline over existing kernel objects** - one
+tile program, every engine, **zero new kernel objects/verbs**. A tile is shape
+x dtype x memory space; a `TileBuf<D>` is a dtype-tagged buffer over a memory
+grant (object 5); a `TileProgram` is built once and lowered per engine - the
+`CpuExecutor` runs it strand-parallel in the cell (scalar inner kernels, yield
+at every tile-loop back-edge), and the **`EngineExecutor` lowers the SAME
+program to dependency-graph nodes** (object 6) for the kernel's CPU engine now
+and device engines when their driver cells exist (`EngineUnavailable`, never
+faked). The kernel slice is **two graph-node op codes** inside the existing
+`OP_GRAPH_SUBMIT` payload (the LIBRHEO.md Phase C buffer-node step): op 4
+BufReduce (wrapping sum) and op 5 TileGemm (bounded int8->i32 GEMM, FNV
+receipt), each carrying a `#[repr(C)]` descriptor's cell VA (validated with
+hard caps -> `STATUS_DENIED`, never a fault); the engine executes them via a
+`#[path]` source-include of librheo's dependency-free tile kernels (shared
+verbatim with bench-core and the host comparison). The **dtype matrix** covers
+every quantization size - native I8/U8/I32/F32 (computed directly) plus
+storage F16/Bf16/FP8 E4M3/FP8 E5M2/TF32/int4-block (bit-exact soft-float-safe
+conversions; MMA *over* a storage dtype is a compile error until a device
+lowers it). A **deterministic `TileSim`** counts work + traffic (never timing);
+its bytes-staged ordering is validated against host wall-clock in
+`comparison/tiles` (both rank tilings `[256,128,64,32,16]`). The `librheotile`
+test proves the framework (tiled GEMM bit-exact vs a naive reference, sim
+determinism, contracts, the full dtype round-trip, CpuExecutor == kernel-engine
+receipts) and `librheotilebattle` the production-shaped battle tier (scaled
+7B-class layer GEMMs, an attention block, paged-KV prefix sharing, the
+librheodata columnar reduce as tiles, a 100-run soak, boundary shapes, a
+64-deep pipeline fence) - both on **all three ISAs**; `p6_*` benches report the
+per-tile-op path lengths. **In-cell SIMD now runs**: librheo cells build
+hard-float (SSE2/NEON/F+D baseline), the kernel enables AVX/AVX-512 for U-mode
+on CPUID and saves/restores vector state across cell switches with XSAVE (the
+kernel stays soft-float), and `tile::simd` runtime-dispatches the GEMM after a
+boot probe (functionality-checks each tier bit-exact vs scalar, benchmarks,
+picks the fastest, scalar fallback) - `librheotile` asserts the AVX2 kernel ran
+bit-exact on-OS. Honest: QEMU TCG exposes AVX2 but not AVX-512 (so AVX-512/VNNI
+light up only on real hardware, host-proven in comparison/tiles) and models no
+SIMD speedup (so under emulation the probe's benchmark may keep scalar - the
+selection adapts to the real host); pipelining is cooperative interleaving (SMP
+#27); device engines are enumerated, not executing. The battle tier surfaced two real
+latent fixes - a grant-slot leak on `SYS_MUNMAP` (freed frames but not the
+per-cell table slot) and an f16-subnormal rounding bug - and the per-cell
+grant table (16->64) and object table (128->512) caps were raised for
+real-workload headroom, both flagged in docs/TILES.md 12.
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
 proofs, and the hardware-lab performance numbers. **SMP** (docs/SMP.md,
@@ -1141,6 +1234,28 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               deadlines, and kernel-side the arbiter's continuous-re-arm property -
               40 pacer deadlines with an RTO + a cell sleep outstanding throughout,
               none lost; docs/NETSTACK.md 21),
+              gpuhw
+              (real-GPU stage 1, docs/GPU-HARDWARE.md 12: PCIe bridge
+              recursion + BAR sizing/assignment + capability walk + vendor
+              recognition + driving every GPU QEMU models: AMD ati-vga,
+              Bochs, Cirrus, VMware, QXL by framebuffer-aperture write+read-
+              back and virtio-gpu (behind a root port) by its 2D driver - six
+              vendors x86, four arm/riscv; NVIDIA/Intel skip-with-reason - +
+              GPU engine registration), iommu (real-GPU stage 2, docs/GPU-HARDWARE.md
+              4/12 + BUILD-ORDER step 12: DMA remapping proven with a real
+              virtio-blk DMA that is mediated by an identity domain then
+              FAULTS when the domain is revoked - x86-64 via VT-d
+              (intel-iommu: root/context/second-level + queued invalidation)
+              and ARM64 via SMMUv3 (smmuv3: stream table + Context Descriptor
+              + LPAE stage-1 + command/event queues); riscv skip-with-reason,
+              no QEMU IOMMU model), librheotile (the tile framework,
+              docs/TILES.md: TileBuf/TileProgram/CpuExecutor + the graph
+              lowering, a tiled int8 GEMM bit-exact vs a naive reference, the
+              deterministic TileSim, and the full dtype matrix - F16/Bf16/FP8
+              E4M3+E5M2/TF32/int4 round-trips), librheotilebattle (the tile
+              battle tier: scaled 7B-class GEMMs, an attention block, paged-KV
+              prefix sharing, the columnar reduce, soak + boundary + pipeline
+              stress),
               bench-core, and the interactive
               lsh bin (+ harness.rs, vfs_personality.rs, inet_personality.rs -
               the N4b remote-INET datapath registered as svc::SocketOps);

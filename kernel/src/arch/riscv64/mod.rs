@@ -10,12 +10,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 #[path = "../linux_abi_generic.rs"]
 pub mod linux_abi;
 mod paging;
-pub use paging::pmem_map_window;
 pub use paging::{
     PagingRoot, paging_activate, paging_activate_kernel, paging_for_each_user_leaf,
     paging_kernel_init, paging_map, paging_map_frame, paging_new_root, paging_protect,
     paging_unmap_frame,
 };
+pub use paging::{mmio_map_window, pmem_map_window};
 
 /// `uname` machine string for the Linux personality (docs/LINUX-COMPAT.md L2).
 pub const LINUX_UNAME_MACHINE: &str = "riscv64";
@@ -736,6 +736,13 @@ pub fn pci_cfg_write32(ecam: u64, bus: u8, dev: u8, func: u8, off: u16, val: u32
     unsafe { (phys_to_virt(a as usize) as *mut u32).write_volatile(val) }
 }
 
+/// The host bridge's 32-bit MMIO window for BAR assignment
+/// (docs/GPU-HARDWARE.md 3). QEMU `virt` puts PCIe MMIO at
+/// 0x4000_0000..0x8000_0000.
+pub fn pci_mmio_window() -> (u64, u64) {
+    (0x4000_0000, 0x4000_0000)
+}
+
 // -------------------------------------------------------------- user mode
 
 /// Saved U-mode register state. Layout matches the offsets in traps.S:
@@ -851,6 +858,27 @@ pub unsafe fn restore_user_fp(area: *const u8) {
             b = in(reg) area, t = out(reg) _, options(nostack, readonly),
         );
     }
+}
+
+/// Bytes reserved per cell for a saved U-mode FP image (f0-f31 + fcsr = 264
+/// bytes; rounded up for alignment/headroom). Vector (RVV) state is not enabled.
+pub const FP_AREA_LEN: usize = 512;
+
+/// Initialize a cell's FP save area to a clean state (all f-regs and fcsr zero -
+/// the reset default; a zeroed fcsr masks nothing but RISC-V has no trapping FP
+/// exceptions, so zero is a valid clean image). Explicit for re-install.
+///
+/// # Safety
+/// `area` must point to at least `FP_AREA_LEN` writable bytes.
+pub unsafe fn fp_area_init(area: *mut u8) {
+    unsafe { core::ptr::write_bytes(area, 0, FP_AREA_LEN) };
+}
+
+/// Portable `SIMD_*` tier mask a cell reads (docs/TILES.md 4). RISC-V cells use
+/// scalar F/D (hard-float baseline); the vector extension (RVV) is not enabled,
+/// so there is no SIMD tier to advertise - the tile executor runs scalar.
+pub fn fp_simd_tiers() -> u64 {
+    0
 }
 
 /// x86-only `arch_prctl` TLS hook (docs/LINUX-COMPAT.md L1). Unreachable on

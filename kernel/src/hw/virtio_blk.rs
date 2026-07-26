@@ -199,10 +199,10 @@ struct PciXport {
 
 impl PciXport {
     fn cfg_w(&self, off: u16, v: u32) {
-        arch::pci_cfg_write32(0, self.bus, self.dev, self.func, off, v);
+        arch::pci_cfg_write32(ecam(), self.bus, self.dev, self.func, off, v);
     }
     fn cfg_r(&self, off: u16) -> u32 {
-        arch::pci_cfg_read32(0, self.bus, self.dev, self.func, off)
+        arch::pci_cfg_read32(ecam(), self.bus, self.dev, self.func, off)
     }
 
     /// Point the PCI_CFG window at `(bar, off)` for a `len`-byte access.
@@ -235,6 +235,9 @@ impl PciXport {
     // Common-configuration accessors (width matches the field).
     fn cc_w32(&self, field: u32, v: u32) {
         self.write(self.common_bar, self.common_off + field, 4, v);
+    }
+    fn cc_r32(&self, field: u32) -> u32 {
+        self.read(self.common_bar, self.common_off + field, 4)
     }
     fn cc_r16(&self, field: u32) -> u16 {
         self.read(self.common_bar, self.common_off + field, 2) as u16
@@ -317,12 +320,18 @@ unsafe fn init_mmio(base: usize) -> Option<VirtioBlk> {
         status |= S_DRIVER;
         w32(base, STATUS, status);
 
-        // Negotiate: require VIRTIO_F_VERSION_1 (feature bit 32 -> sel 1, bit 0).
+        // Negotiate: require VIRTIO_F_VERSION_1 (feature bit 32 -> sel 1,
+        // bit 0), and also ack VIRTIO_F_ACCESS_PLATFORM (bit 33 -> sel 1,
+        // bit 1) when the device offers it - the bit that makes the device
+        // route its DMA through a platform IOMMU (docs/GPU-HARDWARE.md 4).
+        // When `iommu_platform=off` (every other test) the device does not
+        // offer it, so `ap` is 0 and behaviour is unchanged.
+        w32(base, DEVICE_FEATURES_SEL, 1);
+        let ap = r32(base, DEVICE_FEATURES) & 0x2;
         w32(base, DRIVER_FEATURES_SEL, 1);
-        w32(base, DRIVER_FEATURES, 1);
+        w32(base, DRIVER_FEATURES, 1 | ap);
         w32(base, DRIVER_FEATURES_SEL, 0);
         w32(base, DRIVER_FEATURES, 0);
-        let _ = (DEVICE_FEATURES, DEVICE_FEATURES_SEL);
 
         status |= S_FEATURES_OK;
         w32(base, STATUS, status);
@@ -363,11 +372,18 @@ unsafe fn init_mmio(base: usize) -> Option<VirtioBlk> {
     }
 }
 
+/// The PCIe ECAM base. On x86 the CF8/CFC config accessor ignores it; on
+/// ARM/RISC-V it is the MMIO base the accessor reads through, so it must be
+/// the discovered value, not 0 (docs/GPU-HARDWARE.md 3).
+fn ecam() -> u64 {
+    crate::hw::inventory().ecam_base
+}
+
 /// Scan PCI bus 0 for a modern virtio-blk device and initialise it.
 fn probe_pci() -> Option<VirtioBlk> {
     for dev in 0u8..32 {
         for func in 0u8..8 {
-            let id = arch::pci_cfg_read32(0, 0, dev, func, 0x00);
+            let id = arch::pci_cfg_read32(ecam(), 0, dev, func, 0x00);
             let vendor = (id & 0xFFFF) as u16;
             if vendor != PCI_VENDOR_VIRTIO {
                 continue;
@@ -385,7 +401,7 @@ fn probe_pci() -> Option<VirtioBlk> {
 
 /// Read one config-space byte (config access is DWORD-granular).
 fn cfg_read8(bus: u8, dev: u8, func: u8, off: u16) -> u8 {
-    let d = arch::pci_cfg_read32(0, bus, dev, func, off & !3);
+    let d = arch::pci_cfg_read32(ecam(), bus, dev, func, off & !3);
     ((d >> ((off & 3) * 8)) & 0xFF) as u8
 }
 
@@ -394,7 +410,7 @@ fn cfg_read8(bus: u8, dev: u8, func: u8, off: u16) -> u8 {
 fn init_pci(bus: u8, dev: u8, func: u8) -> Option<VirtioBlk> {
     // A capability list must be present (PCI_STATUS bit 4; PCI_STATUS is the
     // high half of the 0x04 dword, so the bit is at 16 + 4).
-    let status_cmd = arch::pci_cfg_read32(0, bus, dev, func, PCI_COMMAND);
+    let status_cmd = arch::pci_cfg_read32(ecam(), bus, dev, func, PCI_COMMAND);
     if status_cmd & (PCI_STATUS_CAP_LIST << 16) == 0 {
         return None;
     }
@@ -410,18 +426,18 @@ fn init_pci(bus: u8, dev: u8, func: u8) -> Option<VirtioBlk> {
     let mut guard = 0;
     while cap != 0 && cap != 0xFF && guard < 48 {
         guard += 1;
-        let hdr = arch::pci_cfg_read32(0, bus, dev, func, cap); // [id,next,len,cfg_type]
+        let hdr = arch::pci_cfg_read32(ecam(), bus, dev, func, cap); // [id,next,len,cfg_type]
         let id = hdr & 0xFF;
         let next = (hdr >> 8) & 0xFF;
         let cfg_type = (hdr >> 24) & 0xFF;
         if id == CAP_ID_VENDOR {
-            let bar = (arch::pci_cfg_read32(0, bus, dev, func, cap + 4) & 0xFF) as u8;
-            let offset = arch::pci_cfg_read32(0, bus, dev, func, cap + 8);
+            let bar = (arch::pci_cfg_read32(ecam(), bus, dev, func, cap + 4) & 0xFF) as u8;
+            let offset = arch::pci_cfg_read32(ecam(), bus, dev, func, cap + 8);
             match cfg_type {
                 VIRTIO_CAP_COMMON => common = Some((bar, offset)),
                 VIRTIO_CAP_NOTIFY => {
                     notify = Some((bar, offset));
-                    notify_mult = arch::pci_cfg_read32(0, bus, dev, func, cap + 16);
+                    notify_mult = arch::pci_cfg_read32(ecam(), bus, dev, func, cap + 16);
                 }
                 VIRTIO_CAP_DEVICE => device = Some((bar, offset)),
                 VIRTIO_CAP_PCI => pci_cfg = Some(cap),
@@ -448,9 +464,9 @@ fn init_pci(bus: u8, dev: u8, func: u8) -> Option<VirtioBlk> {
     };
 
     // Enable memory-space decoding and bus mastering (DMA needs MASTER).
-    let cmd = arch::pci_cfg_read32(0, bus, dev, func, PCI_COMMAND);
+    let cmd = arch::pci_cfg_read32(ecam(), bus, dev, func, PCI_COMMAND);
     arch::pci_cfg_write32(
-        0,
+        ecam(),
         bus,
         dev,
         func,
@@ -463,12 +479,17 @@ fn init_pci(bus: u8, dev: u8, func: u8) -> Option<VirtioBlk> {
     x.cc_w8(CC_DEVICE_STATUS, S_ACK as u8);
     x.cc_w8(CC_DEVICE_STATUS, (S_ACK | S_DRIVER) as u8);
 
-    // Require VIRTIO_F_VERSION_1 (feature bit 32 -> select 1, bit 0).
+    // Require VIRTIO_F_VERSION_1 (feature bit 32 -> select 1, bit 0), and
+    // ack VIRTIO_F_ACCESS_PLATFORM (bit 33 -> select 1, bit 1) when offered
+    // - the bit that routes device DMA through a platform IOMMU
+    // (docs/GPU-HARDWARE.md 4). Not offered under `iommu_platform=off`, so
+    // `ap` is 0 and every other test is unchanged.
+    x.cc_w32(CC_DEVICE_FEATURE_SELECT, 1);
+    let ap = x.cc_r32(CC_DEVICE_FEATURE) & 0x2;
     x.cc_w32(CC_DRIVER_FEATURE_SELECT, 1);
-    x.cc_w32(CC_DRIVER_FEATURE, 1);
+    x.cc_w32(CC_DRIVER_FEATURE, 1 | ap);
     x.cc_w32(CC_DRIVER_FEATURE_SELECT, 0);
     x.cc_w32(CC_DRIVER_FEATURE, 0);
-    let _ = (CC_DEVICE_FEATURE_SELECT, CC_DEVICE_FEATURE);
 
     x.cc_w8(CC_DEVICE_STATUS, (S_ACK | S_DRIVER | S_FEATURES_OK) as u8);
     if x.cc_r8(CC_DEVICE_STATUS) & S_FEATURES_OK as u8 == 0 {

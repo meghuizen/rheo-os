@@ -2,6 +2,8 @@
 
 **Status:** Draft v0.1. Expands ARCHITECTURE.md 4.11; depends on
 ACCELERATORS.md (engines), FILESYSTEMS.md (objects), IO.md (DMA graphs).
+The hardware/memory collaboration contract for tiles, paged KV, and
+quantized buffers on physical GPUs is GPU-HARDWARE.md 11.
 
 Position: AI inference is a **foundational service layer**, treated like
 graphics or storage - but the kernel gains almost nothing new for it, because
@@ -69,7 +71,9 @@ in the trusted base, and "AI-driven kernel scheduling" mysticism
 
 ## 4. The compilation stack and the tile IR
 
-Unified dispatch happens at the IR, not the binary:
+The implemented tile surface (the framework, contracts, executors, graph
+ops, and the battle tests) is TILES.md; this section is the compilation-
+stack design above it. Unified dispatch happens at the IR, not the binary:
 
 ```
 Graph IR      operators, dependencies, conditional edges

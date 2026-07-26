@@ -9,12 +9,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 #[path = "../linux_abi_generic.rs"]
 pub mod linux_abi;
 mod paging;
-pub use paging::pmem_map_window;
 pub use paging::{
     PagingRoot, paging_activate, paging_activate_kernel, paging_for_each_user_leaf,
     paging_kernel_init, paging_map, paging_map_frame, paging_new_root, paging_protect,
     paging_unmap_frame,
 };
+pub use paging::{mmio_map_window, pmem_map_window};
 
 /// `uname` machine string for the Linux personality (docs/LINUX-COMPAT.md L2).
 pub const LINUX_UNAME_MACHINE: &str = "aarch64";
@@ -491,6 +491,12 @@ pub fn discover(inv: &mut crate::hw::Inventory) {
     // PCIe ECAM low window (QEMU virt with highmem-ecam=off), inside the
     // device gigabyte the kernel identity-maps.
     inv.ecam_base = 0x3f00_0000;
+    // The SMMUv3 register base is fixed in the QEMU virt map (docs/GPU-
+    // HARDWARE.md 4). It is only physically present when the machine is
+    // booted with `iommu=smmuv3` (the `iommu` test does); no other code
+    // reads `iommu_base`, and the SMMUv3 driver touches these registers
+    // only on that test, so reporting the address here is safe.
+    inv.iommu_base = 0x0905_0000;
     inv.add_cpu(0, 0);
 }
 
@@ -692,6 +698,13 @@ pub fn pci_cfg_write32(ecam: u64, bus: u8, dev: u8, func: u8, off: u16, val: u32
     unsafe { (phys_to_virt(a as usize) as *mut u32).write_volatile(val) }
 }
 
+/// The host bridge's 32-bit MMIO window for BAR assignment
+/// (docs/GPU-HARDWARE.md 3). QEMU `virt` puts PCIe MMIO at
+/// 0x1000_0000..0x3EFF_0000 (below the 0x3F00_0000 ECAM).
+pub fn pci_mmio_window() -> (u64, u64) {
+    (0x1000_0000, 0x2E00_0000)
+}
+
 // -------------------------------------------------------------- user mode
 
 /// Saved EL0 register state. Layout matches the offsets in vectors.S:
@@ -804,6 +817,38 @@ pub unsafe fn restore_user_fp(area: *const u8) {
             "ldr {t}, [{b}, #520]", "msr fpsr, {t}",
             b = in(reg) area, t = out(reg) _, options(nostack, readonly),
         );
+    }
+}
+
+/// Bytes reserved per cell for a saved U-mode FP/SIMD image (V0-V31 + FPCR +
+/// FPSR = 528 bytes; rounded up for alignment/headroom). SVE state is much
+/// larger and not enabled.
+pub const FP_AREA_LEN: usize = 1024;
+
+/// Initialize a cell's FP/SIMD save area to a clean state (all V-regs, FPCR,
+/// FPSR zero - the AArch64 reset default). Unlike x86's MXCSR, a zeroed FPCR
+/// masks all exceptions, so a zeroed area is already a valid clean image; this
+/// just makes re-install explicit.
+///
+/// # Safety
+/// `area` must point to at least `FP_AREA_LEN` writable bytes.
+pub unsafe fn fp_area_init(area: *mut u8) {
+    unsafe { core::ptr::write_bytes(area, 0, FP_AREA_LEN) };
+}
+
+/// Portable `SIMD_*` tier mask a cell reads (docs/TILES.md 4). ARM64 reports
+/// NEON (Advanced SIMD) when present - it is enabled at EL0 (CPACR_EL1.FPEN)
+/// and is the cell's baseline vector unit; the tile executor auto-vectorises to
+/// it. SVE is not enabled (wide, VL-dependent state), so no SVE tier.
+pub fn fp_simd_tiers() -> u64 {
+    let pfr0: u64;
+    // SAFETY: reading an ID register at EL1.
+    unsafe { asm!("mrs {0}, id_aa64pfr0_el1", out(reg) pfr0, options(nomem, nostack)) };
+    let simd = (pfr0 >> 20) & 0xF; // AdvSIMD field; 0xF = absent
+    if simd != 0xF {
+        crate::abi::SIMD_NEON
+    } else {
+        0
     }
 }
 

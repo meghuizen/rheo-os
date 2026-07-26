@@ -149,7 +149,7 @@ get built and proven early, because retrofitting trust is impossible
 - Depends on: step 11.
 - Build: per-queue IOMMU domains behind the Arch trait, so every device DMA is
   mediated and grant-checked (doctrine 1). QEMU `intel-iommu` / `smmuv3` /
-  RISC-V IOMMU model this.
+  RISC-V IOMMU model this. Design: GPU-HARDWARE.md 4.
 - Done when: a device can only DMA into buffers the owning cell granted; an
   out-of-grant DMA faults.
 
@@ -204,7 +204,8 @@ get built and proven early, because retrofitting trust is impossible
 - Depends on: steps 11, 12, 13.
 - Build: real GPU/NPU engines as contained driver cells, model objects +
   shared weights + paged KV, the compilation service and tile IR on one GPU
-  family (AI-ARCHITECTURE.md, ACCELERATORS.md).
+  family (AI-ARCHITECTURE.md, ACCELERATORS.md). Physical-GPU plumbing design:
+  GPU-HARDWARE.md.
 - Done when: serve a 7B-class model within 15% of vLLM-on-tuned-Linux on
   identical hardware; tile-IR GEMM/attention hits P10 (M5 gate).
 

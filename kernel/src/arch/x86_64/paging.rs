@@ -332,6 +332,37 @@ pub fn pmem_map_window(base_pa: usize, len: usize) -> usize {
     PMEM_WINDOW_VA
 }
 
+/// Device-MMIO mapping window (docs/GPU-HARDWARE.md 3, 12 stage 1). A PCI
+/// BAR lives in the q35 PCI hole (~3-4 GiB physical), above the kernel's
+/// top-2 GiB linear map, so - like the nvdimm - it needs its own window.
+/// A separate fixed VA (PML4[385]) keeps it disjoint from the pmem window;
+/// only the kernels that call `mmio_map_window` install it. `base_pa` is
+/// aligned down to 2 MiB and the returned VA carries the offset back in.
+/// One mapping is live at a time - a new call retargets the same window,
+/// so finish with one BAR before mapping the next (all callers are
+/// sequential bring-up/measure paths). Honest QEMU note: TCG models no
+/// caches, so the missing uncached attribute is invisible here; real
+/// hardware wants PAT/UC pages (lab).
+const MMIO_WINDOW_VA: usize = 0xFFFF_C080_0000_0000;
+
+pub fn mmio_map_window(base_pa: usize, len: usize) -> usize {
+    let aligned = base_pa & !(MIB2 - 1);
+    let offset = base_pa - aligned;
+    let pml4_pa = core::ptr::addr_of!(boot_page_tables) as usize;
+    let npages = (offset + len).div_ceil(MIB2);
+    for p in 0..npages {
+        let va = MMIO_WINDOW_VA + p * MIB2;
+        let pa = aligned + p * MIB2;
+        let pml4 = table_mut(pml4_pa);
+        let pdpt = table_mut(ensure_table(pml4, pml4_index(va)));
+        let pd = table_mut(ensure_table(pdpt, pdpt_index(va)));
+        // 2 MiB supervisor page: present, writable, size, global, non-executable.
+        pd[pd_index(va)] = addr_bits(pa) | P | RW | PS | G | NX;
+    }
+    paging_activate_kernel(); // flush the TLB (reload CR3)
+    MMIO_WINDOW_VA + offset
+}
+
 /// Finish paging bring-up. The MMU and the kernel working root are already
 /// configured by the boot trampoline, which enabled paging and jumped the
 /// kernel to its high VAs before any Rust ran. All that is left is the frame

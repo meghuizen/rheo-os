@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 52] = [
+const TEST_KERNELS: [&str; 56] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -74,6 +74,10 @@ const TEST_KERNELS: [&str; 52] = [
     "netservice",
     "nethttp",
     "nethostcfg",
+    "gpuhw",
+    "iommu",
+    "librheotile",
+    "librheotilebattle",
 ];
 
 /// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
@@ -326,6 +330,83 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "virtio-gpu-device",
         ],
         ("librheogpu", Arch::X86_64) => &["-device", "virtio-gpu-pci,disable-legacy=on"],
+        // gpuhw (docs/GPU-HARDWARE.md 3, 12 stage 1): the same three GPU
+        // functions on every ISA - a real AMD/ATI vendor device (ati-vga,
+        // 0x1002), the Bochs display (0x1234), and a virtio-gpu placed
+        // BEHIND a pcie-root-port, reachable only if enumeration programs
+        // the bridge's secondary bus (PVH boots have no firmware to do it).
+        // NVIDIA/Intel have no QEMU GPU model - the kernel prints their
+        // skip-with-reason lines and the test asserts their absence.
+        // Every GPU device model QEMU provides for the ISA, one per vendor.
+        // x86-64 has all six: virtio-gpu (behind a root port), AMD
+        // (ati-vga), Bochs, Cirrus Logic, VMware SVGA, and Red Hat/QXL
+        // (secondary - qxl-vga must be console 0). NVIDIA and Intel have no
+        // QEMU GPU model - recognised by ID, skip-with-reason
+        // (docs/GPU-HARDWARE.md 12).
+        ("gpuhw", Arch::X86_64) => &[
+            "-device",
+            "pcie-root-port,id=rp1,chassis=1,slot=1",
+            "-device",
+            "virtio-gpu-pci,bus=rp1,disable-legacy=on",
+            "-device",
+            "ati-vga",
+            "-device",
+            "bochs-display",
+            "-device",
+            "cirrus-vga",
+            "-device",
+            "vmware-svga",
+            "-device",
+            "qxl",
+        ],
+        // arm/riscv `virt`: vmware-svga and qxl are x86-only in QEMU, so the
+        // per-ISA set is virtio-gpu + AMD + Bochs + Cirrus (four vendors).
+        ("gpuhw", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-device",
+            "pcie-root-port,id=rp1,chassis=1,slot=1",
+            "-device",
+            "virtio-gpu-pci,bus=rp1,disable-legacy=on",
+            "-device",
+            "ati-vga",
+            "-device",
+            "bochs-display",
+            "-device",
+            "cirrus-vga",
+        ],
+        // iommu (docs/GPU-HARDWARE.md 4, BUILD-ORDER.md step 12): VT-d DMA
+        // remapping. x86-64 q35 gets `-device intel-iommu` (caching-mode=on
+        // so the vIOMMU faults + requires invalidation, the mode that
+        // reports out-of-grant DMA) plus a virtio-blk-pci disk as the DMA
+        // source. intel-iommu must precede the devices it covers. arm/riscv
+        // `virt` surface no DMAR base, so the kernel skips-with-reason and
+        // needs no IOMMU device (a plain virtio-blk keeps the probe honest).
+        ("iommu", Arch::X86_64) => &[
+            "-device",
+            "intel-iommu,caching-mode=on",
+            "-drive",
+            "file=tests/fixtures/ext4.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-pci,drive=blk0,disable-legacy=on,iommu_platform=on",
+        ],
+        // ARM64: the SMMUv3 covers PCI, so use virtio-blk-*pci* (behind the
+        // SMMU) with iommu_platform=on, mirroring the x86 VT-d proof. The
+        // machine gains iommu=smmuv3 via `machine_override`.
+        ("iommu", Arch::Aarch64) => &[
+            "-drive",
+            "file=tests/fixtures/ext4.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-pci,drive=blk0,disable-legacy=on,iommu_platform=on",
+        ],
+        // RISC-V has no QEMU IOMMU model, so the kernel skips-with-reason;
+        // a plain virtio-blk keeps the (unreached) probe honest.
+        ("iommu", Arch::Riscv64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-drive",
+            "file=tests/fixtures/ext4.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-device,drive=blk0",
+        ],
         // pmem (docs/MEMORY.md real-PMEM path): a real QEMU nvdimm whose
         // persistent span the kernel discovers via the ACPI NFIT and backs a
         // `MemKind::Pmem` grant with. Only x86-64 q35 exposes one here: the
@@ -426,6 +507,31 @@ impl Arch {
         match self {
             Arch::X86_64 => "x86_64-unknown-none",
             Arch::Aarch64 => "aarch64-unknown-none-softfloat",
+            Arch::Riscv64 => "riscv64gc-unknown-none-elf",
+        }
+    }
+
+    /// Target for **hard-float cells** (librheo): the kernel stays soft-float
+    /// (`target()`), but a cell that wants the vector units compiles hard-float
+    /// so it can emit SSE/NEON (and, via runtime `#[target_feature]` dispatch,
+    /// AVX/AVX-512/VNNI). x86 needs a custom JSON (the bare target forces
+    /// soft-float); ARM64 uses the builtin hard-float (`+neon`) triple; RISC-V's
+    /// bare target is already `lp64d` hard-float, so it is unchanged. See
+    /// docs/LIBRHEO.md / docs/TILES.md 4.
+    fn cell_target(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "targets/rheo_cell-x86_64.json",
+            Arch::Aarch64 => "aarch64-unknown-none",
+            Arch::Riscv64 => "riscv64gc-unknown-none-elf",
+        }
+    }
+
+    /// Output directory stem for `cell_target()` (the `target/<stem>/` cargo
+    /// writes to). For x86 this is the JSON file stem, not the triple.
+    fn cell_target_dir(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "rheo_cell-x86_64",
+            Arch::Aarch64 => "aarch64-unknown-none",
             Arch::Riscv64 => "riscv64gc-unknown-none-elf",
         }
     }
@@ -634,6 +740,8 @@ fn std_patch() -> bool {
 /// before the test kernels, which `include_bytes!` the built ELFs.
 fn build_userland(arch: Arch) -> bool {
     println!("[xtask] building userspace for {}", arch.name());
+    // The soft-float cells (userland/libc/net) build for the kernel's bare
+    // target: they do no vector work, so hard-float buys them nothing.
     let mut cmd = Command::new("cargo");
     cmd.args([
         "build",
@@ -642,8 +750,6 @@ fn build_userland(arch: Arch) -> bool {
         "-p",
         "rheo-libc",
         "-p",
-        "librheo",
-        "-p",
         "rheo-net",
         "--release",
         "--target",
@@ -651,7 +757,68 @@ fn build_userland(arch: Arch) -> bool {
         "-Zbuild-std=core,alloc,compiler_builtins",
         "-Zbuild-std-features=compiler-builtins-mem",
     ]);
+    if !matches!(cmd.status().map(|s| s.success()), Ok(true)) {
+        return false;
+    }
+    // librheo builds **hard-float** (docs/LIBRHEO.md / docs/TILES.md 4): its
+    // tile executor and any SIMD path need real vector registers. Built for the
+    // cell target, then staged into the kernel target's release dir the test
+    // kernels `include_bytes!` from (a build-orchestration copy - the loader is
+    // unchanged; the kernel remains soft-float and just loads the hard-float
+    // ELF, with FP state saved/restored across cell switches).
+    if !build_librheo(arch, false) {
+        return false;
+    }
+    stage_cell_bins(arch)
+}
+
+/// Build the librheo cell binaries for `arch`'s hard-float cell target. When
+/// `embedded`, rebuild only `librheo-embed` with `--no-default-features` (the
+/// minimal spine, docs/LIBRHEO.md Phase F).
+fn build_librheo(arch: Arch, embedded: bool) -> bool {
+    let mut cmd = Command::new("cargo");
+    cmd.args(["build", "-p", "librheo"]);
+    if embedded {
+        cmd.args(["--bin", "librheo-embed", "--no-default-features"]);
+    }
+    cmd.args([
+        "--release",
+        "--target",
+        arch.cell_target(),
+        "-Zbuild-std=core,alloc,compiler_builtins",
+        "-Zbuild-std-features=compiler-builtins-mem",
+        "-Zjson-target-spec",
+    ]);
     matches!(cmd.status().map(|s| s.success()), Ok(true))
+}
+
+/// Stage the hard-float librheo cell binaries into the kernel target's release
+/// dir, where the test kernels `include_bytes!` them. A no-op on RISC-V, whose
+/// cell target IS the kernel target (already `lp64d` hard-float). Copies the
+/// top-level executables (extensionless files) only, not `deps/` or depfiles.
+fn stage_cell_bins(arch: Arch) -> bool {
+    if arch.cell_target_dir() == arch.target() {
+        return true; // same dir - nothing to stage (RISC-V)
+    }
+    let src = PathBuf::from(format!("target/{}/release", arch.cell_target_dir()));
+    let dst = PathBuf::from(format!("target/{}/release", arch.target()));
+    let Ok(entries) = std::fs::read_dir(&src) else {
+        eprintln!("error: cannot read {}", src.display());
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Executables have no extension; skip .d depfiles, dirs, and the
+        // build/deps/incremental subdirs.
+        if path.is_file() && path.extension().is_none() {
+            let name = entry.file_name();
+            if let Err(e) = std::fs::copy(&path, dst.join(&name)) {
+                eprintln!("error: staging {}: {e}", name.to_string_lossy());
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Rebuild only the `librheo-embed` bin with `--no-default-features` (the
@@ -664,21 +831,9 @@ fn build_librheo_embedded(arch: Arch) -> bool {
         "[xtask] building librheo-embed (no-default-features) for {}",
         arch.name()
     );
-    let mut cmd = Command::new("cargo");
-    cmd.args([
-        "build",
-        "-p",
-        "librheo",
-        "--bin",
-        "librheo-embed",
-        "--no-default-features",
-        "--release",
-        "--target",
-        arch.target(),
-        "-Zbuild-std=core,alloc,compiler_builtins",
-        "-Zbuild-std-features=compiler-builtins-mem",
-    ]);
-    matches!(cmd.status().map(|s| s.success()), Ok(true))
+    // Built for the hard-float cell target and staged like the full build, so
+    // the librheo-embed the `librheoproc` kernel embeds is the minimal spine.
+    build_librheo(arch, true) && stage_cell_bins(arch)
 }
 
 /// Build the `netsmoltcp-demo` bin with the `smoltcp` feature (docs/NETSTACK.md
@@ -1280,9 +1435,34 @@ fn build_smp_kernel(arch: Arch, release: bool) -> bool {
     matches!(cmd.status().map(|s| s.success()), Ok(true))
 }
 
+/// A per-test replacement for the `-machine` string. Most tests share the
+/// per-arch default; the `iommu` test on ARM needs `iommu=smmuv3` added
+/// (an SMMUv3 covers PCI devices, so the test also uses virtio-blk-pci).
+fn machine_override(arch: Arch, kernel: &str) -> Option<&'static str> {
+    match (kernel, arch) {
+        ("iommu", Arch::Aarch64) => Some("virt,gic-version=3,highmem-ecam=off,iommu=smmuv3"),
+        _ => None,
+    }
+}
+
 fn qemu_command(arch: Arch, release: bool, bin: &str) -> Command {
     let mut cmd = Command::new(arch.qemu());
-    cmd.args(arch.qemu_machine_args());
+    let margs = arch.qemu_machine_args();
+    if let Some(machine) = machine_override(arch, bin) {
+        // Emit the machine args, substituting the token after `-machine`.
+        let mut i = 0;
+        while i < margs.len() {
+            if margs[i] == "-machine" && i + 1 < margs.len() {
+                cmd.arg("-machine").arg(machine);
+                i += 2;
+            } else {
+                cmd.arg(margs[i]);
+                i += 1;
+            }
+        }
+    } else {
+        cmd.args(margs);
+    }
     cmd.arg("-kernel").arg(arch.kernel_path(release, bin));
     cmd.args(["-no-reboot", "-nodefaults"]);
     cmd

@@ -124,6 +124,31 @@ No gate can be *passed* in QEMU; none is *killed* by these numbers. P2-
 batched and P5 are the two to watch on real hardware, where a TLB miss on
 the address-space switch is the cost QEMU cannot show.
 
+### Tiles (host, docs/TILES.md)
+
+The tile framework's cost model is validated where its benefit is real -
+on the host, because QEMU models no caches (`comparison/tiles`). The
+in-QEMU `p6_*` benches report per-tile-op instruction path lengths and the
+tiling-cost ordering (finer tiling = more tile trips = more instructions);
+the host confirms that ordering in wall-clock:
+
+| block (1024³) | host ms | TileSim bytes_staged |
+|---:|---:|---:|
+| 16 | ~221 | 138,412,032 |
+| 64 | ~123 | 37,748,736 |
+| 256 | ~96 | 12,582,912 |
+
+Host fastest→slowest and sim least→most-bytes **both rank
+`[256,128,64,32,16]`** - the traffic model ranks tilings as the host
+measures (the co-design loop's traffic leg). Differential fuzz: 10,000
+random shapes, tiled == naive. AVX2 inner kernel == scalar, bit-for-bit,
+2,000 shapes. Honest: the scalar `no_std` kernel is not a tuned BLAS.
+**In-cell SIMD now runs on-OS** - librheo cells are hard-float and the
+kernel saves vector state across cell switches, so `tile::simd` dispatches
+AVX2 in a cell (the `librheotile` test asserts it bit-exact); AVX-512/VNNI
+light up on real hardware (QEMU TCG has AVX2 only), proven here on the host.
+`comparison/tiles/README.md` has the full caveats.
+
 ## 6. Verdict on viability, as of this commit
 
 - The capability model, the queue-pair ABI, and cells-as-protection-domains

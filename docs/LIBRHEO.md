@@ -316,10 +316,14 @@ Graph submission over the queue (extends the queue object, docs/IO.md 1):
   `results_va`. The completion carries the node count. A malformed edge / empty /
   oversized graph completes with a distinct status (not a fault). Node ops are the
   arithmetic set `graph.rs` already has (Const/Add/Mul/Select - a conditional edge
-  for MoE routing / speculative decoding); a **buffer-reduce / map node kind** (a
-  graph node that reduces a mapped buffer) is a documented next step - it needs
-  object 6's node model to carry buffer references, a larger change. The parallel
-  *aggregation* is served today by the strand `map_reduce` path below.
+  for MoE routing / speculative decoding) **plus the buffer-carrying tile ops**
+  (docs/TILES.md 6, the once-documented next step now done): op 4 BufReduce (the
+  wrapping sum of a mapped buffer) and op 5 TileGemm (a bounded int8->i32 GEMM
+  whose node result is the FNV receipt of C) - `node.a` carries the cell VA of a
+  `#[repr(C)]` descriptor, validated with hard caps (STATUS_DENIED on violation,
+  never a fault). The parallel *aggregation* is also served by the strand
+  `map_reduce` path below; the tile framework's `EngineExecutor` lowers a
+  `TileProgram` onto these nodes (the device-portable artifact).
 
 Engine introspection + reservations (expose objects 4 / 7):
 

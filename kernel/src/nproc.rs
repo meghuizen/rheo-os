@@ -467,6 +467,11 @@ fn process_exit(cell: usize, code: u64) -> *mut TrapFrame {
 /// runnable cell, and completes its pending `SYS_WAIT`. Panics only on a true
 /// deadlock (a scheduling bug, surfaced loudly).
 fn reschedule(leaving: usize) -> *mut TrapFrame {
+    // Save the outgoing cell's live FP/SIMD state (harmless if it is exiting);
+    // the incoming cell's is restored after the address-space switch below. The
+    // native analogue of the Linux `thread::save_current_fp` in `linux::proc`.
+    user::save_native_fp(leaving);
+
     // Wake blocked parents whose awaited child is now a zombie.
     for i in 0..MAX_CELLS {
         if procs()[i].state == PState::Blocked {
@@ -485,6 +490,7 @@ fn reschedule(leaving: usize) -> *mut TrapFrame {
     };
 
     user::switch_to_cell(n);
+    user::restore_native_fp(n);
     complete_block(n);
     user::cell_frame(n)
 }
