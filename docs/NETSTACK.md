@@ -158,9 +158,13 @@ kernels stay green.
     trait seam) and `timer` (a timer wheel multiplexing many logical timers onto the
     reactor's single one-shot). Proven **deterministically in-cell** - two endpoints
     over a virtual link drive the full lifecycle incl. a drop/RTO recovery (§11).
-  - **N2b (next): congestion control + the two transports.** CUBIC/BBR as
-    `CongestionControl` impls (the N2a seam), the smoltcp blessed correctness cell,
-    and the native sharded/zero-copy transport; a live TCP echo / HTTP GET to SLIRP.
+  - **N2b (done): real congestion control - Reno + CUBIC.** `cc` (RFC 5681 Reno and
+    RFC 8312 CUBIC as drop-in `CongestionControl` impls over the N2a seam), wired
+    into the send window, with fast-retransmit dup-ACK handling added to `tcp`.
+    Proven **deterministically in-cell** - integer cwnd trajectories pinned against
+    oracles + a real fast-retransmit-before-RTO scenario (§12).
+  - **N2c (next): the two transports.** The smoltcp blessed correctness cell and the
+    native sharded/zero-copy transport; a live TCP echo / HTTP GET to a real peer.
 - **N3 - TLS 1.3 + HTTPS.** Crypto crates wired; keys-as-capabilities.
 - **N4 - Service-cell model + fan-out + host services** (DHCP + zeroconf + NTP).
 - **N5 - App protocols.** HTTP/2, gRPC, Arrow Flight (warehouse), Kafka.
@@ -636,9 +640,9 @@ Unacked data is retransmitted from `snd_una` when the RTO fires.
 
 `trait CongestionControl { on_ack(bytes, rtt); on_loss(); cwnd(); }` is the seam.
 N2a ships only **`FixedWindow`** (a large fixed cwnd, so the peer's advertised
-window - flow control - dominates). CUBIC/BBR are **N2b**, a drop-in
-`impl CongestionControl`; `Connection` is generic over `C` so swapping the
-controller is a type parameter, not a rewrite.
+window - flow control - dominates). **N2b** slots in real controllers (Reno, CUBIC)
+as drop-in `impl CongestionControl`s (§12); `Connection` is generic over `C` so
+swapping the controller is a type parameter, not a rewrite.
 
 ### The socket-shaped API
 
@@ -706,4 +710,118 @@ an external peer at the hardware lab).
   until a window update arrives (no persist-timer probe yet).
 - **RST handling is minimal**: a received RST drops the connection to CLOSED.
 - **Congestion control itself** (only the `FixedWindow` seam ships) and **ECN** are
-  N2b.
+  N2b (§12).
+
+## 12. Phase N2b (done): TCP congestion control - Reno + CUBIC
+
+N2b fills the N2a seam with two **from-scratch** congestion controllers over the
+`CongestionControl` trait - portable userspace, **no kernel object**, **no ABI
+change**, **no new dependency**, **no `cfg(target_arch)`**. Both use **integer /
+fixed-point** cwnd math (matching the kernel's no-FPU discipline even though these
+are soft-float U-mode cells; no float appears in the window arithmetic).
+
+### The controllers (`net::cc`)
+
+- **`Reno`** (RFC 5681), all in bytes:
+  - **Slow start** (`cwnd < ssthresh`): `cwnd += bytes_acked` per ACK - exponential,
+    one doubling per RTT.
+  - **Congestion avoidance** (`cwnd >= ssthresh`): a byte accumulator adds one MSS
+    per cwnd worth of acked bytes - the clean, coalescing-robust form of AIMD's
+    `cwnd += MSS*MSS/cwnd` (linear, +1 MSS/RTT).
+  - **Fast retransmit / fast recovery** (3rd duplicate ACK): `ssthresh =
+    max(cwnd/2, 2*MSS)`, `cwnd = ssthresh + 3*MSS` (inflate); each further dup ACK
+    inflates by one MSS; the first new ACK deflates to `cwnd = ssthresh` and exits
+    recovery.
+  - **RTO** (`on_loss`): `ssthresh = max(cwnd/2, 2*MSS)`, `cwnd = 1*MSS` (slow-start
+    restart).
+- **`Cubic`** (RFC 8312): the window follows `W(t) = C*(t - K)^3 + W_max` with
+  `beta = 0.7`, `C = 0.4`, `K = cbrt(W_max*(1-beta)/C)` - **concave** approaching the
+  pre-loss `W_max`, **convex** past it - guarded below by the TCP-friendly estimate
+  `W_est(t) = W_max*beta + (3*(1-beta)/(1+beta))*t/RTT` (`cwnd = max(W_cubic, W_est)`).
+
+### The CUBIC fixed-point scheme (correctness-critical)
+
+No floats. Windows are in **bytes**, the cubic term's time in **milliseconds**. With
+`C = 0.4 = 2/5`, `beta = 0.7 = 7/10`, `1-beta = 3/10`, `3*(1-beta)/(1+beta) = 9/17`:
+- `K` (ms) `= cbrt(W_max_segments * (1-beta)/C * 1e9) = cbrt(3 * W_max_seg *
+  250_000_000)`, via an **integer cube root** (`icbrt`, a binary search).
+- the cubic term (bytes) `= MSS * C * (dt_ms/1000)^3 = (2 * MSS * dt_ms^3) /
+  5_000_000_000`, computed in `i128` so `dt_ms^3` never overflows and the sign of a
+  pre-`K` (`dt < 0`) term is exact (Rust truncates toward zero - the oracle is
+  computed the same way).
+- `W_est` base `= (7*W_max)/10`, slope-per-RTT `= (9*MSS)/17`.
+
+This tracks the real-valued cubic to within a few bytes across the sampled
+timescale (measured max deviation 8 bytes at `W_max = 32 MSS`).
+
+### How they wire to the send window
+
+`Connection<C>` is generic over the controller; the usable send window stays
+`min(peer_advertised_window, cwnd())`, unchanged from N2a. The connection now:
+- calls `cc.tick(now)` before every ack/loss step so a **time-based** controller
+  (CUBIC) can evaluate `W(t)` (ack-clocked controllers - Reno, `FixedWindow` -
+  ignore it);
+- **detects duplicate ACKs** (RFC 5681: a pure ACK that doesn't advance `snd_una`,
+  carries no data, and leaves the window unchanged while data is outstanding) and
+  calls `cc.on_dup_ack()`; on the 3rd it sets a `fast_retransmit` flag, and the next
+  `poll` rewinds `snd_nxt` to `snd_una` to **retransmit the lost segment immediately,
+  before the RTO** (no RTO backoff, distinct from the timeout path);
+- feeds `cc.on_ack(bytes_acked, rtt)` / `cc.on_loss()` from the existing ack and RTO
+  paths.
+
+The trait grew `tick` / `on_dup_ack` / `ssthresh` / `in_recovery` / `set_mss`, all
+**default-implemented**, so `FixedWindow` and the whole N2a `nettcp` proof are
+byte-for-byte unchanged.
+
+### The proof (`nettcpcc` test kernel, all 3 ISAs)
+
+A cell (`nettcpcc-demo`) drives **deterministic integer cwnd trajectories**, each
+pinned against a precomputed oracle, exiting `0x42` only if every one matches
+(entirely in-cell - no NIC, no SLIRP, the N2a deterministic philosophy):
+
+1. **Reno slow start**: `cwnd` doubles per ACK round, `1 -> 2 -> 4 -> 8 -> 16 MSS`,
+   up to `ssthresh`.
+2. **Reno AIMD**: past `ssthresh`, `cwnd` grows by exactly one MSS per round (linear).
+3. **Reno fast retransmit / recovery** (scripted dup ACKs): the 3rd dup returns the
+   trigger; `ssthresh = 8 MSS` (`cwnd/2`), `cwnd = 11 MSS` (`ssthresh + 3*MSS`); two
+   further dups inflate to `12`, `13 MSS`; the first new ACK deflates to `8 MSS`
+   (**not** a collapse to 1 MSS).
+4. **Reno RTO collapse**: `ssthresh = 8 MSS`, `cwnd = 1 MSS`.
+5. **CUBIC shape**: after a loss with `W_max = 32 MSS`, `W(t)` at seven sampled
+   times matches the integer oracle `[32712, 42815, 46317, 46720, 47531, 52252,
+   64388]` bytes (K ~= 2.884 s, where `W == W_max = 46720`) **and** stays within 16
+   bytes of the real-valued cubic; the increments are concave (decreasing:
+   `10103, 3502, 403`) before `K` and convex (increasing: `811, 4721, 12136`) after.
+6. **CUBIC vs Reno**: from the same pre-loss `32 MSS`, at a matched late checkpoint
+   CUBIC (`~44 MSS`, convex growth from a gentler `0.7` decrease) exceeds Reno
+   (`22 MSS`, linear growth from a `0.5` decrease).
+7. **Integration** - a real `Connection<Reno>` over the in-cell virtual link: a
+   held-back segment makes the receiver re-ACK, three duplicate ACKs
+   **fast-retransmit the lost segment before the RTO deadline**, `cwnd` halves (fast
+   recovery, `ssthresh = 4 MSS`, **not** RTO collapse), and the full payload still
+   transfers (received == sent).
+8. **Bulk transfer**: a real `Connection<Reno>` and `Connection<Cubic>` each carry a
+   20-segment payload to completion (received == sent) with `cwnd` grown from slow
+   start.
+
+**Live path (honest):** a live TCP handshake to SLIRP is **skipped with reason** (as
+in N2a): SLIRP's user-net has no TCP echo/responder, so there is no deterministic
+live peer, and faking one would be dishonest. A live TCP echo / HTTP GET is an
+**N2c / hardware-lab** deliverable. The deterministic cwnd-trajectory proof is the
+real deliverable.
+
+### What N2b simplifies / defers (honest)
+
+- **Reno, not full NewReno**: fast recovery exits on the first new ACK; NewReno
+  **partial-ACK** deflation (staying in recovery across multiple losses in a window)
+  is deferred - it wants SACK, also deferred.
+- **CUBIC is time-clocked, not ack-clocked**: `on_ack` sets `cwnd` to `W(t)` for the
+  elapsed `t`, rather than the incremental `cwnd += (W(t+RTT) - cwnd)/cwnd` per ACK.
+  Same trajectory, cleaner to pin against an oracle; the per-ack increment is the
+  optimization.
+- **CUBIC HyStart and fast-convergence are deferred** (documented, not built):
+  pre-loss CUBIC stays in slow start until a loss, and a loss always saves
+  `W_max = cwnd` (no fast-convergence discount).
+- **BBR** and **ECN** are later phases.
+- The two transports (**smoltcp** blessed cell + the **native sharded** transport)
+  are **N2c**, as is a **live** TCP handshake.

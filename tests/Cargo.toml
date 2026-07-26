@@ -196,6 +196,15 @@ path = "src/netlocal.rs"
 name = "nettcp"
 path = "src/nettcp.rs"
 
+# rheo-net Phase N2b (docs/NETSTACK.md §11): real TCP congestion control - Reno +
+# CUBIC (net::cc) over the N2a seam. Deterministic integer cwnd trajectories (slow
+# start, AIMD, fast retransmit/recovery, RTO, the CUBIC W(t) shape) pinned against
+# oracles, plus a real Connection<Reno> fast-retransmit-before-RTO scenario over the
+# in-cell virtual link. Needs no netdev - entirely in-cell.
+[[bin]]
+name = "nettcpcc"
+path = "src/nettcpcc.rs"
+
 # Linux-personality L8 (docs/LINUX-COMPAT.md L8): AF_UNIX sockets - an unmodified
 # static-glibc C fixture doing socketpair+fork and bind/listen/connect/accept.
 [[bin]]

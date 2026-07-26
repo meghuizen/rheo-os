@@ -57,8 +57,18 @@
 //! - [`timer`]: a [`timer::TimerWheel`] multiplexing many logical timers (per-
 //!   connection RTO / TIME-WAIT) onto the reactor's single one-shot deadline.
 //!
+//! **Phase N2b** adds real congestion control over the N2a seam:
+//! - [`cc`]: [`cc::Reno`] (RFC 5681 - slow start, AIMD, fast retransmit / fast
+//!   recovery, RTO slow-start restart) and [`cc::Cubic`] (RFC 8312 - the cubic
+//!   window in fixed point with an integer cube root), both drop-in
+//!   [`tcp::CongestionControl`] impls wired into the send window. The trait grew
+//!   `tick`/`on_dup_ack`/`ssthresh`/`in_recovery`/`set_mss` (default-implemented, so
+//!   [`tcp::FixedWindow`] is unchanged), and [`tcp::Connection`] now detects
+//!   duplicate ACKs and fast-retransmits on the 3rd.
+//!
 //! Still deferred (per docs/NETSTACK.md): the smoltcp blessed cell + the sharded
-//! transport + real congestion control (N2b); `local` (the AF_UNIX-equivalent
+//! transport (N2c); full NewReno partial-ACK recovery, CUBIC HyStart /
+//! fast-convergence, and BBR; `local` (the AF_UNIX-equivalent
 //! zero-copy transport), the Linux AF_UNIX personality, negative caching, and the
 //! *live* ICMPv6 path (the v6 codec is unit-proven; SLIRP cannot generate v6
 //! errors).
@@ -68,6 +78,7 @@
 extern crate alloc;
 
 pub mod arp;
+pub mod cc;
 pub mod dns;
 pub mod eth;
 pub mod icmp;

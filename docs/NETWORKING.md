@@ -38,7 +38,7 @@ requires - the kernel owns the queue plumbing, not the protocols.
   grants (section 1), header/payload split (section 1), a device RX interrupt, and
   everything in sections 4-7 (eBPF dataplane, DDoS staging, DPU offload).
 
-## 0a. What is built (rheo-net Phase N1a-N1e + N2a): the L2/L3/L4 core + caching DNS + traceroute + native TCP
+## 0a. What is built (rheo-net Phase N1a-N1e + N2a/N2b): the L2/L3/L4 core + caching DNS + traceroute + native TCP + congestion control
 
 The **greenfield network stack** begins here as **portable userspace** - a new
 `net/` workspace crate (`no_std` + alloc, no per-ISA code) built for the three
@@ -105,8 +105,21 @@ two TCP endpoints in one cell over a virtual link drive the full lifecycle
 recovered by RTO**, clean teardown to CLOSED/TIME-WAIT), plus the checksum/segment
 oracles (`0x613C`) and the timer-wheel multiplex - exiting `0x42`. A **live** TCP
 handshake to SLIRP is **skipped with reason** (SLIRP has no TCP responder to make
-it deterministic); congestion control itself, the smoltcp cell, the sharded
-transport, SACK/window-scaling/ECN are **N2b** (docs/NETSTACK.md 11).
+it deterministic).
+
+**Phase N2b** fills the seam with real **congestion control**: `net::cc` -
+**Reno** (RFC 5681: slow start, AIMD, fast retransmit / fast recovery on 3 dup ACKs,
+RTO slow-start restart) and **CUBIC** (RFC 8312: the cubic window `W(t)` in
+**integer / fixed-point** math with an integer cube root, plus the TCP-friendly
+region), both drop-in `CongestionControl` impls wired into the send window; `net::tcp`
+gained dup-ACK detection + fast-retransmit-before-RTO. Proof: the `nettcpcc` test
+kernel (all three ISAs), **deterministic + network-free** - integer cwnd trajectories
+(slow start, AIMD, fast retransmit/recovery, RTO, the CUBIC `W(t)` shape) pinned
+against precomputed oracles + a real `Connection<Reno>` fast-retransmit scenario over
+the in-cell virtual link, exiting `0x42`. A **live** TCP handshake is again
+**skipped with reason**. The smoltcp cell + the sharded transport + a live handshake
+are **N2c**; SACK/window-scaling/ECN, NewReno partial-ACK recovery, CUBIC
+HyStart/fast-convergence, and BBR are deferred (docs/NETSTACK.md 11-12).
 
 ## 1. NIC queues are the primitive
 

@@ -83,3 +83,13 @@ path = "src/bin/netlocal-demo.rs"
 [[bin]]
 name = "nettcp-demo"
 path = "src/bin/nettcp-demo.rs"
+
+# The N2b proof cell: real TCP congestion control - Reno + CUBIC (net::cc) over the
+# N2a CongestionControl seam. Deterministic integer cwnd trajectories (slow start,
+# AIMD, fast retransmit/recovery, RTO, the CUBIC W(t) shape) pinned against
+# precomputed oracles, plus a real Connection<Reno> fast-retransmit-before-RTO
+# scenario over the in-cell VirtualLink. Loaded by the `nettcpcc` test kernel; needs
+# no netdev - it is entirely in-cell.
+[[bin]]
+name = "nettcpcc-demo"
+path = "src/bin/nettcpcc-demo.rs"

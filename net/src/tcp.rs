@@ -261,6 +261,36 @@ pub trait CongestionControl {
     fn on_loss(&mut self);
     /// The current congestion window, in bytes.
     fn cwnd(&self) -> u32;
+
+    // --- N2b extensions (default impls keep `FixedWindow` and any minimal
+    // controller unchanged; the real controllers live in [`crate::cc`]) ---
+
+    /// Advance the controller's notion of time (nanoseconds). The [`Connection`]
+    /// calls this before ack/loss processing so a **time-based** controller (CUBIC)
+    /// can compute `W(t)`. Ack-clocked controllers (Reno, [`FixedWindow`]) ignore it.
+    fn tick(&mut self, _now_ns: u64) {}
+
+    /// A **duplicate ACK** arrived (RFC 5681 dup-ACK: no new data acked, empty
+    /// payload, window unchanged, outstanding data). Returns `true` iff this is the
+    /// **3rd** duplicate - the **fast-retransmit** trigger, so the [`Connection`]
+    /// retransmits the lost segment immediately (before the RTO). Default: never.
+    fn on_dup_ack(&mut self) -> bool {
+        false
+    }
+
+    /// The slow-start threshold in bytes (inspection / the deterministic proof).
+    /// Default: effectively unbounded.
+    fn ssthresh(&self) -> u32 {
+        u32::MAX
+    }
+
+    /// True while in fast recovery. Default: `false`.
+    fn in_recovery(&self) -> bool {
+        false
+    }
+
+    /// Inform the controller of the negotiated MSS (bytes). Default: no-op.
+    fn set_mss(&mut self, _mss: u16) {}
 }
 
 /// The trivial N2a congestion controller: a large fixed window, so the effective
@@ -346,6 +376,10 @@ pub struct Connection<C: CongestionControl = FixedWindow> {
     /// The TIME-WAIT (2*MSL) expiry.
     time_wait_deadline: Option<u64>,
 
+    /// Set when a 3rd duplicate ACK arrived: the next [`poll`](Self::poll) rewinds to
+    /// `snd_una` and fast-retransmits the lost segment (before the RTO).
+    fast_retransmit: bool,
+
     cc: C,
 }
 
@@ -386,6 +420,8 @@ impl<C: CongestionControl + Default> Connection<C> {
         remote_port: u16,
         iss: u32,
     ) -> Connection<C> {
+        let mut cc = C::default();
+        cc.set_mss(DEFAULT_MSS);
         Connection {
             state: State::Closed,
             local_ip,
@@ -415,7 +451,8 @@ impl<C: CongestionControl + Default> Connection<C> {
             rto_deadline: None,
             rtt_probe: None,
             time_wait_deadline: None,
-            cc: C::default(),
+            fast_retransmit: false,
+            cc,
         }
     }
 }
@@ -434,6 +471,12 @@ impl<C: CongestionControl> Connection<C> {
     /// The current congestion controller (for inspection / N2b).
     pub fn congestion(&self) -> &C {
         &self.cc
+    }
+
+    /// The congestion controller, mutably - to configure a controller (e.g. warm-
+    /// start its cwnd/ssthresh) in the deterministic congestion-control proof.
+    pub fn congestion_mut(&mut self) -> &mut C {
+        &mut self.cc
     }
 
     /// The negotiated MSS (min of our default and the peer's advertised MSS).
@@ -548,6 +591,7 @@ impl<C: CongestionControl> Connection<C> {
     /// uses [`on_wire_segment`](Self::on_wire_segment), which decodes + verifies the
     /// checksum first.
     pub fn on_segment(&mut self, now: u64, seg: &Segment) {
+        self.cc.tick(now);
         if seg.flags & RST != 0 {
             // Minimal RST handling (N2a): drop the connection.
             self.state = State::Closed;
@@ -564,6 +608,7 @@ impl<C: CongestionControl> Connection<C> {
                     self.snd_wnd = seg.window as u32;
                     if let Some(m) = seg.mss {
                         self.mss = self.mss.min(m);
+                        self.cc.set_mss(self.mss);
                     }
                     self.state = State::SynRcvd;
                 }
@@ -576,6 +621,7 @@ impl<C: CongestionControl> Connection<C> {
                     self.snd_wnd = seg.window as u32;
                     if let Some(m) = seg.mss {
                         self.mss = self.mss.min(m);
+                        self.cc.set_mss(self.mss);
                     }
                     if seg.flags & ACK != 0 {
                         self.process_ack(now, seg.ack, seg.window);
@@ -593,6 +639,18 @@ impl<C: CongestionControl> Connection<C> {
 
         // Synchronised states: process the ack, then data, then FIN.
         if seg.flags & ACK != 0 {
+            // Duplicate-ACK detection (RFC 5681 §2): a pure ACK that doesn't advance
+            // `snd_una`, carries no data, leaves the window unchanged, and finds
+            // outstanding data. The 3rd such dup triggers fast retransmit. Compute
+            // this **before** `process_ack` overwrites `snd_wnd`.
+            let is_dup = seg.payload.is_empty()
+                && seg.flags & (SYN | FIN) == 0
+                && seq::lt(self.snd_una, self.snd_nxt)
+                && seg.ack == self.snd_una
+                && seg.window as u32 == self.snd_wnd;
+            if is_dup && self.cc.on_dup_ack() {
+                self.fast_retransmit = true;
+            }
             self.process_ack(now, seg.ack, seg.window);
         }
         if self.state == State::SynRcvd && self.snd_una == self.iss.wrapping_add(1) {
@@ -766,6 +824,7 @@ impl<C: CongestionControl> Connection<C> {
     /// immediate output) and, when it returns `None`, advances the clock to
     /// [`poll_at`](Self::poll_at).
     pub fn poll(&mut self, now: u64) -> Option<Vec<u8>> {
+        self.cc.tick(now);
         // TIME-WAIT expiry.
         if self.state == State::TimeWait
             && let Some(dl) = self.time_wait_deadline
@@ -786,6 +845,18 @@ impl<C: CongestionControl> Connection<C> {
             self.rto_ns = (self.rto_ns * 2).min(RTO_MAX); // exponential backoff
             self.cc.on_loss();
             self.rto_deadline = Some(now + self.rto_ns);
+        }
+
+        // Fast retransmit (3 dup ACKs): the CC already halved cwnd and entered fast
+        // recovery; rewind to `snd_una` so the data path resends the lost segment
+        // now, before the RTO would fire. No RTO backoff, no `on_loss` (distinct
+        // from the timeout path above).
+        if self.fast_retransmit {
+            self.fast_retransmit = false;
+            if seq::lt(self.snd_una, self.snd_nxt) {
+                self.snd_nxt = self.snd_una;
+                self.rtt_probe = None; // Karn: no RTT sample from a retransmit
+            }
         }
 
         // SYN (active open) / SYN-ACK (passive open).
