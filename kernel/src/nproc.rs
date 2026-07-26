@@ -199,6 +199,46 @@ pub fn spawn(
         }
     };
 
+    // Inherit the parent's cross-cell channel, if it has one (docs/LIBRHEO.md
+    // Phase J): map the same channel frames into the child RW and mint a channel
+    // capability into the shared bundle, so a spawned child streams its output to
+    // the parent over the Phase E channel (a spawned pipeline stage). The child
+    // gets the **opposite** role (parent consumer <-> child producer). Only a
+    // parent that holds a channel triggers this - an ordinary spawn is unchanged.
+    let (p_chan_va, p_role) = user::cell_chan(cur);
+    let child_chan = if p_chan_va != 0 {
+        // SAFETY: single CPU; the parent's address space is read (a page-table
+        // walk) and the child's is edited (published when the child is switched
+        // to). Both are uniquely owned for the trap.
+        let n = unsafe {
+            (*user::cell_aspace(cur)).share_rw_into(
+                &mut child_aspace,
+                p_chan_va as usize,
+                QueuePair::REGION_SIZE,
+            )
+        };
+        if n == 0 {
+            None
+        } else {
+            // SAFETY: as the qp-cap mint above - the shared tables are uniquely
+            // owned for the trap.
+            let cap = unsafe {
+                let objects = &mut *(objs_ptr as *mut ObjectTable);
+                let caps = &mut *caps_ptr;
+                let Ok(obj) = objects.create(ObjectKind::QueuePair) else {
+                    return u64::MAX;
+                };
+                match caps.mint(objects, obj, READ | WRITE, BUDGET_UNLIMITED) {
+                    Ok(h) => h.raw_low32(),
+                    Err(_) => return u64::MAX,
+                }
+            };
+            Some((p_chan_va, cap, p_role ^ 1))
+        }
+    } else {
+        None
+    };
+
     // Persist the child's kernel-owned storage.
     // SAFETY: single CPU; slot `child` is free, so these MaybeUninit cells are
     // unused and outlive the child's run.
@@ -226,6 +266,10 @@ pub fn spawn(
             load::USER_QUEUE_VA as u64,
             qp_cap_id,
         );
+    }
+    // Record the inherited channel so the child's `SYS_CONNECT` reports its end.
+    if let Some((va, cap, role)) = child_chan {
+        user::set_channel_info(child, va, cap, role);
     }
     procs()[child] = Proc {
         state: PState::Runnable,

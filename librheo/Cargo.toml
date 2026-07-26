@@ -79,6 +79,16 @@ path = "src/bin/librheo-gpu.rs"
 name = "librheo-ipc"
 path = "src/bin/librheo-ipc.rs"
 
+# Phase J: cross-cell stdout pipeline - an orchestrator spawns a producer child
+# that inherits its channel and streams its output back over the async channel.
+[[bin]]
+name = "librheo-pipe"
+path = "src/bin/librheo-pipe.rs"
+
+[[bin]]
+name = "librheo-pipesrc"
+path = "src/bin/librheo-pipesrc.rs"
+
 # The embedded proof - built `--no-default-features` to prove librheo scales down.
 [[bin]]
 name = "librheo-embed"

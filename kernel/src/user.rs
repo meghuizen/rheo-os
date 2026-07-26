@@ -765,6 +765,14 @@ pub fn set_channel_info(idx: usize, chan_va: u64, cap_id: u32, role: u64) {
     cells()[idx].chan_role = role;
 }
 
+/// This cell's cross-cell channel end as `(chan_va, role)` (0 = none)
+/// (docs/LIBRHEO.md Phase J). `nproc::spawn` reads it to propagate the parent's
+/// channel to a spawned child (the child gets the opposite role).
+pub fn cell_chan(idx: usize) -> (u64, u64) {
+    let c = cells()[idx];
+    (c.chan_va, c.chan_role)
+}
+
 /// Tag an installed cell with a syscall personality (call after `install`,
 /// before `run`). Native is the default; a Linux cell's traps are handled by
 /// `crate::linux` instead of the native dispatch.

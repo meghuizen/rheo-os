@@ -14,6 +14,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::ipc::{AsyncReceiver, AsyncSender, Channel};
 use crate::rt;
 use crate::sys;
 
@@ -78,6 +79,44 @@ pub fn spawn(path: &str, argv: &[&str], env: &[&str]) -> Result<Child, SpawnErro
     } else {
         Ok(Child { handle })
     }
+}
+
+/// A spawned child piped to this cell (docs/LIBRHEO.md Phase J). The child
+/// **inherits this cell's cross-cell channel** at spawn (the kernel maps the same
+/// frames into it, opposite role), so the child's streamed output flows to this
+/// cell over the Phase E channel - **not through the kernel** - and this cell
+/// reads it with [`rx`](Pipe::rx). [`tx`](Pipe::tx) sends acks / back-pressure to
+/// the child. Reap the child with `child.wait().await` once its stream is drained.
+pub struct Pipe {
+    /// The spawned producer child.
+    pub child: Child,
+    /// This (consumer) end's sender - acks / back-pressure to the child.
+    pub tx: AsyncSender,
+    /// This (consumer) end's receiver - the child's streamed output.
+    pub rx: AsyncReceiver,
+}
+
+/// Spawn `path` as a child whose output is **piped to this cell over the Phase E
+/// channel** (docs/LIBRHEO.md Phase J): a cross-cell stdout pipeline between a
+/// spawned cell and this one, built on the item-1 async `Sender`/`Receiver`. This
+/// cell must already hold a cross-cell channel (`SYS_CONNECT` - wired at connect
+/// time); the child inherits it at spawn with the opposite role. Returns a
+/// [`Pipe`] (the child handle + this end's async sender/receiver), or
+/// [`SpawnError`] (no channel wired, no spawn capability, ELF not found, cell
+/// table full).
+///
+/// **Honest scope** (single-CPU, docs/LIBRHEO.md Phase J): the pipe connects a
+/// spawned child to its **parent** cell (a valid `SYS_SWITCH` `cur^1` pair). Two
+/// *sibling* spawned stages (`a | b`, both children) as a directly-switched pair
+/// await a directed cross-cell switch / SMP (task #27) - the mechanism (channel
+/// inheritance + async `Sender`/`Receiver`) is the deliverable.
+pub fn spawn_piped(path: &str, argv: &[&str], env: &[&str]) -> Result<Pipe, SpawnError> {
+    // Bind this cell's channel end to the reactor (the async Sender/Receiver).
+    let ch = Channel::open().ok_or(SpawnError)?;
+    let (tx, rx) = ch.split();
+    // Spawn the child; the kernel maps this cell's channel into it (opposite role).
+    let child = spawn(path, argv, env)?;
+    Ok(Pipe { child, tx, rx })
 }
 
 // ------------------------------------------------------------------- args

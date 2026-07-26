@@ -935,6 +935,36 @@ The consumer asserts, in-guest, (a) the exact received sequence and (b)
 `rt::chan_wakeups() == 8` - i.e. **every** message arrived via a genuine reactor
 park + cross-cell wake, not a busy switch - then exits `0x42`.
 
+### Cross-cell stdout pipeline between spawned cells
+
+A spawned child's output flows to another cell over a Phase E channel - not
+through the kernel - built on the async `Sender`/`Receiver` above. **`SYS_SPAWN`
+now propagates the parent's channel to the child**: if the spawning cell holds a
+cross-cell channel, the kernel maps the *same* channel frames into the new child
+(RW, via `AddressSpace::share_rw_into` over the existing per-ISA leaf walk), mints
+a channel capability into the shared bundle, and records the child's channel end
+with the **opposite** role (parent consumer <-> child producer). No new kernel
+object - it composes the existing Cell (object 1) and QueuePair (object 3), the
+same machinery the harness uses to wire a Phase E channel, now inherited at spawn.
+librheo's `proc::spawn_piped` returns a `Pipe { child, tx, rx }`: the child streams
+its output over the async channel, the parent reads it with `rx` (acking with
+`tx`), then reaps the child.
+
+**Honest scope** (single-CPU): the pipe connects a spawned child to its **parent**
+- a valid `SYS_SWITCH` `cur^1` pair, so the async channel's cooperative
+cell-boundary hand-off works and the child frees the shared channel frames on exit
+*after* the parent has drained the stream (no double-free, no use-after-free). Two
+*sibling* spawned stages (`a | b`, both children in arbitrary slots) as a directly
+switched pair await a **directed** cross-cell switch / SMP (task #27); the
+mechanism - channel inheritance + async `Sender`/`Receiver` + reap-on-`wait` - is
+the deliverable, and the parent-as-consumer is a first-class pipeline stage.
+
+**Proof** (`librheopipe`, all three ISAs): an orchestrator cell (consumer)
+`spawn_piped`s `/bin/pipesrc` (producer) from a ramfs; the child inherits the
+channel and streams the 12 bytes `"ABCDEFGHIJKL"` back over the async `Sender`; the
+orchestrator reads them over the async `Receiver` (acking each), reaps the child,
+asserts it reconstructed exactly that stream, and exits `0x42`.
+
 What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
 
 - **Async-real**: the queue reactor (submit/doorbell/drain/complete), strand
@@ -966,9 +996,9 @@ What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
   #27), real **HBM/CXL/PMEM** (emulated on DDR)
   and NUMA (single-node), durability/latency **contracts** (advisory - no durable/
   RT backend in QEMU), a **first-class file/socket capability** (fds are `FileOps`
-  handles today), the **timer IRQ** and the **x86/arm UART RX IRQ**, **cross-cell
-  stdout pipelines** between spawned cells, and the full `term` editor + history
-  wired into `lrsh`. These are engineering, not redesign: every one has its seam
+  handles today), the **timer IRQ** and the **x86/arm UART RX IRQ**, and the full
+  `term` editor + history wired into `lrsh`. These are engineering, not redesign:
+  every one has its seam
   in place (the queue object, the grant object, the `ipc` channel, the interrupt
   path, the cooperative scheduler).
 

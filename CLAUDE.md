@@ -451,7 +451,18 @@ truly parallel producer/consumer awaits SMP #27) - honest. The `librheoipc` test
 runs one binary as two cells that **ping-pong 8 typed messages** over the async
 Sender/Receiver; the consumer asserts the exact sequence **and**
 `rt::chan_wakeups() == 8` (every message a genuine reactor park+wake, not a spin),
-exiting `0x42` on **all three ISAs**.
+exiting `0x42` on **all three ISAs**. **(2) Cross-cell stdout pipelines**:
+**`SYS_SPAWN` now propagates the parent's channel to the spawned child** (maps the
+same frames RW via `AddressSpace::share_rw_into`, mints a channel cap into the
+shared bundle, records the child's end with the opposite role - no new kernel
+object, it composes Cell + QueuePair). `proc::spawn_piped` returns a `Pipe {
+child, tx, rx }`: the child streams its output over the async channel (not through
+the kernel), the parent reads it with `rx`, then reaps the child. Honest: the pipe
+connects a spawned child to its **parent** (a valid `cur^1` pair; the child frees
+the shared frames on exit after the parent drained them); two sibling spawned
+stages await a directed switch/SMP (#27). The `librheopipe` test spawns
+`/bin/pipesrc`, which streams `"ABCDEFGHIJKL"` back over the inherited channel; the
+orchestrator reconstructs+verifies it and exits `0x42` on **all three ISAs**.
 
 **Phase F** closes librheo as a **complete foundation**: a native **process
 model**, **time**, a **librheo-native shell**, an **embedded** proof, and honest
@@ -670,7 +681,10 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               attach/set-scanout/transfer/flush round trip, headless-honest),
               librheoipc (librheo Phase J: symmetric async IPC - two cells
               ping-pong typed messages over the async Sender/Receiver, each recv
-              a genuine reactor park), bench-core, and the interactive
+              a genuine reactor park), librheopipe (librheo Phase J: a cross-cell
+              stdout pipeline - an orchestrator spawns a producer child that
+              inherits its channel and streams its output back), bench-core, and
+              the interactive
               lsh bin (+ harness.rs, vfs_personality.rs); fixtures/ holds the
               ext4 test image (+ gen-ext4.sh); linux-fixtures/ holds the
               built-from-source glibc test binaries (rusthello/ + rustthreads/
@@ -699,7 +713,9 @@ librheo/      the native userspace foundation library (docs/LIBRHEO.md):
               async Sender/Receiver on the reactor)/display (Phase E
               Surface/Compositor/InputEvent + Phase H Scanout/Gpu real GPU present
               over OP_GPU_PRESENT - docs/DISPLAY.md)/proc (Phase F spawn/wait/args/
-              env)/time (Phase F clock + async sleep/timeout)/net (Phase G raw-frame
+              env + Phase J spawn_piped: a spawned child inherits the parent's
+              channel as its stdout pipe)/time (Phase F clock + async
+              sleep/timeout)/net (Phase G raw-frame
               send/recv/mac over OP_NET_* - docs/NETWORKING.md) +
               crt0 (feature-gated: default=full, --no-default-features=embedded
               spine) + the librheo-demo (Phase A), librheo-data (Phase B
@@ -709,8 +725,10 @@ librheo/      the native userspace foundation library (docs/LIBRHEO.md):
               lrsh (the librheo-native shell), librheo-echo/librheo-child (native
               coreutils it spawns), librheo-embed (the embedded spine-only cell),
               librheo-net (Phase G ARP round trip over virtio-net), librheo-gpu
-              (Phase H virtio-gpu 2D present round trip), and librheo-ipc (Phase J
-              two-cell async Sender/Receiver ping-pong)
+              (Phase H virtio-gpu 2D present round trip), librheo-ipc (Phase J
+              two-cell async Sender/Receiver ping-pong), and librheo-pipe/
+              librheo-pipesrc (Phase J cross-cell stdout pipeline: a spawned
+              producer child streams its output to the parent over the channel)
               programs
 json/         rheo-json: a dependency-free, zero-copy JSON parser (scalar +
               SSE2 string-scan), no_std, host-tested + benchmarked
