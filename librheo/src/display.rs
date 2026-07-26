@@ -12,14 +12,21 @@
 //! compositor delivers [`InputEvent`]s (reusing the Phase D [`term`](crate::term)
 //! key type) to the focused client over an [`ipc::Channel`](crate::ipc::Channel).
 //!
-//! **Real GPU is deferred** (docs/DISPLAY.md): the framebuffer is in-memory, not
-//! a virtio-gpu scanout. The MECHANISM delivered here - a shared sealed buffer
-//! moved by capability delegation, a typed cross-cell present queue, a flip
-//! completion, and an input-event shape - is the deliverable; wiring it to a
-//! real display engine is future work.
+//! **Phase H adds a real GPU scanout path** (docs/DISPLAY.md, docs/LIBRHEO.md
+//! Phase H): [`Scanout`] / [`Gpu`] drive a real virtio-gpu 2D resource. A cell
+//! draws into a framebuffer grant and [`Scanout::present`]s it - an
+//! `OP_GPU_PRESENT` submission the kernel bridges to the virtio-gpu driver
+//! (copy into the resource, transfer to host, flush to scanout 0). The Phase E
+//! in-memory compositor path is unchanged (it still proves zero-copy cross-cell
+//! sharing); the GPU present is the added real-hardware step. QEMU runs headless
+//! in CI, so the proof is the genuine command round-trip (every 2D command
+//! returns `RESP_OK_*` from the real device model), not a visible pixel -
+//! visible output stays deferred, honestly (docs/DISPLAY.md).
 
 use crate::ipc::{self, Channel};
 use crate::mem::{Grant, MemKind};
+use crate::rt;
+use crate::sys;
 
 /// Bytes per pixel (packed 32-bit RGBA/XRGB - the compositor treats a pixel as
 /// an opaque `u32`).
@@ -203,5 +210,88 @@ impl Compositor {
         // in `result`, frame id echoed in `user_data`.
         ch.complete(frame.frame_id as u64, crate::sys::STATUS_OK, sum);
         (frame.frame_id, sum)
+    }
+}
+
+// ============================================================================
+// Real GPU scanout (docs/LIBRHEO.md Phase H, docs/DISPLAY.md). The virtio-gpu
+// 2D driver is a single-instance kernel resource; `OP_GPU_PRESENT` bridges a
+// cell's present to it. This is the added real-hardware step over the Phase E
+// in-memory compositor - the compositor can present its composited framebuffer
+// to a real display surface after building it.
+// ============================================================================
+
+/// The GPU present verb: submit one framebuffer to the virtio-gpu driver over
+/// the queue (`OP_GPU_PRESENT`) and await the completion. Low-level; most cells
+/// use [`Scanout`].
+pub struct Gpu;
+
+impl Gpu {
+    /// Present the `w x h` RGBA framebuffer at `buf_va` (a live cell VA): the
+    /// kernel copies it into the virtio-gpu resource, transfers it to the host,
+    /// and flushes it to scanout 0. Returns the byte count on success. `Err` if
+    /// no GPU is installed or a 2D command failed.
+    #[allow(clippy::result_unit_err)]
+    pub async fn present(buf_va: u64, w: u32, h: u32) -> Result<u32, ()> {
+        let mut a = [0u8; 24];
+        a[0..8].copy_from_slice(&buf_va.to_le_bytes());
+        a[8..12].copy_from_slice(&w.to_le_bytes());
+        a[12..16].copy_from_slice(&h.to_le_bytes());
+        let cqe = rt::submit_and_await(sys::OP_GPU_PRESENT, a).await;
+        if cqe.status == sys::STATUS_OK {
+            Ok(cqe.result)
+        } else {
+            Err(())
+        }
+    }
+}
+
+/// A client-side scanout surface backed by a framebuffer grant, presented to a
+/// real virtio-gpu resource. Draw into [`pixels_mut`](Scanout::pixels_mut), then
+/// [`present`](Scanout::present) to push the frame to the device. Unlike
+/// [`Surface`] (which delegates a sealed buffer to a compositor cell), this goes
+/// straight to the GPU driver.
+pub struct Scanout {
+    grant: Grant,
+    w: u32,
+    h: u32,
+}
+
+impl Scanout {
+    /// Allocate a `w x h` RGBA scanout (a committed DDR grant). `None` if the
+    /// kernel refuses the grant.
+    pub fn new(w: u32, h: u32) -> Option<Scanout> {
+        let len = w as usize * h as usize * BYTES_PER_PIXEL;
+        let grant = Grant::alloc(MemKind::Ddr, len)?;
+        Some(Scanout { grant, w, h })
+    }
+
+    pub fn width(&self) -> u32 {
+        self.w
+    }
+    pub fn height(&self) -> u32 {
+        self.h
+    }
+
+    /// The pixel buffer as a mutable `u32` slice.
+    pub fn pixels_mut(&mut self) -> &mut [u32] {
+        let n = self.w as usize * self.h as usize;
+        // SAFETY: the committed, unsealed grant holds `n` u32s at its base.
+        unsafe { core::slice::from_raw_parts_mut(self.grant.base() as *mut u32, n) }
+    }
+
+    /// The content fingerprint of the current pixels.
+    pub fn checksum(&self) -> u32 {
+        let n = self.w as usize * self.h as usize;
+        // SAFETY: the committed grant holds `n` u32s at its base.
+        let px = unsafe { core::slice::from_raw_parts(self.grant.base() as *const u32, n) };
+        checksum(px)
+    }
+
+    /// Present the current frame to the real GPU scanout (transfer + flush).
+    /// Returns the byte count on success.
+    #[allow(clippy::result_unit_err)]
+    pub async fn present(&self) -> Result<u32, ()> {
+        Gpu::present(self.grant.base() as u64, self.w, self.h).await
     }
 }

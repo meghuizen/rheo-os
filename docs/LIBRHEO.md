@@ -805,7 +805,67 @@ grants, **header/payload split**, and the **device RX interrupt** - all document
 in docs/NETWORKING.md. The mechanism (a NIC driver + typed async raw-frame queue
 opcodes) is the deliverable; the stack rides on it.
 
-## Final honest accounting - the whole librheo A-G
+## Phase H - a real GPU: virtio-gpu 2D driver + compositor scanout
+
+Phase E delivered the compositor **mechanism** (a sealed buffer moved zero-copy
+between cells + a flip completion) with an **in-memory** framebuffer. Phase H
+adds the **real display engine**: a virtio-gpu 2D driver that presents a client
+frame to a (QEMU) display surface - keeping VIRGL/3D and the full display
+pipeline deferred (docs/DISPLAY.md).
+
+### Kernel surface added (Phase H)
+
+- A hand-written **virtio-gpu 2D driver** (`kernel/src/hw/virtio_gpu.rs`, the
+  plain 2D / VIRGL-off subset of virtio spec 5.7), the exact virtio-net/blk
+  template over **two transports** - virtio-mmio on arm/riscv `virt`, virtio-pci
+  on x86-64 q35 (through the `VIRTIO_PCI_CAP_PCI_CFG` config tunnel, no BAR
+  mapping). Reset + **minimal** feature negotiation (`VIRTIO_F_VERSION_1` only -
+  no VIRGL, no EDID), a single **controlq**; every 2D command is a
+  `virtio_gpu_ctrl_hdr` + body submitted as a **2-descriptor chain**
+  (`[readable command][writable response]`, the virtio-blk request/status shape),
+  polled for its response code. The bring-up is `GET_DISPLAY_INFO` ->
+  `RESOURCE_CREATE_2D` (resource 1, `B8G8R8A8_UNORM`, **128x128**) ->
+  `RESOURCE_ATTACH_BACKING` (a kernel-side framebuffer of **16 frame-pool
+  frames**, attached as **one `virtio_gpu_mem_entry` per frame** - so no
+  contiguous alloc is needed) -> `SET_SCANOUT` (scanout 0); a present is
+  `TRANSFER_TO_HOST_2D` + `RESOURCE_FLUSH`. All rings/buffers/framebuffer come
+  from the frame pool (the only static is a small `Option<VirtioGpu>`); DMA uses
+  **physical** addresses (`virt_to_phys`).
+- One **queue opcode** (`OP_GPU_PRESENT`, no new kernel object - it extends the
+  queue object 3 with a mechanism) bridges a cell's async present to the driver
+  in `kernel_process`, completing with the strand token - the same async model as
+  the Phase B `io` and Phase G `net` opcodes. The framebuffer VA in the payload is
+  the cell's own mapped memory (its address space is active during the drain); the
+  kernel copies it into the resource's kernel-side framebuffer, then transfers +
+  flushes.
+
+### librheo module (Phase H)
+
+`display` gains `Gpu` (the `OP_GPU_PRESENT` verb) and `Scanout` (a client
+drawable backed by a framebuffer grant: draw into `pixels_mut`, then
+`present().await`, which pushes the frame to the real device). The Phase E
+in-memory `Compositor` is **unchanged** - it still composites a shared sealed
+buffer and checksums it (the zero-copy cross-cell proof); the GPU present is the
+added real-hardware step a compositor can take after building its framebuffer.
+
+### Proof + honesty (Phase H)
+
+The `librheogpu` test kernel (all three ISAs): a librheo cell draws a known
+128x128 RGBA pattern into a framebuffer grant and `present`s it; the kernel runs
+the full create-2d -> attach -> set-scanout -> transfer -> flush sequence and the
+cell exits `0x42`. CI runs QEMU **headless** (`-display none`), exactly as the
+virtio-net proof is network-free, so there is no monitor to assert a pixel
+against. The proof is the **genuine driver round-trip**: every 2D command returns
+its expected `RESP_OK_*` from the real QEMU device model. Measured, **all six
+commands return OK** on all three ISAs (`GET_DISPLAY_INFO` reports QEMU's default
+1280x800 even headless; then create-2d, attach, set-scanout, transfer, flush) -
+the test prints the per-command report (the honest surface) and asserts the cell's
+`0x42`. This does **not** claim visible output. Deferred: real VIRGL/3D, the
+cursor plane, multi-scanout, EDID/mode negotiation, vsync-interrupt -> typed
+event, and an actual visible framebuffer - the 2D scanout command round-trip +
+the compositor present wiring is the deliverable (docs/DISPLAY.md 12).
+
+## Final honest accounting - the whole librheo A-H
 
 librheo is now a **complete native userspace foundation** (docs/ARCHITECTURE.md's
 10-object model expressed as a Rust library a program links). A program today can:
@@ -836,6 +896,10 @@ librheo is now a **complete native userspace foundation** (docs/ARCHITECTURE.md'
 - send and receive **raw Ethernet frames** over a real virtio-net NIC (`net`:
   `mac`/`send`/`recv` over `OP_NET_*` queue opcodes) - the NIC data path; the
   IP/TCP stack is a service - **Phase G**.
+- present a framebuffer to a **real GPU** over a virtio-gpu 2D driver
+  (`display`: `Scanout`/`Gpu` over the `OP_GPU_PRESENT` queue opcode - create-2d
+  -> attach -> set-scanout -> transfer -> flush); VIRGL/3D and the full display
+  pipeline stay deferred - **Phase H**.
 
 What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
 
@@ -855,8 +919,11 @@ What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
   SMP work); the **console UART RX is interrupt-driven on riscv64 (AIA) and aarch64
   (GICv3)** - a genuine `wfi` park - and stays a **poll on x86-64** (its QEMU TCG +
   split-irqchip IOAPIC/LAPIC does not re-deliver reliably; documented, honest).
-- **Deferred (documented)**: a **real GPU** (virtio-gpu scanout; the compositor
-  framebuffer is in-memory), the **full network stack** (Phase G lands the NIC
+- **Deferred (documented)**: **real VIRGL/3D + the full display pipeline** (Phase
+  H lands the virtio-gpu 2D scanout round-trip - create-2d/attach/set-scanout/
+  transfer/flush + `display::Scanout` present; the cursor plane, multi-scanout,
+  EDID/mode negotiation, vsync-interrupt -> typed event, and a visible framebuffer
+  stay future work), the **full network stack** (Phase G lands the NIC
   data path - a virtio-net driver + raw-frame `net::send`/`recv`/`mac`; IP/TCP/QUIC
   stays a service/transport-library in a cell, plus a socket object + a device RX
   interrupt), **SMP** secondary-core bring-up +
@@ -870,7 +937,7 @@ What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
   in place (the queue object, the grant object, the `ipc` channel, the interrupt
   path, the cooperative scheduler).
 
-librheo A-G is proven by **seven in-QEMU test kernels on all three ISAs**
+librheo A-H is proven by **eight in-QEMU test kernels on all three ISAs**
 (`librhearun`, `librheodata`, `librheocompute`, `librheoterm`, `librheowl`,
-`librheoproc`, `librheonet`), each asserting exact behaviour, kept green alongside
-the whole suite (30 kernels x 3 ISAs).
+`librheoproc`, `librheonet`, `librheogpu`), each asserting exact behaviour, kept
+green alongside the whole suite (31 kernels x 3 ISAs).

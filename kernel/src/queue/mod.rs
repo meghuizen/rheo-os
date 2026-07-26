@@ -86,6 +86,14 @@ pub const OP_NET_RX: u8 = 9;
 /// `net_mac(buf_va)`: payload `[buf_va u64@0]`; writes the 6-byte MAC at `buf_va`,
 /// `result` = 6.
 pub const OP_NET_MAC: u8 = 10;
+// ---- GPU present opcode (docs/LIBRHEO.md Phase H, docs/DISPLAY.md) ----
+/// `gpu_present(buf_va, w, h)`: payload `[buf_va u64@0][w u32@8][h u32@12]`. The
+/// compositor's `w x h` RGBA framebuffer at `buf_va` (the cell's own mapped
+/// memory) is copied into the virtio-gpu resource, transferred to the host, and
+/// flushed to scanout 0. `result` = bytes presented. Writes to the device, so it
+/// needs WRITE (the `opcode_right` default). Extends the queue object (object 3)
+/// with a mechanism - no new kernel object (ARCHITECTURE.md 6).
+pub const OP_GPU_PRESENT: u8 = 11;
 
 /// `SqEntry.flags` bit: the op's data rides inline in the payload rather than
 /// by reference at `buf_va` (docs/IO.md 1 - the inline-vs-by-reference
@@ -610,6 +618,14 @@ fn run_opcode(entry: &SqEntry) -> (u32, u32) {
         OP_NET_MAC => {
             let buf_va = rd_u64(p, 0);
             crate::hw::virtio_net::mac(buf_va)
+        }
+        // GPU 2D present (docs/LIBRHEO.md Phase H): bridge to the virtio-gpu
+        // driver. The VA is the cell's own mapped framebuffer.
+        OP_GPU_PRESENT => {
+            let buf_va = rd_u64(p, 0);
+            let w = rd_u32(p, 8);
+            let h = rd_u32(p, 12);
+            crate::hw::virtio_gpu::present(buf_va, w, h)
         }
         _ => (STATUS_BAD_OPCODE, 0),
     }

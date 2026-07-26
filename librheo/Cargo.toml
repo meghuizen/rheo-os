@@ -68,6 +68,11 @@ path = "src/bin/lrsh.rs"
 name = "librheo-net"
 path = "src/bin/librheo-net.rs"
 
+# Phase H: a real GPU scanout over a virtio-gpu 2D driver (present round trip).
+[[bin]]
+name = "librheo-gpu"
+path = "src/bin/librheo-gpu.rs"
+
 # The embedded proof - built `--no-default-features` to prove librheo scales down.
 [[bin]]
 name = "librheo-embed"

@@ -398,6 +398,11 @@ pub const OP_GRAPH_SUBMIT: u8 = 7;
 pub const OP_NET_TX: u8 = 8;
 pub const OP_NET_RX: u8 = 9;
 pub const OP_NET_MAC: u8 = 10;
+/// GPU 2D present (docs/LIBRHEO.md Phase H, docs/DISPLAY.md). See `display` for
+/// the typed layer. Payload `[buf_va u64@0][w u32@8][h u32@12]`: presents the
+/// cell's `w x h` RGBA framebuffer through the virtio-gpu driver (copy into the
+/// resource, transfer to host, flush to scanout); `result` = bytes presented.
+pub const OP_GPU_PRESENT: u8 = 11;
 /// `SqEntry.flags` bit: the op's data rides inline in the payload (IO.md 1).
 pub const FLAG_INLINE: u8 = 1 << 0;
 /// Durability-class flag bits (docs/IO.md). Advisory: the kernel ignores them

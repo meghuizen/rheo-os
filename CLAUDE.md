@@ -499,6 +499,37 @@ sender IP and exiting `0x42`. Deferred: the full transport stack (IP/TCP/QUIC/TL
 in a cell), a socket `ObjectKind` + steering grants, header/payload split, and the
 device RX interrupt. **librheo A-G is complete.**
 
+**Phase H** brings up a **real GPU: a virtio-gpu 2D driver wired to the Phase E
+compositor** (docs/DISPLAY.md, LIBRHEO.md Phase H); VIRGL/3D and the full display
+pipeline stay deferred. A hand-written **virtio-gpu 2D driver**
+(`kernel/src/hw/virtio_gpu.rs`, the plain 2D / VIRGL-off subset of virtio spec
+5.7) mirrors virtio-net/blk over the **two transports** - virtio-mmio on
+arm/riscv `virt`, virtio-pci on x86-64 q35 (via the `VIRTIO_PCI_CAP_PCI_CFG`
+config tunnel, no BAR mapping) - with reset + **minimal** feature negotiation
+(`VIRTIO_F_VERSION_1` only; no VIRGL/EDID), a single **controlq**, and every 2D
+command a `virtio_gpu_ctrl_hdr` + body submitted as a **2-descriptor chain**
+(`[readable command][writable response]`, the virtio-blk request/status shape)
+polled for its `RESP_OK_*` code. Bring-up: `GET_DISPLAY_INFO` -> `CREATE_2D`
+(resource 1, `B8G8R8A8_UNORM`, **128x128**) -> `ATTACH_BACKING` (a kernel-side
+framebuffer of **16 frame-pool frames**, one `virtio_gpu_mem_entry` per frame, so
+no contiguous alloc is needed) -> `SET_SCANOUT` (scanout 0); a present is
+`TRANSFER_TO_HOST_2D` + `RESOURCE_FLUSH`. All rings/buffers/framebuffer come from
+the frame pool (only static is a small `Option<VirtioGpu>`); DMA by **physical**
+address (`virt_to_phys`). One **queue opcode** (`OP_GPU_PRESENT`, no new kernel
+object - it extends the queue object with a mechanism) bridges a cell's async
+present to the driver in `kernel_process`, copying the cell's framebuffer into the
+resource then transfer+flush. librheo's **`display`** gained `Gpu`/`Scanout` (draw
+into a framebuffer grant, `present().await` to the real device); the Phase E
+in-memory `Compositor` is unchanged (still proves zero-copy). The `librheogpu`
+test proves it on **all three ISAs**: a librheo cell draws a known 128x128 RGBA
+frame and presents it, exiting `0x42`. QEMU runs **headless** (`-display none`),
+so - like virtio-net's network-free ARP proof - the proof is the **genuine driver
+round-trip**: **all six 2D commands return OK** from the real device model
+(`GET_DISPLAY_INFO` reports QEMU's default 1280x800 even headless; then create-2d,
+attach, set-scanout, transfer, flush). No claim of visible output; the 2D scanout
+command round-trip + compositor present wiring is the deliverable. **librheo A-H
+is complete.**
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
 proofs, and the hardware-lab performance numbers. **SMP secondary-core
@@ -559,7 +590,8 @@ kernel/       the no_std kernel library + boot demo bin
               (shell/resource/POSIX-file syscalls), hw (ACPI/FDT/PCIe
               discovery + the machine Inventory; block BlockDevice trait +
               virtio_blk driver; virtio_net raw-frame NIC driver -
-              docs/NETWORKING.md), elf + load (ELF loader for native
+              docs/NETWORKING.md; virtio_gpu 2D display driver -
+              docs/DISPLAY.md), elf + load (ELF loader for native
               programs), user run loop (with per-cell syscall
               personalities), nproc (native process model: SYS_SPAWN/WAIT +
               cooperative cross-cell scheduler - docs/LIBRHEO.md Phase F),
@@ -603,7 +635,10 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               F: native spawn/wait + one-shot timer + the lrsh shell + the
               embedded spine-only cell), librheonet (librheo Phase G: raw-frame
               networking - virtio-net driver + net::send/recv/mac, an ARP round
-              trip via SLIRP), bench-core, and the interactive
+              trip via SLIRP), librheogpu (librheo Phase H: a real GPU -
+              virtio-gpu 2D driver + display::Scanout present, the create-2d/
+              attach/set-scanout/transfer/flush round trip, headless-honest),
+              bench-core, and the interactive
               lsh bin (+ harness.rs, vfs_personality.rs); fixtures/ holds the
               ext4 test image (+ gen-ext4.sh); linux-fixtures/ holds the
               built-from-source glibc test binaries (rusthello/ + rustthreads/
@@ -629,8 +664,9 @@ librheo/      the native userspace foundation library (docs/LIBRHEO.md):
               GraphBuilder)/sched (Reservation + lattice-rt Priority/PeriodicTask/
               TimingReport)/term (Phase D byte-stream input/edit/render)/ipc
               (Phase E cross-cell Channel + sealed-buffer share)/display (Phase E
-              Surface/Compositor/InputEvent)/proc (Phase F spawn/wait/args/env)/
-              time (Phase F clock + async sleep/timeout)/net (Phase G raw-frame
+              Surface/Compositor/InputEvent + Phase H Scanout/Gpu real GPU present
+              over OP_GPU_PRESENT - docs/DISPLAY.md)/proc (Phase F spawn/wait/args/
+              env)/time (Phase F clock + async sleep/timeout)/net (Phase G raw-frame
               send/recv/mac over OP_NET_* - docs/NETWORKING.md) +
               crt0 (feature-gated: default=full, --no-default-features=embedded
               spine) + the librheo-demo (Phase A), librheo-data (Phase B
@@ -639,7 +675,8 @@ librheo/      the native userspace foundation library (docs/LIBRHEO.md):
               compositor demo), Phase F: librheo-orch (spawn/wait/timer proof),
               lrsh (the librheo-native shell), librheo-echo/librheo-child (native
               coreutils it spawns), librheo-embed (the embedded spine-only cell),
-              and librheo-net (Phase G ARP round trip over virtio-net)
+              librheo-net (Phase G ARP round trip over virtio-net), and librheo-gpu
+              (Phase H virtio-gpu 2D present round trip)
               programs
 json/         rheo-json: a dependency-free, zero-copy JSON parser (scalar +
               SSE2 string-scan), no_std, host-tested + benchmarked

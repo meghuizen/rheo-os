@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 30] = [
+const TEST_KERNELS: [&str; 31] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -52,6 +52,7 @@ const TEST_KERNELS: [&str; 30] = [
     "linuxdyn",
     "librheoproc",
     "librheonet",
+    "librheogpu",
 ];
 
 /// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
@@ -113,6 +114,19 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "-device",
             "virtio-net-pci,netdev=n0,disable-legacy=on",
         ],
+        // librheogpu (docs/LIBRHEO.md Phase H, docs/DISPLAY.md): a virtio-gpu 2D
+        // device the driver brings up and presents to. QEMU runs headless
+        // (`-display none` is added for every test kernel in `boot_expect_pass`),
+        // so the proof is the genuine 2D command round-trip, not a visible pixel.
+        // Same two transports as blockfs: virtio-mmio on arm/riscv, virtio-pci on
+        // x86 (disable-legacy=on pins the modern layout the driver expects).
+        ("librheogpu", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-device",
+            "virtio-gpu-device",
+        ],
+        ("librheogpu", Arch::X86_64) => &["-device", "virtio-gpu-pci,disable-legacy=on"],
         _ => &[],
     }
 }
