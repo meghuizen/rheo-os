@@ -978,13 +978,22 @@ struct DescPtr {
     base: u64,
 }
 
-static mut SYSCALL_KSTACK: [u8; 64 * 1024] = [0; 64 * 1024];
+// The SYSCALL dispatch runs on this stack. Unlike a hardware interrupt/
+// exception (which the CPU auto-aligns to 16 bytes when loading RSP from the
+// TSS), SYSCALL does not touch RSP, so KERNEL_RSP must itself be 16-byte
+// aligned or the SysV ABI is violated and SSE spills in the Rust dispatch
+// (core::fmt) corrupt. A bare `[u8; _]` is only align-1, so its top address
+// was 16-aligned only by luck of the .bss layout - any code motion shifting
+// it to an odd offset re-triggered the corruption. Force the alignment.
+#[repr(align(16))]
+struct SyscallKStack([u8; 64 * 1024]);
+static mut SYSCALL_KSTACK: SyscallKStack = SyscallKStack([0; 64 * 1024]);
 
 /// Set up ring 3: a full GDT with user segments and a TSS, then the
 /// SYSCALL/SYSRET MSRs. Called from paging_kernel_init.
 pub(super) fn user_init() {
     unsafe {
-        let kstack_top = core::ptr::addr_of!(SYSCALL_KSTACK) as u64 + (64 * 1024);
+        let kstack_top = core::ptr::addr_of!(SYSCALL_KSTACK.0) as u64 + (64 * 1024);
         *core::ptr::addr_of_mut!(KERNEL_RSP) = kstack_top;
 
         let tss = &mut *core::ptr::addr_of_mut!(TSS);
