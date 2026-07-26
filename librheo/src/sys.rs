@@ -403,6 +403,11 @@ pub const OP_NET_MAC: u8 = 10;
 /// cell's `w x h` RGBA framebuffer through the virtio-gpu driver (copy into the
 /// resource, transfer to host, flush to scanout); `result` = bytes presented.
 pub const OP_GPU_PRESENT: u8 = 11;
+/// Async cross-cell channel message (docs/LIBRHEO.md Phase J). Carried over a
+/// **shared** channel ring the kernel never processes (the two cells drive the
+/// SPSC rings directly), so this opcode is a convention between the two ends, not
+/// a `kernel_process` handler. `ipc::AsyncSender`/`AsyncReceiver` use it.
+pub const OP_CHAN_MSG: u8 = 12;
 /// `SqEntry.flags` bit: the op's data rides inline in the payload (IO.md 1).
 pub const FLAG_INLINE: u8 = 1 << 0;
 /// Durability-class flag bits (docs/IO.md). Advisory: the kernel ignores them

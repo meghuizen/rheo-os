@@ -901,6 +901,40 @@ librheo is now a **complete native userspace foundation** (docs/ARCHITECTURE.md'
   -> attach -> set-scanout -> transfer -> flush); VIRGL/3D and the full display
   pipeline stay deferred - **Phase H**.
 
+## Phase J - the librheo polish trio (this milestone)
+
+Three documented refinements of Phases E/F, moved from the deferred/refinement
+lists to done. Additive userspace polish - no new kernel object or verb.
+
+### Symmetric async IPC channel (`Sender`/`Receiver` on the reactor)
+
+Phase E's cross-cell `ipc::Channel` is synchronous: `recv`/`await_completion`
+**spin** on `switch_to_peer` (the two cells busy-toggle the CPU with no other work
+done). Phase J adds the documented refinement **alongside** it (the sync channel
+stays - the compositor uses it): `Channel::split()` yields a fully symmetric async
+`AsyncSender`/`AsyncReceiver` that **park on the strand reactor**. The reactor
+grows a channel slot (`rt::attach_channel`/`chan_send`/`chan_recv`, mirroring the
+console/timer/wait slots): a strand that `recv`s parks on a token, the vcore runs
+the cell's **other strands**, and only when they have all parked does `block_on`'s
+idle path hand the CPU to the peer (`SYS_SWITCH`) and, on return, deliver the
+message by completing the parked token. The SPSC shared-ring substrate is
+unchanged (a message is still a pure shared-memory write over the Phase E channel
+frames); **only the waiting changed** - park on the reactor vs. spin on `switch`.
+
+**Honest**: the *in-cell* wait is a genuine reactor park (sibling strands run
+while a strand awaits IPC - proven, see below); the *cell-boundary* hand-off is
+still one cooperative `SYS_SWITCH` under the single-CPU model. A truly parallel
+producer and consumer running on two cores awaits SMP (task #27). `Message { tag,
+val }` travels losslessly in both directions (the SQ payload one way, the CQ
+`user_data`+`result` the other), so the API is symmetric regardless of end.
+
+**Proof** (`librheoipc`, all three ISAs): one binary run as two cells sharing a
+typed channel (mirroring `librheowl`); a producer strand (client) and a consumer
+strand (server) **ping-pong 8 typed messages** over the async `Sender`/`Receiver`.
+The consumer asserts, in-guest, (a) the exact received sequence and (b)
+`rt::chan_wakeups() == 8` - i.e. **every** message arrived via a genuine reactor
+park + cross-cell wake, not a busy switch - then exits `0x42`.
+
 What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
 
 - **Async-real**: the queue reactor (submit/doorbell/drain/complete), strand
@@ -911,9 +945,10 @@ What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
   send/recv** (`OP_NET_*` completions over a real virtio-net NIC; RX is polled).
 - **Sync-translated / cooperative** (single-CPU, honest): the **timer is now
   interrupt-driven on all three ISAs** (riscv Sstc, aarch64 CNTV, x86-64 LAPIC LVT
-  - a genuine 0%-CPU park); the cross-cell IPC channel is synchronous with an
-  explicit peer hand-off (a fully symmetric async `Sender`/`Receiver` is the
-  documented refinement); parallel `compute` strands **interleave** on one CPU
+  - a genuine 0%-CPU park); the cross-cell IPC channel now has a **fully symmetric
+  async `Sender`/`Receiver`** (Phase J: it parks on the reactor - the in-cell wait
+  is a genuine park, only the cell-boundary hand-off stays a cooperative
+  `SYS_SWITCH`); parallel `compute` strands **interleave** on one CPU
   rather than run on separate cores; reservations are **admitted** (the EDF math is
   real and refuses over-commit) but not yet **scheduled** (run-queue enforcement is
   SMP work); the **console UART RX is interrupt-driven on riscv64 (AIA) and aarch64
@@ -928,7 +963,7 @@ What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
   stays a service/transport-library in a cell, plus a socket object + a device RX
   interrupt), **SMP** secondary-core bring-up +
   work-stealing + reservation enforcement + **priority-inheritance** locks (task
-  #27), a **symmetric async IPC channel**, real **HBM/CXL/PMEM** (emulated on DDR)
+  #27), real **HBM/CXL/PMEM** (emulated on DDR)
   and NUMA (single-node), durability/latency **contracts** (advisory - no durable/
   RT backend in QEMU), a **first-class file/socket capability** (fds are `FileOps`
   handles today), the **timer IRQ** and the **x86/arm UART RX IRQ**, **cross-cell

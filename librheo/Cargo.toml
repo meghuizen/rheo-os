@@ -73,6 +73,12 @@ path = "src/bin/librheo-net.rs"
 name = "librheo-gpu"
 path = "src/bin/librheo-gpu.rs"
 
+# Phase J: symmetric async IPC - two cells ping-pong typed messages over the
+# async Sender/Receiver, parking on the reactor (no busy switch).
+[[bin]]
+name = "librheo-ipc"
+path = "src/bin/librheo-ipc.rs"
+
 # The embedded proof - built `--no-default-features` to prove librheo scales down.
 [[bin]]
 name = "librheo-embed"

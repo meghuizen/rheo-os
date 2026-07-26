@@ -140,6 +140,10 @@ name = "librheogpu"
 path = "src/librheogpu.rs"
 
 [[bin]]
+name = "librheoipc"
+path = "src/librheoipc.rs"
+
+[[bin]]
 name = "smp"
 path = "src/smp.rs"
 required-features = ["smp"]

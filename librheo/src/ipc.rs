@@ -16,14 +16,20 @@
 //! equivalent. The client fills+seals a buffer, shares it, sends the handle over
 //! the channel; the server reads the same frames with no copy.
 //!
-//! **Scope (honest).** The channel is synchronous with an explicit peer hand-off
-//! (`recv`/`await_completion` loop over `switch`); folding it into the strand
-//! reactor as a park-on-channel-completion (a fully symmetric async `Sender<T>`/
-//! `Receiver<T>`) is the documented refinement. Spawn-driven connect (a cell
-//! spawning its peer and exchanging the channel cap) is Phase F; here the test
-//! kernel wires the two cells and their shared channel.
+//! **Scope (honest).** The synchronous [`Channel`] is an explicit peer hand-off
+//! (`recv`/`await_completion` loop over `switch`) - Phase E's compositor uses it.
+//! **Phase J** adds the documented refinement alongside it: [`Channel::split`]
+//! yields a fully symmetric async [`AsyncSender`]/[`AsyncReceiver`] that **park
+//! on the strand reactor** (docs/LIBRHEO.md Phase J). Two cells' strands then
+//! exchange messages without either busy-switching: the in-cell wait is a genuine
+//! reactor park (sibling strands run while a strand awaits), and only the
+//! cell-boundary hand-off remains a cooperative `switch` under the single-CPU
+//! model (a true parallel producer/consumer awaits SMP, task #27 - honest).
+//! Spawn-driven connect (a cell spawning its peer and exchanging the channel cap)
+//! is Phase F; here the test kernel wires the two cells and their shared channel.
 
 use crate::mem::Grant;
+use crate::rt;
 use crate::sys::{self, CqEntry, Qp, SqEntry};
 
 /// Channel role: the initiator (SQ producer, CQ consumer).
@@ -38,6 +44,7 @@ pub struct Channel {
     qp: Qp,
     cap_id: u32,
     role: u64,
+    chan_va: u64,
 }
 
 impl Channel {
@@ -52,7 +59,22 @@ impl Channel {
             qp,
             cap_id: info.cap_id as u32,
             role: info.role,
+            chan_va: info.chan_va,
         })
+    }
+
+    /// Split into a symmetric async [`AsyncSender`] + [`AsyncReceiver`] that
+    /// **park on the strand reactor** instead of spinning on
+    /// [`switch_to_peer`](Self::switch_to_peer) (docs/LIBRHEO.md Phase J). Binds
+    /// this end's ring to the reactor; both halves then drive it. This is the
+    /// documented refinement of the synchronous [`Channel`]: two cells' strands
+    /// exchange messages without either busy-switching - the in-cell wait is a
+    /// genuine reactor park (sibling strands run meanwhile), only the
+    /// cell-boundary hand-off stays a cooperative switch under the single-CPU
+    /// model. Consumes the channel (the async halves own it from here).
+    pub fn split(self) -> (AsyncSender, AsyncReceiver) {
+        rt::attach_channel(self.chan_va, self.role, self.cap_id);
+        (AsyncSender { _priv: () }, AsyncReceiver { _priv: () })
     }
 
     /// This end's role (`ROLE_CLIENT` / `ROLE_SERVER`).
@@ -160,6 +182,50 @@ pub fn share(grant: &Grant) -> Option<SharedBuffer> {
         peer_va: info.peer_va,
         peer_cap_id: info.peer_cap_id as u32,
     })
+}
+
+// ------------------------------------------------- symmetric async channel
+
+/// A typed message carried over the async channel (docs/LIBRHEO.md Phase J):
+/// an application `tag` (the SPSC entry's `user_data`) and a `val` word. Both
+/// travel losslessly in each direction (the SQ payload / the CQ `user_data` +
+/// `result`), so the API is symmetric regardless of which end sends.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct Message {
+    pub tag: u64,
+    pub val: u32,
+}
+
+/// The sending half of a [`Channel::split`] (docs/LIBRHEO.md Phase J). `send`
+/// enqueues on this end's producer ring and parks on the reactor only if the
+/// ring is momentarily full - never a busy switch.
+pub struct AsyncSender {
+    _priv: (),
+}
+
+impl AsyncSender {
+    /// Send `msg` to the peer cell. Parks (yielding the vcore to sibling
+    /// strands) only if the ring is full; the reactor completes it when the peer
+    /// drains space.
+    pub async fn send(&self, msg: Message) {
+        rt::chan_send(msg.tag, msg.val).await
+    }
+}
+
+/// The receiving half of a [`Channel::split`] (docs/LIBRHEO.md Phase J). `recv`
+/// always parks on the reactor and is woken by the reactor's channel service -
+/// an idle receiver costs no spin, and the wakeup is genuinely reactor-driven.
+pub struct AsyncReceiver {
+    _priv: (),
+}
+
+impl AsyncReceiver {
+    /// Receive one [`Message`] from the peer cell, parking on the reactor until
+    /// it arrives. While parked the vcore runs the cell's other strands.
+    pub async fn recv(&self) -> Message {
+        let (tag, val) = rt::chan_recv().await;
+        Message { tag, val }
+    }
 }
 
 /// View a peer's delegated buffer as a read-only byte slice - the receiving end

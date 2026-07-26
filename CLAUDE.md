@@ -432,11 +432,26 @@ read-only (zero-copy - same frames), composites it, and returns a flip completio
 carrying its checksum; the client asserts that checksum **equals its own known
 value** (`0x3eb4f800`) - proving zero-copy cross-cell sharing - and exits `0x42`
 on **all three ISAs**. Honest: zero-copy is real (the only copy is the
-compositor's own composite into its framebuffer); the channel is synchronous with
-an explicit peer hand-off (a fully-symmetric async `Sender`/`Receiver` parking on
-the reactor is the documented refinement); spawn-driven connect is Phase F; real
+compositor's own composite into its framebuffer); the synchronous channel is an
+explicit peer hand-off (the compositor uses it); a **fully-symmetric async
+`Sender`/`Receiver` parking on the reactor** is now done as **Phase J** (below);
+spawn-driven connect is Phase F; real
 GPU (virtio-gpu scanout) is deferred - the mechanism (shared sealed buffer + typed
 present queue + flip completion + input-event shape) is the deliverable.
+
+A **Phase J polish trio** refines librheo Phases E/F (additive userspace, no new
+kernel object). **(1) Symmetric async IPC**: `ipc::Channel::split()` yields an
+async `AsyncSender`/`AsyncReceiver` that **park on the strand reactor** (a channel
+slot in `rt`, mirroring the console/timer/wait slots) instead of spinning on
+`switch_to_peer`. A strand that `recv`s parks, the vcore runs the cell's other
+strands, and only when all have parked does `block_on` hand the CPU to the peer
+(`SYS_SWITCH`) and deliver the message. The in-cell wait is a genuine reactor park;
+the cell-boundary hand-off stays a cooperative switch under the single-CPU model (a
+truly parallel producer/consumer awaits SMP #27) - honest. The `librheoipc` test
+runs one binary as two cells that **ping-pong 8 typed messages** over the async
+Sender/Receiver; the consumer asserts the exact sequence **and**
+`rt::chan_wakeups() == 8` (every message a genuine reactor park+wake, not a spin),
+exiting `0x42` on **all three ISAs**.
 
 **Phase F** closes librheo as a **complete foundation**: a native **process
 model**, **time**, a **librheo-native shell**, an **embedded** proof, and honest
@@ -653,7 +668,9 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               trip via SLIRP), librheogpu (librheo Phase H: a real GPU -
               virtio-gpu 2D driver + display::Scanout present, the create-2d/
               attach/set-scanout/transfer/flush round trip, headless-honest),
-              bench-core, and the interactive
+              librheoipc (librheo Phase J: symmetric async IPC - two cells
+              ping-pong typed messages over the async Sender/Receiver, each recv
+              a genuine reactor park), bench-core, and the interactive
               lsh bin (+ harness.rs, vfs_personality.rs); fixtures/ holds the
               ext4 test image (+ gen-ext4.sh); linux-fixtures/ holds the
               built-from-source glibc test binaries (rusthello/ + rustthreads/
@@ -678,7 +695,8 @@ librheo/      the native userspace foundation library (docs/LIBRHEO.md):
               (map_reduce/parallel_for/scan strand workers + Engine::info +
               GraphBuilder)/sched (Reservation + lattice-rt Priority/PeriodicTask/
               TimingReport)/term (Phase D byte-stream input/edit/render)/ipc
-              (Phase E cross-cell Channel + sealed-buffer share)/display (Phase E
+              (Phase E cross-cell Channel + sealed-buffer share + Phase J symmetric
+              async Sender/Receiver on the reactor)/display (Phase E
               Surface/Compositor/InputEvent + Phase H Scanout/Gpu real GPU present
               over OP_GPU_PRESENT - docs/DISPLAY.md)/proc (Phase F spawn/wait/args/
               env)/time (Phase F clock + async sleep/timeout)/net (Phase G raw-frame
@@ -690,8 +708,9 @@ librheo/      the native userspace foundation library (docs/LIBRHEO.md):
               compositor demo), Phase F: librheo-orch (spawn/wait/timer proof),
               lrsh (the librheo-native shell), librheo-echo/librheo-child (native
               coreutils it spawns), librheo-embed (the embedded spine-only cell),
-              librheo-net (Phase G ARP round trip over virtio-net), and librheo-gpu
-              (Phase H virtio-gpu 2D present round trip)
+              librheo-net (Phase G ARP round trip over virtio-net), librheo-gpu
+              (Phase H virtio-gpu 2D present round trip), and librheo-ipc (Phase J
+              two-cell async Sender/Receiver ping-pong)
               programs
 json/         rheo-json: a dependency-free, zero-copy JSON parser (scalar +
               SSE2 string-scan), no_std, host-tested + benchmarked

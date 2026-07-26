@@ -16,6 +16,11 @@ use core::future::Future;
 use crate::cap::CapSet;
 use crate::sys::{self, CqEntry, Qp};
 
+/// Channel role: the initiator (SQ producer, CQ consumer) - mirrors
+/// `ipc::ROLE_CLIENT`. Kept as a raw constant here so the spine (`rt`) does not
+/// depend on the `full`-gated `ipc` module.
+const CHAN_ROLE_CLIENT: u64 = 0;
+
 pub use runtime::strand::{
     JoinHandle, StrandId, complete, has_pending, next_token, park_on, spawn, stats, yield_now,
 };
@@ -46,6 +51,24 @@ pub struct Reactor {
     wait_req: Option<(u64, u64)>,
     /// Exit code the last serviced child wait returned.
     wait_code: u64,
+    /// The cross-cell channel this cell drives, if [`attach_channel`] bound one
+    /// (docs/LIBRHEO.md Phase J): `(ring overlay, role, cap id)`. Unlike the
+    /// kernel queue, the kernel never drains this - the two cells drive the SPSC
+    /// rings directly over the shared frames, so the symmetric async
+    /// `Sender`/`Receiver` parks on the reactor and the idle path hands the CPU
+    /// to the peer (the one cooperative cell-boundary switch that remains under
+    /// the single-CPU model - the *in-cell* wait is a genuine park, not a spin).
+    chan: Option<(Qp, u64, u32)>,
+    /// A strand parked in `chan_recv` (its token), and the message the reactor
+    /// delivered once it was available.
+    chan_recv_req: Option<u64>,
+    chan_recv_msg: Option<(u64, u32)>,
+    /// A strand parked in `chan_send` because the ring was momentarily full
+    /// (message + token). Woken when the peer drains space.
+    chan_send_req: Option<(u64, u32, u64)>,
+    /// Count of channel-recv deliveries the reactor drove (park -> peer switch ->
+    /// wake). Proof the wait is a genuine reactor park, not a busy switch spin.
+    chan_wakeups: u64,
 }
 
 impl Reactor {
@@ -138,6 +161,75 @@ impl Reactor {
     fn wait_result(&self) -> u64 {
         self.wait_code
     }
+
+    /// Enqueue `(tag, val)` on this end's producer ring (the client's SQ, the
+    /// server's CQ). `false` if the ring is momentarily full.
+    fn chan_produce(&self, tag: u64, val: u32) -> bool {
+        let Some((qp, role, cap_id)) = self.chan.as_ref() else {
+            return false;
+        };
+        if *role == CHAN_ROLE_CLIENT {
+            qp.submit(sys::OP_CHAN_MSG, 0, *cap_id, 0, tag, &val.to_le_bytes())
+        } else {
+            qp.cq_push(CqEntry {
+                flow_id: 0,
+                user_data: tag,
+                status: sys::STATUS_OK,
+                result: val,
+            })
+        }
+    }
+
+    /// Dequeue one `(tag, val)` from this end's consumer ring (the client's CQ,
+    /// the server's SQ), or `None` if empty.
+    fn chan_consume(&self) -> Option<(u64, u32)> {
+        let (qp, role, _) = self.chan.as_ref()?;
+        if *role == CHAN_ROLE_CLIENT {
+            qp.reap().map(|e| (e.user_data, e.result))
+        } else {
+            qp.sq_pop().map(|e| {
+                let mut b = [0u8; 4];
+                b.copy_from_slice(&e.payload[0..4]);
+                (e.user_data, u32::from_le_bytes(b))
+            })
+        }
+    }
+
+    /// Idle-path service for the async channel (docs/LIBRHEO.md Phase J): deliver
+    /// a parked recv if a message is now available, complete a parked send if the
+    /// ring drained, else hand the CPU to the peer so it can produce/consume.
+    /// Reached from `block_on` only once every in-cell strand has parked - so the
+    /// in-cell wait is a genuine reactor park (sibling strands ran meanwhile) and
+    /// only the cell-boundary hand-off is a cooperative switch. Returns whether it
+    /// made progress (a delivery, or a hand-off to the peer).
+    fn service_channel(&mut self) -> bool {
+        if self.chan.is_none() {
+            return false;
+        }
+        if let Some(token) = self.chan_recv_req
+            && let Some(m) = self.chan_consume()
+        {
+            self.chan_recv_msg = Some(m);
+            self.chan_recv_req = None;
+            self.chan_wakeups += 1;
+            complete(token);
+            return true;
+        }
+        if let Some((tag, val, token)) = self.chan_send_req
+            && self.chan_produce(tag, val)
+        {
+            self.chan_send_req = None;
+            complete(token);
+            return true;
+        }
+        // Nothing satisfiable locally: hand the CPU to the peer, then let the next
+        // `block_on` pass re-check (the peer will have produced/consumed).
+        if self.chan_recv_req.is_some() || self.chan_send_req.is_some() {
+            sys::switch();
+            return true;
+        }
+        false
+    }
 }
 
 static mut REACTOR: Option<Reactor> = None;
@@ -177,6 +269,11 @@ pub fn init(caps: &CapSet, qp_va: u64) {
         timer_req: None,
         wait_req: None,
         wait_code: 0,
+        chan: None,
+        chan_recv_req: None,
+        chan_recv_msg: None,
+        chan_send_req: None,
+        chan_wakeups: 0,
     };
     // SAFETY: single-CPU cooperative cell; init runs once before any strand.
     unsafe {
@@ -239,6 +336,60 @@ pub async fn sleep_ns(deadline_ns: u64) {
     park_on(token).await;
 }
 
+/// Bind this cell's end of a cross-cell shared channel to the reactor
+/// (docs/LIBRHEO.md Phase J): `chan_va` is the mapped ring region, `role` its
+/// end (`0` = client/SQ-producer, `1` = server/CQ-producer), `cap_id` the
+/// channel capability. After this, [`chan_send`]/[`chan_recv`] park on the
+/// reactor - the symmetric async `Sender`/`Receiver`. `ipc::Channel::split`
+/// calls this.
+///
+/// # Safety note
+/// `chan_va` must be this cell's mapped, kernel-initialised shared ring region
+/// (the same frames the peer maps). `Qp::attach` panics on an ABI mismatch.
+pub fn attach_channel(chan_va: u64, role: u64, cap_id: u32) {
+    // SAFETY: `chan_va` is the cell's mapped channel region (see the contract).
+    let qp = unsafe { Qp::attach(chan_va as *mut u8) };
+    with_reactor(|r| r.chan = Some((qp, role, cap_id)));
+}
+
+/// Whether a cross-cell channel is bound to this cell's reactor.
+pub fn chan_attached() -> bool {
+    with_reactor(|r| r.chan.is_some())
+}
+
+/// How many channel receives the reactor delivered by a genuine park -> peer
+/// switch -> wake (docs/LIBRHEO.md Phase J). A busy-switch spin would never
+/// touch this; a proof the async receiver actually parked.
+pub fn chan_wakeups() -> u64 {
+    with_reactor(|r| r.chan_wakeups)
+}
+
+/// Send `(tag, val)` to the peer cell over the async channel (docs/LIBRHEO.md
+/// Phase J). Enqueues on this end's producer ring; if it is momentarily full,
+/// parks until the reactor drains space (the peer consuming). `ipc::AsyncSender`
+/// wraps this.
+pub async fn chan_send(tag: u64, val: u32) {
+    if with_reactor(|r| r.chan_produce(tag, val)) {
+        return;
+    }
+    let token = next_token();
+    with_reactor(|r| r.chan_send_req = Some((tag, val, token)));
+    park_on(token).await;
+}
+
+/// Receive one `(tag, val)` from the peer cell over the async channel
+/// (docs/LIBRHEO.md Phase J). **Always parks** on the reactor: the vcore runs
+/// other strands while this one waits, and only when they have all parked does
+/// the reactor hand the CPU to the peer (the cooperative cell-boundary switch) -
+/// so an idle receiver costs no spin and every message is a reactor wake.
+/// `ipc::AsyncReceiver` wraps this.
+pub async fn chan_recv() -> (u64, u32) {
+    let token = next_token();
+    with_reactor(|r| r.chan_recv_req = Some(token));
+    park_on(token).await;
+    with_reactor(|r| r.chan_recv_msg.take()).expect("librheo: channel recv woke with no message")
+}
+
 /// Async wait for a spawned child (docs/LIBRHEO.md Phase F): register the wait,
 /// park until the reactor blocks the parent in `SYS_WAIT` and the child exits,
 /// and return the child's exit code. While parked the vcore runs the other
@@ -271,6 +422,8 @@ pub fn block_on<F: Future<Output = ()> + 'static>(root: F) {
             guard = 0; // armed a one-shot deadline and woke its strand: progress
         } else if with_reactor(|r| r.service_wait()) {
             guard = 0; // blocked in SYS_WAIT for a child and woke its strand
+        } else if with_reactor(|r| r.service_channel()) {
+            guard = 0; // delivered a channel message or handed the CPU to the peer
         } else {
             // No completion, no console read: allow a few settling iterations
             // (join hand-offs), then declare no progress.
