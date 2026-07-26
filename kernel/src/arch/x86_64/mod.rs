@@ -729,23 +729,57 @@ pub fn clone_child_frame(parent: &TrapFrame, child_sp: u64, _tls: u64) -> TrapFr
     f
 }
 
-/// Save the live U-mode FP/SIMD state (SSE: XMM0-15 + MXCSR + x87) into a
-/// 512-byte 16-aligned area, for a cooperative context switch between two
-/// threads of one cell (docs/LINUX-COMPAT.md L4). The kernel is soft-float, so
-/// the registers still hold the trapped thread's values.
-///
-/// # Safety
-/// `area` must point to at least 512 writable, 16-byte-aligned bytes.
-pub unsafe fn save_user_fp(area: *mut u8) {
-    unsafe { asm!("fxsave [{p}]", p = in(reg) area, options(nostack)) };
+/// The XSAVE component mask (an XCR0 value) the kernel enabled **and validated**
+/// at boot, or 0 when XSAVE/AVX is unavailable (then FXSAVE/SSE is used). Set
+/// once in `paging_kernel_init`, before any cell or thread runs; read on every
+/// FP save/restore. This is the "adapt to the hardware, fall back gracefully"
+/// hinge (docs/TILES.md 4): on a CPU with AVX-512 it saves the ZMM state, on an
+/// SSE-only CPU it is 0 and the FXSAVE path runs.
+static mut XSAVE_MASK: u64 = 0;
+
+/// The validated XSAVE mask (0 = FXSAVE/SSE only). Also the honest report of
+/// which FP/SIMD widths the kernel turned on for U-mode.
+pub fn fp_xsave_mask() -> u64 {
+    // SAFETY: written once at boot before any cell/thread runs; single CPU.
+    unsafe { *core::ptr::addr_of!(XSAVE_MASK) }
 }
 
-/// Restore U-mode FP/SIMD state saved by [`save_user_fp`].
+/// Save the live U-mode FP/SIMD state for a context switch (docs/LINUX-COMPAT.md
+/// L4, docs/TILES.md 4). Uses XSAVE with the validated mask when AVX/AVX-512 is
+/// enabled (saving YMM/ZMM), else the 512-byte FXSAVE image (SSE). The kernel is
+/// soft-float, so the registers still hold the switched-away context's values.
 ///
 /// # Safety
-/// `area` must point to a valid 512-byte FXSAVE image (16-aligned).
+/// `area` must point to at least `FP_AREA_LEN` writable bytes, 64-byte aligned
+/// for the XSAVE path (16 suffices for FXSAVE).
+pub unsafe fn save_user_fp(area: *mut u8) {
+    let mask = fp_xsave_mask();
+    unsafe {
+        if mask != 0 {
+            asm!("xsave [{p}]", p = in(reg) area,
+                 in("eax") mask as u32, in("edx") (mask >> 32) as u32, options(nostack));
+        } else {
+            asm!("fxsave [{p}]", p = in(reg) area, options(nostack));
+        }
+    }
+}
+
+/// Restore U-mode FP/SIMD state saved by [`save_user_fp`] (matching XSAVE/FXSAVE
+/// per the validated mask).
+///
+/// # Safety
+/// `area` must point to a valid image written by `save_user_fp` (or a clean one
+/// from `fp_area_init`), same alignment rules.
 pub unsafe fn restore_user_fp(area: *const u8) {
-    unsafe { asm!("fxrstor [{p}]", p = in(reg) area, options(nostack, readonly)) };
+    let mask = fp_xsave_mask();
+    unsafe {
+        if mask != 0 {
+            asm!("xrstor [{p}]", p = in(reg) area,
+                 in("eax") mask as u32, in("edx") (mask >> 32) as u32, options(nostack, readonly));
+        } else {
+            asm!("fxrstor [{p}]", p = in(reg) area, options(nostack, readonly));
+        }
+    }
 }
 
 /// Bytes reserved per cell for a saved U-mode FP/SIMD image. Sized for the
@@ -1073,10 +1107,10 @@ pub(super) fn user_init() {
         // Enable SSE for U-mode (docs/LINUX-COMPAT.md L1): CR0.MP set,
         // CR0.EM clear (no x87 emulation), CR0.TS clear; CR4.OSFXSR (fxsave
         // area valid) + CR4.OSXMMEXCPT. glibc's SSE2 `memcpy`/`str*` ifunc
-        // variants are the x86-64 baseline and fault without this. AVX
-        // (XSAVE/XCR0) is intentionally not enabled: QEMU's default CPU does
-        // not expose it, so glibc's ifunc resolver stays on SSE2. No FP state
-        // save/restore yet (one ring-3 context per cell; kernel is soft-float).
+        // variants are the x86-64 baseline and fault without this. AVX/AVX-512
+        // are enabled just below when CPUID reports them (docs/TILES.md 4); FP
+        // state is saved/restored across cell switches (the kernel is
+        // soft-float, so ring-3 owns the FP/vector registers).
         let mut cr0: u64;
         asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack));
         cr0 = (cr0 | (1 << 1)) & !(1 << 2) & !(1 << 3);
@@ -1085,6 +1119,40 @@ pub(super) fn user_init() {
         asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
         cr4 |= (1 << 9) | (1 << 10);
         asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack));
+
+        // Enable AVX/AVX-512 for U-mode when the hardware has it (docs/TILES.md
+        // 4): a hard-float cell runtime-dispatches to AVX2/AVX-512/VNNI tile
+        // kernels, whose wider register state the kernel then saves/restores
+        // across cell switches with XSAVE. Gated on CPUID, so a CPU without
+        // XSAVE/AVX keeps the FXSAVE/SSE path (graceful fallback); the kernel
+        // itself stays soft-float and only enables the feature for ring 3. A
+        // boot health check reads XCR0 back and records only the bits that
+        // actually stuck as the save/restore mask - honest about what the
+        // hardware (or hypervisor) really honored.
+        let l1 = core::arch::x86_64::__cpuid_count(1, 0);
+        let l7 = core::arch::x86_64::__cpuid_count(7, 0);
+        let have_xsave = l1.ecx & (1 << 26) != 0;
+        let have_avx = l1.ecx & (1 << 28) != 0;
+        let have_avx512 = l7.ebx & (1 << 16) != 0;
+        if have_xsave && have_avx {
+            // CR4.OSXSAVE (bit 18): enable XSAVE and XGETBV/XSETBV.
+            cr4 |= 1 << 18;
+            asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack));
+            // XCR0 = x87 (0) | SSE (1) | AVX (2), plus the three AVX-512 state
+            // components (opmask 5, ZMM_Hi256 6, Hi16_ZMM 7) when present.
+            let mut want: u64 = 0b111;
+            if have_avx512 {
+                want |= (1 << 5) | (1 << 6) | (1 << 7);
+            }
+            asm!("xsetbv", in("ecx") 0, in("eax") want as u32, in("edx") (want >> 32) as u32,
+                 options(nomem, nostack));
+            // Read XCR0 back and keep only the bits that took, so a component the
+            // platform silently dropped never leads to a mismatched xrstor.
+            let (lo, hi): (u32, u32);
+            asm!("xgetbv", in("ecx") 0, out("eax") lo, out("edx") hi, options(nomem, nostack));
+            let got = ((hi as u64) << 32) | lo as u64;
+            *core::ptr::addr_of_mut!(XSAVE_MASK) = got & want;
+        }
 
         // EFER.SCE (enable SYSCALL); NXE was set in paging_kernel_init.
         let efer = paging_rdmsr(0xC000_0080) | 1;
