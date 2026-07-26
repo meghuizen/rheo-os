@@ -17,6 +17,22 @@ edition = "2024"
 # provides `net`/`time`/`mem`/`rt`.
 librheo = { path = "../librheo" }
 
+# The blessed pure-Rust `no_std` transport (docs/NETSTACK.md 3, §13, Phase N2c) -
+# Redox's stack, correctness-first, single-poll. Pinned. `default-features = false`
+# keeps it `no_std` (no `std`/`log`/`defmt` pulled) with only what the transport
+# cell needs. Optional + behind the `smoltcp` feature so the from-scratch stack +
+# every existing test are unaffected when it is off (the default). This is the one
+# doc-named dependency N2c adds, per the no-deps rule; its small transitive tree
+# (bitflags/byteorder/cfg-if/heapless/managed/hash32) is all `no_std`.
+smoltcp = { version = "=0.13.1", default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-udp",
+    "socket-tcp",
+    "alloc",
+], optional = true }
+
 # Profile feature gates (docs/NETSTACK.md): a deployment links only the layers
 # its profile needs. For N1a every profile pulls the same L2/L3 core (the
 # modules are always compiled); the gates are declared now so later phases
@@ -32,6 +48,9 @@ edge = []
 hft = []
 # Data-warehouse throughput: Arrow Flight / Kafka, zero-copy grants (future).
 warehouse = []
+# N2c: the smoltcp blessed transport cell (docs/NETSTACK.md 13). Off by default
+# so the from-scratch stack + every existing test are unaffected.
+smoltcp = ["dep:smoltcp"]
 
 [lib]
 name = "rheo_net"
@@ -93,3 +112,14 @@ path = "src/bin/nettcp-demo.rs"
 [[bin]]
 name = "nettcpcc-demo"
 path = "src/bin/nettcpcc-demo.rs"
+
+# The N2c proof cell: (A) the smoltcp blessed transport cell - a smoltcp UDP round
+# trip to SLIRP's DNS (10.0.2.3:53) over a QueueDevice bound to librheo::net, plus
+# deterministic in-cell smoltcp TCP + UDP over the Loopback device; and (B) the
+# native sharded transport - 2 shards, connections hashed to shards, a cross-shard
+# TCP handshake + transfer over the in-cell VirtualLink. Requires the `smoltcp`
+# feature (built separately by xtask); loaded by the `netsmoltcp` test kernel.
+[[bin]]
+name = "netsmoltcp-demo"
+path = "src/bin/netsmoltcp-demo.rs"
+required-features = ["smoltcp"]

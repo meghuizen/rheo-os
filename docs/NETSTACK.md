@@ -3,8 +3,10 @@
 **Status:** Building. Phase **N1a** (the L2/L3 core), **N1b's L4** (UDP + ICMP),
 **N1c's caching DNS client**, **N1e's TTL / hop-limit + traceroute**, **N1d's
 local sockets** (native `net::local` + Linux AF_UNIX), **N2a's native TCP core**,
-and the **L8-INET** personality slice (AF_INET/AF_INET6 sockets + a minimal epoll
-over the **loopback** interface - §10(C), docs/LINUX-COMPAT.md) are done; the full
+**N2b's congestion control** (Reno + CUBIC), **N2c's two transports** (the smoltcp
+blessed cell + the native sharded framing - §13), and the **L8-INET** personality
+slice (AF_INET/AF_INET6 sockets + a minimal epoll over the **loopback** interface -
+§10(C), docs/LINUX-COMPAT.md) are done; the full
 roadmap (N1-N8) is below. This document is the architecture + roadmap + crypto posture;
 `docs/NETWORKING.md` holds the doctrine (the kernel owns queue plumbing + grant
 checks + steering, and no network stack).
@@ -163,8 +165,10 @@ kernels stay green.
     into the send window, with fast-retransmit dup-ACK handling added to `tcp`.
     Proven **deterministically in-cell** - integer cwnd trajectories pinned against
     oracles + a real fast-retransmit-before-RTO scenario (§12).
-  - **N2c (next): the two transports.** The smoltcp blessed correctness cell and the
-    native sharded/zero-copy transport; a live TCP echo / HTTP GET to a real peer.
+  - **N2c (done): the two transports.** The smoltcp blessed correctness cell
+    (integrated over the raw-frame NIC path, a live smoltcp UDP round trip to
+    SLIRP's DNS) and the native sharded transport framing (connections hashed to
+    shards, shared-nothing). §13.
 - **N3 - TLS 1.3 + HTTPS.** Crypto crates wired; keys-as-capabilities.
 - **N4 - Service-cell model + fan-out + host services** (DHCP + zeroconf + NTP).
 - **N5 - App protocols.** HTTP/2, gRPC, Arrow Flight (warehouse), Kafka.
@@ -825,3 +829,121 @@ real deliverable.
 - **BBR** and **ECN** are later phases.
 - The two transports (**smoltcp** blessed cell + the **native sharded** transport)
   are **N2c**, as is a **live** TCP handshake.
+
+## 13. Phase N2c (done): the two transports - smoltcp blessed cell + native sharded framing
+
+N2c delivers the two transports the design has named since §3: the **blessed
+correctness-first** stack (smoltcp) for control/low-rate cells, and the **native
+sharded** framing for the HFT/warehouse hot lines. Both ride the existing
+raw-frame NIC path - **no kernel object, no verb, no ABI/reactor change, no
+`cfg(target_arch)`**. The from-scratch `net::{tcp,cc,udp,ip,eth,...}` stack and
+every pre-existing test are **unaffected**: smoltcp sits *alongside* it behind a
+cargo feature, never replacing it.
+
+### (A) The smoltcp blessed transport cell (`net::smoltcp_cell`, feature `smoltcp`)
+
+**smoltcp** is the doc-named blessed pure-Rust `no_std` transport (§3, Redox's
+stack, correctness-first, single-poll, no ambient threads). N2c integrates it as
+an **alternative** transport running in a loaded rheo-os cell **over the raw-frame
+NIC path** (`librheo::net`: `OP_NET_TX`/`OP_NET_RX`/`OP_NET_MAC` -> virtio-net).
+
+- **Dependency (the one N2c adds, per the no-deps rule).** `smoltcp = "=0.13.1"`,
+  pinned, `default-features = false`, features `medium-ethernet` / `proto-ipv4` /
+  `proto-ipv6` / `socket-udp` / `socket-tcp` / `alloc`. It builds `no_std` for all
+  three bare targets (`x86_64-unknown-none`, `aarch64-unknown-none-softfloat`,
+  `riscv64gc-unknown-none-elf`) - **no transitive dep pulls `std`**. Its small tree
+  (`bitflags`/`byteorder`/`cfg-if`/`heapless`/`managed`/`hash32`) is all `no_std`;
+  `defmt`/`log` are optional and left off. It is behind the **`smoltcp` cargo
+  feature** (off by default) so nothing links it unless a cell opts in - the
+  `netsmoltcp-demo` bin sets `required-features = ["smoltcp"]` and is built by a
+  dedicated xtask step, so `build_userland` (default features) never touches it.
+- **The `phy::Device` bridge (the load-bearing integration).** smoltcp's
+  `phy::Device` is **synchronous** (`receive`/`transmit` pop/push frames with no
+  `.await`), while `librheo::net::send`/`recv` are **async** over the strand
+  reactor. `QueueDevice` bridges them the standard async-over-smoltcp way: two
+  `VecDeque`s. The async driver (`smoltcp_cell::pump`) pulls frames off the NIC
+  with `net::recv` into the device's RX queue, the caller runs smoltcp's
+  synchronous `iface.poll`, then the driver ships the device's TX queue out with
+  `net::send`. So the `RxToken`/`TxToken` consume/produce exactly the frames
+  `net::recv`/`net::send` carry - smoltcp drives the real virtio-net driver end to
+  end, one hop removed by the queue buffer.
+- **The clock.** smoltcp wants a monotonic millisecond `Instant`. A cell has **no
+  userspace ticks->ns reading** (the kernel owns the timebase; `librheo::time`
+  documents the gap), so the driver advances smoltcp's clock by the **real**
+  duration it sleeps between polls (`librheo::time::sleep`, a genuine kernel
+  one-shot deadline): sleep 2 ms, advance the smoltcp clock 2 ms. The clock is
+  therefore real monotonic milliseconds, not a synthetic counter - honest.
+- **The interface.** `smoltcp::iface::Interface` with an Ethernet `Config` (the
+  NIC MAC), the SLIRP guest IP `10.0.2.15/24`, over the `QueueDevice`.
+
+### (B) The native sharded transport framing (`net::shard`)
+
+The Snap/Seastar **shared-nothing** shape: `shard::Transport` owns N `Shard`s,
+each holding a **disjoint** set of connections in its own `BTreeMap`;
+`connect`/`listen` route to the owning shard by hashing the connection's
+`FourTuple` (FNV-1a over the canonical 12 bytes, the same from-scratch idiom
+`net::dns`'s blocklist uses; a per-epoch keyed seed - §8.3 - is a later
+refinement). There is **no shared mutable stack state** between shards, so a flood
+or a bug on one shard's connections cannot reach another's (the §1 DDoS-isolation
+story).
+
+**Honest under the single-CPU cooperative model (docs/CONCURRENCY.md; SMP is task
+#27):** the shards **interleave on one core** - this is *structural* isolation
+(disjoint ownership, no cross-shard aliasing), **NOT** parallel throughput. A
+truly parallel per-core transport - each shard pinned to its own hart/vcore,
+connections steered by hardware RSS - awaits SMP. N2c delivers the *framing* (the
+hash-to-shard routing + the shared-nothing ownership discipline), so the parallel
+version is a scheduling change, not a rewrite.
+
+*(Note: with N shards a power of two, `FourTuple::hash % N` and the mirror-tuple
+relation interact - FNV-1a's **low bit is order-independent**, so a tuple and its
+mirror always share a shard under `% 2`. The N2c proof therefore demonstrates
+per-shard function by driving each shard-owned connection against a **locally-held
+peer** (the remote host - not another shard), which is the realistic case: a
+transport owns only its local ends.)*
+
+### The proof (`netsmoltcp` test kernel, all 3 ISAs)
+
+A `netsmoltcp-demo` cell (loaded like `netl4`, over QEMU SLIRP + virtio-net;
+virtio-mmio on arm/riscv, virtio-pci on x86-64) proves, exiting `0x42` only if
+every step passes:
+
+1. **(B) Native sharded transport (deterministic, network-free):** a
+   `shard::Transport` of **2 shards** routes a set of 32 connections; the set
+   **partitions** across both shards (each connection owned by exactly the shard
+   its hash names, in no other - shared-nothing), and a shard-0-owned **and** a
+   shard-1-owned connection each complete a full TCP handshake + byte transfer
+   over the in-cell `VirtualLink` (reusing the N2a machinery) against a
+   locally-held peer.
+2. **(A1) smoltcp in-cell over `Loopback` (deterministic, network-free):** a
+   smoltcp TCP client + server over smoltcp's built-in `Loopback` device complete
+   a handshake and transfer bytes; a smoltcp UDP socket pair round-trips a
+   datagram. This pins the integration (Device trait, Interface, SocketSet, the
+   poll loop, `alloc`, the ms clock) with no network.
+3. **(A2) smoltcp live UDP over the real NIC:** a smoltcp UDP socket sends a DNS
+   query to SLIRP's built-in responder `10.0.2.3:53` over the `QueueDevice` bound
+   to `librheo::net`, and **receives the reply** (asserted: from `10.0.2.3:53`,
+   transaction id echoed) - proving smoltcp drives our virtio-net driver end to
+   end. Deterministic like `netl4`'s live UDP (SLIRP answers regardless of the
+   upstream result). If a future sandbox has no SLIRP DNS, this step's timeout is
+   the honest failure signal; steps 1-2 are the network-free core.
+
+No kernel object / verb / dependency-in-the-kernel was added; smoltcp is the one
+doc-named userspace dependency (pinned, `no_std`, feature-gated); no
+`cfg(target_arch)`.
+
+### What N2c defers (honest)
+
+- **smoltcp TCP over the live NIC** (a real remote TCP peer): SLIRP has no
+  built-in TCP echo/responder (the N2a/N2b deferral), so the live smoltcp proof is
+  UDP (which SLIRP answers via its DNS); the in-cell `Loopback` TCP is the
+  deterministic TCP proof. A live TCP echo / HTTP GET is a hardware-lab / N5
+  (HTTP) deliverable.
+- **Zero-copy in the smoltcp path:** the `QueueDevice` copies each frame into/out
+  of its `VecDeque` (smoltcp's tokens want owned buffers). smoltcp is the
+  *correctness-first* transport (§3) - zero-copy DMA to the wire is the native
+  sharded transport's job and the N6 perf substrate; smoltcp is deliberately not
+  the hot-line stack.
+- **Parallel sharding:** structural only under the single CPU (above) - SMP (#27).
+- The per-epoch **keyed** shard hash (§8.3) and a cross-shard queue-pair steering
+  path are later-phase refinements; N2c ships the deterministic FNV framing.

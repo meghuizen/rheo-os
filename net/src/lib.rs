@@ -66,10 +66,18 @@
 //!   [`tcp::FixedWindow`] is unchanged), and [`tcp::Connection`] now detects
 //!   duplicate ACKs and fast-retransmits on the 3rd.
 //!
-//! Still deferred (per docs/NETSTACK.md): the smoltcp blessed cell + the sharded
-//! transport (N2c); full NewReno partial-ACK recovery, CUBIC HyStart /
-//! fast-convergence, and BBR; `local` (the AF_UNIX-equivalent
-//! zero-copy transport), the Linux AF_UNIX personality, negative caching, and the
+//! **Phase N2c** adds the two transports:
+//! - [`smoltcp_cell`] (feature `smoltcp`): the blessed pure-Rust `no_std`
+//!   transport integrated over the raw-frame NIC path - a [`smoltcp_cell::QueueDevice`]
+//!   ([`smoltcp::phy::Device`]) whose RX/TX tokens carry the frames `librheo::net`
+//!   ships, driven by [`smoltcp_cell::pump`]. Alongside the from-scratch stack,
+//!   never replacing it.
+//! - [`shard`]: the native **sharded** transport framing - a [`shard::Transport`]
+//!   of N shards, connections hashed to shards by their [`shard::FourTuple`],
+//!   shared-nothing (structural on the single CPU, not parallel - SMP is #27).
+//!
+//! Still deferred (per docs/NETSTACK.md): TLS 1.3 (N3); full NewReno partial-ACK
+//! recovery, CUBIC HyStart / fast-convergence, and BBR; negative caching; and the
 //! *live* ICMPv6 path (the v6 codec is unit-proven; SLIRP cannot generate v6
 //! errors).
 
@@ -84,8 +92,15 @@ pub mod eth;
 pub mod icmp;
 pub mod ip;
 pub mod local;
+pub mod shard;
 pub mod tcp;
 pub mod timer;
 pub mod trace;
 pub mod udp;
 pub mod wire;
+
+/// The smoltcp blessed transport cell (docs/NETSTACK.md §13, N2c). Gated behind
+/// the `smoltcp` feature so the from-scratch stack + every existing test are
+/// unaffected when it is off (the default). Present only when a cell opts in.
+#[cfg(feature = "smoltcp")]
+pub mod smoltcp_cell;

@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 44] = [
+const TEST_KERNELS: [&str; 45] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -64,6 +64,7 @@ const TEST_KERNELS: [&str; 44] = [
     "netlocal",
     "nettcp",
     "nettcpcc",
+    "netsmoltcp",
     "linuxunix",
     "linuxinet",
 ];
@@ -200,6 +201,25 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "virtio-net-device,netdev=n0",
         ],
         ("nettrace", Arch::X86_64) => &[
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-pci,netdev=n0,disable-legacy=on",
+        ],
+        // netsmoltcp (docs/NETSTACK.md §13, rheo-net Phase N2c): the smoltcp
+        // blessed transport cell drives the NIC over the same SLIRP + virtio-net
+        // setup as netl4. The smoltcp UDP socket sends a DNS query to SLIRP's
+        // built-in responder (10.0.2.3:53) and receives the reply. Same two
+        // transports: virtio-mmio on arm/riscv, virtio-pci on x86-64.
+        ("netsmoltcp", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-device,netdev=n0",
+        ],
+        ("netsmoltcp", Arch::X86_64) => &[
             "-netdev",
             "user,id=n0",
             "-device",
@@ -553,6 +573,36 @@ fn build_librheo_embedded(arch: Arch) -> bool {
     matches!(cmd.status().map(|s| s.success()), Ok(true))
 }
 
+/// Build the `netsmoltcp-demo` bin with the `smoltcp` feature (docs/NETSTACK.md
+/// §13, Phase N2c). `build_userland` builds `rheo-net` with default features, so
+/// the smoltcp cell - gated behind `required-features = ["smoltcp"]` - is skipped
+/// there (the from-scratch stack + every other net demo stay smoltcp-free). This
+/// dedicated step builds only that one bin with the feature on, into the same
+/// release path the `netsmoltcp` test kernel `include_bytes!`s. Must run after
+/// `build_userland` so it does not disturb the other demo bins.
+fn build_smoltcp_demo(arch: Arch) -> bool {
+    println!(
+        "[xtask] building netsmoltcp-demo (--features smoltcp) for {}",
+        arch.name()
+    );
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "build",
+        "-p",
+        "rheo-net",
+        "--bin",
+        "netsmoltcp-demo",
+        "--features",
+        "smoltcp",
+        "--release",
+        "--target",
+        arch.target(),
+        "-Zbuild-std=core,alloc,compiler_builtins",
+        "-Zbuild-std-features=compiler-builtins-mem",
+    ]);
+    matches!(cmd.status().map(|s| s.success()), Ok(true))
+}
+
 /// Build a real-std program (`manifest`) for the rheo-os target of `arch`, so
 /// a test can embed the ELF (docs/USERLAND.md M4/M5). Applies the rust-src std
 /// patch first (idempotent) and uses `-Zbuild-std=std` against the custom JSON
@@ -858,6 +908,11 @@ fn build(arch: Arch, release: bool) -> bool {
     // librheo bin with the full feature set) so this minimal build is the one the
     // `librheoproc` kernel embeds.
     if !build_librheo_embedded(arch) {
+        return false;
+    }
+    // The N2c smoltcp cell (docs/NETSTACK.md §13): built separately with the
+    // `smoltcp` feature (the default `build_userland` skips it via required-features).
+    if !build_smoltcp_demo(arch) {
         return false;
     }
     // The librheodata (Phase B) dataset the test kernel reads off the live disk.

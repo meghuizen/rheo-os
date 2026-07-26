@@ -205,6 +205,15 @@ path = "src/nettcp.rs"
 name = "nettcpcc"
 path = "src/nettcpcc.rs"
 
+# rheo-net Phase N2c (docs/NETSTACK.md §13): the two transports - the smoltcp
+# blessed transport cell (a live smoltcp UDP DNS round trip to SLIRP 10.0.2.3:53
+# over librheo::net + a deterministic in-cell smoltcp TCP/UDP over Loopback) and
+# the native sharded transport (2 shards, connections hashed to shards, a
+# cross-shard TCP transfer over the in-cell virtual link). Needs the SLIRP netdev.
+[[bin]]
+name = "netsmoltcp"
+path = "src/netsmoltcp.rs"
+
 # Linux-personality L8 (docs/LINUX-COMPAT.md L8): AF_UNIX sockets - an unmodified
 # static-glibc C fixture doing socketpair+fork and bind/listen/connect/accept.
 [[bin]]
