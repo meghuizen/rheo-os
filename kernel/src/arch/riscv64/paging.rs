@@ -301,6 +301,27 @@ pub fn pmem_map_window(base_pa: usize, _len: usize) -> usize {
     super::phys_to_virt(base_pa)
 }
 
+/// Device-MMIO mapping window (docs/GPU-HARDWARE.md 12 stage 1). The boot
+/// map's device gigapage covers phys 0..1 GiB (UART, PLIC, virtio, ECAM),
+/// and RAM starts at 2 GiB - but QEMU virt's PCIe MMIO window (where a PCI
+/// BAR lands) is the 1..2 GiB gap in between. Install the missing
+/// supervisor R|W gigapage in the KERNEL root so `phys_to_virt` reaches
+/// it (measured: a store to an assigned BAR faulted with scause 0xf until
+/// this page existed). Only the kernel root gains it - cell roots are
+/// untouched, exactly like the x86-64 window. Idempotent.
+pub fn mmio_map_window(base_pa: usize, _len: usize) -> usize {
+    let va = super::phys_to_virt(base_pa);
+    let l2_pa = unsafe { core::ptr::addr_of!(KERNEL_ROOT_PA).read() } as usize;
+    let l2 = table_mut(l2_pa);
+    let idx = l2_index(va);
+    if l2[idx] & PTE_V == 0 {
+        let pa_gig = base_pa & !(GIB - 1);
+        l2[idx] = table_to_pte(pa_gig, PTE_V | PTE_R | PTE_W | PTE_G | PTE_A | PTE_D);
+        paging_activate_kernel(); // sfence: make the new gigapage visible
+    }
+    va
+}
+
 /// Finish paging bring-up. The MMU and the kernel working root are already
 /// configured by the boot trampoline, which enabled paging and jumped the
 /// kernel to its high VAs before any Rust ran. All that is left is the frame

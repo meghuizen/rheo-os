@@ -8,9 +8,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub mod linux_abi;
 mod paging;
 pub use paging::{
-    PagingRoot, paging_activate, paging_activate_kernel, paging_for_each_user_leaf,
-    paging_kernel_init, paging_map, paging_map_frame, paging_new_root, paging_protect,
-    paging_unmap_frame, pmem_map_window,
+    PagingRoot, mmio_map_window, paging_activate, paging_activate_kernel,
+    paging_for_each_user_leaf, paging_kernel_init, paging_map, paging_map_frame, paging_new_root,
+    paging_protect, paging_unmap_frame, pmem_map_window,
 };
 
 /// `uname` machine string for the Linux personality (docs/LINUX-COMPAT.md L2).

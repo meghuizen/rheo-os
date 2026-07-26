@@ -638,8 +638,17 @@ kernel that CI runs:
   a virtio-gpu placed *behind* a `pcie-root-port` - reachable only through
   the kernel's own bridge programming. On arm/riscv the kernel assigns 6
   BARs and reads them back; on x86 SeaBIOS got there first and the
-  read-back proves agreement. MSI-X *routing* (vectors to vcores) is not
-  in stage 1; only capability presence is recorded.
+  read-back proves agreement. The stage closes with the tree's first
+  **real vendor-GPU MMIO**: the AMD device's 16 MiB framebuffer aperture
+  is mapped through a per-ISA device window (`arch::mmio_map_window` - a
+  second fixed 2 MiB-page window beside the pmem one on x86-64, where a
+  BAR sits above the top-2 GiB linear map; the missing 1..2 GiB gigapage
+  installed in the kernel root on RISC-V, whose PCIe window falls in the
+  gap between the boot map's device gigapage and RAM; plain
+  `phys_to_virt` on ARM64), written through, and read back - the full
+  enumeration -> BAR -> mapping -> decode -> device-memory path on real
+  AMD-vendor silicon emulation. MSI-X *routing* (vectors to vcores) is
+  not in stage 1; only capability presence is recorded.
 - **Stage 2 - IOMMU:** domains + the grant-to-mapping path + fault events
   against `intel-iommu` (x86-64) and `smmuv3` (ARM64), both already on
   the DEVELOPMENT.md launch lines; an `iommu` test kernel proves a device

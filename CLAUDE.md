@@ -70,7 +70,11 @@ vendor ID + declared op-boundary preemption, an honest zero measured cost -
 recognised and registered, not yet driven). The `gpuhw` test proves it on all
 three ISAs against QEMU's real `ati-vga` (AMD, 0x1002), a Bochs display, and
 a virtio-gpu behind a `pcie-root-port`; NVIDIA/Intel have no QEMU device
-model and report skip-with-reason.
+model and report skip-with-reason. The stage closes with the tree's first
+real vendor-GPU MMIO: the AMD framebuffer aperture mapped via
+`arch::mmio_map_window` (a second x86-64 fixed window beside the pmem one;
+the missing 1..2 GiB gigapage on RISC-V; `phys_to_virt` on ARM64), written
+through and read back on all three ISAs.
 
 The **strand runtime** (`runtime/`, BUILD-ORDER.md step 7,
 docs/CONCURRENCY.md) is the userspace library that brings native async and

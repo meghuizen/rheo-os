@@ -120,6 +120,45 @@ extern "C" fn kernel_main() -> ! {
         "BAR0 read-back does not match the recorded base"
     );
 
+    // --- Drive the AMD device: MMIO into its framebuffer aperture ------
+    // The first real vendor-GPU MMIO in the tree (docs/GPU-HARDWARE.md 12
+    // stage 1): map the ati-vga's BAR0 - the 16 MiB framebuffer aperture
+    // QEMU models as device memory - write a pixel pattern through it, and
+    // read it back. This proves the full path: enumeration -> BAR ->
+    // mapping window -> MMIO decode -> device memory, on a real AMD-vendor
+    // device model. Decode is forced on first so the proof does not depend
+    // on who (SeaBIOS or assign_pci_bars) enabled it.
+    let cmd = arch::pci_cfg_read32(inv.ecam_base, adev.bus, adev.dev, adev.func, 0x04);
+    arch::pci_cfg_write32(
+        inv.ecam_base,
+        adev.bus,
+        adev.dev,
+        adev.func,
+        0x04,
+        cmd | 0x6,
+    );
+    let fb_va = arch::mmio_map_window(bar0.base as usize, bar0.size as usize);
+    let fb = fb_va as *mut u32;
+    for i in 0..64usize {
+        // SAFETY: fb maps BAR0's device memory, sized by the mask probe;
+        // offsets stay inside it (64 * 4 KiB < 16 MiB). Volatile: MMIO.
+        unsafe { fb.add(i * 1024).write_volatile(0xA5A5_0000 | i as u32) };
+    }
+    for i in 0..64usize {
+        // SAFETY: as above.
+        let got = unsafe { fb.add(i * 1024).read_volatile() };
+        assert_eq!(
+            got,
+            0xA5A5_0000 | i as u32,
+            "AMD framebuffer read-back mismatch"
+        );
+    }
+    println!(
+        "gpuhw: amd framebuffer MMIO write/read-back OK ({} MiB aperture at {:#x})",
+        bar0.size / (1024 * 1024),
+        bar0.base
+    );
+
     // --- Engine registration: CPU + every recognised GPU ---------------
     let n = svc::engine_count();
     println!("gpuhw: engines registered = {}", n);

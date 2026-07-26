@@ -279,6 +279,14 @@ pub fn pmem_map_window(base_pa: usize, _len: usize) -> usize {
     super::phys_to_virt(base_pa)
 }
 
+/// Device-MMIO mapping window (docs/GPU-HARDWARE.md 12 stage 1). The
+/// 48-bit-wide linear map covers the PCIe MMIO window (a PCI BAR at
+/// 0x1000_0000..0x3E00_0000), so this is simply `phys_to_virt` - the same
+/// path the ECAM and virtio-mmio accesses already take.
+pub fn mmio_map_window(base_pa: usize, _len: usize) -> usize {
+    super::phys_to_virt(base_pa)
+}
+
 /// Finish paging bring-up. The MMU, TCR, MAIR, TTBR0/TTBR1 and SCTLR are
 /// already configured by the boot trampoline (kernel/arch/aarch64/boot.S),
 /// which enabled the MMU and jumped the kernel to its high (TTBR1) VAs before
