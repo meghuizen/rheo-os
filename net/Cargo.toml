@@ -49,3 +49,11 @@ path = "src/bin/netcore-demo.rs"
 [[bin]]
 name = "netl4-demo"
 path = "src/bin/netl4-demo.rs"
+
+# The N1c proof cell: the caching DNS client - an in-memory compressed-response
+# parse oracle + pointer-loop safety, deterministic hosts/blocklist/cache-hit
+# checks (network-free, asserted via the query counter), and a bonus live resolve
+# over SLIRP's DNS (10.0.2.3). Loaded by the `netdns` test kernel.
+[[bin]]
+name = "netdns-demo"
+path = "src/bin/netdns-demo.rs"

@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 37] = [
+const TEST_KERNELS: [&str; 38] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -59,6 +59,7 @@ const TEST_KERNELS: [&str; 37] = [
     "librheopipe",
     "netcore",
     "netl4",
+    "netdns",
 ];
 
 /// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
@@ -153,6 +154,25 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "virtio-net-device,netdev=n0",
         ],
         ("netl4", Arch::X86_64) => &[
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-pci,netdev=n0,disable-legacy=on",
+        ],
+        // netdns (docs/NETSTACK.md rheo-net Phase N1c): the caching DNS client
+        // over the same SLIRP + virtio-net setup as netl4. The deterministic
+        // codec/hosts/blocklist/cache checks are network-free; the bonus live
+        // resolve queries SLIRP's built-in DNS responder (10.0.2.3:53). Same two
+        // transports: virtio-mmio on arm/riscv, virtio-pci on x86.
+        ("netdns", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-device,netdev=n0",
+        ],
+        ("netdns", Arch::X86_64) => &[
             "-netdev",
             "user,id=n0",
             "-device",

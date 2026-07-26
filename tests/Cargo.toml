@@ -164,6 +164,14 @@ path = "src/netcore.rs"
 name = "netl4"
 path = "src/netl4.rs"
 
+# rheo-net Phase N1c (docs/NETSTACK.md): the caching DNS client - a compressed
+# response parse oracle + pointer-loop safety, and deterministic hosts/blocklist/
+# cache-hit checks (network-free, asserted via a query counter), plus a bonus
+# live resolve over SLIRP's DNS (10.0.2.3).
+[[bin]]
+name = "netdns"
+path = "src/netdns.rs"
+
 [[bin]]
 name = "smp"
 path = "src/smp.rs"

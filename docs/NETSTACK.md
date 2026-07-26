@@ -1,8 +1,8 @@
 # rheo-net: the greenfield network stack
 
-**Status:** Building. Phase **N1a** (the L2/L3 core) and **N1b's L4** (UDP +
-ICMP) are done; the full roadmap (N1-N8) is below. This document is the
-architecture + roadmap + crypto posture;
+**Status:** Building. Phase **N1a** (the L2/L3 core), **N1b's L4** (UDP + ICMP),
+and **N1c's caching DNS client** are done; the full roadmap (N1-N8) is below.
+This document is the architecture + roadmap + crypto posture;
 `docs/NETWORKING.md` holds the doctrine (the kernel owns queue plumbing + grant
 checks + steering, and no network stack).
 
@@ -130,9 +130,13 @@ kernels stay green.
   - **N1b (L4 done): UDP + ICMP.** `udp` (pseudo-header checksum + async
     `UdpEndpoint`) and `icmp` (ICMPv4 echo + the traceroute TTL hook), proven by
     a DNS query over UDP to SLIRP's `10.0.2.3:53` and a ping to the gateway
-    `10.0.2.2` (§7). Still open in N1b: `local`/AF_UNIX (the zero-copy local path
-    + the Linux AF_UNIX personality) and the caching `dns` client (LRU+TTL cache,
-    blocklist, configurable resolvers) - the next slice, **N1c**.
+    `10.0.2.2` (§7).
+  - **N1c (done): the caching DNS client.** `dns` - full message build/parse
+    (A/AAAA/CNAME + name-compression pointers, loop-bounded), an async caching
+    `Resolver` over `udp`, an LRU + TTL `Cache`, a `Blocklist` (a from-scratch
+    hash set + wildcard suffixes), and configurable resolvers + a static hosts
+    table (§8). Still open in N1: `local`/AF_UNIX (the zero-copy local path + the
+    Linux AF_UNIX personality) - the next slice.
 - **N2 - TCP + congestion control + the two transports** (native sharded + the
   smoltcp cell); proof: a TCP echo / HTTP GET to SLIRP.
 - **N3 - TLS 1.3 + HTTPS.** Crypto crates wired; keys-as-capabilities.
@@ -273,11 +277,94 @@ for the query regardless of the upstream result (we assert only the transaction-
 echo + a well-formed UDP reply, never the resolved address), so the proof does not
 depend on real outbound DNS.
 
-### Deferred to N1c (explicit)
+### Deferred past N1b (explicit)
 
-`local` (the AF_UNIX-equivalent zero-copy transport + the datapath selector), the
-caching `dns` client (LRU+TTL cache, blocklist, configurable resolvers, host
-config), and the Linux AF_UNIX personality. **ICMPv6** echo and **full traceroute**
-(the TTL-increment loop + time-exceeded parsing) are deferred to N7. The next-hop
-choice today ARPs the destination directly (SLIRP proxy-ARPs `10.0.2.0/24`); a
-real routing table (gateway for off-link) is an N1c refinement.
+`local` (the AF_UNIX-equivalent zero-copy transport + the datapath selector) and
+the Linux AF_UNIX personality (the next slice). **ICMPv6** echo and **full
+traceroute** (the TTL-increment loop + time-exceeded parsing) are deferred to N7.
+The next-hop choice today ARPs the destination directly (SLIRP proxy-ARPs
+`10.0.2.0/24`); a real routing table (gateway for off-link) is a later refinement.
+
+## 8. Phase N1c (done): the caching DNS client
+
+### What the `net` crate adds
+
+- **`net::dns`** - a from-scratch DNS client (no external crate):
+  - **Message codec** - `build_query` (A/AAAA, a transaction id, RD set) and
+    `parse_response` (header, questions skipped, answer RRs). It decodes **A**,
+    **AAAA**, and **CNAME**, and follows **name-compression pointers** (the
+    `0xC0` scheme - the low 6 bits + the next byte are a 14-bit offset from the
+    message start).
+  - **`Resolver`** - async `resolve(name, qtype) -> Result<Vec<IpAddr>, DnsError>`
+    that checks, in order, the **blocklist**, the **hosts table**, and the
+    **cache** (all network-free), then queries the configured resolvers over
+    `udp::UdpEndpoint`, parses the reply (verifying the transaction id + source),
+    and inserts the answer into the cache with the RR TTL. Bounded by a reactor
+    `time::timeout` per attempt plus a retry budget.
+  - **`Cache`** - an **LRU with TTL expiry** keyed on `(name, qtype)`: a lookup
+    evicts an expired entry, and an insert past the cap evicts the
+    least-recently-used entry. It runs on an **opaque monotonic clock** the
+    caller supplies, so the math is exact and portable and the deterministic
+    proof drives it directly.
+  - **`Blocklist`** - exact names in a from-scratch open-addressing **hash set**
+    (FNV-1a, O(1) average) plus wildcard suffixes (`*.ads.example` blocks the
+    base name and every subdomain). A blocked name resolves to `Err(Blocked)`
+    (or a configured **sinkhole** address) with **no network query**.
+  - **`Config` + `HostsTable`** - configurable resolver IPs, an optional
+    sinkhole, cache cap + query timing, and a static **hosts** table (Linux
+    `/etc/hosts`-shaped) checked before the cache/network.
+
+### Name-compression safety (correctness- and security-critical)
+
+The classic DNS-parser bug is a crafted pointer **loop** that hangs the parser, or
+a pointer past the buffer that reads out of bounds. `read_name` defends against
+both: it **caps pointer jumps** at `MAX_JUMPS` (128), **rejects** any offset at or
+past the message end, and **caps** the assembled name at 255 bytes. A malicious
+packet gets a clean `DnsError::Parse`, never a hang. This is pinned by a
+**known-good in-memory oracle** (like N1a's `0xB861` and N1b's `0x6D45`): a
+hand-crafted **compressed** response (a `0xC0` pointer back to the question name)
+parses to `example.com A 93.184.216.34` TTL 3600; and three crafted packets - a
+self-pointer, a mutual pointer cycle, and an out-of-bounds pointer - are each
+asserted to error rather than hang.
+
+### Large blocklists (the arena path)
+
+The `HashSet` is the O(1) shape a multi-million-entry list needs. At N1c test
+scale its slots + interned names live on the general heap; for a truly huge list
+they would live in a **grant-backed `librheo::mem` arena** (a reserved, committed
+typed grant) instead - the documented path, not built here.
+
+### The proof (`netdns` test kernel, all 3 ISAs)
+
+A `netdns-demo` cell (loaded like `netl4`) over QEMU SLIRP + virtio-net. The
+**core assertions are deterministic and network-free** - they hold with no
+outbound internet, so they are the proof:
+
+1. **Parse oracle** - the compressed response decodes to the exact A record; the
+   three crafted pointer-loop / out-of-bounds packets all error (no hang).
+2. **Hosts table** - names in the static hosts table resolve to their configured
+   IP with the query counter at **zero**.
+3. **Blocklist** - an exact-blocked name and a wildcard-blocked name both return
+   `Err(Blocked)` with the counter at **zero**.
+4. **Cache hit** - a pre-seeded name resolves from cache (twice, case/trailing-dot
+   normalized to the same key) with the counter at **zero**; a standalone `Cache`
+   unit proves TTL expiry + LRU eviction on an explicit clock.
+
+The **query counter** (`Resolver::queries_sent`) is the network-free evidence: a
+blocklist / hosts / cache hit sends nothing, so `queries_sent == 0` proves the
+short-circuit. Then a **bonus live** resolve of `example.com` over SLIRP's DNS
+(`10.0.2.3:53`) asserts only **structure** - a valid A record present, a query was
+sent, and a second lookup is a cache hit (no extra query) - never a specific
+address (SLIRP proxies to the host resolver, so the address is non-deterministic).
+If this sandbox has **no outbound DNS**, the resolve times out cleanly and is
+**tolerated** (the deterministic checks already passed); the cell never fakes a
+pass. It exits `0x42` only if every deterministic check passes, on all three ISAs.
+No kernel object / verb / dependency was added; no `cfg(target_arch)`.
+
+### Deferred past N1c (explicit)
+
+**Negative caching** (caching an NXDOMAIN for a short TTL) is deferred - each
+NXDOMAIN currently re-queries; the seam is `Config` + `Cache`. The codec + resolver
+support **AAAA**; only the *live* proof is A (SLIRP proxies to the host resolver, so
+a deterministic AAAA answer is not guaranteed). `local`/AF_UNIX (the zero-copy local
+path + the Linux AF_UNIX personality) is the next N1 slice.

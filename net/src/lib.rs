@@ -30,14 +30,23 @@
 //! - [`wire`]: the shared eth/ip framing + next-hop ARP resolution both L4
 //!   protocols send/receive over (the TTL hook lives here).
 //!
+//! **Phase N1c** adds the caching resolver over that L4:
+//! - [`dns`]: full DNS message build/parse (A/AAAA/CNAME + name-compression
+//!   pointers, loop-bounded), an async caching [`dns::Resolver`] over
+//!   [`udp::UdpEndpoint`], an LRU + TTL [`dns::Cache`], a [`dns::Blocklist`]
+//!   (a from-scratch hash set + wildcard suffixes), and configurable resolvers +
+//!   a static hosts table ([`dns::HostsTable`]).
+//!
 //! Still deferred (per docs/NETSTACK.md): `local` (the AF_UNIX-equivalent
-//! zero-copy transport), the caching `dns` client, ICMPv6, and full traceroute.
+//! zero-copy transport), the Linux AF_UNIX personality, negative caching, ICMPv6,
+//! and full traceroute.
 
 #![no_std]
 
 extern crate alloc;
 
 pub mod arp;
+pub mod dns;
 pub mod eth;
 pub mod icmp;
 pub mod ip;

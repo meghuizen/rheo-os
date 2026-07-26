@@ -38,7 +38,7 @@ requires - the kernel owns the queue plumbing, not the protocols.
   grants (section 1), header/payload split (section 1), a device RX interrupt, and
   everything in sections 4-7 (eBPF dataplane, DDoS staging, DPU offload).
 
-## 0a. What is built (rheo-net Phase N1a/N1b): the L2/L3/L4 core
+## 0a. What is built (rheo-net Phase N1a/N1b/N1c): the L2/L3/L4 core + caching DNS
 
 The **greenfield network stack** begins here as **portable userspace** - a new
 `net/` workspace crate (`no_std` + alloc, no per-ISA code) built for the three
@@ -66,8 +66,20 @@ query over **UDP** to SLIRP's built-in responder at `10.0.2.3:53` and an **ICMP
 echo** to the gateway `10.0.2.2`, asserting the UDP checksum validates + the
 transaction id echoes, the ping reply type/id/seq match, and two known-good
 checksum oracles (`0x6D45` UDP, `0xFFE0` ICMP) - exiting `0x42`, network-free.
-Still deferred to **N1c**: the local/AF_UNIX zero-copy path and the caching DNS
-client; ICMPv6 + full traceroute are N7 (docs/NETSTACK.md 5-7).
+
+**Phase N1c** adds `dns` - a from-scratch **caching DNS client**: a full message
+codec (A/AAAA/CNAME + loop-bounded name-compression pointers), an async caching
+`Resolver` over `udp`, an **LRU + TTL cache**, a **blocklist** (a from-scratch
+hash set + wildcard suffixes, designed for huge lists via a grant-backed arena),
+and configurable resolvers + a static hosts table. Proof: the `netdns` test kernel
+(all three ISAs) asserts, **network-free**, a compressed-response parse oracle +
+pointer-loop safety, and hosts/blocklist/cache resolutions that each send **zero**
+network queries (a query counter is the evidence), plus a **bonus live** resolve of
+`example.com` over SLIRP's DNS (`10.0.2.3`) that asserts only structure and
+tolerates a timeout where there is no outbound DNS - exiting `0x42`. Negative
+caching is deferred (documented). Still deferred: the local/AF_UNIX zero-copy path
+and the Linux AF_UNIX personality; ICMPv6 + full traceroute are N7
+(docs/NETSTACK.md 5-8).
 
 ## 1. NIC queues are the primitive
 
