@@ -53,13 +53,48 @@ pub const SYS_GRAPH: u64 = 14;
 pub const SYS_RESERVE: u64 = 15;
 /// Acquire a lease; returns its fencing token.
 pub const SYS_LEASE: u64 = 16;
-/// Print the CPU report (vendor, core count, instruction-set features) to
-/// the console. Kernel-formatted so feature names stay in one place.
+/// cpuinfo(out_va) -> 0. With `out_va == 0`, print the CPU report (vendor,
+/// core count, instruction-set features) to the console (the shell builtin).
+/// With `out_va != 0`, write a [`CpuFeatures`] there instead - the machine-
+/// readable form a cell reads to pick its SIMD path (docs/TILES.md 4). Mechanism
+/// only: it exposes the already-discovered `hw::Inventory` CPU report + the FP
+/// widths the kernel validated at boot; no new object (ARCHITECTURE.md 6).
 pub const SYS_CPUINFO: u64 = 17;
 /// Print the enumerated PCIe devices and their engine classification.
 pub const SYS_LSPCI: u64 = 18;
 /// Print the NUMA topology: per-node RAM and CPU counts.
 pub const SYS_NUMA: u64 = 19;
+
+// Portable SIMD-tier bits reported in `CpuFeatures::simd` - the widths the
+// kernel actually **enabled and validated** for U-mode (not just what CPUID
+// claims), so a cell dispatches only to a path whose register state the kernel
+// saves across cell switches (docs/TILES.md 4). x86 tiers are cumulative
+// (AVX-512 implies AVX2 implies SSE2); ARM64 reports NEON; RISC-V reports none
+// (scalar F/D only until RVV). A cell still runs its own functionality +
+// benchmark probe before trusting a tier.
+/// x86 SSE2 (the hard-float x86 baseline).
+pub const SIMD_SSE2: u64 = 1 << 0;
+/// x86 AVX2 (x86-64-v3).
+pub const SIMD_AVX2: u64 = 1 << 1;
+/// x86 AVX-512F (x86-64-v4).
+pub const SIMD_AVX512F: u64 = 1 << 2;
+/// x86 AVX-512-VNNI (Zen4 / Sapphire Rapids int8 `dpbusd`).
+pub const SIMD_AVX512VNNI: u64 = 1 << 3;
+/// ARM64 NEON (Advanced SIMD).
+pub const SIMD_NEON: u64 = 1 << 4;
+
+/// Machine-readable CPU feature report a cell reads via `SYS_CPUINFO(out_va)`
+/// (docs/TILES.md 4). `features` is the raw per-ISA CPUID bitmask
+/// (`arch::cpu_feature_names()`-indexed, for diagnostics); `simd` is the
+/// portable `SIMD_*` tier mask of kernel-enabled+validated widths a cell
+/// dispatches on; `vendor` is the ASCII vendor string, NUL-padded.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CpuFeatures {
+    pub features: u64,
+    pub simd: u64,
+    pub vendor: [u8; 16],
+}
 
 /// Write bytes to the console from a loaded userland program (docs/USERLAND.md
 /// M1). The argument is the VA of a `DebugWrite { ptr, len }` in the cell;
@@ -337,6 +372,47 @@ pub struct ReserveInfo {
     pub handle: u64,
     pub committed_ppm: u64,
 }
+
+/// Graph-node op 4 (BufReduce) descriptor (docs/TILES.md 6): `node.a` is the
+/// cell VA of this struct. The engine returns the wrapping u64 sum over
+/// `elems` elements of `dtype` (0=I8, 1=U8, 2=I32; signed sign-extends).
+/// Validation caps: `va != 0`, `0 < elems <= 1<<20`, `dtype <= 2` - anything
+/// else completes STATUS_DENIED. Kept in sync with librheo's `sys` mirror.
+#[repr(C)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct BufReduceDesc {
+    pub va: u64,
+    pub elems: u64,
+    pub dtype: u32,
+    pub _pad: u32,
+}
+const _: () = assert!(core::mem::size_of::<BufReduceDesc>() == 24);
+
+/// Graph-node op 5 (TileGemm) descriptor (docs/TILES.md 6): `node.a` is the
+/// cell VA of this struct. The engine zeroes C, runs the int8->i32 GEMM
+/// whole (the node is the tile loop), and returns the FNV-1a hash of C's
+/// logical m x n window - the deterministic receipt; the buffer carries the
+/// real output. Strides are in elements. Validation caps: VAs non-zero,
+/// `1 <= m,n,k <= 256`, strides >= the matching dims, `dtype_in == 0` (I8)
+/// and `dtype_acc == 2` (I32) exactly - the kernel path is integer-only
+/// (the aarch64 kernel target is soft-float). Worst node = 16.7M MACs,
+/// worst graph = 32 nodes: the documented drain bound.
+#[repr(C)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct TileGemmDesc {
+    pub a_va: u64,
+    pub b_va: u64,
+    pub c_va: u64,
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub a_stride: u32,
+    pub b_stride: u32,
+    pub c_stride: u32,
+    pub dtype_in: u32,
+    pub dtype_acc: u32,
+}
+const _: () = assert!(core::mem::size_of::<TileGemmDesc>() == 56);
 
 /// One node of a userspace-built dependency graph (docs/LIBRHEO.md Phase C,
 /// docs/ARCHITECTURE.md 3 object 6), kept in sync with librheo's `compute` arm.

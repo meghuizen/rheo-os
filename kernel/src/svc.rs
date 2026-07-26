@@ -125,7 +125,23 @@ pub fn handle(nr: u64, args: &[u64; 6]) -> Option<u64> {
             Some(n as u64)
         }
         SYS_CPUINFO => {
-            print_cpuinfo();
+            // out_va == 0: print for the shell. out_va != 0: write a
+            // machine-readable CpuFeatures a cell reads to pick its SIMD path
+            // (docs/TILES.md 4). Mechanism only - exposes the discovered CPU
+            // report + the FP widths the kernel validated at boot.
+            if arg == 0 {
+                print_cpuinfo();
+            } else {
+                let inv = crate::hw::inventory();
+                let feats = crate::abi::CpuFeatures {
+                    features: inv.cpu.features,
+                    simd: crate::arch::fp_simd_tiers(),
+                    vendor: inv.cpu.vendor,
+                };
+                // SAFETY: `arg` is a writable VA in the calling cell; the cell
+                // provides a buffer of at least size_of::<CpuFeatures>().
+                unsafe { (arg as *mut crate::abi::CpuFeatures).write(feats) };
+            }
             Some(0)
         }
         SYS_LSPCI => {
@@ -393,6 +409,44 @@ pub fn graph_submit(nodes_va: u64, count: u32, results_va: u64) -> (u32, u32) {
             1 => Op::Add,
             2 => Op::Mul,
             3 => Op::Select,
+            // The buffer-carrying tile ops (docs/TILES.md 6): node.a is the
+            // cell VA of a #[repr(C)] descriptor - the same trust contract
+            // as `nodes_va` itself - validated here with hard caps; any
+            // violation completes STATUS_DENIED, never a fault.
+            4 => {
+                if node.a_is_node != 0 || node.a == 0 {
+                    return (STATUS_DENIED, 0);
+                }
+                // SAFETY: `node.a` is the cell's mapped descriptor buffer.
+                let d = unsafe { (node.a as *const BufReduceDesc).read_unaligned() };
+                if d.va == 0 || d.elems == 0 || d.elems > (1 << 20) || d.dtype > 2 {
+                    return (STATUS_DENIED, 0);
+                }
+                Op::BufReduce(d)
+            }
+            5 => {
+                if node.a_is_node != 0 || node.a == 0 {
+                    return (STATUS_DENIED, 0);
+                }
+                // SAFETY: `node.a` is the cell's mapped descriptor buffer.
+                let d = unsafe { (node.a as *const TileGemmDesc).read_unaligned() };
+                let dims_ok = (1..=256).contains(&d.m)
+                    && (1..=256).contains(&d.n)
+                    && (1..=256).contains(&d.k);
+                let strides_ok = d.a_stride >= d.k && d.b_stride >= d.n && d.c_stride >= d.n;
+                if d.a_va == 0
+                    || d.b_va == 0
+                    || d.c_va == 0
+                    || !dims_ok
+                    || !strides_ok
+                    || d.dtype_in != 0 // I8 in ...
+                    || d.dtype_acc != 2
+                // ... i32 accumulate, exactly
+                {
+                    return (STATUS_DENIED, 0);
+                }
+                Op::TileGemm(d)
+            }
             _ => return (STATUS_BAD_OPCODE, 0),
         };
         let a = wire_input(node.a_is_node, node.a);

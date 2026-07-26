@@ -39,13 +39,16 @@ pub const MAX_THREADS: usize = 8;
 /// Per-context FP/SIMD save area. Sized above the largest per-ISA image
 /// (x86 FXSAVE 512, ARM64 V-regs+FPSR/FPCR 528, RISC-V f-regs+fcsr 264) and
 /// 16-aligned (FXSAVE/`stp q` require it).
-#[repr(C, align(16))]
+// 64-byte aligned and sized for the widest per-ISA save format: x86 uses XSAVE
+// when AVX/AVX-512 is enabled (an AVX-512 area is ~2.5 KiB and XSAVE requires
+// 64-byte alignment), not just the 512-byte FXSAVE image (docs/TILES.md 4).
+#[repr(C, align(64))]
 #[derive(Copy, Clone)]
-struct FpArea([u8; 1024]);
+struct FpArea([u8; arch::FP_AREA_LEN]);
 
 impl FpArea {
     const fn new() -> FpArea {
-        FpArea([0; 1024])
+        FpArea([0; arch::FP_AREA_LEN])
     }
 }
 

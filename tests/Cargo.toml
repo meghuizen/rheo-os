@@ -235,6 +235,19 @@ path = "src/linuxinet.rs"
 name = "gpuhw"
 path = "src/gpuhw.rs"
 
+# The tile framework (docs/TILES.md): TileBuf/TileProgram/CpuExecutor/TileSim
+# proof - a strand-parallel tiled int8 GEMM bit-exact against a naive
+# reference, deterministic sim counts, contracts, quantization round-trip.
+[[bin]]
+name = "librheotile"
+path = "src/librheotile.rs"
+
+# The tile battle tier (docs/TILES.md 10): production-shaped workloads +
+# soak/boundary/pipeline stress, exact checksums on all three ISAs.
+[[bin]]
+name = "librheotilebattle"
+path = "src/librheotilebattle.rs"
+
 # IOMMU containment (docs/GPU-HARDWARE.md 4, BUILD-ORDER.md step 12): VT-d
 # DMA remapping - a virtio-blk DMA succeeds through an identity domain and
 # faults when the domain is revoked. x86-64 real (intel-iommu); arm/riscv

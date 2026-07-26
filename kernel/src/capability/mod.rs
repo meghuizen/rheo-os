@@ -121,7 +121,14 @@ struct Object {
     epoch: u32,
 }
 
-const MAX_OBJECTS: usize = 128;
+// Total kernel objects (cells, grants, queues, ...) the system tracks. A
+// fixed table indexed by a monotonic counter that does not yet reclaim a
+// destroyed object's id (docs/TILES.md 12): a cell that creates and drops
+// many grants over its life consumes ids until this cap. Raised 128 -> 512
+// for headroom (an Object is 8 B, so 4 KiB) while the reclamation design -
+// which must bump the object epoch to keep revocation sound (section 8.2) -
+// remains future work. Real-workload sizing is flagged in docs/TILES.md 12.
+const MAX_OBJECTS: usize = 512;
 
 /// The kernel object table. One per system.
 pub struct ObjectTable {
