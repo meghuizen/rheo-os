@@ -398,6 +398,12 @@ pub fn discover(inv: &mut crate::hw::Inventory) {
     // PCIe ECAM low window (QEMU virt with highmem-ecam=off), inside the
     // device gigabyte the kernel identity-maps.
     inv.ecam_base = 0x3f00_0000;
+    // The SMMUv3 register base is fixed in the QEMU virt map (docs/GPU-
+    // HARDWARE.md 4). It is only physically present when the machine is
+    // booted with `iommu=smmuv3` (the `iommu` test does); no other code
+    // reads `iommu_base`, and the SMMUv3 driver touches these registers
+    // only on that test, so reporting the address here is safe.
+    inv.iommu_base = 0x0905_0000;
     inv.add_cpu(0, 0);
 }
 

@@ -272,7 +272,18 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "-device",
             "virtio-blk-pci,drive=blk0,disable-legacy=on,iommu_platform=on",
         ],
-        ("iommu", Arch::Riscv64 | Arch::Aarch64) => &[
+        // ARM64: the SMMUv3 covers PCI, so use virtio-blk-*pci* (behind the
+        // SMMU) with iommu_platform=on, mirroring the x86 VT-d proof. The
+        // machine gains iommu=smmuv3 via `machine_override`.
+        ("iommu", Arch::Aarch64) => &[
+            "-drive",
+            "file=tests/fixtures/ext4.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-pci,drive=blk0,disable-legacy=on,iommu_platform=on",
+        ],
+        // RISC-V has no QEMU IOMMU model, so the kernel skips-with-reason;
+        // a plain virtio-blk keeps the (unreached) probe honest.
+        ("iommu", Arch::Riscv64) => &[
             "-global",
             "virtio-mmio.force-legacy=false",
             "-drive",
@@ -1065,9 +1076,34 @@ fn build_smp_kernel(arch: Arch, release: bool) -> bool {
     matches!(cmd.status().map(|s| s.success()), Ok(true))
 }
 
+/// A per-test replacement for the `-machine` string. Most tests share the
+/// per-arch default; the `iommu` test on ARM needs `iommu=smmuv3` added
+/// (an SMMUv3 covers PCI devices, so the test also uses virtio-blk-pci).
+fn machine_override(arch: Arch, kernel: &str) -> Option<&'static str> {
+    match (kernel, arch) {
+        ("iommu", Arch::Aarch64) => Some("virt,gic-version=3,highmem-ecam=off,iommu=smmuv3"),
+        _ => None,
+    }
+}
+
 fn qemu_command(arch: Arch, release: bool, bin: &str) -> Command {
     let mut cmd = Command::new(arch.qemu());
-    cmd.args(arch.qemu_machine_args());
+    let margs = arch.qemu_machine_args();
+    if let Some(machine) = machine_override(arch, bin) {
+        // Emit the machine args, substituting the token after `-machine`.
+        let mut i = 0;
+        while i < margs.len() {
+            if margs[i] == "-machine" && i + 1 < margs.len() {
+                cmd.arg("-machine").arg(machine);
+                i += 2;
+            } else {
+                cmd.arg(margs[i]);
+                i += 1;
+            }
+        }
+    } else {
+        cmd.args(margs);
+    }
     cmd.arg("-kernel").arg(arch.kernel_path(release, bin));
     cmd.args(["-no-reboot", "-nodefaults"]);
     cmd
