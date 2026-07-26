@@ -3,20 +3,22 @@
 //! that same struct leads to the XSDT and from there to the MADT (CPU
 //! list), MCFG (PCIe ECAM base), and SRAT (NUMA affinities).
 //!
-//! Physical addresses are read through the kernel's low-1 GiB identity map
-//! (the MMU is on before discovery runs), so ACPI tables placed by QEMU in
-//! low RAM are directly readable.
+//! Physical addresses are read through the kernel's high linear map
+//! (`arch::phys_to_virt`; docs/MEMORY.md) - the MMU is on before discovery
+//! runs, and the kernel no longer identity-maps RAM low - so ACPI tables placed
+//! by QEMU in low RAM are reachable at their high alias.
 
 use super::{Inventory, MemKind};
+use crate::arch;
 
 fn rd8(pa: u64) -> u8 {
-    unsafe { (pa as *const u8).read() }
+    unsafe { (arch::phys_to_virt(pa as usize) as *const u8).read() }
 }
 fn rd32(pa: u64) -> u32 {
-    unsafe { (pa as *const u32).read_unaligned() }
+    unsafe { (arch::phys_to_virt(pa as usize) as *const u32).read_unaligned() }
 }
 fn rd64(pa: u64) -> u64 {
-    unsafe { (pa as *const u64).read_unaligned() }
+    unsafe { (arch::phys_to_virt(pa as usize) as *const u64).read_unaligned() }
 }
 
 fn sig4(pa: u64) -> [u8; 4] {
@@ -107,8 +109,74 @@ fn walk_sdt(sdt: u64, is_xsdt: bool, inv: &mut Inventory) {
             b"APIC" => parse_madt(table, inv),
             b"MCFG" => parse_mcfg(table, inv),
             b"SRAT" => parse_srat(table, inv),
+            b"NFIT" => parse_nfit(table, inv),
+            b"DMAR" => parse_dmar(table, inv),
             _ => {}
         }
+    }
+}
+
+/// The ACPI GUID for "byte-addressable persistent memory" SPA ranges
+/// (NFIT SPA Range Structure), stored in the mixed-endian GUID layout QEMU
+/// writes for an nvdimm: {66F0D379-B4F3-4074-AC43-0D3318B78CDB}.
+const NFIT_PM_GUID: [u8; 16] = [
+    0x79, 0xD3, 0xF0, 0x66, 0xF3, 0xB4, 0x74, 0x40, 0xAC, 0x43, 0x0D, 0x33, 0x18, 0xB7, 0x8C, 0xDB,
+];
+
+/// NFIT -> persistent-memory regions (docs/MEMORY.md real-PMEM path). A real
+/// QEMU nvdimm's physical span is reported **only** here (the SPA Range
+/// Structure), not in the PVH E820 memmap, so this is the discovery path that
+/// turns a `MemKind::Pmem` grant into genuinely nvdimm-backed frames rather than
+/// DDR. Each SPA Range Structure (type 0) whose address-range-type GUID is the
+/// persistent-memory GUID contributes its `[base, base+len)` as a `Pmem` region.
+fn parse_nfit(nfit: u64, inv: &mut Inventory) {
+    let len = rd32(nfit + 4) as u64;
+    // Header(36) + reserved(4); sub-structures follow.
+    let mut off = 40;
+    while off + 4 <= len {
+        let stype = rd8(nfit + off) as u16 | ((rd8(nfit + off + 1) as u16) << 8);
+        let slen = (rd8(nfit + off + 2) as u16 | ((rd8(nfit + off + 3) as u16) << 8)) as u64;
+        if slen == 0 {
+            break;
+        }
+        // Type 0 = System Physical Address Range Structure: GUID@16, base@32,
+        // length@40 (ACPI 6.x table 5-132).
+        if stype == 0 && slen >= 48 {
+            let mut guid = [0u8; 16];
+            for (i, b) in guid.iter_mut().enumerate() {
+                *b = rd8(nfit + off + 16 + i as u64);
+            }
+            if guid == NFIT_PM_GUID {
+                let base = rd64(nfit + off + 32);
+                let size = rd64(nfit + off + 40);
+                inv.add_mem(base, size, MemKind::Pmem, 0);
+            }
+        }
+        off += slen;
+    }
+}
+
+/// DMAR -> the VT-d remapping-hardware register base (docs/GPU-HARDWARE.md
+/// 4, the IOMMU containment mechanism). The table header (36) is followed
+/// by host_address_width(1) + flags(1) + reserved(10), then remapping
+/// structures; the first DRHD (type 0) carries the register base at offset
+/// 8 within it. Only present when QEMU is started with `-device
+/// intel-iommu`; absent otherwise, leaving `iommu_base` 0 (skip-with-reason).
+fn parse_dmar(dmar: u64, inv: &mut Inventory) {
+    let len = rd32(dmar + 4) as u64;
+    let mut off = 48; // header(36) + haw(1) + flags(1) + reserved(10)
+    while off + 4 <= len {
+        let stype = rd8(dmar + off) as u16 | ((rd8(dmar + off + 1) as u16) << 8);
+        let slen = (rd8(dmar + off + 2) as u16 | ((rd8(dmar + off + 3) as u16) << 8)) as u64;
+        if slen == 0 {
+            break;
+        }
+        // Type 0 = DRHD (DMA Remapping Hardware Unit Definition): the
+        // register base is a u64 at offset 8 within the structure.
+        if stype == 0 && slen >= 16 && inv.iommu_base == 0 {
+            inv.iommu_base = rd64(dmar + off + 8);
+        }
+        off += slen;
     }
 }
 

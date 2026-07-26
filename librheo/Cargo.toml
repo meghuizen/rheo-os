@@ -1,0 +1,95 @@
+[package]
+name = "librheo"
+version = "0.1.0"
+edition = "2024"
+
+# librheo (docs/LIBRHEO.md): the greenfield native userspace foundation library
+# for rheo-os - the role a libc plays, rebuilt for THIS kernel: async-first,
+# capability-native, built ON `runtime/` (heap, strand executor, type-level
+# rights). Unlike `libc/` (the C/POSIX compat layer) it does not chase an
+# existing ABI; it expresses the kernel's own object model (queue pairs,
+# capabilities, per-cell entropy). Phase A ships the spine: mem/rng/cap + the
+# async queue reactor (rt). A program links it, gets `_start`/heap/allocator,
+# and reaches the kernel through its cell's queue pair.
+
+[dependencies]
+runtime = { path = "../runtime" }
+
+# Feature gating (docs/LIBRHEO.md): `full` (the default) pulls every extended
+# module; an **embedded** cell builds `--no-default-features` to link only the
+# spine (cap/rt/mem/sys), which is substantially smaller yet still does a queue
+# round-trip. `librheo-embed` is the proof; the other bins need `full`.
+[features]
+default = ["full"]
+full = []
+
+[lib]
+name = "librheo"
+
+[[bin]]
+name = "librheo-demo"
+path = "src/bin/librheo-demo.rs"
+
+[[bin]]
+name = "librheo-data"
+path = "src/bin/librheo-data.rs"
+
+[[bin]]
+name = "librheo-compute"
+path = "src/bin/librheo-compute.rs"
+
+[[bin]]
+name = "librheo-term"
+path = "src/bin/librheo-term.rs"
+
+[[bin]]
+name = "librheo-wl"
+path = "src/bin/librheo-wl.rs"
+
+# Phase F: native process model + a librheo-native shell + coreutils it spawns.
+[[bin]]
+name = "librheo-orch"
+path = "src/bin/librheo-orch.rs"
+
+[[bin]]
+name = "librheo-echo"
+path = "src/bin/librheo-echo.rs"
+
+[[bin]]
+name = "librheo-child"
+path = "src/bin/librheo-child.rs"
+
+[[bin]]
+name = "lrsh"
+path = "src/bin/lrsh.rs"
+
+# Phase G: raw-frame networking over a real virtio-net NIC (ARP round trip).
+[[bin]]
+name = "librheo-net"
+path = "src/bin/librheo-net.rs"
+
+# Phase H: a real GPU scanout over a virtio-gpu 2D driver (present round trip).
+[[bin]]
+name = "librheo-gpu"
+path = "src/bin/librheo-gpu.rs"
+
+# Phase J: symmetric async IPC - two cells ping-pong typed messages over the
+# async Sender/Receiver, parking on the reactor (no busy switch).
+[[bin]]
+name = "librheo-ipc"
+path = "src/bin/librheo-ipc.rs"
+
+# Phase J: cross-cell stdout pipeline - an orchestrator spawns a producer child
+# that inherits its channel and streams its output back over the async channel.
+[[bin]]
+name = "librheo-pipe"
+path = "src/bin/librheo-pipe.rs"
+
+[[bin]]
+name = "librheo-pipesrc"
+path = "src/bin/librheo-pipesrc.rs"
+
+# The embedded proof - built `--no-default-features` to prove librheo scales down.
+[[bin]]
+name = "librheo-embed"
+path = "src/bin/librheo-embed.rs"

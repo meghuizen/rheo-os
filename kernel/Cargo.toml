@@ -3,4 +3,12 @@ name = "kernel"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# SMP (docs/SMP.md, task #27): per-CPU state + a kernel spinlock + secondary-core
+# bring-up. Opt-in and OFF by default so the 31 existing test kernels link a
+# byte-identical `kernel` lib (adding the module perturbs LLVM codegen-unit
+# hashing, which must not reach kernels that never use SMP). Only the `smp` test
+# kernel enables it, built in a separate cargo invocation (like librheo-embed).
+smp = []
+
 [dependencies]

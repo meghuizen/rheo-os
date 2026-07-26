@@ -410,6 +410,18 @@ part of it.
   capability-bundle; a per-identity synthesized filesystem view (Plan 9's
   namespaces, enforceable this time). SSH-to-bash works; ~99% interactive
   fidelity, ~80% arbitrary-script fidelity, honestly stated.
+- Linux binaries: the Linux personality (docs/LINUX-COMPAT.md) implements
+  the Linux syscall ABI over cells and grants. Currently kernel-hosted like
+  `svc.rs` (a documented bridge, not a doctrine change): it adds no kernel
+  object - PIDs/fds/signals/**processes** are per-cell synthesized state - so
+  section 5's exclusions hold; the kernel proper gains only mechanisms that
+  pass the section 6 test (thread-pointer switch state, unmap/protect,
+  multi-context cells per 4.3, U-mode FP/SIMD state, and - for L6 processes -
+  a page-table user-leaf walk behind eager-copy/reclaim `fork` and a
+  generalized cross-cell run loop reusing the native address-space switch).
+  fork/execve/wait4/cross-cell pipes run unmodified static-glibc programs and
+  a shell driving the upstream uutils/coreutils (the P11 gate, measured
+  12/12 = 100% on all three ISAs).
 - Edges: Kubernetes API, gRPC/HTTP/JSON gateways, Arrow Flight, YAML
   manifests (tightened parser) - all translate at the boundary.
 

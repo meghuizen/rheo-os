@@ -1,0 +1,17 @@
+# Standalone crate (its own workspace): built by xtask for a
+# `*-unknown-linux-gnu` target as an unpatched multi-threaded Rust std fixture
+# for the Linux personality (docs/LINUX-COMPAT.md L4), not part of the kernel
+# workspace. The empty [workspace] table detaches it.
+[workspace]
+
+[package]
+name = "rustthreads"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rustthreads"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"

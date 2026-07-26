@@ -8,6 +8,119 @@ NIC/DPU. The design goal is that a packet nobody holds a grant for costs
 approximately nothing, and that a flood against one tenant cannot perturb
 another.
 
+## 0. What is built (Phase G): the NIC data path, raw frames
+
+The **NIC driver + a raw-frame async path** are real; the **IP/TCP/QUIC stack
+stays deferred as a service** (sections 2-3), exactly as the position above
+requires - the kernel owns the queue plumbing, not the protocols.
+
+- A hand-written **virtio-net driver** (`kernel/src/hw/virtio_net.rs`), mirroring
+  the virtio-blk driver over the same **two transports** - virtio-mmio on
+  arm/riscv `virt`, virtio-pci on x86-64 q35 (through the `VIRTIO_PCI_CAP_PCI_CFG`
+  config tunnel, no BAR mapping). Reset + minimal feature negotiation
+  (`VIRTIO_F_VERSION_1` + `VIRTIO_NET_F_MAC`; no mergeable-rx-buffers or
+  checksum/GSO offload), an RX and a TX **split virtqueue**, and the 12-byte v1
+  `virtio_net_hdr`. DMA uses **physical** addresses (`virt_to_phys`) since the
+  kernel moved to the higher half. Polled (no device IRQ yet - a later refinement,
+  like virtio-blk).
+- librheo's **`net`** is now a real async surface: `mac()`, `send(frame)`,
+  `recv(buf)` over three queue opcodes (`OP_NET_TX`/`OP_NET_RX`/`OP_NET_MAC`)
+  bridged to the driver in `kernel_process`, completing with the strand token -
+  the same async model as the Phase B `io` opcodes. `connect`/`listen` stay
+  `Unsupported` stubs: a socket/IP/TCP layer is a **service** (section 2).
+- Proof: the `librheonet` test kernel (all three ISAs) - a librheo cell asks the
+  NIC for its MAC, sends a **broadcast ARP request** for the SLIRP gateway
+  `10.0.2.2`, and **receives SLIRP's ARP reply** (a real, deterministic,
+  network-free RX proof over QEMU `-netdev user`), asserting the reply's ethertype
+  + opcode + sender IP and exiting `0x42`.
+- Deferred (documented): the full transport stack (IP/ARP-cache/TCP/QUIC/TLS as a
+  library in a cell, section 2), a first-class socket `ObjectKind` + steering-table
+  grants (section 1), header/payload split (section 1), a device RX interrupt, and
+  everything in sections 4-7 (eBPF dataplane, DDoS staging, DPU offload).
+
+## 0a. What is built (rheo-net Phase N1a-N1e + N2a/N2b): the L2/L3/L4 core + caching DNS + traceroute + native TCP + congestion control
+
+The **greenfield network stack** begins here as **portable userspace** - a new
+`net/` workspace crate (`no_std` + alloc, no per-ISA code) built for the three
+bare targets as a loaded ELF cell, riding ON the Phase G raw-frame path. Its full
+architecture, crypto posture, and the N1-N8 roadmap are **docs/NETSTACK.md**.
+
+Phase N1a ships the L2/L3 core - `eth` (Ethernet II parse/build, zero-copy views),
+`arp` (request/reply + an IP->MAC cache + an async `resolve` over `librheo::net`),
+and `ip` (IPv4 + IPv6 header parse/build + the RFC 1071 ones-complement Internet
+checksum, a reusable accumulator UDP/ICMP inherit). It adds **no kernel object and
+no per-ISA code** - it is pure parsing over the existing `OP_NET_*` queue path.
+
+Proof: the `netcore` test kernel (all three ISAs, same SLIRP + virtio-net wiring
+as `librheonet`) - a cell reads the NIC MAC, **resolves the SLIRP gateway
+`10.0.2.2` through `net::arp`** (the ARP round trip now runs through the stack's
+`eth`/`arp` layers, not `librheonet`'s hand-built frame), validates the checksum
+against a known value (`0xB861`), round-trips an IPv4 header build/parse/validate
+(a flipped byte fails), and round-trips an IPv6 header - exiting `0x42`.
+
+**Phase N1b (L4)** adds `udp` (datagram build/parse + the pseudo-header checksum,
+reusing N1a's `Checksum` accumulator, + an async `UdpEndpoint`), `icmp` (ICMPv4
+echo/ping + the IPv4 TTL hook for a later traceroute), and `wire` (the shared
+eth/ip framing). Proof: the `netl4` test kernel (all three ISAs) sends a real DNS
+query over **UDP** to SLIRP's built-in responder at `10.0.2.3:53` and an **ICMP
+echo** to the gateway `10.0.2.2`, asserting the UDP checksum validates + the
+transaction id echoes, the ping reply type/id/seq match, and two known-good
+checksum oracles (`0x6D45` UDP, `0xFFE0` ICMP) - exiting `0x42`, network-free.
+
+**Phase N1c** adds `dns` - a from-scratch **caching DNS client**: a full message
+codec (A/AAAA/CNAME + loop-bounded name-compression pointers), an async caching
+`Resolver` over `udp`, an **LRU + TTL cache**, a **blocklist** (a from-scratch
+hash set + wildcard suffixes, designed for huge lists via a grant-backed arena),
+and configurable resolvers + a static hosts table. Proof: the `netdns` test kernel
+(all three ISAs) asserts, **network-free**, a compressed-response parse oracle +
+pointer-loop safety, and hosts/blocklist/cache resolutions that each send **zero**
+network queries (a query counter is the evidence), plus a **bonus live** resolve of
+`example.com` over SLIRP's DNS (`10.0.2.3`) that asserts only structure and
+tolerates a timeout where there is no outbound DNS - exiting `0x42`. Negative
+caching is deferred (documented).
+
+**Phase N1e** makes TTL (IPv4) and Hop Limit (IPv6) **first-class** (default 64,
+built + parsed), adds the forwarding-plane `ip::decrement_ttl`/`decrement_hop_limit`
+primitives (the router/firewall path - decrement, recompute the IPv4 checksum,
+drop + signal Time Exceeded at zero), ICMP **Time Exceeded** (v4 type 11 +
+the v6 type 3 codec), and a real **traceroute** state machine (`net::trace`,
+ICMP-echo probes correlated by sequence number). Proof: the `nettrace` test kernel
+(all three ISAs) asserts, **network-free**, the TTL/hop-limit round-trips, the
+decrement primitive (checksum oracle `0xB961`, drop signal at TTL 0/1), the Time
+Exceeded oracles (`0xF4FF` v4, `0x1936` v6), and the **traceroute state machine
+fed synthetic responses** reconstructing an exact 4-hop path (multi-hop discovery
+without real routers), plus a **bonus live** 1-hop trace to the gateway `10.0.2.2`
+that tolerates a timeout - exiting `0x42`. Still deferred: the *live* ICMPv6 path +
+IGMP/MLD are N7 (docs/NETSTACK.md 5-9).
+
+**Phase N2a** adds the native **TCP** transport: `net::tcp` (the RFC 793 state
+machine - handshake, sliding-window flow control, RFC 6298 RTO/RTT + Karn,
+cumulative-ack retransmission, FIN teardown + TIME-WAIT, the TCP checksum, and a
+`CongestionControl` trait seam for the N2b CUBIC/BBR drop-in) and `net::timer` (a
+timer wheel multiplexing many logical timers - per-connection RTO / TIME-WAIT -
+onto the reactor's **single** one-shot deadline, pure userspace, no ABI change).
+Proof: the `nettcp` test kernel (all three ISAs), **deterministic + network-free** -
+two TCP endpoints in one cell over a virtual link drive the full lifecycle
+(three-way handshake, bidirectional data with exact bytes, a **dropped segment
+recovered by RTO**, clean teardown to CLOSED/TIME-WAIT), plus the checksum/segment
+oracles (`0x613C`) and the timer-wheel multiplex - exiting `0x42`. A **live** TCP
+handshake to SLIRP is **skipped with reason** (SLIRP has no TCP responder to make
+it deterministic).
+
+**Phase N2b** fills the seam with real **congestion control**: `net::cc` -
+**Reno** (RFC 5681: slow start, AIMD, fast retransmit / fast recovery on 3 dup ACKs,
+RTO slow-start restart) and **CUBIC** (RFC 8312: the cubic window `W(t)` in
+**integer / fixed-point** math with an integer cube root, plus the TCP-friendly
+region), both drop-in `CongestionControl` impls wired into the send window; `net::tcp`
+gained dup-ACK detection + fast-retransmit-before-RTO. Proof: the `nettcpcc` test
+kernel (all three ISAs), **deterministic + network-free** - integer cwnd trajectories
+(slow start, AIMD, fast retransmit/recovery, RTO, the CUBIC `W(t)` shape) pinned
+against precomputed oracles + a real `Connection<Reno>` fast-retransmit scenario over
+the in-cell virtual link, exiting `0x42`. A **live** TCP handshake is again
+**skipped with reason**. The smoltcp cell + the sharded transport + a live handshake
+are **N2c**; SACK/window-scaling/ECN, NewReno partial-ACK recovery, CUBIC
+HyStart/fast-convergence, and BBR are deferred (docs/NETSTACK.md 11-12).
+
 ## 1. NIC queues are the primitive
 
 - A network grant = a set of hardware RX/TX queue pairs, IOMMU-mapped into

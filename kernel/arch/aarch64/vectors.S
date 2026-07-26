@@ -13,10 +13,11 @@
  */
 
 // TrapFrame offsets (see aarch64/mod.rs).
-.equ TF_SP,   248
-.equ TF_ELR,  256
-.equ TF_SPSR, 264
-.equ TF_KSP,  272
+.equ TF_SP,    248
+.equ TF_ELR,   256
+.equ TF_SPSR,  264
+.equ TF_KSP,   272
+.equ TF_TPIDR, 280
 
 .section .text
 
@@ -35,7 +36,8 @@ vector_table:
     FATAL_SLOT 3                // current EL SP0: SError
 .p2align 7
     b sync_current_spx          // current EL SPx: synchronous (kernel SVC)
-    FATAL_SLOT 5                // current EL SPx: IRQ
+.p2align 7
+    b irq_current_spx           // current EL SPx: IRQ (GICv3, docs/LIBRHEO.md D/F)
     FATAL_SLOT 6                // current EL SPx: FIQ
     FATAL_SLOT 7                // current EL SPx: SError
 .p2align 7
@@ -66,6 +68,38 @@ sync_current_spx:
     mrs x0, esr_el1
     mrs x1, elr_el1
     bl aarch64_sync_handler
+    ldp x0, x1, [sp, #0]
+    ldp x2, x3, [sp, #16]
+    ldp x4, x5, [sp, #32]
+    ldp x6, x7, [sp, #48]
+    ldp x8, x9, [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x15, [sp, #112]
+    ldp x16, x17, [sp, #128]
+    ldp x18, x29, [sp, #144]
+    ldr x30, [sp, #160]
+    add sp, sp, #176
+    eret
+
+// Current-EL SPx IRQ (docs/LIBRHEO.md Phase D/F): a GICv3 interrupt taken while
+// the kernel idles at `wfi` (EL1, SP_EL1). Save the caller-saved registers (which
+// also 16-aligns the frame), ack+service+EOI in Rust, restore, eret back to the
+// instruction after `wfi`. Mirrors sync_current_spx's save set (x0-x18, x29, x30).
+irq_current_spx:
+    sub sp, sp, #176
+    stp x0, x1, [sp, #0]
+    stp x2, x3, [sp, #16]
+    stp x4, x5, [sp, #32]
+    stp x6, x7, [sp, #48]
+    stp x8, x9, [sp, #64]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x15, [sp, #112]
+    stp x16, x17, [sp, #128]
+    stp x18, x29, [sp, #144]
+    str x30, [sp, #160]
+    bl aarch64_irq_handler
     ldp x0, x1, [sp, #0]
     ldp x2, x3, [sp, #16]
     ldp x4, x5, [sp, #32]
@@ -114,6 +148,8 @@ el0_sync:
     str x1, [x0, #TF_ELR]
     mrs x1, spsr_el1
     str x1, [x0, #TF_SPSR]
+    mrs x1, tpidr_el0           // per-thread TLS pointer
+    str x1, [x0, #TF_TPIDR]
 
     ldr x1, [x0, #TF_KSP]
     mov sp, x1
@@ -130,6 +166,8 @@ el0_resume:                     // x0 = &TrapFrame
     msr elr_el1, x1
     ldr x1, [x0, #TF_SPSR]
     msr spsr_el1, x1
+    ldr x1, [x0, #TF_TPIDR]     // per-thread TLS pointer
+    msr tpidr_el0, x1
     ldr x1, [x0, #TF_SP]
     msr sp_el0, x1
     ldp x2, x3, [x0, #16]

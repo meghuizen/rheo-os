@@ -129,6 +129,21 @@ impl HoleList {
         self.insert(addr, size);
     }
 
+    /// Add another owned region to the free list - arena growth for a heap
+    /// that maps more backing memory on demand (librheo grows over SYS_MMAP,
+    /// docs/LIBRHEO.md). Regions smaller than a hole header are ignored.
+    ///
+    /// # Safety
+    /// `[base, base+size)` must be valid, writable, uniquely owned memory that
+    /// outlives every allocation, and disjoint from every region already held.
+    pub unsafe fn add_region(&mut self, base: usize, size: usize) {
+        let base = align_up(base, HOLE_ALIGN);
+        let size = size & !(HOLE_ALIGN - 1);
+        if size >= HOLE_SIZE {
+            self.insert(base, size);
+        }
+    }
+
     /// Insert a free region, keeping the list address-sorted, and coalesce
     /// with the immediately adjacent neighbours.
     fn insert(&mut self, addr: usize, size: usize) {
@@ -194,6 +209,15 @@ impl Heap {
     /// See `HoleList::init`. Call once before any allocation.
     pub unsafe fn init(&self, base: usize, size: usize) {
         unsafe { (*self.list.get()).init(base, size) };
+    }
+
+    /// Add another backing region to the heap (arena growth). See
+    /// [`HoleList::add_region`].
+    ///
+    /// # Safety
+    /// As [`HoleList::add_region`].
+    pub unsafe fn add_region(&self, base: usize, size: usize) {
+        unsafe { (*self.list.get()).add_region(base, size) };
     }
 }
 

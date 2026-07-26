@@ -21,18 +21,378 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 10] = [
+const TEST_KERNELS: [&str; 47] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
     "isolation-hw",
     "resources",
+    "pmem",
+    "smp",
     "shell-smoke",
     "hwinfo",
     "rng",
     "runtime",
     "posix",
+    "blockfs",
+    "elfrun",
+    "posixrun",
+    "libcrun",
+    "jsonrun",
+    "stdrun",
+    "librhearun",
+    "librheodata",
+    "librheocompute",
+    "librheoterm",
+    "librheowl",
+    "coreutils",
+    "linuxrun",
+    "linuxtools",
+    "linuxthreads",
+    "linuxsig",
+    "linuxproc",
+    "linuxdyn",
+    "librheoproc",
+    "librheonet",
+    "librheogpu",
+    "librheoipc",
+    "librheopipe",
+    "netcore",
+    "netl4",
+    "netdns",
+    "nettrace",
+    "netlocal",
+    "nettcp",
+    "nettcpcc",
+    "netsmoltcp",
+    "linuxunix",
+    "linuxinet",
+    "gpuhw",
+    "iommu",
 ];
+
+/// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
+/// (the ext4 fixture). arm/riscv `virt` present it over virtio-mmio; x86 q35
+/// has no virtio-mmio, so there it is a virtio-*pci* device (disable-legacy=on
+/// pins the modern-only layout the PCI-config-tunnel driver expects).
+fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
+    match (kernel, arch) {
+        ("blockfs", Arch::Riscv64 | Arch::Aarch64) => &[
+            // Present the modern (version 2) virtio-mmio transport, which the
+            // driver implements; QEMU defaults to the legacy version-1 layout.
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-drive",
+            "file=tests/fixtures/ext4.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-device,drive=blk0",
+        ],
+        ("blockfs", Arch::X86_64) => &[
+            "-drive",
+            "file=tests/fixtures/ext4.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-pci,drive=blk0,disable-legacy=on",
+        ],
+        // librheodata (docs/LIBRHEO.md Phase B): the columnar dataset on a live
+        // virtio-blk disk, generated fresh by `gen_columnar_dataset` into
+        // target/ (gitignored, never committed). Same transports as blockfs.
+        ("librheodata", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-drive",
+            "file=target/librheodata.bin,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-device,drive=blk0",
+        ],
+        ("librheodata", Arch::X86_64) => &[
+            "-drive",
+            "file=target/librheodata.bin,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-pci,drive=blk0,disable-legacy=on",
+        ],
+        // librheonet (docs/LIBRHEO.md Phase G, docs/NETWORKING.md): a virtio-net
+        // NIC on a SLIRP user netdev - deterministic + network-free. The guest
+        // sends a broadcast ARP for the gateway 10.0.2.2; SLIRP answers with an
+        // ARP reply the driver receives (a real, reproducible headless RX proof).
+        // Same two transports as blockfs: virtio-mmio on arm/riscv, virtio-pci
+        // on x86 (disable-legacy=on pins the modern layout the driver expects).
+        ("librheonet", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-device,netdev=n0",
+        ],
+        ("librheonet", Arch::X86_64) => &[
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-pci,netdev=n0,disable-legacy=on",
+        ],
+        // netcore (docs/NETSTACK.md rheo-net Phase N1a): same SLIRP + virtio-net
+        // setup as librheonet - the ARP round trip now runs through the `net`
+        // crate's eth/arp layers. Deterministic + network-free (SLIRP answers the
+        // broadcast ARP for the gateway 10.0.2.2). Same two transports.
+        ("netcore", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-device,netdev=n0",
+        ],
+        ("netcore", Arch::X86_64) => &[
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-pci,netdev=n0,disable-legacy=on",
+        ],
+        // netl4 (docs/NETSTACK.md rheo-net Phase N1b): UDP + ICMP over the same
+        // SLIRP + virtio-net setup as netcore. The guest sends a DNS query over
+        // UDP to SLIRP's built-in responder (10.0.2.3:53) and an ICMP echo to the
+        // gateway (10.0.2.2), both of which SLIRP answers deterministically and
+        // network-free. Same two transports: virtio-mmio on arm/riscv, virtio-pci
+        // on x86 (disable-legacy=on pins the modern layout the driver expects).
+        ("netl4", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-device,netdev=n0",
+        ],
+        ("netl4", Arch::X86_64) => &[
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-pci,netdev=n0,disable-legacy=on",
+        ],
+        // netdns (docs/NETSTACK.md rheo-net Phase N1c): the caching DNS client
+        // over the same SLIRP + virtio-net setup as netl4. The deterministic
+        // codec/hosts/blocklist/cache checks are network-free; the bonus live
+        // resolve queries SLIRP's built-in DNS responder (10.0.2.3:53). Same two
+        // transports: virtio-mmio on arm/riscv, virtio-pci on x86.
+        ("netdns", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-device,netdev=n0",
+        ],
+        ("netdns", Arch::X86_64) => &[
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-pci,netdev=n0,disable-legacy=on",
+        ],
+        // nettrace (docs/NETSTACK.md rheo-net Phase N1e): TTL/hop-limit +
+        // traceroute over the same SLIRP + virtio-net setup as netdns. The core
+        // proof (TTL/decrement/Time-Exceeded oracles + the traceroute state
+        // machine fed synthetic responses) is network-free; the bonus live 1-hop
+        // trace probes the gateway 10.0.2.2 (SLIRP is the destination at hop 1, no
+        // intermediate hops). Same two transports: virtio-mmio on arm/riscv,
+        // virtio-pci on x86.
+        ("nettrace", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-device,netdev=n0",
+        ],
+        ("nettrace", Arch::X86_64) => &[
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-pci,netdev=n0,disable-legacy=on",
+        ],
+        // netsmoltcp (docs/NETSTACK.md §13, rheo-net Phase N2c): the smoltcp
+        // blessed transport cell drives the NIC over the same SLIRP + virtio-net
+        // setup as netl4. The smoltcp UDP socket sends a DNS query to SLIRP's
+        // built-in responder (10.0.2.3:53) and receives the reply. Same two
+        // transports: virtio-mmio on arm/riscv, virtio-pci on x86-64.
+        ("netsmoltcp", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-device,netdev=n0",
+        ],
+        ("netsmoltcp", Arch::X86_64) => &[
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-pci,netdev=n0,disable-legacy=on",
+        ],
+        // librheogpu (docs/LIBRHEO.md Phase H, docs/DISPLAY.md): a virtio-gpu 2D
+        // device the driver brings up and presents to. QEMU runs headless
+        // (`-display none` is added for every test kernel in `boot_expect_pass`),
+        // so the proof is the genuine 2D command round-trip, not a visible pixel.
+        // Same two transports as blockfs: virtio-mmio on arm/riscv, virtio-pci on
+        // x86 (disable-legacy=on pins the modern layout the driver expects).
+        ("librheogpu", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-device",
+            "virtio-gpu-device",
+        ],
+        ("librheogpu", Arch::X86_64) => &["-device", "virtio-gpu-pci,disable-legacy=on"],
+        // gpuhw (docs/GPU-HARDWARE.md 3, 12 stage 1): the same three GPU
+        // functions on every ISA - a real AMD/ATI vendor device (ati-vga,
+        // 0x1002), the Bochs display (0x1234), and a virtio-gpu placed
+        // BEHIND a pcie-root-port, reachable only if enumeration programs
+        // the bridge's secondary bus (PVH boots have no firmware to do it).
+        // NVIDIA/Intel have no QEMU GPU model - the kernel prints their
+        // skip-with-reason lines and the test asserts their absence.
+        // Every GPU device model QEMU provides for the ISA, one per vendor.
+        // x86-64 has all six: virtio-gpu (behind a root port), AMD
+        // (ati-vga), Bochs, Cirrus Logic, VMware SVGA, and Red Hat/QXL
+        // (secondary - qxl-vga must be console 0). NVIDIA and Intel have no
+        // QEMU GPU model - recognised by ID, skip-with-reason
+        // (docs/GPU-HARDWARE.md 12).
+        ("gpuhw", Arch::X86_64) => &[
+            "-device",
+            "pcie-root-port,id=rp1,chassis=1,slot=1",
+            "-device",
+            "virtio-gpu-pci,bus=rp1,disable-legacy=on",
+            "-device",
+            "ati-vga",
+            "-device",
+            "bochs-display",
+            "-device",
+            "cirrus-vga",
+            "-device",
+            "vmware-svga",
+            "-device",
+            "qxl",
+        ],
+        // arm/riscv `virt`: vmware-svga and qxl are x86-only in QEMU, so the
+        // per-ISA set is virtio-gpu + AMD + Bochs + Cirrus (four vendors).
+        ("gpuhw", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-device",
+            "pcie-root-port,id=rp1,chassis=1,slot=1",
+            "-device",
+            "virtio-gpu-pci,bus=rp1,disable-legacy=on",
+            "-device",
+            "ati-vga",
+            "-device",
+            "bochs-display",
+            "-device",
+            "cirrus-vga",
+        ],
+        // iommu (docs/GPU-HARDWARE.md 4, BUILD-ORDER.md step 12): VT-d DMA
+        // remapping. x86-64 q35 gets `-device intel-iommu` (caching-mode=on
+        // so the vIOMMU faults + requires invalidation, the mode that
+        // reports out-of-grant DMA) plus a virtio-blk-pci disk as the DMA
+        // source. intel-iommu must precede the devices it covers. arm/riscv
+        // `virt` surface no DMAR base, so the kernel skips-with-reason and
+        // needs no IOMMU device (a plain virtio-blk keeps the probe honest).
+        ("iommu", Arch::X86_64) => &[
+            "-device",
+            "intel-iommu,caching-mode=on",
+            "-drive",
+            "file=tests/fixtures/ext4.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-pci,drive=blk0,disable-legacy=on,iommu_platform=on",
+        ],
+        // ARM64: the SMMUv3 covers PCI, so use virtio-blk-*pci* (behind the
+        // SMMU) with iommu_platform=on, mirroring the x86 VT-d proof. The
+        // machine gains iommu=smmuv3 via `machine_override`.
+        ("iommu", Arch::Aarch64) => &[
+            "-drive",
+            "file=tests/fixtures/ext4.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-pci,drive=blk0,disable-legacy=on,iommu_platform=on",
+        ],
+        // RISC-V has no QEMU IOMMU model, so the kernel skips-with-reason;
+        // a plain virtio-blk keeps the (unreached) probe honest.
+        ("iommu", Arch::Riscv64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-drive",
+            "file=tests/fixtures/ext4.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-device,drive=blk0",
+        ],
+        // pmem (docs/MEMORY.md real-PMEM path): a real QEMU nvdimm whose
+        // persistent span the kernel discovers via the ACPI NFIT and backs a
+        // `MemKind::Pmem` grant with. Only x86-64 q35 exposes one here: the
+        // appended `-machine nvdimm=on` + `-m ...,slots,maxmem` enable memory
+        // devices, the memory-backend-file is the backing store (a zeroed 16 MiB
+        // file generated into target/ by `gen_pmem_backing`, never committed),
+        // and the nvdimm device attaches it. arm/riscv `virt` do not accept an
+        // nvdimm (arm needs an ACPI GED device; riscv has no nvdimm support), so
+        // the pmem kernel runs there with no extra args and skips-with-reason.
+        ("pmem", Arch::X86_64) => &[
+            "-machine",
+            "nvdimm=on",
+            "-m",
+            "1G,slots=2,maxmem=4G",
+            "-object",
+            "memory-backend-file,id=pm0,share=on,mem-path=target/pmem.img,size=16M,pmem=on",
+            "-device",
+            "nvdimm,memdev=pm0,id=nv0",
+        ],
+        _ => &[],
+    }
+}
+
+/// Path of the generated columnar dataset (gitignored).
+const COLUMNAR_DATASET: &str = "target/librheodata.bin";
+
+/// Generate the librheo Phase B columnar dataset (docs/LIBRHEO.md): a 16-byte
+/// header `[magic u32][nrows u32][ncols u32][reserved u32]` then column A
+/// (`col_a[i] = i`) then column B (`col_b[i] = i & 1`), each `nrows` little-
+/// endian u32, padded to a 512-byte sector. Deterministic, so the scan's exact
+/// aggregate is a closed form. Written to `target/` (never committed - the "no
+/// artifacts staged" rule) before the `librheodata` kernel boots.
+fn gen_columnar_dataset() -> bool {
+    const NROWS: u32 = 65536;
+    const NCOLS: u32 = 2;
+    let mut out: Vec<u8> = Vec::with_capacity(16 + (NROWS * NCOLS * 4) as usize + 512);
+    out.extend_from_slice(&0x314C_4F43u32.to_le_bytes()); // magic "COL1"
+    out.extend_from_slice(&NROWS.to_le_bytes());
+    out.extend_from_slice(&NCOLS.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    for i in 0..NROWS {
+        out.extend_from_slice(&i.to_le_bytes()); // col_a[i] = i
+    }
+    for i in 0..NROWS {
+        out.extend_from_slice(&(i & 1).to_le_bytes()); // col_b[i] = i & 1
+    }
+    while !out.len().is_multiple_of(512) {
+        out.push(0);
+    }
+    if let Err(e) = std::fs::write(COLUMNAR_DATASET, &out) {
+        eprintln!("[xtask] writing {COLUMNAR_DATASET}: {e}");
+        return false;
+    }
+    true
+}
+/// Path of the generated nvdimm backing file (gitignored).
+const PMEM_BACKING: &str = "target/pmem.img";
+
+/// Generate a zeroed 16 MiB backing file for the `pmem` test kernel's QEMU
+/// nvdimm (docs/MEMORY.md real-PMEM path). Written to `target/` before boot
+/// (never committed - the "no artifacts staged" rule). A fresh nvdimm starts
+/// zeroed, which is what the write/read round-trip proof expects.
+fn gen_pmem_backing() -> bool {
+    const SIZE: usize = 16 * 1024 * 1024;
+    if let Ok(meta) = std::fs::metadata(PMEM_BACKING)
+        && meta.len() as usize == SIZE
+    {
+        return true; // already staged at the right size
+    }
+    if let Err(e) = std::fs::write(PMEM_BACKING, vec![0u8; SIZE]) {
+        eprintln!("[xtask] writing {PMEM_BACKING}: {e}");
+        return false;
+    }
+    true
+}
+
 const BENCH_KERNEL: &str = "bench-core";
 
 #[derive(Clone, Copy, PartialEq)]
@@ -192,11 +552,15 @@ fn main() -> ExitCode {
             build(a, true)
                 && TEST_KERNELS
                     .iter()
-                    .all(|kernel| boot_expect_pass(a, true, kernel, &[]))
+                    .all(|kernel| boot_expect_pass(a, true, kernel, extra_qemu_args(a, kernel)))
         }),
         // Benchmarks always run the release build: instruction path
         // lengths of an unoptimized kernel are not the system's numbers.
         "bench" => arches.iter().all(|&a| build(a, true) && bench(a, true)),
+        // Patch the toolchain's vendored rust-src to add `target_os = "rheo"`
+        // so `std` can be built for the rheo-os target (docs/USERLAND.md M4).
+        // Idempotent; run once per toolchain before building std programs.
+        "std-patch" => std_patch(),
         _ => {
             print_usage();
             false
@@ -212,14 +576,441 @@ fn main() -> ExitCode {
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo xtask <build|run|test|bench> \
+        "usage: cargo xtask <build|run|test|bench|std-patch> \
          [--arch x86_64|aarch64|riscv64|all] [--bin <kernel>] [--release]"
     );
 }
 
+/// Apply the rheo-os std patch to the active toolchain's rust-src
+/// (targets/patch-std.py). Idempotent.
+fn std_patch() -> bool {
+    println!("[xtask] patching rust-src std for target_os = \"rheo\"");
+    matches!(
+        Command::new("python3")
+            .args(["targets/patch-std.py"])
+            .status()
+            .map(|s| s.success()),
+        Ok(true)
+    )
+}
+
 /// Bare-metal build with build-std (DEVELOPMENT.md 3): the kernel and
 /// every in-QEMU test kernel.
+/// Build the userspace programs (docs/USERLAND.md) that the `elfrun`,
+/// `posixrun`, and `libcrun` tests embed: the raw `userland` programs and the
+/// libc-linked programs in `rheo-libc`. Always release (a separate artifact
+/// from the kernel profile). The link base is per-arch (userland/link/<arch>.ld)
+/// so the default code model reaches it - no RUSTFLAGS override needed.
+/// `alloc` is in build-std so libc-linked programs can use the heap. Must run
+/// before the test kernels, which `include_bytes!` the built ELFs.
+fn build_userland(arch: Arch) -> bool {
+    println!("[xtask] building userspace for {}", arch.name());
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "build",
+        "-p",
+        "userland",
+        "-p",
+        "rheo-libc",
+        "-p",
+        "librheo",
+        "-p",
+        "rheo-net",
+        "--release",
+        "--target",
+        arch.target(),
+        "-Zbuild-std=core,alloc,compiler_builtins",
+        "-Zbuild-std-features=compiler-builtins-mem",
+    ]);
+    matches!(cmd.status().map(|s| s.success()), Ok(true))
+}
+
+/// Rebuild only the `librheo-embed` bin with `--no-default-features` (the
+/// spine: cap/rt/mem/sys - no term/io/proc/rng/...) so it links the minimal
+/// surface (docs/LIBRHEO.md Phase F embedded proof). Overwrites the full-feature
+/// build `build_userland` produced at the same path; the `librheoproc` kernel
+/// embeds this minimal artifact and asserts it is substantially smaller.
+fn build_librheo_embedded(arch: Arch) -> bool {
+    println!(
+        "[xtask] building librheo-embed (no-default-features) for {}",
+        arch.name()
+    );
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "build",
+        "-p",
+        "librheo",
+        "--bin",
+        "librheo-embed",
+        "--no-default-features",
+        "--release",
+        "--target",
+        arch.target(),
+        "-Zbuild-std=core,alloc,compiler_builtins",
+        "-Zbuild-std-features=compiler-builtins-mem",
+    ]);
+    matches!(cmd.status().map(|s| s.success()), Ok(true))
+}
+
+/// Build the `netsmoltcp-demo` bin with the `smoltcp` feature (docs/NETSTACK.md
+/// §13, Phase N2c). `build_userland` builds `rheo-net` with default features, so
+/// the smoltcp cell - gated behind `required-features = ["smoltcp"]` - is skipped
+/// there (the from-scratch stack + every other net demo stay smoltcp-free). This
+/// dedicated step builds only that one bin with the feature on, into the same
+/// release path the `netsmoltcp` test kernel `include_bytes!`s. Must run after
+/// `build_userland` so it does not disturb the other demo bins.
+fn build_smoltcp_demo(arch: Arch) -> bool {
+    println!(
+        "[xtask] building netsmoltcp-demo (--features smoltcp) for {}",
+        arch.name()
+    );
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "build",
+        "-p",
+        "rheo-net",
+        "--bin",
+        "netsmoltcp-demo",
+        "--features",
+        "smoltcp",
+        "--release",
+        "--target",
+        arch.target(),
+        "-Zbuild-std=core,alloc,compiler_builtins",
+        "-Zbuild-std-features=compiler-builtins-mem",
+    ]);
+    matches!(cmd.status().map(|s| s.success()), Ok(true))
+}
+
+/// Build a real-std program (`manifest`) for the rheo-os target of `arch`, so
+/// a test can embed the ELF (docs/USERLAND.md M4/M5). Applies the rust-src std
+/// patch first (idempotent) and uses `-Zbuild-std=std` against the custom JSON
+/// target. Used for the `stdrun` proof program and the `coreutils` cell.
+fn build_std_program(arch: Arch, manifest: &str, label: &str) -> bool {
+    if !std_patch() {
+        return false;
+    }
+    println!("[xtask] building std program '{label}' for {}", arch.name());
+    let target = format!("targets/rheo_os-{}.json", arch.name());
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "build",
+        "--manifest-path",
+        manifest,
+        "--release",
+        "--target",
+        &target,
+        "-Zbuild-std=std,panic_abort",
+        "-Zbuild-std-features=compiler-builtins-mem",
+        "-Zjson-target-spec",
+    ]);
+    matches!(cmd.status().map(|s| s.success()), Ok(true))
+}
+
+impl Arch {
+    /// The `*-unknown-linux-gnu` rustup target for the Linux personality
+    /// fixtures (docs/LINUX-COMPAT.md L2).
+    fn linux_gnu_target(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "x86_64-unknown-linux-gnu",
+            Arch::Aarch64 => "aarch64-unknown-linux-gnu",
+            Arch::Riscv64 => "riscv64gc-unknown-linux-gnu",
+        }
+    }
+
+    /// The gcc that links a static-glibc binary for this ISA.
+    fn linux_cc(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "gcc",
+            Arch::Aarch64 => "aarch64-linux-gnu-gcc",
+            Arch::Riscv64 => "riscv64-linux-gnu-gcc",
+        }
+    }
+
+    /// The toolchain runtime dynamic-linker + libc for the L7 dynamic fixture
+    /// (docs/LINUX-COMPAT.md L7): `(ld.so source path, libc.so.6 source path)`.
+    /// These live in the cross toolchain sysroots (host multiarch for x86-64)
+    /// and are copied into the gitignored fixture build dir at build time - no
+    /// `.so` blob is committed. If a path is missing for an ISA, that ISA's
+    /// dynamic fixture is skipped-with-reason (the static L2-L6 coverage stays).
+    fn dyn_runtime_libs(self) -> (&'static str, &'static str) {
+        match self {
+            Arch::X86_64 => (
+                "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+                "/lib/x86_64-linux-gnu/libc.so.6",
+            ),
+            Arch::Aarch64 => (
+                "/usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1",
+                "/usr/aarch64-linux-gnu/lib/libc.so.6",
+            ),
+            Arch::Riscv64 => (
+                "/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1",
+                "/usr/riscv64-linux-gnu/lib/libc.so.6",
+            ),
+        }
+    }
+}
+
+/// Build the Linux-personality test fixtures from source (docs/LINUX-COMPAT.md
+/// L2, fixture matrix in section 6): a static-glibc Rust `std` hello and a
+/// static-glibc C hello. No binaries live in git; these are `include_bytes!`d
+/// by the `linuxrun` test kernel. Must run before the kernels.
+fn build_linux_fixtures(arch: Arch) -> bool {
+    println!("[xtask] building Linux fixtures for {}", arch.name());
+    let cc = arch.linux_cc();
+
+    // Rust std hello: static glibc, ET_EXEC (-no-pie + static relocation
+    // model). All three ISAs are now higher-half kernels (docs/MEMORY.md), so
+    // the whole low half is free and every fixture keeps glibc's stock ET_EXEC
+    // base (x86/arm 0x400000, riscv 0x10000) - no relink - which proves a stock
+    // binary loads unmodified (docs/LINUX-COMPAT.md L2). The cross gcc is the
+    // linker so the right sysroot/crt objects are used.
+    let rustflags = format!(
+        "-C target-feature=+crt-static -C relocation-model=static \
+         -C linker={cc} -C link-arg=-no-pie"
+    );
+    let mut rust = Command::new("cargo");
+    rust.args([
+        "build",
+        "--manifest-path",
+        "tests/linux-fixtures/rusthello/Cargo.toml",
+        "--release",
+        "--target",
+        arch.linux_gnu_target(),
+    ]);
+    rust.env("RUSTFLAGS", &rustflags);
+    if !matches!(rust.status().map(|s| s.success()), Ok(true)) {
+        eprintln!(
+            "[xtask] Rust glibc fixture build failed for {}",
+            arch.name()
+        );
+        return false;
+    }
+
+    // Multi-threaded Rust std fixture (L4, docs/LINUX-COMPAT.md): same
+    // static-glibc ET_EXEC recipe, exercising clone/futex/TLS/join.
+    let mut threads = Command::new("cargo");
+    threads.args([
+        "build",
+        "--manifest-path",
+        "tests/linux-fixtures/rustthreads/Cargo.toml",
+        "--release",
+        "--target",
+        arch.linux_gnu_target(),
+    ]);
+    threads.env("RUSTFLAGS", &rustflags);
+    if !matches!(threads.status().map(|s| s.success()), Ok(true)) {
+        eprintln!(
+            "[xtask] Rust threads fixture build failed for {}",
+            arch.name()
+        );
+        return false;
+    }
+
+    // C hello: gcc -static -no-pie, stock ET_EXEC base (no relink).
+    let out_dir = format!("tests/linux-fixtures/build/{}", arch.name());
+    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+        eprintln!("[xtask] mkdir {out_dir}: {e}");
+        return false;
+    }
+    let mut c = Command::new(cc);
+    c.arg("-static").arg("-no-pie");
+    c.args([
+        "tests/linux-fixtures/hello.c",
+        "-o",
+        &format!("{out_dir}/chello"),
+    ]);
+    if !matches!(c.status().map(|s| s.success()), Ok(true)) {
+        eprintln!("[xtask] C glibc fixture build failed for {}", arch.name());
+        return false;
+    }
+
+    // Signal fixtures (L5) + process fixtures (L6): same static-glibc ET_EXEC
+    // recipe as chello. `procdemo` (pipe2+fork+dup2+execve+wait4) and `cecho`
+    // (its execve target) are the `linuxproc` proof (docs/LINUX-COMPAT.md L6).
+    for (src, bin) in [
+        ("sig_raise.c", "sig_raise"),
+        ("sig_segv.c", "sig_segv"),
+        ("sig_dfl.c", "sig_dfl"),
+        ("procdemo.c", "procdemo"),
+        ("cecho.c", "cecho"),
+        ("rsh.c", "rsh"),
+        // AF_UNIX (L8, docs/LINUX-COMPAT.md): socketpair+fork + bind/listen/
+        // connect/accept, the `linuxunix` proof.
+        ("af_unix.c", "af_unix"),
+        // AF_INET/AF_INET6 loopback (L8-INET, docs/LINUX-COMPAT.md): TCP+UDP+epoll
+        // over 127.0.0.1 and TCP over ::1, the `linuxinet` proof.
+        ("inet.c", "inet"),
+    ] {
+        let mut sc = Command::new(cc);
+        sc.arg("-static").arg("-no-pie");
+        sc.args([
+            &format!("tests/linux-fixtures/{src}"),
+            "-o",
+            &format!("{out_dir}/{bin}"),
+        ]);
+        if !matches!(sc.status().map(|s| s.success()), Ok(true)) {
+            eprintln!(
+                "[xtask] signal fixture {bin} build failed for {}",
+                arch.name()
+            );
+            return false;
+        }
+    }
+
+    if !build_dyn_fixture(arch, cc, &out_dir) {
+        return false;
+    }
+
+    build_coreutils_fixture(arch)
+}
+
+/// Build the L7 **dynamically-linked** glibc fixture (docs/LINUX-COMPAT.md L7):
+/// a stock ET_DYN/PIE C hello (no `-static`/`-no-pie`) plus the toolchain's real
+/// `ld-linux` + `libc.so.6`, copied into the gitignored build dir so the
+/// `linuxdyn` test can `include_bytes!` them and seed the cell's `/lib`. The
+/// runtime `.so`s are never committed. If they cannot be located for this ISA,
+/// the fixture is **skipped-with-reason**: a 1-byte placeholder `ld.so` is
+/// written so the test still compiles, and it detects the placeholder and skips
+/// (the static L2-L6 coverage remains). Returns false only on a hard build
+/// error (the C compile itself failing), never on a missing runtime lib.
+fn build_dyn_fixture(arch: Arch, cc: &str, out_dir: &str) -> bool {
+    // Stock dynamic PIE: no -static, no -no-pie (ET_DYN/PIE is gcc's default).
+    let mut c = Command::new(cc);
+    c.args([
+        "tests/linux-fixtures/dhello.c",
+        "-o",
+        &format!("{out_dir}/dhello"),
+    ]);
+    if !matches!(c.status().map(|s| s.success()), Ok(true)) {
+        eprintln!("[xtask] dynamic C fixture build failed for {}", arch.name());
+        return false;
+    }
+
+    // Copy the real ld.so + libc.so.6 out of the toolchain, or skip-with-reason.
+    let (ld_src, libc_src) = arch.dyn_runtime_libs();
+    let ld_dst = format!("{out_dir}/ld.so");
+    let libc_dst = format!("{out_dir}/libc.so.6");
+    let copied =
+        std::fs::copy(ld_src, &ld_dst).is_ok() && std::fs::copy(libc_src, &libc_dst).is_ok();
+    if copied {
+        println!(
+            "[xtask] copied dynamic runtime ({ld_src}, {libc_src}) for {}",
+            arch.name()
+        );
+    } else {
+        eprintln!(
+            "[xtask] SKIP dynamic fixture for {}: runtime ld.so/libc not found \
+             ({ld_src}); linuxdyn will skip this ISA (static coverage stays)",
+            arch.name()
+        );
+        // 1-byte placeholders so the test still compiles + detects the skip.
+        let _ = std::fs::write(&ld_dst, [0u8]);
+        let _ = std::fs::write(&libc_dst, [0u8]);
+    }
+    true
+}
+
+/// Pinned upstream uutils/coreutils crate for the L3 Linux-personality fixture
+/// (docs/LINUX-COMPAT.md 6). Bump deliberately, in the doc's fixture matrix too.
+const COREUTILS_VERSION: &str = "0.0.29";
+/// The subset of utilities the `linuxtools` test exercises (each is a crate
+/// feature that pulls in the matching `uu_*` dependency). Kept small so the
+/// static-glibc multicall binary and its build stay lean.
+const COREUTILS_FEATURES: &str = "true,false,echo,cat,wc,head,seq,ls,sort,basename,dirname,pwd";
+
+/// Build the **unpatched upstream uutils/coreutils** multicall binary from
+/// crates.io (pinned `COREUTILS_VERSION`), static-glibc ET_EXEC for `arch`, for
+/// the `linuxtools` test (docs/LINUX-COMPAT.md L3). Built with `cargo install`
+/// (which compiles the crate's own multicall `coreutils` bin from registry
+/// source) into the gitignored `build/<arch>/cu` root; no binary lives in git.
+/// Existence-cached: a rebuild is skipped if the binary is already present, so
+/// repeated `cargo xtask test` runs stay fast (delete `build/<arch>/cu` to force
+/// a rebuild after bumping the version or feature set).
+fn build_coreutils_fixture(arch: Arch) -> bool {
+    let cc = arch.linux_cc();
+    let root = format!("tests/linux-fixtures/build/{}/cu", arch.name());
+    let bin = format!("{root}/bin/coreutils");
+    if std::path::Path::new(&bin).exists() {
+        println!("[xtask] coreutils fixture cached for {}", arch.name());
+        return true;
+    }
+    println!(
+        "[xtask] building upstream uutils/coreutils {COREUTILS_VERSION} for {}",
+        arch.name()
+    );
+    let rustflags = format!(
+        "-C target-feature=+crt-static -C relocation-model=static \
+         -C linker={cc} -C link-arg=-no-pie"
+    );
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "install",
+        "coreutils",
+        "--version",
+        &format!("={COREUTILS_VERSION}"),
+        "--force",
+        // Not `--locked`: 0.0.29's bundled Cargo.lock pins an ancient rustix
+        // that no longer builds on current nightly; fresh resolution of the
+        // (semver-compatible) transitive deps is required. The fixture *crate*
+        // is still version-pinned, which is what the reproducibility contract
+        // (docs/LINUX-COMPAT.md 6) asks for.
+        "--no-default-features",
+        "--features",
+        COREUTILS_FEATURES,
+        "--target",
+        arch.linux_gnu_target(),
+        "--target-dir",
+        &format!("{root}-target"),
+        "--root",
+        &root,
+    ]);
+    cmd.env("RUSTFLAGS", &rustflags);
+    if !matches!(cmd.status().map(|s| s.success()), Ok(true)) {
+        eprintln!(
+            "[xtask] coreutils fixture build failed for {} (crates.io fetch + \
+             cross static-glibc link required)",
+            arch.name()
+        );
+        return false;
+    }
+    true
+}
+
 fn build(arch: Arch, release: bool) -> bool {
+    if !build_userland(arch) {
+        return false;
+    }
+    // The embedded proof (docs/LIBRHEO.md Phase F): rebuild `librheo-embed` with
+    // NO default features (the spine only) so it links the minimal surface and is
+    // substantially smaller. Must run AFTER `build_userland` (which builds every
+    // librheo bin with the full feature set) so this minimal build is the one the
+    // `librheoproc` kernel embeds.
+    if !build_librheo_embedded(arch) {
+        return false;
+    }
+    // The N2c smoltcp cell (docs/NETSTACK.md §13): built separately with the
+    // `smoltcp` feature (the default `build_userland` skips it via required-features).
+    if !build_smoltcp_demo(arch) {
+        return false;
+    }
+    // The librheodata (Phase B) dataset the test kernel reads off the live disk.
+    if !gen_columnar_dataset() {
+        return false;
+    }
+    // The pmem (real-PMEM path) nvdimm backing file.
+    if !gen_pmem_backing() {
+        return false;
+    }
+    if !build_linux_fixtures(arch) {
+        return false;
+    }
+    if !build_std_program(arch, "targets/std-rheo/hello/Cargo.toml", "hello") {
+        return false;
+    }
+    if !build_std_program(arch, "targets/std-rheo/coreutils/Cargo.toml", "coreutils") {
+        return false;
+    }
     println!("[xtask] building kernels for {}", arch.name());
     let mut cmd = Command::new("cargo");
     cmd.args([
@@ -236,12 +1027,109 @@ fn build(arch: Arch, release: bool) -> bool {
     if release {
         cmd.arg("--release");
     }
+    if arch == Arch::Aarch64 {
+        // Higher-half kernel (docs/MEMORY.md): the kernel .text/.data run at
+        // high (TTBR1) VAs while the low `.user` window is per-cell in TTBR0.
+        // Kernel code materializes the addresses of low `.user` symbols, which
+        // is beyond the small code model's +-4 GiB adrp reach, so the aarch64
+        // kernel is built with the large code model (absolute movz/movk). Only
+        // this package needs it; the userland/std fixtures link low and small.
+        cmd.env("RUSTFLAGS", "-C code-model=large");
+    }
+    if arch == Arch::X86_64 {
+        // Higher-half kernel (docs/MEMORY.md): the kernel + `.user` window run
+        // at top-2 GiB VAs. Kernel code references those symbols with signed
+        // 32-bit relocations, which reach the top 2 GiB only under the "kernel"
+        // code model - the small model (unsigned 32-bit, .cargo/config.toml)
+        // cannot address them. Static relocation is kept (nothing relocates the
+        // image). The env RUSTFLAGS overrides the config's [target] rustflags
+        // for this package only; the low-linked userland/std fixtures keep the
+        // config's small model.
+        cmd.env(
+            "RUSTFLAGS",
+            "-C relocation-model=static -C code-model=kernel",
+        );
+    }
+    if !matches!(cmd.status().map(|s| s.success()), Ok(true)) {
+        return false;
+    }
+    build_smp_kernel(arch, release)
+}
+
+/// Per-arch RUSTFLAGS for the higher-half kernel build (see `build`). Applied to
+/// both the main kernel build and the separate `smp` kernel build so they use
+/// the same code/relocation model.
+fn kernel_rustflags(arch: Arch) -> Option<&'static str> {
+    match arch {
+        Arch::Aarch64 => Some("-C code-model=large"),
+        Arch::X86_64 => Some("-C relocation-model=static -C code-model=kernel"),
+        Arch::Riscv64 => None,
+    }
+}
+
+/// Build the `smp` test kernel in its own cargo invocation with `kernel/smp`
+/// enabled (docs/SMP.md, task #27). SMP is feature-gated OFF by default so the
+/// other 31 test kernels link a byte-identical `kernel` lib (adding the module
+/// perturbs LLVM codegen-unit hashing, which must not reach non-SMP kernels).
+/// The `smp` bin has `required-features = ["smp"]`, so the main `-p qemu-tests`
+/// build skips it; this builds just that bin with the feature on. Same target +
+/// RUSTFLAGS as the main kernel build.
+fn build_smp_kernel(arch: Arch, release: bool) -> bool {
+    println!(
+        "[xtask] building the smp test kernel (kernel/smp feature) for {}",
+        arch.name()
+    );
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "build",
+        "-p",
+        "qemu-tests",
+        "--bin",
+        "smp",
+        "--features",
+        "smp",
+        "--target",
+        arch.target(),
+        "-Zbuild-std=core,alloc,compiler_builtins",
+        "-Zbuild-std-features=compiler-builtins-mem",
+    ]);
+    if release {
+        cmd.arg("--release");
+    }
+    if let Some(flags) = kernel_rustflags(arch) {
+        cmd.env("RUSTFLAGS", flags);
+    }
     matches!(cmd.status().map(|s| s.success()), Ok(true))
+}
+
+/// A per-test replacement for the `-machine` string. Most tests share the
+/// per-arch default; the `iommu` test on ARM needs `iommu=smmuv3` added
+/// (an SMMUv3 covers PCI devices, so the test also uses virtio-blk-pci).
+fn machine_override(arch: Arch, kernel: &str) -> Option<&'static str> {
+    match (kernel, arch) {
+        ("iommu", Arch::Aarch64) => Some("virt,gic-version=3,highmem-ecam=off,iommu=smmuv3"),
+        _ => None,
+    }
 }
 
 fn qemu_command(arch: Arch, release: bool, bin: &str) -> Command {
     let mut cmd = Command::new(arch.qemu());
-    cmd.args(arch.qemu_machine_args());
+    let margs = arch.qemu_machine_args();
+    if let Some(machine) = machine_override(arch, bin) {
+        // Emit the machine args, substituting the token after `-machine`.
+        let mut i = 0;
+        while i < margs.len() {
+            if margs[i] == "-machine" && i + 1 < margs.len() {
+                cmd.arg("-machine").arg(machine);
+                i += 2;
+            } else {
+                cmd.arg(margs[i]);
+                i += 1;
+            }
+        }
+    } else {
+        cmd.args(margs);
+    }
     cmd.arg("-kernel").arg(arch.kernel_path(release, bin));
     cmd.args(["-no-reboot", "-nodefaults"]);
     cmd

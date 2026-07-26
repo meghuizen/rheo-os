@@ -31,6 +31,22 @@ pub struct Reservation {
     util_ppm: u64,
 }
 
+impl Reservation {
+    /// The all-zero reservation, for fixed-capacity reservation tables
+    /// (docs/LIBRHEO.md Phase C).
+    pub const ZERO: Reservation = Reservation {
+        budget: 0,
+        period: 0,
+        deadline: 0,
+        util_ppm: 0,
+    };
+
+    /// Utilization this reservation contributes, in parts per million.
+    pub fn util_ppm(&self) -> u64 {
+        self.util_ppm
+    }
+}
+
 /// The admission controller: tracks committed utilization and gates new
 /// reservations. One per core.
 pub struct Admission {

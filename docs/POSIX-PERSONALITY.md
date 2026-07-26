@@ -7,9 +7,14 @@ the POSIX file syscall surface (`open`/`read`/`write`/`close`/`lseek`/
 `stat`/`getdents`/`mkdir`/`unlink`, errno) over the VFS, the per-session `/`
 mount table (section 3), and a `std::fs`-shaped facade so standard-library
 file code runs unchanged. Proven on all three ISAs (`posix` test kernel).
-Deferred: processes/fork/exec, signals, mmap, `/proc`+`/sys`, and hosting an
-unmodified Linux binary in a personality cell (needs the runtime-in-U-mode
-integration).
+Deferred: processes/fork/exec, signals, mmap, `/proc`+`/sys`.
+
+**Hosting unmodified Linux binaries** is now its own staged design and
+implementation: the **Linux personality** (docs/LINUX-COMPAT.md). It is
+currently kernel-resident (the `svc.rs` bridge pattern - "kernel-side
+handlers before the service framework exists"); its Linux-facing state
+(fds, PIDs, signals) is per-cell synthesized state, never a kernel object,
+and the migration path into a real personality cell is documented there.
 
 Position: POSIX is a **compatibility personality at the edge**, never the
 native model (the mistake Hurd made). It is a translation layer - gVisor-
@@ -38,7 +43,12 @@ object store.
   address space plus grants has no clean meaning. Implemented as
   "clone a cell within the same capability bundle," which covers the shell's
   dominant fork+exec pattern well. Copy-on-write fork of a large heap with
-  immediate divergence is where it is weakest; documented.
+  immediate divergence is where it is weakest; documented. **Implemented**
+  (Linux personality L6, docs/LINUX-COMPAT.md): `fork`/`execve`/`wait4` plus
+  cross-cell `pipe2` run unmodified static-glibc programs and a shell - no new
+  kernel object, the child is a `user` cell in the parent's bundle with an
+  **eager** page copy (COW deferred). A minimal shell (`rsh`) forks + execs the
+  unpatched upstream uutils/coreutils multicall over pipes and `&&`/`||`.
 - **mmap.** Anonymous and local-file mappings work. `mmap` of a *remote*
   object is refused transparently (no network paging, doctrine 4) -
   pin-local-first or fail loudly.
@@ -85,6 +95,12 @@ object store.
   failure population.
 - ARCHITECTURE.md P11 gates this: interactive parity plus >= 80% of a defined
   coreutils/tooling suite, with < 60% suite pass as the kill threshold.
+  **Measured (Linux personality L6, `linuxproc` test):** a 12-command shell
+  suite of the unpatched upstream uutils/coreutils multicall, run by the `rsh`
+  shell over fork/execve/wait4/pipe2 with pipelines and `&&`/`||`, passes
+  **12/12 = 100 %** on all three ISAs (x86_64, aarch64, riscv64) - exact stdout
+  + exit asserted per command. The suite and its outputs are listed in
+  docs/LINUX-COMPAT.md L6.
 
 ## 6. Relationship to native software
 

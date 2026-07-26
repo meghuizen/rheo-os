@@ -17,7 +17,10 @@ what order; `docs/DEVELOPMENT.md` covers the day-to-day mechanics.
 BUILD-ORDER.md steps 0-5 are done, plus slices of 6-10, and a native
 shell: exception vectors + cycle counters + context switch per ISA; a
 bitmap frame allocator and per-ISA paging (Sv39 / AArch64 4 KiB granule /
-x86-64 4-level) with the MMU on; the capability core (runtime-tested for
+x86-64 4-level) with the MMU on, the kernel run in the **higher half** on all
+three ISAs (docs/MEMORY.md) so the whole low half is free for user programs -
+a stock Linux `ET_EXEC` (0x400000) loads unmodified; the capability core
+(runtime-tested for
 the four ARCHITECTURE.md 8.2 proof properties); the queue-pair ABI with
 per-entry grant checks and flow-context propagation; **cells in real user
 mode behind hardware address spaces** (RISC-V U-mode, ARM64 EL0, x86-64
@@ -28,8 +31,11 @@ The full single-host **kernel object model** is implemented: memory grants
 **cryptographic per-cell entropy** (a ChaCha20 DRBG with fast key erasure,
 seeded from the hardware RNG - RDSEED/RDRAND on x86-64, RNDR on ARM64 -
 after SP 800-90B health tests, non-blocking, falling back to a documented
-floor where no hwrng exists; a cell draws bytes as a library call over its
-own DRBG state, not a syscall, per docs/TIME-IDENTITY.md 4), typed event
+floor where no hwrng exists; the design's "library call over the cell's own
+DRBG state, not a syscall" path is proven at the primitive level in the host
+comparison, while the lsh `rand` builtin currently draws via `SYS_RANDOM` -
+linking the full DRBG into a U-mode cell awaits the runtime's `.user` heap +
+`mem*` shims, per docs/TIME-IDENTITY.md 4), typed event
 streams with flow context, EDF-admitted reservations, leases with fencing
 tokens + epoch revocation, and a dependency graph executed on a compute
 engine (attest-by-measurement). On
@@ -50,7 +56,53 @@ split at node boundaries), and PCIe enumeration through the ECAM/config
 space, classifying each function into an engine kind - GPU, NIC, NVMe, or a
 processing accelerator (NPU/TPU, PCI base class 0x12). The `hwinfo` test
 kernel asserts the basics on all three ISAs; `cargo xtask run --bin hwinfo`
-prints the full inventory.
+prints the full inventory. **Real-GPU stage 1 is done** (docs/GPU-HARDWARE.md
+12): PCIe enumeration now recurses bridges (programming secondary bus numbers
+where firmware left them zero - the bare arm/riscv boots have no firmware to
+do it; x86 q35's `-kernel` path runs SeaBIOS, which got there first), sizes
+every BAR by the mask probe, walks the capability list (MSI/MSI-X/PCIe/FLR),
+and offers opt-in BAR assignment from a per-ISA host-bridge window
+(`hw::assign_pci_bars`, invisible to boots that skip it); `kernel/src/hw/gpu.rs`
+recognises every display-class function by vendor (NVIDIA, AMD, Intel, virtio,
+Bochs, Cirrus, VMware, Red Hat/QXL) AND silicon family (NVIDIA
+Pascal/Turing/Ampere/Ada/Hopper/Blackwell, AMD GCN/RDNA/CDNA, Intel Xe) into
+the inventory, resolves a per-vendor driver front-end (`vendor_driver`
+declaring each vendor's lowering path per ACCELERATORS.md 4), drives **every
+GPU QEMU models** (AMD/Bochs/Cirrus/VMware/QXL via a framebuffer-aperture
+write+read-back, virtio-gpu via its 2D command driver - six vendors on
+x86-64, four on arm/riscv where VMware+QXL are x86-only), and each registers
+in the engine table behind `SYS_ENGINE_INFO(out_va, index)` enumeration (kind + PCI
+vendor ID + declared op-boundary preemption, an honest zero measured cost -
+recognised and registered, not yet driven). The `gpuhw` test proves it on all
+three ISAs against QEMU's real `ati-vga` (AMD, 0x1002), a Bochs display, and
+a virtio-gpu behind a `pcie-root-port`; NVIDIA/Intel have no QEMU device
+model and report skip-with-reason. The stage closes with the tree's first
+real vendor-GPU MMIO: the AMD framebuffer aperture mapped via
+`arch::mmio_map_window` (a second x86-64 fixed window beside the pmem one;
+the missing 1..2 GiB gigapage on RISC-V; `phys_to_virt` on ARM64), written
+through and read back on all three ISAs; plus opt-in **attach measurement**
+(`hw::gpu_attach_measure`: ticks/KiB streamed through each aperture - a
+transport measurement, reported live by `SYS_ENGINE_INFO`) and a **real Bochs
+2D modeset** (`hw/gpu.rs::bochs_modeset` over the DISPI/VBE interface:
+640x480x32 + LFB, framebuffer render + pixel read-back on all three ISAs),
+so every GPU device model QEMU has is genuinely driven - virtio-gpu by the
+Phase H 2D driver, AMD through its framebuffer aperture, Bochs by a working
+2D modeset. **Real-GPU stage 2 (the IOMMU) is done on x86-64 AND ARM64**
+(docs/GPU-HARDWARE.md 4, BUILD-ORDER step 12): two backends, both proven by
+the `iommu` test with a real device (virtio-blk negotiating
+`VIRTIO_F_ACCESS_PLATFORM`) - a read succeeds through an identity domain,
+then FAULTS once the domain is revoked. **x86-64 VT-d**
+(`kernel/src/hw/iommu.rs`): DMAR-discovered register base, root/context/
+second-level page tables, queued invalidation (QEMU's caching-mode IOMMU
+only tears down device shadow mappings via QI), fault read from the
+fault-recording register. **ARM64 SMMUv3** (`kernel/src/hw/smmuv3.rs`):
+linear stream table + Context Descriptor + LPAE stage-1 page tables (QEMU
+models stage-1 only), a command queue for STE/TLB invalidation, fault read
+from the event queue. (Fixing this also fixed a real latent bug: the
+virtio-blk PCI path passed a hardcoded 0 ECAM base to the config accessor,
+which x86 ignores but ARM/RISC-V use as the MMIO base - so virtio-blk-pci
+never worked on ARM; now it uses the discovered ECAM base.) RISC-V
+skips-with-reason (no QEMU IOMMU model in 8.2).
 
 The **strand runtime** (`runtime/`, BUILD-ORDER.md step 7,
 docs/CONCURRENCY.md) is the userspace library that brings native async and
@@ -87,28 +139,511 @@ A **POSIX + filesystem stack** (`posix/`, docs/FILESYSTEMS.md,
 POSIX-PERSONALITY.md) sits on a **VFS** translation layer (a `FileSystem`
 trait): a read-write **ramfs** (the working store), a read-only **ext4**
 driver that parses a real ext4 image (superblock, block-group descriptors,
-inodes, the extent tree, linear dirs - host-validated and read in-QEMU from
-an embedded 512 KiB image, since there is no block driver yet), a mount
-table + path resolution (the per-session `/`), the **POSIX fd surface**
-(`open/read/write/close/lseek/stat/getdents/mkdir/unlink` with errno), and a
-**`std::fs`-shaped facade** (`File`, `OpenOptions`, `read`/`write`/
-`read_to_string`, `read_dir`, `metadata`) so standard-library file code runs
-natively. The `posix` test kernel exercises ramfs rw, ext4 ro (incl. a
-multi-block file), the errno surface, and the std facade on all three ISAs.
-The route to *live-disk* filesystems is a **virtio-blk driver + a
-`BlockDevice` trait** behind the same VFS, at which point existing Rust FS
-drivers (redoxfs, fatfs, a read/write ext4 crate) can be dropped in rather
-than hand-written - gated by the no-deps rule (a doc must name any crate).
+inodes, the extent tree, linear dirs - host-validated against a `mkfs.ext4`
+image), a mount table + path resolution (the per-session `/`), the **POSIX
+fd surface** (`open/read/write/close/lseek/stat/getdents/mkdir/unlink` with
+errno), and a **`std::fs`-shaped facade** (`File`, `OpenOptions`,
+`read`/`write`/`read_to_string`, `read_dir`, `metadata`) so standard-library
+file code runs natively. The `posix` test kernel exercises ramfs rw, ext4 ro
+(incl. a multi-block file), the errno surface, and the std facade on all
+three ISAs.
+
+A **live-disk block stack** closes the loop from storage transport to
+filesystem: a **`BlockDevice` trait** (`kernel/src/hw/block.rs`, 512-byte
+sectors, transport-agnostic) and a **virtio-blk driver**
+(`kernel/src/hw/virtio_blk.rs`) - reset/feature negotiation, a split
+virtqueue, and the block request protocol - over **two transports**:
+virtio-mmio on arm/riscv `virt`, and **virtio-pci on x86-64 q35**. The x86
+path drives the device *entirely through PCI configuration space* using the
+`VIRTIO_PCI_CAP_PCI_CFG` capability (virtio spec 4.1.4.8), so no BAR needs
+to be assigned or mapped - which matters because PVH boot has no firmware to
+program BARs. Since the kernel moved to the high half (docs/MEMORY.md) PA no
+longer equals VA, so the driver hands the device **physical** addresses for
+the virtqueue via `virt_to_phys` (the queue lives in the kernel's own RAM,
+reached through its linear map). The `blockfs` test kernel discovers the device, reads a real ext4
+image off the *live disk* (attached by QEMU with `-drive`), mounts it, and
+reads files through `std::fs` - on **all three ISAs**. At the `BlockDevice`
+seam existing Rust FS drivers (redoxfs, fatfs, a read/write ext4 crate) can
+be dropped in rather than hand-written - gated by the no-deps rule (a doc
+must name any crate).
+
+A **native-userland** path is being built out so real Rust/C/C++ apps
+(eventually the uutils/coreutils) run as cells, recompiled for a rheo-os
+target over a relibc-style Rust libc (docs/USERLAND.md, milestones M1-M5).
+Done so far: an **ELF loader** (`kernel/src/elf.rs` + `load.rs`) with a
+general per-cell address space (`arch::paging_map_frame` maps an arbitrary
+user VA to an allocated frame, creating tables on demand) - a separately-
+compiled program (the `userland` crate) is loaded into a cell and run, no
+longer baked into the kernel image (the `elfrun` test); and a
+**multi-argument POSIX syscall surface** - the ABI is now
+`decode_syscall -> (nr, [u64;6])`, with kernel-native `mmap`-anon +
+`exit_group`, and fd-based `open/close/read/write/lseek` forwarded to a
+**personality handler** (`svc::FileOps`, function pointers a service
+registers) backed by the `posix/` VFS, keeping the kernel filesystem-free
+(the `posixrun` test runs a native program that reads a file over the VFS);
+and a **Rust libc** (`libc/`, package `rheo-libc`) - a relibc-style
+translation layer with `crt0` (`_start`), a heap over `SYS_MMAP` wired as the
+global allocator (so Rust `alloc` works) plus C `malloc`/`free`, fd-based I/O
+wrappers, and `println!` (the `libcrun` test runs `libcdemo`, which builds a
+`Vec`, round-trips C `malloc`, formats output, and reads a file via the VFS).
+A **custom Rust target + std port** works (M4): real `std` compiles, links,
+and **runs on the OS on all three ISAs** - a std program using
+`String`/`Vec`/`format!`/`println!` returning an `ExitCode` (the `stdrun`
+test). The `rheo-os` targets (`targets/rheo_os-*.json`, `os = "rheo"`,
+soft-float) build std via a repo-held, idempotent rust-src patch
+(`cargo xtask std-patch`, `targets/patch-std.py` + `targets/std-rheo/`): std
+routes rheo to the single-threaded portable fallbacks (SMP deferred) with real
+rheo arms for the heap (a hole-list allocator over `SYS_MMAP`), non-blocking
+`stdio` (fds over the M2 syscalls), and `process::exit` (`SYS_EXIT_GROUP`); a
+crt0 (`rheo-rt`) provides `_start`. Float-heavy programs await U-mode FP/SIMD
+enablement. Also built
+alongside as an M4-prep workload: **rheo-json** (`json/`), a dependency-free
+zero-copy JSON parser that runs on the OS and is benchmarked against simdjson
+(docs/JSON.md).
+
+**Coreutils run on the OS** (M5, docs/USERLAND.md): standard command-line
+tools as a U-mode cell. Three OS capabilities land first - **argv/env** (the
+kernel builds the System V initial process stack in `setup_stack`; the crt0
+reads `argc`/`argv` so `std::env::args` works; env is an in-process table), and
+a **`std::fs` read/write path over the VFS** (a rheo `std` `fs` arm translating
+`File`/`metadata`/`read_dir` onto the file syscalls, now including `stat`/
+`fstat`/`getdents`, forwarded to the POSIX personality). On top of them
+**rheo-coreutils** (`targets/std-rheo/coreutils/`) is a busybox-style multicall
+program built against real `std` - `true`/`false`/`echo`/`cat`/`wc`/`head`/
+`ls`/`seq`/`basename`/`dirname`/`nl`/`pwd`/`env`, dispatched by `argv`. The
+`coreutils` test loads it with a real `argv`, runs one utility per invocation
+over a ramfs, and asserts each utility's exit code and exact stdout on all
+three ISAs. These are faithful from-scratch ports, not the upstream uutils
+crate (whose clap/uucore tree needs `std` surface rheo lacks - `IsTerminal`,
+locale, terminal width - so it is deferred; docs/USERLAND.md M5).
+
+A **Linux personality** is complete (docs/LINUX-COMPAT.md, milestones
+L0-L7 all done) so *unmodified* Linux binaries - unpatched Rust std
+(`*-unknown-linux-gnu`), glibc-linked C (static and dynamic), stock tools - run
+as cells. It is
+kernel-resident like `svc.rs` (a documented bridge to a future personality
+cell) and adds no kernel object: PIDs/fds/signals are per-cell synthesized
+state. L0 is done: a per-cell `Personality { Native, Linux }` tag branches
+dispatch *before* the syscall number is decoded (the ABIs collide),
+per-ISA Linux syscall-number tables live in `arch::linux_abi` (x86-64
+legacy table; asm-generic table shared by arm64/riscv64), unknown numbers
+log `linux: ENOSYS nr=<n>` and return -ENOSYS. L1 added the ELF auxv,
+ET_DYN loading, the U-mode thread pointer (fs_base / tpidr_el0 / tp), and
+U-mode FP/SIMD enablement. **L2 is done**: the core syscall set (read/write/
+readv/writev, openat/close/lseek, fstat/newfstatat, getdents64, brk,
+anonymous mmap/munmap/mprotect, poll/ppoll, uname, clock_gettime, getrandom,
+prlimit64, ioctl(TIOCGWINSZ), dup/fcntl, and the identity/recorded/ENOSYS
+calls - honesty table in docs/LINUX-COMPAT.md), a per-cell fd table
+(`kernel/src/linux/fd.rs`: console, VFS files, /dev/{null,zero,urandom}),
+real memory over the cell's own address space (`AddressSpace::unmap`/
+`protect` + per-ISA `paging_unmap_frame`/`paging_protect` + `frames::free`;
+`kernel/src/linux/mem.rs`), and per-ISA `ticks_to_ns`. The `linuxrun` test
+now also runs, on **all three ISAs** with exact stdout + exit asserted, two
+**unpatched static-glibc** binaries built from source: a Rust `std` hello and
+a C hello, each loaded at glibc's **stock ET_EXEC base, no relink**
+(docs/LINUX-COMPAT.md L2). glibc (not musl) is the supported libc. **L3 is
+done**: the **unmodified upstream uutils/coreutils** multicall binary (crates.io
+`coreutils` 0.0.29, pinned, static-glibc, built from source by xtask - no binary
+in git) runs as a `Personality::Linux` cell on **all three ISAs**; the
+`linuxtools` test asserts exact stdout + exit for eleven utilities (true, false,
+echo, cat, seq, head, wc, basename, dirname, ls, pwd). L3 added per-cell cwd
+(getcwd/chdir), statx, mremap, a single-process pipe2 (splice stays ENOSYS -
+uu_cat falls back), a per-fd getdents64 cursor, `/proc/self/auxv`, and the
+`openat` dirfd-as-`int` fix. **L4 is done**: **threads as multi-context cells**
+(the CONCURRENCY.md vcore model made real) - a Linux cell holds up to 8
+execution contexts (a `TrapFrame` + FP save area each), scheduled
+**cooperatively, round-robin, at syscall boundaries** on the single CPU
+(`kernel/src/linux/thread.rs`), sharing one address space and kernel stack with
+eager FP/SIMD save-restore and per-context TLS. Added `clone` (pthread flag set,
+arch-specific arg order via `CLONE_BACKWARDS`), `futex` (WAIT/WAKE + _BITSET),
+per-context `gettid`, thread `exit` vs `exit_group`, CHILD_CLEARTID clear+wake,
+`set_tid_address`, real `sched_yield`, and `sched_getaffinity`/`prctl`(name);
+memory gained demand-commit (PROT_NONE `mmap` reserves without frames,
+`mprotect` commits) so glibc's per-thread 64 MiB arenas don't exhaust the pool.
+PIDs/TIDs/futex waiter lists stay per-cell synthesized state (no kernel object).
+An **unpatched multi-threaded Rust `std`** binary (4 `std::thread`s + `mpsc` +
+`Mutex` + `Arc<AtomicUsize>` + join) runs on **all three ISAs** with exact
+stdout/exit asserted (the `linuxthreads` test), and `sort` (rayon-threaded) is
+re-enabled in `linuxtools`. Cooperative-only (a spinning thread starves siblings
+until timer preemption, task #27) and futex wake is FIFO (priority inheritance is
+a documented TODO) - both disclosed in docs/LINUX-COMPAT.md + CONCURRENCY.md.
+**L5 is done**: **synthesized POSIX signals, no kernel object** - dispositions a
+per-cell table, masks/pending/altstack per-context (`kernel/src/linux/signal.rs`).
+Delivery is a **saved-`TrapFrame` rewrite** in trap context: a Linux `rt_sigframe`
+(siginfo + ucontext with the interrupted GPRs/PC/SP + saved mask) is built on the
+user stack, the frame's PC set to the handler and its return to the restorer -
+glibc's `SA_RESTORER` on x86-64, an injected 2-instruction `rt_sigreturn`
+trampoline page (`arch::SIGTRAMP_VA`) on ARM64/RISC-V; `rt_sigreturn` restores.
+Real `rt_sigaction`/`rt_sigprocmask`/`sigaltstack`/`rt_sigreturn` (the L2 stubs)
+plus `kill`/`tgkill`/`tkill`/`rt_sigqueueinfo` (self-targeting). **Synchronous
+faults become signals**: `on_user_trap` maps the per-ISA fault cause (vector /
+ESR EC / scause -> `arch::FaultCause`) to SIGSEGV/SIGBUS/SIGILL/SIGFPE and, for a
+Linux cell with an installed unblocked handler, delivers by frame rewrite; else
+terminates 128+signo. A **native** cell fault stays terminal (`Outcome::Faulted`)
+- delivery is behind the Linux branch only; the x86-64 ring-3 fault path
+(`vectors.S`) now captures the full `TrapFrame` and resumes via `sysret`
+(ARM64/RISC-V already carried the frame). The `linuxsig` test asserts, on **all
+three ISAs**, three static-glibc C fixtures: `sig_raise` (async
+`raise(SIGUSR1)`->handler->resume, exit 0), `sig_segv` (null write ->
+SIGSEGV handler `_exit(0)`, not a killed cell), `sig_dfl` (`raise(SIGABRT)`, no
+handler -> terminate 134). Scope: self / fault delivery (a signal to a non-running
+sibling context is recorded pending, not force-delivered); FP state is not
+saved across a handler - both documented.
+**L6 is done**: **processes - fork / execve / wait4 / cross-cell pipes** (no new
+kernel object; all per-cell synthesized state, `kernel/src/linux/proc.rs` +
+`pipe.rs`). `fork` is clone-cell-within-capability-bundle: a new `user` cell in
+the parent's bundle with the parent's committed pages **eager-copied** (COW
+deferred) via a per-ISA page-table user-leaf walk (`arch::paging_for_each_user_leaf`
+behind `AddressSpace::fork_from`/`free_user_frames`), the `LinuxState`/fds/cwd/
+signal dispositions deep-copied, child pid synthesized. `execve` **streams** a new
+ELF from the VFS into a fresh address space (`load::exec_elf_from_vfs`: only the
+header + phdrs are buffered; segments read page-by-page into destination frames,
+the kernel holds no whole-image buffer). `wait4` blocks the parent cooperatively
+until a child exits, reaping WIFEXITED/WIFSIGNALED status and freeing the child.
+`pipe2` is a **global cross-cell** ring buffer (`kernel/src/linux/pipe.rs`) whose
+two ends live in different cells after fork; reads/writes block cooperatively with
+cross-cell wake, EOF on all-writers-closed, SIGPIPE on all-readers-closed. The run
+loop is **generalized**: a cell that blocks or exits hands the CPU to the next
+runnable cell via the same address-space switch the native `SYS_SWITCH` uses -
+the native path is byte-for-byte unchanged, `crate::linux::proc` drives the
+cross-cell switch behind the `Personality::Linux` branch. `MAX_CELLS` 8 -> 16. The
+`linuxproc` test proves it on **all three ISAs**: (A) a direct static-glibc
+multi-process fixture (`procdemo`: pipe2+fork+dup2+execve of `/bin/cecho` from the
+VFS+wait4, exact transcript+exit), and (B) the **P11 gate** - `rsh`, a minimal
+from-scratch static-glibc shell (dash cross-build was out of budget), forks+execs
+the unpatched upstream uutils/coreutils multicall over pipelines and `&&`/`||`,
+passing a 12-command coreutils suite **12/12 = 100%** (gate >= 80%; POSIX-
+PERSONALITY.md 5).
+**L7 is done** (the final milestone): **dynamic linking - an *unmodified,
+dynamically-linked* glibc binary runs**. `load::load_elf_linux` parses `PT_INTERP`
+and, when present, loads BOTH the main program (ET_DYN, 4 GiB bias) and the ELF
+interpreter `ld-linux-*.so` (ET_DYN, 64 GiB bias `LINUX_INTERP_BASE`, streamed
+from the VFS), starting execution in ld.so with the auxv carrying `AT_BASE` =
+interp bias, `AT_PHDR`/`AT_ENTRY` = the main program's. The kernel does **no
+relocation processing** - ld.so self-relocates then maps + relocates the program
+and `libc.so.6` (initial-exec TLS + IRELATIVE/ifunc relocs run to completion on
+all three ISAs). `mmap` gained **file-backed MAP_PRIVATE + MAP_FIXED**
+(`kernel/src/linux/mem.rs`): ld.so reserves a library's span then MAP_FIXED-
+overlays each segment (text/data from the file, an anonymous **zeroed** overlay
+for the bss - the anon path frees+replaces the reservation's file frames, or
+libc's stdio/malloc bss locks keep file garbage and self-deadlock), plus
+`pread64` and x86-64 legacy `access`. The real per-ISA glibc (`ld-linux` +
+`libc.so.6`) is **copied from the cross toolchain at build time** into a
+gitignored dir (never committed) and seeded into a ramfs `/lib`; a missing
+runtime lib makes that ISA skip-with-reason (static coverage stays). The
+`linuxdyn` test runs a stock **dynamically-linked glibc C hello** (gcc default
+PIE, unmodified) on **all three ISAs**, exact stdout + exit asserted. This closes
+"unmodified Linux binaries run" for the common dynamic case; the whole
+**L0-L7 Linux personality is complete** - unpatched static and dynamic glibc C,
+unpatched Rust `std`, and the real upstream uutils/coreutils all run as cells,
+kernel-resident like `svc.rs` and adding no kernel object (`execve` of a *dynamic*
+binary and a dynamic Rust/uutils-0.9.x fixture are the documented next steps).
+**L8 has begun** (docs/LINUX-COMPAT.md L8, docs/NETSTACK.md rheo-net Phase N1d):
+**AF_UNIX (Unix domain) sockets** - `socket`/`socketpair`/`bind`/`listen`/
+`accept`/`connect`/`sendmsg`/`recvmsg` on SOCK_STREAM, sockets as per-cell fds
+whose byte transport reuses the **L6 cross-cell ring** (a connection is two rings,
+one per direction) plus a global name registry (`kernel/src/linux/unixsock.rs`) -
+no new kernel object, the L6 `pipe2` precedent. The `linuxunix` test runs an
+unmodified static-glibc AF_UNIX C fixture (socketpair+fork + bind/listen/connect/
+accept over an abstract name) on **all three ISAs**. SCM_RIGHTS fd-passing and
+SOCK_DGRAM are documented deferrals.
+
+**librheo** (`librheo/`, docs/LIBRHEO.md) is the greenfield **native userspace
+foundation library** - the role a libc plays, rebuilt for this kernel:
+async-first, capability-native, built ON `runtime/` (not a POSIX threading
+port, and distinct from `libc/`'s C/POSIX compat role). **Phase A** ships the
+spine: a `no_std`+`alloc` crate (a loaded ELF cell for the bare targets) with
+`mem` (a grow-on-demand global allocator over `runtime::Heap` + `SYS_MMAP`,
+which added `Heap::add_region`), `rng` (a ChaCha20 fast-key-erasure DRBG as a
+**library call**, seeded once over `SYS_RANDOM` - realizing TIME-IDENTITY.md 4
+in a cell), `cap` (capability-typed handles over `runtime::rights` + a
+startup `CapSet`), and `rt` (the strand executor + a **userland reactor**:
+submit -> `SYS_DOORBELL` -> drain CQ -> `complete(user_data)`, so a strand
+parked on a token wakes on its completion). To make a loaded cell actually own
+a queue pair, the **queue ABI was redesigned to a stable on-wire layout**
+(`kernel/src/queue/mod.rs`): a `repr(C)` `QueueHeader` (version, depth, the four
+ring indices at fixed offsets, sq/cq offsets) followed by the SQ/CQ arrays, with
+`QueuePair` now an overlay over a single region (`init`/`attach`) rather than
+head/tail atomics inside the Rust struct - unified, so bench-core/queue-pipeline/
+runtime/isolation-hw stay green. The loader gained `map_queue` (maps the ring at
+**16 GiB** = `USER_QUEUE_VA` into a loaded cell, mints a `QueuePair` cap, records
+`(qp_va, cap_id)`), `submit` carries args + `reap` returns the full `CqEntry` +
+`SYS_DOORBELL` returns the processed count, and **`SYS_QUEUE_INFO` (31)** reports
+`(qp_va, cap_id)` to the cell. The `librhearun` test loads `librheo-demo` into a
+cell with a real mapped queue pair and asserts it exits `0x42` - reached only if
+heap+rng+cap and an **async queue round-trip** (8 strands each `submit_and_await`
+an `OP_ECHO` and verify the echo) all pass, on **all three ISAs**.
+**Phase B** makes librheo the **terabytes / analytical-DB / warehouse**
+substrate: **typed memory grants exposed to a cell** (`SYS_GRANT`/`COMMIT`/
+`DECOMMIT`/`SEAL`/`MMAP_FILE`/`MUNMAP` - object 5 as mechanism: reserve typed
+address space + mint a MemoryGrant cap, demand-commit frames without a fault
+handler, seal immutable, mmap a VFS file, and a real unmap that fixes the anon-
+`SYS_MMAP` frame leak; DDR always real and **PMEM real where a QEMU nvdimm is
+exposed** (Phase J: x86-64 q35 via the ACPI NFIT + a separate pmem allocator,
+distinct from the DDR pool; arm/riscv `virt` expose no nvdimm so PMEM
+skips-with-reason to DDR - docs/MEMORY.md 2.1), HBM/CXL/Remote emulated-as-DDR,
+device-BAR refused, NUMA single-node - all honest/documented, per-cell grant
+tables as fixed statics, every commit/decommit/seal grant-checked), and **real
+async I/O opcodes
+over the queue** (`OP_OPEN`/`READ`/`WRITE`/`CLOSE`/`FSTAT` bridged to
+`kernel_process` via `svc::FileOps`, completing through the CQ with the strand
+token; per-opcode rights replacing hardcoded-WRITE; distinct CapError statuses;
+IO.md contract flags with the inline-vs-by-reference threshold - small writes
+inline, larger I/O by-reference and **zero-copy** straight into the cell's mapped
+pages). librheo gained `mem` (`Grant`/`Arena`/`Mapping` + NUMA hint), `io` (async
+`File`/`read_at`/`write_at`/batched/`Contract`/`Stream`, zero-copy `read_into` a
+grant), and a thin `store` (`Dataset`). The `librheodata` test is the **mini-
+DuckDB proof**: a columnar dataset (65536 rows x 2 u32 cols, generated by xtask,
+never committed) on a **live virtio-blk disk** is served to a librheo cell, which
+mmaps it zero-copy, fans a `SUM`/`COUNT`/`MAX`-under-predicate columnar scan
+across 8 strands, and asserts the exact aggregate (`SUM=1073741824`), on **all
+three ISAs**.
+
+**Phase C** makes librheo the **parallel / accelerated compute + QoS** substrate:
+**userspace-built dependency graphs submitted to the compute engine** (a new
+`OP_GRAPH_SUBMIT` queue opcode - a cell writes an `abi::GraphNode` list into its
+own buffer, the kernel validates the edges topologically, runs it on the CPU
+engine, and writes per-node results back, completing through the CQ with the
+strand token - objects 4/6 as mechanism), **engine introspection**
+(`SYS_ENGINE_INFO` surfaces the throughput measured at attach - attest-by-
+measurement), and **admission-checked reservations** (`SYS_RESERVE_ADMIT`/`QUERY`/
+`RELEASE` - the per-cell EDF schedulability math in `sched.rs` admits CPU
+budget/period/deadline + an advisory memory floor, mints a Reservation capability,
+and refuses an over-committed set cleanly; object 7). librheo gained `compute`
+(`map_reduce`/`parallel_for`/`scan` strand workers, `Engine::info`, and a
+`GraphBuilder` that builds + `submit().await`s a graph) and `sched` (`Reservation`
+RAII handle with typed rejections, plus a `lattice-rt`-shaped `Priority`/
+`PeriodicTask`/`TimingReport`). The `librheocompute` test proves it on **all three
+ISAs**: a parallel `map_reduce` aggregation (`SUM=4194304`), a submitted graph
+(`(6+1)*6=42`), a reservation admitted (committed ppm > 0) then two cleanly
+rejected (bad-params + over-commit), and the engine's measured throughput
+reported. Honest: the admission **math** is real and enforced at admit, but
+runtime enforcement is SMP/preemption-gated (task #27) - the runtime is
+single-CPU cooperative, so parallel strands interleave and a reservation is an
+admitted, not-yet-scheduled guarantee; the CPU engine is the only real engine
+(GPU/NPU accelerators ride the same graph/engine API as attested-firmware future
+work); a free-form graph's buffer-reduce node is the documented next step.
+
+**Phase D** brings up the **kernel's first hardware interrupt** and the terminal.
+A native cell blocking on console input (`SYS_WAIT_INPUT`) parks, and the kernel
+idles until a byte arrives instead of spinning - the OS's **first block-and-wake**.
+Bytes land in a portable kernel-side **RX ring** (`kernel/src/input.rs`); the
+reactor gains a console-read slot (`rt::read_console`) that parks a strand and, when
+no queue completion is ready, blocks in `SYS_WAIT_INPUT`. The interrupt path is
+boot-critical and opt-in (`arch::enable_uart_rx_irq`, called only by the Phase D
+test, so the other kernels are untouched): **interrupt-driven on RISC-V and
+ARM64**. RISC-V routes the 16550 UART's IRQ (source 10) through the **AIA** (S-mode
+APLIC in MSI mode -> S-mode IMSIC via the `siselect`/`sireg`/`stopei` CSRs ->
+`sip.SEIP`) and takes the S external interrupt to drain the UART, halting at `wfi`
+(cells run with `sstatus.SIE` clear; SIE set only to service a pending SEI after
+`wfi` woke on it). ARM64 routes the PL011 UART's IRQ (SPI 33) through the **GICv3**
+(GICD + the boot CPU's GICR, CPU interface via `ICC_*_EL1`) and takes it in the
+current-EL-SPx vector slot, draining the byte and EOI'ing via `ICC_EOIR1_EL1`;
+cells run at EL0 with IRQ masked and the kernel unmasks (`daifclr`) only after
+`wfi`. Both are genuine 0%-CPU parks. **x86-64 stays a poll** - under QEMU's TCG +
+`kernel-irqchip=split` the LAPIC ISR/IRR are not modeled and IOAPIC-routed lines do
+not re-deliver reliably, so faking it would be dishonest (its *timer* IS
+interrupt-driven; only the IOAPIC-routed UART is affected). On top of the raw byte
+substrate, librheo gained **`term`** - the
+byte-stream terminal discipline: `input` (a decoder: CSI/SS3 escape sequences ->
+typed `Key`s, UTF-8, control chars, async `next_key().await`), `edit` (a line
+editor with insertion, cursor moves, word/line kill, history recall, completion
+hook), and `render` (a buffered, minimal-diff renderer, batched writes). The
+`librheoterm` test drives a read-eval loop with scripted keystrokes (typing,
+backspace, cursor-left + insert, an arrow-key escape, Up-arrow history) and asserts
+the exact committed lines + exit on **all three ISAs**, plus the idle-park (kernel
+idled at `wfi`) on **RISC-V and ARM64**. Honest: RISC-V and ARM64 are
+interrupt-driven, each with a device-loopback caveat (QEMU's 16550/PL011 loopback
+does not drive the interrupt-controller line, so the deterministic test raises the
+controller line directly - RISC-V the IMSIC MSI, ARM64 `GICD_ISPENDR` for SPI 33 -
+exactly the interrupt the device would raise; the byte is genuinely delivered and a
+genuine interrupt genuinely wakes `wfi`, docs/LIBRHEO.md Phase D). This is "wake on
+input", not preemptive scheduling
+(SMP/#27).
+
+**Phase E** makes librheo the substrate for **services and a Wayland-class
+compositor**: two cells share a **typed cross-cell queue pair** and pass
+ownership of a **sealed buffer grant** (zero-copy), with a **flip/present
+completion**. Two kernel additions, both **exposing** existing objects (no new
+object): **`SYS_CONNECT` (43)** reports a cell's shared-channel end
+(`ChannelInfo { chan_va, cap_id, role }`) - a cross-cell channel is **one ring
+region mapped into two cells** at 24 GiB (`load::alloc_channel` +
+`map_channel_into`), whose header the kernel writes once but **never drains**:
+the two cells drive the SPSC rings directly over the shared frames (IO.md 6, the
+queue object 3), so a message is a pure shared-memory write. **`SYS_GRANT_SHARE`
+(44)** delegates a **sealed** grant to the peer cell (objects 2/5): the kernel
+maps its frames **read-only** into the peer (`AddressSpace::share_ro_into`, over
+the existing per-ISA leaf walk), mints a MemoryGrant cap there on the **same**
+object (epoch-revocable), and reports `ShareInfo { peer_va, peer_cap_id }` -
+**zero-copy shared memory, the dmabuf equivalent** (requires DELEGATE + sealed;
+`SYS_GRANT` now mints `READ|WRITE|MAP|DELEGATE`). librheo gained **`ipc`**
+(`Channel` - a typed cross-cell queue pair with client `send`/`await_completion`
++ server `recv`/`complete` over `SqEntry`/`CqEntry`, the cooperative
+`switch_to_peer` hand-off, and `share`/`recv_buffer` for zero-copy buffer
+passing) and **`display`** (`Surface` - a client drawable backed by a sealed
+buffer grant, `commit` seals+delegates+sends+awaits the flip; `Compositor` - an
+in-memory framebuffer, `present` composites the shared buffer + replies with the
+flip completion; `InputEvent` reuses the Phase D `term::input::Key` as the HID
+event-stream shape). The `librheowl` test runs **one binary as two cells** (the
+test kernel wires both + the shared channel + roles): the client draws a 64x64
+buffer, seals + shares it, commits a frame; the compositor maps the shared grant
+read-only (zero-copy - same frames), composites it, and returns a flip completion
+carrying its checksum; the client asserts that checksum **equals its own known
+value** (`0x3eb4f800`) - proving zero-copy cross-cell sharing - and exits `0x42`
+on **all three ISAs**. Honest: zero-copy is real (the only copy is the
+compositor's own composite into its framebuffer); the synchronous channel is an
+explicit peer hand-off (the compositor uses it); a **fully-symmetric async
+`Sender`/`Receiver` parking on the reactor** is now done as **Phase J** (below);
+spawn-driven connect is Phase F; real
+GPU (virtio-gpu scanout) is deferred - the mechanism (shared sealed buffer + typed
+present queue + flip completion + input-event shape) is the deliverable.
+
+A **Phase J polish trio** refines librheo Phases E/F (additive userspace, no new
+kernel object). **(1) Symmetric async IPC**: `ipc::Channel::split()` yields an
+async `AsyncSender`/`AsyncReceiver` that **park on the strand reactor** (a channel
+slot in `rt`, mirroring the console/timer/wait slots) instead of spinning on
+`switch_to_peer`. A strand that `recv`s parks, the vcore runs the cell's other
+strands, and only when all have parked does `block_on` hand the CPU to the peer
+(`SYS_SWITCH`) and deliver the message. The in-cell wait is a genuine reactor park;
+the cell-boundary hand-off stays a cooperative switch under the single-CPU model (a
+truly parallel producer/consumer awaits SMP #27) - honest. The `librheoipc` test
+runs one binary as two cells that **ping-pong 8 typed messages** over the async
+Sender/Receiver; the consumer asserts the exact sequence **and**
+`rt::chan_wakeups() == 8` (every message a genuine reactor park+wake, not a spin),
+exiting `0x42` on **all three ISAs**. **(2) Cross-cell stdout pipelines**:
+**`SYS_SPAWN` now propagates the parent's channel to the spawned child** (maps the
+same frames RW via `AddressSpace::share_rw_into`, mints a channel cap into the
+shared bundle, records the child's end with the opposite role - no new kernel
+object, it composes Cell + QueuePair). `proc::spawn_piped` returns a `Pipe {
+child, tx, rx }`: the child streams its output over the async channel (not through
+the kernel), the parent reads it with `rx`, then reaps the child. Honest: the pipe
+connects a spawned child to its **parent** (a valid `cur^1` pair; the child frees
+the shared frames on exit after the parent drained them); two sibling spawned
+stages await a directed switch/SMP (#27). The `librheopipe` test spawns
+`/bin/pipesrc`, which streams `"ABCDEFGHIJKL"` back over the inherited channel; the
+orchestrator reconstructs+verifies it and exits `0x42` on **all three ISAs**.
+**(3) The full `term` line editor in `lrsh`**: the librheo-native shell now drives
+the Phase D editor - `KeyReader` (parking on input) + `LineEditor` (in-line cursor
+edits, backspace, word/line kill, **Up/Down history**, a **Tab command-name
+completion hook**) + the buffered `Renderer` - instead of a raw line read; committed
+lines still run builtins or spawn `/bin/<cmd>`. The `librheoproc` shell scenario
+feeds scripted keystrokes (typing, a backspace edit `child 9`->`child 8`, Up-arrow
+history recall, `ec`<Tab>->`echo`) and asserts the committed-command evidence
+(`child 8` ran twice, no `child 9` command, completion produced `echo`) + exit
+`0x42` on **all three ISAs**.
+
+**Phase F** closes librheo as a **complete foundation**: a native **process
+model**, **time**, a **librheo-native shell**, an **embedded** proof, and honest
+benchmarks. Three kernel additions **expose** the Cell object (1) / arm-timer verb
+(no new object; per-cell synthesized state in `kernel/src/nproc.rs`, mirroring
+`linux::proc` for `Personality::Native` cells). **`SYS_SPAWN` (45)** - gated by a
+**cell-spawn capability** (`ObjectKind::Cell` + WRITE - no ambient authority) -
+streams an ELF from the VFS into a **new** native cell with its own address space +
+queue pair (sharing the parent's cap bundle like `fork`), builds its SysV stack
+from the caller's argv/envp, and returns a child handle; **`SYS_WAIT` (46)** blocks
+the parent cooperatively (generalizing the L6 cross-cell run loop), runs the child,
+and reaps its exit code (a faulted native child is reaped with `FAULT_EXIT`=139 -
+native cells have no signals); **`SYS_ARM_TIMER` (47)** is a one-shot deadline,
+now the OS's **second interrupt**, **interrupt-driven on all three ISAs** (the
+kernel arms the per-ISA timer and halts at `wfi`/`hlt` until it fires - a genuine
+0%-CPU park: RISC-V Sstc `stimecmp`, ARM64 CNTV virtual timer via the GICv3, x86-64
+LAPIC LVT one-shot in x2APIC mode; opt-in via `arch::enable_timer_irq`, with a
+cooperative deadline-check fallback where not wired).
+librheo gained **`proc`** (`spawn`/`Child::wait().await`/`args`/`env`/`identity`),
+**`time`** (monotonic `Instant`/`now` + async `sleep`/`timeout`/`interval` over the
+reactor's timer slot), and a **`net`** stub (deferred - networking is a service).
+It is **feature-gated**: `default=["full"]`; an **embedded** cell builds
+`--no-default-features` (spine only: cap/rt/mem/sys) - `librheo-embed` does a direct
+queue round-trip and is **~9x smaller** loadable than a full binary. **`lrsh`** is
+the librheo-native shell (builtins + `spawn`/`wait` of native coreutils over the
+Phase D console path; **Phase J** wires in the full `term` line editor - see
+below). The `librheoproc` test proves it on **all three ISAs**: an
+orchestrator spawns `/bin/echo` + three `/bin/child` cells (argv fan-out), reduces
+exit codes to 12, and a `time::sleep` wakes on the timer (asserting a genuine
+`wfi`/`hlt` idle-park on all three ISAs); `lrsh` runs a scripted keystroke
+session through the term editor (committed-command evidence + exit `0x42`); and the spine-only `librheo-embed`
+round-trips. Benchmarks (icount, per TOOLING.md): full async round-trip ~1,433
+(x86-64) / ~2,048 (riscv64) instructions, spawn+wait ~263k (x86-64) / ~539k
+(riscv64) - process create is dominated by ELF stream-load + child crt0, the honest
+price of a new address space. Honest deferrals: the
+**x86-64 UART RX interrupt** (poll fallback - its QEMU TCG split-irqchip
+IOAPIC/LAPIC does not re-deliver reliably; the timer + the riscv/arm UART RX are
+all interrupt-driven), and the `net` stack - docs/LIBRHEO.md has the full A-F
+accounting. **librheo A-F is complete.**
+
+**Phase G** turns the Phase F `net` stub into the real **NIC data path - raw
+Ethernet frames over a virtio-net driver** (docs/NETWORKING.md, LIBRHEO.md Phase
+G); the IP/TCP/QUIC stack stays a **service**, deferred. A hand-written
+**virtio-net driver** (`kernel/src/hw/virtio_net.rs`) mirrors virtio-blk over the
+**two transports** - virtio-mmio on arm/riscv `virt`, virtio-pci on x86-64 q35
+(via the `VIRTIO_PCI_CAP_PCI_CFG` config tunnel, no BAR mapping) - with reset +
+**minimal** feature negotiation (`VIRTIO_F_VERSION_1` + `VIRTIO_NET_F_MAC`; no
+mergeable-rx-buffers or checksum/GSO offload), an **RX** and a **TX** split
+virtqueue, the 12-byte v1 `virtio_net_hdr`, and the MAC from device config; DMA
+uses **physical** addresses (`virt_to_phys`), polled (a device RX IRQ is a later
+refinement). Three **queue opcodes** (`OP_NET_TX`/`OP_NET_RX`/`OP_NET_MAC`, no new
+kernel object) bridge a cell's async submissions to the driver in `kernel_process`,
+completing with the strand token - the Phase B `io` model. librheo's **`net`** is
+now real: `mac`/`send`/`recv` of raw frames (`connect`/`listen` stay `Unsupported`
+- IP/TCP is a service). The `librheonet` test proves it on **all three ISAs**: a
+librheo cell reads the NIC MAC, sends a **broadcast ARP request** for the SLIRP
+gateway `10.0.2.2`, and **receives SLIRP's ARP reply** (a deterministic,
+network-free RX proof over QEMU `-netdev user`), asserting ethertype + opcode +
+sender IP and exiting `0x42`. Deferred: the full transport stack (IP/TCP/QUIC/TLS
+in a cell), a socket `ObjectKind` + steering grants, header/payload split, and the
+device RX interrupt. **librheo A-G is complete.**
+
+**Phase H** brings up a **real GPU: a virtio-gpu 2D driver wired to the Phase E
+compositor** (docs/DISPLAY.md, LIBRHEO.md Phase H); VIRGL/3D and the full display
+pipeline stay deferred. A hand-written **virtio-gpu 2D driver**
+(`kernel/src/hw/virtio_gpu.rs`, the plain 2D / VIRGL-off subset of virtio spec
+5.7) mirrors virtio-net/blk over the **two transports** - virtio-mmio on
+arm/riscv `virt`, virtio-pci on x86-64 q35 (via the `VIRTIO_PCI_CAP_PCI_CFG`
+config tunnel, no BAR mapping) - with reset + **minimal** feature negotiation
+(`VIRTIO_F_VERSION_1` only; no VIRGL/EDID), a single **controlq**, and every 2D
+command a `virtio_gpu_ctrl_hdr` + body submitted as a **2-descriptor chain**
+(`[readable command][writable response]`, the virtio-blk request/status shape)
+polled for its `RESP_OK_*` code. Bring-up: `GET_DISPLAY_INFO` -> `CREATE_2D`
+(resource 1, `B8G8R8A8_UNORM`, **128x128**) -> `ATTACH_BACKING` (a kernel-side
+framebuffer of **16 frame-pool frames**, one `virtio_gpu_mem_entry` per frame, so
+no contiguous alloc is needed) -> `SET_SCANOUT` (scanout 0); a present is
+`TRANSFER_TO_HOST_2D` + `RESOURCE_FLUSH`. All rings/buffers/framebuffer come from
+the frame pool (only static is a small `Option<VirtioGpu>`); DMA by **physical**
+address (`virt_to_phys`). One **queue opcode** (`OP_GPU_PRESENT`, no new kernel
+object - it extends the queue object with a mechanism) bridges a cell's async
+present to the driver in `kernel_process`, copying the cell's framebuffer into the
+resource then transfer+flush. librheo's **`display`** gained `Gpu`/`Scanout` (draw
+into a framebuffer grant, `present().await` to the real device); the Phase E
+in-memory `Compositor` is unchanged (still proves zero-copy). The `librheogpu`
+test proves it on **all three ISAs**: a librheo cell draws a known 128x128 RGBA
+frame and presents it, exiting `0x42`. QEMU runs **headless** (`-display none`),
+so - like virtio-net's network-free ARP proof - the proof is the **genuine driver
+round-trip**: **all six 2D commands return OK** from the real device model
+(`GET_DISPLAY_INFO` reports QEMU's default 1280x800 even headless; then create-2d,
+attach, set-scanout, transfer, flush). No claim of visible output; the 2D scanout
+command round-trip + compositor present wiring is the deliverable. **librheo A-H
+is complete.**
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
-proofs, and the hardware-lab performance numbers. **SMP secondary-core
-bring-up** is scoped separately: CPU *detection* and topology are done (4
-cores on x86-64/RISC-V, per-node affinity), but starting the other cores
-running kernel code needs per-CPU state + locking (the kernel is currently
-single-CPU `static mut`) and is blocked portably here - ARM64 PSCI CPU_ON
-traps from EL1 (no EL3/EL2 in this QEMU config) and x86 APs need a 16-bit
-real-mode trampoline.
+proofs, and the hardware-lab performance numbers. **SMP** (docs/SMP.md,
+task #27) now has its foundation and a real RISC-V secondary: the portable
+**per-CPU state + kernel spinlock** (`kernel/src/smp.rs`: a `SpinLock<T>` +
+a per-CPU registry with `this_cpu()`, zero-impact on the single-CPU path)
+and a **genuine RISC-V secondary hart running kernel code** - brought up via
+SBI HSM `hart_start` onto the shared kernel address space, it claims a
+per-CPU registry slot, marks itself online, and writes a shared counter
+through the cross-core spinlock, which the primary reads back and asserts
+(the `smp` test, riscv64). ARM64 and x86-64 make a genuine, guarded bring-up
+attempt and skip-with-reason: ARM64's PSCI `CPU_ON` (`smc #0`) empirically
+**traps to EL1** (no EL3/EL2 firmware in this QEMU config; the SMC is guarded
+so the trap is observed, not fatal - CPU detection there is likewise
+EL1-limited to the boot CPU), and x86-64 APs need a 16-bit real-mode
+INIT-SIPI-SIPI trampoline below 1 MiB (not implemented; ACPI still enumerates
+the 4 APs). Still deferred: **preemptive multi-core scheduling** (the runtime
+stays single-CPU cooperative - the secondary does proof-of-life work and
+parks, it is not yet fed runnable cells) and making the shared kernel
+`static mut` state SMP-safe end to end.
 
 The `.user` linker window holds U-mode code (`.user.text`), shared
 read-only constants (`.user.rodata`), and per-cell data (`.user.bss`) in
@@ -152,26 +687,142 @@ QEMU 8.x system emulators must be installed to run or test.
 docs/         the design documents (the spec - keep code consistent with it)
 kernel/       the no_std kernel library + boot demo bin
   src/        ISA-independent: capability core, queue ABI, cells, mm
-              (frames + grants), time (clock), rng (ChaCha20 DRBG +
+              (frames + frames_pmem real-nvdimm allocator + grants), time (clock), rng (ChaCha20 DRBG +
               hwrng seeding), event streams,
-              sched (reservations), lease, engine, graph, pty, svc
-              (shell/resource syscalls), hw (ACPI/FDT/PCIe discovery +
-              the machine Inventory), user run loop, U-mode programs
+              sched (reservations), lease, engine, graph, pty, smp
+              (per-CPU state + a kernel SpinLock + RISC-V SBI-HSM secondary-hart
+              bring-up - docs/SMP.md), input
+              (kernel RX ring + the SYS_WAIT_INPUT park-until-input primitive -
+              docs/LIBRHEO.md Phase D), svc
+              (shell/resource/POSIX-file syscalls), hw (ACPI/FDT/PCIe
+              discovery + the machine Inventory; block BlockDevice trait +
+              virtio_blk driver; virtio_net raw-frame NIC driver -
+              docs/NETWORKING.md; virtio_gpu 2D display driver -
+              docs/DISPLAY.md), elf + load (ELF loader for native
+              programs), user run loop (with per-cell syscall
+              personalities), nproc (native process model: SYS_SPAWN/WAIT +
+              cooperative cross-cell scheduler - docs/LIBRHEO.md Phase F),
+              linux (the Linux personality:
+              docs/LINUX-COMPAT.md), U-mode programs
               (user_progs.rs incl. the lsh shell), abi
   src/arch/   per-ISA Rust modules incl. paging.rs (one dir per ISA)
   arch/       per-ISA assembly (boot, vectors/traps, context switch, user)
   link/       linker scripts per ISA (incl. the .user text/rodata/data window)
 tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
-              isolation-hw, resources, shell-smoke, hwinfo, rng, runtime,
-              posix, bench-core, and the interactive lsh bin (+ harness.rs);
-              fixtures/ holds the ext4 test image (+ gen-ext4.sh)
+              isolation-hw, resources, pmem (Phase J: a MemKind::Pmem grant
+              backed by a real QEMU nvdimm - x86-64 via the ACPI NFIT; arm/riscv
+              skip-with-reason - docs/MEMORY.md 2.1), smp (per-CPU state + kernel spinlock +
+              a real RISC-V secondary hart; ARM64/x86-64 skip-with-reason -
+              docs/SMP.md), shell-smoke, hwinfo, rng, runtime,
+              posix, blockfs (live virtio-blk disk), elfrun (load a native
+              ELF), posixrun (native program over the POSIX syscalls),
+              libcrun (a program linked against rheo-libc), jsonrun (a
+              program parsing JSON with rheo-json on-OS), stdrun (a real-std
+              program on-OS), librhearun (librheo Phase A: a loaded cell with
+              a real mapped queue pair does heap+rng+cap + an async queue
+              round-trip, docs/LIBRHEO.md), librheodata (librheo Phase B: the
+              mini-DuckDB scan - typed grants + async I/O opcodes + a zero-copy
+              columnar scan off a live virtio-blk disk), librheocompute (librheo
+              Phase C: parallel map_reduce + a userspace graph submitted to the
+              CPU engine + reservation admission), librheoterm (librheo Phase D:
+              the interrupt-driven console wakeup + the term byte-stream
+              discipline - scripted editing/history/escape, idle-park on RISC-V +
+              ARM64; x86-64 poll),
+              librheowl (librheo Phase E: the Wayland-class compositor demo -
+              two cells share a typed cross-cell queue pair + pass a sealed
+              buffer grant zero-copy + a flip completion, checksum-verified),
+              coreutils (the coreutils multicall cell, with
+              argv + std::fs over the VFS), linuxrun (Personality::Linux:
+              bare Linux-ABI programs plus, at L2, unpatched static-glibc
+              Rust + C hellos), linuxtools (L3: the unmodified upstream
+              uutils/coreutils multicall cell over a ramfs, incl. threaded
+              sort), linuxthreads (L4: an unpatched multi-threaded Rust std
+              binary - clone/futex/TLS/join), linuxsig (L5: signal delivery -
+              async raise, fault->SIGSEGV handler, SIG_DFL terminate),
+              linuxproc (L6: fork/execve/wait4/cross-cell pipes - a direct
+              multi-process C fixture + the P11 coreutils-suite shell),
+              linuxdyn (L7: an unmodified dynamically-linked glibc C hello over
+              PT_INTERP + ld-linux + fd-backed mmap), librheoproc (librheo Phase
+              F: native spawn/wait + one-shot timer + the lrsh shell + the
+              embedded spine-only cell), librheonet (librheo Phase G: raw-frame
+              networking - virtio-net driver + net::send/recv/mac, an ARP round
+              trip via SLIRP), librheogpu (librheo Phase H: a real GPU -
+              virtio-gpu 2D driver + display::Scanout present, the create-2d/
+              attach/set-scanout/transfer/flush round trip, headless-honest),
+              librheoipc (librheo Phase J: symmetric async IPC - two cells
+              ping-pong typed messages over the async Sender/Receiver, each recv
+              a genuine reactor park), librheopipe (librheo Phase J: a cross-cell
+              stdout pipeline - an orchestrator spawns a producer child that
+              inherits its channel and streams its output back), gpuhw
+              (real-GPU stage 1, docs/GPU-HARDWARE.md 12: PCIe bridge
+              recursion + BAR sizing/assignment + capability walk + vendor
+              recognition + driving every GPU QEMU models: AMD ati-vga,
+              Bochs, Cirrus, VMware, QXL by framebuffer-aperture write+read-
+              back and virtio-gpu (behind a root port) by its 2D driver - six
+              vendors x86, four arm/riscv; NVIDIA/Intel skip-with-reason - +
+              GPU engine registration), iommu (real-GPU stage 2, docs/GPU-HARDWARE.md
+              4/12 + BUILD-ORDER step 12: DMA remapping proven with a real
+              virtio-blk DMA that is mediated by an identity domain then
+              FAULTS when the domain is revoked - x86-64 via VT-d
+              (intel-iommu: root/context/second-level + queued invalidation)
+              and ARM64 via SMMUv3 (smmuv3: stream table + Context Descriptor
+              + LPAE stage-1 + command/event queues); riscv skip-with-reason,
+              no QEMU IOMMU model), bench-core, and
+              the interactive
+              lsh bin (+ harness.rs, vfs_personality.rs); fixtures/ holds the
+              ext4 test image (+ gen-ext4.sh); linux-fixtures/ holds the
+              built-from-source glibc test binaries (rusthello/ + rustthreads/
+              + hello.c + sig_{raise,segv,dfl}.c + procdemo/cecho/rsh.c +
+              dhello.c; coreutils via cargo install, and the L7 ld.so/libc.so.6
+              copied from the toolchain - all gitignored)
 comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md
 xtask/        build/run/test/bench orchestration (cargo xtask ...)
 idl/          system IDL + codegen        (future, step 6)
 runtime/      strand runtime: heap (alloc), async executor + channel,
               type-level capability rights (BUILD-ORDER step 7)
+userland/     native U-mode programs built for a bare target and loaded
+              from an ELF (docs/USERLAND.md): hello, iodemo
+libc/         rheo-libc: the Rust libc translation layer (crt0, heap +
+              allocator, malloc, fd I/O, println) + the libcdemo/jsondemo
+              programs
+librheo/      the native userspace foundation library (docs/LIBRHEO.md):
+              no_std+alloc, mem (grow heap + typed grants/arena/mapping)/rng
+              (per-cell DRBG)/cap (typed handles)/rt (strand executor + userland
+              queue reactor)/sys (syscall + on-wire queue ABI)/io (async
+              File/read_at/write_at/Contract)/store (Dataset)/compute
+              (map_reduce/parallel_for/scan strand workers + Engine::info +
+              GraphBuilder)/sched (Reservation + lattice-rt Priority/PeriodicTask/
+              TimingReport)/term (Phase D byte-stream input/edit/render)/ipc
+              (Phase E cross-cell Channel + sealed-buffer share + Phase J symmetric
+              async Sender/Receiver on the reactor)/display (Phase E
+              Surface/Compositor/InputEvent + Phase H Scanout/Gpu real GPU present
+              over OP_GPU_PRESENT - docs/DISPLAY.md)/proc (Phase F spawn/wait/args/
+              env + Phase J spawn_piped: a spawned child inherits the parent's
+              channel as its stdout pipe)/time (Phase F clock + async
+              sleep/timeout)/net (Phase G raw-frame
+              send/recv/mac over OP_NET_* - docs/NETWORKING.md) +
+              crt0 (feature-gated: default=full, --no-default-features=embedded
+              spine) + the librheo-demo (Phase A), librheo-data (Phase B
+              mini-DuckDB scan), librheo-compute (Phase C parallel compute + graph
+              + QoS), librheo-term (Phase D terminal), librheo-wl (Phase E
+              compositor demo), Phase F: librheo-orch (spawn/wait/timer proof),
+              lrsh (the librheo-native shell), librheo-echo/librheo-child (native
+              coreutils it spawns), librheo-embed (the embedded spine-only cell),
+              librheo-net (Phase G ARP round trip over virtio-net), librheo-gpu
+              (Phase H virtio-gpu 2D present round trip), librheo-ipc (Phase J
+              two-cell async Sender/Receiver ping-pong), and librheo-pipe/
+              librheo-pipesrc (Phase J cross-cell stdout pipeline: a spawned
+              producer child streams its output to the parent over the channel)
+              programs
+json/         rheo-json: a dependency-free, zero-copy JSON parser (scalar +
+              SSE2 string-scan), no_std, host-tested + benchmarked
+              (docs/JSON.md, comparison/json/)
 services/     system service cells        (future, phase 5)
-targets/      custom target JSON          (only if built-in targets fail)
+targets/      rheo-os custom target specs + the std port: rheo_os-*.json,
+              patch-std.py (rust-src std patch: heap/stdio/args/env/fs arms),
+              std-rheo/ (rheo sys sources + the rheo-rt crt0, the std proof
+              program, and the rheo-coreutils multicall cell).
+              docs/USERLAND.md M4/M5
 ```
 
 ## Rules

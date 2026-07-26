@@ -12,12 +12,14 @@
 use kernel::capability::{BUDGET_UNLIMITED, ObjectKind, ObjectTable, READ, WRITE};
 use kernel::cell::Cell;
 use kernel::queue::{
-    self, CqEntry, OP_ECHO, QueuePair, RING_DEPTH, STATUS_DENIED, STATUS_OK, SqEntry,
+    self, OP_ECHO, QueuePair, STATUS_BAD_HANDLE, STATUS_OK, STATUS_REVOKED, SqEntry,
 };
 use kernel::{arch, println};
 
-static mut SQ_STORAGE: [SqEntry; RING_DEPTH] = [SqEntry::ZERO; RING_DEPTH];
-static mut CQ_STORAGE: [CqEntry; RING_DEPTH] = [CqEntry::ZERO; RING_DEPTH];
+/// The shared queue-pair region (header + SQ + CQ), page-aligned.
+#[repr(C, align(4096))]
+struct Region([u8; QueuePair::REGION_SIZE]);
+static mut REGION: Region = Region([0; QueuePair::REGION_SIZE]);
 
 const BATCH: usize = 16;
 
@@ -35,12 +37,7 @@ extern "C" fn kernel_main() -> ! {
         .mint(&objects, qp_object, READ | WRITE, BUDGET_UNLIMITED)
         .unwrap();
 
-    let qp = unsafe {
-        QueuePair::new(
-            core::ptr::addr_of_mut!(SQ_STORAGE) as *mut SqEntry,
-            core::ptr::addr_of_mut!(CQ_STORAGE) as *mut CqEntry,
-        )
-    };
+    let qp = unsafe { QueuePair::init(core::ptr::addr_of_mut!(REGION) as *mut u8) };
 
     // Submit a batch of echo ops, each with its own flow id; ring the
     // doorbell once for the whole batch.
@@ -70,20 +67,23 @@ extern "C" fn kernel_main() -> ! {
     assert!(qp.cq.pop().is_none());
     println!("queue-pipeline: batched submit + flow-context propagation OK");
 
-    // A forged cap_id in an otherwise valid entry is denied per entry.
+    // A forged cap_id in an otherwise valid entry is denied per entry. The
+    // completion carries the distinct `STATUS_BAD_HANDLE` (docs/LIBRHEO.md
+    // Phase B: each CapError gets its own status, not a collapsed deny).
     let mut forged = SqEntry::new(OP_ECHO, cap, 0x77, 0x77);
     forged.cap_id = 0xFFFF_1234;
     qp.sq.push(forged);
     queue::kernel_process(&qp, &mut producer.caps, &objects);
-    assert_eq!(qp.cq.pop().unwrap().status, STATUS_DENIED);
+    assert_eq!(qp.cq.pop().unwrap().status, STATUS_BAD_HANDLE);
     println!("queue-pipeline: forged capability denied on data path OK");
 
-    // Revoke mid-stream: the same capability that just worked goes dark.
+    // Revoke mid-stream: the same capability that just worked goes dark, now
+    // reporting the distinct `STATUS_REVOKED`.
     objects.revoke_epoch(qp_object);
     qp.sq.push(SqEntry::new(OP_ECHO, cap, 0x88, 0x88));
     queue::kernel_process(&qp, &mut producer.caps, &objects);
     let denied = qp.cq.pop().unwrap();
-    assert_eq!(denied.status, STATUS_DENIED);
+    assert_eq!(denied.status, STATUS_REVOKED);
     assert_eq!(denied.flow_id, 0x88, "flow context lost on the deny path");
     println!("queue-pipeline: mid-stream revocation enforced OK");
 

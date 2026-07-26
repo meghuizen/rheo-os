@@ -18,7 +18,7 @@ use kernel::capability::{
     BUDGET_UNLIMITED, CapTable, ObjectId, ObjectKind, ObjectTable, READ, WRITE,
 };
 use kernel::mm::AddressSpace;
-use kernel::queue::{CqEntry, QueuePair, RING_DEPTH, SqEntry};
+use kernel::queue::QueuePair;
 
 /// Per-cell user page size budgets (each a whole number of 4 KiB pages).
 const STACK_BYTES: usize = 32 * 1024;
@@ -93,20 +93,25 @@ pub unsafe fn build_shell_cell(
     (aspace, io_addr, frame)
 }
 
-/// One cell's user-visible backing store, all in `.user.bss`.
+/// One cell's user-visible backing store, all in `.user.bss`. The queue pair
+/// is now a single on-wire region (header + SQ + CQ) the `QueuePair` overlay
+/// binds to (docs/LIBRHEO.md), replacing the old separate SQ/CQ arrays.
 #[repr(C, align(4096))]
 pub struct CellStore {
     pub stack: [u8; STACK_BYTES],
     pub params: Params,
     _pad_params: [u8; 4096 - core::mem::size_of::<Params>()],
-    pub sq: [SqEntry; RING_DEPTH],
-    pub cq: [CqEntry; RING_DEPTH],
+    pub region: QueueRegion,
     pub qp: QueuePairCell,
     /// A page the cell can be told to poke (isolation prober target).
     pub scratch: [u8; 4096],
 }
 
-/// QueuePair plus a page of slack so it occupies its own page(s).
+/// The shared queue-pair ring region, page-aligned so it maps cleanly.
+#[repr(C, align(4096))]
+pub struct QueueRegion(pub [u8; QueuePair::REGION_SIZE]);
+
+/// QueuePair overlay plus a page of slack so it occupies its own page(s).
 #[repr(C, align(4096))]
 pub struct QueuePairCell {
     pub qp: core::mem::MaybeUninit<QueuePair>,
@@ -119,8 +124,7 @@ impl CellStore {
             stack: [0; STACK_BYTES],
             params: Params::ZERO,
             _pad_params: [0; 4096 - core::mem::size_of::<Params>()],
-            sq: [SqEntry::ZERO; RING_DEPTH],
-            cq: [CqEntry::ZERO; RING_DEPTH],
+            region: QueueRegion([0; QueuePair::REGION_SIZE]),
             qp: QueuePairCell {
                 qp: core::mem::MaybeUninit::uninit(),
                 _pad: [0; 4096 - core::mem::size_of::<QueuePair>()],
@@ -176,10 +180,8 @@ pub unsafe fn build_cell(
     aspace.map_user_range(stack_addr, STACK_BYTES, MapPerm::UserRw);
     let params_addr = core::ptr::addr_of!(store.params) as usize;
     aspace.map_user(params_addr & !0xFFF, MapPerm::UserRw);
-    let sq_addr = core::ptr::addr_of!(store.sq) as usize;
-    aspace.map_user_range(sq_addr, core::mem::size_of_val(&store.sq), MapPerm::UserRw);
-    let cq_addr = core::ptr::addr_of!(store.cq) as usize;
-    aspace.map_user_range(cq_addr, core::mem::size_of_val(&store.cq), MapPerm::UserRw);
+    let region_addr = core::ptr::addr_of!(store.region) as usize;
+    aspace.map_user_range(region_addr, QueuePair::REGION_SIZE, MapPerm::UserRw);
     let qp_addr = core::ptr::addr_of!(store.qp) as usize;
     aspace.map_user(qp_addr & !0xFFF, MapPerm::UserRw);
     // Each cell owns its scratch page (read+write). Another cell's scratch
@@ -195,12 +197,13 @@ pub unsafe fn build_cell(
         .mint(objects, object, READ | WRITE, BUDGET_UNLIMITED)
         .unwrap();
 
-    // Initialise the shared queue pair in place.
+    // Initialise the on-wire region and overlay a queue pair on it. The
+    // region is identity-mapped for a `.user` cell (kernel VA == user VA), so
+    // `init` writes the header and binds the overlay at the same VA.
     let qp_ptr = store.qp.qp.as_mut_ptr();
     unsafe {
-        qp_ptr.write(QueuePair::new(
-            core::ptr::addr_of_mut!(store.sq) as *mut SqEntry,
-            core::ptr::addr_of_mut!(store.cq) as *mut CqEntry,
+        qp_ptr.write(QueuePair::init(
+            core::ptr::addr_of_mut!(store.region) as *mut u8
         ));
     }
 

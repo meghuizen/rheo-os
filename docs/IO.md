@@ -22,6 +22,16 @@ library level.
 - Wakeup policy per queue: interrupt-driven (delivered as events) for
   latency queues, polled by dedicated-core strands for throughput queues -
   a grant attribute, not a driver mystery.
+  - *Implemented so far (docs/LIBRHEO.md Phase D/F):* the **first two hardware
+    interrupts**. A native cell blocking on console input (`SYS_WAIT_INPUT`)
+    parks, and the kernel idles at `wfi`/`hlt` until the **UART RX interrupt**
+    delivers a byte (RISC-V S-mode external via the AIA IMSIC; ARM64 PL011 SPI
+    via the GICv3; x86-64 still polls - its QEMU TCG split-irqchip IOAPIC/LAPIC
+    does not re-deliver reliably). A cell blocking on a deadline (`SYS_ARM_TIMER`)
+    parks until the **timer interrupt** fires (RISC-V Sstc `stimecmp`; ARM64 CNTV
+    virtual timer via the GICv3; x86-64 LAPIC LVT one-shot) - interrupt-driven on
+    **all three ISAs**. Both are genuine 0%-CPU parks. The general per-queue
+    completion IRQ is future work.
 
 ## 2. Completion contracts
 

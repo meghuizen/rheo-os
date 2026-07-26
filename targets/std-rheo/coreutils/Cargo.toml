@@ -1,0 +1,29 @@
+[package]
+name = "rheo-coreutils"
+version = "0.1.0"
+edition = "2021"
+
+# A coreutils multicall program for the rheo-os target (docs/USERLAND.md M5).
+# Faithful reimplementations of a real coreutils subset (echo, cat, wc, head,
+# ls, seq, basename, dirname, nl, pwd, env, true, false), dispatched by argv,
+# built against real `std` and running on the OS (the `coreutils` test kernel
+# loads it). It exercises the M5 foundations end to end: argv via crt0,
+# `std::env`, and `std::fs` over the VFS. Built with the patched rust-src:
+#   cargo xtask std-patch
+#   cargo build -p rheo-coreutils --release \
+#     --target targets/rheo_os-<arch>.json \
+#     -Zbuild-std=std,panic_abort -Zbuild-std-features=compiler-builtins-mem \
+#     -Zjson-target-spec
+# Excluded from the workspace (needs the custom target + build-std).
+
+[[bin]]
+name = "coreutils"
+path = "src/main.rs"
+
+[dependencies]
+rheo-rt = { path = "../rheo-rt" }
+
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"

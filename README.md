@@ -63,9 +63,12 @@ the resource-object suite, `shell-smoke`, `hwinfo` (hardware discovery:
 firmware source, CPU features, typed memory map, NUMA topology, PCIe
 devices), `rng` (the ChaCha20 DRBG), `runtime` (the strand async runtime:
 heap/`alloc`, executor, async channel, type-level capability rights, native
-async over the real queue-pair ABI), and `posix` (the filesystem + POSIX
+async over the real queue-pair ABI), `posix` (the filesystem + POSIX
 stack: a read-write ramfs and a read-only ext4 image behind a VFS, the
-POSIX fd surface, and a `std::fs` facade). Each reports pass/fail through a
+POSIX fd surface, and a `std::fs` facade), and `blockfs` (a virtio-blk
+driver reading a live ext4 disk through the `BlockDevice` seam - virtio-mmio
+on arm/riscv, virtio-pci on x86-64, all three ISAs). Each reports pass/fail
+through a
 QEMU exit device, so the result
 is the process exit code - the same check CI runs on every push. Serial
 output is saved to `target/qemu-<arch>-<bin>.log`.
@@ -112,9 +115,9 @@ cargo xtask run --bin lsh --arch riscv64
 
 Boots the kernel and drops you at the `lsh>` prompt on the serial console.
 lsh is a real user-mode cell talking to the kernel over a PTY; its builtins
-query genuine kernel objects. Try `help`, `uptime`, `rand` (a
-cryptographic per-cell ChaCha20 DRBG, drawn as a library call - no
-syscall), `meminfo`, `caps`, `ps`, `event 8`, `graph 6` (a pipeline is a
+query genuine kernel objects. Try `help`, `uptime`, `rand` (bytes from the
+cell's own cryptographic ChaCha20 DRBG via `SYS_RANDOM`), `meminfo`,
+`caps`, `ps`, `event 8`, `graph 6` (a pipeline is a
 dependency graph
 submitted to the kernel), `reserve 3 10`, `lease`, and the hardware
 builtins `cpuinfo`, `lspci`, `numa` (from the boot discovery pass), then
@@ -190,6 +193,7 @@ roadmap; `docs/DEVELOPMENT.md` is the practical how-to.
 | `docs/FILESYSTEMS.md` | Three storage tiers, native object store, POSIX view synthesis |
 | `docs/NETWORKING.md` | Cell-owned NICs, QUIC/TLS, WASM dataplane, DDoS pipeline |
 | `docs/ACCELERATORS.md` | Engine contract, GPU/NPU/TPU/FPGA/DPU, driver cell containment |
+| `docs/GPU-HARDWARE.md` | Real PCIe GPUs: enumeration/BARs, IOMMU containment, VRAM backing, firmware trust, driver cells, tile/inference memory contract |
 | `docs/AI-ARCHITECTURE.md` | Kernel vs service vs library split, model objects, KV paging, tile IR |
 | `docs/GRAPHICS.md` | Vulkan mapping, compositor cells, HID, display scope |
 | `docs/DISPLAY.md` | Frame buffers, vsync events, double/triple buffering, VRR, frame pacing, input-to-photon latency |

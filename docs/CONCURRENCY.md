@@ -41,6 +41,39 @@ debugging tool.
   poller unparks exactly that strand. One kernel notification carries a batch
   of completions - one wakeup, N strands resumed.
 
+**Status - the "kernel schedules N contexts per cell" half is real for Linux
+cells (docs/LINUX-COMPAT.md L4).** The Linux personality realizes the vcore
+mechanism directly: a Linux cell holds up to 8 execution contexts (a TrapFrame +
+FP save area each), scheduled **cooperatively, round-robin, at syscall
+boundaries** on the single CPU (`kernel/src/linux/thread.rs`). `clone` creates a
+context, `futex` WAIT/WAKE is the wait-on-address primitive that parks/wakes one,
+`exit` ends one, `sched_yield` hands off. FP/SIMD state is saved/restored eagerly
+per switch (two contexts time-share the vector registers) and the TLS base is
+reloaded per context. This is the *cooperative* form: unlike a strand runtime
+that yields at every await point, a Linux thread only yields when it issues a
+syscall, so **a compute-bound thread that never syscalls starves its siblings**
+until the preemption doorbell (section 4, task #27) - accepted and documented.
+Two other section-6/1-mandated properties are deferred with the same honesty:
+**priority inheritance** on futex wake is a TODO (plain FIFO for now; no
+RT-reservation mutexes in the L4 suite), and multiple *vcores* (real SMP
+parallelism) still awaits secondary-core bring-up. The native strand runtime
+(sections 1-3) remains the single-vcore userspace scheduler.
+
+**The first real wakeups (docs/LIBRHEO.md Phase D/F).** Until Phase D, "park on a
+token" was closed only by a synchronous doorbell drain - a reactor with nothing
+ready could only spin, because the kernel had **no interrupts on any ISA**. Phase
+D adds the OS's **first block-and-wake**: a librheo `term` cell whose strand parks
+on console input drives the reactor to block in `SYS_WAIT_INPUT`, and the kernel
+**idles until the UART RX interrupt delivers a byte** (RISC-V S-mode external via
+the AIA IMSIC; ARM64 PL011 SPI via the GICv3) instead of spinning - a genuine
+0%-CPU park. Phase F adds the **second interrupt**, the **timer**: a strand
+parking on a deadline (`time::sleep`/`SYS_ARM_TIMER`) idles until the per-ISA timer
+interrupt fires - **interrupt-driven on all three ISAs** (RISC-V Sstc `stimecmp`;
+ARM64 CNTV virtual timer via the GICv3; x86-64 LAPIC LVT one-shot). x86-64's UART
+RX still polls (its QEMU TCG split-irqchip IOAPIC/LAPIC does not re-deliver
+reliably, documented). The general completion-queue IRQ and the preemption
+doorbell (section 4) remain future work.
+
 ## 2. Both stack disciplines
 
 - **Stackless** (async state machines): bytes per strand, no stack, maximum

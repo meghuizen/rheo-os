@@ -23,7 +23,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use kernel::capability::{BUDGET_UNLIMITED, ObjectKind, ObjectTable, READ, WRITE};
 use kernel::cell::Cell;
-use kernel::queue::{CqEntry, OP_NOP, QueuePair, RING_DEPTH, SqEntry, kernel_process};
+use kernel::queue::{OP_NOP, QueuePair, kernel_process};
 use kernel::{arch, println};
 use runtime::rights::{
     Cap, EXECUTE as R_EXECUTE, Full, READ as R_READ, ReadOnly, ReadWrite, WRITE as R_WRITE,
@@ -279,8 +279,10 @@ fn test_channel() {
 
 // ---- native async on the real queue-pair ABI ----
 
-static mut SQ: [SqEntry; RING_DEPTH] = [SqEntry::ZERO; RING_DEPTH];
-static mut CQ: [CqEntry; RING_DEPTH] = [CqEntry::ZERO; RING_DEPTH];
+/// The shared queue-pair region (header + SQ + CQ), page-aligned.
+#[repr(C, align(4096))]
+struct Region([u8; QueuePair::REGION_SIZE]);
+static mut REGION: Region = Region([0; QueuePair::REGION_SIZE]);
 static mut QP: Option<QueuePair> = None;
 
 /// The headline: strands do I/O over the real queue-pair. Each strand submits
@@ -303,10 +305,7 @@ fn test_async_on_queue() {
     // SAFETY: single-CPU init of the queue-pair statics; the ref lives for
     // the rest of the run.
     let qp: &'static QueuePair = unsafe {
-        *addr_of_mut!(QP) = Some(QueuePair::new(
-            addr_of_mut!(SQ) as *mut SqEntry,
-            addr_of_mut!(CQ) as *mut CqEntry,
-        ));
+        *addr_of_mut!(QP) = Some(QueuePair::init(addr_of_mut!(REGION) as *mut u8));
         (*addr_of_mut!(QP)).as_ref().unwrap()
     };
 

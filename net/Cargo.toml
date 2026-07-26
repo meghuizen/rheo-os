@@ -1,0 +1,125 @@
+[package]
+name = "rheo-net"
+version = "0.1.0"
+edition = "2024"
+
+# rheo-net (docs/NETSTACK.md, docs/NETWORKING.md): the greenfield network stack
+# for rheo-os, built as portable userspace - `no_std` + alloc, no `cfg(target_arch)`,
+# compiled for the three bare targets as a loaded ELF cell. It rides ON librheo's
+# raw-frame path (`librheo::net`: OP_NET_TX/RX/MAC) + the strand reactor + the
+# heap; it adds NO kernel object and no per-ISA code. Phase N1a ships the L2/L3
+# core: `eth` (Ethernet II), `arp` (request/reply + cache + async resolve), `ip`
+# (IPv4 + IPv6 header parse/build + the ones-complement Internet checksum).
+
+[dependencies]
+# The raw-frame NIC path, the async reactor, the heap, and the one-shot timer -
+# rheo-net is a layer over librheo, not a peer of it. `full` (librheo default)
+# provides `net`/`time`/`mem`/`rt`.
+librheo = { path = "../librheo" }
+
+# The blessed pure-Rust `no_std` transport (docs/NETSTACK.md 3, §13, Phase N2c) -
+# Redox's stack, correctness-first, single-poll. Pinned. `default-features = false`
+# keeps it `no_std` (no `std`/`log`/`defmt` pulled) with only what the transport
+# cell needs. Optional + behind the `smoltcp` feature so the from-scratch stack +
+# every existing test are unaffected when it is off (the default). This is the one
+# doc-named dependency N2c adds, per the no-deps rule; its small transitive tree
+# (bitflags/byteorder/cfg-if/heapless/managed/hash32) is all `no_std`.
+smoltcp = { version = "=0.13.1", default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-udp",
+    "socket-tcp",
+    "alloc",
+], optional = true }
+
+# Profile feature gates (docs/NETSTACK.md): a deployment links only the layers
+# its profile needs. For N1a every profile pulls the same L2/L3 core (the
+# modules are always compiled); the gates are declared now so later phases
+# (UDP/TCP/TLS/app protocols) can be attached per profile without a churn of the
+# public surface. `default = ["edge"]` is the general-purpose profile.
+[features]
+default = ["edge"]
+# A tiny subset: raw frames + minimal UDP (future). Smallest datapath.
+embedded = []
+# General host / firewall / WAF: the full L2-L4 core (future TCP/TLS).
+edge = []
+# Extreme low latency / HFT: branchless hot paths, kernel-bypass (future).
+hft = []
+# Data-warehouse throughput: Arrow Flight / Kafka, zero-copy grants (future).
+warehouse = []
+# N2c: the smoltcp blessed transport cell (docs/NETSTACK.md 13). Off by default
+# so the from-scratch stack + every existing test are unaffected.
+smoltcp = ["dep:smoltcp"]
+
+[lib]
+name = "rheo_net"
+
+# The N1a proof cell: reads the NIC MAC, resolves the SLIRP gateway via net::arp
+# (a real ARP round trip through the stack), and round-trips IPv4/IPv6 headers +
+# the checksum in memory. Loaded by the `netcore` test kernel.
+[[bin]]
+name = "netcore-demo"
+path = "src/bin/netcore-demo.rs"
+
+# The N1b proof cell: the UDP + ICMP round trips over SLIRP (a DNS query to
+# 10.0.2.3:53 and a ping to the gateway 10.0.2.2) plus the checksum oracles.
+# Loaded by the `netl4` test kernel.
+[[bin]]
+name = "netl4-demo"
+path = "src/bin/netl4-demo.rs"
+
+# The N1c proof cell: the caching DNS client - an in-memory compressed-response
+# parse oracle + pointer-loop safety, deterministic hosts/blocklist/cache-hit
+# checks (network-free, asserted via the query counter), and a bonus live resolve
+# over SLIRP's DNS (10.0.2.3). Loaded by the `netdns` test kernel.
+[[bin]]
+name = "netdns-demo"
+path = "src/bin/netdns-demo.rs"
+
+# The N1e proof cell: first-class TTL / IPv6 hop limit + the forwarding-plane
+# decrement primitive + ICMP Time Exceeded (v4 + v6 codec) + the traceroute state
+# machine fed synthetic responses (multi-hop discovery without real routers), plus
+# a bonus live 1-hop trace to the gateway. Loaded by the `nettrace` test kernel.
+[[bin]]
+name = "nettrace-demo"
+path = "src/bin/nettrace-demo.rs"
+
+# The N1d native proof cell: the local fast path (net::local) - two cells exchange
+# a payload over librheo::ipc + a sealed grant, zero-copy, no IP stack, plus the
+# datapath selector. Loaded by the `netlocal` test kernel (two cells, one shared
+# channel; needs no netdev - it is all in-cell/cross-cell).
+[[bin]]
+name = "netlocal-demo"
+path = "src/bin/netlocal-demo.rs"
+
+# The N2a proof cell: the native TCP state machine + the timer wheel. Two TCP
+# endpoints in one cell over a virtual link drive the full lifecycle
+# deterministically (handshake, bidirectional data, a dropped segment recovered by
+# RTO, teardown), plus the checksum/segment-encode oracles and the timer-wheel
+# multiplex over the single reactor slot. Loaded by the `nettcp` test kernel; needs
+# no netdev - it is entirely in-cell.
+[[bin]]
+name = "nettcp-demo"
+path = "src/bin/nettcp-demo.rs"
+
+# The N2b proof cell: real TCP congestion control - Reno + CUBIC (net::cc) over the
+# N2a CongestionControl seam. Deterministic integer cwnd trajectories (slow start,
+# AIMD, fast retransmit/recovery, RTO, the CUBIC W(t) shape) pinned against
+# precomputed oracles, plus a real Connection<Reno> fast-retransmit-before-RTO
+# scenario over the in-cell VirtualLink. Loaded by the `nettcpcc` test kernel; needs
+# no netdev - it is entirely in-cell.
+[[bin]]
+name = "nettcpcc-demo"
+path = "src/bin/nettcpcc-demo.rs"
+
+# The N2c proof cell: (A) the smoltcp blessed transport cell - a smoltcp UDP round
+# trip to SLIRP's DNS (10.0.2.3:53) over a QueueDevice bound to librheo::net, plus
+# deterministic in-cell smoltcp TCP + UDP over the Loopback device; and (B) the
+# native sharded transport - 2 shards, connections hashed to shards, a cross-shard
+# TCP handshake + transfer over the in-cell VirtualLink. Requires the `smoltcp`
+# feature (built separately by xtask); loaded by the `netsmoltcp` test kernel.
+[[bin]]
+name = "netsmoltcp-demo"
+path = "src/bin/netsmoltcp-demo.rs"
+required-features = ["smoltcp"]

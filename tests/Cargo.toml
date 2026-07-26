@@ -12,6 +12,13 @@ kernel = { path = "../kernel" }
 runtime = { path = "../runtime" }
 posix = { path = "../posix" }
 
+[features]
+# The `smp` test kernel needs kernel/smp (docs/SMP.md). Kept out of the default
+# set + gated on the bin via required-features so the other 31 test kernels build
+# a byte-identical `kernel` lib (SMP off); xtask builds the smp kernel in a
+# separate cargo invocation with this feature on.
+smp = ["kernel/smp"]
+
 [[bin]]
 name = "cap-invariants"
 path = "src/cap_invariants.rs"
@@ -33,6 +40,10 @@ name = "resources"
 path = "src/resources.rs"
 
 [[bin]]
+name = "pmem"
+path = "src/pmem.rs"
+
+[[bin]]
 name = "hwinfo"
 path = "src/hwinfo.rs"
 
@@ -47,6 +58,195 @@ path = "src/runtime.rs"
 [[bin]]
 name = "posix"
 path = "src/posix.rs"
+
+[[bin]]
+name = "blockfs"
+path = "src/blockfs.rs"
+
+[[bin]]
+name = "elfrun"
+path = "src/elfrun.rs"
+
+[[bin]]
+name = "posixrun"
+path = "src/posixrun.rs"
+
+[[bin]]
+name = "libcrun"
+path = "src/libcrun.rs"
+
+[[bin]]
+name = "jsonrun"
+path = "src/jsonrun.rs"
+
+[[bin]]
+name = "stdrun"
+path = "src/stdrun.rs"
+
+[[bin]]
+name = "librhearun"
+path = "src/librhearun.rs"
+
+[[bin]]
+name = "librheodata"
+path = "src/librheodata.rs"
+
+[[bin]]
+name = "librheocompute"
+path = "src/librheocompute.rs"
+
+[[bin]]
+name = "librheoterm"
+path = "src/librheoterm.rs"
+
+[[bin]]
+name = "librheowl"
+path = "src/librheowl.rs"
+
+[[bin]]
+name = "coreutils"
+path = "src/coreutils.rs"
+
+[[bin]]
+name = "linuxrun"
+path = "src/linuxrun.rs"
+
+[[bin]]
+name = "linuxtools"
+path = "src/linuxtools.rs"
+
+[[bin]]
+name = "linuxthreads"
+path = "src/linuxthreads.rs"
+
+[[bin]]
+name = "linuxsig"
+path = "src/linuxsig.rs"
+
+[[bin]]
+name = "linuxproc"
+path = "src/linuxproc.rs"
+
+[[bin]]
+name = "linuxdyn"
+path = "src/linuxdyn.rs"
+
+[[bin]]
+name = "librheoproc"
+path = "src/librheoproc.rs"
+
+[[bin]]
+name = "librheonet"
+path = "src/librheonet.rs"
+
+[[bin]]
+name = "librheogpu"
+path = "src/librheogpu.rs"
+
+[[bin]]
+name = "librheoipc"
+path = "src/librheoipc.rs"
+
+[[bin]]
+name = "librheopipe"
+path = "src/librheopipe.rs"
+
+# rheo-net Phase N1a (docs/NETSTACK.md): the L2/L3 core through the new `net`
+# crate - an ARP round trip via net::eth/net::arp + IPv4/IPv6 build/parse/checksum.
+[[bin]]
+name = "netcore"
+path = "src/netcore.rs"
+
+# rheo-net Phase N1b (docs/NETSTACK.md): UDP + ICMP over SLIRP - a DNS query to
+# 10.0.2.3:53 (UDP round trip) and a ping to the gateway 10.0.2.2 (ICMP echo),
+# plus the UDP/ICMP checksum oracles.
+[[bin]]
+name = "netl4"
+path = "src/netl4.rs"
+
+# rheo-net Phase N1c (docs/NETSTACK.md): the caching DNS client - a compressed
+# response parse oracle + pointer-loop safety, and deterministic hosts/blocklist/
+# cache-hit checks (network-free, asserted via a query counter), plus a bonus
+# live resolve over SLIRP's DNS (10.0.2.3).
+[[bin]]
+name = "netdns"
+path = "src/netdns.rs"
+
+# rheo-net Phase N1e (docs/NETSTACK.md): first-class TTL / IPv6 hop limit + the
+# forwarding-plane decrement primitive + ICMP Time Exceeded (v4 + v6 codec) + the
+# traceroute state machine fed synthetic responses (multi-hop discovery without
+# real routers), plus a bonus live 1-hop trace to the gateway 10.0.2.2.
+[[bin]]
+name = "nettrace"
+path = "src/nettrace.rs"
+
+# rheo-net Phase N1d (docs/NETSTACK.md §10): the native local fast path
+# (net::local) - two cells exchange a payload over librheo::ipc + a sealed grant,
+# zero-copy, no IP stack, plus the datapath selector. Needs no netdev.
+[[bin]]
+name = "netlocal"
+path = "src/netlocal.rs"
+
+# rheo-net Phase N2a (docs/NETSTACK.md §11): the native TCP state machine + the
+# timer wheel. Two TCP endpoints in one cell over a virtual link drive the full
+# lifecycle deterministically (handshake, bidirectional data, drop/RTO recovery,
+# teardown), plus the checksum/segment oracles and the timer-wheel multiplex over
+# the single reactor slot. Needs no netdev - entirely in-cell.
+[[bin]]
+name = "nettcp"
+path = "src/nettcp.rs"
+
+# rheo-net Phase N2b (docs/NETSTACK.md §11): real TCP congestion control - Reno +
+# CUBIC (net::cc) over the N2a seam. Deterministic integer cwnd trajectories (slow
+# start, AIMD, fast retransmit/recovery, RTO, the CUBIC W(t) shape) pinned against
+# oracles, plus a real Connection<Reno> fast-retransmit-before-RTO scenario over the
+# in-cell virtual link. Needs no netdev - entirely in-cell.
+[[bin]]
+name = "nettcpcc"
+path = "src/nettcpcc.rs"
+
+# rheo-net Phase N2c (docs/NETSTACK.md §13): the two transports - the smoltcp
+# blessed transport cell (a live smoltcp UDP DNS round trip to SLIRP 10.0.2.3:53
+# over librheo::net + a deterministic in-cell smoltcp TCP/UDP over Loopback) and
+# the native sharded transport (2 shards, connections hashed to shards, a
+# cross-shard TCP transfer over the in-cell virtual link). Needs the SLIRP netdev.
+[[bin]]
+name = "netsmoltcp"
+path = "src/netsmoltcp.rs"
+
+# Linux-personality L8 (docs/LINUX-COMPAT.md L8): AF_UNIX sockets - an unmodified
+# static-glibc C fixture doing socketpair+fork and bind/listen/connect/accept.
+[[bin]]
+name = "linuxunix"
+path = "src/linuxunix.rs"
+
+# Linux-personality L8-INET (docs/LINUX-COMPAT.md L8-INET): AF_INET/AF_INET6
+# sockets over loopback - a static-glibc C fixture doing TCP+UDP+epoll over
+# 127.0.0.1 and TCP over ::1.
+[[bin]]
+name = "linuxinet"
+path = "src/linuxinet.rs"
+
+# Real-GPU hardware plumbing (docs/GPU-HARDWARE.md 3, 12 stage 1): PCIe
+# bridge recursion + BAR sizing/assignment + capability walk + vendor
+# recognition (AMD real via QEMU's ati-vga; NVIDIA/Intel skip-with-reason)
+# + GPU engine registration.
+[[bin]]
+name = "gpuhw"
+path = "src/gpuhw.rs"
+
+# IOMMU containment (docs/GPU-HARDWARE.md 4, BUILD-ORDER.md step 12): VT-d
+# DMA remapping - a virtio-blk DMA succeeds through an identity domain and
+# faults when the domain is revoked. x86-64 real (intel-iommu); arm/riscv
+# skip-with-reason (no DMAR register base surfaced).
+[[bin]]
+name = "iommu"
+path = "src/iommu.rs"
+
+[[bin]]
+name = "smp"
+path = "src/smp.rs"
+required-features = ["smp"]
 
 [[bin]]
 name = "shell-smoke"

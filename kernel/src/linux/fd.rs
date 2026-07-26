@@ -1,0 +1,1506 @@
+//! The Linux personality's per-cell file-descriptor table (docs/LINUX-COMPAT.md
+//! L2). A Linux process's fds are personality state, not a kernel object: this
+//! is a fixed 64-entry table per cell. fds 0/1/2 are the console (serial);
+//! opened files forward to the registered `svc::FileOps` VFS handler; the
+//! `/dev/{null,zero,urandom}` character devices are synthesized here.
+//!
+//! Console I/O is **non-blocking** (a hard requirement - the cell must never
+//! park): stdin drains whatever the serial RX FIFO holds right now (0 bytes if
+//! none), stdout/stderr write straight to the UART.
+
+use crate::arch::{self, linux_abi::Stat};
+use crate::linux::dirent;
+use crate::linux::epoll;
+use crate::linux::errno::*;
+use crate::linux::inetsock::{self, AF_INET, AF_INET6};
+use crate::linux::pipe;
+use crate::linux::unixsock::{self, AF_UNIX, NAME_MAX, SOCK_DGRAM, SOCK_STREAM, SOCK_TYPE_MASK};
+use crate::svc;
+
+pub const NFD: usize = 64;
+
+/// `S_IFSOCK` (a socket file type), for a socket fd's `fstat` (docs/LINUX-COMPAT.md
+/// L8). Not in `dirent` (no VFS socket nodes); local to the fd table.
+const S_IFSOCK: u32 = 0o140000;
+/// Longest path stored per open fd (for `getdents64`/`newfstatat` by fd).
+const PATH_MAX: usize = 256;
+
+/// AT_FDCWD: "relative to the current directory". For L2 only absolute paths
+/// (and AT_FDCWD with an absolute path) are supported.
+pub const AT_FDCWD: i64 = -100;
+
+/// One descriptor slot. The `Vfs` variant carries the file's path so a
+/// directory fd can be re-resolved for by-fd `getdents64`/`fstatat`; that
+/// makes the enum large, but the kernel is allocation-free (no boxing) and the
+/// fd table is a fixed per-cell static, so the size is deliberate.
+#[allow(clippy::large_enum_variant)]
+#[derive(Copy, Clone)]
+enum FdKind {
+    Closed,
+    /// Serial console: 0 = stdin, 1 = stdout, 2 = stderr.
+    Console(u8),
+    /// A VFS-backed file. `vfs_fd` is the descriptor `FileOps::open` returned
+    /// (passed back verbatim to read/write/lseek/close); `path` is stored for
+    /// by-fd `getdents64`/`fstatat`.
+    Vfs {
+        vfs_fd: i64,
+        path: [u8; PATH_MAX],
+        path_len: u16,
+        /// Bytes of the packed `linux_dirent64` stream already returned by
+        /// `getdents64` for this fd, so repeated calls advance and finally
+        /// report end-of-directory (0) instead of looping forever.
+        dir_off: u16,
+    },
+    /// `/dev/null` - read EOF, writes discarded.
+    Null,
+    /// `/dev/zero` - reads zero-fill, writes discarded.
+    Zero,
+    /// `/dev/urandom` - reads from the cell's DRBG.
+    Urandom,
+    /// `/proc/self/auxv` - reads the cell's serialized auxv (docs/LINUX-COMPAT.md
+    /// L3); `pos` is the read cursor. glibc/rustix read AT_EXECFN etc. from here
+    /// when the kernel provides no PR_GET_AUXV, which is how the upstream
+    /// coreutils multicall binary learns its own name to dispatch a utility.
+    ProcAuxv {
+        pos: usize,
+    },
+    /// One end of a **cross-cell** pipe (docs/LINUX-COMPAT.md L6): `idx` selects
+    /// the global ring buffer (`linux::pipe`), `writer` picks the end. After
+    /// `fork` the two ends live in different cells; blocking read/write with
+    /// cross-cell wake is handled by the process scheduler.
+    Pipe {
+        idx: u8,
+        writer: bool,
+    },
+    /// An AF_UNIX socket created by `socket()`, not yet bound or connected
+    /// (docs/LINUX-COMPAT.md L8). SOCK_STREAM only (SOCK_DGRAM is a documented
+    /// deferral - datagram boundary preservation is not implemented).
+    SockFresh,
+    /// A bound + listening AF_UNIX socket: `lst` indexes the global listener
+    /// registry (`linux::unixsock`) holding its name + accept backlog.
+    SockListen {
+        lst: u8,
+    },
+    /// A connected AF_UNIX socket (from `socketpair`, `connect`, or `accept`):
+    /// reads ring `rx`, writes ring `tx` (both `linux::pipe` indices). Backed by
+    /// the L6 cross-cell ring machinery - one connection is two rings.
+    SockConn {
+        rx: u8,
+        tx: u8,
+    },
+    /// An AF_INET/AF_INET6 **stream** socket created by `socket()`, not yet
+    /// listening or connected (docs/LINUX-COMPAT.md L8-INET). `local_port` is 0
+    /// until `bind`; loopback-only.
+    InetStreamFresh {
+        v6: bool,
+        local_port: u16,
+    },
+    /// A bound + listening AF_INET/AF_INET6 stream socket: `lst` indexes the INET
+    /// listener registry (`linux::inetsock`).
+    InetListen {
+        lst: u8,
+        v6: bool,
+        port: u16,
+    },
+    /// A connected AF_INET/AF_INET6 stream socket (from `connect`/`accept`): the
+    /// transport is the same L6 ring pair as AF_UNIX (`rx`/`tx`); the ports are
+    /// kept for `getsockname`/`getpeername`.
+    InetConn {
+        rx: u8,
+        tx: u8,
+        local_port: u16,
+        peer_port: u16,
+        v6: bool,
+    },
+    /// An AF_INET/AF_INET6 **datagram** (UDP) socket. `ep` indexes the INET
+    /// datagram registry once `bound` (an explicit `bind`, or an implicit
+    /// ephemeral bind on the first `sendto`); `peer_port` is a `connect`-set
+    /// default destination.
+    InetDgram {
+        v6: bool,
+        ep: u8,
+        bound: bool,
+        peer_port: u16,
+    },
+    /// An epoll instance (docs/LINUX-COMPAT.md L8-INET): `ep` indexes the
+    /// per-personality epoll registry (`linux::epoll`).
+    Epoll {
+        ep: u8,
+    },
+}
+
+/// Room for the serialized auxv served through `/proc/self/auxv` (matches
+/// `linux::stack::AUXV_BYTES_MAX`).
+const AUXV_MAX: usize = 20 * 16;
+
+#[derive(Copy, Clone)]
+pub struct FdTable {
+    fds: [FdKind; NFD],
+    /// The cell's `/proc/self/auxv` bytes, copied in by `install_cell` after
+    /// the stack (with its auxv) is built.
+    auxv: [u8; AUXV_MAX],
+    auxv_len: usize,
+}
+
+impl Default for FdTable {
+    fn default() -> FdTable {
+        FdTable::new()
+    }
+}
+
+impl FdTable {
+    pub const fn new() -> FdTable {
+        FdTable {
+            fds: [FdKind::Closed; NFD],
+            auxv: [0; AUXV_MAX],
+            auxv_len: 0,
+        }
+    }
+
+    /// Reset to the initial state: fds 0/1/2 = console, the rest closed.
+    pub fn init_console(&mut self) {
+        self.fds = [FdKind::Closed; NFD];
+        self.fds[0] = FdKind::Console(0);
+        self.fds[1] = FdKind::Console(1);
+        self.fds[2] = FdKind::Console(2);
+    }
+
+    /// Store the cell's serialized auxv for `/proc/self/auxv` reads.
+    pub fn set_auxv(&mut self, bytes: &[u8]) {
+        let n = bytes.len().min(AUXV_MAX);
+        self.auxv[..n].copy_from_slice(&bytes[..n]);
+        self.auxv_len = n;
+    }
+
+    /// pipe2(pipefd[2], flags): allocate a global cross-cell pipe and write the
+    /// read and write fds (two `int`s) into `pipefd` (docs/LINUX-COMPAT.md L6).
+    /// Flags (O_CLOEXEC/O_NONBLOCK) are accepted and ignored: the ends block
+    /// cooperatively (the scheduler decides). Close-on-exec is not tracked -
+    /// `execve` keeps all fds open (documented, docs/LINUX-COMPAT.md L6); a
+    /// pipeline child closes its unused ends explicitly, which the shell does.
+    pub fn pipe2(&mut self, pipefd_va: u64) -> i64 {
+        let Some(idx) = pipe::alloc() else {
+            return -ENFILE;
+        };
+        let Some(rd) = self.free_slot(3) else {
+            pipe::close_end(idx, false);
+            pipe::close_end(idx, true);
+            return -EMFILE;
+        };
+        self.fds[rd] = FdKind::Pipe {
+            idx: idx as u8,
+            writer: false,
+        };
+        let Some(wr) = self.free_slot(3) else {
+            self.fds[rd] = FdKind::Closed;
+            pipe::close_end(idx, false);
+            pipe::close_end(idx, true);
+            return -EMFILE;
+        };
+        self.fds[wr] = FdKind::Pipe {
+            idx: idx as u8,
+            writer: true,
+        };
+        // SAFETY: `pipefd_va` is a writable [i32; 2] in the calling cell.
+        unsafe {
+            let p = pipefd_va as *mut i32;
+            p.write(rd as i32);
+            p.add(1).write(wr as i32);
+        }
+        0
+    }
+
+    /// If `fd` is a pipe end, its `(global pipe idx, writer)`. The process
+    /// scheduler uses this to route blocking read/write (docs/LINUX-COMPAT.md L6).
+    pub fn pipe_end(&self, fd: i64) -> Option<(usize, bool)> {
+        let slot = usize_fd(fd)?;
+        match self.fds[slot] {
+            FdKind::Pipe { idx, writer } => Some((idx as usize, writer)),
+            _ => None,
+        }
+    }
+
+    /// Bump the global pipe end-refcount for every pipe fd in this table - the
+    /// `fork` inheritance step, after the child's table is copied from the
+    /// parent (docs/LINUX-COMPAT.md L6): both processes now hold the end.
+    pub fn inherit_pipe_ends(&self) {
+        for f in self.fds.iter() {
+            match *f {
+                FdKind::Pipe { idx, writer } => pipe::add_end(idx as usize, writer),
+                // A connected socket is two ring ends (rx = reader, tx = writer).
+                FdKind::SockConn { rx, tx } | FdKind::InetConn { rx, tx, .. } => {
+                    pipe::add_end(rx as usize, false);
+                    pipe::add_end(tx as usize, true);
+                }
+                FdKind::SockListen { lst } => unixsock::addref(lst),
+                FdKind::InetListen { lst, .. } => inetsock::addref_listener(lst),
+                FdKind::InetDgram {
+                    ep, bound: true, ..
+                } => inetsock::addref_dgram(ep),
+                FdKind::Epoll { ep } => epoll::addref(ep),
+                _ => {}
+            }
+        }
+    }
+
+    /// Close every open descriptor - the process-exit teardown
+    /// (docs/LINUX-COMPAT.md L6): drops pipe ends (firing EOF/EPIPE for peers)
+    /// and closes VFS files.
+    pub fn close_all(&mut self) {
+        for i in 0..NFD {
+            if !matches!(self.fds[i], FdKind::Closed) {
+                self.close(i as i64);
+            }
+        }
+    }
+
+    fn free_slot(&self, from: usize) -> Option<usize> {
+        (from..NFD).find(|&i| matches!(self.fds[i], FdKind::Closed))
+    }
+
+    /// True if `fd` is one of the console descriptors (used by `ioctl` to
+    /// answer TIOCGWINSZ only for the terminal).
+    pub fn is_console(&self, fd: i64) -> bool {
+        usize_fd(fd).is_some_and(|s| matches!(self.fds[s], FdKind::Console(_)))
+    }
+
+    /// True if `fd` refers to an open descriptor (used by `poll` to distinguish
+    /// a valid fd from a closed one).
+    pub fn is_open(&self, fd: i64) -> bool {
+        usize_fd(fd).is_some_and(|s| !matches!(self.fds[s], FdKind::Closed))
+    }
+
+    /// read(fd, buf, count).
+    pub fn read(&mut self, fd: i64, buf_va: u64, count: u64) -> i64 {
+        let Some(slot) = usize_fd(fd) else {
+            return -EBADF;
+        };
+        match self.fds[slot] {
+            FdKind::Console(0) => {
+                // Non-blocking stdin: drain the serial RX FIFO (0 if empty).
+                let buf =
+                    unsafe { core::slice::from_raw_parts_mut(buf_va as *mut u8, count as usize) };
+                let mut n = 0;
+                while n < buf.len() {
+                    match arch::serial_read_byte() {
+                        Some(b) => {
+                            buf[n] = b;
+                            n += 1;
+                        }
+                        None => break,
+                    }
+                }
+                n as i64
+            }
+            FdKind::Console(_) => -EBADF,
+            FdKind::Null => 0,
+            FdKind::Zero => {
+                let buf =
+                    unsafe { core::slice::from_raw_parts_mut(buf_va as *mut u8, count as usize) };
+                buf.fill(0);
+                count as i64
+            }
+            FdKind::Urandom => {
+                let buf =
+                    unsafe { core::slice::from_raw_parts_mut(buf_va as *mut u8, count as usize) };
+                crate::rng::derive_cell_drbg().fill_bytes(buf);
+                count as i64
+            }
+            FdKind::ProcAuxv { pos } => {
+                let end = self.auxv_len;
+                let n = (end - pos.min(end)).min(count as usize);
+                let buf = unsafe { core::slice::from_raw_parts_mut(buf_va as *mut u8, n) };
+                buf.copy_from_slice(&self.auxv[pos..pos + n]);
+                self.fds[slot] = FdKind::ProcAuxv { pos: pos + n };
+                n as i64
+            }
+            FdKind::Pipe { idx, writer: false } => match pipe::read(idx as usize, buf_va, count) {
+                // Non-blocking here: -EAGAIN when empty with writers still open.
+                // The blocking + cross-cell wake path is `proc::sys_read`, which
+                // intercepts pipe fds before reaching here; readv/writev on a
+                // pipe fall through to this non-blocking behavior (documented).
+                pipe::ReadNb::Done(n) => n,
+                pipe::ReadNb::WouldBlock => -EAGAIN,
+            },
+            FdKind::Pipe { writer: true, .. } => -EBADF, // write end not readable
+            // Connected socket (AF_UNIX or AF_INET loopback): read this end's rx
+            // ring (non-blocking; the cross-cell blocking path is
+            // `proc`/`sys_read`, docs/LINUX-COMPAT.md L8). readv/recvmsg fall here.
+            FdKind::SockConn { rx, .. } | FdKind::InetConn { rx, .. } => {
+                match pipe::read(rx as usize, buf_va, count) {
+                    pipe::ReadNb::Done(n) => n,
+                    pipe::ReadNb::WouldBlock => -EAGAIN,
+                }
+            }
+            FdKind::SockFresh
+            | FdKind::SockListen { .. }
+            | FdKind::InetStreamFresh { .. }
+            | FdKind::InetListen { .. }
+            | FdKind::InetDgram { .. } => -ENOTCONN,
+            FdKind::Epoll { .. } => -EINVAL,
+            FdKind::Vfs { vfs_fd, .. } => match svc::file_ops() {
+                Some(o) => (o.read)(vfs_fd as u64, buf_va, count),
+                None => -EBADF,
+            },
+            FdKind::Closed => -EBADF,
+        }
+    }
+
+    /// write(fd, buf, count).
+    pub fn write(&mut self, fd: i64, buf_va: u64, count: u64) -> i64 {
+        let Some(slot) = usize_fd(fd) else {
+            return -EBADF;
+        };
+        match self.fds[slot] {
+            FdKind::Console(0) => -EBADF,
+            FdKind::Console(_) => {
+                let buf =
+                    unsafe { core::slice::from_raw_parts(buf_va as *const u8, count as usize) };
+                for &b in buf {
+                    arch::serial_write_byte(b);
+                }
+                super::tap_stdout(buf);
+                count as i64
+            }
+            FdKind::Null | FdKind::Zero | FdKind::Urandom => count as i64,
+            FdKind::ProcAuxv { .. } => -EBADF, // read-only
+            FdKind::Pipe { writer: false, .. } => -EBADF, // read end not writable
+            FdKind::Pipe { idx, writer: true } => match pipe::write(idx as usize, buf_va, count) {
+                pipe::WriteNb::Done(n) => n,
+                pipe::WriteNb::WouldBlock => -EAGAIN,
+                pipe::WriteNb::Epipe => -EPIPE,
+            },
+            // Connected socket (AF_UNIX or AF_INET loopback): write this end's tx
+            // ring (non-blocking; the cross-cell blocking + SIGPIPE path is
+            // `sys_write`). writev/sendmsg fall through to here.
+            FdKind::SockConn { tx, .. } | FdKind::InetConn { tx, .. } => {
+                match pipe::write(tx as usize, buf_va, count) {
+                    pipe::WriteNb::Done(n) => n,
+                    pipe::WriteNb::WouldBlock => -EAGAIN,
+                    pipe::WriteNb::Epipe => -EPIPE,
+                }
+            }
+            FdKind::SockFresh
+            | FdKind::SockListen { .. }
+            | FdKind::InetStreamFresh { .. }
+            | FdKind::InetListen { .. }
+            | FdKind::InetDgram { .. } => -ENOTCONN,
+            FdKind::Epoll { .. } => -EINVAL,
+            FdKind::Vfs { vfs_fd, .. } => match svc::file_ops() {
+                Some(o) => (o.write)(vfs_fd as u64, buf_va, count),
+                None => -EBADF,
+            },
+            FdKind::Closed => -EBADF,
+        }
+    }
+
+    /// Read up to `len` bytes at file `offset` from a VFS-backed fd into the
+    /// (kernel or user) VA `dst`, without disturbing the caller's view of the
+    /// fd position beyond an explicit seek. Backs `pread64` and the L7
+    /// fd-backed `mmap` (docs/LINUX-COMPAT.md L7): ld.so `pread`s ELF headers
+    /// and `mmap`s library segments from the same fd. Only VFS files are
+    /// readable this way; other fd kinds return -EBADF (ld.so maps regular
+    /// files only). A short read leaves the tail of `dst` untouched (mmap
+    /// pre-zeroes its frames).
+    pub fn pread(&self, fd: i64, dst: u64, len: u64, offset: i64) -> i64 {
+        let Some(slot) = usize_fd(fd) else {
+            return -EBADF;
+        };
+        match self.fds[slot] {
+            FdKind::Vfs { vfs_fd, .. } => match svc::file_ops() {
+                Some(o) => {
+                    (o.lseek)(vfs_fd as u64, offset, 0); // SEEK_SET
+                    (o.read)(vfs_fd as u64, dst, len)
+                }
+                None => -EBADF,
+            },
+            FdKind::Closed => -EBADF,
+            _ => -EBADF,
+        }
+    }
+
+    /// openat(dirfd, path, flags, mode). L2: absolute paths (or AT_FDCWD with
+    /// an absolute path) only. `/dev/{null,zero,urandom,random}` are
+    /// synthesized; everything else forwards to `FileOps::open`.
+    pub fn openat(&mut self, dirfd: i64, path_va: u64, path_len: usize, flags: u64) -> i64 {
+        if dirfd != AT_FDCWD && dirfd >= 0 {
+            // Relative-to-a-dirfd resolution is L3 (docs/LINUX-COMPAT.md).
+            return -ENOSYS;
+        }
+        let bytes = unsafe { core::slice::from_raw_parts(path_va as *const u8, path_len) };
+        let name = &bytes[..bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len())];
+
+        let Some(slot) = self.free_slot(3) else {
+            return -EMFILE;
+        };
+        let dev = match name {
+            b"/dev/null" => Some(FdKind::Null),
+            b"/dev/zero" => Some(FdKind::Zero),
+            b"/dev/urandom" | b"/dev/random" => Some(FdKind::Urandom),
+            b"/proc/self/auxv" => Some(FdKind::ProcAuxv { pos: 0 }),
+            _ => None,
+        };
+        if let Some(kind) = dev {
+            self.fds[slot] = kind;
+            return slot as i64;
+        }
+        let Some(o) = svc::file_ops() else {
+            return -ENOENT;
+        };
+        let vfs_fd = (o.open)(path_va, name.len() as u64, flags);
+        if vfs_fd < 0 {
+            return vfs_fd;
+        }
+        let mut path = [0u8; PATH_MAX];
+        let plen = name.len().min(PATH_MAX);
+        path[..plen].copy_from_slice(&name[..plen]);
+        self.fds[slot] = FdKind::Vfs {
+            vfs_fd,
+            path,
+            path_len: plen as u16,
+            dir_off: 0,
+        };
+        slot as i64
+    }
+
+    /// close(fd).
+    pub fn close(&mut self, fd: i64) -> i64 {
+        let Some(slot) = usize_fd(fd) else {
+            return -EBADF;
+        };
+        match self.fds[slot] {
+            FdKind::Closed => return -EBADF,
+            FdKind::Vfs { vfs_fd, .. } => {
+                if let Some(o) = svc::file_ops() {
+                    (o.close)(vfs_fd as u64);
+                }
+            }
+            FdKind::Pipe { idx, writer } => {
+                pipe::close_end(idx as usize, writer); // reclaimed when both ends close
+            }
+            FdKind::SockConn { rx, tx } => unixsock::drop_conn(rx, tx),
+            FdKind::SockListen { lst } => unixsock::close(lst),
+            FdKind::InetConn { rx, tx, .. } => inetsock::drop_conn(rx, tx),
+            FdKind::InetListen { lst, .. } => inetsock::close_listener(lst),
+            FdKind::InetDgram {
+                ep, bound: true, ..
+            } => inetsock::close_dgram(ep),
+            FdKind::Epoll { ep } => epoll::close(ep),
+            _ => {}
+        }
+        self.fds[slot] = FdKind::Closed;
+        0
+    }
+
+    /// dup(oldfd) - lowest free slot. Vfs entries share the underlying VFS fd
+    /// (close-once semantics; acceptable for the L2 fixtures).
+    pub fn dup(&mut self, oldfd: i64) -> i64 {
+        let Some(old) = usize_fd(oldfd) else {
+            return -EBADF;
+        };
+        if matches!(self.fds[old], FdKind::Closed) {
+            return -EBADF;
+        }
+        let Some(slot) = self.free_slot(0) else {
+            return -EMFILE;
+        };
+        self.fds[slot] = self.fds[old];
+        self.bump_if_pipe(slot);
+        slot as i64
+    }
+
+    /// dup3(oldfd, newfd, flags) / dup2 semantics: place `oldfd` at `newfd`.
+    pub fn dup3(&mut self, oldfd: i64, newfd: i64) -> i64 {
+        let (Some(old), Some(new)) = (usize_fd(oldfd), usize_fd(newfd)) else {
+            return -EBADF;
+        };
+        if matches!(self.fds[old], FdKind::Closed) {
+            return -EBADF;
+        }
+        if old != new {
+            self.close(newfd);
+            self.fds[new] = self.fds[old];
+            self.bump_if_pipe(new);
+        }
+        new as i64
+    }
+
+    /// If slot holds a pipe end or a socket, add a reference to the shared
+    /// backing (a dup shares the end/rings/listener, so close must be balanced).
+    fn bump_if_pipe(&self, slot: usize) {
+        match self.fds[slot] {
+            FdKind::Pipe { idx, writer } => pipe::add_end(idx as usize, writer),
+            FdKind::SockConn { rx, tx } | FdKind::InetConn { rx, tx, .. } => {
+                pipe::add_end(rx as usize, false);
+                pipe::add_end(tx as usize, true);
+            }
+            FdKind::SockListen { lst } => unixsock::addref(lst),
+            FdKind::InetListen { lst, .. } => inetsock::addref_listener(lst),
+            FdKind::InetDgram {
+                ep, bound: true, ..
+            } => inetsock::addref_dgram(ep),
+            FdKind::Epoll { ep } => epoll::addref(ep),
+            _ => {}
+        }
+    }
+
+    /// fcntl(fd, cmd, arg) - the minimal subset glibc needs.
+    pub fn fcntl(&mut self, fd: i64, cmd: u64, arg: u64) -> i64 {
+        const F_DUPFD: u64 = 0;
+        const F_GETFD: u64 = 1;
+        const F_SETFD: u64 = 2;
+        const F_GETFL: u64 = 3;
+        const F_SETFL: u64 = 4;
+        const F_DUPFD_CLOEXEC: u64 = 1030;
+        let Some(slot) = usize_fd(fd) else {
+            return -EBADF;
+        };
+        if matches!(self.fds[slot], FdKind::Closed) {
+            return -EBADF;
+        }
+        match cmd {
+            F_DUPFD | F_DUPFD_CLOEXEC => {
+                let start = arg as usize;
+                let Some(dst) = self.free_slot(start.min(NFD)) else {
+                    return -EMFILE;
+                };
+                self.fds[dst] = self.fds[slot];
+                self.bump_if_pipe(dst);
+                dst as i64
+            }
+            F_GETFD | F_SETFD | F_SETFL => 0,
+            F_GETFL => 2, // O_RDWR - the personality does not track open flags
+            _ => 0,
+        }
+    }
+
+    /// lseek(fd, off, whence).
+    pub fn lseek(&mut self, fd: i64, off: i64, whence: u64) -> i64 {
+        let Some(slot) = usize_fd(fd) else {
+            return -EBADF;
+        };
+        match self.fds[slot] {
+            FdKind::Vfs { vfs_fd, .. } => match svc::file_ops() {
+                Some(o) => (o.lseek)(vfs_fd as u64, off, whence),
+                None => -EBADF,
+            },
+            FdKind::Console(_) | FdKind::Null | FdKind::Zero | FdKind::Urandom => -ESPIPE,
+            FdKind::ProcAuxv { .. } | FdKind::Pipe { .. } => -ESPIPE,
+            FdKind::SockFresh
+            | FdKind::SockListen { .. }
+            | FdKind::SockConn { .. }
+            | FdKind::InetStreamFresh { .. }
+            | FdKind::InetListen { .. }
+            | FdKind::InetConn { .. }
+            | FdKind::InetDgram { .. }
+            | FdKind::Epoll { .. } => -ESPIPE,
+            FdKind::Closed => -EBADF,
+        }
+    }
+
+    /// fstat(fd, statbuf) - synthesize a `struct stat` for the entry.
+    pub fn fstat(&mut self, fd: i64, statbuf_va: u64) -> i64 {
+        let Some(slot) = usize_fd(fd) else {
+            return -EBADF;
+        };
+        let st = match self.fds[slot] {
+            FdKind::Closed => return -EBADF,
+            FdKind::Console(_) | FdKind::Null | FdKind::Zero | FdKind::Urandom => {
+                // A character device: mode S_IFCHR|0620, zero size.
+                Stat::new(dirent::S_IFCHR | 0o620, 0, 1, 1, 1000, 1000, 0, 4096, 0, 0)
+            }
+            FdKind::ProcAuxv { .. } => {
+                // A read-only regular file sized to the auxv byte stream.
+                let size = self.auxv_len as u64;
+                Stat::new(
+                    dirent::S_IFREG | 0o444,
+                    size,
+                    1,
+                    1,
+                    1000,
+                    1000,
+                    0,
+                    4096,
+                    size.div_ceil(512),
+                    0,
+                )
+            }
+            FdKind::Pipe { .. } => {
+                Stat::new(dirent::S_IFIFO | 0o600, 0, 1, 1, 1000, 1000, 0, 4096, 0, 0)
+            }
+            FdKind::SockFresh
+            | FdKind::SockListen { .. }
+            | FdKind::SockConn { .. }
+            | FdKind::InetStreamFresh { .. }
+            | FdKind::InetListen { .. }
+            | FdKind::InetConn { .. }
+            | FdKind::InetDgram { .. }
+            | FdKind::Epoll { .. } => {
+                Stat::new(S_IFSOCK | 0o600, 0, 1, 1, 1000, 1000, 0, 4096, 0, 0)
+            }
+            FdKind::Vfs { vfs_fd, .. } => {
+                let Some(o) = svc::file_ops() else {
+                    return -EBADF;
+                };
+                // FileOps writes the native abi::Stat into a kernel temp
+                // (identity-mapped, writable there); convert to the Linux ABI.
+                let mut native = crate::abi::Stat { size: 0, kind: 0 };
+                let r = (o.fstat)(vfs_fd as u64, &mut native as *mut _ as u64);
+                if r < 0 {
+                    return r;
+                }
+                let mode = dirent::mode_for_kind(native.kind);
+                let blocks = native.size.div_ceil(512);
+                Stat::new(mode, native.size, 1, 1, 1000, 1000, 0, 4096, blocks, 0)
+            }
+        };
+        // SAFETY: `statbuf_va` is a writable VA in the calling cell.
+        unsafe { (statbuf_va as *mut Stat).write(st) };
+        0
+    }
+
+    /// The `(st_mode, size)` a `fstat`/`statx` would report for `fd`, without
+    /// writing a `struct stat`. Used by `statx` (docs/LINUX-COMPAT.md L3), which
+    /// has its own ABI-independent buffer layout.
+    pub fn mode_size(&mut self, fd: i64) -> Result<(u32, u64), i64> {
+        let Some(slot) = usize_fd(fd) else {
+            return Err(-EBADF);
+        };
+        match self.fds[slot] {
+            FdKind::Closed => Err(-EBADF),
+            FdKind::Console(_) | FdKind::Null | FdKind::Zero | FdKind::Urandom => {
+                Ok((dirent::S_IFCHR | 0o620, 0))
+            }
+            FdKind::ProcAuxv { .. } => Ok((dirent::S_IFREG | 0o444, self.auxv_len as u64)),
+            FdKind::Pipe { .. } => Ok((dirent::S_IFIFO | 0o600, 0)),
+            FdKind::SockFresh
+            | FdKind::SockListen { .. }
+            | FdKind::SockConn { .. }
+            | FdKind::InetStreamFresh { .. }
+            | FdKind::InetListen { .. }
+            | FdKind::InetConn { .. }
+            | FdKind::InetDgram { .. }
+            | FdKind::Epoll { .. } => Ok((S_IFSOCK | 0o600, 0)),
+            FdKind::Vfs { vfs_fd, .. } => {
+                let Some(o) = svc::file_ops() else {
+                    return Err(-EBADF);
+                };
+                let mut native = crate::abi::Stat { size: 0, kind: 0 };
+                let r = (o.fstat)(vfs_fd as u64, &mut native as *mut _ as u64);
+                if r < 0 {
+                    return Err(r);
+                }
+                Ok((dirent::mode_for_kind(native.kind), native.size))
+            }
+        }
+    }
+
+    /// getdents64(fd, buf, len) for a VFS-backed directory fd. The full
+    /// directory is packed as a `linux_dirent64` stream and paged out across
+    /// calls via the fd's `dir_off`, so a reader looping until it gets 0 (real
+    /// `ls`) terminates. The directory must fit `PACKED_MAX` bytes of records
+    /// (ample for L3 test roots); records are always returned whole.
+    pub fn getdents64(&mut self, fd: i64, buf_va: u64, len: u64) -> i64 {
+        const PACKED_MAX: usize = 4096;
+        let Some(slot) = usize_fd(fd) else {
+            return -EBADF;
+        };
+        let (path, path_len, dir_off) = match &self.fds[slot] {
+            FdKind::Vfs {
+                path,
+                path_len,
+                dir_off,
+                ..
+            } => (*path, *path_len as usize, *dir_off as usize),
+            FdKind::Closed => return -EBADF,
+            _ => return -ENOTDIR,
+        };
+        let Some(o) = svc::file_ops() else {
+            return -EBADF;
+        };
+        // FileOps.getdents packs [u32 kind][u32 name_len][name] records into a
+        // kernel scratch buffer; repack the whole thing as a linux_dirent64
+        // stream, then hand out the slice starting at dir_off.
+        let mut scratch = [0u8; PACKED_MAX];
+        let n = (o.getdents)(
+            path.as_ptr() as u64,
+            path_len as u64,
+            scratch.as_mut_ptr() as u64,
+            scratch.len() as u64,
+        );
+        if n < 0 {
+            return n;
+        }
+        let src = &scratch[..n as usize];
+        let mut packed = [0u8; PACKED_MAX];
+        let mut si = 0usize;
+        let mut pi = 0usize;
+        let mut ino = 2u64;
+        while si + 8 <= src.len() {
+            let kind = u32::from_ne_bytes(src[si..si + 4].try_into().unwrap()) as u64;
+            let nlen = u32::from_ne_bytes(src[si + 4..si + 8].try_into().unwrap()) as usize;
+            si += 8;
+            if si + nlen > src.len() {
+                break;
+            }
+            let name = &src[si..si + nlen];
+            si += nlen;
+            match dirent::pack(&mut packed, pi, ino, kind, name) {
+                Some(next) => pi = next,
+                None => break,
+            }
+            ino += 1;
+        }
+        let total = pi;
+        if dir_off >= total {
+            return 0; // end of directory
+        }
+        // Copy whole records from dir_off while they fit the caller's buffer.
+        let out = unsafe { core::slice::from_raw_parts_mut(buf_va as *mut u8, len as usize) };
+        let mut cur = dir_off;
+        let mut oi = 0usize;
+        while cur < total {
+            let reclen =
+                u16::from_ne_bytes(packed[cur + 16..cur + 18].try_into().unwrap()) as usize;
+            if oi + reclen > out.len() {
+                break;
+            }
+            out[oi..oi + reclen].copy_from_slice(&packed[cur..cur + reclen]);
+            oi += reclen;
+            cur += reclen;
+        }
+        if oi == 0 {
+            return -EINVAL; // caller's buffer too small for even one record
+        }
+        if let FdKind::Vfs { dir_off, .. } = &mut self.fds[slot] {
+            *dir_off = cur as u16;
+        }
+        oi as i64
+    }
+
+    // ----------------------------------------------------- AF_UNIX sockets (L8)
+
+    /// Validate an AF_UNIX SOCK_STREAM `(domain, type)`, or an errno. SOCK_DGRAM
+    /// is refused (`-EPROTONOSUPPORT`) - datagram boundary preservation is a
+    /// documented deferral (docs/LINUX-COMPAT.md L8). SOCK_CLOEXEC/SOCK_NONBLOCK
+    /// in the high bits are accepted + ignored (the ends block cooperatively).
+    fn check_stream(domain: u64, ty: u64) -> Result<(), i64> {
+        if domain != AF_UNIX {
+            return Err(-EAFNOSUPPORT);
+        }
+        match ty & SOCK_TYPE_MASK {
+            SOCK_STREAM => Ok(()),
+            SOCK_DGRAM => Err(-EPROTONOSUPPORT),
+            _ => Err(-EPROTONOSUPPORT),
+        }
+    }
+
+    /// socket(domain, type, protocol): an unbound socket. AF_UNIX stream (L8) or
+    /// an AF_INET/AF_INET6 loopback stream/datagram socket (L8-INET). The type's
+    /// high bits (SOCK_CLOEXEC/SOCK_NONBLOCK) are accepted + ignored.
+    pub fn socket(&mut self, domain: u64, ty: u64) -> i64 {
+        match domain {
+            AF_UNIX => {
+                if let Err(e) = Self::check_stream(domain, ty) {
+                    return e;
+                }
+                let Some(slot) = self.free_slot(3) else {
+                    return -EMFILE;
+                };
+                self.fds[slot] = FdKind::SockFresh;
+                slot as i64
+            }
+            AF_INET | AF_INET6 => {
+                let v6 = domain == AF_INET6;
+                let Some(slot) = self.free_slot(3) else {
+                    return -EMFILE;
+                };
+                self.fds[slot] = match ty & SOCK_TYPE_MASK {
+                    SOCK_STREAM => FdKind::InetStreamFresh { v6, local_port: 0 },
+                    SOCK_DGRAM => FdKind::InetDgram {
+                        v6,
+                        ep: 0,
+                        bound: false,
+                        peer_port: 0,
+                    },
+                    _ => return -EPROTONOSUPPORT,
+                };
+                slot as i64
+            }
+            _ => -EAFNOSUPPORT,
+        }
+    }
+
+    /// epoll_create1(flags): an epoll instance as a new fd (L8-INET). Flags
+    /// (EPOLL_CLOEXEC) are accepted + ignored.
+    pub fn epoll_create(&mut self) -> i64 {
+        let Some(ep) = epoll::create() else {
+            return -ENFILE;
+        };
+        let Some(slot) = self.free_slot(3) else {
+            epoll::close(ep);
+            return -EMFILE;
+        };
+        self.fds[slot] = FdKind::Epoll { ep };
+        slot as i64
+    }
+
+    /// epoll_ctl(epfd, op, fd, event): register/modify/remove a watched fd. Reads
+    /// the `struct epoll_event` (`events` u32, then `data` u64 at the per-ISA
+    /// offset - x86-64 packs it, ARM64/RISC-V align it).
+    pub fn epoll_ctl(&mut self, epfd: i64, op: u64, fd: i64, event_va: u64) -> i64 {
+        let Some(slot) = usize_fd(epfd) else {
+            return -EBADF;
+        };
+        let FdKind::Epoll { ep } = self.fds[slot] else {
+            return -EINVAL;
+        };
+        let (events, data) = if event_va != 0 {
+            // SAFETY: `event_va` is a caller-provided `struct epoll_event`.
+            unsafe {
+                let ev = (event_va as *const u32).read_unaligned();
+                let d = ((event_va + arch::linux_abi::EPOLL_EVENT_DATA_OFFSET as u64)
+                    as *const u64)
+                    .read_unaligned();
+                (ev, d)
+            }
+        } else {
+            (0, 0)
+        };
+        epoll::ctl(ep, op, fd as i32, events, data)
+    }
+
+    /// epoll_wait/epoll_pwait(epfd, events, maxevents, ...): report level-triggered
+    /// readiness for the watched fds. Non-blocking (readiness is computed now); see
+    /// `linux::epoll`.
+    pub fn epoll_wait(&mut self, epfd: i64, events_va: u64, maxevents: usize) -> i64 {
+        let Some(slot) = usize_fd(epfd) else {
+            return -EBADF;
+        };
+        let FdKind::Epoll { ep } = self.fds[slot] else {
+            return -EINVAL;
+        };
+        let mut snap = [(0i32, 0u32, 0u64); epoll::MAX_WATCH];
+        let n = epoll::snapshot(ep, &mut snap);
+        let size = arch::linux_abi::EPOLL_EVENT_SIZE as u64;
+        let doff = arch::linux_abi::EPOLL_EVENT_DATA_OFFSET as u64;
+        let mut out = 0usize;
+        for &(wfd, wevents, data) in snap[..n].iter() {
+            if out >= maxevents {
+                break;
+            }
+            let mut re = 0u32;
+            if wevents & epoll::EPOLLIN != 0 && self.pollin_ready(wfd as i64) {
+                re |= epoll::EPOLLIN;
+            }
+            if wevents & epoll::EPOLLOUT != 0 && self.pollout_ready(wfd as i64) {
+                re |= epoll::EPOLLOUT;
+            }
+            if re != 0 {
+                let base = events_va + out as u64 * size;
+                // SAFETY: `events_va` is a caller-provided array of `maxevents`
+                // `struct epoll_event`; `out < maxevents`.
+                unsafe {
+                    (base as *mut u32).write_unaligned(re);
+                    ((base + doff) as *mut u64).write_unaligned(data);
+                }
+                out += 1;
+            }
+        }
+        out as i64
+    }
+
+    /// socketpair(domain, type, protocol, sv): two connected AF_UNIX sockets
+    /// backed by two direction rings (L8). Writes the fd pair into `sv_va`.
+    pub fn socketpair(&mut self, domain: u64, ty: u64, sv_va: u64) -> i64 {
+        if let Err(e) = Self::check_stream(domain, ty) {
+            return e;
+        }
+        let Some((a_rx, a_tx, b_rx, b_tx)) = unixsock::socketpair() else {
+            return -ENFILE;
+        };
+        let Some(s0) = self.free_slot(3) else {
+            unixsock::drop_conn(a_rx, a_tx);
+            unixsock::drop_conn(b_rx, b_tx);
+            return -EMFILE;
+        };
+        self.fds[s0] = FdKind::SockConn { rx: a_rx, tx: a_tx };
+        let Some(s1) = self.free_slot(3) else {
+            self.fds[s0] = FdKind::Closed;
+            unixsock::drop_conn(a_rx, a_tx);
+            unixsock::drop_conn(b_rx, b_tx);
+            return -EMFILE;
+        };
+        self.fds[s1] = FdKind::SockConn { rx: b_rx, tx: b_tx };
+        // SAFETY: `sv_va` is a writable [i32; 2] in the calling cell.
+        unsafe {
+            let p = sv_va as *mut i32;
+            p.write(s0 as i32);
+            p.add(1).write(s1 as i32);
+        }
+        0
+    }
+
+    /// bind(fd, addr, addrlen): register the socket's name in the global registry
+    /// (L8). Marks the fd listening-capable; `listen` then validates it.
+    pub fn bind(&mut self, fd: i64, addr_va: u64, addrlen: u64) -> i64 {
+        let Some(slot) = usize_fd(fd) else {
+            return -EBADF;
+        };
+        match self.fds[slot] {
+            FdKind::SockFresh => {
+                let mut key = [0u8; NAME_MAX];
+                let Some(klen) = read_sun_key(addr_va, addrlen, &mut key) else {
+                    return -EINVAL;
+                };
+                match unixsock::bind(&key[..klen]) {
+                    Some(lst) => {
+                        self.fds[slot] = FdKind::SockListen { lst };
+                        0
+                    }
+                    None => -EADDRINUSE,
+                }
+            }
+            // AF_INET stream: record the local port; `listen` registers it.
+            FdKind::InetStreamFresh { v6, .. } => {
+                let Some((av6, port, _)) = read_inaddr(addr_va, addrlen) else {
+                    return -EINVAL;
+                };
+                if av6 != v6 {
+                    return -EINVAL;
+                }
+                self.fds[slot] = FdKind::InetStreamFresh {
+                    v6,
+                    local_port: port,
+                };
+                0
+            }
+            // AF_INET datagram: register the UDP endpoint now.
+            FdKind::InetDgram {
+                v6, bound: false, ..
+            } => {
+                let Some((av6, port, _)) = read_inaddr(addr_va, addrlen) else {
+                    return -EINVAL;
+                };
+                if av6 != v6 {
+                    return -EINVAL;
+                }
+                match inetsock::register_dgram(v6, port) {
+                    Some(ep) => {
+                        self.fds[slot] = FdKind::InetDgram {
+                            v6,
+                            ep,
+                            bound: true,
+                            peer_port: 0,
+                        };
+                        0
+                    }
+                    None => -EADDRINUSE,
+                }
+            }
+            _ => -EINVAL,
+        }
+    }
+
+    /// listen(fd, backlog): a bound socket is accept-ready (the registry already
+    /// carries its backlog); `backlog` is advisory here. For an AF_INET stream the
+    /// listener is registered now (auto-binding an ephemeral port if unbound).
+    pub fn listen(&mut self, fd: i64) -> i64 {
+        let Some(slot) = usize_fd(fd) else {
+            return -EBADF;
+        };
+        match self.fds[slot] {
+            FdKind::SockListen { .. } | FdKind::InetListen { .. } => 0,
+            FdKind::SockFresh => -EINVAL, // not bound
+            FdKind::InetStreamFresh { v6, local_port } => {
+                let port = if local_port != 0 {
+                    local_port
+                } else {
+                    inetsock::ephemeral_port()
+                };
+                match inetsock::register_listener(v6, port) {
+                    Some(lst) => {
+                        self.fds[slot] = FdKind::InetListen { lst, v6, port };
+                        0
+                    }
+                    None => -EADDRINUSE,
+                }
+            }
+            _ => -ENOTSOCK,
+        }
+    }
+
+    /// connect(fd, addr, addrlen): look up the peer's bound name and establish a
+    /// connection (allocate the two rings, queue the server ends). Non-blocking:
+    /// returns once the connection is queued (AF_UNIX stream semantics).
+    pub fn connect(&mut self, fd: i64, addr_va: u64, addrlen: u64) -> i64 {
+        let Some(slot) = usize_fd(fd) else {
+            return -EBADF;
+        };
+        match self.fds[slot] {
+            FdKind::SockConn { .. } | FdKind::InetConn { .. } => return -EISCONN,
+            FdKind::SockFresh | FdKind::InetStreamFresh { .. } | FdKind::InetDgram { .. } => {}
+            _ => return -EINVAL,
+        }
+        // AF_INET stream: look up the loopback listener, allocate the ring pair.
+        if let FdKind::InetStreamFresh { v6, local_port } = self.fds[slot] {
+            let Some((av6, port, loop_ok)) = read_inaddr(addr_va, addrlen) else {
+                return -EINVAL;
+            };
+            if av6 != v6 {
+                return -EAFNOSUPPORT;
+            }
+            if !loop_ok {
+                return -ENETUNREACH; // NIC-backed remote INET is a later phase
+            }
+            let client_port = if local_port != 0 {
+                local_port
+            } else {
+                inetsock::ephemeral_port()
+            };
+            return match inetsock::connect_stream(v6, port, client_port) {
+                Ok((rx, tx)) => {
+                    self.fds[slot] = FdKind::InetConn {
+                        rx,
+                        tx,
+                        local_port: client_port,
+                        peer_port: port,
+                        v6,
+                    };
+                    0
+                }
+                Err(inetsock::ConnectErr::NoListener) => -ECONNREFUSED,
+                Err(inetsock::ConnectErr::Backlog) => -EAGAIN,
+                Err(inetsock::ConnectErr::NoRing) => -ENFILE,
+            };
+        }
+        // AF_INET datagram: record a default peer (and ephemeral-bind if needed).
+        if let FdKind::InetDgram { v6, ep, bound, .. } = self.fds[slot] {
+            let Some((av6, port, loop_ok)) = read_inaddr(addr_va, addrlen) else {
+                return -EINVAL;
+            };
+            if av6 != v6 {
+                return -EAFNOSUPPORT;
+            }
+            if !loop_ok {
+                return -ENETUNREACH;
+            }
+            let (ep, bound) = if bound {
+                (ep, true)
+            } else {
+                match inetsock::register_dgram(v6, 0) {
+                    Some(e) => (e, true),
+                    None => return -EAGAIN,
+                }
+            };
+            self.fds[slot] = FdKind::InetDgram {
+                v6,
+                ep,
+                bound,
+                peer_port: port,
+            };
+            return 0;
+        }
+        let mut key = [0u8; NAME_MAX];
+        let Some(klen) = read_sun_key(addr_va, addrlen, &mut key) else {
+            return -EINVAL;
+        };
+        match unixsock::connect(&key[..klen]) {
+            Ok((rx, tx)) => {
+                self.fds[slot] = FdKind::SockConn { rx, tx };
+                0
+            }
+            Err(unixsock::ConnectErr::NoListener) => -ECONNREFUSED,
+            Err(unixsock::ConnectErr::Backlog) => -EAGAIN,
+            Err(unixsock::ConnectErr::NoRing) => -ENFILE,
+        }
+    }
+
+    /// accept(fd, addr, addrlen): dequeue a pending connection into a new fd.
+    /// Non-blocking: `-EAGAIN` if the backlog is empty (the cooperative
+    /// single-process proof connects before accepting; a blocking cross-cell
+    /// accept server is a later refinement, docs/LINUX-COMPAT.md L8).
+    pub fn accept(&mut self, fd: i64, addr_va: u64, addrlen_va: u64) -> i64 {
+        let Some(slot) = usize_fd(fd) else {
+            return -EBADF;
+        };
+        // AF_INET stream: dequeue a pending connection, report the client's addr.
+        if let FdKind::InetListen { lst, v6, port } = self.fds[slot] {
+            let Some((rx, tx, client_port)) = inetsock::accept_stream(lst) else {
+                return -EAGAIN;
+            };
+            let Some(nslot) = self.free_slot(3) else {
+                inetsock::drop_conn(rx, tx);
+                return -EMFILE;
+            };
+            self.fds[nslot] = FdKind::InetConn {
+                rx,
+                tx,
+                local_port: port,
+                peer_port: client_port,
+                v6,
+            };
+            write_inaddr(addr_va, addrlen_va, v6, client_port);
+            return nslot as i64;
+        }
+        let FdKind::SockListen { lst } = self.fds[slot] else {
+            return -EINVAL;
+        };
+        let Some((rx, tx)) = unixsock::accept(lst) else {
+            return -EAGAIN;
+        };
+        let Some(nslot) = self.free_slot(3) else {
+            unixsock::drop_conn(rx, tx);
+            return -EMFILE;
+        };
+        self.fds[nslot] = FdKind::SockConn { rx, tx };
+        // The connecting peer is unnamed (no bind): report just the family.
+        if addr_va != 0 && addrlen_va != 0 {
+            // SAFETY: caller-provided sockaddr + socklen_t out-params.
+            unsafe {
+                (addr_va as *mut u16).write(AF_UNIX as u16);
+                (addrlen_va as *mut u32).write(2);
+            }
+        }
+        nslot as i64
+    }
+
+    /// getsockname/getpeername(fd, addr, addrlen, peer): for AF_UNIX report the
+    /// bound name (or family-only); for AF_INET report the `sockaddr_in`/`_in6`
+    /// (loopback IP + the local or, with `peer`, the remote port).
+    pub fn getsockname(&self, fd: i64, addr_va: u64, addrlen_va: u64, peer: bool) -> i64 {
+        let Some(slot) = usize_fd(fd) else {
+            return -EBADF;
+        };
+        // AF_INET variants report a sockaddr_in/_in6.
+        match self.fds[slot] {
+            FdKind::InetListen { v6, port, .. } => {
+                write_inaddr(addr_va, addrlen_va, v6, port);
+                return 0;
+            }
+            FdKind::InetStreamFresh { v6, local_port } => {
+                write_inaddr(addr_va, addrlen_va, v6, local_port);
+                return 0;
+            }
+            FdKind::InetConn {
+                v6,
+                local_port,
+                peer_port,
+                ..
+            } => {
+                write_inaddr(
+                    addr_va,
+                    addrlen_va,
+                    v6,
+                    if peer { peer_port } else { local_port },
+                );
+                return 0;
+            }
+            FdKind::InetDgram {
+                v6,
+                ep,
+                bound: true,
+                peer_port,
+            } => {
+                let (_, port) = inetsock::dgram_addr(ep);
+                write_inaddr(addr_va, addrlen_va, v6, if peer { peer_port } else { port });
+                return 0;
+            }
+            _ => {}
+        }
+        // AF_UNIX.
+        let (name, nlen) = match self.fds[slot] {
+            FdKind::SockListen { lst } => unixsock::name_of(lst),
+            FdKind::SockConn { .. } | FdKind::SockFresh => ([0u8; NAME_MAX], 0),
+            _ => return -ENOTSOCK,
+        };
+        if addr_va == 0 {
+            return -EINVAL;
+        }
+        // SAFETY: caller-provided sockaddr_un (>= 2 + nlen bytes) + socklen_t.
+        unsafe {
+            (addr_va as *mut u16).write(AF_UNIX as u16);
+            if nlen > 0 {
+                core::ptr::copy_nonoverlapping(name.as_ptr(), (addr_va + 2) as *mut u8, nlen);
+            }
+            if addrlen_va != 0 {
+                (addrlen_va as *mut u32).write((2 + nlen) as u32);
+            }
+        }
+        0
+    }
+
+    /// sendto(fd, buf, len, dest_addr, addrlen): a UDP datagram over loopback
+    /// (L8-INET). Ephemeral-binds the socket if unbound. Best-effort: reports the
+    /// whole datagram accepted even if no endpoint is bound at the destination
+    /// (UDP semantics). Stream sockets never reach here (routed to `write`).
+    pub fn sendto(&mut self, fd: i64, buf: u64, len: u64, dest_addr: u64, addrlen: u64) -> i64 {
+        let Some(slot) = usize_fd(fd) else {
+            return -EBADF;
+        };
+        let FdKind::InetDgram {
+            v6,
+            ep,
+            bound,
+            peer_port,
+        } = self.fds[slot]
+        else {
+            return -ENOTSOCK;
+        };
+        // Ensure a source port (ephemeral bind on first send).
+        let ep = if bound {
+            ep
+        } else {
+            match inetsock::register_dgram(v6, 0) {
+                Some(e) => {
+                    self.fds[slot] = FdKind::InetDgram {
+                        v6,
+                        ep: e,
+                        bound: true,
+                        peer_port,
+                    };
+                    e
+                }
+                None => return -EAGAIN,
+            }
+        };
+        let (dv6, dport) = if dest_addr != 0 {
+            let Some((av6, port, loop_ok)) = read_inaddr(dest_addr, addrlen) else {
+                return -EINVAL;
+            };
+            if !loop_ok {
+                return -ENETUNREACH;
+            }
+            (av6, port)
+        } else if peer_port != 0 {
+            (v6, peer_port)
+        } else {
+            return -EINVAL; // no destination (would be EDESTADDRREQ)
+        };
+        let (_, src_port) = inetsock::dgram_addr(ep);
+        let n = (len as usize).min(inetsock::DGRAM_MAX);
+        // SAFETY: `buf` is a readable range of `n` bytes in the active cell.
+        let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, n) };
+        inetsock::send_dgram(dv6, dport, src_port, bytes);
+        len as i64
+    }
+
+    /// recvfrom(fd, buf, len, src_addr, addrlen): dequeue one UDP datagram over
+    /// loopback (L8-INET), filling `src_addr` with the sender's loopback address +
+    /// port. Non-blocking: `-EAGAIN` when the queue is empty.
+    pub fn recvfrom(&mut self, fd: i64, buf: u64, len: u64, src_addr: u64, addrlen_va: u64) -> i64 {
+        let Some(slot) = usize_fd(fd) else {
+            return -EBADF;
+        };
+        let FdKind::InetDgram { v6, ep, bound, .. } = self.fds[slot] else {
+            return -ENOTSOCK;
+        };
+        if !bound {
+            return -EAGAIN; // never bound: nothing can have arrived
+        }
+        // SAFETY: `buf` is a writable range of `len` bytes in the active cell.
+        let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
+        match inetsock::recv_dgram(ep, out) {
+            Some((src_port, n)) => {
+                if src_addr != 0 {
+                    write_inaddr(src_addr, addrlen_va, v6, src_port);
+                }
+                n as i64
+            }
+            None => -EAGAIN,
+        }
+    }
+
+    /// If `fd` is a connected socket, its read ring (`rx`). The `sys_read`
+    /// blocking path routes a socket read through the L6 pipe scheduler on it.
+    pub fn sock_rx(&self, fd: i64) -> Option<usize> {
+        match self.fds[usize_fd(fd)?] {
+            FdKind::SockConn { rx, .. } | FdKind::InetConn { rx, .. } => Some(rx as usize),
+            _ => None,
+        }
+    }
+
+    /// If `fd` is a connected socket, its write ring (`tx`).
+    pub fn sock_tx(&self, fd: i64) -> Option<usize> {
+        match self.fds[usize_fd(fd)?] {
+            FdKind::SockConn { tx, .. } | FdKind::InetConn { tx, .. } => Some(tx as usize),
+            _ => None,
+        }
+    }
+
+    /// True if `fd` is a datagram (UDP) socket - `sendto`/`recvfrom` route to the
+    /// datagram path (`linux::inetsock`) rather than the stream write/read path.
+    pub fn is_dgram(&self, fd: i64) -> bool {
+        usize_fd(fd).is_some_and(|s| matches!(self.fds[s], FdKind::InetDgram { .. }))
+    }
+
+    /// POLLIN readiness for `fd` (used by epoll, level-triggered). A socket is
+    /// readable when its rx ring holds data, its writers all closed (EOF), a
+    /// listener has a pending connection, or a datagram is queued.
+    pub fn pollin_ready(&self, fd: i64) -> bool {
+        let Some(slot) = usize_fd(fd) else {
+            return false;
+        };
+        match self.fds[slot] {
+            FdKind::SockConn { rx, .. } | FdKind::InetConn { rx, .. } => {
+                pipe::has_data(rx as usize) || pipe::writers(rx as usize) == 0
+            }
+            FdKind::Pipe { idx, writer: false } => {
+                pipe::has_data(idx as usize) || pipe::writers(idx as usize) == 0
+            }
+            FdKind::InetListen { lst, .. } => inetsock::listener_has_pending(lst),
+            FdKind::InetDgram {
+                ep, bound: true, ..
+            } => inetsock::dgram_has_data(ep),
+            FdKind::Console(0)
+            | FdKind::Vfs { .. }
+            | FdKind::Null
+            | FdKind::Zero
+            | FdKind::Urandom
+            | FdKind::ProcAuxv { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// POLLOUT readiness for `fd`: a stream socket is writable while its tx ring
+    /// has space (or its readers closed); regular/console/datagram fds always are.
+    pub fn pollout_ready(&self, fd: i64) -> bool {
+        let Some(slot) = usize_fd(fd) else {
+            return false;
+        };
+        match self.fds[slot] {
+            FdKind::SockConn { tx, .. } | FdKind::InetConn { tx, .. } => {
+                pipe::has_space(tx as usize) || pipe::readers(tx as usize) == 0
+            }
+            FdKind::Pipe { idx, writer: true } => {
+                pipe::has_space(idx as usize) || pipe::readers(idx as usize) == 0
+            }
+            FdKind::Console(1)
+            | FdKind::Console(2)
+            | FdKind::Vfs { .. }
+            | FdKind::Null
+            | FdKind::Zero
+            | FdKind::InetDgram { bound: true, .. } => true,
+            _ => false,
+        }
+    }
+}
+
+/// Parse a `sockaddr_un` at `addr_va` (`addrlen` bytes) into a registry key
+/// written to `out`, returning its length (docs/LINUX-COMPAT.md L8). A pathname
+/// key is the `sun_path` up to its first NUL; an **abstract** name (leading NUL)
+/// is taken verbatim (the leading NUL is part of the key). `None` on a non-UNIX
+/// family or an empty/oversized name.
+fn read_sun_key(addr_va: u64, addrlen: u64, out: &mut [u8; NAME_MAX]) -> Option<usize> {
+    let len = addrlen as usize;
+    if addr_va == 0 || len < 2 {
+        return None;
+    }
+    // SAFETY: caller-provided sockaddr of `len` bytes in the active cell.
+    let fam = unsafe { (addr_va as *const u16).read_unaligned() };
+    if fam as u64 != AF_UNIX {
+        return None;
+    }
+    let path_len = (len - 2).min(NAME_MAX);
+    if path_len == 0 {
+        return None;
+    }
+    // SAFETY: `sun_path` immediately follows the 2-byte family field.
+    let src = unsafe { core::slice::from_raw_parts((addr_va + 2) as *const u8, path_len) };
+    let key_len = if src[0] == 0 {
+        path_len // abstract namespace: verbatim, leading NUL kept
+    } else {
+        src.iter().position(|&b| b == 0).unwrap_or(path_len)
+    };
+    if key_len == 0 {
+        return None;
+    }
+    out[..key_len].copy_from_slice(&src[..key_len]);
+    Some(key_len)
+}
+
+/// Parse a `sockaddr_in` (AF_INET) or `sockaddr_in6` (AF_INET6) at `addr_va`
+/// (`addrlen` bytes) into `(is_v6, port, dest_is_loopback)` (docs/LINUX-COMPAT.md
+/// L8-INET). `port` is host-order; `dest_is_loopback` is true for 127.0.0.0/8 or
+/// ::1 (and for the wildcard 0.0.0.0 / ::, treated as loopback for a local
+/// connect). `None` on an unknown family or a short buffer.
+///
+/// Layout: `sin_family` u16 @0, `sin_port` big-endian u16 @2, then the address
+/// (v4: 4 bytes @4; v6: 16 bytes @8 after a 4-byte flowinfo).
+fn read_inaddr(addr_va: u64, addrlen: u64) -> Option<(bool, u16, bool)> {
+    let len = addrlen as usize;
+    if addr_va == 0 || len < 4 {
+        return None;
+    }
+    // SAFETY: caller-provided sockaddr of `len` bytes in the active cell.
+    let fam = unsafe { (addr_va as *const u16).read_unaligned() } as u64;
+    // SAFETY: the port immediately follows the 2-byte family (big-endian).
+    let port = u16::from_be(unsafe { ((addr_va + 2) as *const u16).read_unaligned() });
+    match fam {
+        AF_INET => {
+            if len < 8 {
+                return None;
+            }
+            // SAFETY: `sin_addr` (4 bytes) at offset 4.
+            let a = unsafe { core::slice::from_raw_parts((addr_va + 4) as *const u8, 4) };
+            let oct = [a[0], a[1], a[2], a[3]];
+            let is_local = inetsock::is_loopback_v4(oct) || oct == [0, 0, 0, 0];
+            Some((false, port, is_local))
+        }
+        AF_INET6 => {
+            if len < 24 {
+                return None;
+            }
+            // SAFETY: `sin6_addr` (16 bytes) at offset 8.
+            let a = unsafe { core::slice::from_raw_parts((addr_va + 8) as *const u8, 16) };
+            let mut oct = [0u8; 16];
+            oct.copy_from_slice(a);
+            let is_local = inetsock::is_loopback_v6(oct) || oct == [0u8; 16];
+            Some((true, port, is_local))
+        }
+        _ => None,
+    }
+}
+
+/// Write a loopback `sockaddr_in`/`sockaddr_in6` for `(v6, port)` into `addr_va`,
+/// setting `*addrlen_va` to the struct size (docs/LINUX-COMPAT.md L8-INET). The
+/// caller passes a `sockaddr_storage`-sized buffer (glibc always does), so the
+/// full 16/28 bytes are written.
+fn write_inaddr(addr_va: u64, addrlen_va: u64, v6: bool, port: u16) {
+    if addr_va == 0 {
+        return;
+    }
+    let pbe = port.to_be();
+    // SAFETY: caller-provided sockaddr buffer (>= 28 bytes) + socklen_t out-param.
+    unsafe {
+        if v6 {
+            core::ptr::write_bytes(addr_va as *mut u8, 0, 28);
+            (addr_va as *mut u16).write_unaligned(inetsock::AF_INET6 as u16);
+            ((addr_va + 2) as *mut u16).write_unaligned(pbe);
+            // sin6_addr = ::1 at offset 8 (15 zero bytes then 1).
+            *((addr_va + 8 + 15) as *mut u8) = 1;
+            if addrlen_va != 0 {
+                (addrlen_va as *mut u32).write(28);
+            }
+        } else {
+            core::ptr::write_bytes(addr_va as *mut u8, 0, 16);
+            (addr_va as *mut u16).write_unaligned(inetsock::AF_INET as u16);
+            ((addr_va + 2) as *mut u16).write_unaligned(pbe);
+            // sin_addr = 127.0.0.1 at offset 4.
+            let ip = [127u8, 0, 0, 1];
+            core::ptr::copy_nonoverlapping(ip.as_ptr(), (addr_va + 4) as *mut u8, 4);
+            if addrlen_va != 0 {
+                (addrlen_va as *mut u32).write(16);
+            }
+        }
+    }
+}
+
+/// Validate a raw fd and narrow it to a table slot.
+fn usize_fd(fd: i64) -> Option<usize> {
+    if (0..NFD as i64).contains(&fd) {
+        Some(fd as usize)
+    } else {
+        None
+    }
+}

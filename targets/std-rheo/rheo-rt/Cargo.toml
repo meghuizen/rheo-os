@@ -1,0 +1,8 @@
+[package]
+name = "rheo-rt"
+version = "0.1.0"
+edition = "2021"
+
+# crt0 for rheo-os std programs (docs/USERLAND.md M4): provides the ELF entry
+# `_start`, which calls the compiler-generated C `main` and exits via
+# SYS_EXIT_GROUP. Pulled in by ENTRY(_start) in the userland linker script.

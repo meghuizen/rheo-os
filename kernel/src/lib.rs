@@ -19,17 +19,24 @@ pub mod capability;
 pub mod cell;
 #[macro_use]
 pub mod console;
+pub mod elf;
 pub mod engine;
 pub mod event;
 pub mod graph;
 pub mod hw;
+pub mod input;
 pub mod lease;
+pub mod linux;
+pub mod load;
 pub mod mm;
+pub mod nproc;
 mod panic;
 pub mod pty;
 pub mod queue;
 pub mod rng;
 pub mod sched;
+#[cfg(feature = "smp")]
+pub mod smp;
 pub mod svc;
 pub mod time;
 pub mod user;

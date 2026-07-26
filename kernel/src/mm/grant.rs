@@ -5,11 +5,14 @@
 //! (further writes through the grant API are refused). Elastic grants and
 //! pressure events (MEMORY.md 4-7, BUILD-ORDER.md step 8) are deferred.
 
-use super::frames;
+use super::{frames, frames_pmem};
 
-/// The typed kind of memory a grant is backed by (docs/MEMORY.md). Only
-/// DDR is real in QEMU; the others are declared so the type is complete
-/// and callers must name their intent.
+/// The typed kind of memory a grant is backed by (docs/MEMORY.md). DDR is
+/// always real; `Pmem` is genuinely backed by a real QEMU nvdimm's physical
+/// frames where one is present (x86-64 via NFIT; docs/MEMORY.md real-PMEM
+/// path), falling back to DDR where no nvdimm is exposed. HBM/CXL/Remote have
+/// no QEMU device model and stay honestly DDR-emulated; DeviceBar has no backing
+/// and is refused. Callers must name their intent.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum MemKind {
     Ddr,
@@ -62,7 +65,7 @@ impl Grant {
             return Err(GrantError::TooLarge);
         }
         for _ in 0..pages {
-            self.frames[self.committed] = frames::alloc();
+            self.frames[self.committed] = alloc_frame(self.kind);
             self.committed += 1;
         }
         Ok(())
@@ -77,7 +80,7 @@ impl Grant {
         let n = pages.min(self.committed);
         for _ in 0..n {
             self.committed -= 1;
-            frames::free(self.frames[self.committed]);
+            free_frame(self.frames[self.committed]);
         }
         Ok(())
     }
@@ -109,7 +112,45 @@ impl Drop for Grant {
         // destroyed; unsealed grants free on drop (RAII reclaim).
         while self.committed > 0 {
             self.committed -= 1;
-            frames::free(self.frames[self.committed]);
+            free_frame(self.frames[self.committed]);
+        }
+    }
+}
+
+/// Allocate one frame to back a grant of `kind`. `Pmem` draws from the real
+/// nvdimm region when one was discovered (docs/MEMORY.md real-PMEM path);
+/// otherwise, and for every other kind, it draws a zeroed DDR frame. The Pmem
+/// fallback is logged once so an emulated-as-DDR pmem grant is never silently
+/// mistaken for a real one.
+fn alloc_frame(kind: MemKind) -> usize {
+    if kind == MemKind::Pmem {
+        if let Some(pa) = frames_pmem::alloc() {
+            return pa;
+        }
+        note_pmem_ddr_fallback();
+    }
+    frames::alloc()
+}
+
+/// Free one frame back to whichever pool owns it (the pmem region, else DDR).
+fn free_frame(pa: usize) {
+    if frames_pmem::contains(pa) {
+        frames_pmem::free(pa);
+    } else {
+        frames::free(pa);
+    }
+}
+
+static mut PMEM_FALLBACK_WARNED: bool = false;
+
+/// One-time honest note: a `Pmem` grant is being backed by DDR because no
+/// nvdimm was discovered on this machine (docs/MEMORY.md).
+fn note_pmem_ddr_fallback() {
+    // SAFETY: single-threaded kernel init/commit path; a benign one-shot flag.
+    unsafe {
+        if !*core::ptr::addr_of!(PMEM_FALLBACK_WARNED) {
+            *core::ptr::addr_of_mut!(PMEM_FALLBACK_WARNED) = true;
+            crate::println!("mm: pmem grant backed by DDR (no nvdimm discovered)");
         }
     }
 }

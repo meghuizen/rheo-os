@@ -8,8 +8,11 @@ use crate::arch;
 
 pub const FRAME_SIZE: usize = 4096;
 
-/// Pool size: 32 MiB = 8192 frames -> 1 KiB bitmap.
-pub const POOL_FRAMES: usize = 8192;
+/// Pool size: 128 MiB = 32768 frames -> 4 KiB bitmap. Bumped for the Linux
+/// personality (docs/LINUX-COMPAT.md L2): a static-glibc cell's BSS + brk +
+/// mmap arenas dwarf the native programs'. QEMU runs `-m 1G`, and the pool
+/// fits inside the identity-mapped RAM window on all three ISAs.
+pub const POOL_FRAMES: usize = 32768;
 
 static mut BITMAP: [u64; POOL_FRAMES / 64] = [0; POOL_FRAMES / 64];
 static mut NEXT_HINT: usize = 0;
@@ -21,7 +24,10 @@ unsafe extern "C" {
 
 /// One-time setup; panics if the pool would overlap the kernel image.
 pub fn init() {
-    let kernel_end = core::ptr::addr_of!(__kernel_end) as usize;
+    // `__kernel_end` is a kernel virtual address; compare its physical address
+    // to the (physical) frame-pool base. Identity on x86/riscv; the high
+    // linear-map offset on aarch64 (docs/MEMORY.md).
+    let kernel_end = arch::virt_to_phys(core::ptr::addr_of!(__kernel_end) as usize);
     assert!(
         kernel_end <= arch::FRAME_POOL_BASE,
         "kernel image ({kernel_end:#x}) overlaps the frame pool ({:#x})",
@@ -50,7 +56,9 @@ pub fn alloc() -> usize {
                 bitmap[word] |= 1 << bit;
                 *core::ptr::addr_of_mut!(NEXT_HINT) = frame + 1;
                 let pa = arch::FRAME_POOL_BASE + frame * FRAME_SIZE;
-                core::ptr::write_bytes(pa as *mut u8, 0, FRAME_SIZE);
+                // Zero through the kernel's linear map (identity on x86/riscv;
+                // the high map on aarch64), never the raw physical address.
+                core::ptr::write_bytes(arch::phys_to_virt(pa) as *mut u8, 0, FRAME_SIZE);
                 return pa;
             }
         }

@@ -580,3 +580,95 @@ echo "frame p99: $(every.stats.exec_p99_ns / 1_000_000) ms"
 echo "vsync miss: $(every.stats.deadline_miss)"
 echo "input lag:  $(display.stats.input_to_photon_p99_us) µs"
 ```
+
+---
+
+## 12. Phase H (implemented): the virtio-gpu 2D driver + compositor scanout
+
+Everything above is the design target. What is **built and proven on all
+three ISAs** (docs/LIBRHEO.md Phase H) is the bring-up seam: a real GPU
+driver that presents a client frame to a (QEMU) display surface.
+
+### The driver (`kernel/src/hw/virtio_gpu.rs`)
+
+A hand-written **virtio-gpu 2D driver** (virtio spec 5.7, the plain 2D /
+VIRGL-off subset), structured exactly like the virtio-net / virtio-blk
+drivers, over the **two transports**: virtio-mmio on arm/riscv `virt`,
+virtio-pci on x86-64 q35 (through the `VIRTIO_PCI_CAP_PCI_CFG` config-space
+tunnel, no BAR mapping). Reset + **minimal** feature negotiation
+(`VIRTIO_F_VERSION_1` only — no VIRGL, no EDID), a single **controlq** (queue
+0; the cursorq is left unconfigured). Every 2D command is a
+`virtio_gpu_ctrl_hdr` (24 B) + a command body, submitted on the controlq as a
+**2-descriptor chain** (`[device-readable command][device-writable response]`,
+linked with `VRING_DESC_F_NEXT` — the virtio-blk request/status pattern), then
+the used ring is polled for the device's response code.
+
+The 2D bring-up runs at install time:
+
+1. `GET_DISPLAY_INFO` → `RESP_OK_DISPLAY_INFO`, carrying `pmodes[0]` (scanout 0's
+   size — informational; recorded, not used to size the resource).
+2. `RESOURCE_CREATE_2D` → `RESP_OK_NODATA`: resource id 1, format
+   `B8G8R8A8_UNORM`, a **fixed 128×128**.
+3. `RESOURCE_ATTACH_BACKING` → `RESP_OK_NODATA`: the framebuffer backing is
+   **16 frame-pool frames** (128×128×4 = 64 KiB), attached as **one
+   `virtio_gpu_mem_entry` per frame** (physical address + length) — so the
+   backing need not be physically contiguous, and no large kernel static is
+   needed.
+4. `SET_SCANOUT` → `RESP_OK_NODATA`: bind resource 1 to scanout 0.
+
+A **present** (the `OP_GPU_PRESENT` queue opcode) then copies the cell's
+framebuffer bytes into the attached frames and issues `TRANSFER_TO_HOST_2D` +
+`RESOURCE_FLUSH` (both → `RESP_OK_NODATA`).
+
+All rings, command/response buffers, and the framebuffer are allocated from
+the frame pool (`crate::mm::frames::alloc()`); the only kernel static is a
+small `Option<VirtioGpu>`. DMA uses **physical** addresses (`virt_to_phys`);
+the CPU reaches everything through the high-half linear map (`phys_to_virt`).
+
+**Framebuffer size — 128×128, why.** RGBA 128×128 = exactly 16 frames, a clean
+constant frame count; it matches the display-info fallback; and it is large
+enough to be a real transfer while small enough to keep the attach command
+(32 + 16×16 = 288 B) inside one command frame. The frame allocator has no
+contiguous-multi-frame API, so the multi-entry backing (one entry per frame)
+is what makes a non-trivial framebuffer possible without adding one.
+
+### The compositor wiring (librheo `display`)
+
+librheo's `display` gains `Gpu` (the `OP_GPU_PRESENT` verb) and `Scanout` (a
+client drawable backed by a framebuffer grant: draw into `pixels_mut`, then
+`present().await`). The Phase E in-memory `Compositor` is **unchanged** — it
+still composites a shared sealed buffer into its framebuffer and checksums it
+(the zero-copy cross-cell proof). Phase H adds the real-hardware step: after
+compositing, a framebuffer can be pushed to the device via a GPU present.
+
+The GPU resource backing is a **kernel-side** framebuffer (allocated at
+install, attached once), and `present(buf_va, w, h)` copies the cell's bytes
+into it before transfer+flush — chosen over attaching the cell's own frames
+because the cell's grant frames are not guaranteed contiguous or stable across
+the resource's life; the kernel-side framebuffer has a simple, fixed lifetime.
+
+### Honesty — the proof is the round-trip, not a visible pixel
+
+CI runs QEMU **headless** (`-display none`), exactly as the virtio-net proof is
+network-free (SLIRP's real ARP reply, not a rendered packet). There is no
+monitor to assert a pixel against. The proof is therefore the **genuine driver
+round-trip**: every 2D command returns its expected `RESP_OK_*` code from the
+real QEMU device model. Measured on all three ISAs, **all six commands return
+OK** — `GET_DISPLAY_INFO` (QEMU reports a default 1280×800 even headless),
+`RESOURCE_CREATE_2D`, `RESOURCE_ATTACH_BACKING`, `SET_SCANOUT`,
+`TRANSFER_TO_HOST_2D`, `RESOURCE_FLUSH` — and the `librheo-gpu` cell exits
+`0x42`. `SET_SCANOUT` succeeding headless is not guaranteed on every QEMU build
+(a display-less scanout can be a no-op); the pass criterion the test asserts is
+the cell's `0x42` (present OK = transfer + flush OK), and the per-command report
+is printed so the honest surface is visible. This does **not** claim visible
+output.
+
+### Deferred (the design above, still future work)
+
+Real VIRGL/3D, the cursor plane (cursorq), multi-scanout, EDID/mode
+negotiation, vsync-interrupt→typed-event delivery, an IOMMU-mapped
+grant-checked scanout DMA, and an actual visible framebuffer on hardware. The
+deliverable is the 2D scanout command round-trip + the compositor present
+wiring. The driver's kernel residency is a bring-up seam in tension with
+ARCHITECTURE.md 5; its migration into a contained driver cell is
+GPU-HARDWARE.md 12 (stage 3).

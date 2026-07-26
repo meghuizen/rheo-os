@@ -22,7 +22,11 @@ static mut ADMISSION: Admission = Admission::new();
 static mut ENGINE: Engine = Engine::cpu();
 static mut READY: bool = false;
 
-/// One-time init: seed the per-cell DRBG and attach (measure) the engine.
+/// One-time init: seed the per-cell DRBG and attach (measure) the CPU
+/// engine. GPU engines need no registration step - the engine table IS the
+/// hardware inventory (engine 0 = the CPU, then every recognised GPU),
+/// read live at query time, so a later `gpu_attach_measure` is reflected
+/// without a refresh (docs/GPU-HARDWARE.md 9).
 pub fn init() {
     unsafe {
         *core::ptr::addr_of_mut!(DRBG) = rng::derive_cell_drbg();
@@ -31,13 +35,19 @@ pub fn init() {
     }
 }
 
+/// Engine count: the CPU plus every recognised GPU. For the test kernels.
+pub fn engine_count() -> usize {
+    1 + crate::hw::inventory().ngpu
+}
+
 fn events() -> &'static mut EventStream {
     unsafe { &mut *core::ptr::addr_of_mut!(EVENTS) }
 }
 
 /// Handle a shell/resource syscall. Returns Some(ret) if this module owns
 /// the number, None otherwise (the caller faults the cell).
-pub fn handle(nr: u64, arg: u64) -> Option<u64> {
+pub fn handle(nr: u64, args: &[u64; 6]) -> Option<u64> {
+    let arg = args[0];
     match nr {
         SYS_READLINE => Some(read_line(arg)),
         SYS_WRITE => Some(write(arg)),
@@ -70,6 +80,50 @@ pub fn handle(nr: u64, arg: u64) -> Option<u64> {
             let lease = Lease::acquire(1 << 40, 0);
             Some(lease.token)
         }
+        SYS_ENGINE_INFO => {
+            // Engine introspection (docs/LIBRHEO.md Phase C, object 4;
+            // docs/GPU-HARDWARE.md 9): report engine `args[1]` - index 0 is
+            // the CPU engine, then every PCIe-recognised GPU straight from
+            // the hardware inventory - and return the engine count so a
+            // cell can enumerate. A GPU's measured cost is the aperture
+            // transport measurement `gpu_attach_measure` recorded (0 =
+            // unmeasured); its preemption is the declared accelerator
+            // contract (op boundary).
+            let idx = args[1] as usize;
+            let inv = crate::hw::inventory();
+            let n = 1 + inv.ngpu;
+            let info = if idx == 0 {
+                let engine = unsafe { &*core::ptr::addr_of!(ENGINE) };
+                Some(EngineInfo {
+                    kind: 0,
+                    measured_cost_ticks: engine.measured_cost_ticks(),
+                    preemption: match engine.preemption {
+                        crate::engine::Preemption::Instruction => 0,
+                        crate::engine::Preemption::OpBoundary => 1,
+                    },
+                    vendor: 0,
+                })
+            } else if idx < n {
+                let g = &inv.gpus[idx - 1];
+                Some(EngineInfo {
+                    kind: 1,
+                    measured_cost_ticks: g.measured_cost_ticks,
+                    preemption: 1,
+                    vendor: g.vendor_id as u64,
+                })
+            } else {
+                None
+            };
+            if let Some(info) = info {
+                // SAFETY: `arg` is a user VA in the running cell's active
+                // address space, sized for an `EngineInfo` (the cell passes
+                // its own slot).
+                unsafe {
+                    (arg as *mut EngineInfo).write(info);
+                }
+            }
+            Some(n as u64)
+        }
         SYS_CPUINFO => {
             print_cpuinfo();
             Some(0)
@@ -82,7 +136,74 @@ pub fn handle(nr: u64, arg: u64) -> Option<u64> {
             print_numa();
             Some(0)
         }
+        SYS_DEBUG_WRITE => Some(debug_write(arg)),
+        // POSIX file syscalls (docs/USERLAND.md M2): forwarded to the
+        // registered personality handler. The handler runs in kernel context
+        // with user-memory access enabled, so it takes raw user VAs. Returns
+        // None (faults the cell) if no personality is installed.
+        SYS_OPEN => file_ops().map(|o| (o.open)(args[0], args[1], args[2]) as u64),
+        SYS_CLOSE => file_ops().map(|o| (o.close)(args[0]) as u64),
+        SYS_READ => file_ops().map(|o| (o.read)(args[0], args[1], args[2]) as u64),
+        SYS_WRITE_FD => file_ops().map(|o| (o.write)(args[0], args[1], args[2]) as u64),
+        SYS_LSEEK => file_ops().map(|o| (o.lseek)(args[0], args[1] as i64, args[2]) as u64),
+        SYS_STAT => file_ops().map(|o| (o.stat)(args[0], args[1], args[2]) as u64),
+        SYS_FSTAT => file_ops().map(|o| (o.fstat)(args[0], args[1]) as u64),
+        SYS_GETDENTS => file_ops().map(|o| (o.getdents)(args[0], args[1], args[2], args[3]) as u64),
         _ => None,
+    }
+}
+
+/// The POSIX personality's file operations (docs/USERLAND.md M2). In the full
+/// design these live in a service cell reached over a queue pair; for M2 they
+/// are function pointers a test/service registers, keeping the kernel free of
+/// any filesystem dependency. Each runs in kernel context during the trap and
+/// takes raw user VAs (readable/writable there). A negative return is
+/// `-errno`.
+#[derive(Copy, Clone)]
+pub struct FileOps {
+    pub open: fn(path_va: u64, path_len: u64, flags: u64) -> i64,
+    pub close: fn(fd: u64) -> i64,
+    pub read: fn(fd: u64, buf_va: u64, len: u64) -> i64,
+    pub write: fn(fd: u64, buf_va: u64, len: u64) -> i64,
+    pub lseek: fn(fd: u64, off: i64, whence: u64) -> i64,
+    pub stat: fn(path_va: u64, path_len: u64, statbuf_va: u64) -> i64,
+    pub fstat: fn(fd: u64, statbuf_va: u64) -> i64,
+    pub getdents: fn(path_va: u64, path_len: u64, buf_va: u64, buf_len: u64) -> i64,
+}
+
+static mut FILE_OPS: Option<FileOps> = None;
+
+/// Install the POSIX personality handler (called once at boot by the cell
+/// that provides the filesystem view).
+pub fn set_file_ops(ops: FileOps) {
+    unsafe {
+        *core::ptr::addr_of_mut!(FILE_OPS) = Some(ops);
+    }
+}
+
+/// The installed POSIX personality handler, if any. Public so the Linux
+/// personality's fd table can forward file I/O through the same VFS
+/// (docs/LINUX-COMPAT.md L2).
+pub fn file_ops() -> Option<&'static FileOps> {
+    // SAFETY: set once at boot, read-only afterwards.
+    unsafe { (*core::ptr::addr_of!(FILE_OPS)).as_ref() }
+}
+
+/// Copy `len` bytes from a loaded program's buffer to the console
+/// (docs/USERLAND.md M1). The kernel runs in the cell's address space during
+/// the trap with supervisor access to user pages enabled, so the user VAs are
+/// directly readable. `len` is capped so a bad request cannot run away.
+fn debug_write(req_va: u64) -> u64 {
+    // SAFETY: the program passes the VA of a `DebugWrite` in its own mapped
+    // pages; we read the descriptor, then `len` bytes from `ptr`.
+    unsafe {
+        let req = (req_va as *const DebugWrite).read();
+        let len = (req.len as usize).min(4096);
+        let src = req.ptr as *const u8;
+        for i in 0..len {
+            crate::arch::serial_write_byte(src.add(i).read());
+        }
+        len as u64
     }
 }
 
@@ -243,6 +364,64 @@ fn write(io_va: u64) -> u64 {
         }
     }
     0
+}
+
+/// Run a **userspace-built** dependency graph on the CPU engine (docs/LIBRHEO.md
+/// Phase C, docs/ARCHITECTURE.md 3 objects 4/6). `nodes_va` points at `count`
+/// [`GraphNode`]s in the submitting cell's own memory (its address space is
+/// active during the drain, so the VAs are directly readable); the graph is
+/// validated (topological edges, node cap), executed, and each node's `u64`
+/// result written back to `results_va`. Returns `(status, count)` on success or
+/// a `(STATUS_*, 0)` failure - the queue completion the reactor delivers.
+///
+/// # Safety
+/// `nodes_va`/`results_va` are trusted to be the calling cell's mapped buffers;
+/// the caller (`queue::run_opcode`) invokes this only during that cell's trap.
+pub fn graph_submit(nodes_va: u64, count: u32, results_va: u64) -> (u32, u32) {
+    use crate::queue::{STATUS_BAD_OPCODE, STATUS_DENIED, STATUS_OK};
+    let count = count as usize;
+    if count == 0 || count > crate::graph::MAX_NODES {
+        return (STATUS_BAD_OPCODE, 0);
+    }
+    let mut g = Graph::new();
+    for i in 0..count {
+        // SAFETY: `nodes_va` is the cell's mapped buffer; each 32-byte node is
+        // read unaligned to tolerate any buffer alignment.
+        let node = unsafe { (nodes_va as *const GraphNode).add(i).read_unaligned() };
+        let op = match node.op {
+            0 => Op::Const(node.a),
+            1 => Op::Add,
+            2 => Op::Mul,
+            3 => Op::Select,
+            _ => return (STATUS_BAD_OPCODE, 0),
+        };
+        let a = wire_input(node.a_is_node, node.a);
+        let b = wire_input(node.b_is_node, node.b);
+        if g.push(op, a, b).is_err() {
+            // BadEdge (a forward reference) or Full - a malformed graph.
+            return (STATUS_DENIED, 0);
+        }
+    }
+    let mut results = [0u64; crate::graph::MAX_NODES];
+    let engine = unsafe { &*core::ptr::addr_of!(ENGINE) };
+    g.run(engine, &mut results);
+    for (i, &r) in results.iter().take(count).enumerate() {
+        // SAFETY: `results_va` is the cell's mapped buffer, `count` u64s wide.
+        unsafe {
+            (results_va as *mut u64).add(i).write_unaligned(r);
+        }
+    }
+    (STATUS_OK, count as u32)
+}
+
+/// Decode one graph-node input: an immediate value or a reference to an earlier
+/// node's result (validated as topological by `Graph::push`).
+fn wire_input(is_node: u32, val: u64) -> Input {
+    if is_node != 0 {
+        Input::Node(val as usize)
+    } else {
+        Input::Imm(val)
+    }
 }
 
 /// A small dependency graph run on the compute engine, modelling
