@@ -38,7 +38,7 @@ requires - the kernel owns the queue plumbing, not the protocols.
   grants (section 1), header/payload split (section 1), a device RX interrupt, and
   everything in sections 4-7 (eBPF dataplane, DDoS staging, DPU offload).
 
-## 0a. What is built (rheo-net Phase N1a/N1b/N1c): the L2/L3/L4 core + caching DNS
+## 0a. What is built (rheo-net Phase N1a/N1b/N1c/N1e): the L2/L3/L4 core + caching DNS + traceroute
 
 The **greenfield network stack** begins here as **portable userspace** - a new
 `net/` workspace crate (`no_std` + alloc, no per-ISA code) built for the three
@@ -77,9 +77,22 @@ pointer-loop safety, and hosts/blocklist/cache resolutions that each send **zero
 network queries (a query counter is the evidence), plus a **bonus live** resolve of
 `example.com` over SLIRP's DNS (`10.0.2.3`) that asserts only structure and
 tolerates a timeout where there is no outbound DNS - exiting `0x42`. Negative
-caching is deferred (documented). Still deferred: the local/AF_UNIX zero-copy path
-and the Linux AF_UNIX personality; ICMPv6 + full traceroute are N7
-(docs/NETSTACK.md 5-8).
+caching is deferred (documented).
+
+**Phase N1e** makes TTL (IPv4) and Hop Limit (IPv6) **first-class** (default 64,
+built + parsed), adds the forwarding-plane `ip::decrement_ttl`/`decrement_hop_limit`
+primitives (the router/firewall path - decrement, recompute the IPv4 checksum,
+drop + signal Time Exceeded at zero), ICMP **Time Exceeded** (v4 type 11 +
+the v6 type 3 codec), and a real **traceroute** state machine (`net::trace`,
+ICMP-echo probes correlated by sequence number). Proof: the `nettrace` test kernel
+(all three ISAs) asserts, **network-free**, the TTL/hop-limit round-trips, the
+decrement primitive (checksum oracle `0xB961`, drop signal at TTL 0/1), the Time
+Exceeded oracles (`0xF4FF` v4, `0x1936` v6), and the **traceroute state machine
+fed synthetic responses** reconstructing an exact 4-hop path (multi-hop discovery
+without real routers), plus a **bonus live** 1-hop trace to the gateway `10.0.2.2`
+that tolerates a timeout - exiting `0x42`. Still deferred: the local/AF_UNIX
+zero-copy path and the Linux AF_UNIX personality; the *live* ICMPv6 path + IGMP/MLD
+are N7 (docs/NETSTACK.md 5-9).
 
 ## 1. NIC queues are the primitive
 

@@ -1,10 +1,10 @@
 # rheo-net: the greenfield network stack
 
 **Status:** Building. Phase **N1a** (the L2/L3 core), **N1b's L4** (UDP + ICMP),
-and **N1c's caching DNS client** are done; the full roadmap (N1-N8) is below.
-This document is the architecture + roadmap + crypto posture;
-`docs/NETWORKING.md` holds the doctrine (the kernel owns queue plumbing + grant
-checks + steering, and no network stack).
+**N1c's caching DNS client**, and **N1e's TTL / hop-limit + traceroute** are done;
+the full roadmap (N1-N8) is below. This document is the architecture + roadmap +
+crypto posture; `docs/NETWORKING.md` holds the doctrine (the kernel owns queue
+plumbing + grant checks + steering, and no network stack).
 
 ## 0. Position
 
@@ -135,8 +135,14 @@ kernels stay green.
     (A/AAAA/CNAME + name-compression pointers, loop-bounded), an async caching
     `Resolver` over `udp`, an LRU + TTL `Cache`, a `Blocklist` (a from-scratch
     hash set + wildcard suffixes), and configurable resolvers + a static hosts
-    table (§8). Still open in N1: `local`/AF_UNIX (the zero-copy local path + the
-    Linux AF_UNIX personality) - the next slice.
+    table (§8).
+  - **N1e (done): first-class TTL / hop limit + traceroute.** `ip` gains the
+    default 64 (TTL + IPv6 hop limit) and the forwarding-plane
+    `decrement_ttl`/`decrement_hop_limit` primitives (the router/firewall path);
+    `icmp` gains ICMP Time Exceeded (v4 type 11 + the v6 type 3 codec); `trace` is
+    the TTL-increment traceroute state machine (§9). Still open in N1:
+    `local`/AF_UNIX (the zero-copy local path + the Linux AF_UNIX personality) -
+    the next slice.
 - **N2 - TCP + congestion control + the two transports** (native sharded + the
   smoltcp cell); proof: a TCP echo / HTTP GET to SLIRP.
 - **N3 - TLS 1.3 + HTTPS.** Crypto crates wired; keys-as-capabilities.
@@ -144,7 +150,9 @@ kernels stay green.
 - **N5 - App protocols.** HTTP/2, gRPC, Arrow Flight (warehouse), Kafka.
 - **N6 - Perf substrate.** NIC RX IRQ, zero-copy DMA + offload/multiqueue/RSS,
   timer wheel; the socket/steering kernel object if earned; DDoS-isolation proof.
-- **N7 - WireGuard + IPsec + QUIC/HTTP3 + multicast/IGMP + traceroute/ICMP polish.**
+- **N7 - WireGuard + IPsec + QUIC/HTTP3 + multicast/IGMP + ICMP polish** (core
+  traceroute + TTL/hop-limit landed early in **N1e**, §9; N7 keeps IGMP/MLD, PMTU,
+  and the live ICMPv6 path).
 - **N8 - Inline NIC TLS offload** (the keys-as-capabilities payoff): program
   session keys into a NIC TX/RX queue as a capability, encrypted zero-copy fetch
   removes Kafka's encryption cliff. Hardware-only, so the QEMU proof is the
@@ -248,7 +256,7 @@ recomputes the checksum over each received datagram and drops any that fail.
 `wire::frame_ipv4` takes the IPv4 TTL, and both endpoints expose `set_ttl`. That
 is the seam a later traceroute uses (send probes with an increasing TTL, read the
 ICMP **time-exceeded** each router returns). N1b ships the hook, not the loop -
-the TTL-increment traceroute + time-exceeded parsing is **N7**.
+the TTL-increment traceroute + time-exceeded parsing is **N1e** (§9, done).
 
 ### The proof (`netl4` test kernel, all 3 ISAs)
 
@@ -280,10 +288,12 @@ depend on real outbound DNS.
 ### Deferred past N1b (explicit)
 
 `local` (the AF_UNIX-equivalent zero-copy transport + the datapath selector) and
-the Linux AF_UNIX personality (the next slice). **ICMPv6** echo and **full
-traceroute** (the TTL-increment loop + time-exceeded parsing) are deferred to N7.
-The next-hop choice today ARPs the destination directly (SLIRP proxy-ARPs
-`10.0.2.0/24`); a real routing table (gateway for off-link) is a later refinement.
+the Linux AF_UNIX personality (the next slice). **Full traceroute** (the
+TTL-increment loop + time-exceeded parsing) landed in **N1e** (§9). **Live
+ICMPv6** stays deferred (the v6 Time Exceeded codec is done + unit-proven in N1e,
+but SLIRP cannot generate v6 errors). The next-hop choice today ARPs the
+destination directly (SLIRP proxy-ARPs `10.0.2.0/24`); a real routing table
+(gateway for off-link) is a later refinement.
 
 ## 8. Phase N1c (done): the caching DNS client
 
@@ -368,3 +378,108 @@ NXDOMAIN currently re-queries; the seam is `Config` + `Cache`. The codec + resol
 support **AAAA**; only the *live* proof is A (SLIRP proxies to the host resolver, so
 a deterministic AAAA answer is not guaranteed). `local`/AF_UNIX (the zero-copy local
 path + the Linux AF_UNIX personality) is the next N1 slice.
+
+## 9. Phase N1e (done): first-class TTL / hop limit + traceroute
+
+N1b shipped only a settable-TTL *hook* and deferred the rest. N1e makes TTL
+(IPv4) and Hop Limit (IPv6) **first-class and correct**, adds ICMP/ICMPv6 Time
+Exceeded, a real traceroute state machine, and the forwarding-plane decrement
+primitive (the router/firewall path).
+
+### First-class TTL / hop limit (`net::ip`)
+
+- `ip::DEFAULT_TTL = 64` and `ip::DEFAULT_HOP_LIMIT = 64` (RFC 1122 §3.2.1.7 for
+  v4, RFC 8200 §3 for v6). The IPv4 TTL and the IPv6 hop limit are the **same
+  concept** - the number of forwarding hops a datagram may still cross, one byte
+  each - so rheo-net treats them symmetrically. Both fields are built **and**
+  parsed and round-trip (the N1e proof asserts the default and an explicit value
+  for each).
+- **The forwarding-plane decrement primitive** (the router/firewall forward
+  path). `ip::decrement_ttl(hdr: &mut [u8]) -> Option<()>` operates on an on-wire
+  IPv4 header: a node **forwarding** a datagram runs it per hop. It returns `None`
+  when the TTL is already `0` or `1` (the datagram **expires here** - the caller
+  drops it and emits a Time Exceeded, because forwarding a TTL-1 datagram would
+  make it 0, which RFC 791 forbids), and on a real forward it decrements the TTL
+  and **recomputes the IPv4 header checksum**. `ip::decrement_hop_limit` mirrors
+  it for IPv6 (no checksum to recompute - RFC 8200 dropped it).
+
+**Checksum on decrement (correctness-critical).** The decrement recomputes the
+header checksum by a **full recompute** via the N1a `checksum16` scalar oracle
+(zero the field, sum the header, store) - not the RFC-1624 incremental update.
+Full recompute is chosen for clarity and because it reuses the one audited
+checksum routine (no second code path to keep correct). It is pinned by a
+**known-good oracle**: the netcore RFC example header (TTL `0x40`, checksum
+`0xB861`) after `decrement_ttl` (TTL `0x3F`) checksums to `0xB961`, and the
+resulting header re-verifies (`verify_checksum` folds to zero) - both asserted.
+
+### ICMP Time Exceeded (`net::icmp`)
+
+- **ICMPv4 Time Exceeded (type 11, code 0)**: `build_time_exceeded` / `parse_error`
+  build and parse the message with the standard payload - the offending IP header
+  **plus its first 8 bytes** (RFC 792). Those 8 bytes are what a traceroute
+  correlates on. Pinned by a known-good oracle: a fixed Time Exceeded checksums to
+  `0xF4FF`, self-verifies, and round-trips its embedded original.
+- **ICMPv6 Time Exceeded (type 3, code 0)**: `build_time_exceeded_v6` /
+  `verify_checksum_v6` with the IPv6 **pseudo-header** checksum (via the existing
+  `Checksum` accumulator, next-header 58). Pinned to `0x1936`. The v6 **codec** is
+  done + unit-proven; the *live* v6 path is deferred (SLIRP cannot generate v6
+  ICMP errors - see the proof split below).
+
+### The traceroute state machine (`net::trace`)
+
+**Probe method (documented choice):** an **ICMP echo request whose sequence
+number equals the TTL** (the scheme Windows `tracert` uses). RFC 792 guarantees a
+Time Exceeded echoes back the offending IP header + its first 8 bytes; for an
+echo probe those 8 bytes are the echo header, so the **sequence number (= the hop)
+survives inside the router's reply** - a correlation key with no extra state.
+(Classic Unix traceroute uses UDP to a per-hop port; the echo scheme keeps send +
+correlate in one module and reuses `icmp::IcmpEndpoint`.)
+
+`trace::Tracer` is a **pure state machine with no I/O**: it hands out the next
+probe TTL (from 1 upward, bounded at `max_hops`, default 30), consumes
+already-correlated `Response`s (`trace::classify` turns a received ICMP message
+into a `TimeExceeded { seq, from }` or `Reply { seq, from }`), records each hop,
+and terminates on the destination's Echo Reply. A per-hop timeout is recorded as a
+silent hop (`0.0.0.0`) so one unresponsive router does not stall the trace.
+`Tracer::run` is the thin live driver over an `IcmpEndpoint` (set TTL, send probe,
+`recv_trace`, record), retried per `attempts`.
+
+### The proof (`nettrace` test kernel, all 3 ISAs)
+
+A `nettrace-demo` cell (loaded like `netdns`) over QEMU SLIRP + virtio-net. The
+**deterministic core is the proof** (network-free):
+
+1. **TTL / hop-limit round-trip** - an IPv4 header round-trips its TTL (default 64
+   + explicit) and an IPv6 header its hop limit (default 64 + explicit).
+2. **The decrement primitive** - `decrement_ttl` from `N -> N-1` recomputes a
+   valid checksum matching the `0xB961` oracle, and from TTL `1` (and `0`) returns
+   the drop signal (`None`); `decrement_hop_limit` mirrors it for v6.
+3. **Time Exceeded oracles** - the ICMPv4 Time Exceeded checksums to `0xF4FF`,
+   self-verifies, and round-trips its embedded original; the ICMPv6 codec
+   checksums to `0x1936` and self-verifies.
+4. **The traceroute state machine fed synthetic responses** - a crafted sequence
+   of Time Exceededs (hops 1..3, distinct router IPs) then a destination Echo
+   Reply is put through the real `build_time_exceeded` -> `classify` ->
+   `Tracer::record` path, and the tracer reconstructs the **exact ordered 4-hop
+   list** (3 routers + destination) and terminates. This proves **multi-hop
+   discovery without real intermediate routers**.
+
+Then a **bonus live** 1-hop trace to the gateway `10.0.2.2` over SLIRP. **SLIRP
+has no intermediate hops** - it is the destination at hop 1 and answers the echo
+directly - so the demo asserts only that (a reached hop is `10.0.2.2` at TTL 1)
+and **tolerates a clean timeout** with a printed reason, never faking a pass.
+Multi-hop discovery is proven by the parser + state machine (step 4), **not** by
+the emulator: SLIRP cannot generate intermediate Time Exceededs, and it cannot
+generate ICMPv6 errors at all (hence the live v6 deferral). The cell exits `0x42`
+only if steps 1-4 pass, on **all three ISAs**. No kernel object / verb /
+dependency was added; no `cfg(target_arch)`.
+
+### Deferred past N1e (explicit)
+
+The **live ICMPv6** traceroute (the v6 codec is done + unit-proven; a live proof
+needs a v6 backend SLIRP does not provide). A full IPv6 **send** framing path
+(`wire` frames IPv4 today; the v6 hop-limit field is first-class and round-trips,
+but a v6 `Ipv6Framing` + v6 endpoints ride in with the live v6 path). PMTU
+discovery and IGMP/MLD multicast stay in **N7**. The forwarding decrement is the
+primitive a router/firewall runs; wiring it into an actual multi-cell forwarding
+service is a later phase (the mechanism is the N1e deliverable).

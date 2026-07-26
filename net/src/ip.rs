@@ -128,6 +128,59 @@ pub const IPV4_HEADER_LEN: usize = 20;
 /// The fixed IPv6 header length in bytes.
 pub const IPV6_HEADER_LEN: usize = 40;
 
+/// The default IPv4 **TTL** (RFC 1122 §3.2.1.7 recommends 64) for a
+/// locally-originated datagram. The IPv4 TTL and the IPv6 hop limit are the same
+/// concept - the number of forwarding hops a datagram may still cross, one byte
+/// each - so rheo-net treats them symmetrically (this constant is the default for
+/// both; the endpoints stamp it and traceroute overrides it per probe).
+pub const DEFAULT_TTL: u8 = 64;
+/// The default IPv6 **hop limit** - the v6 equivalent of [`DEFAULT_TTL`], same
+/// value and same meaning (RFC 8200 §3, the "Hop Limit" field).
+pub const DEFAULT_HOP_LIMIT: u8 = DEFAULT_TTL;
+
+/// The **forwarding-plane IPv4 TTL decrement** - the primitive a rheo-net node
+/// acting as a router or firewall runs on the forward path (docs/NETSTACK.md).
+/// `hdr` is an on-wire IPv4 header (the checksum field included, as received).
+///
+/// Because a datagram whose TTL reaches 0 must never be forwarded (RFC 791), this
+/// returns `None` when the TTL is already `0` or `1` - the datagram **expires on
+/// this hop**, so the caller drops it and emits an ICMP Time Exceeded
+/// ([`crate::icmp::build_time_exceeded`]). On a real forward it decrements the TTL
+/// and **recomputes the header checksum** (a full recompute via [`checksum16`],
+/// the scalar oracle - so the forwarded header stays valid) and returns `Some`.
+pub fn decrement_ttl(hdr: &mut [u8]) -> Option<()> {
+    if hdr.len() < IPV4_HEADER_LEN {
+        return None;
+    }
+    // TTL 0 or 1 expires here: forwarding a TTL-1 datagram would make it 0.
+    if hdr[8] <= 1 {
+        return None;
+    }
+    hdr[8] -= 1;
+    // Zero the checksum field, recompute over the header, store it back.
+    hdr[10] = 0;
+    hdr[11] = 0;
+    let ck = checksum16(&hdr[..IPV4_HEADER_LEN]);
+    hdr[10..12].copy_from_slice(&ck.to_be_bytes());
+    Some(())
+}
+
+/// The **forwarding-plane IPv6 hop-limit decrement** - the v6 equivalent of
+/// [`decrement_ttl`]. IPv6 has no header checksum (RFC 8200), so this only
+/// decrements the hop-limit byte. Returns `None` when the hop limit is already
+/// `0` or `1` (the packet expires - the caller drops it and emits an ICMPv6 Time
+/// Exceeded, [`crate::icmp::build_time_exceeded_v6`]).
+pub fn decrement_hop_limit(hdr: &mut [u8]) -> Option<()> {
+    if hdr.len() < IPV6_HEADER_LEN {
+        return None;
+    }
+    if hdr[7] <= 1 {
+        return None;
+    }
+    hdr[7] -= 1;
+    Some(())
+}
+
 /// IP protocol numbers N1a names (UDP/ICMP land in N1b).
 pub mod proto {
     pub const ICMP: u8 = 1;

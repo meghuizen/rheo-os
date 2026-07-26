@@ -57,3 +57,11 @@ path = "src/bin/netl4-demo.rs"
 [[bin]]
 name = "netdns-demo"
 path = "src/bin/netdns-demo.rs"
+
+# The N1e proof cell: first-class TTL / IPv6 hop limit + the forwarding-plane
+# decrement primitive + ICMP Time Exceeded (v4 + v6 codec) + the traceroute state
+# machine fed synthetic responses (multi-hop discovery without real routers), plus
+# a bonus live 1-hop trace to the gateway. Loaded by the `nettrace` test kernel.
+[[bin]]
+name = "nettrace-demo"
+path = "src/bin/nettrace-demo.rs"

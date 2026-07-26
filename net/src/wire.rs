@@ -10,7 +10,10 @@ use crate::ip::{self, Ipv4Addr, Ipv4Header};
 use librheo::net;
 
 /// The default IPv4 TTL for a locally-originated packet (RFC 1122 suggests 64).
-pub const DEFAULT_TTL: u8 = 64;
+/// The value is first-class in [`crate::ip`] (shared with the IPv6 hop limit); it
+/// is re-exported here so the L4 endpoints that frame through `wire` keep using
+/// the same name.
+pub const DEFAULT_TTL: u8 = ip::DEFAULT_TTL;
 
 /// The largest frame `wire` builds or receives (standard Ethernet MTU + headers;
 /// jumbo frames are a later phase).

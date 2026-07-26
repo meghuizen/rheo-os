@@ -37,9 +37,20 @@
 //!   (a from-scratch hash set + wildcard suffixes), and configurable resolvers +
 //!   a static hosts table ([`dns::HostsTable`]).
 //!
+//! **Phase N1e** makes TTL / hop limit first-class and adds traceroute:
+//! - [`ip`]: `DEFAULT_TTL`/`DEFAULT_HOP_LIMIT` (64) and the forwarding-plane
+//!   [`ip::decrement_ttl`]/[`ip::decrement_hop_limit`] primitives (the
+//!   router/firewall forward path - decrement, recompute the IPv4 checksum, drop
+//!   + signal Time Exceeded at zero).
+//! - [`icmp`]: ICMPv4 **Time Exceeded** (type 11) and ICMPv6 Time Exceeded (type
+//!   3) build/parse, and `IcmpEndpoint::recv_trace`.
+//! - [`trace`]: the TTL-increment traceroute state machine (deterministic core +
+//!   a thin live driver), ICMP-echo probes correlated by sequence number.
+//!
 //! Still deferred (per docs/NETSTACK.md): `local` (the AF_UNIX-equivalent
-//! zero-copy transport), the Linux AF_UNIX personality, negative caching, ICMPv6,
-//! and full traceroute.
+//! zero-copy transport), the Linux AF_UNIX personality, negative caching, and the
+//! *live* ICMPv6 path (the v6 codec is unit-proven; SLIRP cannot generate v6
+//! errors).
 
 #![no_std]
 
@@ -50,5 +61,6 @@ pub mod dns;
 pub mod eth;
 pub mod icmp;
 pub mod ip;
+pub mod trace;
 pub mod udp;
 pub mod wire;

@@ -172,6 +172,14 @@ path = "src/netl4.rs"
 name = "netdns"
 path = "src/netdns.rs"
 
+# rheo-net Phase N1e (docs/NETSTACK.md): first-class TTL / IPv6 hop limit + the
+# forwarding-plane decrement primitive + ICMP Time Exceeded (v4 + v6 codec) + the
+# traceroute state machine fed synthetic responses (multi-hop discovery without
+# real routers), plus a bonus live 1-hop trace to the gateway 10.0.2.2.
+[[bin]]
+name = "nettrace"
+path = "src/nettrace.rs"
+
 [[bin]]
 name = "smp"
 path = "src/smp.rs"
