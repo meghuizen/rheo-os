@@ -22,6 +22,7 @@ extern "C" fn kernel_main() -> ! {
     test_independence();
     test_reseed();
     test_next_u64_matches_fill();
+    test_erase_on_read();
     test_statistical_sanity();
     test_pool_gate();
     test_health_tests();
@@ -112,6 +113,27 @@ fn test_next_u64_matches_fill() {
         );
     }
     println!("rng: next_u64/fill_bytes consistency OK");
+}
+
+/// Fast-key-erasure rule 2 (Bernstein 2017.07.23): a byte handed to a
+/// caller is immediately wiped from the DRBG state, so capturing the state
+/// later reveals nothing about past output. Draw odd sizes, spanning a
+/// refill, and check the spent region is erased after every draw.
+fn test_erase_on_read() {
+    let mut d = Drbg::from_key([0x33u8; 32]);
+    let mut out = [0u8; 300];
+    for take in [1usize, 5, 32, 100, 300] {
+        d.fill_bytes(&mut out[..take]);
+        assert!(
+            d.spent_bytes_erased(),
+            "delivered bytes survive in DRBG state after a {take}-byte draw"
+        );
+        assert!(
+            out[..take].iter().any(|&b| b != 0) || take == 1,
+            "output unexpectedly all zero"
+        );
+    }
+    println!("rng: erase-on-read (delivered bytes wiped from state) OK");
 }
 
 /// Output is close to unbiased: over a large buffer the set-bit fraction is

@@ -36,27 +36,36 @@ real-hardware question about the syscall boundary.
 
 ## Measured results
 
-Host: Intel Xeon @ 2.10 GHz, Linux 6.18.5. Representative of three runs
-(cycle counts vary a few percent; the ratios are stable).
+Host: Intel Xeon @ 2.10 GHz (shared cloud container), Linux 6.18.5.
+Representative of three runs (cycle counts vary a few percent; the
+ratios are stable). The DRBG here includes **erase-on-read** - every
+delivered byte is volatile-wiped from the state as it is copied out
+(Bernstein's fast-key-erasure rule, cr.yp.to 2017.07.23) - so the
+measured cost is the shipped semantics, not a copy-only variant.
 
 **32-byte draw (a key- or nonce-sized request) - cycles per call:**
 
 | path | cycles/call | vs rheo-os |
 |------|------------:|-----------:|
-| rheo-os DRBG (library call) | ~110 | 1.0x |
-| Linux `getrandom(2)` syscall | ~525 | 4.8x slower |
-| Linux `getentropy(3)` (glibc) | ~530 | 4.8x slower |
+| rheo-os DRBG (library call, erase-on-read) | ~250 | 1.0x |
+| Linux `getrandom(2)` syscall | ~1290 | 5.1x slower |
+| Linux `getentropy(3)` (glibc) | ~1330 | 5.3x slower |
 
 **Bulk throughput (MB/s, higher is better):**
 
 | path | MB/s |
 |------|-----:|
-| rheo-os DRBG (library call) | ~610 |
-| Linux `getrandom(3)` (glibc) | ~473 |
-| Linux `/dev/urandom` | ~472 |
+| rheo-os DRBG (library call, erase-on-read) | ~395 |
+| Linux `getrandom(3)` (glibc) | ~368 |
+| Linux `/dev/urandom` | ~365 |
 
-rheo-os is ~4.8x faster on the small draws that dominate real use (every
-TLS nonce, ECDSA nonce, UUID, cookie) and ~1.3x faster on bulk.
+rheo-os is ~5x faster on the small draws that dominate real use (every
+TLS nonce, ECDSA nonce, UUID, cookie) and modestly faster on bulk.
+(Absolute numbers moved with the measurement host since the previous
+revision; the comparison is always same-run, same-machine. The
+erase-on-read wipe costs ~1/8 store per byte because it is issued
+u64-wide - a per-byte volatile loop measured ~2x worse on bulk and was
+rejected.)
 
 ## Honest caveats
 
@@ -75,8 +84,9 @@ TLS nonce, ECDSA nonce, UUID, cookie) and ~1.3x faster on bulk.
   reseed bookkeeping that a per-cell DRBG does not.
 - These are host numbers for the comparison only. The in-kernel RNG path
   length on all three ISAs is measured separately and deterministically by
-  `cargo xtask bench` (the `rng_*` lines): ~23-25 instructions per byte for
-  the scalar ChaCha20 DRBG, consistent across x86-64/ARM64/RISC-V.
+  `cargo xtask bench` (the `rng_*` lines): ~24-27 instructions per byte for
+  the scalar ChaCha20 DRBG including the erase-on-read wipe, consistent
+  across x86-64/ARM64/RISC-V.
 
 ## The entropy-source companion (entropy_bench.rs)
 

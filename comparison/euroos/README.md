@@ -236,7 +236,7 @@ here; EuroOS `kernel/src/entropy.rs` + `crates/euroentropy` (read
 | Forward secrecy | Explicit fast key erasure per refill + volatile wipe of the old key | SP 800-90A state update gives backtracking resistance; no explicit zeroization |
 | Reseeding | `reseed_root()` folds fresh hwrng entropy through health tests; restore-always-reseeds is a design rule | `reseed()` on new noise arrival; counter tracked, no interval enforced |
 | Verification | ChaCha20 core checked against the RFC 8439 vector; `rng` test kernel on 3 ISAs; host benchmark vs Linux getrandom (comparison/rng/) | HMAC vs RFC 4231, NIST ACVP known-answer tests, host tests incl. determinism and blocking-gate checks |
-| Performance | ~110 cycles per 32-byte draw, ~610 MB/s scalar (measured, 4.8x faster than Linux `getrandom` on small draws) | Unmeasured; HMAC-DRBG costs several SHA-256 compressions per 32-byte block - the cost profile Linux left behind when its CRNG moved to ChaCha20 |
+| Performance | ~250 cycles per 32-byte draw incl. erase-on-read, ~395 MB/s scalar (measured, ~5x faster than Linux `getrandom` on small draws) | Unmeasured; HMAC-DRBG costs several SHA-256 compressions per 32-byte block - the cost profile Linux left behind when its CRNG moved to ChaCha20 |
 
 What EuroOS could take: the ChaCha20 fast-key-erasure output stage
 (keep HMAC-DRBG for conditioning if the NIST paper trail matters -

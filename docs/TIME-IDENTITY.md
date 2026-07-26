@@ -24,7 +24,7 @@ Where a source is absent its slot is skipped; where all credited sources are
 absent the pool refuses to seed and consumers get an error, never weak bytes
 (the attestation stance of BOOT.md 4 enforced locally). See the `rng` test
 kernel, the `entropy_*`/`rng_*` lines of `cargo xtask bench`, and the host
-comparison in `comparison/rng/` (~4.8x faster than Linux `getrandom` on
+comparison in `comparison/rng/` (~5x faster than Linux `getrandom` on
 key/nonce-sized draws; the AVX2 multi-block path there measures the SIMD
 headroom the soft-float kernel targets cannot use yet). The "library call,
 not a syscall" fast path is proven at the primitive level - the host

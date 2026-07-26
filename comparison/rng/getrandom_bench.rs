@@ -50,7 +50,11 @@ impl Drbg {
         self.key.copy_from_slice(&ks[..32]);
         self.buf.copy_from_slice(&ks[32..32 + OUT]);
         self.pos = 0;
+        wipe(&mut ks);
     }
+    // Mirrors the kernel exactly, including the erase-on-read wipe of
+    // delivered bytes (Bernstein's fast-key-erasure rule) - the measured
+    // cost is the shipped cost, not an optimistic copy-only variant.
     fn fill_bytes(&mut self, dst: &mut [u8]) {
         let mut i = 0;
         while i < dst.len() {
@@ -59,8 +63,32 @@ impl Drbg {
             }
             let n = core::cmp::min(dst.len() - i, OUT - self.pos);
             dst[i..i + n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+            wipe(&mut self.buf[self.pos..self.pos + n]);
             self.pos += n;
             i += n;
+        }
+    }
+}
+
+// The kernel's volatile word-wide wipe (kernel/src/rng/mod.rs::wipe).
+fn wipe(bytes: &mut [u8]) {
+    let mut p = bytes.as_mut_ptr();
+    let mut n = bytes.len();
+    unsafe {
+        while n > 0 && (p as usize) & 7 != 0 {
+            core::ptr::write_volatile(p, 0);
+            p = p.add(1);
+            n -= 1;
+        }
+        while n >= 8 {
+            core::ptr::write_volatile(p as *mut u64, 0);
+            p = p.add(8);
+            n -= 8;
+        }
+        while n > 0 {
+            core::ptr::write_volatile(p, 0);
+            p = p.add(1);
+            n -= 1;
         }
     }
 }

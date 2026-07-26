@@ -46,7 +46,24 @@ const KS_BYTES: usize = KS_BLOCKS * 64;
 /// applied to the root).
 const ROOT_RESEED_INTERVAL: u64 = 512;
 
-/// A ChaCha20 deterministic random bit generator with fast key erasure.
+/// A ChaCha20 deterministic random bit generator with fast key erasure,
+/// per Bernstein's construction (cr.yp.to blog, 2017.07.23) - the same
+/// flow Linux's per-CPU CRNG adopted. The two rules that make it
+/// forward-secure against later state capture:
+///
+/// 1. **The key is overwritten first**: every refill re-keys from the
+///    leading keystream bytes, so the key that produced past output never
+///    survives the refill that used it.
+/// 2. **Delivered bytes are erased on the way out**: `fill_bytes` wipes
+///    each output byte from the buffer as it is copied, so the state only
+///    ever holds *future* output. Capturing the DRBG reveals nothing about
+///    bytes already handed to a caller.
+///
+/// Honest limit: `Drbg` is `Copy`, and Rust moves/copies can leave stale
+/// bitwise copies on the stack that these wipes cannot reach; the wipes
+/// cover the long-lived state, which is what a later compromise reads.
+/// The 256-byte batch keeps per-cell state small (djb's example batches
+/// 736 bytes; the batch size only trades throughput, not security).
 #[derive(Copy, Clone)]
 pub struct Drbg {
     key: [u8; 32],
@@ -108,13 +125,14 @@ impl Drbg {
         self.key.copy_from_slice(&ks[..32]);
         self.buf.copy_from_slice(&ks[32..32 + OUT]);
         self.pos = 0;
-        // Wipe the local keystream copy of the new key.
-        for b in ks[..32].iter_mut() {
-            unsafe { core::ptr::write_volatile(b, 0) };
-        }
+        // Wipe the whole local keystream copy (it holds the new key and a
+        // duplicate of the buffer).
+        wipe(&mut ks);
     }
 
-    /// Fill `dst` with random bytes.
+    /// Fill `dst` with random bytes, erasing each byte from the buffer as
+    /// it is delivered (rule 2 above): the state never retains output a
+    /// caller has already received.
     pub fn fill_bytes(&mut self, dst: &mut [u8]) {
         let mut i = 0;
         while i < dst.len() {
@@ -123,6 +141,7 @@ impl Drbg {
             }
             let n = core::cmp::min(dst.len() - i, OUT - self.pos);
             dst[i..i + n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+            wipe(&mut self.buf[self.pos..self.pos + n]);
             self.pos += n;
             i += n;
         }
@@ -149,7 +168,19 @@ impl Drbg {
             self.key[i] = blk[i] ^ seed[i];
             i += 1;
         }
+        // Wipe the keystream temporary and the abandoned buffer tail
+        // (never-delivered output of the old key).
+        wipe(&mut blk);
+        wipe(&mut self.buf);
         self.pos = OUT;
+    }
+
+    /// Test hook: true if every already-delivered byte has been wiped from
+    /// the buffer. State inspection exists only so the `rng` test kernel
+    /// can prove the erase-on-read rule; never use it to read state.
+    #[doc(hidden)]
+    pub fn spent_bytes_erased(&self) -> bool {
+        self.buf[..self.pos].iter().all(|&b| b == 0)
     }
 
     /// Derive an independent child DRBG. Per-cell streams are derived, never
@@ -158,6 +189,34 @@ impl Drbg {
         let mut k = [0u8; 32];
         self.fill_bytes(&mut k);
         Drbg::from_key(k)
+    }
+}
+
+/// Volatile-wipe a byte region (key/output erasure). Volatile so the
+/// compiler cannot elide the "dead" stores; u64-wide where alignment
+/// allows so bulk erasure does not dominate the draw path (a per-byte
+/// volatile loop costs ~8x more and cannot vectorise).
+pub(crate) fn wipe(bytes: &mut [u8]) {
+    let mut p = bytes.as_mut_ptr();
+    let mut n = bytes.len();
+    // SAFETY: p..p+n is the caller's exclusive slice; u64 stores are only
+    // issued on 8-byte-aligned addresses fully inside it.
+    unsafe {
+        while n > 0 && (p as usize) & 7 != 0 {
+            core::ptr::write_volatile(p, 0);
+            p = p.add(1);
+            n -= 1;
+        }
+        while n >= 8 {
+            core::ptr::write_volatile(p as *mut u64, 0);
+            p = p.add(8);
+            n -= 8;
+        }
+        while n > 0 {
+            core::ptr::write_volatile(p, 0);
+            p = p.add(1);
+            n -= 1;
+        }
     }
 }
 

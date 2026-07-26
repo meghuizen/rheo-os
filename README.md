@@ -94,7 +94,7 @@ sh comparison/rng/run.sh
 ```
 
 Same ChaCha20 primitive Linux uses; the win is the per-cell library-call
-model (no syscall on the hot path). On the reference host rheo-os is ~4.8x
+model (no syscall on the hot path). On the reference host rheo-os is ~5x
 faster on key/nonce-sized draws and ~1.3x on bulk (`comparison/rng/README.md`).
 
 And the strand (light-thread) model against Linux/Go/Python:

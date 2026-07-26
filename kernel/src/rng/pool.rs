@@ -94,9 +94,7 @@ impl EntropyPool {
             i += 1;
         }
         // Wipe the keystream copy (it determines the new key).
-        for b in blk.iter_mut() {
-            unsafe { core::ptr::write_volatile(b, 0) };
-        }
+        super::wipe(&mut blk);
     }
 
     /// Absorb `data`, crediting `credit_bits` to the ledger and recording
@@ -150,9 +148,7 @@ impl EntropyPool {
         self.key.copy_from_slice(&blk[..32]);
         let mut out = [0u8; 32];
         out.copy_from_slice(&blk[32..]);
-        for b in blk.iter_mut() {
-            unsafe { core::ptr::write_volatile(b, 0) };
-        }
+        super::wipe(&mut blk);
         Some(out)
     }
 }
