@@ -35,6 +35,8 @@ pub mod pty;
 pub mod queue;
 pub mod rng;
 pub mod sched;
+#[cfg(feature = "smp")]
+pub mod smp;
 pub mod svc;
 pub mod time;
 pub mod user;

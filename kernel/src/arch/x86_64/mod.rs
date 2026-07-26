@@ -443,6 +443,41 @@ pub fn discover(inv: &mut crate::hw::Inventory) {
     crate::hw::acpi::parse(boot_firmware_ptr(), inv);
 }
 
+// ------------------------------------------------------------------- SMP
+// docs/SMP.md, task #27. x86-64 AP bring-up is **not implemented here** and is
+// honestly reported as blocked: an application processor starts in 16-bit
+// real mode and must be released with an INIT-SIPI-SIPI sequence pointing at a
+// trampoline placed below 1 MiB, which then switches to long mode and joins the
+// kernel. PVH boot hands us no low real-mode memory or firmware to stage that
+// trampoline, and building one cleanly is out of scope for this phase (it must
+// not destabilise the single-core boot every other kernel depends on). CPU
+// *detection* is done - ACPI MADT already counts the APs in the inventory - so
+// the honest deliverable is the count plus a documented blocker. `smp` skips x86
+// with this reason and still passes.
+
+/// This CPU's index. x86-64 does not bring up secondaries here, so only the boot
+/// processor ever asks - always CPU 0.
+#[cfg(feature = "smp")]
+pub fn cpu_index() -> usize {
+    0
+}
+
+/// No-op: no per-CPU identity register is established (single-core path).
+#[cfg(feature = "smp")]
+pub fn smp_set_this_cpu(_index: usize) {}
+
+/// The bootstrap processor's hardware id (APIC id 0 on this QEMU q35 config).
+#[cfg(feature = "smp")]
+pub fn boot_cpu_hw_id() -> u32 {
+    0
+}
+
+/// Report the x86-64 AP-bring-up blocker (docs/SMP.md). No AP is started.
+#[cfg(feature = "smp")]
+pub fn smp_start_secondary(_hw_id: u32) -> Result<(), &'static str> {
+    Err("needs a 16-bit real-mode AP trampoline (INIT-SIPI-SIPI) below 1 MiB; not implemented")
+}
+
 /// Feature names; bit i corresponds to index i in CpuReport.features.
 pub fn cpu_feature_names() -> &'static [&'static str] {
     &[

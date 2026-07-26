@@ -128,6 +128,11 @@ pub use imp::{
     uart_inject_and_wait, uart_irq_enabled, user_fs_base, user_sp, virt_to_phys,
 };
 
+/// SMP surface (docs/SMP.md, task #27), exported only under the `smp` feature so
+/// the non-SMP kernels link a byte-identical `kernel` lib.
+#[cfg(feature = "smp")]
+pub use imp::{boot_cpu_hw_id, cpu_index, smp_set_this_cpu, smp_start_secondary};
+
 /// Full arch bring-up for a kernel binary: console, exception vectors,
 /// then the frame allocator and the kernel address space (MMU on).
 pub fn init() {

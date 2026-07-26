@@ -12,6 +12,13 @@ kernel = { path = "../kernel" }
 runtime = { path = "../runtime" }
 posix = { path = "../posix" }
 
+[features]
+# The `smp` test kernel needs kernel/smp (docs/SMP.md). Kept out of the default
+# set + gated on the bin via required-features so the other 31 test kernels build
+# a byte-identical `kernel` lib (SMP off); xtask builds the smp kernel in a
+# separate cargo invocation with this feature on.
+smp = ["kernel/smp"]
+
 [[bin]]
 name = "cap-invariants"
 path = "src/cap_invariants.rs"
@@ -131,6 +138,11 @@ path = "src/librheonet.rs"
 [[bin]]
 name = "librheogpu"
 path = "src/librheogpu.rs"
+
+[[bin]]
+name = "smp"
+path = "src/smp.rs"
+required-features = ["smp"]
 
 [[bin]]
 name = "shell-smoke"

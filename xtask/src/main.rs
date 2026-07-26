@@ -21,12 +21,13 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 31] = [
+const TEST_KERNELS: [&str; 32] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
     "isolation-hw",
     "resources",
+    "smp",
     "shell-smoke",
     "hwinfo",
     "rng",
@@ -772,6 +773,55 @@ fn build(arch: Arch, release: bool) -> bool {
             "RUSTFLAGS",
             "-C relocation-model=static -C code-model=kernel",
         );
+    }
+    if !matches!(cmd.status().map(|s| s.success()), Ok(true)) {
+        return false;
+    }
+    build_smp_kernel(arch, release)
+}
+
+/// Per-arch RUSTFLAGS for the higher-half kernel build (see `build`). Applied to
+/// both the main kernel build and the separate `smp` kernel build so they use
+/// the same code/relocation model.
+fn kernel_rustflags(arch: Arch) -> Option<&'static str> {
+    match arch {
+        Arch::Aarch64 => Some("-C code-model=large"),
+        Arch::X86_64 => Some("-C relocation-model=static -C code-model=kernel"),
+        Arch::Riscv64 => None,
+    }
+}
+
+/// Build the `smp` test kernel in its own cargo invocation with `kernel/smp`
+/// enabled (docs/SMP.md, task #27). SMP is feature-gated OFF by default so the
+/// other 31 test kernels link a byte-identical `kernel` lib (adding the module
+/// perturbs LLVM codegen-unit hashing, which must not reach non-SMP kernels).
+/// The `smp` bin has `required-features = ["smp"]`, so the main `-p qemu-tests`
+/// build skips it; this builds just that bin with the feature on. Same target +
+/// RUSTFLAGS as the main kernel build.
+fn build_smp_kernel(arch: Arch, release: bool) -> bool {
+    println!(
+        "[xtask] building the smp test kernel (kernel/smp feature) for {}",
+        arch.name()
+    );
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "build",
+        "-p",
+        "qemu-tests",
+        "--bin",
+        "smp",
+        "--features",
+        "smp",
+        "--target",
+        arch.target(),
+        "-Zbuild-std=core,alloc,compiler_builtins",
+        "-Zbuild-std-features=compiler-builtins-mem",
+    ]);
+    if release {
+        cmd.arg("--release");
+    }
+    if let Some(flags) = kernel_rustflags(arch) {
+        cmd.env("RUSTFLAGS", flags);
     }
     matches!(cmd.status().map(|s| s.success()), Ok(true))
 }

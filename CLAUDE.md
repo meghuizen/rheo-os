@@ -532,13 +532,24 @@ is complete.**
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
-proofs, and the hardware-lab performance numbers. **SMP secondary-core
-bring-up** is scoped separately: CPU *detection* and topology are done (4
-cores on x86-64/RISC-V, per-node affinity), but starting the other cores
-running kernel code needs per-CPU state + locking (the kernel is currently
-single-CPU `static mut`) and is blocked portably here - ARM64 PSCI CPU_ON
-traps from EL1 (no EL3/EL2 in this QEMU config) and x86 APs need a 16-bit
-real-mode trampoline.
+proofs, and the hardware-lab performance numbers. **SMP** (docs/SMP.md,
+task #27) now has its foundation and a real RISC-V secondary: the portable
+**per-CPU state + kernel spinlock** (`kernel/src/smp.rs`: a `SpinLock<T>` +
+a per-CPU registry with `this_cpu()`, zero-impact on the single-CPU path)
+and a **genuine RISC-V secondary hart running kernel code** - brought up via
+SBI HSM `hart_start` onto the shared kernel address space, it claims a
+per-CPU registry slot, marks itself online, and writes a shared counter
+through the cross-core spinlock, which the primary reads back and asserts
+(the `smp` test, riscv64). ARM64 and x86-64 make a genuine, guarded bring-up
+attempt and skip-with-reason: ARM64's PSCI `CPU_ON` (`smc #0`) empirically
+**traps to EL1** (no EL3/EL2 firmware in this QEMU config; the SMC is guarded
+so the trap is observed, not fatal - CPU detection there is likewise
+EL1-limited to the boot CPU), and x86-64 APs need a 16-bit real-mode
+INIT-SIPI-SIPI trampoline below 1 MiB (not implemented; ACPI still enumerates
+the 4 APs). Still deferred: **preemptive multi-core scheduling** (the runtime
+stays single-CPU cooperative - the secondary does proof-of-life work and
+parks, it is not yet fed runnable cells) and making the shared kernel
+`static mut` state SMP-safe end to end.
 
 The `.user` linker window holds U-mode code (`.user.text`), shared
 read-only constants (`.user.rodata`), and per-cell data (`.user.bss`) in
@@ -584,7 +595,9 @@ kernel/       the no_std kernel library + boot demo bin
   src/        ISA-independent: capability core, queue ABI, cells, mm
               (frames + grants), time (clock), rng (ChaCha20 DRBG +
               hwrng seeding), event streams,
-              sched (reservations), lease, engine, graph, pty, input
+              sched (reservations), lease, engine, graph, pty, smp
+              (per-CPU state + a kernel SpinLock + RISC-V SBI-HSM secondary-hart
+              bring-up - docs/SMP.md), input
               (kernel RX ring + the SYS_WAIT_INPUT park-until-input primitive -
               docs/LIBRHEO.md Phase D), svc
               (shell/resource/POSIX-file syscalls), hw (ACPI/FDT/PCIe
@@ -602,7 +615,9 @@ kernel/       the no_std kernel library + boot demo bin
   arch/       per-ISA assembly (boot, vectors/traps, context switch, user)
   link/       linker scripts per ISA (incl. the .user text/rodata/data window)
 tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
-              isolation-hw, resources, shell-smoke, hwinfo, rng, runtime,
+              isolation-hw, resources, smp (per-CPU state + kernel spinlock +
+              a real RISC-V secondary hart; ARM64/x86-64 skip-with-reason -
+              docs/SMP.md), shell-smoke, hwinfo, rng, runtime,
               posix, blockfs (live virtio-blk disk), elfrun (load a native
               ELF), posixrun (native program over the POSIX syscalls),
               libcrun (a program linked against rheo-libc), jsonrun (a

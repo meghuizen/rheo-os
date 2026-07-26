@@ -403,6 +403,110 @@ pub fn boot_hartid() -> usize {
     unsafe { core::ptr::addr_of!(BOOT_HARTID).read() as usize }
 }
 
+// ------------------------------------------------------------------- SMP
+// docs/SMP.md, task #27. RISC-V is the ISA where a genuine second core runs
+// kernel code here: OpenSBI runs in M-mode below the S-mode kernel, so the SBI
+// HSM `hart_start` ecall is available to start a secondary hart. The secondary
+// enters `secondary_entry` (arch/riscv64/smp.S) with the MMU off, loads the
+// shared kernel satp, and calls `rv_secondary_main` below. Gated behind the
+// `smp` feature so the non-SMP kernels link a byte-identical `kernel` lib
+// (adding it perturbs codegen-unit hashing); only the `smp` test enables it.
+
+#[cfg(feature = "smp")]
+global_asm!(include_str!("../../../arch/riscv64/smp.S"));
+
+#[cfg(feature = "smp")]
+unsafe extern "C" {
+    /// Physical (low LMA) address of the secondary entry trampoline, published
+    /// as a high .rodata word by smp.S (an absolute reloc the high-half kernel
+    /// can read - it cannot form the low address PC-relatively under medany).
+    static SECONDARY_ENTRY_PA: u64;
+}
+
+/// The per-hart CPU index for this hart. The kernel keeps it in `tp` (the thread
+/// pointer, free in S-mode kernel context - no cell runs in the SMP test, and
+/// `tp` is only meaningful as user TLS while a cell runs). Defaults to 0 until
+/// [`smp_set_this_cpu`] establishes an identity, so the single-CPU path always
+/// reports CPU 0.
+#[cfg(feature = "smp")]
+pub fn cpu_index() -> usize {
+    let v: usize;
+    // SAFETY: reads `tp`, a GPR; no memory effect.
+    unsafe { asm!("mv {0}, tp", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v
+}
+
+/// Record this hart's CPU index in `tp`. Called once per hart as it comes up
+/// (the primary in `smp::init`, a secondary in `rv_secondary_main`).
+#[cfg(feature = "smp")]
+pub fn smp_set_this_cpu(index: usize) {
+    // SAFETY: writes `tp`, a GPR; safe in kernel context (no cell running).
+    unsafe { asm!("mv tp, {0}", in(reg) index, options(nomem, nostack, preserves_flags)) };
+}
+
+/// The boot hart id, as the portable CPU hardware id.
+#[cfg(feature = "smp")]
+pub fn boot_cpu_hw_id() -> u32 {
+    boot_hartid() as u32
+}
+
+/// SBI HSM `hart_start(hartid, start_addr, opaque)` (EID 0x48534D "HSM", FID 0).
+/// Returns the SBI error code (0 = success). The started hart begins at
+/// `start_addr` in S-mode with the MMU off, `a0 = hartid`, `a1 = opaque`.
+#[cfg(feature = "smp")]
+fn sbi_hart_start(hartid: usize, start_addr: usize, opaque: usize) -> isize {
+    let error: isize;
+    // SAFETY: an ecall to OpenSBI (M-mode) with the HSM calling convention; the
+    // clobbered a-registers are declared, ra is preserved by the SBI ABI.
+    unsafe {
+        asm!(
+            "ecall",
+            inlateout("a0") hartid => error,
+            inlateout("a1") start_addr => _,
+            in("a2") opaque,
+            in("a6") 0usize,          // FID 0 = hart_start
+            in("a7") 0x0048_534Dusize, // EID "HSM"
+            options(nostack),
+        );
+    }
+    error
+}
+
+/// Start one secondary hart running kernel code (docs/SMP.md). Hands it the
+/// kernel's own satp (so it shares the address space) via the SBI `opaque` arg
+/// and the low physical entry trampoline as `start_addr`. Returns Ok if SBI
+/// accepted the start; the caller waits for the hart to actually come online.
+#[cfg(feature = "smp")]
+pub fn smp_start_secondary(hw_id: u32) -> Result<(), &'static str> {
+    let satp: usize;
+    // SAFETY: reads satp, an S-mode CSR.
+    unsafe { asm!("csrr {0}, satp", out(reg) satp, options(nomem, nostack)) };
+    let entry = unsafe { core::ptr::addr_of!(SECONDARY_ENTRY_PA).read() } as usize;
+    match sbi_hart_start(hw_id as usize, entry, satp) {
+        0 => Ok(()),
+        -2 => Err("SBI_ERR_NOT_SUPPORTED (no HSM extension)"),
+        -3 => Err("SBI_ERR_INVALID_PARAM"),
+        -6 => Err("SBI_ERR_ALREADY_AVAILABLE (hart already running)"),
+        _ => Err("SBI hart_start failed"),
+    }
+}
+
+/// The secondary hart's Rust entry, called from smp.S with `a0 = hartid` once it
+/// is running high-half kernel code on the shared address space. Establishes its
+/// per-CPU identity, runs the portable bring-up proof, then returns to the asm
+/// `wfi` park. Never returns to normal scheduling - this is a proof of life, not
+/// preemptive SMP scheduling (docs/SMP.md).
+#[cfg(feature = "smp")]
+#[unsafe(no_mangle)]
+extern "C" fn rv_secondary_main(hartid: usize) {
+    // Install a trap vector so a stray fault is contained rather than jumping to
+    // the reset stvec (0). The secondary should not trap: it does integer work
+    // on shared memory and parks. secondary_run claims this CPU's registry index
+    // and sets its per-CPU identity (tp).
+    trap_init();
+    crate::smp::secondary_run(hartid as u32);
+}
+
 /// Feature names; bit i in CpuReport.features corresponds to index i.
 pub fn cpu_feature_names() -> &'static [&'static str] {
     &[

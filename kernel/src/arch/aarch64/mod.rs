@@ -26,6 +26,8 @@ pub const CLONE_BACKWARDS: bool = true;
 global_asm!(include_str!("../../../arch/aarch64/boot.S"));
 global_asm!(include_str!("../../../arch/aarch64/vectors.S"));
 global_asm!(include_str!("../../../arch/aarch64/context_switch.S"));
+#[cfg(feature = "smp")]
+global_asm!(include_str!("../../../arch/aarch64/smp.S"));
 
 pub const NAME: &str = "ARM64";
 
@@ -396,6 +398,77 @@ pub fn discover(inv: &mut crate::hw::Inventory) {
     // device gigabyte the kernel identity-maps.
     inv.ecam_base = 0x3f00_0000;
     inv.add_cpu(0, 0);
+}
+
+// ------------------------------------------------------------------- SMP
+// docs/SMP.md, task #27. On this QEMU virt config the kernel runs at EL1 with
+// no EL2/EL3 (secure=off, virtualization=off), so PSCI is unusable from the
+// kernel: an `smc #0` (PSCI conduit) is UNDEFINED at EL1 with no EL3 to service
+// it and traps back into EL1. `smp_start_secondary` makes a **genuine** PSCI
+// `CPU_ON` attempt, but guards the SMC with a temporary exception vector so the
+// trap is observed and reported instead of killing the primary (which would hit
+// the fatal sync handler). Either way ARM64 skips-with-reason: a real secondary
+// bring-up needs an EL3 PSCI provider (firmware) this config does not have.
+
+/// This CPU's index. ARM64 does not bring up secondaries here, so only the boot
+/// CPU ever asks - always CPU 0.
+#[cfg(feature = "smp")]
+pub fn cpu_index() -> usize {
+    0
+}
+
+/// No-op: no per-CPU identity register is established (single-core path).
+#[cfg(feature = "smp")]
+pub fn smp_set_this_cpu(_index: usize) {}
+
+/// The boot CPU's hardware id: MPIDR_EL1 affinity 0 (0 on this config).
+#[cfg(feature = "smp")]
+pub fn boot_cpu_hw_id() -> u32 {
+    let mpidr: u64;
+    // SAFETY: reads MPIDR_EL1, a read-only id register available at EL1.
+    unsafe { asm!("mrs {0}, mpidr_el1", out(reg) mpidr) };
+    (mpidr & 0xFF) as u32
+}
+
+#[cfg(feature = "smp")]
+unsafe extern "C" {
+    /// Guarded PSCI `CPU_ON` (arch/aarch64/smp.S). Issues `smc #0` with the
+    /// function id in x0 and args in x1-x3, behind a temporary exception vector
+    /// that catches the EL1 trap. Returns the PSCI status, or the sentinel
+    /// `PSCI_TRAPPED` if the SMC trapped (no EL3 conduit).
+    fn psci_cpu_on_guarded(target: u64, entry: u64, ctx: u64) -> u64;
+    /// Physical (low LMA) entry the guarded attempt points a would-be secondary
+    /// at: the boot trampoline, which parks any non-boot core in a wfe loop.
+    static SMP_PARK_ENTRY_PA: u64;
+}
+
+/// Sentinel returned by [`psci_cpu_on_guarded`] when the SMC trapped to EL1.
+#[cfg(feature = "smp")]
+const PSCI_TRAPPED: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
+/// Make a genuine PSCI `CPU_ON` attempt for `hw_id` and report the observed
+/// outcome (docs/SMP.md). Always returns Err on this config: the SMC either
+/// traps (no EL3) or, if QEMU emulates PSCI, a full ARM secondary bring-up (a
+/// shared-page-table MMU-on trampoline) is not implemented here.
+#[cfg(feature = "smp")]
+pub fn smp_start_secondary(hw_id: u32) -> Result<(), &'static str> {
+    let entry = unsafe { core::ptr::addr_of!(SMP_PARK_ENTRY_PA).read() };
+    // PSCI_CPU_ON (64-bit) function id 0xC4000003 is set inside the asm helper.
+    let status = unsafe { psci_cpu_on_guarded(hw_id as u64, entry, 0) };
+    match status {
+        PSCI_TRAPPED => {
+            Err("PSCI CPU_ON: smc #0 trapped to EL1 (no EL3 firmware in this QEMU config)")
+        }
+        0 => Err(
+            "PSCI CPU_ON accepted, but ARM shared-page-table secondary bring-up is not implemented",
+        ),
+        s if s == (-1i64 as u64) => Err("PSCI CPU_ON returned NOT_SUPPORTED"),
+        s if s == (-2i64 as u64) => Err("PSCI CPU_ON returned INVALID_PARAMETERS"),
+        s if s == (-4i64 as u64) => {
+            Err("PSCI CPU_ON returned ALREADY_ON (QEMU pre-started the core)")
+        }
+        _ => Err("PSCI CPU_ON returned an error status"),
+    }
 }
 
 /// Feature names; bit i corresponds to index i in CpuReport.features.
