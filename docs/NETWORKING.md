@@ -38,6 +38,28 @@ requires - the kernel owns the queue plumbing, not the protocols.
   grants (section 1), header/payload split (section 1), a device RX interrupt, and
   everything in sections 4-7 (eBPF dataplane, DDoS staging, DPU offload).
 
+## 0a. What is built next (rheo-net Phase N1a): the L2/L3 core
+
+The **greenfield network stack** begins here as **portable userspace** - a new
+`net/` workspace crate (`no_std` + alloc, no per-ISA code) built for the three
+bare targets as a loaded ELF cell, riding ON the Phase G raw-frame path. Its full
+architecture, crypto posture, and the N1-N8 roadmap are **docs/NETSTACK.md**.
+
+Phase N1a ships the L2/L3 core - `eth` (Ethernet II parse/build, zero-copy views),
+`arp` (request/reply + an IP->MAC cache + an async `resolve` over `librheo::net`),
+and `ip` (IPv4 + IPv6 header parse/build + the RFC 1071 ones-complement Internet
+checksum, a reusable accumulator UDP/ICMP inherit). It adds **no kernel object and
+no per-ISA code** - it is pure parsing over the existing `OP_NET_*` queue path.
+
+Proof: the `netcore` test kernel (all three ISAs, same SLIRP + virtio-net wiring
+as `librheonet`) - a cell reads the NIC MAC, **resolves the SLIRP gateway
+`10.0.2.2` through `net::arp`** (the ARP round trip now runs through the stack's
+`eth`/`arp` layers, not `librheonet`'s hand-built frame), validates the checksum
+against a known value (`0xB861`), round-trips an IPv4 header build/parse/validate
+(a flipped byte fails), and round-trips an IPv6 header - exiting `0x42`. Deferred
+to N1b: UDP, ICMP (echo + traceroute), the local/AF_UNIX zero-copy path, and the
+caching DNS client (docs/NETSTACK.md 5).
+
 ## 1. NIC queues are the primitive
 
 - A network grant = a set of hardware RX/TX queue pairs, IOMMU-mapped into

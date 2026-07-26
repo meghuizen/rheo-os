@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 35] = [
+const TEST_KERNELS: [&str; 36] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -57,6 +57,7 @@ const TEST_KERNELS: [&str; 35] = [
     "librheogpu",
     "librheoipc",
     "librheopipe",
+    "netcore",
 ];
 
 /// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
@@ -113,6 +114,24 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "virtio-net-device,netdev=n0",
         ],
         ("librheonet", Arch::X86_64) => &[
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-pci,netdev=n0,disable-legacy=on",
+        ],
+        // netcore (docs/NETSTACK.md rheo-net Phase N1a): same SLIRP + virtio-net
+        // setup as librheonet - the ARP round trip now runs through the `net`
+        // crate's eth/arp layers. Deterministic + network-free (SLIRP answers the
+        // broadcast ARP for the gateway 10.0.2.2). Same two transports.
+        ("netcore", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-device,netdev=n0",
+        ],
+        ("netcore", Arch::X86_64) => &[
             "-netdev",
             "user,id=n0",
             "-device",
@@ -428,6 +447,8 @@ fn build_userland(arch: Arch) -> bool {
         "rheo-libc",
         "-p",
         "librheo",
+        "-p",
+        "rheo-net",
         "--release",
         "--target",
         arch.target(),

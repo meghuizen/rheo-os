@@ -151,6 +151,12 @@ path = "src/librheoipc.rs"
 name = "librheopipe"
 path = "src/librheopipe.rs"
 
+# rheo-net Phase N1a (docs/NETSTACK.md): the L2/L3 core through the new `net`
+# crate - an ARP round trip via net::eth/net::arp + IPv4/IPv6 build/parse/checksum.
+[[bin]]
+name = "netcore"
+path = "src/netcore.rs"
+
 [[bin]]
 name = "smp"
 path = "src/smp.rs"

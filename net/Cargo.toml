@@ -1,0 +1,44 @@
+[package]
+name = "rheo-net"
+version = "0.1.0"
+edition = "2024"
+
+# rheo-net (docs/NETSTACK.md, docs/NETWORKING.md): the greenfield network stack
+# for rheo-os, built as portable userspace - `no_std` + alloc, no `cfg(target_arch)`,
+# compiled for the three bare targets as a loaded ELF cell. It rides ON librheo's
+# raw-frame path (`librheo::net`: OP_NET_TX/RX/MAC) + the strand reactor + the
+# heap; it adds NO kernel object and no per-ISA code. Phase N1a ships the L2/L3
+# core: `eth` (Ethernet II), `arp` (request/reply + cache + async resolve), `ip`
+# (IPv4 + IPv6 header parse/build + the ones-complement Internet checksum).
+
+[dependencies]
+# The raw-frame NIC path, the async reactor, the heap, and the one-shot timer -
+# rheo-net is a layer over librheo, not a peer of it. `full` (librheo default)
+# provides `net`/`time`/`mem`/`rt`.
+librheo = { path = "../librheo" }
+
+# Profile feature gates (docs/NETSTACK.md): a deployment links only the layers
+# its profile needs. For N1a every profile pulls the same L2/L3 core (the
+# modules are always compiled); the gates are declared now so later phases
+# (UDP/TCP/TLS/app protocols) can be attached per profile without a churn of the
+# public surface. `default = ["edge"]` is the general-purpose profile.
+[features]
+default = ["edge"]
+# A tiny subset: raw frames + minimal UDP (future). Smallest datapath.
+embedded = []
+# General host / firewall / WAF: the full L2-L4 core (future TCP/TLS).
+edge = []
+# Extreme low latency / HFT: branchless hot paths, kernel-bypass (future).
+hft = []
+# Data-warehouse throughput: Arrow Flight / Kafka, zero-copy grants (future).
+warehouse = []
+
+[lib]
+name = "rheo_net"
+
+# The N1a proof cell: reads the NIC MAC, resolves the SLIRP gateway via net::arp
+# (a real ARP round trip through the stack), and round-trips IPv4/IPv6 headers +
+# the checksum in memory. Loaded by the `netcore` test kernel.
+[[bin]]
+name = "netcore-demo"
+path = "src/bin/netcore-demo.rs"

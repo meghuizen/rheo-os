@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["json", "kernel", "libc", "librheo", "posix", "runtime", "tests", "userland", "xtask"]
+members = ["json", "kernel", "libc", "librheo", "net", "posix", "runtime", "tests", "userland", "xtask"]
 # Needs the custom rheo-os target + build-std (docs/USERLAND.md M4), so a plain
 # host `cargo build` cannot compile it; kept out of the workspace build.
 exclude = ["targets/std-rheo/hello", "targets/std-rheo/coreutils"]

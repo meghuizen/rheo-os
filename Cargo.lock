@@ -39,6 +39,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rheo-net"
+version = "0.1.0"
+dependencies = [
+ "librheo",
+]
+
+[[package]]
 name = "runtime"
 version = "0.1.0"
 
