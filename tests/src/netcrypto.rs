@@ -4,8 +4,8 @@
 //! test vector** - ChaCha20-Poly1305 (RFC 8439), SHA-256/384 (NIST/RFC 6234),
 //! HKDF (RFC 5869), X25519 (RFC 7748), Ed25519 (RFC 8032), AES-GCM (NIST/GCM-spec)
 //! - plus decrypt round trips, tamper rejections, the two-randomness-class API,
-//! and the nonce-safe `SealingKey`. It exits `0x42` only if every check passes;
-//! this kernel asserts that code on all three ISAs. So the exit code is the proof.
+//!   and the nonce-safe `SealingKey`. It exits `0x42` only if every check passes;
+//!   this kernel asserts that code on all three ISAs. So the exit code is the proof.
 //!
 //! Pure compute - **no netdev, no NIC** - but the cell still gets a mapped queue
 //! pair + minted cap (librheo's `_start` discovers it via `SYS_QUEUE_INFO`) and a

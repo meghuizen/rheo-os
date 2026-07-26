@@ -9,7 +9,7 @@
 //! on input between keystrokes via `SYS_WAIT_INPUT` (the OS's first
 //! block-and-wake). The scripted bytes exercise typing, backspace, cursor-left
 //! + insert, and Up-arrow history recall; the cell verifies the committed lines
-//! and exits `0x42` only if every one is exact.
+//!   and exits `0x42` only if every one is exact.
 //!
 //! On an ISA where the UART RX interrupt is wired (`input::interrupt_driven`),
 //! the test also asserts the kernel actually idled at WFI while the cell was
