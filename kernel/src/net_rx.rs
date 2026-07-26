@@ -6,12 +6,16 @@
 //! Before this, `librheo::net::recv` was a **re-poll**: `OP_NET_RX` returned
 //! "nothing available" and the cell submitted it again, so a cell waiting for a
 //! packet burned a whole core. Now the cell parks (its reactor blocks here) and
-//! the kernel idles until the NIC raises its RX interrupt.
+//! the kernel **halts** until a frame arrives or the caller's deadline expires.
 //!
 //! Everything here is portable; the per-ISA interrupt-controller code stays in
-//! `kernel/src/arch` (the portability rule), reached through three seams:
+//! `kernel/src/arch` (the portability rule), reached through seams:
 //! `arch::enable_virtio_net_irq(slot)`, `arch::net_irq_enabled()`,
-//! `arch::net_irq_pending()`, plus the shared `arch::idle_wait()`.
+//! `arch::net_irq_pending()` and `arch::idle_wait()` for the NIC line, plus
+//! `arch::timer_irq_enabled()`/`timer_arm`/`timer_expired`/`timer_disarm`/`timer_wait`
+//! for the deadline and the timer-backed idle. Which of the two an ISA has is what
+//! selects the wait mode below - portable logic over the predicates, no
+//! `cfg(target_arch)` here.
 //!
 //! ## Where the received frames are buffered
 //!
@@ -25,27 +29,87 @@
 //! interrupt handler records the arrival ([`on_irq`]) and the wait path copies
 //! once, from the virtqueue buffer straight into the cell's buffer.
 //!
+//! ## How the wait idles: three modes, decided portably
+//!
+//! A wait may only halt the CPU if *something* can wake it. Two independent
+//! interrupt sources can, and the choice between them is plain portable logic over
+//! the `arch` predicates ([`IdleMode`]):
+//!
+//! 1. **[`IdleMode::NicInterrupt`]** - the NIC RX interrupt is wired, so the kernel
+//!    arms the caller's deadline and halts **once**, waking on either source. The
+//!    genuine 0%-CPU park (riscv64, aarch64).
+//! 2. **[`IdleMode::TimerIdle`]** - no NIC RX interrupt on this ISA, but the timer
+//!    interrupt is. The kernel then polls the receive queue and **halts on a short
+//!    timer slice** ([`TIMER_SLICE_NS`]) between polls: a real halt, not a spin, at
+//!    a low duty cycle. This is x86-64, whose *timer* is genuinely interrupt-driven
+//!    (LAPIC one-shot, x2APIC) while its virtio-*pci* NIC has no usable interrupt
+//!    line under QEMU TCG. The wake comes from the timer, never from the NIC - which
+//!    is why this is reported as its own mode and never as "interrupt-driven".
+//! 3. **[`IdleMode::Poll`]** - neither interrupt available: the honest last-resort
+//!    bounded poll, where the CPU spins.
+//!
+//! ## The deadline is a deadline, not a spin count
+//!
+//! `timeout_ns` means the same thing in all three modes: a **monotonic deadline**,
+//! measured with the armed hardware timer where one is armed and with
+//! `arch::cycles()` otherwise. [`POLL_BUDGET`] is only a safety backstop for an
+//! *indefinite* wait (`timeout_ns == 0`) in poll mode; it can never truncate a
+//! caller's deadline. Before this, the fallback exited after a fixed iteration
+//! count, so the same `timeout_ns` meant wildly different things per ISA (and a
+//! long wait on a slow poll path blew past any test budget).
+//!
 //! ## Honesty
 //!
-//! [`interrupt_driven`] reports whether this ISA delivers the NIC RX interrupt;
-//! [`irq_count`] counts interrupts the kernel actually took (a genuine device
-//! interrupt, not a claim), and [`did_idle`] records whether it halted at
-//! WFI waiting for one (the 0%-CPU park). Where no interrupt is available the
-//! wait falls back to a **bounded kernel poll loop** - still one park instead of
-//! a userspace re-submit storm, but the CPU spins; both counters stay false/0 and
-//! say so. docs/NETSTACK.md has the per-ISA table.
+//! [`interrupt_driven`] reports **only** whether this ISA delivers the NIC RX
+//! interrupt - it is not widened by the timer-backed mode. [`irq_count`] counts NIC
+//! interrupts the kernel actually took (a genuine device interrupt, not a claim),
+//! [`did_idle`] records whether the wait halted the CPU at all, and [`idle_mode`]
+//! says **how** it halted. docs/NETSTACK.md 16 has the per-ISA table.
 
 use core::ptr::{addr_of, addr_of_mut};
 
-/// Iterations the poll fallback spins before giving up (returning 0 frames).
-/// Only reached where no NIC RX interrupt is wired; bounded so a packet that
-/// never arrives cannot wedge the machine.
+/// Iterations an **indefinite** poll-mode wait (`timeout_ns == 0`, no NIC and no
+/// timer interrupt) spins before giving up. A safety backstop only: a bounded wait
+/// exits on its deadline, so this can never cut a caller's timeout short.
 const POLL_BUDGET: u64 = 200_000_000;
+
+/// The timer slice [`IdleMode::TimerIdle`] halts for between receive-queue polls:
+/// **500 microseconds**.
+///
+/// The trade-off, stated plainly. Receive latency grows by at most one slice, so
+/// 500 us is invisible next to the millisecond-scale round trips this path serves
+/// (ARP, DHCP, DNS, a TCP RTO) - and next to QEMU's own emulation jitter. In the
+/// other direction the slice must be comfortably larger than the cost of arming the
+/// timer and re-polling the device (a handful of MSR / MMIO accesses, microseconds
+/// under QEMU TCG) so that the **halt dominates** and the duty cycle stays around a
+/// percent instead of 100%. 500 us sits two orders of magnitude above the one and
+/// two below the other. Shorter would spend the saving back on bookkeeping; longer
+/// would start to show up as receive latency.
+pub const TIMER_SLICE_NS: u64 = 500_000;
+
+/// How a receive wait idled - reported so a test and the docs can state the truth
+/// per ISA instead of blurring "halted" into "interrupt-driven".
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum IdleMode {
+    /// No [`wait_frame`] has run yet.
+    None,
+    /// Halted on the **NIC's RX interrupt** (with the caller's deadline armed
+    /// alongside it): one halt, woken by the device. A genuine 0%-CPU park.
+    NicInterrupt,
+    /// No NIC RX interrupt on this ISA: polled the receive queue and halted on a
+    /// [`TIMER_SLICE_NS`] timer slice between polls. A real halt woken by the
+    /// **timer** - low duty cycle, but not a NIC interrupt.
+    TimerIdle,
+    /// Neither interrupt available: a bounded poll. The CPU spins.
+    Poll,
+}
 
 /// Interrupts taken from the NIC (incremented by [`on_irq`]).
 static mut IRQS: u64 = 0;
-/// Whether a wait halted the CPU at WFI at least once.
+/// Whether a wait halted the CPU at least once (either idle mode).
 static mut IDLED: bool = false;
+/// The mode the most recent [`wait_frame`] used.
+static mut MODE: IdleMode = IdleMode::None;
 
 /// Reset the receive-wait state (call before installing a fresh set of cells).
 pub fn reset() {
@@ -53,6 +117,7 @@ pub fn reset() {
     unsafe {
         *addr_of_mut!(IRQS) = 0;
         *addr_of_mut!(IDLED) = false;
+        *addr_of_mut!(MODE) = IdleMode::None;
     }
 }
 
@@ -71,10 +136,21 @@ pub fn enable_irq() -> bool {
     }
 }
 
-/// Whether the running ISA delivers NIC receive interrupts (a genuine 0%-CPU
-/// park at WFI) rather than polling. False until [`enable_irq`] succeeds.
+/// Whether the running ISA delivers **NIC receive interrupts** (a genuine 0%-CPU
+/// park woken by the device) rather than polling. False until [`enable_irq`]
+/// succeeds.
+///
+/// Deliberately narrow: the timer-backed [`IdleMode::TimerIdle`] mode also halts the
+/// CPU, but the NIC did not wake it, so this stays false there. Ask [`idle_mode`] for
+/// what actually happened.
 pub fn interrupt_driven() -> bool {
     crate::arch::net_irq_enabled()
+}
+
+/// How the most recent [`wait_frame`] idled (see [`IdleMode`]).
+pub fn idle_mode() -> IdleMode {
+    // SAFETY: single CPU.
+    unsafe { *addr_of!(MODE) }
 }
 
 /// How many NIC interrupts the kernel has taken. Non-zero is proof a real device
@@ -85,9 +161,11 @@ pub fn irq_count() -> u64 {
     unsafe { *addr_of!(IRQS) }
 }
 
-/// Whether a [`wait_frame`] call halted the CPU at WFI waiting for a frame (the
-/// 0%-CPU park assertion). False in the poll build, and false when every frame
-/// was already queued before the wait began.
+/// Whether a [`wait_frame`] call halted the CPU (at WFI / `hlt`) while waiting for a
+/// frame - true in **both** idle modes, since both genuinely stop the CPU. False in
+/// [`IdleMode::Poll`], and false when every frame was already queued before the wait
+/// began. Pair it with [`interrupt_driven`] / [`idle_mode`] to say *which* interrupt
+/// did the waking.
 pub fn did_idle() -> bool {
     // SAFETY: single CPU.
     unsafe { *addr_of!(IDLED) }
@@ -116,24 +194,35 @@ pub fn on_irq() {
 ///
 /// `timeout_ns` bounds the wait (0 = wait indefinitely) - the primitive a
 /// transport needs for a retransmission timeout: "a frame, or the deadline,
-/// whichever comes first". Where both the NIC and the timer interrupt are wired
-/// the kernel arms the deadline and halts **once**, waking on either source; the
-/// timer is disarmed on the way out.
+/// whichever comes first". It is a **monotonic deadline** in every mode, so the same
+/// `timeout_ns` means the same span of time on every ISA (see the module docs).
 ///
-/// Returns 0 if no NIC is installed, if the timeout elapsed with no frame, or -
-/// in the poll fallback - if the spin budget expires.
+/// Returns 0 if no NIC is installed, if the deadline elapsed with no frame, or - for
+/// an *indefinite* wait on the last-resort poll path - if [`POLL_BUDGET`] expires.
 pub fn wait_frame(buf_va: u64, len: usize, timeout_ns: u64) -> usize {
     if len == 0 {
         return 0;
     }
-    // A deadline can be honoured two ways: by arming the hardware timer (so the
-    // wait can halt the CPU and still wake), or - where no timer interrupt is
-    // wired - by checking the monotonic counter in the poll loop.
-    let use_timer = timeout_ns > 0 && crate::arch::timer_irq_enabled();
-    // Halting is only safe when *something* can wake us: the NIC interrupt, plus
-    // an armed deadline if one was asked for.
-    let can_idle = crate::arch::net_irq_enabled() && (timeout_ns == 0 || use_timer);
-    if use_timer {
+    let nic_irq = crate::arch::net_irq_enabled();
+    let timer_irq = crate::arch::timer_irq_enabled();
+    // Portable idle decision (module docs): halt on the NIC where it can wake us,
+    // else halt on timer slices where the timer can, else poll. No per-ISA code -
+    // just the two `arch` predicates.
+    let mode = if nic_irq && (timeout_ns == 0 || timer_irq) {
+        IdleMode::NicInterrupt
+    } else if timer_irq {
+        IdleMode::TimerIdle
+    } else {
+        IdleMode::Poll
+    };
+    // SAFETY: single CPU.
+    unsafe {
+        *addr_of_mut!(MODE) = mode;
+    }
+    // Only the NIC mode arms the hardware timer for the *deadline*: the timer-idle
+    // mode needs it for its slices, so there the deadline is the cycle counter.
+    let armed = mode == IdleMode::NicInterrupt && timeout_ns > 0;
+    if armed {
         crate::arch::timer_arm(timeout_ns);
     }
     let start = crate::arch::cycles();
@@ -143,7 +232,7 @@ pub fn wait_frame(buf_va: u64, len: usize, timeout_ns: u64) -> usize {
         // frame that arrived while the cell was computing is still credited to
         // (and acknowledged by) the interrupt path. `idle_wait` returns at once
         // when an interrupt is pending.
-        if crate::arch::net_irq_enabled() && crate::arch::net_irq_pending() {
+        if nic_irq && crate::arch::net_irq_pending() {
             crate::arch::idle_wait();
         }
 
@@ -153,34 +242,57 @@ pub fn wait_frame(buf_va: u64, len: usize, timeout_ns: u64) -> usize {
             None => break 0, // no NIC installed
         }
 
-        if timed_out(timeout_ns, use_timer, start) {
+        if timed_out(timeout_ns, armed, start) {
             break 0;
         }
 
-        if can_idle {
-            // Genuine 0%-CPU park: halt until the NIC's RX interrupt fires (or the
-            // armed deadline does).
-            // SAFETY: single CPU.
-            unsafe {
-                *addr_of_mut!(IDLED) = true;
+        match mode {
+            IdleMode::NicInterrupt => {
+                // Genuine 0%-CPU park: halt until the NIC's RX interrupt fires (or
+                // the armed deadline does).
+                mark_idled();
+                crate::arch::idle_wait();
             }
-            crate::arch::idle_wait();
-        } else {
-            // Honest fallback: no NIC interrupt on this ISA (or a deadline with no
-            // timer interrupt to arm), so the kernel polls the receive queue. One
-            // park for the cell (no re-submit storm), but the CPU spins - bounded,
-            // so a lost packet cannot wedge the machine.
-            spins += 1;
-            if spins > POLL_BUDGET {
-                break 0;
+            IdleMode::TimerIdle => {
+                // Timer-backed low-duty-cycle polling: halt for one slice (never
+                // past the caller's deadline), then re-poll the receive queue. The
+                // halt is real - `timer_wait` arms the per-ISA one-shot and stops
+                // the CPU until it fires.
+                let slice = match timeout_ns {
+                    0 => TIMER_SLICE_NS,
+                    t => TIMER_SLICE_NS
+                        .min(t.saturating_sub(elapsed_ns(start)))
+                        .max(1),
+                };
+                mark_idled();
+                crate::arch::timer_wait(slice);
             }
-            core::hint::spin_loop();
+            IdleMode::None | IdleMode::Poll => {
+                // Honest last resort: neither interrupt is available on this ISA, so
+                // the kernel polls the receive queue. One park for the cell (no
+                // re-submit storm), but the CPU spins. A bounded wait still exits on
+                // its deadline above; the budget only stops an *indefinite* wait
+                // from wedging the machine.
+                spins += 1;
+                if timeout_ns == 0 && spins > POLL_BUDGET {
+                    break 0;
+                }
+                core::hint::spin_loop();
+            }
         }
     };
-    if use_timer {
+    if armed {
         crate::arch::timer_disarm();
     }
     result
+}
+
+/// Record that the wait halted the CPU (either idle mode).
+fn mark_idled() {
+    // SAFETY: single CPU.
+    unsafe {
+        *addr_of_mut!(IDLED) = true;
+    }
 }
 
 /// Kernel-side twin of [`wait_frame`] over a **kernel-owned** slice: the
@@ -193,15 +305,20 @@ pub fn wait_frame_slice(out: &mut [u8], timeout_ns: u64) -> usize {
     wait_frame(out.as_mut_ptr() as u64, len, timeout_ns)
 }
 
-/// Whether the requested deadline has passed: the armed hardware timer where one
-/// is available, else the monotonic cycle counter.
-fn timed_out(timeout_ns: u64, use_timer: bool, start: u64) -> bool {
+/// Whether the requested deadline has passed: the armed hardware timer where the
+/// deadline itself was armed, else the monotonic cycle counter. Either way this is a
+/// **time** comparison, never an iteration count.
+fn timed_out(timeout_ns: u64, armed: bool, start: u64) -> bool {
     if timeout_ns == 0 {
         return false;
     }
-    if use_timer {
+    if armed {
         return crate::arch::timer_expired();
     }
-    let elapsed = crate::arch::cycles().wrapping_sub(start);
-    crate::arch::ticks_to_ns(elapsed) >= timeout_ns
+    elapsed_ns(start) >= timeout_ns
+}
+
+/// Nanoseconds elapsed since the cycle-counter reading `start`.
+fn elapsed_ns(start: u64) -> u64 {
+    crate::arch::ticks_to_ns(crate::arch::cycles().wrapping_sub(start))
 }

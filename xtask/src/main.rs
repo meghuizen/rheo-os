@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 51] = [
+const TEST_KERNELS: [&str; 52] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -73,6 +73,7 @@ const TEST_KERNELS: [&str; 51] = [
     "linuxnet",
     "netservice",
     "nethttp",
+    "nethostcfg",
 ];
 
 /// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
@@ -245,6 +246,28 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "virtio-net-device,netdev=n0",
         ],
         ("netdns", Arch::X86_64) => &[
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-pci,netdev=n0,disable-legacy=on",
+        ],
+        // nethostcfg (docs/NETSTACK.md rheo-net Phase N4c): host configuration -
+        // DHCP + zeroconf/mDNS + NTP + the hostcfg store, over the same SLIRP +
+        // virtio-net setup as netdns. The deterministic core (codecs, the DHCP state
+        // machine + its timers, the link-local ARP claim, the mDNS codec, the NTP
+        // offset/delay KAT) is entirely network-free; the netdev is here only so the
+        // four *bonus* live attempts genuinely put frames on the wire - SLIRP runs no
+        // guest-visible DHCP/NTP/mDNS service, so each skips with a printed reason.
+        // Same two transports: virtio-mmio on arm/riscv, virtio-pci on x86.
+        ("nethostcfg", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-device,netdev=n0",
+        ],
+        ("nethostcfg", Arch::X86_64) => &[
             "-netdev",
             "user,id=n0",
             "-device",

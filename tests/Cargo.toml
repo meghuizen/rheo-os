@@ -286,6 +286,17 @@ path = "src/linuxnet.rs"
 name = "netservice"
 path = "src/netservice.rs"
 
+# rheo-net Phase N4c (docs/NETSTACK.md §20): **host configuration** - a DHCP client
+# (byte oracle + the DISCOVER->OFFER->REQUEST->ACK walk + T1/T2 renewal/rebind/
+# expiry + DECLINE/RELEASE + six rejections), the hostcfg store read back by
+# dns::Config and udp::UdpEndpoint, IPv4 link-local (ARP probe + conflict re-pick +
+# announce + defend), mDNS over the DNS codec, and the NTP offset/delay known-answer
+# test with the result as a bounded interval. Deterministic and network-free; four
+# bonus live attempts (DHCP/NTP/mDNS/link-local) skip with a reason.
+[[bin]]
+name = "nethostcfg"
+path = "src/nethostcfg.rs"
+
 [[bin]]
 name = "smp"
 path = "src/smp.rs"

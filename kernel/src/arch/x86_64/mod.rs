@@ -180,11 +180,15 @@ pub fn uart_inject_and_wait(_b: u8) {}
 /// `VIRTIO_PCI_CAP_PCI_CFG` tunnel, because PVH boot has no firmware to program
 /// BARs), so there is no mapped BAR to hold an MSI-X table, and legacy INTx would
 /// ride the same IOAPIC path that does not re-deliver reliably under QEMU TCG +
-/// `kernel-irqchip=split` (see the seam comment above). `SYS_WAIT_NET` therefore
-/// falls back to the kernel's bounded poll loop (kernel/src/net_rx.rs): the cell
-/// still parks once instead of re-submitting, but the CPU spins - not a 0%-CPU
-/// idle, and reported as such (docs/NETSTACK.md per-ISA table). Programming MSI-X
-/// through the config tunnel is the documented next step.
+/// `kernel-irqchip=split` (see the seam comment above).
+///
+/// The **timer** interrupt here *is* genuine (the LAPIC one-shot below), so
+/// `SYS_WAIT_NET` does not spin: it takes the timer-backed idle mode
+/// (`net_rx::IdleMode::TimerIdle`) - poll the receive queue, halt at `hlt` for one
+/// short timer slice, re-poll - a real halt at a low duty cycle, honoured against the
+/// caller's deadline. It is reported as timer-backed, never as NIC-interrupt-driven
+/// (docs/NETSTACK.md 16 has the per-ISA table). Programming MSI-X through the config
+/// tunnel is the documented next step.
 pub fn net_irq_enabled() -> bool {
     false
 }

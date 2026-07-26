@@ -156,3 +156,19 @@ pub async fn send_frame(frame: &[u8]) -> Result<(), WireError> {
 pub async fn recv_frame(buf: &mut [u8]) -> Result<usize, WireError> {
     net::try_recv(buf).await.map_err(|_| WireError::Net)
 }
+
+/// Wait up to `timeout_ns` for one raw Ethernet frame into `buf`, **parking** rather
+/// than polling (`librheo::net::recv_timeout` -> `SYS_WAIT_NET`). Returns the frame
+/// length, or `0` if the deadline elapsed with nothing received.
+///
+/// This is the receive a protocol driver should reach for: the wait is expressed as a
+/// **duration**, so it means the same thing on every ISA, and the kernel spends it
+/// halted rather than spinning wherever an interrupt can wake it (the NIC's RX
+/// interrupt on riscv64/aarch64, a short timer slice on x86-64 - docs/NETSTACK.md
+/// 16). [`recv_frame`] stays the non-blocking drain that a batching transport wants.
+#[cfg(feature = "hosted")]
+pub async fn recv_frame_timeout(buf: &mut [u8], timeout_ns: u64) -> Result<usize, WireError> {
+    net::recv_timeout(buf, timeout_ns)
+        .await
+        .map_err(|_| WireError::Net)
+}

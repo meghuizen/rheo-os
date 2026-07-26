@@ -39,6 +39,12 @@ pub const HEADER_LEN: usize = 8;
 #[cfg(feature = "hosted")]
 pub const RECV_RETRIES: u32 = 200_000;
 
+/// How many datagrams [`UdpEndpoint::recv_from_timeout`] looks at inside its deadline
+/// before giving up - a **frame** count, so a chatty link cannot stretch a bounded
+/// wait, while the wait itself stays a duration.
+#[cfg(feature = "hosted")]
+pub const RECV_FRAME_BUDGET: u32 = 32;
+
 /// A parsed UDP header (the 8 bytes before the payload).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct UdpHeader {
@@ -244,19 +250,73 @@ pub struct UdpEndpoint {
     src_ip: Ipv4Addr,
     ttl: u8,
     cache: ArpCache,
+    /// The gateway for off-link destinations, when the endpoint was built from a
+    /// [`HostConfig`](crate::hostcfg::HostConfig) that had one. `None` means "treat
+    /// every destination as on-link", which is the pre-N4c behaviour and is what
+    /// SLIRP's proxy-ARP actually wants.
+    gateway: Option<Ipv4Addr>,
+    /// The netmask, when known - together with `src_ip` this is what makes
+    /// on-link-vs-gateway a real decision rather than a guess.
+    netmask: Option<Ipv4Addr>,
 }
 
 #[cfg(feature = "hosted")]
 impl UdpEndpoint {
     /// A new endpoint for `src_ip` reachable at `src_mac`, TTL defaulting to
-    /// [`wire::DEFAULT_TTL`].
+    /// [`wire::DEFAULT_TTL`]. No netmask or gateway, so every destination is
+    /// treated as on-link (see [`from_host_config`](Self::from_host_config) for the
+    /// routed form).
     pub fn new(src_mac: Mac, src_ip: Ipv4Addr) -> UdpEndpoint {
         UdpEndpoint {
             src_mac,
             src_ip,
             ttl: wire::DEFAULT_TTL,
             cache: ArpCache::new(),
+            gateway: None,
+            netmask: None,
         }
+    }
+
+    /// An endpoint whose identity **and routing** come from the host-config store
+    /// (docs/NETSTACK.md §20, rheo-net N4c): the source address, the netmask, and
+    /// the default gateway.
+    ///
+    /// This is the difference that matters: [`send_to`](Self::send_to) resolves the
+    /// **next hop** rather than the destination, so an off-link destination is sent
+    /// to the gateway's MAC - the routing decision `net::wire` used to list as a
+    /// deferred refinement. With [`UdpEndpoint::new`] there is no netmask, so the
+    /// old behaviour (ARP the destination directly) is unchanged.
+    pub fn from_host_config(src_mac: Mac, cfg: &crate::hostcfg::HostConfig) -> UdpEndpoint {
+        UdpEndpoint {
+            src_mac,
+            src_ip: cfg.source_address(),
+            ttl: wire::DEFAULT_TTL,
+            cache: ArpCache::new(),
+            gateway: cfg.gateway(),
+            netmask: cfg.netmask(),
+        }
+    }
+
+    /// The source address this endpoint sends from.
+    pub fn src_ip(&self) -> Ipv4Addr {
+        self.src_ip
+    }
+
+    /// The gateway used for off-link destinations, if any.
+    pub fn gateway(&self) -> Option<Ipv4Addr> {
+        self.gateway
+    }
+
+    /// The address whose MAC must be resolved to reach `dst`: `dst` itself when it is
+    /// on-link (or when no netmask is configured), the gateway otherwise. Exposed so
+    /// the routing decision is testable without sending a packet.
+    pub fn next_hop(&self, dst: Ipv4Addr) -> Ipv4Addr {
+        let (Some(mask), Some(gw)) = (self.netmask, self.gateway) else {
+            return dst;
+        };
+        let m = u32::from_be_bytes(mask.0);
+        let on_link = (u32::from_be_bytes(self.src_ip.0) & m) == (u32::from_be_bytes(dst.0) & m);
+        if on_link { dst } else { gw }
     }
 
     /// The IPv4 TTL stamped on sent packets (the traceroute hook - a later phase
@@ -280,8 +340,12 @@ impl UdpEndpoint {
         src_port: u16,
         payload: &[u8],
     ) -> Result<(), WireError> {
+        // The next hop is the destination when it is on-link, the gateway otherwise
+        // (the host-config routing decision; without a netmask this is `dst_ip`, the
+        // pre-N4c behaviour).
+        let hop = self.next_hop(dst_ip);
         let dst_mac =
-            wire::resolve_next_hop(&mut self.cache, self.src_mac, self.src_ip, dst_ip).await?;
+            wire::resolve_next_hop(&mut self.cache, self.src_mac, self.src_ip, hop).await?;
 
         let mut datagram = [0u8; wire::MAX_FRAME - wire::L4_OFFSET];
         let dlen = build_v4(
@@ -312,10 +376,48 @@ impl UdpEndpoint {
     /// Bounded by [`RECV_RETRIES`]; returns `WireError::ArpTimeout` if none
     /// arrives (reusing the timeout variant - the caller retransmits).
     pub async fn recv_from(&mut self, buf: &mut [u8]) -> Result<Received, WireError> {
+        self.recv_inner(buf, None).await
+    }
+
+    /// Wait up to `timeout_ns` for the next UDP-over-IPv4 datagram, **parking** in the
+    /// kernel instead of polling ([`wire::recv_frame_timeout`]). Returns
+    /// `WireError::ArpTimeout` if the deadline elapses with nothing for us.
+    ///
+    /// The duration-bounded twin of [`recv_from`](Self::recv_from). Prefer it: a
+    /// deadline in nanoseconds means the same thing on every ISA, whereas
+    /// [`RECV_RETRIES`] is an iteration count whose wall-clock length depends on how
+    /// the ISA's receive path happens to work. `recv_from` is kept unchanged for the
+    /// callers that want the poll drain.
+    pub async fn recv_from_timeout(
+        &mut self,
+        buf: &mut [u8],
+        timeout_ns: u64,
+    ) -> Result<Received, WireError> {
+        self.recv_inner(buf, Some(timeout_ns)).await
+    }
+
+    /// The shared receive body: `None` = poll [`RECV_RETRIES`] times, `Some(ns)` =
+    /// park up to a per-frame deadline, bounded by [`RECV_FRAME_BUDGET`] frames so
+    /// unrelated traffic cannot stretch the wait.
+    async fn recv_inner(
+        &mut self,
+        buf: &mut [u8],
+        timeout_ns: Option<u64>,
+    ) -> Result<Received, WireError> {
         let mut frame = [0u8; wire::MAX_FRAME];
-        for _ in 0..RECV_RETRIES {
-            let n = wire::recv_frame(&mut frame).await?;
+        let attempts = match timeout_ns {
+            None => RECV_RETRIES,
+            Some(_) => RECV_FRAME_BUDGET,
+        };
+        for _ in 0..attempts {
+            let n = match timeout_ns {
+                None => wire::recv_frame(&mut frame).await?,
+                Some(t) => wire::recv_frame_timeout(&mut frame, t).await?,
+            };
             if n == 0 {
+                if timeout_ns.is_some() {
+                    break; // the deadline elapsed with nothing on the link
+                }
                 continue;
             }
             let Some(parsed) = wire::parse_ipv4(&frame[..n]) else {

@@ -227,9 +227,18 @@ extern "C" fn kernel_main() -> ! {
              0% CPU, woken by an interrupt)"
         );
     } else {
+        // No NIC RX interrupt here. The wait is not a spin either: with the timer
+        // interrupt wired it halts on short timer slices between polls
+        // (kernel/src/net_rx.rs `IdleMode::TimerIdle`) - a real halt, woken by the
+        // timer, never claimed as a NIC interrupt.
         println!(
-            "netwait: kernel poll fallback (no NIC RX interrupt on this ISA) - the cell parks \
-             once, but the kernel spins while waiting"
+            "netwait: no NIC RX interrupt on this ISA - the receive wait used {:?}{}",
+            net_rx::idle_mode(),
+            if net_rx::did_idle() {
+                " (the kernel halted the CPU between polls - a real halt, not a spin)"
+            } else {
+                " (every frame was already queued, so the wait never had to halt)"
+            }
         );
     }
 

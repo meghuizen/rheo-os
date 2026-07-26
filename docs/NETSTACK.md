@@ -232,7 +232,13 @@ kernels stay green.
     trip to SLIRP's resolver and a real remote TCP connect on all three ISAs.
     Routing it to the **N4a service cell** instead is the documented end state,
     blocked on N4a's name-based rendezvous.
-  - **N4c: host services** - DHCP + zeroconf + NTP clients as service cells.
+  - **N4c (done): host configuration** (§20) - a **DHCP** client (RFC 2131), IPv4
+    **link-local** autoconfiguration + **mDNS** (RFC 3927 / 6762, reusing the DNS
+    codec), an **SNTP/NTPv4** client whose answer is a *bounded interval*, and the
+    **`hostcfg`** store the rest of the stack reads for its address, netmask,
+    gateway, resolvers and search domains. All four are ordinary userspace over UDP
+    or ARP; the live phases are bounded by **durations**, which is what made the
+    kernel's receive wait honour a deadline on every ISA.
 - **N5 - App protocols.** HTTP/2, gRPC, Arrow Flight (warehouse), Kafka.
 - **N6 - Perf substrate.** (NIC RX IRQ landed early in **N2d**, §16.) Zero-copy DMA + offload/multiqueue/RSS,
   timer wheel; the socket/steering kernel object if earned; DDoS-isolation proof.
@@ -1306,8 +1312,16 @@ available, copies it into the cell's buffer (the cell's address space is active
 during the trap, so **one copy**, straight from the virtqueue buffer the device
 DMA'd into), and returns its length. `timeout_ns = 0` waits indefinitely; a
 non-zero deadline is the "**a frame, or the RTO, whichever comes first**" primitive
-every transport needs - where both the NIC and the timer interrupt are wired the
-kernel arms the deadline and halts **once**, waking on either source.
+every transport needs.
+
+`timeout_ns` is a **monotonic deadline in every wait mode** - never an iteration
+count. (It was not always: the original fallback exited after a fixed number of poll
+iterations, so the same `timeout_ns` bought wildly different spans of time on
+different ISAs, and a wait that had to run out its clock could blow past any time
+budget. `POLL_BUDGET` is now only a backstop for an *indefinite* wait on the
+last-resort poll path, and can never truncate a caller's deadline.) The deadline is
+measured with the armed hardware timer where the wait armed one, and with
+`arch::cycles()` otherwise.
 
 Mechanism only, **no new kernel object** (ARCHITECTURE.md 6): it exposes the same
 virtio-net driver the `OP_NET_*` opcodes already bridge to, in the shape of the
@@ -1361,25 +1375,80 @@ drain a batching transport uses (`net::wire::recv_frame`, `net::arp::resolve`'s 
 loop, and the smoltcp cell's RX batch all use `try_recv`, so their behaviour is
 unchanged - the last frame of a burst must not block).
 
-### Per-ISA interrupt status (honest)
+### The three wait modes, and how the mode is chosen
+
+A wait may only halt the CPU if *something* can wake it. **Two** independent
+interrupt sources can, and the choice between them is plain portable logic over the
+existing `arch` predicates - no `cfg(target_arch)` outside `kernel/src/arch/`:
+
+```
+NIC RX interrupt wired, and any deadline armable   -> IdleMode::NicInterrupt
+else timer interrupt wired                         -> IdleMode::TimerIdle
+else                                               -> IdleMode::Poll
+```
+
+- **`NicInterrupt`** - arm the caller's deadline, then halt **once**, waking on
+  either source. The genuine 0%-CPU park.
+- **`TimerIdle`** - no NIC RX interrupt on this ISA, but the timer interrupt is
+  wired, so the wait becomes **timer-backed low-duty-cycle polling**: poll the receive
+  queue, arm a short one-shot slice, halt at `wfi`/`hlt` until it fires, re-poll,
+  until a frame arrives or the caller's deadline expires. Crucially this is a **real
+  halt between polls, not a spin** - but the timer is what wakes it, never the NIC, so
+  it is reported as its own mode and never as "interrupt-driven".
+- **`Poll`** - neither interrupt available: the honest bounded poll, where the CPU
+  spins. Still deadline-honouring.
+
+**The timer slice is 500 microseconds** (`net_rx::TIMER_SLICE_NS`). The trade-off both
+ways: receive latency grows by at most one slice, and 500 us is invisible next to the
+millisecond-scale round trips this path serves (ARP, DHCP, DNS, a TCP RTO) and next to
+QEMU's own emulation jitter; in the other direction the slice must be well above the
+cost of arming the timer and re-polling the device (a handful of MSR/MMIO accesses,
+microseconds under QEMU TCG) so that **the halt dominates** and the duty cycle is
+around a percent instead of 100%. 500 us sits two orders of magnitude above the one and
+two below the other - shorter spends the saving back on bookkeeping, longer starts to
+show up as latency. A slice is also clamped to the remaining time, so it never
+overshoots the deadline.
+
+### Per-ISA wait status (honest)
 
 | ISA | NIC transport | RX interrupt path | Receive wait |
 |---|---|---|---|
-| **RISC-V 64** | virtio-mmio (slot 7 on QEMU `virt`) | APLIC-S source `1+slot` in MSI mode -> this hart's IMSIC S-file (identity `16+slot`) -> `sip.SEIP`; dispatched by identity in `handle_ext_irq` | **interrupt-driven**, halts at `wfi` - genuine 0%-CPU park |
-| **ARM64** | virtio-mmio (slot 31 on QEMU `virt`) | GICv3 SPI `16+slot` (INTID `48+slot`) -> GICD -> `ICC_IAR1_EL1`, EOI via `ICC_EOIR1_EL1` | **interrupt-driven**, halts at `wfi` - genuine 0%-CPU park |
-| **x86-64** | virtio-**pci** (q35, driven through the `VIRTIO_PCI_CAP_PCI_CFG` tunnel) | **none wired** - see below | **kernel poll** (bounded): the cell still parks once, but the CPU spins |
+| **RISC-V 64** | virtio-mmio (slot 7 on QEMU `virt`) | APLIC-S source `1+slot` in MSI mode -> this hart's IMSIC S-file (identity `16+slot`) -> `sip.SEIP`; dispatched by identity in `handle_ext_irq` | **NIC-interrupt-driven**, halts at `wfi` - genuine 0%-CPU park |
+| **ARM64** | virtio-mmio (slot 31 on QEMU `virt`) | GICv3 SPI `16+slot` (INTID `48+slot`) -> GICD -> `ICC_IAR1_EL1`, EOI via `ICC_EOIR1_EL1` | **NIC-interrupt-driven**, halts at `wfi` - genuine 0%-CPU park |
+| **x86-64** | virtio-**pci** (q35, driven through the `VIRTIO_PCI_CAP_PCI_CFG` tunnel) | **none wired** - see below | **timer-backed idle**: `hlt` for a 500 us LAPIC slice between receive-queue polls. A real halt, ~1% duty cycle - woken by the timer, *not* by the NIC |
+| *(no timer either)* | any | none | **bounded poll**, the CPU spins - the honest last resort |
 
-x86-64 is a documented fallback, not a claim. The NIC there is driven *entirely
-through PCI configuration space* because PVH boot has no firmware to program BARs -
-so there is no mapped BAR to hold an MSI-X table - and legacy INTx would ride the
-same IOAPIC path that, under QEMU TCG + `kernel-irqchip=split`, does not re-deliver
-reliably (the same reason the x86-64 UART RX line stays a poll, docs/LIBRHEO.md
-Phase D; its *timer* LAPIC path does work). The honest x86-64 result is therefore:
-the userspace re-submit storm is gone (one park per receive, the real improvement),
-but the kernel-side wait is a bounded spin, and `net_rx::interrupt_driven()` /
-`did_idle()` both report false there. **Programming the MSI-X table through the
-config tunnel** (the table lives in a BAR the tunnel can reach) is the specific
-next step.
+x86-64's *NIC* interrupt is a documented gap, not a claim. The NIC there is driven
+*entirely through PCI configuration space* because PVH boot has no firmware to program
+BARs - so there is no mapped BAR to hold an MSI-X table - and legacy INTx would ride
+the same IOAPIC path that, under QEMU TCG + `kernel-irqchip=split`, does not re-deliver
+reliably (the same reason the x86-64 UART RX line stays a poll, docs/LIBRHEO.md Phase
+D). Its **LAPIC timer, however, is genuinely interrupt-driven** (Phase F), which is
+exactly what the timer-backed mode uses: x86-64 *can* idle, it just cannot idle on the
+NIC. **Programming the MSI-X table through the config tunnel** (the table lives in a
+BAR the tunnel can reach) remains the specific next step, and would move x86-64 from
+`TimerIdle` to `NicInterrupt`.
+
+Reporting stays deliberately unblurred: `net_rx::interrupt_driven()` means **"the NIC
+RX interrupt is wired"** and nothing else (false on x86-64); `net_rx::did_idle()` means
+"the wait halted the CPU" (true in both idle modes); and `net_rx::idle_mode()` says
+**which** mode ran. No ISA reports as NIC-interrupt-driven unless a NIC interrupt is
+what wakes it.
+
+### Deadlines belong in the protocol APIs, not poll counts
+
+The same rule applies one level up, in `net/`. A driver that took a *drain count*
+(`claim(ll, polls_per_probe)`, `mdns::query(.., polls)`, `dhcp::RECV_POLLS`) leaked the
+mechanism into its API and could not mean the same thing twice: one drain is an
+interrupt park on one ISA and a poll on another. Those are now **durations** - a probe
+listens for `probe_window_ns`, a DHCP attempt waits `RECV_WINDOW_NS`, an NTP query
+waits `timeout_ns` - implemented over `wire::recv_frame_timeout` ->
+`librheo::net::recv_timeout` -> `SYS_WAIT_NET`, i.e. a kernel park with a real
+deadline. Where a *count* is still right it counts **frames**, not polls
+(`PROBE_FRAME_BUDGET`, `RECV_FRAME_BUDGET`, `ntp::RECV_ATTEMPTS`), so unrelated link
+traffic cannot stretch a bounded wait. `wire::recv_frame` (a single non-blocking
+`try_recv`) stays for the batching transports that must not block on the last frame of
+a burst.
 
 ### The proof (`netwait` test kernel, all 3 ISAs)
 
@@ -1679,10 +1748,12 @@ service cell.
 
 A remote receive blocks in **`net_rx::wait_frame_slice`** - the N2d
 park-until-frame primitive with a deadline. On **riscv64/aarch64** the kernel
-genuinely halts at WFI until the NIC's RX interrupt fires; on **x86-64** it falls
-back to the documented bounded kernel poll (its NIC is virtio-pci through the
-config tunnel: no mapped BAR for an MSI-X table, and legacy INTx rides the QEMU-TCG
-IOAPIC path that does not re-deliver). Identical honesty to §16.
+genuinely halts at WFI until the NIC's RX interrupt fires; on **x86-64** there is no
+NIC RX interrupt (its NIC is virtio-pci through the config tunnel: no mapped BAR for an
+MSI-X table, and legacy INTx rides the QEMU-TCG IOAPIC path that does not re-deliver),
+so the wait takes the **timer-backed idle** - `hlt` for a 500 us LAPIC slice between
+receive-queue polls, a real halt rather than a spin, honoured against the caller's
+deadline. Identical honesty to §16, which has the per-ISA table.
 
 ### What is on the wire
 
@@ -1978,3 +2049,154 @@ deterministic and **network-free** - no netdev is attached.
   framework with the N4b/N6 inbound path (a remote listener needs the NIC
   flow-steering grants).
 - **gRPC, Arrow Flight and the Kafka client** (N5b/N5c) ride on this h2.
+
+## 20. Phase N4c (done): host configuration - DHCP, zeroconf, mDNS, NTP
+
+Everything up to here assumed the host already knew who it was. `10.0.2.15`, the
+gateway `10.0.2.2`, the resolver `10.0.2.3` were **written into the code** in several
+places. N4c answers the two questions a host has to answer before anything else works
+- *who am I on this link* and *what time is it* - with real protocol clients, and
+puts the answers in one store the rest of the stack reads.
+
+All four pieces are ordinary userspace over UDP or ARP, which is exactly where the
+doctrine wants them (docs/ARCHITECTURE.md 4.7). **No kernel object, no new syscall
+verb, no new dependency, no `cfg(target_arch)`.**
+
+### 20.1 What is built
+
+- **`net::hostcfg`** - the **host-configuration store**: address, netmask, gateway,
+  DNS servers, search domains, hostname, and where the configuration came from
+  (`Unconfigured` / `Static` / `Dhcp` / `LinkLocal`). It owns the one routing decision
+  a single-homed host needs - `next_hop(dst)` is `dst` when `dst` is on-link and the
+  gateway otherwise - plus `prefix_len`, `broadcast`, `netmask_is_valid` and
+  search-domain `qualify`. `HostConfig::slirp()` is now the **single place** QEMU's
+  guest/gateway/resolver addresses are named; `udp::UdpEndpoint::from_host_config`,
+  `dns::Config` and `net::service` read the store instead of carrying literals.
+  A link-local claim deliberately **clears the gateway**: a link-local host has no
+  route off the link, and must fail rather than guess.
+- **`net::dhcp`** - a **DHCP client** (RFC 2131): the BOOTP-shaped codec with the
+  magic cookie and TLV options, `DISCOVER -> OFFER -> REQUEST -> ACK -> BOUND`, the
+  T1/T2 renewal and rebinding timers (with RFC defaults `lease/2` and `lease*7/8` and
+  a clamp for a nonsensical `T1 > T2`), expiry back to SELECTING with a **fresh**
+  transaction id, NAK, `DECLINE` and `RELEASE`. Broadcast messages are framed from
+  `0.0.0.0` to `255.255.255.255` with **no ARP** - the whole point, since ARP needs an
+  address we do not have yet; a renewal unicast resolves the server's MAC normally.
+- **`net::zeroconf`** - **IPv4 link-local** (RFC 3927) and **mDNS** (RFC 6762).
+  Link-local is an ARP state machine, not an address generator: pick a candidate from
+  `169.254.1.0`-`169.254.254.255`, send `PROBE_COUNT` **ARP probes** whose *sender*
+  address is `0.0.0.0` (a normal request would claim the address it asks about),
+  treat either "somebody answers for it" or "somebody else is probing it" as a
+  conflict and re-pick, then send `ANNOUNCE_COUNT` **announcements** with sender ==
+  target. After claiming, a conflict is **defended once** and a second one inside
+  `DEFEND_INTERVAL_NS` yields - defending forever is how two hosts ARP-storm a link.
+  mDNS is **the `dns` codec unchanged** over multicast to `224.0.0.251:5353` (which
+  is why N4c made that codec posture-independent rather than writing a second name
+  parser): id 0, no recursion, the **QU** bit in a question class, the **cache-flush**
+  bit in a record class, TTL 0 as a **goodbye**, `.local`-only scoping, and the RFC
+  1112 `224.0.0.251 -> 01:00:5e:00:00:fb` MAC mapping.
+- **`net::ntp`** - an **SNTP/NTPv4 client** (RFC 5905 client subset): the 48-byte
+  codec, the four-timestamp offset and round-trip delay, `MINPOLL`/`MAXPOLL` backoff
+  (which a Kiss-o'-Death also triggers - ignoring one is how a client gets blocked),
+  and the result as a **bounded interval** (`ntp::Estimate`, the shape of
+  `kernel::time::Interval`) of half-width `delay/2` widened by the server's declared
+  root distance. It adjusts a **userspace offset** and never touches a system clock.
+  A cell also has no nanosecond wall clock to fill T1/T4 with, so a *live* sync is
+  not claimed - the arithmetic is what is proven. PTP and NTS stay deferred.
+
+Postures: the codecs and state machines are **always compiled** (pure parsing over
+`alloc`); only the async drivers (`dhcp::configure`, `zeroconf::claim`, `mdns::query`,
+`ntp::query`) sit behind `hosted`.
+
+### 20.2 Durations, not drain counts
+
+N4c's drivers wait for frames, and that is where the phase found a real defect. The
+first cut took a **drain count** (`claim(ll, polls_per_probe, ..)`,
+`mdns::query(.., polls)`, `dhcp::RECV_POLLS`), which cannot mean the same thing twice:
+one "drain" is an interrupt park on riscv64/aarch64 and a poll on x86-64, so the same
+number bought a different amount of listening - and an unbounded amount of CPU - per
+ISA. Every such parameter is now a **duration** in nanoseconds, implemented over
+`wire::recv_frame_timeout` -> `librheo::net::recv_timeout` -> `SYS_WAIT_NET`, i.e. a
+kernel park with a real deadline. Where a count is still the right bound it counts
+**frames** (`PROBE_FRAME_BUDGET`, `RECV_FRAME_BUDGET`, `ntp::RECV_ATTEMPTS`) so
+unrelated link traffic cannot stretch a bounded wait. That change is what forced the
+kernel's receive wait to honour a deadline rather than a spin count in every mode, and
+to idle on the timer where it cannot idle on the NIC - §16 has the mechanism and the
+per-ISA table.
+
+The live-phase budgets, stated plainly: **1 s** per DHCP attempt (three attempts,
+`dhcp::RECV_WINDOW_NS`), **1 s** for the NTP reply (`ntp::REPLY_TIMEOUT_NS`), **500 ms**
+for an mDNS response, and **200 ms** of listening after each ARP probe - the last
+deliberately shorter than RFC 3927's one-to-two seconds because it is a bonus liveness
+check whose protocol is already proven deterministically. Worst case the four live
+phases cost a few seconds of wall clock between them, and on riscv64/aarch64 they cost
+essentially no CPU.
+
+A second real defect fell out of the same work: `LinkLocal::announce` used to serve
+**both** the bounded announcement sequence and an unbounded post-claim *defence*, so
+once claimed it returned a frame forever and a driver's `while let Some(f) =
+ll.announce()` never terminated. Announcing and defending are now separate acts -
+`announce()` returns `None` once `ANNOUNCE_COUNT` have gone out, and `defend()` is the
+deliberate answer to an `Observation::Defend` - and the boundedness is asserted.
+
+### 20.3 The proof (`nethostcfg` test kernel, all 3 ISAs)
+
+The deterministic core is **network-free** and every failure has its own exit code, so
+a failure names itself. It covers: a complete **byte oracle** for an encoded DISCOVER
+(every field pinned at its wire offset *and* every uncovered byte asserted zero, at the
+padded 300-byte length); the full state-machine walk driven by OFFER/ACK built with the
+crate's **own** encoder, so encode and decode are exercised on the same bytes; a decode
+oracle on the ACK; the extracted lease and the armed T1/T2/expiry deadlines; the T1/T2
+defaults and the `T1 > T2` clamp; renewal (unicast, `ciaddr` set, requested-IP and
+server-id **absent** per RFC 2131 §4.4.5 table 5), rebinding, expiry and NAK; seven
+malformed or hostile shapes each rejected with **its own** error; DECLINE and RELEASE;
+the `hostcfg` store populated from the lease and **read back by two real stack paths**
+(a `dns::Config` whose resolvers are the leased servers, a `udp::UdpEndpoint` that
+routes an off-link destination to the leased gateway); the link-local generator KAT,
+the `0.0.0.0`-sender probe decoded back off the wire, conflict re-pick, a racing probe,
+3 probes + 2 announcements reaching Claimed, `announce()` then bounded, and
+defend-once-then-yield; mDNS byte oracles with and without the QU bit, cache-flush and
+goodbye decoding, the multicast-MAC mapping and `.local` scoping; and the NTP
+known-answer test - T1..T4 of `S / S+1 / S+1.5 / S+2` giving an offset of exactly
+**+250 ms** and a delay of exactly **1.5 s**, as an interval of half-width exactly
+**750 ms** (and **1.75 s** once the server declares 1 s root delay and 0.5 s root
+dispersion), plus nine rejections and the KoD backoff. The cell exits `0x42` only if
+all of it passes.
+
+Then four **bonus live** phases over SLIRP, none fatal and none permitted to fake a
+result:
+
+- **DHCP is genuinely answered.** SLIRP *does* run a DHCP server on the emulated link,
+  so the cell completes a real `DISCOVER -> OFFER -> REQUEST -> ACK` with it and gets
+  `10.0.2.15/24`, gateway `10.0.2.2`, an 86400 s lease - decoded by the same parser the
+  oracles exercise, on all three ISAs. It is **reported, not asserted**: a lease is a
+  property of the QEMU backend rather than of this code, and a link with no server
+  prints the skip instead. Nothing ever synthesises one.
+- **NTP and mDNS skip with a reason.** SLIRP runs no NTP service and hosts no mDNS
+  peer, so those two windows elapse and say so.
+- **The link-local probes go out** and observe no conflict, which the cell reports as
+  *absence of evidence*, not as proof the address is free.
+
+The kernel then asserts the **wait mode** it actually used, which follows
+deterministically from the two interrupt predicates: `NicInterrupt` on riscv64 and
+aarch64 (with `did_idle()`, and 3-4 genuine device interrupts taken per run - a count
+only incrementable from the ISA's interrupt vector), `TimerIdle` on x86-64 (with
+`did_idle()` true and `interrupt_driven()` asserted **false**, so the halt is never
+dressed up as a NIC interrupt). That is the per-ISA claim of §16 checked at runtime
+rather than only written down.
+
+### What N4c defers (explicit)
+
+- **DHCPv6** and IPv6 **SLAAC**/router discovery; IPv6 link-local + MLD.
+- **DNS-SD** (RFC 6763 `PTR`/`SRV`/`TXT` service enumeration): three more record
+  types plus a service registry - a phase, not an add-on.
+- mDNS **known-answer** and duplicate-question suppression, name probing/conflict
+  resolution (§8 - the ARP probe's analogue for names), and the
+  one-second-per-probe / two-second-per-announce **timing schedule** (the state
+  machines count probes; the delays are a driver's to schedule).
+- **IGMP/MLD** group management: `224.0.0.251` is link-local multicast (never
+  forwarded, no snooping required) and the driver negotiates no receive filter, so
+  nothing needs programming here. General multicast is a later phase.
+- **PTP and NTS** (authenticated NTP), and any **clock discipline**: the offset stays
+  a userspace correction with a bound.
+- **Running the four clients inside the N4a service cell** so other cells inherit the
+  configuration - that needs N4a's deferred name-based rendezvous.

@@ -113,6 +113,32 @@
 //! Both live in the **always-compiled** (posture-independent) half of the crate:
 //! HTTP is parsing and state machines, so it needs neither librheo nor the NIC.
 //!
+//! **Phase N4c** adds **host configuration** - the four services that answer "who am
+//! I on this link, and what time is it?" (docs/NETSTACK.md §20). All four are UDP or
+//! ARP based and all four are naturally userspace, which is where the doctrine wants
+//! them:
+//! - [`hostcfg`]: the **host-configuration store** - address / netmask / gateway /
+//!   DNS servers / search domains / hostname, plus the on-link-vs-gateway
+//!   [`hostcfg::HostConfig::next_hop`] routing decision. DHCP, static config and
+//!   zeroconf all write it; [`udp::UdpEndpoint::from_host_config`], [`dns`] and
+//!   [`service`] read it, so the stack no longer carries hardcoded addresses.
+//! - [`dhcp`]: a **DHCP client** (RFC 2131) - the BOOTP-shaped codec with the magic
+//!   cookie and TLV options, the DISCOVER -> OFFER -> REQUEST -> ACK state machine,
+//!   the T1/T2 renewal and rebinding timers, expiry, DECLINE and RELEASE.
+//! - [`zeroconf`]: **IPv4 link-local** autoconfiguration (RFC 3927 - candidate
+//!   selection, ARP probe, conflict re-pick, announce, single defence) and **mDNS**
+//!   (RFC 6762 - `.local` query/response over `224.0.0.251:5353`, the QU and
+//!   cache-flush bits, goodbye TTLs) **reusing the [`dns`] codec unchanged**.
+//! - [`ntp`]: an **SNTP/NTPv4 client** (RFC 5905 client subset) - the 48-byte codec,
+//!   the four-timestamp offset and round-trip delay, poll backoff, and the result as
+//!   a **bounded interval** ([`ntp::Estimate`]) in the shape of
+//!   `kernel::time::Interval`, never a false instant. It adjusts a **userspace
+//!   offset**, never a system clock; PTP and NTS stay deferred.
+//!
+//! N4c is what made the [`dns`] codec posture-independent: mDNS is DNS messages with
+//! a different transport, so it reuses the same parser rather than getting a second
+//! one. Only [`dns::Resolver`]/[`dns::Config`] stayed behind `hosted`.
+//!
 //! Still deferred (per docs/NETSTACK.md): TLS 1.3 (N3b); full NewReno partial-ACK
 //! recovery, CUBIC HyStart / fast-convergence, and BBR; negative caching; and the
 //! *live* ICMPv6 path (the v6 codec is unit-proven; SLIRP cannot generate v6
@@ -124,14 +150,19 @@ extern crate alloc;
 
 pub mod arp;
 pub mod cc;
+pub mod dhcp;
+pub mod dns;
 pub mod eth;
+pub mod hostcfg;
 pub mod http1;
 pub mod http2;
 pub mod ip;
+pub mod ntp;
 pub mod shard;
 pub mod tcp;
 pub mod udp;
 pub mod wire;
+pub mod zeroconf;
 
 // The **librheo-hosted** modules (feature `hosted`, on by default): every layer
 // that reaches the NIC or the clock through librheo's async surface. Gating them
@@ -142,8 +173,6 @@ pub mod wire;
 // handler and global allocator, so a kernel cannot link it; the codec posture
 // carries none of that. Nothing here is duplicated - the same `eth`/`ip`/`udp`/
 // `tcp` code serves both postures.
-#[cfg(feature = "hosted")]
-pub mod dns;
 #[cfg(feature = "hosted")]
 pub mod icmp;
 #[cfg(feature = "hosted")]

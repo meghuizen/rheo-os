@@ -43,20 +43,32 @@
 //! grant-backed [`librheo::mem`] arena rather than the general heap; N1c uses the
 //! heap at test scale and documents that arena path.
 //!
+//! ## Two postures
+//! The **codec** half of this module - name reading/writing, question and
+//! response parsing, the [`Cache`], the [`Blocklist`], the [`HostsTable`] - is
+//! always compiled: it is pure parsing over `alloc`, with no librheo and no NIC.
+//! That is what lets **mDNS** ([`crate::zeroconf::mdns`]) reuse this exact codec in
+//! either posture, and it mirrors how `http1`/`http2` are posture-independent. Only
+//! [`Config`] and [`Resolver`] - which need the clock and a
+//! [`UdpEndpoint`](crate::udp::UdpEndpoint) - sit behind the `hosted` feature.
+//!
 //! ## Deferred (documented)
 //! Negative caching (caching an NXDOMAIN for a short TTL) is deferred - each
 //! NXDOMAIN currently re-queries; the seam is `Config` + `Cache`. AAAA is fully
 //! supported in the codec and resolver; only the *live* proof is A (SLIRP proxies
-//! to the host resolver). A real routing table (gateway for off-link) stays the
-//! N1b/N1c refinement noted in [`crate::wire`].
+//! to the host resolver). Off-link routing now reads the
+//! [`crate::hostcfg`] store (rheo-net N4c); a multi-route table is still deferred.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
+#[cfg(feature = "hosted")]
 use librheo::time::{self, Duration, Instant};
 
 use crate::ip::{IpAddr, Ipv4Addr, Ipv6Addr};
+#[cfg(feature = "hosted")]
 use crate::udp::UdpEndpoint;
+#[cfg(feature = "hosted")]
 use crate::wire::WireError;
 
 // ---- record types / codes ----
@@ -130,8 +142,10 @@ fn ascii_lower(b: u8) -> u8 {
 }
 
 /// Normalize a name for keys: strip a single trailing dot and lowercase ASCII.
-/// `Example.COM.` and `example.com` become the same key.
-fn normalize(name: &str) -> String {
+/// `Example.COM.` and `example.com` become the same key. Public so mDNS
+/// ([`crate::zeroconf::mdns`]) and the host-config store ([`crate::hostcfg`]) key
+/// names exactly the way the resolver does.
+pub fn normalize(name: &str) -> String {
     let trimmed = name.strip_suffix('.').unwrap_or(name);
     let mut s = String::with_capacity(trimmed.len());
     for &b in trimmed.as_bytes() {
@@ -211,18 +225,15 @@ pub fn read_name(msg: &[u8], start: usize, out: &mut String) -> Result<usize, Dn
     after.ok_or(DnsError::Parse)
 }
 
-/// Build a standard query for `name`/`qtype` (recursion desired) into `out`.
-/// Returns the length written, or `None` if `out` is too small or a label is
-/// invalid (empty or over 63 bytes).
-pub fn build_query(id: u16, name: &str, qtype: QType, out: &mut [u8]) -> Option<usize> {
-    if out.len() < 12 {
-        return None;
-    }
-    out[0..2].copy_from_slice(&id.to_be_bytes());
-    out[2..4].copy_from_slice(&0x0100u16.to_be_bytes()); // flags: RD set
-    out[4..6].copy_from_slice(&1u16.to_be_bytes()); // qdcount = 1
-    out[6..12].copy_from_slice(&[0, 0, 0, 0, 0, 0]); // an/ns/ar = 0
-    let mut pos = 12;
+/// Write `name` as length-prefixed labels plus the terminating root label into
+/// `out`, starting at `pos`. Returns the new position, or `None` if `out` is too
+/// small or a label is invalid (over 63 bytes). Empty labels (a leading or
+/// trailing dot) are skipped. **No compression** is emitted - a pointer needs a
+/// message-wide offset table, and every name this crate writes is short.
+///
+/// Shared by [`build_query`] and the mDNS builders in [`crate::zeroconf::mdns`], so
+/// label encoding exists in exactly one place.
+pub fn write_name(name: &str, out: &mut [u8], mut pos: usize) -> Option<usize> {
     for label in name.split('.') {
         if label.is_empty() {
             continue; // skip an empty (trailing/leading) label
@@ -239,16 +250,104 @@ pub fn build_query(id: u16, name: &str, qtype: QType, out: &mut [u8]) -> Option<
         out[pos..pos + bytes.len()].copy_from_slice(bytes);
         pos += bytes.len();
     }
-    if pos + 5 > out.len() {
+    if pos + 1 > out.len() {
         return None;
     }
     out[pos] = 0; // root label
-    pos += 1;
-    out[pos..pos + 2].copy_from_slice(&qtype.as_u16().to_be_bytes());
+    Some(pos + 1)
+}
+
+/// Build a DNS query message into `out`: a 12-byte header with `flags`, one
+/// question for `name`/`qtype` in class `qclass`. Returns the length written, or
+/// `None` if `out` is too small or a label is invalid.
+///
+/// The general form [`build_query`] and mDNS both use: unicast DNS wants
+/// `flags = 0x0100` (recursion desired) and `qclass = CLASS_IN`, while mDNS wants
+/// `flags = 0` (no recursion, id 0) and may set the **QU** bit (`0x8000`) in
+/// `qclass` to ask for a unicast reply (RFC 6762 §5.4).
+pub fn build_question_message(
+    id: u16,
+    flags: u16,
+    name: &str,
+    qtype: u16,
+    qclass: u16,
+    out: &mut [u8],
+) -> Option<usize> {
+    if out.len() < 12 {
+        return None;
+    }
+    out[0..2].copy_from_slice(&id.to_be_bytes());
+    out[2..4].copy_from_slice(&flags.to_be_bytes());
+    out[4..6].copy_from_slice(&1u16.to_be_bytes()); // qdcount = 1
+    out[6..12].copy_from_slice(&[0, 0, 0, 0, 0, 0]); // an/ns/ar = 0
+    let mut pos = write_name(name, out, 12)?;
+    if pos + 4 > out.len() {
+        return None;
+    }
+    out[pos..pos + 2].copy_from_slice(&qtype.to_be_bytes());
     pos += 2;
-    out[pos..pos + 2].copy_from_slice(&CLASS_IN.to_be_bytes());
+    out[pos..pos + 2].copy_from_slice(&qclass.to_be_bytes());
     pos += 2;
     Some(pos)
+}
+
+/// Build a standard query for `name`/`qtype` (recursion desired) into `out`.
+/// Returns the length written, or `None` if `out` is too small or a label is
+/// invalid (empty or over 63 bytes).
+pub fn build_query(id: u16, name: &str, qtype: QType, out: &mut [u8]) -> Option<usize> {
+    build_question_message(id, 0x0100, name, qtype.as_u16(), CLASS_IN, out)
+}
+
+/// One parsed question from a DNS/mDNS message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Question {
+    /// The queried name (decompressed, lowercased).
+    pub name: String,
+    /// The on-wire query type.
+    pub qtype: u16,
+    /// The on-wire query class. In **mDNS** the top bit is the **QU** flag
+    /// ("please answer by unicast", RFC 6762 §5.4), so the class itself is
+    /// `qclass & 0x7FFF`.
+    pub qclass: u16,
+}
+
+impl Question {
+    /// True if the mDNS **QU** bit is set - the asker wants a unicast reply.
+    pub fn unicast_response(&self) -> bool {
+        self.qclass & 0x8000 != 0
+    }
+
+    /// The class with the mDNS QU bit masked off.
+    pub fn class(&self) -> u16 {
+        self.qclass & 0x7FFF
+    }
+}
+
+/// Parse the question section of a DNS/mDNS message (the header's `qdcount`
+/// questions after the 12-byte header). Names are decompressed with the same
+/// loop-bounded [`read_name`] the answer path uses. Returns
+/// [`DnsError::Parse`] on any malformed input.
+pub fn parse_questions(msg: &[u8]) -> Result<Vec<Question>, DnsError> {
+    if msg.len() < 12 {
+        return Err(DnsError::Parse);
+    }
+    let qd = u16::from_be_bytes([msg[4], msg[5]]);
+    let mut pos = 12;
+    let mut out = Vec::new();
+    for _ in 0..qd {
+        let mut name = String::new();
+        pos = read_name(msg, pos, &mut name)?;
+        if pos + 4 > msg.len() {
+            return Err(DnsError::Parse);
+        }
+        out.push(Question {
+            name,
+            qtype: u16::from_be_bytes([msg[pos], msg[pos + 1]]),
+            qclass: u16::from_be_bytes([msg[pos + 2], msg[pos + 3]]),
+        });
+        pos += 4;
+    }
+    Ok(out)
 }
 
 /// The data of a parsed resource record.
@@ -271,10 +370,36 @@ pub struct Record {
     pub name: String,
     /// The on-wire type code.
     pub rtype: u16,
-    /// The record TTL in seconds.
+    /// The on-wire class code **as received**. In **mDNS** the top bit is the
+    /// **cache-flush** flag (RFC 6762 §10.2), so the real class is
+    /// `class & 0x7FFF` - use [`Record::class`] / [`Record::cache_flush`] rather
+    /// than comparing this field directly.
+    pub class: u16,
+    /// The record TTL in seconds. A TTL of 0 in mDNS is a **goodbye** (the record
+    /// is going away, RFC 6762 §10.1) - see [`Record::is_goodbye`].
     pub ttl: u32,
     /// The decoded record data.
     pub data: RData,
+}
+
+impl Record {
+    /// The class with the mDNS cache-flush bit masked off.
+    pub fn class(&self) -> u16 {
+        self.class & 0x7FFF
+    }
+
+    /// True if the mDNS **cache-flush** bit is set: the responder is asserting
+    /// this record is authoritative and any cached records for the same
+    /// name/type/class should be replaced, not merged (RFC 6762 §10.2).
+    pub fn cache_flush(&self) -> bool {
+        self.class & 0x8000 != 0
+    }
+
+    /// True if this is an mDNS **goodbye**: TTL 0 means the record is going away
+    /// and a cache should drop it (RFC 6762 §10.1).
+    pub fn is_goodbye(&self) -> bool {
+        self.ttl == 0
+    }
 }
 
 /// A parsed DNS response.
@@ -320,6 +445,7 @@ pub fn parse_response(msg: &[u8]) -> Result<Response, DnsError> {
             return Err(DnsError::Parse);
         }
         let rtype = u16::from_be_bytes([msg[pos], msg[pos + 1]]);
+        let class = u16::from_be_bytes([msg[pos + 2], msg[pos + 3]]);
         let ttl = u32::from_be_bytes([msg[pos + 4], msg[pos + 5], msg[pos + 6], msg[pos + 7]]);
         let rdlen = u16::from_be_bytes([msg[pos + 8], msg[pos + 9]]) as usize;
         pos += 10;
@@ -349,6 +475,7 @@ pub fn parse_response(msg: &[u8]) -> Result<Response, DnsError> {
         answers.push(Record {
             name,
             rtype,
+            class,
             ttl,
             data,
         });
@@ -358,6 +485,7 @@ pub fn parse_response(msg: &[u8]) -> Result<Response, DnsError> {
 
 /// Collect the addresses of `qtype` from a response, with the minimum answer TTL
 /// (seconds) - the conservative cache lifetime.
+#[cfg(feature = "hosted")]
 fn extract(resp: &Response, qtype: QType) -> (Vec<IpAddr>, u32) {
     let mut ips = Vec::new();
     let mut min_ttl = u32::MAX;
@@ -699,10 +827,11 @@ impl Cache {
     }
 }
 
-// ---- config + resolver ----
+// ---- config + resolver (the `hosted` posture: they need the clock + a NIC) ----
 
 /// Resolver configuration: the upstream resolver IPs, the static hosts table, an
 /// optional sinkhole address for blocked names, the cache cap, and query timing.
+#[cfg(feature = "hosted")]
 pub struct Config {
     /// Upstream resolvers, tried in order (each on UDP port 53).
     pub resolvers: Vec<Ipv4Addr>,
@@ -722,12 +851,14 @@ pub struct Config {
     pub retries: u32,
 }
 
+#[cfg(feature = "hosted")]
 impl Default for Config {
     fn default() -> Self {
         Config::new()
     }
 }
 
+#[cfg(feature = "hosted")]
 impl Config {
     /// A default config: no resolvers/hosts, no sinkhole, 256-entry cache, a
     /// 1s per-attempt timeout, 4 retries.
@@ -747,6 +878,7 @@ impl Config {
 /// A caching DNS resolver (docs/NETSTACK.md N1c). Resolution checks, in order:
 /// the blocklist, the hosts table, the cache (all network-free), then queries the
 /// configured resolvers over UDP, caching the answer with its TTL.
+#[cfg(feature = "hosted")]
 pub struct Resolver {
     config: Config,
     cache: Cache,
@@ -757,6 +889,7 @@ pub struct Resolver {
     queries_sent: u32,
 }
 
+#[cfg(feature = "hosted")]
 impl Resolver {
     /// A resolver for the local identity `src_mac` / `src_ip` with `config`.
     pub fn new(src_mac: crate::eth::Mac, src_ip: Ipv4Addr, config: Config) -> Resolver {
@@ -905,6 +1038,7 @@ impl Resolver {
 /// copying the DNS message into `buf`; returns its length. Skips datagrams from
 /// other sources / with a wrong id, bounded so a chatty backend cannot spin
 /// forever. Free function (not a method) so it borrows only the endpoint + buffer.
+#[cfg(feature = "hosted")]
 async fn recv_dns_reply(
     udp: &mut UdpEndpoint,
     resolver: Ipv4Addr,

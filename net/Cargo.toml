@@ -240,3 +240,15 @@ path = "src/bin/netsvc-client.rs"
 name = "nethttp-demo"
 path = "src/bin/nethttp-demo.rs"
 required-features = ["tls"]
+
+# The N4c proof cell (docs/NETSTACK.md §20): host configuration - DHCP (codec byte
+# oracle + the DISCOVER->OFFER->REQUEST->ACK walk + T1/T2 renewal/rebind/expiry +
+# DECLINE/RELEASE + six rejections), the hostcfg store read back by dns::Config and
+# udp::UdpEndpoint, IPv4 link-local (ARP probe + conflict re-pick + announce +
+# defend), mDNS over the DNS codec, and the NTP offset/delay known-answer test with
+# the result as a bounded interval. Deterministic and network-free; the live DHCP /
+# NTP / mDNS / link-local attempts are bonus and skip-with-reason. Loaded by the
+# `nethostcfg` test kernel.
+[[bin]]
+name = "nethostcfg-demo"
+path = "src/bin/nethostcfg-demo.rs"

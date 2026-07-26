@@ -242,6 +242,12 @@ impl Service {
             );
         }
         let n = ends.len();
+        // The identity comes from the **host-config store** (rheo-net N4c), not from
+        // three addresses written inline here: `HostConfig::slirp()` is the one place
+        // QEMU's guest/gateway/DNS addresses are named. `set_identity` overrides it
+        // once the real NIC MAC is known, and a DHCP-configured service would pass
+        // its own `HostConfig` instead.
+        let host = crate::hostcfg::HostConfig::slirp();
         Some(Service {
             state: Rc::new(RefCell::new(State {
                 hosts: hosts_table,
@@ -253,8 +259,8 @@ impl Service {
             })),
             ends,
             src_mac: Mac([0u8; 6]),
-            src_ip: Ipv4Addr::new(10, 0, 2, 15),
-            gateway: Ipv4Addr::new(10, 0, 2, 2),
+            src_ip: host.source_address(),
+            gateway: host.gateway().unwrap_or(crate::hostcfg::UNSPECIFIED),
         })
     }
 

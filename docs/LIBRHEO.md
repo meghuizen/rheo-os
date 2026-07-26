@@ -1025,8 +1025,12 @@ What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
   split-irqchip IOAPIC/LAPIC does not re-deliver reliably; documented, honest); the
   **NIC receive line** (rheo-net N2d) is the third interrupt source and splits the
   same way - interrupt-driven on riscv64 (APLIC->IMSIC) and aarch64 (GICv3 SPI),
-  a bounded kernel poll on x86-64 (its virtio-pci NIC is driven through the config
-  tunnel with no mapped BAR for an MSI-X table).
+  **not wired** on x86-64 (its virtio-pci NIC is driven through the config tunnel with
+  no mapped BAR for an MSI-X table). x86-64's receive wait is nevertheless **not a
+  spin**: it borrows the interrupt it *does* have and halts at `hlt` for a 500 us LAPIC
+  slice between receive-queue polls (`net_rx::IdleMode::TimerIdle`, docs/NETSTACK.md
+  16) - a real halt at a low duty cycle, reported as timer-backed and never as
+  NIC-interrupt-driven.
 - **Deferred (documented)**: **real VIRGL/3D + the full display pipeline** (Phase
   H lands the virtio-gpu 2D scanout round-trip - create-2d/attach/set-scanout/
   transfer/flush + `display::Scanout` present; the cursor plane, multi-scanout,

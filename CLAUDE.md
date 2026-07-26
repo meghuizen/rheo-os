@@ -605,14 +605,21 @@ reset**, and finally parks with a 20 ms deadline on an empty queue; asserted are
 reactor wakeup **per** receive (`rt::net_wakeups()` - one park + one wake, never N
 re-polls), a witness strand that ran **while** the receiver was parked, and
 kernel-side `net_rx::irq_count() > 0` + `did_idle()` on the interrupt-driven ISAs.
-Per-ISA honesty: **riscv64** (APLIC-S source `1+slot` in MSI mode -> IMSIC -> `sip.SEIP`)
-and **aarch64** (GICv3 SPI `16+slot`) are genuinely interrupt-driven and halt at
-`wfi` - a real 0%-CPU park; **x86-64 falls back to a bounded kernel poll** (its NIC
-is virtio-*pci* driven through the `VIRTIO_PCI_CAP_PCI_CFG` tunnel with no mapped
-BAR for an MSI-X table, and legacy INTx rides the same QEMU-TCG IOAPIC path that
-does not re-deliver - the cell still parks once, but the CPU spins, and both
-`interrupt_driven()`/`did_idle()` report false). MSI-X through the config tunnel,
-interrupt coalescing, and zero-copy receive are the documented next steps.
+Per-ISA honesty (the wait has **three modes**, chosen by portable logic over the
+`arch` predicates - `net_rx::IdleMode`): **riscv64** (APLIC-S source `1+slot` in MSI
+mode -> IMSIC -> `sip.SEIP`) and **aarch64** (GICv3 SPI `16+slot`) are genuinely
+**NIC-interrupt-driven** and halt at `wfi` - a real 0%-CPU park. **x86-64 has no NIC
+RX interrupt** (its NIC is virtio-*pci* driven through the `VIRTIO_PCI_CAP_PCI_CFG`
+tunnel with no mapped BAR for an MSI-X table, and legacy INTx rides the same QEMU-TCG
+IOAPIC path that does not re-deliver) but it *does* have a genuine LAPIC timer, so its
+wait is a **timer-backed idle** (N4c): poll the receive queue, `hlt` for a **500 us**
+one-shot slice, re-poll - a real halt at ~1% duty cycle, not a spin, with
+`interrupt_driven()` still reporting **false** (only `did_idle()`/`idle_mode()` report
+the halt, so a timer wake is never dressed up as a NIC interrupt). `timeout_ns` is a
+**monotonic deadline in every mode** - `POLL_BUDGET` is only a backstop for an
+indefinite wait on the last-resort poll path and can never truncate a caller's timeout.
+MSI-X through the config tunnel, interrupt coalescing, and zero-copy receive are the
+documented next steps.
 
 **rheo-net N4a** (docs/NETSTACK.md 17) is the **network service cell + concurrent
 fan-out** - the keystone every remaining network scenario rides on (app-protocol
@@ -780,6 +787,54 @@ registries (4 UDP / 4 TCP / 4 ARP); one documented 2 s receive + 3 s connect bou
 fixed); and moving the datapath into the **N4a service cell** awaits N4a's deferred
 name-based rendezvous.
 
+**rheo-net N4c** (docs/NETSTACK.md 20) is **host configuration** - the two questions a
+host must answer before anything works, *who am I on this link* and *what time is it*.
+Four pieces, all ordinary userspace over UDP/ARP, **no kernel object, no new verb, no
+new dependency, no `cfg(target_arch)`**: **`net::hostcfg`**, the host-config store
+(address / netmask / gateway / DNS servers / search domains / hostname / source) owning
+the on-link-vs-gateway `next_hop` decision - `HostConfig::slirp()` is now the **one**
+place QEMU's guest/gateway/resolver addresses are named, and
+`udp::UdpEndpoint::from_host_config` / `dns::Config` / `net::service` read the store
+instead of carrying literals (a link-local claim deliberately **clears** the gateway);
+**`net::dhcp`**, a DHCP client (RFC 2131 - the BOOTP codec + magic cookie + TLV
+options, DISCOVER->OFFER->REQUEST->ACK->BOUND, T1/T2 renewal + rebinding + expiry with
+the RFC defaults and a `T1 > T2` clamp, NAK, DECLINE, RELEASE, and the broadcast
+`0.0.0.0 -> 255.255.255.255` **no-ARP** framing that is the whole special case);
+**`net::zeroconf`**, IPv4 link-local (RFC 3927 - the `0.0.0.0`-sender ARP **probe**,
+conflict re-pick, bounded announce, defend-once-then-yield) plus **mDNS** (RFC 6762
+over the **`dns` codec unchanged** - which is why N4c made that codec
+posture-independent: QU bit, cache-flush bit, TTL-0 goodbye, `.local` scoping, the RFC
+1112 `01:00:5e` MAC mapping); and **`net::ntp`**, an SNTP/NTPv4 client whose answer is
+a **bounded interval** (half-width `delay/2` widened by the server's root distance),
+adjusting a *userspace offset* and never a system clock. Codecs + state machines are
+always compiled; only the four async drivers are `hosted`. The `nethostcfg` test proves
+it on **all three ISAs**: a deterministic **network-free** core (a complete DISCOVER
+byte oracle with every uncovered byte asserted zero, the state-machine walk driven by
+OFFER/ACK from our *own* encoder, renewal/rebind/expiry/NAK, seven rejections each with
+its own error, DECLINE/RELEASE, the store read back by `dns::Config` + `UdpEndpoint`,
+the link-local KAT + conflict protocol, mDNS oracles, and the NTP KAT - offset exactly
+**+250 ms**, delay **1.5 s**, half-width **750 ms**/**1.75 s** - plus nine rejections
+and the KoD backoff), then four **bonus live** phases: SLIRP **does** run a DHCP
+server, so a real DISCOVER->OFFER->REQUEST->ACK yields `10.0.2.15/24` on every ISA
+(reported, never asserted - it is a property of the QEMU backend, and nothing ever
+synthesises a lease), while NTP and mDNS skip-with-reason and the link-local probes go
+out and report *absence of evidence*. N4c also **fixed two real defects**: every live
+wait is now bounded by a **duration** rather than a drain count (a drain is an
+interrupt park on one ISA and a poll on another, so a count meant different things per
+ISA and blew the test budget) - `wire::recv_frame_timeout` -> `net::recv_timeout` ->
+`SYS_WAIT_NET`, with counts that remain counting **frames**, which is what forced the
+kernel wait's deadline-not-spin-count semantics and its timer-backed idle above; and
+`LinkLocal::announce` used to serve both the bounded announcement sequence and an
+unbounded post-claim *defence*, so once claimed it returned a frame forever and a
+driver's `while let Some(f) = ll.announce()` never terminated (announcing and
+`defend()` are now separate, and the boundedness is asserted). The test also asserts
+the kernel's **wait mode** per ISA: `NicInterrupt` + `did_idle()` on riscv64/aarch64
+(3-4 genuine device interrupts per run), `TimerIdle` + `did_idle()` +
+`interrupt_driven() == false` on x86-64. Deferred: DHCPv6/SLAAC, DNS-SD, mDNS
+known-answer suppression + name probing + the RFC timing schedule, IGMP/MLD, PTP/NTS
+and any clock discipline, and running the four clients inside the N4a service cell
+(needs N4a's name-based rendezvous).
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
 proofs, and the hardware-lab performance numbers. **SMP** (docs/SMP.md,
@@ -850,7 +905,9 @@ kernel/       the no_std kernel library + boot demo bin
               bring-up - docs/SMP.md), input
               (kernel RX ring + the SYS_WAIT_INPUT park-until-input primitive -
               docs/LIBRHEO.md Phase D), net_rx (the SYS_WAIT_NET
-              park-until-frame primitive + the NIC RX interrupt sink -
+              park-until-frame primitive + the NIC RX interrupt sink + the three
+              deadline-honouring wait modes: a NIC-interrupt park, a timer-backed
+              idle where only the timer interrupt exists, else a bounded poll -
               docs/NETSTACK.md 16), svc
               (shell/resource/POSIX-file syscalls + the N4b SocketOps
               remote-INET bridge - a FileOps-shaped fn-pointer table a service
@@ -937,7 +994,17 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               known-answer vectors incl. Huffman, the h2 connection (preface,
               SETTINGS, concurrent streams, WINDOW_UPDATE-gated body, RST/PING/
               GOAWAY), and one h1 exchange through the TLS 1.3 record layer with
-              ALPN; pure compute, live GET skipped-with-reason),
+              ALPN; pure compute, live GET skipped-with-reason), nethostcfg
+              (rheo-net N4c: host configuration - the DHCP byte oracle + full
+              state-machine walk (renewal/rebind/expiry/NAK/DECLINE/RELEASE +
+              seven rejections), the hostcfg store read back by dns::Config and
+              udp::UdpEndpoint, IPv4 link-local (0.0.0.0 ARP probe, conflict
+              re-pick, bounded announce, defend-once-then-yield), mDNS over the
+              DNS codec, and the NTP offset/delay KAT as a bounded interval;
+              deterministic core plus four duration-bounded live phases (SLIRP's
+              real DHCP lease reported, NTP/mDNS skip-with-reason) and the
+              per-ISA wait-mode assertion - NIC-interrupt park on riscv64/aarch64,
+              timer-backed idle on x86-64),
               bench-core, and the interactive
               lsh bin (+ harness.rs, vfs_personality.rs, inet_personality.rs -
               the N4b remote-INET datapath registered as svc::SocketOps);
@@ -1001,7 +1068,12 @@ net/          rheo-net: the greenfield network stack as portable userspace
               shard (N2c), crypto (N3a) + tls (N3b, both feature-gated),
               service (N4a: the service-cell framework - one channel end +
               one strand per client, so one service cell serves many clients
-              concurrently), and http1 + http2 (N5a: HTTP/1.1 - a zero-copy,
+              concurrently), hostcfg + dhcp + zeroconf (link-local + mDNS) + ntp
+              (N4c: host configuration - the store the stack reads for its
+              address/netmask/gateway/resolvers/search domains, a DHCP client, RFC
+              3927 link-local, mDNS over the dns codec unchanged, and an SNTP
+              client whose answer is a bounded interval; docs/NETSTACK.md 20),
+              and http1 + http2 (N5a: HTTP/1.1 - a zero-copy,
               smuggling-hardened codec + chunked framing + a transport-agnostic
               Client/Server; HTTP/2 - frames, streams, both flow-control levels,
               and HPACK with the RFC-generated Appendix B Huffman table - both in
@@ -1011,7 +1083,8 @@ net/          rheo-net: the greenfield network stack as portable userspace
               only), which is what links beside a *kernel* for the N4b
               SocketOps bridge (docs/NETSTACK.md 18).
               Plus the netcore/netl4/netdns/nettrace/netlocal/
-              nettcp/nettcpcc/netsmoltcp/netcrypto/nettls/nethttp demo bins and
+              nettcp/nettcpcc/netsmoltcp/netcrypto/nettls/nethttp/nethostcfg
+              demo bins and
               netsvc-demo + netsvc-client (the N4a service + its clients)
 json/         rheo-json: a dependency-free, zero-copy JSON parser (scalar +
               SSE2 string-scan), no_std, host-tested + benchmarked
