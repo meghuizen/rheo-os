@@ -485,6 +485,10 @@ fn main() -> ExitCode {
     let mut arches = vec![Arch::X86_64];
     let mut release = false;
     let mut bin = String::from("kernel");
+    // Set only when `--bin` is passed explicitly, so `test` can tell "run just
+    // this kernel" apart from the `run` default (which is also a valid kernel
+    // name). Without this, `test --bin <name>` silently booted all of them.
+    let mut bin_filter: Option<String> = None;
     let mut iter = args[1..].iter();
     while let Some(flag) = iter.next() {
         match flag.as_str() {
@@ -510,6 +514,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 };
                 bin = value.clone();
+                bin_filter = Some(value.clone());
             }
             "--release" => release = true,
             other => {
@@ -533,12 +538,27 @@ fn main() -> ExitCode {
         // calls (debug builds insert pointer-check panics that land in
         // unmapped kernel .text), and optimized path lengths are the
         // system's real numbers anyway.
-        "test" => arches.iter().all(|&a| {
-            build(a, true)
-                && TEST_KERNELS
-                    .iter()
-                    .all(|kernel| boot_expect_pass(a, true, kernel, extra_qemu_args(a, kernel)))
-        }),
+        // `--bin <kernel>` boots only that one (fast iteration on a single
+        // subsystem); without it the whole matrix runs.
+        "test" => {
+            let kernels: Vec<&str> = match &bin_filter {
+                None => TEST_KERNELS.to_vec(),
+                Some(name) => {
+                    if !TEST_KERNELS.contains(&name.as_str()) {
+                        eprintln!("error: unknown test kernel '{name}'");
+                        eprintln!("known: {}", TEST_KERNELS.join(", "));
+                        return ExitCode::FAILURE;
+                    }
+                    vec![name.as_str()]
+                }
+            };
+            arches.iter().all(|&a| {
+                build(a, true)
+                    && kernels
+                        .iter()
+                        .all(|kernel| boot_expect_pass(a, true, kernel, extra_qemu_args(a, kernel)))
+            })
+        }
         // Benchmarks always run the release build: instruction path
         // lengths of an unoptimized kernel are not the system's numbers.
         "bench" => arches.iter().all(|&a| build(a, true) && bench(a, true)),
