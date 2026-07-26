@@ -63,24 +63,43 @@ pub struct Reactor {
     wait_req: Option<(u64, u64)>,
     /// Exit code the last serviced child wait returned.
     wait_code: u64,
-    /// The cross-cell channel this cell drives, if [`attach_channel`] bound one
-    /// (docs/LIBRHEO.md Phase J): `(ring overlay, role, cap id)`. Unlike the
-    /// kernel queue, the kernel never drains this - the two cells drive the SPSC
+    /// The cross-cell channels this cell drives, one per [`attach_channel_slot`]
+    /// binding (docs/LIBRHEO.md Phase J; the multi-slot fan-out is
+    /// docs/NETSTACK.md the service-cell section, rheo-net N4a). Slot 0 is the
+    /// Phase E/J channel; a **service cell** binds one slot per client and runs one
+    /// strand per slot, which is what serves N clients concurrently. Unlike the
+    /// kernel queue, the kernel never drains these - the two cells drive the SPSC
     /// rings directly over the shared frames, so the symmetric async
-    /// `Sender`/`Receiver` parks on the reactor and the idle path hands the CPU
-    /// to the peer (the one cooperative cell-boundary switch that remains under
-    /// the single-CPU model - the *in-cell* wait is a genuine park, not a spin).
-    chan: Option<(Qp, u64, u32)>,
-    /// A strand parked in `chan_recv` (its token), and the message the reactor
-    /// delivered once it was available.
-    chan_recv_req: Option<u64>,
-    chan_recv_msg: Option<(u64, u32)>,
+    /// `Sender`/`Receiver` parks on the reactor and the idle path hands the CPU to
+    /// the next runnable cell (the one cooperative cell-boundary switch that remains
+    /// under the single-CPU model - the *in-cell* wait is a genuine park, not a spin).
+    chans: [Option<ChanSlot>; MAX_CHANNELS],
+    /// High-water mark of how many channel slots held an unconsumed inbound message
+    /// at the same instant (docs/NETSTACK.md rheo-net N4a): the service's
+    /// concurrency witness - N means all N clients' requests were in flight at once.
+    chan_max_pending: usize,
+}
+
+/// How many cross-cell channel ends one cell's reactor can drive. Matches the
+/// kernel's `MAX_CELL_CHANNELS` (kernel/src/abi.rs).
+pub const MAX_CHANNELS: usize = 4;
+
+/// One bound cross-cell channel end plus the strand state parked on it
+/// (docs/NETSTACK.md the service-cell section, rheo-net N4a).
+struct ChanSlot {
+    qp: Qp,
+    role: u64,
+    cap_id: u32,
+    /// A strand parked in `chan_recv` on this end (its token), and the message
+    /// the reactor delivered once it was available.
+    recv_req: Option<u64>,
+    recv_msg: Option<(u64, u32)>,
     /// A strand parked in `chan_send` because the ring was momentarily full
     /// (message + token). Woken when the peer drains space.
-    chan_send_req: Option<(u64, u32, u64)>,
-    /// Count of channel-recv deliveries the reactor drove (park -> peer switch ->
+    send_req: Option<(u64, u32, u64)>,
+    /// Count of recv deliveries the reactor drove on this end (park -> hand-off ->
     /// wake). Proof the wait is a genuine reactor park, not a busy switch spin.
-    chan_wakeups: u64,
+    wakeups: u64,
 }
 
 impl Reactor {
@@ -198,16 +217,16 @@ impl Reactor {
         self.net_rx_n
     }
 
-    /// Enqueue `(tag, val)` on this end's producer ring (the client's SQ, the
-    /// server's CQ). `false` if the ring is momentarily full.
-    fn chan_produce(&self, tag: u64, val: u32) -> bool {
-        let Some((qp, role, cap_id)) = self.chan.as_ref() else {
+    /// Enqueue `(tag, val)` on channel `slot`'s producer ring (the client's SQ,
+    /// the server's CQ). `false` if the ring is momentarily full or unbound.
+    fn chan_produce(&self, slot: usize, tag: u64, val: u32) -> bool {
+        let Some(c) = self.chans.get(slot).and_then(|c| c.as_ref()) else {
             return false;
         };
-        if *role == CHAN_ROLE_CLIENT {
-            qp.submit(sys::OP_CHAN_MSG, 0, *cap_id, 0, tag, &val.to_le_bytes())
+        if c.role == CHAN_ROLE_CLIENT {
+            c.qp.submit(sys::OP_CHAN_MSG, 0, c.cap_id, 0, tag, &val.to_le_bytes())
         } else {
-            qp.cq_push(CqEntry {
+            c.qp.cq_push(CqEntry {
                 flow_id: 0,
                 user_data: tag,
                 status: sys::STATUS_OK,
@@ -216,18 +235,28 @@ impl Reactor {
         }
     }
 
-    /// Dequeue one `(tag, val)` from this end's consumer ring (the client's CQ,
-    /// the server's SQ), or `None` if empty.
-    fn chan_consume(&self) -> Option<(u64, u32)> {
-        let (qp, role, _) = self.chan.as_ref()?;
-        if *role == CHAN_ROLE_CLIENT {
-            qp.reap().map(|e| (e.user_data, e.result))
+    /// Dequeue one `(tag, val)` from channel `slot`'s consumer ring (the client's
+    /// CQ, the server's SQ), or `None` if empty.
+    fn chan_consume(&self, slot: usize) -> Option<(u64, u32)> {
+        let c = self.chans.get(slot).and_then(|c| c.as_ref())?;
+        if c.role == CHAN_ROLE_CLIENT {
+            c.qp.reap().map(|e| (e.user_data, e.result))
         } else {
-            qp.sq_pop().map(|e| {
+            c.qp.sq_pop().map(|e| {
                 let mut b = [0u8; 4];
                 b.copy_from_slice(&e.payload[0..4]);
                 (e.user_data, u32::from_le_bytes(b))
             })
+        }
+    }
+
+    /// Whether channel `slot` has an unconsumed inbound message - a
+    /// non-destructive peek (docs/NETSTACK.md rheo-net N4a).
+    fn chan_inbound(&self, slot: usize) -> bool {
+        match self.chans.get(slot).and_then(|c| c.as_ref()) {
+            Some(c) if c.role == CHAN_ROLE_CLIENT => c.qp.cq_pending(),
+            Some(c) => c.qp.sq_pending(),
+            None => false,
         }
     }
 
@@ -239,29 +268,54 @@ impl Reactor {
     /// only the cell-boundary hand-off is a cooperative switch. Returns whether it
     /// made progress (a delivery, or a hand-off to the peer).
     fn service_channel(&mut self) -> bool {
-        if self.chan.is_none() {
+        if self.chans.iter().all(|c| c.is_none()) {
             return false;
         }
-        if let Some(token) = self.chan_recv_req
-            && let Some(m) = self.chan_consume()
-        {
-            self.chan_recv_msg = Some(m);
-            self.chan_recv_req = None;
-            self.chan_wakeups += 1;
-            complete(token);
-            return true;
+        // Concurrency witness: how many ends hold an inbound message right now.
+        let pending = (0..MAX_CHANNELS).filter(|&s| self.chan_inbound(s)).count();
+        if pending > self.chan_max_pending {
+            self.chan_max_pending = pending;
         }
-        if let Some((tag, val, token)) = self.chan_send_req
-            && self.chan_produce(tag, val)
-        {
-            self.chan_send_req = None;
-            complete(token);
-            return true;
+        // Deliver / complete one slot per pass, scanning slots in order - that
+        // round-robins the per-client strands of a service cell.
+        for slot in 0..MAX_CHANNELS {
+            let Some(token) = self.chans[slot].as_ref().and_then(|c| c.recv_req) else {
+                continue;
+            };
+            if let Some(m) = self.chan_consume(slot) {
+                let c = self.chans[slot].as_mut().expect("channel slot bound");
+                c.recv_msg = Some(m);
+                c.recv_req = None;
+                c.wakeups += 1;
+                complete(token);
+                return true;
+            }
         }
-        // Nothing satisfiable locally: hand the CPU to the peer, then let the next
-        // `block_on` pass re-check (the peer will have produced/consumed).
-        if self.chan_recv_req.is_some() || self.chan_send_req.is_some() {
-            sys::switch();
+        for slot in 0..MAX_CHANNELS {
+            let Some((tag, val, token)) = self.chans[slot].as_ref().and_then(|c| c.send_req) else {
+                continue;
+            };
+            if self.chan_produce(slot, tag, val) {
+                self.chans[slot]
+                    .as_mut()
+                    .expect("channel slot bound")
+                    .send_req = None;
+                complete(token);
+                return true;
+            }
+        }
+        // Nothing satisfiable locally: hand the CPU to the next runnable cell, then
+        // let the next `block_on` pass re-check (a peer will have produced or
+        // consumed). `yield_cell` is the round-robin generalisation of the Phase E
+        // `cur^1` switch - with one peer it *is* that switch (docs/NETSTACK.md the
+        // service-cell section, rheo-net N4a).
+        if self
+            .chans
+            .iter()
+            .flatten()
+            .any(|c| c.recv_req.is_some() || c.send_req.is_some())
+        {
+            sys::yield_cell();
             return true;
         }
         false
@@ -308,11 +362,8 @@ pub fn init(caps: &CapSet, qp_va: u64) {
         net_rx_req: None,
         net_rx_n: 0,
         net_wakeups: 0,
-        chan: None,
-        chan_recv_req: None,
-        chan_recv_msg: None,
-        chan_send_req: None,
-        chan_wakeups: 0,
+        chans: [const { None }; MAX_CHANNELS],
+        chan_max_pending: 0,
     };
     // SAFETY: single-CPU cooperative cell; init runs once before any strand.
     unsafe {
@@ -386,21 +437,69 @@ pub async fn sleep_ns(deadline_ns: u64) {
 /// `chan_va` must be this cell's mapped, kernel-initialised shared ring region
 /// (the same frames the peer maps). `Qp::attach` panics on an ABI mismatch.
 pub fn attach_channel(chan_va: u64, role: u64, cap_id: u32) {
+    attach_channel_slot(0, chan_va, role, cap_id);
+}
+
+/// Bind channel end `slot` of this cell to the reactor (docs/NETSTACK.md the
+/// service-cell section, rheo-net N4a). Slot 0 is [`attach_channel`]'s Phase E/J
+/// channel; a **service cell** binds one slot per client and drives them
+/// concurrently, one parked strand each. `ipc::Channel::split` calls this with the
+/// slot the channel was opened at.
+///
+/// # Safety note
+/// `chan_va` must be this cell's mapped, kernel-initialised shared ring region for
+/// that slot (the same frames the peer maps). `Qp::attach` panics on an ABI mismatch.
+pub fn attach_channel_slot(slot: usize, chan_va: u64, role: u64, cap_id: u32) {
+    assert!(slot < MAX_CHANNELS, "librheo: channel slot out of range");
     // SAFETY: `chan_va` is the cell's mapped channel region (see the contract).
     let qp = unsafe { Qp::attach(chan_va as *mut u8) };
-    with_reactor(|r| r.chan = Some((qp, role, cap_id)));
+    with_reactor(|r| {
+        r.chans[slot] = Some(ChanSlot {
+            qp,
+            role,
+            cap_id,
+            recv_req: None,
+            recv_msg: None,
+            send_req: None,
+            wakeups: 0,
+        })
+    });
 }
 
-/// Whether a cross-cell channel is bound to this cell's reactor.
+/// Whether a cross-cell channel is bound to this cell's reactor (slot 0).
 pub fn chan_attached() -> bool {
-    with_reactor(|r| r.chan.is_some())
+    chan_attached_slot(0)
 }
 
-/// How many channel receives the reactor delivered by a genuine park -> peer
-/// switch -> wake (docs/LIBRHEO.md Phase J). A busy-switch spin would never
-/// touch this; a proof the async receiver actually parked.
+/// Whether channel `slot` is bound to this cell's reactor.
+pub fn chan_attached_slot(slot: usize) -> bool {
+    with_reactor(|r| r.chans.get(slot).is_some_and(|c| c.is_some()))
+}
+
+/// How many channel receives the reactor delivered by a genuine park -> hand-off
+/// -> wake, summed over every bound end (docs/LIBRHEO.md Phase J). A busy-switch
+/// spin would never touch this; a proof the async receivers actually parked.
 pub fn chan_wakeups() -> u64 {
-    with_reactor(|r| r.chan_wakeups)
+    with_reactor(|r| r.chans.iter().flatten().map(|c| c.wakeups).sum())
+}
+
+/// Reactor-driven receive deliveries on channel `slot` alone - the per-client
+/// wakeup count a service asserts (docs/NETSTACK.md rheo-net N4a).
+pub fn chan_wakeups_on(slot: usize) -> u64 {
+    with_reactor(|r| {
+        r.chans
+            .get(slot)
+            .and_then(|c| c.as_ref())
+            .map_or(0, |c| c.wakeups)
+    })
+}
+
+/// The high-water mark of how many channel ends held an unconsumed inbound
+/// message at the same instant (docs/NETSTACK.md the service-cell section,
+/// rheo-net N4a). For a service serving N clients, reaching N proves all N
+/// requests were genuinely in flight together - the concurrency witness.
+pub fn chan_max_pending() -> usize {
+    with_reactor(|r| r.chan_max_pending)
 }
 
 /// Send `(tag, val)` to the peer cell over the async channel (docs/LIBRHEO.md
@@ -408,11 +507,20 @@ pub fn chan_wakeups() -> u64 {
 /// parks until the reactor drains space (the peer consuming). `ipc::AsyncSender`
 /// wraps this.
 pub async fn chan_send(tag: u64, val: u32) {
-    if with_reactor(|r| r.chan_produce(tag, val)) {
+    chan_send_on(0, tag, val).await
+}
+
+/// [`chan_send`] on channel `slot` (docs/NETSTACK.md rheo-net N4a).
+pub async fn chan_send_on(slot: usize, tag: u64, val: u32) {
+    if with_reactor(|r| r.chan_produce(slot, tag, val)) {
         return;
     }
     let token = next_token();
-    with_reactor(|r| r.chan_send_req = Some((tag, val, token)));
+    with_reactor(|r| {
+        if let Some(c) = r.chans[slot].as_mut() {
+            c.send_req = Some((tag, val, token));
+        }
+    });
     park_on(token).await;
 }
 
@@ -423,10 +531,22 @@ pub async fn chan_send(tag: u64, val: u32) {
 /// so an idle receiver costs no spin and every message is a reactor wake.
 /// `ipc::AsyncReceiver` wraps this.
 pub async fn chan_recv() -> (u64, u32) {
+    chan_recv_on(0).await
+}
+
+/// [`chan_recv`] on channel `slot` (docs/NETSTACK.md the service-cell section,
+/// rheo-net N4a). A service cell runs one strand per slot, each parked here; the
+/// reactor scans the slots in order, so the strands round-robin.
+pub async fn chan_recv_on(slot: usize) -> (u64, u32) {
     let token = next_token();
-    with_reactor(|r| r.chan_recv_req = Some(token));
+    with_reactor(|r| {
+        if let Some(c) = r.chans[slot].as_mut() {
+            c.recv_req = Some(token);
+        }
+    });
     park_on(token).await;
-    with_reactor(|r| r.chan_recv_msg.take()).expect("librheo: channel recv woke with no message")
+    with_reactor(|r| r.chans[slot].as_mut().and_then(|c| c.recv_msg.take()))
+        .expect("librheo: channel recv woke with no message")
 }
 
 /// Block-and-wake network receive: register a request, park until the reactor

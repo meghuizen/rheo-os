@@ -225,6 +225,16 @@ reserve/release; arm timer/doorbell; checkpoint/restore (DRBG state and sealed
 shared objects excluded from images by rule); attest; plus delivery of
 pressure, revocation, lease-expiry, and completion events.
 
+Cell scheduling on one CPU is part of the **create/destroy cell** verb, not a
+verb of its own: the native cooperative hand-offs (`SYS_SWITCH`, a directed
+`cur^1` switch; `SYS_YIELD`, its round-robin generalisation added for service
+fan-out, docs/NETSTACK.md 17) are pure mechanism over object 1 with policy
+outside - who runs next is a fixed round-robin, and a hand-off transfers no
+authority (the cells share one capability bundle). They pass section 6 on the same
+grounds as the address-space switch they wrap: a cell cannot switch its own page
+tables, and the CPU is shared hardware. Preemptive multi-core scheduling (SMP,
+task #27) is still ahead of the design here.
+
 Everything else in this document is **composition** of these by cells.
 
 ---

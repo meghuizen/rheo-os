@@ -17,7 +17,7 @@
 //! cell yields only at a syscall boundary. The pre-existing native `run` /
 //! `SYS_SWITCH` path is untouched - a cell that never spawns has no entry here.
 
-use crate::abi::FAULT_EXIT;
+use crate::abi::{FAULT_EXIT, SPAWN_CHAN_SLOT};
 use crate::arch::{self, TrapFrame};
 use crate::capability::{BUDGET_UNLIMITED, ObjectKind, ObjectTable, READ, WRITE};
 use crate::load;
@@ -110,21 +110,28 @@ fn ensure_top(cell: usize) {
 
 // -------------------------------------------------------------------- spawn
 
-/// `SYS_SPAWN(path_va, path_len, argv_va, envp_va)`: load the ELF at `path` from
-/// the VFS into a new native cell, build its initial stack from the caller's
-/// argv/envp, map it a queue pair + mint a queue capability into the shared
-/// bundle, and record the caller as parent. Returns the child's handle (its cell
-/// index) or `u64::MAX` on failure. Gated by the cell-spawn capability.
+/// `SYS_SPAWN(path_va, path_len, argv_va, envp_va, chan_spec)`: load the ELF at
+/// `path` from the VFS into a new native cell, build its initial stack from the
+/// caller's argv/envp, map it a queue pair + mint a queue capability into the
+/// shared bundle, and record the caller as parent. Returns the child's handle (its
+/// cell index) or `u64::MAX` on failure. Gated by the cell-spawn capability.
+///
+/// `chan_spec` picks which of the caller's channel ends the child inherits: 0 =
+/// the Phase J default (slot 0 if wired), else `SPAWN_CHAN_SLOT | slot << 8`
+/// (docs/NETSTACK.md the service-cell section, rheo-net N4a) - a **service cell**
+/// spawns client k with its own slot k, so each client gets a private ring.
 ///
 /// Reading the caller's `frame` (for its kernel SP, shared by the cooperative
 /// child) is the point of the call.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     cur: usize,
     path_va: u64,
     path_len: u64,
     argv_va: u64,
     envp_va: u64,
+    chan_spec: u64,
     frame: *mut TrapFrame,
 ) -> u64 {
     // Cell-spawn authority: the caller must hold an ObjectKind::Cell capability
@@ -199,22 +206,34 @@ pub fn spawn(
         }
     };
 
-    // Inherit the parent's cross-cell channel, if it has one (docs/LIBRHEO.md
-    // Phase J): map the same channel frames into the child RW and mint a channel
-    // capability into the shared bundle, so a spawned child streams its output to
-    // the parent over the Phase E channel (a spawned pipeline stage). The child
-    // gets the **opposite** role (parent consumer <-> child producer). Only a
-    // parent that holds a channel triggers this - an ordinary spawn is unchanged.
-    let (p_chan_va, p_role) = user::cell_chan(cur);
+    // Inherit one of the parent's cross-cell channels (docs/LIBRHEO.md Phase J;
+    // the slot selector is docs/NETSTACK.md rheo-net N4a): map the same channel
+    // frames into the child RW and mint a channel capability into the shared
+    // bundle, so a spawned child streams over the Phase E channel (a spawned
+    // pipeline stage, or a service's client). The child gets the **opposite** role
+    // (parent consumer <-> child producer) at its own **slot 0**, so a client
+    // binary is slot-agnostic. Only a parent that holds that channel triggers
+    // this - an ordinary spawn (`chan_spec` 0, no slot-0 channel) is unchanged.
+    let want_slot = if chan_spec & SPAWN_CHAN_SLOT != 0 {
+        ((chan_spec >> 8) & 0xff) as usize
+    } else {
+        0
+    };
+    let (p_chan_va, p_role) = user::cell_chan_slot(cur, want_slot);
+    if chan_spec & SPAWN_CHAN_SLOT != 0 && p_chan_va == 0 {
+        return u64::MAX; // an explicit slot request must name a wired channel
+    }
     let child_chan = if p_chan_va != 0 {
         // SAFETY: single CPU; the parent's address space is read (a page-table
         // walk) and the child's is edited (published when the child is switched
         // to). Both are uniquely owned for the trap.
+        let child_chan_va = load::channel_slot_va(0) as u64;
         let n = unsafe {
             (*user::cell_aspace(cur)).share_rw_into(
                 &mut child_aspace,
                 p_chan_va as usize,
                 QueuePair::REGION_SIZE,
+                child_chan_va as usize,
             )
         };
         if n == 0 {
@@ -233,7 +252,7 @@ pub fn spawn(
                     Err(_) => return u64::MAX,
                 }
             };
-            Some((p_chan_va, cap, p_role ^ 1))
+            Some((child_chan_va, cap, p_role ^ 1))
         }
     } else {
         None
@@ -359,6 +378,43 @@ pub fn wait(cur: usize, handle: u64, _frame: *mut TrapFrame) -> Sched {
     procs()[cur].state = PState::Blocked;
     procs()[cur].wait_for = child;
     Sched::Switch(reschedule(cur))
+}
+
+// ---------------------------------------------------------------------- yield
+
+/// `SYS_YIELD()`: hand the CPU to the **next runnable native cell** in
+/// round-robin order; the caller stays runnable (docs/NETSTACK.md the service-cell
+/// section, rheo-net N4a). This is the N-cell generalisation of `SYS_SWITCH`'s
+/// directed `cur^1` hand-off, which cannot reach client 3 from client 2 and so
+/// livelocks a service serving N>1 clients. It adds **no kernel object**: it is the
+/// same cooperative cross-cell scheduler `SYS_WAIT`/child-exit already drive
+/// (`reschedule` above), exposed as a plain yield, and transfers no authority -
+/// the cells involved share one capability bundle.
+///
+/// Where the caller has no native process tree (two cells a test kernel wired but
+/// never spawned - Phase E/J), the round-robin degenerates to the `cur^1` peer and
+/// behaviour is unchanged. Returns `Sched::Ret(0)` when the caller is the only
+/// schedulable cell (yield to nobody = resume).
+pub fn yield_cell(cur: usize) -> Sched {
+    let Some(next) = (1..MAX_CELLS)
+        .map(|k| (cur + k) % MAX_CELLS)
+        .find(|&i| schedulable(i))
+    else {
+        return Sched::Ret(0);
+    };
+    user::switch_to_cell(next);
+    complete_block(next);
+    Sched::Switch(user::cell_frame(next))
+}
+
+/// Whether cell `i` can be resumed by a yield: present, native, and either a
+/// runnable member of a native process tree or a cell with no tree state at all
+/// (an installed Phase E/J peer, whose `Proc` slot is `Free`). A `Blocked` waiter
+/// or a `Zombie` is skipped - `reschedule` owns waking those.
+fn schedulable(i: usize) -> bool {
+    user::cell_present(i)
+        && user::cell_is_native(i)
+        && matches!(procs()[i].state, PState::Free | PState::Runnable)
 }
 
 /// Reap zombie child `z`: free its cell slot and kernel-owned storage, and

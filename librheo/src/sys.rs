@@ -69,6 +69,11 @@ pub const SYS_SPAWN: u64 = 45;
 pub const SYS_WAIT: u64 = 46;
 /// arm_timer(deadline_ns) -> 0. Block until `deadline_ns` monotonic ns elapse.
 pub const SYS_ARM_TIMER: u64 = 47;
+/// yield_cell() -> 0. Hand the CPU to the next runnable native cell (round-robin;
+/// falls back to the `cur^1` peer where there is no process tree). The N-cell
+/// generalisation of `SYS_SWITCH`, needed for service fan-out (docs/NETSTACK.md
+/// the service-cell section, rheo-net N4a).
+pub const SYS_YIELD: u64 = 49;
 /// wait_net(buf_va, len, timeout_ns) -> frame_len. Block until a received Ethernet
 /// frame is available; copy up to `len` bytes into `buf` and return the frame
 /// length (0 = gave up / timed out). `timeout_ns` 0 waits indefinitely. The network
@@ -313,16 +318,39 @@ pub fn exit(code: u64) -> ! {
 pub fn switch() {
     unsafe { syscall1(SYS_SWITCH, 0) };
 }
-/// Discover this cell's cross-cell shared-channel end. `Some(ChannelInfo)` or
-/// `None` if no channel is wired.
-pub fn connect() -> Option<ChannelInfo> {
+/// Discover this cell's cross-cell shared-channel end in `slot`.
+/// `Some(ChannelInfo)` or `None` if that slot holds no channel. Slot 0 is the
+/// Phase E/J channel; a **service cell** holds one slot per client
+/// (docs/NETSTACK.md the service-cell section, rheo-net N4a).
+pub fn connect_slot(slot: usize) -> Option<ChannelInfo> {
     let mut info = ChannelInfo {
         chan_va: 0,
         cap_id: 0,
         role: 0,
+        count: 0,
     };
-    let r = unsafe { syscall1(SYS_CONNECT, &mut info as *mut ChannelInfo as u64) };
+    let r = unsafe {
+        syscall2(
+            SYS_CONNECT,
+            &mut info as *mut ChannelInfo as u64,
+            slot as u64,
+        )
+    };
     if r == u64::MAX { None } else { Some(info) }
+}
+
+/// Discover this cell's channel end at slot 0 (the Phase E/J channel).
+pub fn connect() -> Option<ChannelInfo> {
+    connect_slot(0)
+}
+
+/// Hand the CPU to the **next runnable native cell** in round-robin order; the
+/// caller stays runnable (docs/NETSTACK.md the service-cell section, rheo-net
+/// N4a). With no native process tree this is the `cur^1` [`switch`]. The reactor's
+/// channel idle path uses it so a service and N clients all get the CPU - an XOR
+/// hand-off cannot reach client 3 from client 2.
+pub fn yield_cell() {
+    unsafe { syscall1(SYS_YIELD, 0) };
 }
 /// Delegate a sealed grant (`cap_id`) to the peer cell; fills a `ShareInfo` at
 /// `out_va`. Returns 0 or `u64::MAX`.
@@ -336,7 +364,24 @@ pub fn write(fd: u64, buf_va: u64, len: u64) -> i64 {
 /// pointer arrays). Returns the child handle, or `u64::MAX` on failure (no
 /// spawn capability, ELF not found, cell table full). See `proc::spawn`.
 pub fn spawn(path_va: u64, path_len: u64, argv_va: u64, envp_va: u64) -> u64 {
-    unsafe { syscall4(SYS_SPAWN, path_va, path_len, argv_va, envp_va) }
+    spawn_chan(path_va, path_len, argv_va, envp_va, 0)
+}
+
+/// `SYS_SPAWN` `chan_spec` flag: inherit the caller's channel slot named in bits
+/// 15:8 instead of slot 0 (kernel/src/abi.rs `SPAWN_CHAN_SLOT`).
+pub const SPAWN_CHAN_SLOT: u64 = 1 << 0;
+
+/// Build a `chan_spec` naming the caller's channel `slot`.
+pub const fn spawn_chan_spec(slot: usize) -> u64 {
+    SPAWN_CHAN_SLOT | ((slot as u64) << 8)
+}
+
+/// Spawn like [`spawn`], with `chan_spec` naming which of this cell's channel
+/// ends the child inherits (docs/NETSTACK.md the service-cell section, rheo-net
+/// N4a): 0 = slot 0 (the Phase J default), else [`spawn_chan_spec`]. The child
+/// always receives it at its own slot 0 with the opposite role.
+pub fn spawn_chan(path_va: u64, path_len: u64, argv_va: u64, envp_va: u64, chan_spec: u64) -> u64 {
+    unsafe { syscall5(SYS_SPAWN, path_va, path_len, argv_va, envp_va, chan_spec) }
 }
 /// Wait for the child named by `handle`; returns its exit code, or `u64::MAX` if
 /// it names no child. Blocks cooperatively (the caller's other strands run).
@@ -455,6 +500,9 @@ pub struct ChannelInfo {
     pub cap_id: u64,
     /// 0 = initiator (client), 1 = acceptor (server).
     pub role: u64,
+    /// How many channel slots this cell holds (docs/NETSTACK.md the service-cell
+    /// section, rheo-net N4a): 1 for a Phase E/J cell, N for a service cell.
+    pub count: u64,
 }
 
 /// The `SYS_GRANT_SHARE` result block (kernel/src/abi.rs `ShareInfo`).
@@ -653,6 +701,26 @@ impl Qp {
         unsafe { core::ptr::write_volatile(self.cq_entries().add(idx), e) };
         cq_head.store(head.wrapping_add(1), Ordering::Release);
         true
+    }
+
+    /// Whether the SQ holds an unconsumed entry - a **non-destructive** peek used
+    /// by a service cell to measure how many client requests are in flight at once
+    /// (docs/NETSTACK.md the service-cell section, rheo-net N4a). Reads the same
+    /// two shared indices `sq_pop` does, and pops nothing.
+    pub fn sq_pending(&self) -> bool {
+        let h = self.header();
+        // SAFETY: the header lives at the region base for the overlay's life.
+        let (sq_head, sq_tail) = unsafe { (&(*h).sq_head, &(*h).sq_tail) };
+        sq_tail.load(Ordering::Relaxed) != sq_head.load(Ordering::Acquire)
+    }
+
+    /// Whether the CQ holds an unconsumed entry - the [`sq_pending`](Self::sq_pending)
+    /// twin for the other ring direction.
+    pub fn cq_pending(&self) -> bool {
+        let h = self.header();
+        // SAFETY: as above.
+        let (cq_head, cq_tail) = unsafe { (&(*h).cq_head, &(*h).cq_tail) };
+        cq_tail.load(Ordering::Relaxed) != cq_head.load(Ordering::Acquire)
     }
 
     /// Pop one completion, or None if the completion ring is empty.

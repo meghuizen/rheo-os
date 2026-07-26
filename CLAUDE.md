@@ -614,6 +614,59 @@ does not re-deliver - the cell still parks once, but the CPU spins, and both
 `interrupt_driven()`/`did_idle()` report false). MSI-X through the config tunnel,
 interrupt coalescing, and zero-copy receive are the documented next steps.
 
+**rheo-net N4a** (docs/NETSTACK.md 17) is the **network service cell + concurrent
+fan-out** - the keystone every remaining network scenario rides on (app-protocol
+servers, the remote-INET bridge for Linux binaries = **N4b**, onion routing,
+DHCP/zeroconf/NTP). Doctrine puts the stack in userspace, so a long-lived **service
+cell** must serve **many** client cells; Phase E only proved one-to-one. Two hard
+blockers had to go: a cell held **exactly one** channel end (three spawned children
+would all inherit the *same* ring - a race, not a fan-out), and `SYS_SWITCH` is a
+*directed* `cur^1` hand-off (from client cell 2 it reaches cell 3, never the service
+at cell 0 - a livelock). N4a takes the **minimal mechanism extension** of the existing
+spawn/channel path - **no new kernel object**, everything composing Cell (object 1)
+with QueuePair (object 3), exactly the L6-pipe / Phase-J precedents: a **per-cell
+channel table** (`MAX_CELL_CHANNELS` = 4, a fixed static array - the kernel stays
+allocation-free), each slot its own ring region at `channel_slot_va(slot)`, with
+`SYS_CONNECT(out, slot)` gaining the slot argument + a `count`; **`SYS_SPAWN` gaining
+a `chan_spec`** (`SPAWN_CHAN_SLOT | slot << 8` = hand the child the caller's slot
+`slot`, always landing at the child's **own slot 0** so a client binary is
+slot-agnostic; `chan_spec` 0 is the byte-for-byte Phase J default, and
+`AddressSpace::share_rw_into` gained the matching `dst_base`); and **`SYS_YIELD`
+(49)** - hand the CPU to the next runnable native cell, round-robin, the caller
+staying runnable. `SYS_YIELD` is the same cooperative cross-cell scheduler
+`SYS_WAIT`/child-exit already drive (`kernel/src/nproc.rs`) exposed as a plain yield,
+transfers no authority (one capability bundle), and **degenerates to `cur^1`** where
+the caller has no native process tree, so the Phase E/J two-cell path is unchanged;
+the reactor's channel idle path now uses it. On top, `net::service` ships the
+framework: a **`Service`** binding one channel end per client and running **one
+strand per client** (each parked on its own `AsyncReceiver`; the reactor scans slots
+in order, which is what round-robins them), a thin **`Client`** for the spawned cell,
+and a word-wide protocol (`Request { op, client, seq }` packed in the message tag,
+argument/result in its `u32`): `OP_ECHO` (a per-client keyed transform), `OP_RESOLVE`
+(a catalogue name id -> an IPv4, answered from the **network-free** tiers of
+`net::dns` - a `HostsTable` + a TTL `Cache`), `OP_BYE`. librheo gained per-slot
+reactor channels (`attach_channel_slot`, `chan_send_on`/`chan_recv_on`),
+`ipc::Channel::open_slot`, `proc::spawn_on_channel`, and two witnesses -
+`rt::chan_wakeups_on(slot)` + `rt::chan_max_pending()` (over a new **non-destructive**
+`Qp::sq_pending`/`cq_pending` peek). The `netservice` test proves it on **all three
+ISAs**: one service cell serves **three** client cells, each over its **own** channel,
+and exits `0x42` only if every client got its **distinct correct** response (each
+predicts its echo + its own name `10.1.1.1`/`10.2.2.2`/`10.3.3.3` and exits `id+1`,
+codes asserted `1,2,3` - so each was really reaped), `served == [4,3,3]`, the
+**interleave witness** `order == [0,1,2, 0,1,2, 0,1,2, 0]` (strand k reaches round r
+only after strands `0..k` did - no strand monopolised the vcore), the **in-flight
+witness** `max_in_flight == 3` (all three requests queued at the same instant, before
+the first reply), and `wakeups == [4,3,3]` (one genuine reactor park+wake per message,
+never a spin). The core is **deterministic and network-free**; a **bonus live** ARP for
+the SLIRP gateway, performed *inside client 0's serving strand* (parking on the wire
+per N2d while siblings run), resolves on all three ISAs and **degrades honestly** to
+`REPLY_NONE` with no NIC. Honest: **concurrent, not parallel** (one CPU, cooperative -
+a service strand cannot compute while a client computes; SMP is task #27); fan-out is
+**parent-shaped** (the service spawns its clients - a **name-based rendezvous** for
+unrelated cells is the genuinely new capability and a documented follow-on); the
+protocol is word-wide (bigger requests ride a shared sealed grant, the Phase E
+mechanism); and 4 clients is the fixed-array ceiling.
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
 proofs, and the hardware-lab performance numbers. **SMP** (docs/SMP.md,
@@ -692,8 +745,10 @@ kernel/       the no_std kernel library + boot demo bin
               docs/NETWORKING.md; virtio_gpu 2D display driver -
               docs/DISPLAY.md), elf + load (ELF loader for native
               programs), user run loop (with per-cell syscall
-              personalities), nproc (native process model: SYS_SPAWN/WAIT +
-              cooperative cross-cell scheduler - docs/LIBRHEO.md Phase F),
+              personalities + the per-cell channel table: one end per client for
+              a service cell, docs/NETSTACK.md 17), nproc (native process model:
+              SYS_SPAWN/WAIT + SYS_YIELD round-robin yield + the cooperative
+              cross-cell scheduler - docs/LIBRHEO.md Phase F, docs/NETSTACK.md 17),
               linux (the Linux personality:
               docs/LINUX-COMPAT.md), U-mode programs
               (user_progs.rs incl. the lsh shell), abi
@@ -749,7 +804,12 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               ping-pong typed messages over the async Sender/Receiver, each recv
               a genuine reactor park), librheopipe (librheo Phase J: a cross-cell
               stdout pipeline - an orchestrator spawns a producer child that
-              inherits its channel and streams its output back), bench-core, and
+              inherits its channel and streams its output back), netservice
+              (rheo-net N4a: the network service cell + concurrent fan-out - one
+              service cell serves 3 client cells, each over its own cross-cell
+              channel, one strand per client; distinct correct responses + the
+              round-robin interleave/in-flight/park-wake witnesses + reaping,
+              deterministic core plus a bonus live ARP), bench-core, and
               the interactive
               lsh bin (+ harness.rs, vfs_personality.rs); fixtures/ holds the
               ext4 test image (+ gen-ext4.sh); linux-fixtures/ holds the
@@ -776,11 +836,13 @@ librheo/      the native userspace foundation library (docs/LIBRHEO.md):
               GraphBuilder)/sched (Reservation + lattice-rt Priority/PeriodicTask/
               TimingReport)/term (Phase D byte-stream input/edit/render)/ipc
               (Phase E cross-cell Channel + sealed-buffer share + Phase J symmetric
-              async Sender/Receiver on the reactor)/display (Phase E
+              async Sender/Receiver on the reactor + rheo-net N4a multi-slot
+              Channel::open_slot: one end per client for a service cell)/display (Phase E
               Surface/Compositor/InputEvent + Phase H Scanout/Gpu real GPU present
               over OP_GPU_PRESENT - docs/DISPLAY.md)/proc (Phase F spawn/wait/args/
               env + Phase J spawn_piped: a spawned child inherits the parent's
-              channel as its stdout pipe)/time (Phase F clock + async
+              channel as its stdout pipe + rheo-net N4a spawn_on_channel: a service
+              hands each spawned client its own channel slot)/time (Phase F clock + async
               sleep/timeout)/net (Phase G raw-frame
               send/try_recv/mac over OP_NET_* + the N2d parking recv/recv_timeout
               over SYS_WAIT_NET - docs/NETWORKING.md, docs/NETSTACK.md 16) +
@@ -799,6 +861,18 @@ librheo/      the native userspace foundation library (docs/LIBRHEO.md):
               librheo-pipesrc (Phase J cross-cell stdout pipeline: a spawned
               producer child streams its output to the parent over the channel)
               programs
+net/          rheo-net: the greenfield network stack as portable userspace
+              (docs/NETSTACK.md, docs/NETWORKING.md) - no_std+alloc, no per-ISA
+              code, built for the bare targets as loaded ELF cells over
+              librheo's raw-frame path: eth/arp/ip (N1a), udp/icmp/wire (N1b),
+              dns caching resolver (N1c), trace (N1e), local fast path (N1d),
+              tcp + timer wheel (N2a), cc Reno/CUBIC (N2b), smoltcp_cell +
+              shard (N2c), crypto (N3a) + tls (N3b, both feature-gated), and
+              service (N4a: the service-cell framework - one channel end +
+              one strand per client, so one service cell serves many clients
+              concurrently) + the netcore/netl4/netdns/nettrace/netlocal/
+              nettcp/nettcpcc/netsmoltcp/netcrypto/nettls demo bins and
+              netsvc-demo + netsvc-client (the N4a service + its clients)
 json/         rheo-json: a dependency-free, zero-copy JSON parser (scalar +
               SSE2 string-scan), no_std, host-tested + benchmarked
               (docs/JSON.md, comparison/json/)

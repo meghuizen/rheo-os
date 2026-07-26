@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 48] = [
+const TEST_KERNELS: [&str; 49] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -70,6 +70,7 @@ const TEST_KERNELS: [&str; 48] = [
     "nettls",
     "linuxunix",
     "linuxinet",
+    "netservice",
 ];
 
 /// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
@@ -145,6 +146,25 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "virtio-net-device,netdev=n0",
         ],
         ("netwait", Arch::X86_64) => &[
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-pci,netdev=n0,disable-legacy=on",
+        ],
+        // netservice (docs/NETSTACK.md the service-cell section, rheo-net Phase N4a):
+        // the service cell's proof is deterministic and network-free, but it also
+        // performs ONE bonus live ARP for a client, so it gets the same SLIRP +
+        // virtio-net setup as librheonet. With no netdev the service reports the live
+        // path skipped and still passes - the netdev only unlocks the bonus.
+        ("netservice", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-device,netdev=n0",
+        ],
+        ("netservice", Arch::X86_64) => &[
             "-netdev",
             "user,id=n0",
             "-device",

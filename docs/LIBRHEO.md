@@ -1051,3 +1051,32 @@ librheo A-J is proven by **ten in-QEMU test kernels on all three ISAs**
 asserting exact behaviour, kept green alongside the whole suite (34 kernels x 3
 ISAs). Phase J's third refinement - the full `term` editor - is proven inside the
 `librheoproc` shell scenario, not a separate kernel.
+
+### Later extension: multi-slot channels (rheo-net N4a)
+
+Phases E and J gave a cell **one** cross-cell channel end - reported by
+`SYS_CONNECT`, inherited into a spawned child by `SYS_SPAWN`. rheo-net **N4a**
+(docs/NETSTACK.md 17) generalises that to a small **per-cell channel table**
+(`MAX_CELL_CHANNELS = 4`), because a *service* cell needs one end per client: three
+children inheriting the *same* ring would be three producers on one SPSC ring, not a
+fan-out. Slot 0 stays the Phase E/J channel, so every Phase E/J behaviour is
+unchanged byte-for-byte:
+
+- `SYS_CONNECT(out, slot)` gained the slot argument (existing callers pass 0) and
+  now also reports how many ends the cell holds; `ipc::Channel::open_slot`,
+  `rt::attach_channel_slot`, and `rt::chan_send_on`/`chan_recv_on` are the librheo
+  surface.
+- `SYS_SPAWN` gained a `chan_spec` argument selecting which of the caller's ends the
+  child inherits; the child always receives it at **its own slot 0** with the
+  opposite role, so a client binary is slot-agnostic. `proc::spawn_on_channel` wraps
+  it. `chan_spec = 0` is the Phase J default (`proc::spawn`/`spawn_piped`).
+- The reactor's channel idle path now hands the CPU on with **`SYS_YIELD`** (a
+  round-robin yield to the next runnable native cell) rather than `SYS_SWITCH`'s
+  directed `cur^1` - an XOR cannot reach client 3 from client 2. With a single peer
+  `SYS_YIELD` *is* that switch, which is why `librheoipc`/`librheopipe`/`librheowl`
+  are untouched.
+
+No new kernel object: it composes Cell (object 1) with QueuePair (object 3), the
+same way the L6 pipe and Phase J channel inheritance already do. Honest scope stays
+what Phase J stated - the in-cell wait is a genuine reactor park; the cell-boundary
+hand-off is cooperative, single-CPU (SMP is task #27).

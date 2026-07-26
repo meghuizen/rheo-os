@@ -12,11 +12,11 @@
 //! synchronous, so there is no concurrent access to guard against.
 
 use crate::abi::{
-    ChannelInfo, GrantInfo, QueueInfo, ReserveInfo, SYS_ARM_TIMER, SYS_COMMIT, SYS_CONNECT,
-    SYS_CYCLES, SYS_DECOMMIT, SYS_DOORBELL, SYS_EXIT, SYS_EXIT_GROUP, SYS_GRANT, SYS_GRANT_SHARE,
-    SYS_MMAP, SYS_MMAP_FILE, SYS_MUNMAP, SYS_QUEUE_INFO, SYS_RESERVE_ADMIT, SYS_RESERVE_QUERY,
-    SYS_RESERVE_RELEASE, SYS_SEAL, SYS_SPAWN, SYS_SWITCH, SYS_WAIT, SYS_WAIT_INPUT, SYS_WAIT_NET,
-    ShareInfo,
+    ChannelInfo, GrantInfo, MAX_CELL_CHANNELS, QueueInfo, ReserveInfo, SYS_ARM_TIMER, SYS_COMMIT,
+    SYS_CONNECT, SYS_CYCLES, SYS_DECOMMIT, SYS_DOORBELL, SYS_EXIT, SYS_EXIT_GROUP, SYS_GRANT,
+    SYS_GRANT_SHARE, SYS_MMAP, SYS_MMAP_FILE, SYS_MUNMAP, SYS_QUEUE_INFO, SYS_RESERVE_ADMIT,
+    SYS_RESERVE_QUERY, SYS_RESERVE_RELEASE, SYS_SEAL, SYS_SPAWN, SYS_SWITCH, SYS_WAIT,
+    SYS_WAIT_INPUT, SYS_WAIT_NET, SYS_YIELD, ShareInfo,
 };
 use crate::arch::{self, FaultCause, MapPerm, TrapFrame, TrapKind};
 use crate::capability::{
@@ -70,14 +70,30 @@ struct RunCell {
     grant_next: usize,
     /// Next free VA for a file mmap (`SYS_MMAP_FILE`).
     filemmap_next: usize,
-    /// Base VA of the cell's mapped cross-cell shared channel, reported by
-    /// `SYS_CONNECT` (docs/LIBRHEO.md Phase E). 0 = no channel wired.
-    chan_va: u64,
-    /// 32-bit ABI id of the cell's QueuePair capability for the channel.
-    chan_cap_id: u32,
-    /// Channel role: 0 = initiator (client), 1 = acceptor (server).
-    chan_role: u64,
+    /// The cell's cross-cell shared-channel ends, reported by `SYS_CONNECT`
+    /// (docs/LIBRHEO.md Phase E; the multi-slot table is docs/NETSTACK.md the
+    /// service-cell section, rheo-net N4a). Slot 0 is the Phase E/J channel; a
+    /// **service cell** holds one slot per client, which is what makes fan-out
+    /// possible. Fixed array - the kernel allocates nothing.
+    chan: [ChanEnd; MAX_CELL_CHANNELS],
 }
+
+/// One cross-cell channel end a cell holds (docs/NETSTACK.md, rheo-net N4a).
+#[derive(Copy, Clone)]
+struct ChanEnd {
+    /// Base VA of the mapped shared ring region. 0 = this slot is empty.
+    va: u64,
+    /// 32-bit ABI id of the QueuePair capability authorising this end.
+    cap_id: u32,
+    /// 0 = initiator (client), 1 = acceptor (server).
+    role: u64,
+}
+
+const EMPTY_CHAN: ChanEnd = ChanEnd {
+    va: 0,
+    cap_id: 0,
+    role: 0,
+};
 
 const EMPTY: RunCell = RunCell {
     aspace: core::ptr::null(),
@@ -92,9 +108,7 @@ const EMPTY: RunCell = RunCell {
     qp_cap_id: 0,
     grant_next: GRANT_BASE,
     filemmap_next: FILEMMAP_BASE,
-    chan_va: 0,
-    chan_cap_id: 0,
-    chan_role: 0,
+    chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
 };
 
 /// Base VA of a native cell's typed memory-grant reservations (docs/LIBRHEO.md
@@ -738,9 +752,7 @@ pub unsafe fn install(
         qp_cap_id: 0,
         grant_next: GRANT_BASE,
         filemmap_next: FILEMMAP_BASE,
-        chan_va: 0,
-        chan_cap_id: 0,
-        chan_role: 0,
+        chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
     };
     *cell_grants(idx) = [EMPTY_GRANT; MAX_GRANTS_PER_CELL];
 }
@@ -760,18 +772,39 @@ pub fn set_queue_info(idx: usize, qp_va: u64, cap_id: u32) {
 /// connection get the *same* frames (see `load::map_channel_into`) at the same
 /// VA but opposite roles (0 = client, 1 = server).
 pub fn set_channel_info(idx: usize, chan_va: u64, cap_id: u32, role: u64) {
-    assert!(cells()[idx].present, "set_channel_info on empty slot {idx}");
-    cells()[idx].chan_va = chan_va;
-    cells()[idx].chan_cap_id = cap_id;
-    cells()[idx].chan_role = role;
+    set_channel_slot(idx, 0, chan_va, cap_id, role);
 }
 
-/// This cell's cross-cell channel end as `(chan_va, role)` (0 = none)
-/// (docs/LIBRHEO.md Phase J). `nproc::spawn` reads it to propagate the parent's
-/// channel to a spawned child (the child gets the opposite role).
-pub fn cell_chan(idx: usize) -> (u64, u64) {
-    let c = cells()[idx];
-    (c.chan_va, c.chan_role)
+/// Record channel end `slot` for cell `idx` (docs/NETSTACK.md the service-cell
+/// section, rheo-net N4a). Slot 0 is [`set_channel_info`]'s Phase E/J channel;
+/// slots 1.. give a **service cell** one end per client, each a distinct shared
+/// ring region (see `load::map_channel_into_slot`), which is what makes concurrent
+/// fan-out possible. Call after `install`, before `run`.
+pub fn set_channel_slot(idx: usize, slot: usize, chan_va: u64, cap_id: u32, role: u64) {
+    assert!(cells()[idx].present, "set_channel_slot on empty slot {idx}");
+    assert!(slot < MAX_CELL_CHANNELS, "channel slot {slot} out of range");
+    cells()[idx].chan[slot] = ChanEnd {
+        va: chan_va,
+        cap_id,
+        role,
+    };
+}
+
+/// This cell's channel end `slot` as `(chan_va, role)` (`(0, 0)` = none)
+/// (docs/LIBRHEO.md Phase J, docs/NETSTACK.md rheo-net N4a). `nproc::spawn` reads
+/// it to propagate one of the parent's channels to a spawned child (the child
+/// gets the opposite role at its own slot 0).
+pub fn cell_chan_slot(idx: usize, slot: usize) -> (u64, u64) {
+    if slot >= MAX_CELL_CHANNELS {
+        return (0, 0);
+    }
+    let c = cells()[idx].chan[slot];
+    (c.va, c.role)
+}
+
+/// How many channel ends cell `idx` holds (contiguous from slot 0).
+pub fn cell_chan_count(idx: usize) -> usize {
+    cells()[idx].chan.iter().take_while(|c| c.va != 0).count()
 }
 
 /// Tag an installed cell with a syscall personality (call after `install`,
@@ -846,6 +879,13 @@ pub fn cell_present(idx: usize) -> bool {
     cells()[idx].present
 }
 
+/// Whether cell `idx` speaks the native ABI (docs/NETSTACK.md rheo-net N4a).
+/// `nproc::yield_cell` only ever hands the CPU to a native sibling; a Linux cell
+/// is scheduled by `linux::proc`.
+pub fn cell_is_native(idx: usize) -> bool {
+    cells()[idx].personality == Personality::Native
+}
+
 /// The address-space pointer installed for cell `idx` (the Linux process
 /// scheduler's `fork`/`execve` build on it).
 pub fn cell_aspace(idx: usize) -> *const AddressSpace {
@@ -902,9 +942,7 @@ pub unsafe fn install_spawned(
         qp_cap_id,
         grant_next: GRANT_BASE,
         filemmap_next: FILEMMAP_BASE,
-        chan_va: 0,
-        chan_cap_id: 0,
-        chan_role: 0,
+        chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
     };
     *cell_grants(idx) = [EMPTY_GRANT; MAX_GRANTS_PER_CELL];
 }
@@ -952,9 +990,7 @@ pub unsafe fn install_forked(
         qp_cap_id: 0,
         grant_next: GRANT_BASE,
         filemmap_next: FILEMMAP_BASE,
-        chan_va: 0,
-        chan_cap_id: 0,
-        chan_role: 0,
+        chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
     };
 }
 
@@ -1047,22 +1083,31 @@ pub fn on_user_trap(
             arch::set_syscall_ret(unsafe { &mut *frame }, ret);
             frame
         }
-        // Cross-cell connect: report this cell's shared-channel end (docs/
-        // LIBRHEO.md Phase E). The two peers share one ring region; the kernel
-        // never drains it - they drive the SPSC rings directly over the frames.
+        // Cross-cell connect: report this cell's shared-channel end for the
+        // requested slot (docs/LIBRHEO.md Phase E; multi-slot fan-out is
+        // docs/NETSTACK.md rheo-net N4a). Each end is one ring region shared with
+        // one peer; the kernel never drains it - the two cells drive the SPSC
+        // rings directly over the frames.
         SYS_CONNECT => {
             let cell = cells()[cur];
-            let ret = if cell.chan_va == 0 {
+            let slot = args[1] as usize;
+            let end = if slot < MAX_CELL_CHANNELS {
+                cell.chan[slot]
+            } else {
+                EMPTY_CHAN
+            };
+            let ret = if end.va == 0 {
                 u64::MAX
             } else {
                 // SAFETY: `arg` is a user VA in the running cell's active address
-                // space, sized for a `ChannelInfo` (24 bytes); the cell passes
+                // space, sized for a `ChannelInfo` (32 bytes); the cell passes
                 // its own stack slot.
                 unsafe {
                     (arg as *mut ChannelInfo).write(ChannelInfo {
-                        chan_va: cell.chan_va,
-                        cap_id: cell.chan_cap_id as u64,
-                        role: cell.chan_role,
+                        chan_va: end.va,
+                        cap_id: end.cap_id as u64,
+                        role: end.role,
+                        count: cell_chan_count(cur) as u64,
                     });
                 }
                 0
@@ -1100,11 +1145,24 @@ pub fn on_user_trap(
         // child, gated by the cell-spawn capability. A cross-cell scheduler in
         // `crate::nproc` generalizes the Linux L6 run loop for native cells.
         SYS_SPAWN => {
-            let r = crate::nproc::spawn(cur, args[0], args[1], args[2], args[3], frame);
+            let r = crate::nproc::spawn(cur, args[0], args[1], args[2], args[3], args[4], frame);
             arch::set_syscall_ret(unsafe { &mut *frame }, r);
             frame
         }
         SYS_WAIT => match crate::nproc::wait(cur, args[0], frame) {
+            crate::nproc::Sched::Ret(v) => {
+                arch::set_syscall_ret(unsafe { &mut *frame }, v);
+                frame
+            }
+            crate::nproc::Sched::Switch(f) => f,
+        },
+        // Cooperative round-robin yield to the next runnable native cell
+        // (docs/NETSTACK.md the service-cell section, rheo-net N4a). The N-cell
+        // generalisation of `SYS_SWITCH`'s `cur^1` hand-off, needed because a
+        // service serving N clients cannot reach client 3 from client 2 with an
+        // XOR. Falls back to `cur^1` where the caller has no native process tree,
+        // so the Phase E/J two-cell path is unchanged.
+        SYS_YIELD => match crate::nproc::yield_cell(cur) {
             crate::nproc::Sched::Ret(v) => {
                 arch::set_syscall_ret(unsafe { &mut *frame }, v);
                 frame

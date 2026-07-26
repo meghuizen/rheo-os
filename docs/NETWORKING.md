@@ -43,6 +43,22 @@ requires - the kernel owns the queue plumbing, not the protocols.
   **done** for riscv/arm (rheo-net N2d, docs/NETSTACK.md §16); x86-64 MSI-X through
   the PCI config tunnel, interrupt coalescing, and zero-copy receive remain.
 
+> **Service-cell update (N4a, docs/NETSTACK.md §17):** the doctrine of this
+> document - the stack is a **userspace service cell**, the kernel owns only queue
+> plumbing and grant checks (§§1, 5-9) - now has its serving substrate. A service
+> cell holds **one cross-cell channel end per client** and runs **one strand per
+> client**, so a single network service cell serves many client cells concurrently
+> (proven with 3, all three ISAs). It adds **no kernel object**: a per-cell channel
+> *table* (`MAX_CELL_CHANNELS = 4`), a channel-slot selector on `SYS_SPAWN`, and
+> `SYS_YIELD` (a round-robin generalisation of `SYS_SWITCH`'s `cur^1` hand-off,
+> needed because an XOR cannot reach client 3 from client 2) - all mechanism over the
+> existing Cell + QueuePair objects, all documented in NETSTACK.md §17. Honest:
+> **concurrent, not parallel** (one CPU, cooperative - SMP is task #27), fan-out is
+> parent-shaped (the service spawns its clients; a name-based rendezvous for
+> unrelated cells is a documented follow-on), and the wire protocol is word-wide
+> today (bigger requests ride a shared sealed grant). This is what N4b (the
+> remote-INET bridge for unmodified Linux binaries) and N5 (app protocols) build on.
+
 > **Security transports update (N3a/N3b, docs/NETSTACK.md §14-15):** the crypto
 > primitive layer (N3a - ChaCha20-Poly1305 + RustCrypto SHA-2/HKDF/X25519/
 > Ed25519/AES-GCM) and a from-scratch **TLS 1.3** handshake + record layer +

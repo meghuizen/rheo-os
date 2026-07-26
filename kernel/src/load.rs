@@ -90,8 +90,30 @@ pub fn alloc_channel() -> [usize; CHANNEL_PAGES] {
 /// the cell can drive its side of the SPSC rings. Called once per peer with the
 /// **same** `framelist` from [`alloc_channel`], so both cells share the frames.
 pub fn map_channel_into(aspace: &mut AddressSpace, framelist: &[usize; CHANNEL_PAGES]) {
+    map_channel_into_slot(aspace, framelist, 0);
+}
+
+/// The VA of channel **slot** `slot` in a cell (docs/NETSTACK.md the service-cell
+/// section, rheo-net N4a): slot 0 is [`USER_CHANNEL_VA`] (the Phase E/J channel),
+/// and each further slot is one queue-pair region above it. A **service cell**
+/// holds one slot per client, so it has N distinct rings; every client sees its own
+/// end at slot 0. `MAX_CELL_CHANNELS` slots span far less than the 8 GiB to the
+/// next region (32 GiB grants), so nothing collides.
+pub const fn channel_slot_va(slot: usize) -> usize {
+    USER_CHANNEL_VA + slot * QueuePair::REGION_SIZE
+}
+
+/// Map the frames of a shared channel into `aspace` at channel slot `slot`, RW so
+/// the cell can drive its side of the SPSC rings (docs/NETSTACK.md rheo-net N4a).
+/// Called once per peer with the **same** `framelist` from [`alloc_channel`].
+pub fn map_channel_into_slot(
+    aspace: &mut AddressSpace,
+    framelist: &[usize; CHANNEL_PAGES],
+    slot: usize,
+) {
+    let base = channel_slot_va(slot);
     for (i, &pa) in framelist.iter().enumerate() {
-        aspace.map_user_frame(USER_CHANNEL_VA + i * FRAME_SIZE, pa, MapPerm::UserRw);
+        aspace.map_user_frame(base + i * FRAME_SIZE, pa, MapPerm::UserRw);
     }
 }
 

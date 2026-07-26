@@ -195,3 +195,16 @@ required-features = ["crypto"]
 name = "nettls-demo"
 path = "src/bin/nettls-demo.rs"
 required-features = ["tls"]
+
+# The N4a proof cells (docs/NETSTACK.md the service-cell section): the **network
+# service cell** and its clients. `netsvc-demo` is the service - it binds one
+# cross-cell channel end per client, spawns three `netsvc-client` cells (each
+# inheriting its own end), and serves them concurrently with one strand per client.
+# Loaded by the `netservice` test kernel.
+[[bin]]
+name = "netsvc-demo"
+path = "src/bin/netsvc-demo.rs"
+
+[[bin]]
+name = "netsvc-client"
+path = "src/bin/netsvc-client.rs"

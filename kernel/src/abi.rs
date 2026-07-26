@@ -242,14 +242,26 @@ pub const SYS_WAIT_NET: u64 = 48;
 // peer read-only and mints a MemoryGrant capability there - zero-copy shared
 // memory, the dmabuf equivalent.
 
-/// connect_info(out_va) -> 0, or u64::MAX if the cell has no cross-cell channel.
-/// Writes a `ChannelInfo { chan_va, cap_id, role }`: the base VA of the cell's
-/// mapped shared-channel region, the 32-bit ABI id of its minted QueuePair
-/// capability for the channel, and its role (0 = initiator/client, 1 =
-/// acceptor/server) so one binary can serve both ends. librheo's `ipc::Channel`
-/// calls this once to bind the shared ring (IO.md 6: connect = capability
+/// connect_info(out_va, slot) -> 0, or u64::MAX if the cell has no cross-cell
+/// channel in `slot`. Writes a `ChannelInfo { chan_va, cap_id, role, count }`:
+/// the base VA of the cell's mapped shared-channel region for that slot, the
+/// 32-bit ABI id of its minted QueuePair capability for the channel, its role
+/// (0 = initiator/client, 1 = acceptor/server) so one binary can serve both ends,
+/// and how many channel slots the cell holds in total. librheo's `ipc::Channel`
+/// calls this once per end to bind a shared ring (IO.md 6: connect = capability
 /// exchange yielding a typed queue pair).
+///
+/// A cell holds up to [`MAX_CELL_CHANNELS`] ends (docs/NETSTACK.md the
+/// service-cell section, rheo-net N4a) - a **service** holds one per client, a
+/// client holds one (slot 0). Slot 0 is the Phase E/J channel, so every existing
+/// caller passes `slot = 0` and behaves exactly as before.
 pub const SYS_CONNECT: u64 = 43;
+
+/// How many cross-cell channel ends one cell can hold (docs/NETSTACK.md the
+/// service-cell section, rheo-net N4a). Slot 0 is the Phase E/J channel; slots
+/// 1.. let a **service cell** hold one end per client (the fan-out). Fixed, so
+/// the per-cell table stays a static array - the kernel allocates nothing.
+pub const MAX_CELL_CHANNELS: usize = 4;
 // ---- native process model + timers (docs/LIBRHEO.md Phase F,
 // docs/ARCHITECTURE.md 3 object 1 Cell, verb set "create/destroy cell" +
 // "arm timer/doorbell") ----
@@ -263,15 +275,51 @@ pub const SYS_CONNECT: u64 = 43;
 // (like `fork`), running librheo. Native child faults stay terminal (no
 // signals); the parent reaps a fault as an exit code.
 
-/// spawn(path_va, path_len, argv_va, envp_va) -> child handle (>= 0), or
-/// u64::MAX on failure (no spawn capability, ELF not found, cell table full).
+/// spawn(path_va, path_len, argv_va, envp_va, chan_spec) -> child handle (>= 0),
+/// or u64::MAX on failure (no spawn capability, ELF not found, cell table full).
 /// Loads the ELF at `path` from the VFS into a NEW native cell, builds its
 /// initial stack from the NUL-terminated C-string arrays at `argv_va`/`envp_va`
 /// (copied out of the caller before the child's space is built), maps it a queue
 /// pair + mints a queue capability, and records the caller as its parent. The
 /// child is runnable but does not run until the parent `SYS_WAIT`s (or exits).
 /// The returned handle is passed to `SYS_WAIT`.
+///
+/// `chan_spec` selects **which of the caller's channel ends the child inherits**
+/// (docs/NETSTACK.md the service-cell section, rheo-net N4a): 0 = the Phase J
+/// default (inherit the caller's channel **slot 0** if it has one), otherwise
+/// [`SPAWN_CHAN_SLOT`] with the slot number in bits 15:8
+/// ([`spawn_chan_spec`]). The child always receives the inherited end at its own
+/// **slot 0** with the opposite role, so a client binary is slot-agnostic while a
+/// service holds one end per client. Mechanism only - it composes the existing
+/// Cell (object 1) + QueuePair (object 3) objects and adds no new object.
 pub const SYS_SPAWN: u64 = 45;
+
+/// `SYS_SPAWN` `chan_spec` flag: inherit the caller's channel **slot** named in
+/// bits 15:8 rather than slot 0 (docs/NETSTACK.md, rheo-net N4a). Spawn fails
+/// (`u64::MAX`) if that slot holds no channel.
+pub const SPAWN_CHAN_SLOT: u64 = 1 << 0;
+
+/// Build a `SYS_SPAWN` `chan_spec` naming channel `slot` of the caller.
+pub const fn spawn_chan_spec(slot: usize) -> u64 {
+    SPAWN_CHAN_SLOT | ((slot as u64) << 8)
+}
+
+/// yield_cell() -> 0. Hand the CPU to the **next runnable native cell** in
+/// round-robin order and resume there; the caller stays runnable and is reached
+/// again on a later pass (docs/NETSTACK.md the service-cell section, rheo-net
+/// N4a). Where the caller has no native process tree (two cells wired by a test
+/// kernel, never spawned) this degenerates to the `SYS_SWITCH` `cur^1` peer
+/// hand-off, so the Phase E/J two-cell behaviour is unchanged byte-for-byte.
+///
+/// It exists because `SYS_SWITCH` is a *directed* `cur^1` hand-off: with a
+/// service cell and N>1 client cells, `cur^1` cannot reach client 3 from client
+/// 2, so a fan-out would livelock between siblings. This is the same cooperative
+/// cross-cell scheduler `SYS_WAIT`/child-exit already drive (`kernel/src/nproc.rs`),
+/// exposed as a plain yield - mechanism over the Cell object (1), **no new kernel
+/// object**, no authority transfer (a scheduling hint within one capability
+/// bundle). Cooperative and single-CPU: concurrency, not parallelism (SMP is
+/// task #27).
+pub const SYS_YIELD: u64 = 49;
 /// wait(handle) -> the child's exit code (0..=255). **Blocks** cooperatively
 /// (the parent's other strands run meanwhile, driven by librheo's reactor) until
 /// the child named by `handle` exits, then reaps it and frees its slot. Returns
@@ -313,6 +361,10 @@ pub struct ChannelInfo {
     /// 0 = initiator (client: SQ producer, CQ consumer); 1 = acceptor (server:
     /// SQ consumer, CQ producer). The two ends drive opposite sides of the SPSC.
     pub role: u64,
+    /// How many channel slots this cell holds in total (docs/NETSTACK.md the
+    /// service-cell section, rheo-net N4a). 1 for a Phase E/J cell; N for a
+    /// service serving N clients, which uses it to size its per-client fan-out.
+    pub count: u64,
 }
 
 /// The `SYS_GRANT_SHARE` result block (kept in sync with librheo's `ipc` arm).

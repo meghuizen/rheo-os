@@ -219,6 +219,16 @@ kernels stay green.
     layer / handshake / Ed25519-X.509 are proven byte-for-byte against the RFC
     8448 known-answer trace. HTTPS-live is deferred (N3c/N4).
 - **N4 - Service-cell model + fan-out + host services** (DHCP + zeroconf + NTP).
+  Split into slices:
+  - **N4a (done): the network service cell + concurrent fan-out** (§17) - the
+    keystone. One long-lived service cell holds **one cross-cell channel per
+    client** and runs **one strand per client**, serving N clients concurrently.
+    Everything later rides here.
+  - **N4b: the remote-INET bridge for the personality** - route a Linux cell's
+    `AF_INET` connect/send/recv to the N4a service cell, so an unmodified Linux
+    binary reaches the real network (today's L8-INET is loopback-only,
+    docs/LINUX-COMPAT.md L8-INET).
+  - **N4c: host services** - DHCP + zeroconf + NTP clients as service cells.
 - **N5 - App protocols.** HTTP/2, gRPC, Arrow Flight (warehouse), Kafka.
 - **N6 - Perf substrate.** (NIC RX IRQ landed early in **N2d**, §16.) Zero-copy DMA + offload/multiqueue/RSS,
   timer wheel; the socket/steering kernel object if earned; DDoS-isolation proof.
@@ -1415,3 +1425,162 @@ real; neither is dressed up as the other.
 - **Zero-copy receive**: the wait still copies from the virtqueue buffer into the
   cell's buffer. Landing payloads directly in a cell's arena pages (header/payload
   split + grant DMA) is N6.
+
+## 17. Phase N4a (done): the network service cell + concurrent fan-out
+
+This is the **keystone** of the whole roadmap. Doctrine puts the network stack in
+userspace (docs/ARCHITECTURE.md 4.7, §§5-9 of docs/NETWORKING.md): a long-lived
+**service cell** owns it and other cells reach the network by talking to that cell.
+Phase E proved *one* cell can talk to *one* cell. The load-bearing question is
+whether **one cell can serve many, concurrently** - because every remaining item
+needs exactly that: app-protocol servers (N5), the remote-INET bridge for Linux
+binaries (N4b), onion routing, DHCP/zeroconf/NTP (N4c). N4a closes it.
+
+### The gap that had to be closed
+
+Before this phase a cell held **exactly one** channel end. `SYS_CONNECT` reported
+that one end, and Phase J's `SYS_SPAWN` inherited that one end into a child. Three
+spawned children would therefore all inherit the **same ring region** - three
+producers on one SPSC ring, which is not a fan-out but a race. And `SYS_SWITCH` is
+a *directed* `cur^1` hand-off: from client cell 2 it reaches cell 3, never the
+service at cell 0, so a 1-service + 3-client topology livelocks between siblings.
+
+### The architecture choice: composition, with a minimal mechanism extension
+
+Pure composition over the existing verbs is impossible for the reason above, so N4a
+takes the **minimal mechanism extension** of the existing spawn/channel path -
+option (a) of the two the plan named. It adds **no kernel object** (every piece
+composes Cell, object 1, with QueuePair, object 3, exactly as the L6 pipe and Phase
+J channel-inheritance precedents do) and no ambient authority. Three changes:
+
+1. **A per-cell channel *table*** (`MAX_CELL_CHANNELS = 4`, a fixed static array -
+   the kernel still allocates nothing). Slot 0 is the Phase E/J channel; slots 1..
+   let a service hold one end per client. Each slot is a **separate ring region**,
+   at `channel_slot_va(slot) = USER_CHANNEL_VA + slot * REGION_SIZE` (24 GiB +).
+   `SYS_CONNECT(out, slot)` gained the slot argument and reports `count` (how many
+   ends the cell holds) alongside `chan_va`/`cap_id`/`role`. Every pre-existing
+   caller passes slot 0 and is unchanged.
+2. **`SYS_SPAWN` gained a `chan_spec` argument**: 0 = the Phase J default (inherit
+   slot 0 if wired), else `SPAWN_CHAN_SLOT | slot << 8` = inherit the caller's slot
+   `slot`. The child always receives the inherited end at **its own slot 0** with
+   the opposite role, so a client binary is slot-agnostic and identical whichever
+   client it is. `AddressSpace::share_rw_into` gained the matching `dst_base` (its
+   read-only sibling `share_ro_into` already had one).
+3. **`SYS_YIELD` (49)**: hand the CPU to the **next runnable native cell** in
+   round-robin order; the caller stays runnable. This is the N-cell generalisation
+   of `SYS_SWITCH`, and it is *the same cooperative cross-cell scheduler*
+   `SYS_WAIT`/child-exit already drive in `kernel/src/nproc.rs` - exposed as a plain
+   yield, transferring no authority (the cells share one capability bundle). Where
+   the caller has no native process tree (two cells a test kernel wired but never
+   spawned) the round-robin degenerates to `cur^1`, so the Phase E/J two-cell
+   behaviour is byte-for-byte unchanged. The reactor's channel idle path now calls
+   it instead of `sys::switch()`.
+
+**A name-based rendezvous is deliberately out of scope.** Letting an *unrelated*
+cell connect to a pre-existing service by name is a genuinely new capability (a
+kernel-held namespace, and an authority question `spawn` answers structurally
+today), so it would need an ARCHITECTURE.md §6 justification of its own. It is the
+documented follow-on. N4a's fan-out is **parent-shaped**: the service spawns its
+clients, which is enough for every N4b-N5 scenario.
+
+### What the `net` crate adds (`net::service`)
+
+- **`Service`** - `bind()` opens every channel end this cell holds and splits each
+  into the Phase J async `AsyncSender`/`AsyncReceiver`; `spawn_client(slot, path,
+  argv)` spawns a client cell handing it slot `slot`; `serve()` spawns **one strand
+  per client**, each parked on its own receiver, and joins them. A strand answers
+  its client's requests and replies on that client's channel - so a slow client
+  blocks nobody.
+- **`Client`** - the thin end a spawned cell uses: `open(id)` binds the channel it
+  inherited (its slot 0), then `echo`/`resolve`/`bye` send a request and await its
+  response.
+- **The protocol is one word each way**: a `Request { op, client, seq }` packed into
+  the channel message's `tag`, with the argument/result in its 32-bit `val` - the
+  async channel's symmetric payload. `OP_ECHO` returns a **per-client keyed**
+  transform (`echo_transform`, so a client can tell its own answer from a sibling's);
+  `OP_RESOLVE` maps a catalogue name id to an IPv4 address (`u32` is exactly an A
+  record) answered from the **network-free tiers of `net::dns`** - a `HostsTable`
+  and a TTL `Cache`; `OP_BYE` returns the request count and ends that strand.
+- **`ServiceReport`** - the ledger `serve()` returns: per-client served counts, the
+  processing order, the in-flight high-water mark, per-client reactor wakeups, and
+  the live-op result.
+
+Two reactor additions back it (`librheo/src/rt.rs`): `attach_channel_slot` +
+`chan_send_on`/`chan_recv_on` per slot (the reactor scans slots in order, which is
+what round-robins the per-client strands), and two witnesses -
+`chan_wakeups_on(slot)` and `chan_max_pending()`, the latter measured with a new
+**non-destructive** `Qp::sq_pending`/`cq_pending` peek.
+
+### Word-wide protocol: the honest simplification
+
+A name is an id, not a string, and an answer is one `u32`. That is a real
+simplification, chosen so what the phase proves is the *fan-out* rather than a
+marshalling layer. The general form already exists in the substrate: a request too
+big for a word goes in a **sealed grant shared over the same channel** (Phase E
+`ipc::share` - zero-copy, capability-checked), and that is the documented follow-on
+for N4b/N5, where an HTTP header block or a DNS name has to travel.
+
+### Concurrency, not parallelism (honest)
+
+One CPU, cooperative scheduling. The service's strands genuinely interleave (all N
+requests in flight, N strands making progress, no client blocking another) and the
+cells hand the CPU on at syscall boundaries. **Nothing runs simultaneously**: a
+service strand cannot compute while a client computes. That needs SMP (task #27),
+and until then a "concurrent service" is exactly that - concurrent. Everything §17
+claims is a concurrency claim, and the test's witnesses measure concurrency.
+
+Also honest: the async in-cell wait is a genuine reactor park (asserted per client
+via `chan_wakeups_on`), but the cell-boundary hand-off is still the cooperative
+yield - the same standing Phase J caveat.
+
+### The proof (`netservice` test kernel, all 3 ISAs)
+
+The kernel wires a service cell (cell 0) with **three** channel ends - three
+separate ring regions at slots 0-2 - a queue pair, and a **cell-spawn** capability,
+seeds a ramfs with `/bin/netsvc-client`, and runs it. The service then:
+
+1. binds all three ends (`Service::bind`), seeding `alpha`/`beta` into a
+   `dns::HostsTable` and `gamma` into a `dns::Cache` - so the three clients' answers
+   come from **both** network-free resolution tiers;
+2. reads the NIC MAC, enabling the bonus live op;
+3. spawns `/bin/netsvc-client` **three times**, client k on the service's slot k;
+4. runs `serve()` - one strand per client - then reaps all three children.
+
+Each client sends a **distinct** request set and predicts every answer exactly: a
+per-client echo (`echo_transform(0xA5A50000 | id, id)`), its own catalogue name
+(`10.1.1.1` / `10.2.2.2` / `10.3.3.3`), and a `BYE` whose reply is its own request
+count. Client 0 additionally asks for the live gateway resolve.
+
+The service exits `0x42` only if **all** of this holds, identically on all three
+ISAs:
+
+| Assertion | Observed |
+|---|---|
+| distinct correct response per client | each client verifies its own echo + name and exits `id+1`; the service asserts the codes are exactly `1,2,3` |
+| per-client work counted | `served == [4, 3, 3]` (client 0 does the extra live op) |
+| **interleave witness** | `order == [0,1,2, 0,1,2, 0,1,2, 0]` - the exact round-robin: strand k reaches round r only after strands `0..k` did, so no strand monopolised the vcore |
+| **in-flight witness** | `max_in_flight == 3` - all three clients' requests were queued **at the same instant**, before the first reply went out |
+| no spin | `wakeups == [4, 3, 3]` - one genuine reactor park+wake per message, per client |
+| children reaped | all three waited, each with its distinct exit code |
+
+The **deterministic core is network-free**: pre-seeded hosts/cache tiers, no packet
+required. The **bonus live op** is one real ARP for the SLIRP gateway `10.0.2.2`
+that the service performs *inside client 0's serving strand* - it parks on the wire
+(rheo-net N2d) while its sibling strands keep running - and it **degrades honestly**:
+with no NIC, or no reply, it reports `REPLY_NONE`, the client accepts that, and the
+run still passes. On all three ISAs under SLIRP it does resolve, and the log says so.
+
+### What N4a defers (explicit)
+
+- **Name-based rendezvous** (above): an unrelated cell connecting to a running
+  service by name. The genuinely new capability; needs its own §6 justification.
+- **Requests larger than a word**: pass them in a sealed grant over the same
+  channel (the Phase E mechanism already exists). Needed by N4b/N5.
+- **More than `MAX_CELL_CHANNELS` (4) clients**: a real service wants hundreds, which
+  means a per-cell channel *region* whose slots are allocated dynamically, not a
+  fixed array. The fixed array keeps the kernel allocation-free today.
+- **Parallel service** (SMP, task #27) - see above.
+- **Service restart / client disconnect**: a client that dies mid-request leaves its
+  strand parked; supervision (and channel teardown on reap) is future work.
+- **Steering**: a received frame still wakes the *calling* cell. Waking the service
+  cell on a frame destined for a client needs the N6 steering grants.

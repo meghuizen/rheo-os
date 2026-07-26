@@ -247,6 +247,15 @@ path = "src/linuxunix.rs"
 name = "linuxinet"
 path = "src/linuxinet.rs"
 
+# rheo-net Phase N4a (docs/NETSTACK.md the service-cell section): the network
+# service cell + concurrent client fan-out - one service cell serves three client
+# cells concurrently, each over its own cross-cell channel (one strand per client).
+# Deterministic core (network-free) plus one bonus live ARP the service performs for
+# a client, reported and never asserted.
+[[bin]]
+name = "netservice"
+path = "src/netservice.rs"
+
 [[bin]]
 name = "smp"
 path = "src/smp.rs"

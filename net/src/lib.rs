@@ -84,6 +84,14 @@
 //!   [`crypto::kdf`]) and the nonce-reuse guard ([`crypto::aead::SealingKey`]).
 //!   The TLS 1.3 handshake over these primitives is N3b.
 //!
+//! **Phase N4a** adds the service-cell model - the keystone every later service
+//! rides on:
+//! - [`service`]: a [`service::Service`] holding **one cross-cell channel end per
+//!   client** and running **one strand per client**, so a single network service
+//!   cell serves many client cells concurrently (cooperative, single-CPU - SMP is
+//!   task #27), plus the thin [`service::Client`] a spawned cell uses. Fan-out
+//!   composes over librheo Phase J spawn/channel inheritance.
+//!
 //! Still deferred (per docs/NETSTACK.md): TLS 1.3 (N3b); full NewReno partial-ACK
 //! recovery, CUBIC HyStart / fast-convergence, and BBR; negative caching; and the
 //! *live* ICMPv6 path (the v6 codec is unit-proven; SLIRP cannot generate v6
@@ -100,6 +108,7 @@ pub mod eth;
 pub mod icmp;
 pub mod ip;
 pub mod local;
+pub mod service;
 pub mod shard;
 pub mod tcp;
 pub mod timer;

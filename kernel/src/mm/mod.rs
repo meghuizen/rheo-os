@@ -129,16 +129,25 @@ impl AddressSpace {
     }
 
     /// Map every committed user frame of `self` in `[base, base+len)` into `dst`
-    /// at the **same** VA, **read-write** - propagating a cross-cell shared
-    /// channel to a spawned child (docs/LIBRHEO.md Phase J). The same physical
-    /// frames back both spaces, so the child drives its end of the SPSC ring over
-    /// the parent's channel frames (the sibling of [`share_ro_into`], which is
-    /// read-only for a sealed buffer). Returns the number of frames mapped.
-    pub fn share_rw_into(&self, dst: &mut AddressSpace, base: usize, len: usize) -> usize {
+    /// at `dst_base + (va - base)`, **read-write** - propagating a cross-cell
+    /// shared channel to a spawned child (docs/LIBRHEO.md Phase J). The same
+    /// physical frames back both spaces, so the child drives its end of the SPSC
+    /// ring over the parent's channel frames (the sibling of [`share_ro_into`],
+    /// which is read-only for a sealed buffer). `dst_base` lets a **service cell**
+    /// hand its channel *slot k* to a child at the child's slot 0
+    /// (docs/NETSTACK.md the service-cell section, rheo-net N4a), so a client
+    /// binary is slot-agnostic. Returns the number of frames mapped.
+    pub fn share_rw_into(
+        &self,
+        dst: &mut AddressSpace,
+        base: usize,
+        len: usize,
+        dst_base: usize,
+    ) -> usize {
         let mut n = 0usize;
         arch::paging_for_each_user_leaf(&self.root, &mut |va, pa, _perm| {
             if va >= base && va < base + len {
-                dst.map_user_frame(va, pa, MapPerm::UserRw);
+                dst.map_user_frame(dst_base + (va - base), pa, MapPerm::UserRw);
                 n += 1;
             }
         });
