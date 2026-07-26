@@ -63,6 +63,25 @@ run twice (plain TCG and icount) with the output captured. See the
 script for the two documented deviations (AllowUnstableOverhead,
 IRQUSER=OFF) and why they are needed under TCG.
 
+## Host-side comparisons (real wall-clock, not seL4)
+
+Some mechanisms are userspace and best measured natively, on the host,
+against the runtimes they replace - always running the *exact code the OS
+ships* (`include!`d verbatim), and always labeling anything not run here as
+a published reference, never a fabricated local number:
+
+- `threads/` - rheo-os strands vs `std::thread` / goroutines / Python.
+- `json/` - rheo-json vs simdjson (published references for the parts not
+  built here).
+- `rng/` - the ChaCha20 DRBG vs `getrandom`.
+- `tiles/` - **tiled vs naive int8 GEMM, and TileSim's tiling-order
+  prediction vs host wall-clock** (`docs/TILES.md 7`). This is where
+  tiling's cache-locality win is measurable (QEMU models no caches), and
+  where the cost model is falsified or confirmed: the model and the host
+  rank the block sizes the same way. Includes a differential fuzz
+  (tiled == naive) and an AVX2 kernel proven bit-identical to the scalar
+  one. `sh comparison/tiles/run.sh`.
+
 ## The honest framing of the seL4 comparison
 
 Per docs/IO.md 6.1: the queue pair is a composition of seL4's data channel

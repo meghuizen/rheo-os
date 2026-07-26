@@ -624,6 +624,44 @@ attach, set-scanout, transfer, flush). No claim of visible output; the 2D scanou
 command round-trip + compositor present wiring is the deliverable. **librheo A-H
 is complete.**
 
+A **unified tile framework** (`librheo/src/tile/`, docs/TILES.md) makes
+tile-centric compute (the TileLang/cuTile/Triton direction; SME/AMX; NPU/TPU
+systolic; FPGA) a **library discipline over existing kernel objects** - one
+tile program, every engine, **zero new kernel objects/verbs**. A tile is shape
+x dtype x memory space; a `TileBuf<D>` is a dtype-tagged buffer over a memory
+grant (object 5); a `TileProgram` is built once and lowered per engine - the
+`CpuExecutor` runs it strand-parallel in the cell (scalar inner kernels, yield
+at every tile-loop back-edge), and the **`EngineExecutor` lowers the SAME
+program to dependency-graph nodes** (object 6) for the kernel's CPU engine now
+and device engines when their driver cells exist (`EngineUnavailable`, never
+faked). The kernel slice is **two graph-node op codes** inside the existing
+`OP_GRAPH_SUBMIT` payload (the LIBRHEO.md Phase C buffer-node step): op 4
+BufReduce (wrapping sum) and op 5 TileGemm (bounded int8->i32 GEMM, FNV
+receipt), each carrying a `#[repr(C)]` descriptor's cell VA (validated with
+hard caps -> `STATUS_DENIED`, never a fault); the engine executes them via a
+`#[path]` source-include of librheo's dependency-free tile kernels (shared
+verbatim with bench-core and the host comparison). The **dtype matrix** covers
+every quantization size - native I8/U8/I32/F32 (computed directly) plus
+storage F16/Bf16/FP8 E4M3/FP8 E5M2/TF32/int4-block (bit-exact soft-float-safe
+conversions; MMA *over* a storage dtype is a compile error until a device
+lowers it). A **deterministic `TileSim`** counts work + traffic (never timing);
+its bytes-staged ordering is validated against host wall-clock in
+`comparison/tiles` (both rank tilings `[256,128,64,32,16]`). The `librheotile`
+test proves the framework (tiled GEMM bit-exact vs a naive reference, sim
+determinism, contracts, the full dtype round-trip, CpuExecutor == kernel-engine
+receipts) and `librheotilebattle` the production-shaped battle tier (scaled
+7B-class layer GEMMs, an attention block, paged-KV prefix sharing, the
+librheodata columnar reduce as tiles, a 100-run soak, boundary shapes, a
+64-deep pipeline fence) - both on **all three ISAs**; `p6_*` benches report the
+per-tile-op path lengths. Honest: the CpuExecutor is scalar (in-cell SIMD
+awaits U-mode vector state; the AVX2 host kernel is proven equivalent by
+differential fuzz); pipelining is cooperative interleaving (SMP #27); device
+engines are enumerated, not executing. The battle tier surfaced two real
+latent fixes - a grant-slot leak on `SYS_MUNMAP` (freed frames but not the
+per-cell table slot) and an f16-subnormal rounding bug - and the per-cell
+grant table (16->64) and object table (128->512) caps were raised for
+real-workload headroom, both flagged in docs/TILES.md 12.
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
 proofs, and the hardware-lab performance numbers. **SMP** (docs/SMP.md,
@@ -767,7 +805,14 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               (intel-iommu: root/context/second-level + queued invalidation)
               and ARM64 via SMMUv3 (smmuv3: stream table + Context Descriptor
               + LPAE stage-1 + command/event queues); riscv skip-with-reason,
-              no QEMU IOMMU model), bench-core, and
+              no QEMU IOMMU model), librheotile (the tile framework,
+              docs/TILES.md: TileBuf/TileProgram/CpuExecutor + the graph
+              lowering, a tiled int8 GEMM bit-exact vs a naive reference, the
+              deterministic TileSim, and the full dtype matrix - F16/Bf16/FP8
+              E4M3+E5M2/TF32/int4 round-trips), librheotilebattle (the tile
+              battle tier: scaled 7B-class GEMMs, an attention block, paged-KV
+              prefix sharing, the columnar reduce, soak + boundary + pipeline
+              stress), bench-core, and
               the interactive
               lsh bin (+ harness.rs, vfs_personality.rs); fixtures/ holds the
               ext4 test image (+ gen-ext4.sh); linux-fixtures/ holds the
