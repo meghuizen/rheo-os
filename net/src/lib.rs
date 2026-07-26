@@ -139,16 +139,36 @@
 //! a different transport, so it reuses the same parser rather than getting a second
 //! one. Only [`dns::Resolver`]/[`dns::Config`] stayed behind `hosted`.
 //!
-//! Still deferred (per docs/NETSTACK.md): TLS 1.3 (N3b); full NewReno partial-ACK
-//! recovery, CUBIC HyStart / fast-convergence, and BBR; negative caching; and the
-//! *live* ICMPv6 path (the v6 codec is unit-proven; SLIRP cannot generate v6
-//! errors).
+//! **Phase N2e** makes congestion control **rate-based by default**
+//! (docs/NETSTACK.md §21) - loss-based control is the wrong default for high-BDP,
+//! lossy and bufferbloated paths, where **loss is not congestion**:
+//! - [`bbr`]: **BBRv3** - a max-bandwidth filter over windowed delivery-rate samples,
+//!   a windowed min-RTT filter, round-trip counting, the Startup -> Drain -> ProbeBW
+//!   (down/cruise/refill/up) -> ProbeRTT state machine with its pacing/cwnd gains, and
+//!   a loss response that caps in-flight instead of collapsing the window. Integer /
+//!   fixed-point, and now [`tcp::DefaultCc`] - `Reno`/`Cubic` stay selectable.
+//! - [`pacer`]: the **send pacer** - a token bucket that releases bytes at the
+//!   controller's pacing rate, whose deadline is registered with the **kernel timer
+//!   arbiter's pacer slot** (`librheo::time::sleep_pacing`), making it the arbiter's
+//!   first continuously re-armed client. **Pacing is a precondition for BBR, not a
+//!   tuning knob**: unpaced, BBR bursts a window into the link and performs worse than
+//!   CUBIC.
+//! - [`tcp::CongestionControl`] grew the rate-based half of the interface
+//!   ([`tcp::RateSample`], `on_rate_sample`/`pacing_rate_bps`/`inflight_cap`/
+//!   `min_rtt_ns`/`bw_bps`/`rounds`), all default-implemented, so `FixedWindow`,
+//!   [`cc::Reno`] and [`cc::Cubic`] behave **byte-for-byte** as before.
+//!
+//! Still deferred (per docs/NETSTACK.md): full NewReno partial-ACK recovery, CUBIC
+//! HyStart / fast-convergence, SACK, ECN (BBR's other congestion signal), negative
+//! DNS caching, and the *live* ICMPv6 path (the v6 codec is unit-proven; SLIRP cannot
+//! generate v6 errors).
 
 #![no_std]
 
 extern crate alloc;
 
 pub mod arp;
+pub mod bbr;
 pub mod cc;
 pub mod dhcp;
 pub mod dns;
@@ -158,6 +178,7 @@ pub mod http1;
 pub mod http2;
 pub mod ip;
 pub mod ntp;
+pub mod pacer;
 pub mod shard;
 pub mod tcp;
 pub mod udp;

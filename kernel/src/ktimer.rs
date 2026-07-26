@@ -90,10 +90,13 @@ pub enum TimerClient {
     CellSleep = 2,
     /// The network stack's timer wheel / TCP retransmission timeout.
     NetTimer = 3,
-    /// Reserved for the **BBR pacer** (the next phase): a continuously re-armed
-    /// send-pacing deadline, the requester that makes the conflict above fatal
-    /// rather than latent. Registered here now so the pacer is a `register` call
-    /// and not another subsystem reaching for the hardware.
+    /// The **BBR pacer**'s send-pacing deadline (docs/NETSTACK.md 21, rheo-net
+    /// N2e): "release the next segment at `bytes/rate` from the last one". This is
+    /// the arbiter's first **continuously re-armed** client - a paced flow
+    /// registers a fresh deadline after every send, for the life of the flow, so
+    /// it is the requester that makes the pre-N2h conflict fatal rather than
+    /// latent. A cell selects it on `SYS_ARM_TIMER` with
+    /// [`crate::abi::TIMER_CLIENT_PACER`].
     Pacer = 4,
 }
 
@@ -127,6 +130,10 @@ static mut PARKS: u64 = 0;
 /// client fired or cancelled - i.e. the deadlines the pre-N2h direct-`timer_arm`
 /// pattern would have silently lost. The conflict-avoidance counter.
 static mut PRESERVED: u64 = 0;
+/// Deadlines registered per client. Instrumentation only: it is what lets a test
+/// assert that a *cell's* pacer went through the [`TimerClient::Pacer`] slot (and
+/// how many times it re-armed) rather than some other client's.
+static mut REGS: [u64; CLIENTS] = [0; CLIENTS];
 
 /// Clear every deadline and counter (call before installing a fresh set of cells).
 pub fn reset() {
@@ -137,6 +144,7 @@ pub fn reset() {
         *addr_of_mut!(FIRINGS) = 0;
         *addr_of_mut!(PARKS) = 0;
         *addr_of_mut!(PRESERVED) = 0;
+        *addr_of_mut!(REGS) = [0; CLIENTS];
     }
     if arch::timer_irq_enabled() {
         arch::timer_disarm();
@@ -164,6 +172,8 @@ pub fn register(client: TimerClient, in_ns: u64) {
             armed: true,
             fired: false,
         };
+        let regs = &mut *addr_of_mut!(REGS);
+        regs[client as usize] = regs[client as usize].wrapping_add(1);
     }
     rearm(now, false);
 }
@@ -328,6 +338,15 @@ pub fn firings() -> u64 {
 pub fn parks() -> u64 {
     // SAFETY: single CPU.
     unsafe { *addr_of!(PARKS) }
+}
+
+/// Deadlines `client` has registered since the last [`reset`]. A continuously
+/// re-armed client (the [`TimerClient::Pacer`]) counts one per re-arm, which is how
+/// a test sees that a cell's pacing deadlines really landed in the pacer's own slot
+/// (docs/NETSTACK.md 21).
+pub fn registrations(client: TimerClient) -> u64 {
+    // SAFETY: single CPU.
+    unsafe { (*addr_of!(REGS))[client as usize] }
 }
 
 /// Deadlines that survived another client's completion because the arbiter

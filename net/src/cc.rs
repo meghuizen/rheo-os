@@ -31,7 +31,16 @@
 //!   to pin against an oracle; the per-ack increment is the optimization.
 //! - **HyStart and CUBIC fast-convergence are deferred** (documented, not built):
 //!   pre-loss CUBIC stays in slow start until a loss, and a loss always saves
-//!   `W_max = cwnd` (no fast-convergence discount). **BBR is a later phase.**
+//!   `W_max = cwnd` (no fast-convergence discount).
+//!
+//! ## These are no longer the default (rheo-net N2e)
+//! Both controllers remain first-class and selectable - `Connection<Cubic>` - and
+//! **nothing here changed** when [`crate::bbr`] became [`tcp::DefaultCc`](crate::tcp::DefaultCc):
+//! the rate-based half of the trait (delivery-rate samples, a pacing rate, an
+//! in-flight cap) is entirely default-implemented, so these two report "unpaced, no
+//! cap, no path model" and behave byte-for-byte as they did. What changed is the
+//! *recommendation*: loss-based control mis-reads a lossy or high-BDP path, where
+//! **loss is not congestion** (docs/NETSTACK.md §21).
 
 use crate::tcp::CongestionControl;
 

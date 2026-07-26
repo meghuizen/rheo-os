@@ -67,8 +67,15 @@ pub const SYS_GRANT_SHARE: u64 = 44;
 pub const SYS_SPAWN: u64 = 45;
 /// wait(handle) -> the child's exit code, or u64::MAX. Blocks cooperatively.
 pub const SYS_WAIT: u64 = 46;
-/// arm_timer(deadline_ns) -> 0. Block until `deadline_ns` monotonic ns elapse.
+/// arm_timer(deadline_ns, client) -> 0. Block until `deadline_ns` monotonic ns
+/// elapse. `client` names the kernel timer-arbiter slot that holds the deadline:
+/// [`TIMER_CLIENT_CELL_SLEEP`] or [`TIMER_CLIENT_PACER`].
 pub const SYS_ARM_TIMER: u64 = 47;
+/// [`SYS_ARM_TIMER`] argument 1: the cell-sleep slot (`time::sleep`/`timeout`).
+pub const TIMER_CLIENT_CELL_SLEEP: u64 = 0;
+/// [`SYS_ARM_TIMER`] argument 1: the **pacer** slot - a paced transport's
+/// send-release deadline, re-armed after every segment (docs/NETSTACK.md 21).
+pub const TIMER_CLIENT_PACER: u64 = 1;
 /// yield_cell() -> 0. Hand the CPU to the next runnable native cell (round-robin;
 /// falls back to the `cur^1` peer where there is no process tree). The N-cell
 /// generalisation of `SYS_SWITCH`, needed for service fan-out (docs/NETSTACK.md
@@ -389,9 +396,16 @@ pub fn wait(handle: u64) -> u64 {
     unsafe { syscall1(SYS_WAIT, handle) }
 }
 /// Block until `deadline_ns` nanoseconds of monotonic time elapse. The kernel's
-/// cooperative one-shot deadline (docs/LIBRHEO.md Phase F). `time` builds on it.
+/// one-shot deadline (docs/LIBRHEO.md Phase F). `time` builds on it.
 pub fn arm_timer(deadline_ns: u64) {
-    unsafe { syscall1(SYS_ARM_TIMER, deadline_ns) };
+    arm_timer_as(deadline_ns, TIMER_CLIENT_CELL_SLEEP);
+}
+
+/// [`arm_timer`] in a chosen kernel timer-arbiter slot (docs/NETSTACK.md 21): a
+/// paced transport passes [`TIMER_CLIENT_PACER`] so its continuously re-armed
+/// send deadline never contends with the cell's own `sleep`.
+pub fn arm_timer_as(deadline_ns: u64, client: u64) {
+    unsafe { syscall2(SYS_ARM_TIMER, deadline_ns, client) };
 }
 /// Monotonic uptime in raw ticks. `time::now` converts to nanoseconds.
 pub fn uptime() -> u64 {

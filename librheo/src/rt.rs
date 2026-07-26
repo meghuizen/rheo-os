@@ -39,11 +39,22 @@ pub struct Reactor {
     console_req: Option<(u64, usize, u64)>,
     /// Byte count the last serviced console read returned.
     console_n: usize,
-    /// A pending timer: `(deadline_ns, token)` (docs/LIBRHEO.md Phase F). One at
-    /// a time (the nearest deadline); serviced by `block_on` when no queue
+    /// A pending timer: `(deadline_ns, client, token)` (docs/LIBRHEO.md Phase F).
+    /// One at a time (the nearest deadline); serviced by `block_on` when no queue
     /// completion is ready, by arming the kernel's one-shot deadline. Honors
     /// docs/POWER.md - the kernel waits only when a real deadline was requested.
-    timer_req: Option<(u64, u64)>,
+    ///
+    /// `client` is the **kernel timer-arbiter slot** the deadline goes into
+    /// (`sys::TIMER_CLIENT_*`, docs/NETSTACK.md 21): an ordinary `sleep` uses the
+    /// cell-sleep slot, a paced transport the pacer slot. Two deadlines from one
+    /// cell therefore never destroy each other kernel-side. **In the reactor** they
+    /// still share this one request slot, so a strand pacing and a strand sleeping
+    /// interleave rather than wait concurrently (single-CPU cooperative; a per-slot
+    /// reactor timer table is the documented follow-on).
+    timer_req: Option<(u64, u64, u64)>,
+    /// Timer services that armed the **pacer** slot - one per paced release. The
+    /// cell-side witness that pacing really parked on the arbiter (never a spin).
+    pacing_parks: u64,
     /// A pending network receive: `(buf_va, len, timeout_ns, token)` (docs/NETSTACK.md, the
     /// async-receive path / rheo-net N2d). One reader at a time - a cell drives one
     /// NIC receive queue. Serviced by `block_on` when no queue completion is ready,
@@ -152,9 +163,10 @@ impl Reactor {
         self.console_n
     }
 
-    /// Register a pending one-shot timer (the strand parks on `token`).
-    fn set_timer(&mut self, deadline_ns: u64, token: u64) {
-        self.timer_req = Some((deadline_ns, token));
+    /// Register a pending one-shot timer in arbiter slot `client` (the strand
+    /// parks on `token`).
+    fn set_timer(&mut self, deadline_ns: u64, client: u64, token: u64) {
+        self.timer_req = Some((deadline_ns, client, token));
     }
 
     /// Service a pending timer by arming the kernel's one-shot deadline (which
@@ -162,8 +174,11 @@ impl Reactor {
     /// pending. Cooperative: while parked, the vcore first drains every other
     /// ready strand; only when all have parked does `block_on` reach here.
     fn service_timer(&mut self) -> bool {
-        if let Some((deadline_ns, token)) = self.timer_req.take() {
-            sys::arm_timer(deadline_ns);
+        if let Some((deadline_ns, client, token)) = self.timer_req.take() {
+            sys::arm_timer_as(deadline_ns, client);
+            if client == sys::TIMER_CLIENT_PACER {
+                self.pacing_parks += 1;
+            }
             complete(token);
             true
         } else {
@@ -357,6 +372,7 @@ pub fn init(caps: &CapSet, qp_va: u64) {
         console_req: None,
         console_n: 0,
         timer_req: None,
+        pacing_parks: 0,
         wait_req: None,
         wait_code: 0,
         net_rx_req: None,
@@ -422,8 +438,26 @@ pub async fn read_console(buf: *mut u8, len: usize) -> usize {
 /// deadline. `time::sleep`/`timeout`/`interval` build on this.
 pub async fn sleep_ns(deadline_ns: u64) {
     let token = next_token();
-    with_reactor(|r| r.set_timer(deadline_ns, token));
+    with_reactor(|r| r.set_timer(deadline_ns, sys::TIMER_CLIENT_CELL_SLEEP, token));
     park_on(token).await;
+}
+
+/// Async **pacing** sleep: like [`sleep_ns`], but the deadline is held in the
+/// kernel timer arbiter's **pacer** slot (docs/NETSTACK.md 21, rheo-net N2e). A
+/// paced transport calls this after every segment it releases - a continuously
+/// re-armed deadline - and the cell's own `sleep`/`timeout` deadlines survive
+/// alongside it instead of being cancelled by it.
+pub async fn sleep_pacing_ns(deadline_ns: u64) {
+    let token = next_token();
+    with_reactor(|r| r.set_timer(deadline_ns, sys::TIMER_CLIENT_PACER, token));
+    park_on(token).await;
+}
+
+/// How many times the reactor serviced a **pacing** deadline (one per paced
+/// release). Non-zero is the cell-side evidence that pacing parked on the kernel
+/// arbiter's pacer slot rather than spinning (docs/NETSTACK.md 21).
+pub fn pacing_parks() -> u64 {
+    with_reactor(|r| r.pacing_parks)
 }
 
 /// Bind this cell's end of a cross-cell shared channel to the reactor

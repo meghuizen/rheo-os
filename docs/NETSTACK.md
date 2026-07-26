@@ -3,7 +3,9 @@
 **Status:** Building. Phase **N1a** (the L2/L3 core), **N1b's L4** (UDP + ICMP),
 **N1c's caching DNS client**, **N1e's TTL / hop-limit + traceroute**, **N1d's
 local sockets** (native `net::local` + Linux AF_UNIX), **N2a's native TCP core**,
-**N2b's congestion control** (Reno + CUBIC), **N2c's two transports** (the smoltcp
+**N2b's congestion control** (Reno + CUBIC), **N2e's BBRv3 + pacer** (the
+**default** controller: rate-based, loss-tolerant, paced on the kernel timer
+arbiter - §21), **N2c's two transports** (the smoltcp
 blessed cell + the native sharded framing - §13), the **L8-INET** personality
 slice (AF_INET/AF_INET6 sockets + a minimal epoll over the **loopback** interface -
 §10(C), docs/LINUX-COMPAT.md), **N3a's crypto primitive layer** (from-scratch
@@ -198,6 +200,17 @@ kernels stay green.
     into the send window, with fast-retransmit dup-ACK handling added to `tcp`.
     Proven **deterministically in-cell** - integer cwnd trajectories pinned against
     oracles + a real fast-retransmit-before-RTO scenario (§12).
+  - **N2e (done): BBRv3 as the default congestion control, with a pacer.** `bbr`
+    (a from-scratch BBRv3 - a windowed max-bandwidth filter over delivery-rate
+    samples, a 10 s windowed min-RTT filter, round-trip counting, the
+    Startup/Drain/ProbeBW/ProbeRTT machine with its pacing and cwnd gains, and a
+    loss response that caps in-flight instead of collapsing the window) and `pacer`
+    (a token bucket whose release deadline is registered with the N2h arbiter's
+    **pacer** slot - the arbiter's first continuously re-armed client). The CC trait
+    grew its rate-based half, all default-implemented, so Reno/CUBIC are
+    byte-for-byte unchanged. Proven **deterministically in-cell**, including the
+    headline **loss != congestion** assertion against CUBIC on an identical trace
+    (§21).
   - **N2c (done): the two transports.** The smoltcp blessed correctness cell
     (integrated over the raw-frame NIC path, a live smoltcp UDP round trip to
     SLIRP's DNS) and the native sharded transport framing (connections hashed to
@@ -708,13 +721,20 @@ retransmitted segment (the ack is ambiguous), and the RTO **backs off
 exponentially** (doubles, capped) on each timeout until a fresh ack re-measures it.
 Unacked data is retransmitted from `snd_una` when the RTO fires.
 
-### The congestion-control seam (N2b slots in here)
+### The congestion-control seam (N2b and N2e slot in here)
 
 `trait CongestionControl { on_ack(bytes, rtt); on_loss(); cwnd(); }` is the seam.
 N2a ships only **`FixedWindow`** (a large fixed cwnd, so the peer's advertised
 window - flow control - dominates). **N2b** slots in real controllers (Reno, CUBIC)
 as drop-in `impl CongestionControl`s (§12); `Connection` is generic over `C` so
 swapping the controller is a type parameter, not a rewrite.
+
+**N2e** extends the trait with its **rate-based** half - a delivery-rate sample, a
+pacing rate, and an in-flight cap - and makes `bbr::Bbr` the default `C`
+(`tcp::DefaultCc`). Every addition is default-implemented, so the window-based
+controllers above are untouched; the send window becomes
+`min(peer_window, cwnd, inflight_cap)` and a paced connection's data segments are
+released by `net::pacer` on a kernel timer-arbiter deadline (§21).
 
 ### The socket-shaped API
 
@@ -787,7 +807,12 @@ an external peer at the hardware lab).
 ## 12. Phase N2b (done): TCP congestion control - Reno + CUBIC
 
 N2b fills the N2a seam with two **from-scratch** congestion controllers over the
-`CongestionControl` trait - portable userspace, **no kernel object**, **no ABI
+`CongestionControl` trait. (Both remain first-class and selectable, and their
+behaviour here is exactly what it was: since N2e the *default* controller is BBRv3
+- §21 - because loss-based control is the wrong default for high-BDP, lossy and
+bufferbloated paths.)
+
+They are built over the trait - portable userspace, **no kernel object**, **no ABI
 change**, **no new dependency**, **no `cfg(target_arch)`**. Both use **integer /
 fixed-point** cwnd math (matching the kernel's no-FPU discipline even though these
 are soft-float U-mode cells; no float appears in the window arithmetic).
@@ -2385,3 +2410,379 @@ than only written down.
   a userspace correction with a bound.
 - **Running the four clients inside the N4a service cell** so other cells inherit the
   configuration - that needs N4a's deferred name-based rendezvous.
+
+## 21. Phase N2e (done): BBRv3 as the default congestion control, with a pacer
+
+N2b filled the N2a seam with Reno and CUBIC. Both are **loss-based**: they infer
+congestion from a lost packet. N2e makes congestion control **rate-based by default**
+- `net::bbr`, a from-scratch **BBRv3** - and adds the **pacer** that BBR cannot work
+without. Portable userspace in the crate's always-compiled half (a synchronous state
+machine, like `tcp` itself), integer / fixed-point throughout (no floats - these are
+soft-float cells), **no new kernel object**, **no new syscall verb**, **no new
+dependency**, **no `cfg(target_arch)`**.
+
+### 21.1 Why loss-based control is the wrong default
+
+Loss is a proxy for congestion, and it is a bad proxy on exactly the paths this stack
+targets:
+
+- **High-BDP intercontinental paths.** On a 100 ms, 10 Gb/s path a window is ~125 MB.
+  One loss halves it (Reno) or 0.7-scales it (CUBIC), and cubic regrowth takes
+  hundreds of round trips - minutes of degraded throughput for a single corrupted
+  packet. Section 12's own proof shows the shape: after three losses CUBIC is at 37%
+  of the path.
+- **Lossy links.** On wireless, most loss is radio, not queueing. A loss-based
+  controller reads interference as congestion and gives up bandwidth that was never
+  contended. **Loss is not congestion.**
+- **Bufferbloat.** A loss-based controller only backs off once a buffer has
+  *overflowed*, so it deliberately keeps deep queues full. The cost is latency for
+  everything sharing the queue.
+
+BBR replaces the inference with a **measurement**: a windowed maximum delivery rate
+(`max_bw`) and a windowed minimum RTT (`min_rtt`). It sends at `max_bw` with about one
+`max_bw * min_rtt` (one BDP) in flight. Loss does not move the rate; it only caps
+in-flight.
+
+**Reference parameters** are **CloudBridge's published BBRv3 findings** (Habr article
+964556) - *their* measurements, cited, not restated as ours: BBRv3 as production-ready,
+roughly **1:2** throughput versus CUBIC and **1:3** versus Reno, an initial window of
+**10 x MSS**, a startup pacing gain of **2.77** (~90% of path bandwidth within 10 ms),
+a drain gain of **0.75**, a fairness-mode pacing gain of **0.95**, and a **10 s**
+min-RTT window. We reproduce the parameters and the mechanism. **Wall-clock throughput,
+latency and jitter are hardware-lab numbers**: QEMU-TCG has no caches or TLB and no
+real link, so this document reports only deterministic integer state and icount path
+lengths (docs/TOOLING.md 4). That is said once here and not repeated.
+
+### 21.2 The rate-based half of the CC interface
+
+`CongestionControl` could not express BBR: `on_ack(bytes, rtt)` says how *much* was
+acked, never how *fast* it was delivered. N2e adds the rate-based half, **every method
+default-implemented**, so `FixedWindow`, `Reno` and `Cubic` compile untouched and
+behave **byte-for-byte** as they did (§21.7):
+
+| addition | what BBR needs it for | default |
+| --- | --- | --- |
+| `RateSample` + `on_rate_sample(&rs)` | the delivery-rate feed | ignored |
+| `pacing_rate_bps()` | send as a *rate*, not a window | `0` = unpaced |
+| `inflight_cap()` | BBR's `inflight_hi`, and the reduced ProbeRTT cap | `u32::MAX` |
+| `min_rtt_ns()` / `bw_bps()` / `rounds()` | expose the model (inspection + proofs) | `None` / `0` / `0` |
+| `uses_rate_samples()` | opt in to the per-transmission send-time bookkeeping | `false` |
+
+A `RateSample` carries `delivered` / `prior_delivered` (BBR's round-trip mark), `acked`,
+`interval_ns`, the RTT if any, in-flight before and after, and `app_limited`.
+
+**The ACK clock is the completion clock.** The sample is *derived from the send/ack
+bookkeeping the connection already keeps*, not from bolted-on instrumentation. Every
+**first** transmission (`start >= snd_max` - the same test Karn's algorithm uses to
+refuse a retransmit's RTT) records a `TxRecord`: `end_seq`, the send time, and the
+`delivered` counter and last-delivery timestamp as they stood at that moment. The ACK
+that covers it computes
+
+```
+delivered_diff = delivered_now - record.delivered
+interval       = max(now - record.delivered_ns,        // ack-elapsed
+                     record.sent_ns - record.first_tx_ns)  // send-elapsed
+rate           = delivered_diff / interval
+```
+
+which is the `tcp_rate.c` idea expressed over `snd_max` and a `delivered` counter. The
+`max` is what stops a slowly-*sent* burst from reading as a slow *path*. In a hosted
+cell those ACKs arrive as **queue completions** (the CQ entry carries the flow id), so
+BBR's ACK clock *is* this OS's completion clock. `app_limited` is set when a poll finds
+nothing left to send, and a max filter refuses such a sample unless it is higher anyway
+- otherwise the model would measure the application.
+
+Two honest notes on the sample: NIC hardware transmit/receive timestamps would sharpen
+the interval (deferred), and the in-cell `VirtualLink` delivers **instantly**, so a
+loopback exchange yields `interval == 0` and therefore *no* rate samples - which is why
+the model is proven against **scripted** samples with real intervals (§21.6) rather than
+over the loopback.
+
+### 21.3 The BBRv3 state machine (`net::bbr`)
+
+Gains are hundredths (`UNIT = 100`), so `277` is 2.77x - integer only.
+
+| state | pacing gain | cwnd gain | exit |
+| --- | --- | --- | --- |
+| `Startup` | **2.77** | 2.0 | bandwidth plateau (3 rounds without 25% growth) or an excessive-loss round (>2%) |
+| `Drain` | **0.75** | 2.0 | in-flight back to one BDP |
+| `ProbeBw(Down)` | 0.90 | profile (2.0 at edge) | in-flight <= BDP, or one min-RTT |
+| `ProbeBw(Cruise)` | **0.95** | profile | the profile's cruise time (2 s at edge) |
+| `ProbeBw(Refill)` | 1.00 | profile | one round |
+| `ProbeBw(Up)` | 1.25 | profile | in-flight > 1.25 BDP, or two rounds |
+| `ProbeRtt` | 1.00 | **0.5** | the dwell (200 ms at edge) **and** one round |
+
+- **`cwnd = gain * BDP`**, floored at 4 MSS and capped by `inflight_hi`. In Startup it
+  also grows by the bytes just acked, so the window ramps before the bandwidth estimate
+  means anything. `cwnd()` therefore stays meaningful for BBR - it is still the
+  in-flight bound the send window is `min`'d against.
+- **`pacing_rate = gain * max_bw`**, or (before the first sample) the 10 x MSS initial
+  window over a 100 ms assumed RTT, which is 146,000 B/s and pacing at 404,420 B/s.
+- **Round-trip counting**: a round ends when an ACK arrives for data sent after the
+  previous round's `delivered` mark - BBR's `round_start`, and the clock the filters
+  and the plateau test run on.
+- **The max-bandwidth filter** is a ring of per-round maxima (10 rounds at edge). A
+  round start zeroes the slot it is about to reuse, so a sample **expires** exactly
+  `BW_WINDOW_ROUNDS` rounds after it was taken; the estimate is the max over the ring.
+- **The min-RTT filter** takes any lower sample at once, and a *higher* one only once
+  the 10 s window has elapsed (that expiry is what makes it windowed rather than an
+  all-time minimum, and refreshing it is what `ProbeRtt` exists for).
+- **The loss response is not a multiplicative collapse.** A loss signal (an RTO, or a
+  3rd duplicate ACK - which still triggers fast retransmit) trims `inflight_hi` by
+  `beta = 30%`, **at most once per round**, and **floored at one BDP**; the bandwidth
+  estimate, the pacing rate and the min-RTT are untouched, and there is no `ssthresh`
+  at all (`ssthresh()` reports `u32::MAX` to say so). The BDP floor is the crux: a loss
+  trims the *headroom above* the operating point, never the operating point itself, so
+  random loss on an unqueued path costs nothing. Genuine congestion is still answered -
+  as a **falling delivery rate**, which shrinks the BDP through the bandwidth filter and
+  lowers that floor with it. That is the difference between reacting to a *signal* and
+  reacting to a *measurement*, and §21.6 proves both halves.
+
+**Simplifications versus the IETF BBR draft** (also listed in the module docs):
+
+1. **No ECN.** The v3 draft treats ECN marks as a second congestion signal with its own
+   `ecn_thresh`/`ecn_alpha`; rheo-net's IPv4 layer does not negotiate ECN, so only loss
+   is modelled. The seam is the same two methods.
+2. **Loss accounting is per-signal, not per-byte** - without SACK (deferred since N2a)
+   the stack cannot say which bytes were lost, so each signal is charged one MSS in the
+   per-round loss ratio.
+3. **`inflight_hi` / `inflight_lo` are one variable**, trimmed on loss and raised on a
+   probe refill, instead of the draft's two bounds with separate probing rules.
+4. **ProbeBW phase durations are deterministic, not randomised.** The draft randomises
+   the cruise duration so competing flows desynchronise; a fixed duration makes the
+   cycle provable. Randomising it over the per-cell DRBG is a one-line change and is
+   named as future work.
+5. **ProbeRTT starts its dwell at entry** (the cap applies immediately); the draft first
+   waits for in-flight to fall to the cap and *then* holds for 200 ms + one round.
+6. **ProbeBW-Up exits on an in-flight bound or two rounds**, not the draft's full
+   bandwidth-growth / queue-inference test.
+7. **No packet-conservation recovery state** - there is no SACK-driven recovery machine
+   to conserve against.
+8. **Startup exits on a plateau or an excessive-loss round**; the draft also weighs ECN
+   and a queue estimate.
+
+### 21.4 The pacer (`net::pacer`) - a precondition, not a tuning knob
+
+BBR sends *at a rate*. If the sender is unpaced, a cwnd-sized burst leaves at the
+sending NIC's line rate, arrives at the bottleneck far faster than it drains, and builds
+exactly the standing queue BBR exists to avoid; the measured RTT rises, the model
+degrades, and the flow ends up **worse than CUBIC**. So this is not optional: **an
+unpaced BBR is not a slower BBR, it is a broken one.** The documented consequence of
+`pacing_rate_bps()` defaulting to 0 is the mirror image - every window-based controller
+stays unpaced and unchanged.
+
+`Pacer` is a synchronous integer **token bucket**: tokens accrue in bytes at
+`rate_bps`, capped at a burst allowance of `max(2*MSS, rate * 1 ms)` (a bucket with no
+burst cannot release even one segment until a full segment-time has passed, which would
+stall every window opening). `Connection` owns one, syncs its rate from the controller
+each poll, gates **data** segments through `ready(now, n)` / `on_sent(now, n)`, and
+reports `next_send_at()` through `poll_at()` - so a paced connection's next event is
+its release deadline. Pure ACKs, SYN/FIN and retransmissions are **not** paced: delaying
+an ACK slows the peer's clock and delaying a retransmit extends a stall.
+
+One correctness detail worth naming, because it livelocks if missed: token accrual
+**floors**, so the wait to the next release must be **rounded up**. A floored wait comes
+up one byte short, the caller waits again for the same deficit, and the clock crawls
+forward in nanoseconds without ever sending.
+
+**On the kernel timer arbiter.** The release deadline is registered with
+`ktimer::TimerClient::Pacer` - the slot N2h reserved for exactly this - via
+`librheo::time::sleep_pacing` -> `SYS_ARM_TIMER` with `TIMER_CLIENT_PACER`. That
+argument is the phase's only ABI change: `SYS_ARM_TIMER` gains a second argument naming
+the arbiter slot (`0` = the cell sleep, i.e. the pre-N2e shape, so every existing caller
+is unchanged; `1` = the pacer). It is **not a new verb and not a new object** - it names
+a slot in a fixed kernel table and transfers no authority, exactly as `SYS_CONNECT`
+gained its slot argument in N4a. The pacer never touches `arch::timer_*`.
+
+The pacer is the arbiter's **first continuously re-armed client**: a paced flow
+registers a fresh deadline after *every* segment, for the life of the flow. This is the
+requester N2h predicted would make the old direct-`timer_arm` pattern fatal rather than
+latent, and §21.6 exercises exactly that path.
+
+N2e also **finished** the N2h unification. `SYS_ARM_TIMER`'s no-hardware-timer path
+still had its own spin loop that bypassed the arbiter entirely, so on an ISA without a
+verified one-shot (x86-64 under QEMU-TCG, §16) a cell's deadline was invisible to every
+other client - the same class of defect N2h removed for the interrupt path. There is now
+**one** path: register, park, cancel. Where the timer interrupt is wired the park halts
+the CPU (a genuine 0%-CPU idle, and `timer_did_idle()` says so); where it is not, the
+arbiter honours the same deadline in software and the loop spins, honestly, with
+`timer_did_idle()` false.
+
+### 21.5 A paced flow as a reservation (object 7): fitted in part, refused in part
+
+The idea is attractive - "a paced flow *is* a reservation", and object 7 already does
+EDF admission on `(budget, period, deadline)`. Half of it fits and half of it is a
+category error. Both halves are implemented as stated; neither is faked.
+
+- **Refused: the byte rate.** A reservation admits **CPU time** against one core's
+  capacity (`sum(budget_i/period_i) <= 1`, `kernel/src/sched.rs`). A pacing rate is
+  bytes/second against a **link**, and the kernel holds no authority over link
+  capacity: there is no attested line rate, no per-flow NIC rate limiter, and no
+  admission dimension measured in bytes. Admitting "40 Gb/s" would hand back a
+  guarantee nothing can keep - precisely the dishonesty the admission controller exists
+  to refuse. It is also the wrong *granularity*: reservations are per **cell**, while a
+  sharded transport cell (N2c) owns many flows, so one cell-level rate cannot describe
+  them. **What would make it real:** an attested per-NIC-queue capacity (an
+  engine-style attest-by-measurement figure), a per-flow rate limiter in the steering
+  table (the deferred N6 socket/steering object), and a per-flow reservation subject.
+- **Fitted: the pacer's own CPU cost.** Pacing at rate `R` with segment size `S` wakes
+  the cell every `S/R` seconds and each wake costs real CPU - a periodic task with a
+  budget and a period, which is object 7's shape exactly.
+  `pacer::cpu_reservation_for(rate, mss, wakeup_ns)` converts a pacing rate into
+  `(budget, period)` and `admit_pacing_cpu` asks the kernel **whether the cell can
+  afford to pace at that rate at all**. Both are nanoseconds; admission is a ratio, so
+  the units only have to agree with each other. At 12 MB/s this is 2,000 ns every
+  121,666 ns (16,438 ppm of a core); at 100 Gb/s it is a wake every 116 ns, less than
+  one wake costs, and the request is refused as `BadParams` rather than degenerating
+  into a spin. §21.6 admits two 292 MB/s paces (40% each) and watches the third be
+  refused `Overcommit`.
+
+Honest, and unchanged from Phase C: `PACER_WAKEUP_NS` is a **declared** cost, not a
+measured one (there is no meaningful wall clock here), and **enforcement** of an
+admitted reservation is still SMP/preemption work (task #27) - admission is real,
+scheduling is not.
+
+### 21.6 What `nettcpcc` proves (deterministic, all three ISAs)
+
+The N2b kernel is extended, not replaced: its eight Reno/CUBIC trajectory steps run
+**unchanged** and are followed by eleven N2e steps, all integer and all pinned to
+hand-computed oracles. The cell exits `0x42` only if every one matches. The BBR model
+scenarios are driven by a **scripted delivery-rate feed** - one `RateSample` per round
+trip at a chosen rate, RTT and in-flight level, i.e. exactly the ACK stream a link of
+that rate would produce (§21.2 explains why the loopback cannot produce them).
+
+1. **Startup.** Before any sample: `cwnd` 14,600 (10 x MSS) paced at 404,420 B/s. Five
+   rounds of doubling delivery rate give pacing rates `2.77, 5.54, 11.08, 22.16, 44.32
+   MB/s` and windows `100k, 200k, 400k, 800k, 1.6M` - exponential, exactly 2.77x the
+   estimate. Then three flat 16 MB/s rounds: the plateau is declared on the **third**
+   and only the third, and the state becomes `Drain` pacing at 12,000,000 B/s
+   (0.75 x 16 MB/s).
+2. **Drain.** With in-flight at 2 BDP the 0.75 gain holds; the round where in-flight
+   reaches the 800,000-byte BDP enters `ProbeBw(Down)` at gain 0.90.
+3. **The ProbeBW gain cycle.** The four phase changes are asserted in order with their
+   gains - `Cruise 0.95 -> Refill 1.00 -> Up 1.25 -> Down 0.90` - and cruise is measured
+   to have lasted the profile's 2 s (to within one round trip).
+4. **ProbeRTT.** After warm-up on a 50 ms path the path queues to 60 ms, so the 50 ms
+   minimum is never refreshed. Entry happens **only** once it is genuinely stale (not
+   before the 10 s window), `cwnd` at entry is exactly `0.5 * BDP` (300,000 of a
+   600,000-byte BDP - and strictly below one BDP, which ProbeBW would have allowed), the
+   state holds for at least the 200 ms dwell, exits back into `ProbeBw` with the min-RTT
+   refreshed to 60 ms, and does **not** re-enter for the next 20 rounds (the window
+   restarted at the exit). Entries counted: exactly 1.
+5. **The two filters.** A 20 MB/s round is held by the max-bandwidth filter for exactly
+   10 rounds of 5 MB/s traffic and **expires** on the 11th, leaving 5 MB/s. The min-RTT
+   filter takes 60 ms, then 30 ms (lower - taken at once), then ignores 90 ms while the
+   window holds.
+6. **Loss != congestion - the headline.** BBR is warmed to steady state on a 10 MB/s /
+   50 ms path (BDP 500,000) and CUBIC is placed at the same operating point (`cwnd` =
+   one BDP, in the cubic region). Both then run the **same** 12-round trace at exactly
+   the link rate with a **random-loss episode** (three duplicate ACKs) every fourth
+   round - no queue growth, no rate change, i.e. lossy-wireless, not congestion.
+   Asserted:
+   - **BBR**: the bandwidth estimate is still **10 MB/s**, the pacing rate is still the
+     fairness-mode `0.95 x` of it (**9.5 MB/s = 95% of the link**), and `cwnd` has gone
+     `1,000,000 -> 500,000` - it gave up *queue*, not throughput, so its implied sending
+     rate is still **100% of the link rate**. Three loss events recorded.
+   - **CUBIC**: `cwnd` `499,999 -> 187,534` - **37% of the link rate** (exact integer
+     oracle). BBR is sending at **2.6x** CUBIC's rate on an identical trace.
+   - **And the converse**, so this is not loss-blindness: when the *delivery rate
+     itself* halves - real congestion - BBR's estimate follows it as soon as the filter
+     window turns over (round 10), and the pacing rate halves with it to 4.75 MB/s.
+7. **Pacing at the connection level.** A real `Connection<Bbr>` over the in-cell link
+   transfers 20 segments: the burst allowance (2 MSS = 2,920 bytes) leaves back to
+   back - exactly **one** zero gap - and every subsequent release is spaced by exactly
+   **3,610,109 ns**, one segment-time at 404,420 B/s (the ceil-rounded value; the
+   floored segment-time is 3,610,108 ns). 36 deferrals recorded, payload byte-identical,
+   64,981 us of paced span. An unpaced sender would have emitted all 20 at one instant.
+8. **Loss recovery, BBR versus Reno, over the same dropped segment.** Both recover the
+   payload. BBR ends with `cwnd` 20,440 and **no `ssthresh`** (`u32::MAX`); Reno ends at
+   11,680 with `ssthresh` 7,300 after its slow-start restart from 1 MSS.
+9. **The window-based controllers are untouched.** `FixedWindow`, `Reno` and `Cubic`
+   each report `pacing_rate_bps() == 0`, `inflight_cap() == u32::MAX`, no min-RTT, no
+   bandwidth and no rounds; a `Connection<Reno>` with data queued has **no** pacing
+   deadline and an unpaced pacer, while a `Connection<Bbr>` in the same state does have
+   one.
+10. **The pacing-rate -> CPU-reservation arithmetic** (§21.5's numbers), and **the real
+    admission**: two 292 MB/s paces admitted (400,000 then 800,000 ppm committed by the
+    kernel's own accounting), a third refused **`Overcommit`**, and a 100 Gb/s pace
+    refused **`BadParams`**.
+11. **The live pacer on the arbiter.** 16 releases at 1.2 MB/s: 2 in the burst and **14
+    parked on a real kernel deadline in the pacer slot**, re-armed every time.
+    `rt::pacing_parks()` (the cell's count of reactor services that armed *that* slot)
+    must equal 14 exactly - a spin would never touch it.
+
+Kernel-side, `nettcpcc` adds the **continuous-re-arm** property N2h could not yet test:
+40 back-to-back pacer deadlines (200 us each) while a 20 ms network/RTO deadline and a
+40 ms cell-sleep deadline stay outstanding **throughout**. After every single release
+both others are asserted still armed and unfired; then they fire at their own times, in
+order (measured at ~20.3 ms and ~40.3 ms). `ktimer::registrations(Pacer) == 40` and
+`preserved() >= 40` - i.e. 40 completions each re-armed a still-pending deadline instead
+of disarming it, which is exactly what the pre-N2h pattern threw away. Afterwards the
+kernel checks its **own** arbiter counter for the cell's contribution (`>= 14`
+registrations in the pacer slot - the cell cannot fake this), and asserts a genuine
+`wfi`/`hlt` idle-park where the ISA has a verified one-shot (riscv64, aarch64) while
+x86-64 reports the honest software-honoured deadline instead (§16: its LAPIC one-shot is
+inert under QEMU-TCG).
+
+### 21.7 Reno and CUBIC are byte-for-byte unchanged
+
+By construction, not by inspection: every N2e trait method is default-implemented, so
+neither controller's code changed at all (`net::cc` is untouched apart from doc text).
+They also pay **nothing** for the new interface rather than merely behaving the same:
+`uses_rate_samples()` is `false` for them, so the connection skips the `TxRecord` push
+per transmission and the sample construction per ACK entirely.
+The three integration points are all `min`/`0` identities for them - the send window
+gained `.min(cc.inflight_cap())` (`u32::MAX`), `poll_at` gained the pacing deadline
+(`None` when unpaced), and `poll` syncs `pacer.set_rate(cc.pacing_rate_bps())` (`0`,
+which disables the pacer). The eight N2b trajectory assertions run unchanged in the same
+kernel, and all pre-existing kernels stay green. Two call sites that relied on the
+*default type parameter* now name their controller explicitly (`nettcp-demo`'s
+`TcpStream`/`TcpListener`), which is better practice anyway: a proof should say which
+controller it is proving.
+
+### 21.8 Per-profile tunings
+
+Compile-selected, precedence **hft > warehouse > edge/embedded**:
+
+| tuning | edge (default) | hft | warehouse |
+| --- | --- | --- | --- |
+| min-RTT window | 10 s | **2 s** | 10 s |
+| bandwidth window | 10 rounds | 6 rounds | **20 rounds** |
+| ProbeRTT dwell | 200 ms | **50 ms** | 200 ms |
+| cruise duration | 2 s | **500 ms** | **4 s** |
+| ProbeBW cwnd gain | 2.0 | **1.5** | **2.5** |
+
+- **hft is latency-first**: a short min-RTT window with frequent, short ProbeRTT means
+  the model can never sit on a stale, queue-inflated RTT, and a 1.5 BDP in-flight cap
+  with a short cruise keeps pacing strict.
+- **warehouse is throughput-first**: a long bandwidth window so a jumbo-framed bulk
+  flow's rate survives a slow round, a large in-flight allowance, and a long cruise so
+  the flow spends most of its time at the estimate.
+- **embedded keeps CUBIC** as `tcp::DefaultCc` when it is the *only* profile feature
+  enabled. BBR carries two filters and a per-segment re-armed timer; a deployment
+  sending a few small flows over a known link buys little with that. This is a
+  legitimate embedded choice, documented rather than hidden - and `Bbr` remains
+  available there by naming it.
+
+Only the **edge** arm is exercised in QEMU (the test kernels build with default
+features); the other arms are compile-checked. Honest.
+
+### What N2e defers (explicit)
+
+- **ECN** - BBR's other congestion signal (simplification 1 above), which needs IP-layer
+  ECN negotiation first.
+- **SACK**, and with it per-byte loss accounting and the draft's `inflight_lo`/`hi`
+  probing rules.
+- **Randomised ProbeBW cruise** (flow desynchronisation over the per-cell DRBG).
+- **Hardware transmit/receive timestamps** for sharper delivery-rate intervals, and a
+  NIC-timestamped completion carried in the CQ entry.
+- **A delay/rate-shaping `VirtualLink`**, which is what a *closed-loop* in-cell proof of
+  the model would need (today: scripted samples for the model, the instant loopback for
+  pacing and recovery).
+- **Two concurrent timer waiters in one cell.** The reactor still has a single
+  `timer_req` slot, so a strand pacing and a strand sleeping interleave rather than wait
+  together - a pre-N2e limitation the pacer inherits (the *kernel* arbiter keeps them in
+  separate slots, so nothing is lost or falsely reported). The fix is a per-slot reactor
+  timer table, mirroring the N4a channel slots.
+- **Byte-rate admission** as a reservation, and everything §21.5 names as its
+  precondition.

@@ -326,14 +326,31 @@ pub const SYS_YIELD: u64 = 49;
 /// u64::MAX if `handle` names no child of the caller. A native child that faults
 /// is reaped with a sentinel exit code (`FAULT_EXIT`), never a signal.
 pub const SYS_WAIT: u64 = 46;
-/// arm_timer(deadline_ns) -> 0. **Blocks** until `deadline_ns` nanoseconds of
-/// monotonic time elapse from the call, then returns. The "arm timer" verb: a
+/// arm_timer(deadline_ns, client) -> 0. **Blocks** until `deadline_ns` nanoseconds
+/// of monotonic time elapse from the call, then returns. The "arm timer" verb: a
 /// one-shot deadline. Honors docs/POWER.md - the kernel only waits when a real
-/// deadline was requested. Cooperative on every ISA today (the deadline is
-/// checked against the monotonic clock; a true per-ISA timer IRQ is documented
-/// future work, docs/LIBRHEO.md Phase F), so this is an honest deadline wait, not
-/// a 0%-CPU idle. librheo's `time::sleep`/`timeout` build on it.
+/// deadline was requested. Where the per-ISA timer interrupt is wired
+/// (docs/LIBRHEO.md Phase F) the kernel halts at `wfi`/`hlt` until it fires - a
+/// genuine 0%-CPU park; where it is not, the deadline is checked cooperatively
+/// against the monotonic clock (an honest deadline wait, not an idle). The deadline
+/// is held by the **timer arbiter** (`kernel/src/ktimer.rs`), never armed on the
+/// hardware directly, so it coexists with every other outstanding deadline.
+///
+/// `client` (argument 1) selects **which arbiter slot** holds it:
+/// [`TIMER_CLIENT_CELL_SLEEP`] (0 - the pre-N2e shape, so an old caller passing
+/// nothing is unchanged) or [`TIMER_CLIENT_PACER`] (1 - a paced transport's
+/// send-release deadline, continuously re-armed; docs/NETSTACK.md 21). It transfers
+/// no authority and adds no object: it names a slot in a fixed kernel table.
+/// librheo's `time::sleep`/`timeout` use 0; `time::sleep_pacing` uses 1.
 pub const SYS_ARM_TIMER: u64 = 47;
+
+/// [`SYS_ARM_TIMER`] argument 1: hold the deadline in the cell-sleep slot (the
+/// default, and the only behaviour before rheo-net N2e).
+pub const TIMER_CLIENT_CELL_SLEEP: u64 = 0;
+/// [`SYS_ARM_TIMER`] argument 1: hold the deadline in the **pacer** slot - a paced
+/// transport's "release the next segment at `bytes/rate`" deadline, re-armed after
+/// every send (docs/NETSTACK.md 21, rheo-net N2e).
+pub const TIMER_CLIENT_PACER: u64 = 1;
 
 /// The exit code a native child is reaped with when it faults (native cells have
 /// no signal delivery, docs/LIBRHEO.md Phase F): 128 + a SIGSEGV-shaped 11.

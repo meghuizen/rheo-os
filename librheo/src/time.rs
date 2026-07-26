@@ -76,6 +76,15 @@ pub async fn sleep(d: Duration) {
     rt::sleep_ns(d.nanos).await;
 }
 
+/// A **pacing** sleep: identical to [`sleep`], except the deadline is held in the
+/// kernel timer arbiter's *pacer* slot rather than the cell-sleep slot
+/// (docs/NETSTACK.md 21, rheo-net N2e). A transport that paces its sends re-arms
+/// this after every segment; keeping it in its own slot is what lets an ordinary
+/// `sleep`/`timeout` in the same cell stay outstanding across it.
+pub async fn sleep_pacing(d: Duration) {
+    rt::sleep_pacing_ns(d.nanos).await;
+}
+
 /// Run `fut` to completion, or give up after `d`. `Ok(v)` if it finished,
 /// `Err(Elapsed)` if the deadline fired first. On the single-vcore cooperative
 /// runtime this is a best-effort race: both are polled each turn, and the sleep

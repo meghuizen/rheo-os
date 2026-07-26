@@ -1170,10 +1170,17 @@ pub fn on_user_trap(
             crate::nproc::Sched::Switch(f) => f,
         },
         // Arm a one-shot deadline; block until it elapses (docs/LIBRHEO.md Phase
-        // F). Cooperative deadline check against the monotonic clock (honest: not
-        // a 0%-CPU idle); a real per-ISA timer IRQ is documented future work.
+        // F). The deadline goes to the timer arbiter, in the slot `args[1]` names:
+        // 0 = the cell's sleep (the pre-N2e shape), 1 = the transport **pacer**'s
+        // continuously re-armed send deadline (docs/NETSTACK.md 21). An unknown
+        // value falls back to the sleep slot rather than failing the call.
         SYS_ARM_TIMER => {
-            crate::time::arm_timer(args[0]);
+            let client = if args[1] == crate::abi::TIMER_CLIENT_PACER {
+                crate::ktimer::TimerClient::Pacer
+            } else {
+                crate::ktimer::TimerClient::CellSleep
+            };
+            crate::time::arm_timer_as(args[0], client);
             arch::set_syscall_ret(unsafe { &mut *frame }, 0);
             frame
         }
