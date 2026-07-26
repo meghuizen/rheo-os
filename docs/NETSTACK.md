@@ -1,10 +1,11 @@
 # rheo-net: the greenfield network stack
 
 **Status:** Building. Phase **N1a** (the L2/L3 core), **N1b's L4** (UDP + ICMP),
-**N1c's caching DNS client**, and **N1e's TTL / hop-limit + traceroute** are done;
-the full roadmap (N1-N8) is below. This document is the architecture + roadmap +
-crypto posture; `docs/NETWORKING.md` holds the doctrine (the kernel owns queue
-plumbing + grant checks + steering, and no network stack).
+**N1c's caching DNS client**, **N1e's TTL / hop-limit + traceroute**, and **N1d's
+local sockets** (native `net::local` + Linux AF_UNIX) are done; the full roadmap
+(N1-N8) is below. This document is the architecture + roadmap + crypto posture;
+`docs/NETWORKING.md` holds the doctrine (the kernel owns queue plumbing + grant
+checks + steering, and no network stack).
 
 ## 0. Position
 
@@ -140,9 +141,13 @@ kernels stay green.
     default 64 (TTL + IPv6 hop limit) and the forwarding-plane
     `decrement_ttl`/`decrement_hop_limit` primitives (the router/firewall path);
     `icmp` gains ICMP Time Exceeded (v4 type 11 + the v6 type 3 codec); `trace` is
-    the TTL-increment traceroute state machine (§9). Still open in N1:
-    `local`/AF_UNIX (the zero-copy local path + the Linux AF_UNIX personality) -
-    the next slice.
+    the TTL-increment traceroute state machine (§9).
+  - **N1d (done): local sockets.** `net::local` - a native zero-copy cell-to-cell
+    transport over `librheo::ipc` + sealed grants (no IP/Ethernet) + the datapath
+    selector (local vs wire); and **Linux-personality AF_UNIX** (SOCK_STREAM
+    socketpair + bind/listen/connect/accept over a name registry) backed by the L6
+    cross-cell ring - the first slice of the "L8" socket surface (§10,
+    docs/LINUX-COMPAT.md L8).
 - **N2 - TCP + congestion control + the two transports** (native sharded + the
   smoltcp cell); proof: a TCP echo / HTTP GET to SLIRP.
 - **N3 - TLS 1.3 + HTTPS.** Crypto crates wired; keys-as-capabilities.
@@ -483,3 +488,61 @@ but a v6 `Ipv6Framing` + v6 endpoints ride in with the live v6 path). PMTU
 discovery and IGMP/MLD multicast stay in **N7**. The forwarding decrement is the
 primitive a router/firewall runs; wiring it into an actual multi-cell forwarding
 service is a later phase (the mechanism is the N1e deliverable).
+
+## 10. Phase N1d (done): local sockets - native `net::local` + Linux AF_UNIX
+
+The local fast path (the "skip parts of the stack" mechanism of §2): a connection
+selects its datapath at connect time - `local` (zero-copy cell-to-cell IPC, no IP)
+vs `wire` (the full stack). N1d ships the working `local` path two ways - a native
+API for rheo-native cells and Linux-personality **AF_UNIX** for unmodified Linux
+binaries - and the datapath **selector** itself. It adds **no kernel object** and
+**no `cfg(target_arch)`** (the socket *numbers* live in `arch/*/linux_abi`, which
+is allowed per-ISA ABI, and are the only per-ISA part).
+
+### (A) Native `net::local`
+
+- **`net::local`** (`net/src/local.rs`) - a thin typed API over
+  `librheo::ipc::Channel` (a shared cross-cell queue pair) + sealed-grant buffer
+  passing (the dmabuf equivalent). `LocalStream::connect`/`accept` open the two
+  ends; `send`/`await_completion`/`recv`/`complete` carry inline messages;
+  `share(grant)` delegates a **sealed** grant zero-copy and `recv_buffer(peer_va,
+  len)` views the *same frames* on the peer. No IP, no Ethernet, no copy.
+- **The datapath selector** - `local::select(&Target) -> Datapath`: a
+  `Target::Local` (same-host peer) chooses `Datapath::Local` (zero-copy IPC), a
+  `Target::Remote(IpAddr)` chooses `Datapath::Wire` (the IP stack). For N1d the
+  wire side is a stub (a wire connect is a later phase); the selection + the
+  working local path are the deliverable.
+- **Proof (`netlocal` test kernel, all 3 ISAs)** - ONE binary (`netlocal-demo`)
+  run as **two cells** sharing a channel (mirroring `librheowl`), needing **no
+  netdev**. The client checks the selector (local->Local, remote->Wire), draws a
+  known 4 KiB payload into a buffer grant, seals + `share`s it, and hands the peer
+  VA + length over the local stream; the server maps the shared grant read-only
+  (the SAME frames), checksums it, and replies. The client asserts the server's
+  checksum equals its own (proving zero-copy) and exits `0x42`.
+
+### (B) Linux AF_UNIX (the L8 start)
+
+AF_UNIX in the Linux personality (docs/LINUX-COMPAT.md L8): sockets are per-cell
+fds (`kernel/src/linux/fd.rs`), the byte transport is the **L6 cross-cell ring**
+(`kernel/src/linux/pipe.rs`) - a SOCK_STREAM connection is two rings, one per
+direction - and the only new global state is a **name registry + accept queue**
+(`kernel/src/linux/unixsock.rs`), per-personality synthesized state exactly like
+the L6 pipe table (no kernel object; the L6 `pipe2` set the precedent).
+`socket`/`socketpair`/`bind`/`listen`/`accept`/`accept4`/`connect`/`getsockname`/
+`sendto`/`recvfrom`/`sendmsg`/`recvmsg`/`setsockopt`/`getsockopt`/`shutdown` are
+wired into all three `arch/*/linux_abi` tables. Abstract-namespace names
+(`\0`-prefixed) are supported. **Proof (`linuxunix`, all 3 ISAs, exact stdout +
+exit)**: an unmodified static-glibc C fixture (`af_unix.c`, built from source by
+xtask, never committed) does `socketpair(AF_UNIX, SOCK_STREAM)` + `fork` (parent
+and child ping/pong over the two rings) and `socket`/`bind`/`listen`/`connect`/
+`accept` over an abstract name (a loopback hello/world), printing a fixed
+transcript and exiting 0.
+
+### Deferred past N1d (explicit)
+
+**SCM_RIGHTS fd-passing** is deferred (the seam is `sendmsg`'s `msg_control`; it
+is not faked). **SOCK_DGRAM** is refused (`-EPROTONOSUPPORT`) - datagram boundary
+preservation is not implemented. **`accept` is non-blocking** (the loopback proof
+connects before accepting); a blocking cross-cell accept server is a later
+refinement. The **wire** side of the datapath selector is a stub until the TCP/IP
+transport lands (N2). `getpeername` reports family-only for an unnamed peer.

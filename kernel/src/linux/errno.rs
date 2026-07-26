@@ -32,6 +32,17 @@ pub const ENAMETOOLONG: i64 = 36;
 pub const ENOSYS: i64 = 38;
 pub const ENOTEMPTY: i64 = 39;
 
+// Socket errnos (AF_UNIX, docs/LINUX-COMPAT.md L8). Same asm-generic values on
+// all three ISAs.
+pub const ENOTSOCK: i64 = 88;
+pub const EPROTONOSUPPORT: i64 = 93;
+pub const EOPNOTSUPP: i64 = 95;
+pub const EAFNOSUPPORT: i64 = 97;
+pub const EADDRINUSE: i64 = 98;
+pub const EISCONN: i64 = 106;
+pub const ENOTCONN: i64 = 107;
+pub const ECONNREFUSED: i64 = 111;
+
 // The `posix` VFS crate (outside the kernel) already returns these exact
 // numbers through the registered `svc::FileOps` handlers, so a VFS error
 // passes through the personality unchanged; the constants above are the

@@ -292,6 +292,15 @@ PIE, unmodified) on **all three ISAs**, exact stdout + exit asserted. This close
 unpatched Rust `std`, and the real upstream uutils/coreutils all run as cells,
 kernel-resident like `svc.rs` and adding no kernel object (`execve` of a *dynamic*
 binary and a dynamic Rust/uutils-0.9.x fixture are the documented next steps).
+**L8 has begun** (docs/LINUX-COMPAT.md L8, docs/NETSTACK.md rheo-net Phase N1d):
+**AF_UNIX (Unix domain) sockets** - `socket`/`socketpair`/`bind`/`listen`/
+`accept`/`connect`/`sendmsg`/`recvmsg` on SOCK_STREAM, sockets as per-cell fds
+whose byte transport reuses the **L6 cross-cell ring** (a connection is two rings,
+one per direction) plus a global name registry (`kernel/src/linux/unixsock.rs`) -
+no new kernel object, the L6 `pipe2` precedent. The `linuxunix` test runs an
+unmodified static-glibc AF_UNIX C fixture (socketpair+fork + bind/listen/connect/
+accept over an abstract name) on **all three ISAs**. SCM_RIGHTS fd-passing and
+SOCK_DGRAM are documented deferrals.
 
 **librheo** (`librheo/`, docs/LIBRHEO.md) is the greenfield **native userspace
 foundation library** - the role a libc plays, rebuilt for this kernel:

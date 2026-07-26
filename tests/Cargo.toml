@@ -180,6 +180,19 @@ path = "src/netdns.rs"
 name = "nettrace"
 path = "src/nettrace.rs"
 
+# rheo-net Phase N1d (docs/NETSTACK.md §10): the native local fast path
+# (net::local) - two cells exchange a payload over librheo::ipc + a sealed grant,
+# zero-copy, no IP stack, plus the datapath selector. Needs no netdev.
+[[bin]]
+name = "netlocal"
+path = "src/netlocal.rs"
+
+# Linux-personality L8 (docs/LINUX-COMPAT.md L8): AF_UNIX sockets - an unmodified
+# static-glibc C fixture doing socketpair+fork and bind/listen/connect/accept.
+[[bin]]
+name = "linuxunix"
+path = "src/linuxunix.rs"
+
 [[bin]]
 name = "smp"
 path = "src/smp.rs"

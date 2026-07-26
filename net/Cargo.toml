@@ -65,3 +65,11 @@ path = "src/bin/netdns-demo.rs"
 [[bin]]
 name = "nettrace-demo"
 path = "src/bin/nettrace-demo.rs"
+
+# The N1d native proof cell: the local fast path (net::local) - two cells exchange
+# a payload over librheo::ipc + a sealed grant, zero-copy, no IP stack, plus the
+# datapath selector. Loaded by the `netlocal` test kernel (two cells, one shared
+# channel; needs no netdev - it is all in-cell/cross-cell).
+[[bin]]
+name = "netlocal-demo"
+path = "src/bin/netlocal-demo.rs"

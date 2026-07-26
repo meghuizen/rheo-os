@@ -21,6 +21,24 @@ pub mod nr {
     pub const RENAMEAT: u64 = 38;
     pub const FACCESSAT: u64 = 48;
     pub const CHDIR: u64 = 49;
+    // AF_UNIX sockets (docs/LINUX-COMPAT.md L8). asm-generic numbers, shared by
+    // ARM64 and RISC-V.
+    pub const SOCKET: u64 = 198;
+    pub const SOCKETPAIR: u64 = 199;
+    pub const BIND: u64 = 200;
+    pub const LISTEN: u64 = 201;
+    pub const ACCEPT: u64 = 202;
+    pub const CONNECT: u64 = 203;
+    pub const GETSOCKNAME: u64 = 204;
+    pub const GETPEERNAME: u64 = 205;
+    pub const SENDTO: u64 = 206;
+    pub const RECVFROM: u64 = 207;
+    pub const SETSOCKOPT: u64 = 208;
+    pub const GETSOCKOPT: u64 = 209;
+    pub const SHUTDOWN: u64 = 210;
+    pub const SENDMSG: u64 = 211;
+    pub const RECVMSG: u64 = 212;
+    pub const ACCEPT4: u64 = 242;
     pub const OPENAT: u64 = 56;
     pub const CLOSE: u64 = 57;
     pub const PIPE2: u64 = 59;

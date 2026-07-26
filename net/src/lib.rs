@@ -61,6 +61,7 @@ pub mod dns;
 pub mod eth;
 pub mod icmp;
 pub mod ip;
+pub mod local;
 pub mod trace;
 pub mod udp;
 pub mod wire;

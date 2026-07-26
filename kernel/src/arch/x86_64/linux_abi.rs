@@ -52,6 +52,23 @@ pub mod nr {
     pub const FDATASYNC: u64 = 75;
     pub const GETCWD: u64 = 79;
     pub const CHDIR: u64 = 80;
+    // AF_UNIX sockets (docs/LINUX-COMPAT.md L8). x86-64 legacy numbers.
+    pub const SOCKET: u64 = 41;
+    pub const CONNECT: u64 = 42;
+    pub const ACCEPT: u64 = 43;
+    pub const SENDTO: u64 = 44;
+    pub const RECVFROM: u64 = 45;
+    pub const SENDMSG: u64 = 46;
+    pub const RECVMSG: u64 = 47;
+    pub const SHUTDOWN: u64 = 48;
+    pub const BIND: u64 = 49;
+    pub const LISTEN: u64 = 50;
+    pub const GETSOCKNAME: u64 = 51;
+    pub const GETPEERNAME: u64 = 52;
+    pub const SOCKETPAIR: u64 = 53;
+    pub const SETSOCKOPT: u64 = 54;
+    pub const GETSOCKOPT: u64 = 55;
+    pub const ACCEPT4: u64 = 288;
     pub const GETRLIMIT: u64 = 97;
     pub const GETUID: u64 = 102;
     pub const GETGID: u64 = 104;

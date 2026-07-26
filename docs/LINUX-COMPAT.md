@@ -414,6 +414,47 @@ syscalls).
     hello is the L7 proof. **MAP_SHARED of a file** stays unmodeled (ld.so uses
     PRIVATE).
 
+- **L8 [done]** - **AF_UNIX (Unix domain) sockets** - the first slice of the
+  socket surface (docs/NETSTACK.md rheo-net Phase N1d). Like every prior
+  milestone this adds **no kernel object**: sockets are per-cell fds
+  (`kernel/src/linux/fd.rs`) and the byte transport reuses the L6 cross-cell
+  ring buffer (`kernel/src/linux/pipe.rs`) - a SOCK_STREAM connection is **two
+  rings, one per direction**, exactly the shape a bidirectional pipe-pair has.
+  The only new global state is a **name registry + per-listener accept queue**
+  (`kernel/src/linux/unixsock.rs`), per-personality synthesized state just like
+  the pipe table, so cross-cell block/wake reuse the L6 pipe scheduler
+  unchanged. The socket syscall numbers are wired into all three
+  `arch/*/linux_abi` tables (x86-64 legacy `socket`=41.. / asm-generic
+  `socket`=198..; per-ISA ABI, allowed in the arch layer).
+  - **Syscalls**: `socket`, `socketpair`, `bind`, `listen`, `accept`/`accept4`,
+    `connect`, `getsockname`/`getpeername`, `sendto`/`recvfrom` (routed to the
+    blocking write/read path), `sendmsg`/`recvmsg` (iovec gather/scatter),
+    `setsockopt`/`getsockopt` (accept + ignore / zeroed), `shutdown` (no-op).
+    `read`/`write` on a connected socket fd go through the same cross-cell block
+    + SIGPIPE path as pipes. **Abstract-namespace** names (`\0`-prefixed
+    `sun_path`) are supported (keyed verbatim); pathname names key on the
+    `sun_path` up to its first NUL.
+  - **Proof (`linuxunix`, all three ISAs, exact stdout + exit)**: an unmodified
+    static-glibc C fixture (`af_unix.c`, built from source by xtask, never
+    committed) exercises both paths - (1) `socketpair(AF_UNIX, SOCK_STREAM)` +
+    `fork`, where the parent and the forked child (two cells) send + recv
+    "ping"/"pong" in both directions over the two direction rings (the L6
+    cross-cell block/wake), and (2) `socket`/`bind`/`listen`/`connect`/`accept`
+    over an **abstract** name, a single-process loopback that sends + recvs
+    "hello"/"world". Prints exactly `pair: pong` / `conn: hello` / `back: world`
+    / `af_unix OK`, exit 0.
+  - **Accommodations, disclosed**: **SCM_RIGHTS fd-passing is deferred** - the
+    seam is `sendmsg`'s `msg_control` (passing an fd would dup it into the peer
+    cell's fd table over the connection); it is **not faked** (a non-empty
+    control buffer is left untouched). **SOCK_DGRAM is refused**
+    (`-EPROTONOSUPPORT`) - datagram boundary preservation is not implemented
+    (stream only). **`accept` is non-blocking** (returns `-EAGAIN` on an empty
+    backlog): the loopback proof connects before accepting, so it never blocks;
+    a blocking cross-cell accept server (park the acceptor, wake on a queued
+    connection) is a later refinement. `getpeername` reports family-only for an
+    unnamed peer. `bind` implies the name is connectable (the registry carries
+    the backlog); `listen` validates the socket is bound.
+
 ## 6. Fixture build matrix (reproducibility)
 
 All Linux test binaries are built **from source** by xtask/CI - no binaries

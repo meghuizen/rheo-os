@@ -29,6 +29,7 @@ pub mod proc;
 pub mod signal;
 pub mod stack;
 pub mod thread;
+pub mod unixsock;
 
 pub use signal::{FaultOutcome, deliver_fault};
 
@@ -112,6 +113,7 @@ pub fn reset() {
     signal::reset();
     pipe::reset();
     proc::reset();
+    unixsock::reset();
 }
 
 /// Deep-copy cell `from`'s Linux state into cell `to` (the `fork` inheritance
@@ -283,6 +285,29 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
         nr::PIPE | nr::PIPE2 => ret(st.fds.pipe2(args[0])),
         // dup2(old,new) (x86-64 legacy) == dup3(old,new,0).
         nr::DUP2 => ret(st.fds.dup3(args[0] as i64, args[1] as i64)),
+
+        // -- AF_UNIX sockets (docs/LINUX-COMPAT.md L8) - no kernel object; the
+        //    byte transport is the L6 cross-cell ring (linux::pipe). --
+        nr::SOCKET => ret(st.fds.socket(args[0], args[1])),
+        nr::SOCKETPAIR => ret(st.fds.socketpair(args[0], args[1], args[3])),
+        nr::BIND => ret(st.fds.bind(args[0] as i64, args[1], args[2])),
+        nr::LISTEN => ret(st.fds.listen(args[0] as i64)),
+        // accept4's flags (arg3) are accepted + ignored (SOCK_CLOEXEC/NONBLOCK).
+        nr::ACCEPT | nr::ACCEPT4 => ret(st.fds.accept(args[0] as i64, args[1], args[2])),
+        nr::CONNECT => ret(st.fds.connect(args[0] as i64, args[1], args[2])),
+        nr::GETSOCKNAME | nr::GETPEERNAME => {
+            ret(st.fds.getsockname(args[0] as i64, args[1], args[2]))
+        }
+        // sendto/recvfrom on a connected stream socket ignore the address; route
+        // to the blocking write/read path (cross-cell wake + SIGPIPE).
+        nr::SENDTO => sys_write(cur, st, args[0] as i64, args[1], args[2], frame),
+        nr::RECVFROM => sys_read(cur, st, args[0] as i64, args[1], args[2]),
+        // sendmsg/recvmsg: gather/scatter over msg_iov (non-blocking; the fixture
+        // uses read/write). SCM_RIGHTS ancillary data is deferred (L8).
+        nr::SENDMSG => ret(sys_sendmsg(st, args[0] as i64, args[1], true)),
+        nr::RECVMSG => ret(sys_sendmsg(st, args[0] as i64, args[1], false)),
+        nr::SETSOCKOPT | nr::SHUTDOWN => Ctl::Ret(0),
+        nr::GETSOCKOPT => ret(sys_getsockopt(args[3], args[4])),
         // process groups / sessions: recorded (single-session model, no job
         // control); the shell queries them but does not depend on the effect.
         nr::SETPGID | nr::SETSID => Ctl::Ret(0),
@@ -397,6 +422,20 @@ fn sys_read(cur: usize, st: &mut LinuxState, fd: i64, buf: u64, count: u64) -> C
             }
         };
     }
+    // A connected socket reads its rx ring the same way (L8): the transport is an
+    // L6 ring, so the cross-cell block/wake path is identical.
+    if let Some(idx) = st.fds.sock_rx(fd) {
+        return match pipe::read(idx, buf, count) {
+            pipe::ReadNb::Done(n) => ret(n),
+            pipe::ReadNb::WouldBlock => {
+                if proc::runnable_peer_exists(cur) {
+                    proc::block_pipe_read(cur, buf, count, idx)
+                } else {
+                    err(errno::EAGAIN)
+                }
+            }
+        };
+    }
     ret(st.fds.read(fd, buf, count))
 }
 
@@ -435,7 +474,63 @@ fn sys_write(
             }
         };
     }
+    // A connected socket writes its tx ring the same way (L8), with the same
+    // cross-cell block/wake + SIGPIPE-on-no-readers behaviour.
+    if let Some(idx) = st.fds.sock_tx(fd) {
+        return match pipe::write(idx, buf, count) {
+            pipe::WriteNb::Done(n) => ret(n),
+            pipe::WriteNb::WouldBlock => {
+                if proc::runnable_peer_exists(cur) {
+                    proc::block_pipe_write(cur, buf, count, idx)
+                } else {
+                    err(errno::EAGAIN)
+                }
+            }
+            pipe::WriteNb::Epipe => {
+                match signal::kill(cur, proc::pid(cur) as i64, SIGPIPE, frame) {
+                    Ctl::Ret(_) => err(errno::EPIPE),
+                    other => other,
+                }
+            }
+        };
+    }
     ret(st.fds.write(fd, buf, count))
+}
+
+/// sendmsg/recvmsg over a socket fd (docs/LINUX-COMPAT.md L8): gather/scatter the
+/// `msg_iov` array through the fd's non-blocking read/write. `msg_name` is ignored
+/// (connected stream socket) and `msg_control` (SCM_RIGHTS) is **not** processed -
+/// fd-passing is deferred; a non-empty control buffer is left untouched.
+fn sys_sendmsg(st: &mut LinuxState, fd: i64, msg_va: u64, write: bool) -> i64 {
+    #[repr(C)]
+    struct MsgHdr {
+        msg_name: u64,
+        msg_namelen: u32,
+        _pad: u32,
+        msg_iov: u64,
+        msg_iovlen: u64,
+        msg_control: u64,
+        msg_controllen: u64,
+        msg_flags: i32,
+    }
+    if msg_va == 0 {
+        return -errno::EFAULT;
+    }
+    // SAFETY: `msg_va` is a caller-provided `struct msghdr`.
+    let hdr = unsafe { &*(msg_va as *const MsgHdr) };
+    sys_readv(st, fd, hdr.msg_iov, hdr.msg_iovlen, write)
+}
+
+/// getsockopt(fd, level, optname, optval, optlen): report a zeroed value for the
+/// common options (SO_ERROR etc.) so glibc's post-connect probe succeeds.
+fn sys_getsockopt(optval_va: u64, optlen_va: u64) -> i64 {
+    if optval_va != 0 && optlen_va != 0 {
+        // SAFETY: caller-provided optlen (in) + optval buffer.
+        let len = unsafe { (optlen_va as *const u32).read() } as usize;
+        let n = len.min(4);
+        unsafe { core::ptr::write_bytes(optval_va as *mut u8, 0, n) };
+    }
+    0
 }
 
 /// readv/writev: iterate the iovec array, calling the fd read/write per entry.
