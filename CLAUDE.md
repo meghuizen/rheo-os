@@ -63,12 +63,15 @@ do it; x86 q35's `-kernel` path runs SeaBIOS, which got there first), sizes
 every BAR by the mask probe, walks the capability list (MSI/MSI-X/PCIe/FLR),
 and offers opt-in BAR assignment from a per-ISA host-bridge window
 (`hw::assign_pci_bars`, invisible to boots that skip it); `kernel/src/hw/gpu.rs`
-recognises every display-class function by vendor AND silicon family (NVIDIA
+recognises every display-class function by vendor (NVIDIA, AMD, Intel, virtio,
+Bochs, Cirrus, VMware, Red Hat/QXL) AND silicon family (NVIDIA
 Pascal/Turing/Ampere/Ada/Hopper/Blackwell, AMD GCN/RDNA/CDNA, Intel Xe) into
 the inventory, resolves a per-vendor driver front-end (`vendor_driver`
-declaring each vendor's lowering path per ACCELERATORS.md 4), and each
-recognised GPU registers in the engine table behind
-`SYS_ENGINE_INFO(out_va, index)` enumeration (kind + PCI
+declaring each vendor's lowering path per ACCELERATORS.md 4), drives **every
+GPU QEMU models** (AMD/Bochs/Cirrus/VMware/QXL via a framebuffer-aperture
+write+read-back, virtio-gpu via its 2D command driver - six vendors on
+x86-64, four on arm/riscv where VMware+QXL are x86-only), and each registers
+in the engine table behind `SYS_ENGINE_INFO(out_va, index)` enumeration (kind + PCI
 vendor ID + declared op-boundary preemption, an honest zero measured cost -
 recognised and registered, not yet driven). The `gpuhw` test proves it on all
 three ISAs against QEMU's real `ati-vga` (AMD, 0x1002), a Bochs display, and
@@ -753,9 +756,11 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               inherits its channel and streams its output back), gpuhw
               (real-GPU stage 1, docs/GPU-HARDWARE.md 12: PCIe bridge
               recursion + BAR sizing/assignment + capability walk + vendor
-              recognition - a real AMD ati-vga, Bochs, virtio-gpu behind a
-              root port; NVIDIA/Intel skip-with-reason - + GPU engine
-              registration), iommu (real-GPU stage 2, docs/GPU-HARDWARE.md
+              recognition + driving every GPU QEMU models: AMD ati-vga,
+              Bochs, Cirrus, VMware, QXL by framebuffer-aperture write+read-
+              back and virtio-gpu (behind a root port) by its 2D driver - six
+              vendors x86, four arm/riscv; NVIDIA/Intel skip-with-reason - +
+              GPU engine registration), iommu (real-GPU stage 2, docs/GPU-HARDWARE.md
               4/12 + BUILD-ORDER step 12: DMA remapping proven with a real
               virtio-blk DMA that is mediated by an identity domain then
               FAULTS when the domain is revoked - x86-64 via VT-d

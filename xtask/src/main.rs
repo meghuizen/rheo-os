@@ -247,7 +247,13 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
         // the bridge's secondary bus (PVH boots have no firmware to do it).
         // NVIDIA/Intel have no QEMU GPU model - the kernel prints their
         // skip-with-reason lines and the test asserts their absence.
-        ("gpuhw", _) => &[
+        // Every GPU device model QEMU provides for the ISA, one per vendor.
+        // x86-64 has all six: virtio-gpu (behind a root port), AMD
+        // (ati-vga), Bochs, Cirrus Logic, VMware SVGA, and Red Hat/QXL
+        // (secondary - qxl-vga must be console 0). NVIDIA and Intel have no
+        // QEMU GPU model - recognised by ID, skip-with-reason
+        // (docs/GPU-HARDWARE.md 12).
+        ("gpuhw", Arch::X86_64) => &[
             "-device",
             "pcie-root-port,id=rp1,chassis=1,slot=1",
             "-device",
@@ -256,6 +262,26 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "ati-vga",
             "-device",
             "bochs-display",
+            "-device",
+            "cirrus-vga",
+            "-device",
+            "vmware-svga",
+            "-device",
+            "qxl",
+        ],
+        // arm/riscv `virt`: vmware-svga and qxl are x86-only in QEMU, so the
+        // per-ISA set is virtio-gpu + AMD + Bochs + Cirrus (four vendors).
+        ("gpuhw", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-device",
+            "pcie-root-port,id=rp1,chassis=1,slot=1",
+            "-device",
+            "virtio-gpu-pci,bus=rp1,disable-legacy=on",
+            "-device",
+            "ati-vga",
+            "-device",
+            "bochs-display",
+            "-device",
+            "cirrus-vga",
         ],
         // iommu (docs/GPU-HARDWARE.md 4, BUILD-ORDER.md step 12): VT-d DMA
         // remapping. x86-64 q35 gets `-device intel-iommu` (caching-mode=on

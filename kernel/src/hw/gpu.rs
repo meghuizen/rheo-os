@@ -24,8 +24,11 @@ pub const VENDOR_AMD: u16 = 0x1002;
 pub const VENDOR_INTEL: u16 = 0x8086;
 pub const VENDOR_VIRTIO: u16 = 0x1AF4;
 pub const VENDOR_QEMU: u16 = 0x1234;
+pub const VENDOR_CIRRUS: u16 = 0x1013;
+pub const VENDOR_VMWARE: u16 = 0x15AD;
+pub const VENDOR_REDHAT: u16 = 0x1B36;
 
-/// The major GPU vendors, keyed by PCI vendor ID.
+/// The GPU hardware vendors this OS recognises, keyed by PCI vendor ID.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum GpuVendor {
     Nvidia,
@@ -35,6 +38,12 @@ pub enum GpuVendor {
     Virtio,
     /// QEMU's Bochs-compatible display (vendor 0x1234).
     QemuBochs,
+    /// Cirrus Logic (vendor 0x1013).
+    Cirrus,
+    /// VMware SVGA (vendor 0x15AD).
+    Vmware,
+    /// Red Hat / QXL (vendor 0x1B36).
+    Redhat,
     Other,
 }
 
@@ -46,6 +55,9 @@ impl GpuVendor {
             VENDOR_INTEL => GpuVendor::Intel,
             VENDOR_VIRTIO => GpuVendor::Virtio,
             VENDOR_QEMU => GpuVendor::QemuBochs,
+            VENDOR_CIRRUS => GpuVendor::Cirrus,
+            VENDOR_VMWARE => GpuVendor::Vmware,
+            VENDOR_REDHAT => GpuVendor::Redhat,
             _ => GpuVendor::Other,
         }
     }
@@ -57,6 +69,9 @@ impl GpuVendor {
             GpuVendor::Intel => "intel",
             GpuVendor::Virtio => "virtio",
             GpuVendor::QemuBochs => "qemu-bochs",
+            GpuVendor::Cirrus => "cirrus",
+            GpuVendor::Vmware => "vmware",
+            GpuVendor::Redhat => "redhat-qxl",
             GpuVendor::Other => "unknown",
         }
     }
@@ -206,6 +221,21 @@ pub fn vendor_driver(vendor: GpuVendor, driver: GpuDriver) -> VendorDriver {
             driver: GpuDriver::VirtioGpu,
             status: "driven in-tree (Phase H 2D driver)",
         },
+        GpuVendor::Cirrus => VendorDriver {
+            lowering: "Cirrus VGA / linear framebuffer (2D)",
+            driver: GpuDriver::None,
+            status: "framebuffer aperture driven here",
+        },
+        GpuVendor::Vmware => VendorDriver {
+            lowering: "VMware SVGA II FIFO / linear framebuffer (2D)",
+            driver: GpuDriver::None,
+            status: "framebuffer aperture driven here",
+        },
+        GpuVendor::Redhat => VendorDriver {
+            lowering: "QXL / linear VRAM (2D)",
+            driver: GpuDriver::None,
+            status: "framebuffer aperture driven here",
+        },
         GpuVendor::Other => VendorDriver {
             lowering: "none",
             driver: GpuDriver::None,
@@ -268,6 +298,9 @@ impl GpuDevice {
             (GpuVendor::Intel, _) => "intel",
             (GpuVendor::Virtio, 0x1050) => "virtio-gpu",
             (GpuVendor::Virtio, _) => "virtio (display)",
+            (GpuVendor::Cirrus, _) => "cirrus clgd 54xx",
+            (GpuVendor::Vmware, _) => "vmware svga ii",
+            (GpuVendor::Redhat, _) => "qxl",
             (GpuVendor::QemuBochs, _) => "bochs display",
             (GpuVendor::Other, _) => "unknown display",
         }
@@ -346,6 +379,48 @@ pub fn probe(inv: &mut Inventory) {
 /// Whether any recognised GPU of the given vendor is present.
 pub fn vendor_present(inv: &Inventory, vendor: GpuVendor) -> bool {
     inv.gpus[..inv.ngpu].iter().any(|g| g.vendor == vendor)
+}
+
+/// Drive a GPU's linear framebuffer: pick its largest memory BAR (the
+/// VRAM/framebuffer aperture), map it through the per-ISA MMIO window,
+/// write a known pixel pattern, and read it back. Returns `Some(true)` if
+/// the read-back matches (the aperture is genuinely driven on the real
+/// device model), `Some(false)` on mismatch, `None` if the GPU has no
+/// linear framebuffer BAR >= 1 MiB (virtio-gpu is command-queue based, not
+/// a linear framebuffer, so it is driven by its 2D driver instead). This
+/// is the same aperture-drive proof used for AMD's `ati-vga`, generalised
+/// to every QEMU-modelled GPU vendor that exposes a framebuffer
+/// (Cirrus, VMware SVGA, QXL, Bochs).
+pub fn drive_framebuffer(inv: &Inventory, g: &GpuDevice) -> Option<bool> {
+    const FB_MIN: u64 = 1 << 20; // 1 MiB: excludes virtio's small config BARs
+    let d = &inv.pci[g.pci];
+    let mut best: Option<super::PciBar> = None;
+    for b in d.bars.iter() {
+        if b.io || b.size < FB_MIN || b.base == 0 {
+            continue;
+        }
+        match best {
+            Some(cur) if cur.size >= b.size => {}
+            _ => best = Some(*b),
+        }
+    }
+    let bar = best?;
+    let va = crate::arch::mmio_map_window(bar.base as usize, 4096);
+    let p = va as *mut u32;
+    // SAFETY: `va` maps the framebuffer BAR the device sized (>= 1 MiB);
+    // the 64 words written stay well inside it. Volatile: device memory.
+    let mut ok = true;
+    for i in 0..64u32 {
+        unsafe { p.add(i as usize).write_volatile(0x5A5A_0000 | i) };
+    }
+    for i in 0..64u32 {
+        let got = unsafe { p.add(i as usize).read_volatile() };
+        if got != (0x5A5A_0000 | i) {
+            ok = false;
+            break;
+        }
+    }
+    Some(ok)
 }
 
 /// Attach-time measurement for every recognised GPU with a decodable

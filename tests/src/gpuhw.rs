@@ -5,13 +5,13 @@
 //! window, vendor recognition across the major GPU vendors, and GPU
 //! engine registration.
 //!
-//! QEMU attaches, identically on all three ISAs: an `ati-vga` (a real
-//! AMD/ATI vendor ID 0x1002 device model), a `bochs-display`, and a
-//! `virtio-gpu-pci` placed BEHIND a `pcie-root-port` - reachable only if
-//! enumeration programs the bridge's secondary bus (PVH boots have no
-//! firmware to do it). NVIDIA and Intel have no QEMU GPU device model, so
-//! their recognition front-ends report skip-with-reason (the honest
-//! per-vendor table in docs/GPU-HARDWARE.md 12).
+//! It also drives every GPU device model QEMU provides, one per vendor:
+//! AMD (`ati-vga`), Bochs, Cirrus Logic, VMware SVGA and Red Hat/QXL by a
+//! framebuffer-aperture MMIO write + read-back, and virtio-gpu (behind a
+//! `pcie-root-port`) by its 2D command driver. x86-64 gets all six;
+//! arm/riscv `virt` get four (VMware and QXL are x86-only in QEMU). NVIDIA
+//! and Intel have no QEMU GPU device model, so their recognition front-ends
+//! report skip-with-reason (docs/GPU-HARDWARE.md 12).
 
 #![no_std]
 #![no_main]
@@ -28,23 +28,24 @@ extern "C" fn kernel_main() -> ! {
     let inv = hw::inventory();
     gpu::print_summary(inv);
 
-    // --- Vendor recognition across the major vendors -------------------
-    assert!(
-        inv.ngpu >= 3,
-        "expected >= 3 GPU functions (ati, bochs, virtio)"
-    );
-    assert!(
-        gpu::vendor_present(inv, gpu::GpuVendor::Amd),
-        "AMD (ati-vga, vendor 0x1002) not recognised"
-    );
-    assert!(
-        gpu::vendor_present(inv, gpu::GpuVendor::QemuBochs),
-        "bochs-display (vendor 0x1234) not recognised"
-    );
-    assert!(
-        gpu::vendor_present(inv, gpu::GpuVendor::Virtio),
-        "virtio-gpu (vendor 0x1AF4) not recognised"
-    );
+    // --- Vendor recognition across every QEMU-modelled GPU vendor ------
+    // Present on all ISAs: AMD, Bochs, virtio-gpu, Cirrus. x86-64 adds
+    // VMware SVGA and QXL (both x86-only in QEMU).
+    for (vendor, what) in [
+        (gpu::GpuVendor::Amd, "ati-vga 0x1002"),
+        (gpu::GpuVendor::QemuBochs, "bochs 0x1234"),
+        (gpu::GpuVendor::Virtio, "virtio-gpu 0x1AF4"),
+        (gpu::GpuVendor::Cirrus, "cirrus 0x1013"),
+    ] {
+        assert!(gpu::vendor_present(inv, vendor), "{} not recognised", what);
+    }
+    #[cfg(target_arch = "x86_64")]
+    for (vendor, what) in [
+        (gpu::GpuVendor::Vmware, "vmware 0x15AD"),
+        (gpu::GpuVendor::Redhat, "qxl 0x1B36"),
+    ] {
+        assert!(gpu::vendor_present(inv, vendor), "{} not recognised", what);
+    }
     // No QEMU device model exists for these vendors: recognised by ID,
     // honestly absent here (skip-with-reason printed above).
     assert!(!gpu::vendor_present(inv, gpu::GpuVendor::Nvidia));
@@ -175,44 +176,44 @@ extern "C" fn kernel_main() -> ! {
         "BAR0 read-back does not match the recorded base"
     );
 
-    // --- Drive the AMD device: MMIO into its framebuffer aperture ------
-    // The first real vendor-GPU MMIO in the tree (docs/GPU-HARDWARE.md 12
-    // stage 1): map the ati-vga's BAR0 - the 16 MiB framebuffer aperture
-    // QEMU models as device memory - write a pixel pattern through it, and
-    // read it back. This proves the full path: enumeration -> BAR ->
-    // mapping window -> MMIO decode -> device memory, on a real AMD-vendor
-    // device model. Decode is forced on first so the proof does not depend
-    // on who (SeaBIOS or assign_pci_bars) enabled it.
-    let cmd = arch::pci_cfg_read32(inv.ecam_base, adev.bus, adev.dev, adev.func, 0x04);
-    arch::pci_cfg_write32(
-        inv.ecam_base,
-        adev.bus,
-        adev.dev,
-        adev.func,
-        0x04,
-        cmd | 0x6,
-    );
-    let fb_va = arch::mmio_map_window(bar0.base as usize, bar0.size as usize);
-    let fb = fb_va as *mut u32;
-    for i in 0..64usize {
-        // SAFETY: fb maps BAR0's device memory, sized by the mask probe;
-        // offsets stay inside it (64 * 4 KiB < 16 MiB). Volatile: MMIO.
-        unsafe { fb.add(i * 1024).write_volatile(0xA5A5_0000 | i as u32) };
-    }
-    for i in 0..64usize {
-        // SAFETY: as above.
-        let got = unsafe { fb.add(i * 1024).read_volatile() };
-        assert_eq!(
-            got,
-            0xA5A5_0000 | i as u32,
-            "AMD framebuffer read-back mismatch"
-        );
+    // --- Drive every framebuffer-capable GPU: MMIO write + read-back ---
+    // The aperture-drive proof (enumeration -> BAR -> mapping window ->
+    // MMIO decode -> device memory), generalised to EVERY QEMU-modelled
+    // GPU vendor with a linear framebuffer: AMD (ati-vga), Bochs, Cirrus
+    // Logic, VMware SVGA, and Red Hat/QXL. virtio-gpu has no linear
+    // framebuffer (it is command-queue based, driven by its 2D driver), so
+    // `drive_framebuffer` returns None for it. Memory decode is forced on
+    // per device so the proof does not depend on who enabled it.
+    let inv = hw::inventory();
+    let mut driven = 0;
+    for g in &inv.gpus[..inv.ngpu] {
+        let d = &inv.pci[g.pci];
+        let cmd = arch::pci_cfg_read32(inv.ecam_base, d.bus, d.dev, d.func, 0x04);
+        arch::pci_cfg_write32(inv.ecam_base, d.bus, d.dev, d.func, 0x04, cmd | 0x6);
+        match gpu::drive_framebuffer(inv, g) {
+            Some(true) => {
+                driven += 1;
+                println!(
+                    "gpuhw: {} ({}) framebuffer MMIO write/read-back OK",
+                    g.model(),
+                    g.vendor.name()
+                );
+            }
+            Some(false) => panic!("{} framebuffer read-back mismatch", g.model()),
+            None => {} // no linear framebuffer (virtio-gpu)
+        }
     }
     println!(
-        "gpuhw: amd framebuffer MMIO write/read-back OK ({} MiB aperture at {:#x})",
-        bar0.size / (1024 * 1024),
-        bar0.base
+        "gpuhw: {} GPU framebuffers driven (write + read-back)",
+        driven
     );
+    // x86-64 drives amd/bochs/cirrus/vmware/qxl (5); arm/riscv drive
+    // amd/bochs/cirrus (3, vmware+qxl being x86-only). virtio-gpu is driven
+    // separately by its 2D command driver on every ISA.
+    #[cfg(target_arch = "x86_64")]
+    assert!(driven >= 5, "expected >= 5 framebuffer-driven vendors");
+    #[cfg(not(target_arch = "x86_64"))]
+    assert!(driven >= 3, "expected >= 3 framebuffer-driven vendors");
 
     // --- Attach measurement: offload proves itself (transport) ---------
     // Ticks per KiB streamed through each GPU's framebuffer aperture -
