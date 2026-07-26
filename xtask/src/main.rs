@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 36] = [
+const TEST_KERNELS: [&str; 37] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -58,6 +58,7 @@ const TEST_KERNELS: [&str; 36] = [
     "librheoipc",
     "librheopipe",
     "netcore",
+    "netl4",
 ];
 
 /// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
@@ -132,6 +133,26 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "virtio-net-device,netdev=n0",
         ],
         ("netcore", Arch::X86_64) => &[
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-pci,netdev=n0,disable-legacy=on",
+        ],
+        // netl4 (docs/NETSTACK.md rheo-net Phase N1b): UDP + ICMP over the same
+        // SLIRP + virtio-net setup as netcore. The guest sends a DNS query over
+        // UDP to SLIRP's built-in responder (10.0.2.3:53) and an ICMP echo to the
+        // gateway (10.0.2.2), both of which SLIRP answers deterministically and
+        // network-free. Same two transports: virtio-mmio on arm/riscv, virtio-pci
+        // on x86 (disable-legacy=on pins the modern layout the driver expects).
+        ("netl4", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-device,netdev=n0",
+        ],
+        ("netl4", Arch::X86_64) => &[
             "-netdev",
             "user,id=n0",
             "-device",

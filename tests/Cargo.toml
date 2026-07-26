@@ -157,6 +157,13 @@ path = "src/librheopipe.rs"
 name = "netcore"
 path = "src/netcore.rs"
 
+# rheo-net Phase N1b (docs/NETSTACK.md): UDP + ICMP over SLIRP - a DNS query to
+# 10.0.2.3:53 (UDP round trip) and a ping to the gateway 10.0.2.2 (ICMP echo),
+# plus the UDP/ICMP checksum oracles.
+[[bin]]
+name = "netl4"
+path = "src/netl4.rs"
+
 [[bin]]
 name = "smp"
 path = "src/smp.rs"

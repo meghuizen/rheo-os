@@ -38,7 +38,7 @@ requires - the kernel owns the queue plumbing, not the protocols.
   grants (section 1), header/payload split (section 1), a device RX interrupt, and
   everything in sections 4-7 (eBPF dataplane, DDoS staging, DPU offload).
 
-## 0a. What is built next (rheo-net Phase N1a): the L2/L3 core
+## 0a. What is built (rheo-net Phase N1a/N1b): the L2/L3/L4 core
 
 The **greenfield network stack** begins here as **portable userspace** - a new
 `net/` workspace crate (`no_std` + alloc, no per-ISA code) built for the three
@@ -56,9 +56,18 @@ as `librheonet`) - a cell reads the NIC MAC, **resolves the SLIRP gateway
 `10.0.2.2` through `net::arp`** (the ARP round trip now runs through the stack's
 `eth`/`arp` layers, not `librheonet`'s hand-built frame), validates the checksum
 against a known value (`0xB861`), round-trips an IPv4 header build/parse/validate
-(a flipped byte fails), and round-trips an IPv6 header - exiting `0x42`. Deferred
-to N1b: UDP, ICMP (echo + traceroute), the local/AF_UNIX zero-copy path, and the
-caching DNS client (docs/NETSTACK.md 5).
+(a flipped byte fails), and round-trips an IPv6 header - exiting `0x42`.
+
+**Phase N1b (L4)** adds `udp` (datagram build/parse + the pseudo-header checksum,
+reusing N1a's `Checksum` accumulator, + an async `UdpEndpoint`), `icmp` (ICMPv4
+echo/ping + the IPv4 TTL hook for a later traceroute), and `wire` (the shared
+eth/ip framing). Proof: the `netl4` test kernel (all three ISAs) sends a real DNS
+query over **UDP** to SLIRP's built-in responder at `10.0.2.3:53` and an **ICMP
+echo** to the gateway `10.0.2.2`, asserting the UDP checksum validates + the
+transaction id echoes, the ping reply type/id/seq match, and two known-good
+checksum oracles (`0x6D45` UDP, `0xFFE0` ICMP) - exiting `0x42`, network-free.
+Still deferred to **N1c**: the local/AF_UNIX zero-copy path and the caching DNS
+client; ICMPv6 + full traceroute are N7 (docs/NETSTACK.md 5-7).
 
 ## 1. NIC queues are the primitive
 

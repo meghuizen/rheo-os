@@ -42,3 +42,10 @@ name = "rheo_net"
 [[bin]]
 name = "netcore-demo"
 path = "src/bin/netcore-demo.rs"
+
+# The N1b proof cell: the UDP + ICMP round trips over SLIRP (a DNS query to
+# 10.0.2.3:53 and a ping to the gateway 10.0.2.2) plus the checksum oracles.
+# Loaded by the `netl4` test kernel.
+[[bin]]
+name = "netl4-demo"
+path = "src/bin/netl4-demo.rs"

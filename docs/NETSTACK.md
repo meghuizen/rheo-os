@@ -1,7 +1,8 @@
 # rheo-net: the greenfield network stack
 
-**Status:** Building. Phase **N1a** (the L2/L3 core) is done; the full roadmap
-(N1-N8) is below. This document is the architecture + roadmap + crypto posture;
+**Status:** Building. Phase **N1a** (the L2/L3 core) and **N1b's L4** (UDP +
+ICMP) are done; the full roadmap (N1-N8) is below. This document is the
+architecture + roadmap + crypto posture;
 `docs/NETWORKING.md` holds the doctrine (the kernel owns queue plumbing + grant
 checks + steering, and no network stack).
 
@@ -50,11 +51,14 @@ A new `no_std` + alloc workspace crate, mirroring `librheo/` + `json/`, built fo
 the three bare targets as a loaded ELF cell, feature-gated per profile.
 
 - **L2**: `eth` (Ethernet II frame parse/build), `arp` (cache + request/reply +
-  async resolve); later the sDDF driver / RX-virtualiser (demux) / copier split;
-  jumbo frames.
+  async resolve); `wire` (the shared eth/ip framing + next-hop ARP resolution the
+  L4 protocols send/receive over, holding the IPv4 TTL hook); later the sDDF
+  driver / RX-virtualiser (demux) / copier split; jumbo frames.
 - **L3**: `ip` (IPv4 + IPv6 parse/build + the ones-complement Internet checksum);
-  later `icmp`/ICMPv6 (ping + traceroute TTL), IGMP/MLD (multicast), fragmentation.
-- **L4**: `udp`; then `tcp` with RTT/RTO + **pluggable congestion control**
+  `icmp` (ICMPv4 echo/ping + the traceroute TTL hook); later ICMPv6, IGMP/MLD
+  (multicast), fragmentation.
+- **L4**: `udp` (datagram build/parse + the pseudo-header checksum + an async
+  `UdpEndpoint`); then `tcp` with RTT/RTO + **pluggable congestion control**
   (CUBIC/BBR-shaped trait); the local fast-path selector.
 - **`local` / AF_UNIX**: the zero-copy cross-cell transport (over the Phase E/J
   `ipc::Channel` + sealed grants) AND a Linux-personality **AF_UNIX** milestone
@@ -122,12 +126,13 @@ kernels stay green.
 
 - **N1 - Local fast-path + L2-L4 core + caching DNS.** Split into slices:
   - **N1a (done): L2/L3 core.** `eth` + `arp` (cache + async resolve) + `ip`
-    (IPv4 + IPv6 + checksum). Proof below.
-  - **N1b: UDP + ICMP + local/AF_UNIX + caching DNS.** A UDP echo to SLIRP, an
-    ICMP ping to the gateway, two cells over the zero-copy local path, an
-    unmodified Linux AF_UNIX binary under the personality, and a caching DNS
-    lookup over SLIRP's `10.0.2.3` (second lookup hits the cache; a blocklisted
-    name is refused).
+    (IPv4 + IPv6 + checksum). Proof in §6.
+  - **N1b (L4 done): UDP + ICMP.** `udp` (pseudo-header checksum + async
+    `UdpEndpoint`) and `icmp` (ICMPv4 echo + the traceroute TTL hook), proven by
+    a DNS query over UDP to SLIRP's `10.0.2.3:53` and a ping to the gateway
+    `10.0.2.2` (§7). Still open in N1b: `local`/AF_UNIX (the zero-copy local path
+    + the Linux AF_UNIX personality) and the caching `dns` client (LRU+TTL cache,
+    blocklist, configurable resolvers) - the next slice, **N1c**.
 - **N2 - TCP + congestion control + the two transports** (native sharded + the
   smoltcp cell); proof: a TCP echo / HTTP GET to SLIRP.
 - **N3 - TLS 1.3 + HTTPS.** Crypto crates wired; keys-as-capabilities.
@@ -194,8 +199,85 @@ It exits `0x42` only if every step passes; the kernel is untouched. Same SLIRP +
 virtio-net QEMU wiring as `librheonet` (virtio-mmio on arm/riscv, virtio-pci on
 x86-64). No kernel object / verb / dependency was added; no `cfg(target_arch)`.
 
-### Deferred to N1b (explicit)
+### Deferred past N1a (explicit)
 
-`udp`, `icmp` (echo + traceroute TTL), `local` (the AF_UNIX-equivalent zero-copy
-transport + the datapath selector), the caching `dns` client, and the Linux
-AF_UNIX personality. See the N1 roadmap entry above.
+`udp` + `icmp` land in N1b (§7). Still deferred: `local` (the AF_UNIX-equivalent
+zero-copy transport + the datapath selector), the caching `dns` client, the Linux
+AF_UNIX personality (all N1c), ICMPv6, and full traceroute. See the N1 roadmap
+entry above.
+
+## 7. Phase N1b (L4 done): UDP + ICMP
+
+### What the `net` crate adds
+
+- **`net::udp`** - UDP datagram build/parse. `UdpHeader` parse; `build_v4`/
+  `build_v6` write a full datagram; `checksum_v4`/`checksum_v6` compute the
+  checksum over the **pseudo-header + UDP header + payload**; `verify_checksum_v4`
+  checks a received datagram. The checksum **reuses the N1a `Checksum`
+  accumulator** unchanged - the pseudo-header, header, and payload are fed as
+  separate slices and the accumulator carries the odd byte across them, so the
+  result matches one contiguous buffer (this is exactly why N1a built `Checksum`
+  as an accumulator). A computed `0x0000` is transmitted as `0xFFFF` (RFC 768);
+  IPv6 mandates the checksum (RFC 8200). An async `UdpEndpoint` (`send_to`/
+  `recv_from`) frames through `wire` -> `librheo::net`, resolving the next hop via
+  `arp`.
+- **`net::icmp`** - ICMPv4 echo (type 8/0) build/parse with `id`/`seq`, the
+  checksum via `checksum16` over the whole message (no pseudo-header), and an
+  async `IcmpEndpoint` (`send_echo`/`recv_reply`/`ping`).
+- **`net::wire`** - the shared L2/L3 send path both L4 protocols use:
+  `frame_ipv4` (Ethernet + IPv4 header + an L4 payload, with the **TTL settable**),
+  `parse_ipv4`, and `resolve_next_hop`. One place for the framing, so there is no
+  per-protocol copy.
+
+### The UDP checksum (correctness-critical)
+
+The pseudo-header the checksum covers is `[src][dst][zero][proto][udp_len]` for
+IPv4 (12 bytes) and `[src][dst][udp_len(4)][zero(3)][next_header]` for IPv6 (40
+bytes). It is validated two ways: (1) a **known-good oracle** - the fixed DNS-query
+datagram from `10.0.2.15:0x9876` to `10.0.2.3:53` checksums to `0x6D45`, and the
+fixed ICMP echo request to `0xFFE0`, both computed independently and asserted in
+the proof (like N1a's `0xB861`); and (2) the **live round trip** - `recv_from`
+recomputes the checksum over each received datagram and drops any that fail.
+
+### The TTL hook for traceroute
+
+`wire::frame_ipv4` takes the IPv4 TTL, and both endpoints expose `set_ttl`. That
+is the seam a later traceroute uses (send probes with an increasing TTL, read the
+ICMP **time-exceeded** each router returns). N1b ships the hook, not the loop -
+the TTL-increment traceroute + time-exceeded parsing is **N7**.
+
+### The proof (`netl4` test kernel, all 3 ISAs)
+
+A `netl4-demo` cell (loaded like `netcore`) over QEMU SLIRP + virtio-net:
+
+1. asserts the UDP + ICMP checksum oracles (`0x6D45` / `0xFFE0`) in memory;
+2. **UDP round trip** - sends a real DNS query (`A example.com`, transaction id
+   `0x1234`) over UDP to SLIRP's built-in DNS responder at `10.0.2.3:53` and
+   receives the reply; asserts it is from `10.0.2.3:53`, its UDP checksum
+   validates (in `recv_from`), and the transaction id is echoed. DNS is **not
+   parsed** (that is the N1c caching resolver) - this proves the UDP datagram
+   round-tripped and its checksum is exact;
+3. **ICMP echo (ping)** - sends an ICMP echo request to the gateway `10.0.2.2`
+   (SLIRP answers echo to the gateway internally, no host network) and asserts the
+   reply is type 0 with the matching id/seq and a valid checksum.
+
+Bounded retransmits guard a momentary RX miss; if SLIRP does not answer, the demo
+returns a nonzero code and the kernel fails loudly (no fake pass). It exits `0x42`
+only if every step passes, on **all three ISAs** (virtio-mmio on arm/riscv,
+virtio-pci on x86-64). No kernel object / verb / dependency was added; no
+`cfg(target_arch)`.
+
+**Why this is deterministic + network-free:** the ICMP ping targets `10.0.2.2`,
+which libslirp answers itself. SLIRP's DNS at `10.0.2.3` returns a response packet
+for the query regardless of the upstream result (we assert only the transaction-id
+echo + a well-formed UDP reply, never the resolved address), so the proof does not
+depend on real outbound DNS.
+
+### Deferred to N1c (explicit)
+
+`local` (the AF_UNIX-equivalent zero-copy transport + the datapath selector), the
+caching `dns` client (LRU+TTL cache, blocklist, configurable resolvers, host
+config), and the Linux AF_UNIX personality. **ICMPv6** echo and **full traceroute**
+(the TTL-increment loop + time-exceeded parsing) are deferred to N7. The next-hop
+choice today ARPs the destination directly (SLIRP proxy-ARPs `10.0.2.0/24`); a
+real routing table (gateway for off-link) is an N1c refinement.

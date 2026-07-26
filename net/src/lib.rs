@@ -19,10 +19,19 @@
 //! - [`ip`]: IPv4 + IPv6 header parse/build, the address types
 //!   ([`ip::Ipv4Addr`]/[`ip::Ipv6Addr`]/[`ip::IpAddr`]), and the ones-complement
 //!   Internet checksum ([`ip::checksum16`] / the reusable [`ip::Checksum`]
-//!   accumulator, which UDP/ICMP will reuse with a pseudo-header in N1b).
+//!   accumulator, which UDP/ICMP reuse with a pseudo-header).
 //!
-//! Not in N1a (deferred to N1b, per docs/NETSTACK.md): `udp`, `icmp`, `local`
-//! (AF_UNIX-equivalent), and the caching `dns` client.
+//! **Phase N1b** adds L4/L3.5 over that core:
+//! - [`udp`]: UDP datagram build/parse; the checksum over the IPv4/IPv6
+//!   pseudo-header + header + payload via the N1a [`ip::Checksum`] accumulator;
+//!   an async [`udp::UdpEndpoint`] (`send_to`/`recv_from`).
+//! - [`icmp`]: ICMPv4 echo (ping) build/parse + an async [`icmp::IcmpEndpoint`],
+//!   with the **IPv4 TTL hook** for a later traceroute.
+//! - [`wire`]: the shared eth/ip framing + next-hop ARP resolution both L4
+//!   protocols send/receive over (the TTL hook lives here).
+//!
+//! Still deferred (per docs/NETSTACK.md): `local` (the AF_UNIX-equivalent
+//! zero-copy transport), the caching `dns` client, ICMPv6, and full traceroute.
 
 #![no_std]
 
@@ -30,4 +39,7 @@ extern crate alloc;
 
 pub mod arp;
 pub mod eth;
+pub mod icmp;
 pub mod ip;
+pub mod udp;
+pub mod wire;
