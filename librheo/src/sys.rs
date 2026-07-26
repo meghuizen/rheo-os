@@ -511,6 +511,40 @@ pub struct GraphNode {
 }
 const _: () = assert!(core::mem::size_of::<GraphNode>() == 32);
 
+/// Graph-node op 4 (BufReduce) descriptor (kernel/src/abi.rs, docs/TILES.md
+/// 6): `node.a` = the cell VA of this struct; the engine returns the
+/// wrapping u64 sum. dtype: 0=I8, 1=U8, 2=I32.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct BufReduceDesc {
+    pub va: u64,
+    pub elems: u64,
+    pub dtype: u32,
+    pub _pad: u32,
+}
+const _: () = assert!(core::mem::size_of::<BufReduceDesc>() == 24);
+
+/// Graph-node op 5 (TileGemm) descriptor (kernel/src/abi.rs, docs/TILES.md
+/// 6): the engine zeroes C, runs the int8->i32 GEMM whole, and returns the
+/// FNV-1a receipt of C's logical window. Strides in elements. Kernel caps:
+/// `1 <= m,n,k <= 256`, strides >= dims, dtypes exactly (I8=0, I32=2).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct TileGemmDesc {
+    pub a_va: u64,
+    pub b_va: u64,
+    pub c_va: u64,
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub a_stride: u32,
+    pub b_stride: u32,
+    pub c_stride: u32,
+    pub dtype_in: u32,
+    pub dtype_acc: u32,
+}
+const _: () = assert!(core::mem::size_of::<TileGemmDesc>() == 56);
+
 /// A submission entry - 64 bytes, one cache line.
 #[repr(C, align(64))]
 #[derive(Copy, Clone)]

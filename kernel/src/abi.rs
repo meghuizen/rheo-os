@@ -338,6 +338,47 @@ pub struct ReserveInfo {
     pub committed_ppm: u64,
 }
 
+/// Graph-node op 4 (BufReduce) descriptor (docs/TILES.md 6): `node.a` is the
+/// cell VA of this struct. The engine returns the wrapping u64 sum over
+/// `elems` elements of `dtype` (0=I8, 1=U8, 2=I32; signed sign-extends).
+/// Validation caps: `va != 0`, `0 < elems <= 1<<20`, `dtype <= 2` - anything
+/// else completes STATUS_DENIED. Kept in sync with librheo's `sys` mirror.
+#[repr(C)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct BufReduceDesc {
+    pub va: u64,
+    pub elems: u64,
+    pub dtype: u32,
+    pub _pad: u32,
+}
+const _: () = assert!(core::mem::size_of::<BufReduceDesc>() == 24);
+
+/// Graph-node op 5 (TileGemm) descriptor (docs/TILES.md 6): `node.a` is the
+/// cell VA of this struct. The engine zeroes C, runs the int8->i32 GEMM
+/// whole (the node is the tile loop), and returns the FNV-1a hash of C's
+/// logical m x n window - the deterministic receipt; the buffer carries the
+/// real output. Strides are in elements. Validation caps: VAs non-zero,
+/// `1 <= m,n,k <= 256`, strides >= the matching dims, `dtype_in == 0` (I8)
+/// and `dtype_acc == 2` (I32) exactly - the kernel path is integer-only
+/// (the aarch64 kernel target is soft-float). Worst node = 16.7M MACs,
+/// worst graph = 32 nodes: the documented drain bound.
+#[repr(C)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct TileGemmDesc {
+    pub a_va: u64,
+    pub b_va: u64,
+    pub c_va: u64,
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub a_stride: u32,
+    pub b_stride: u32,
+    pub c_stride: u32,
+    pub dtype_in: u32,
+    pub dtype_acc: u32,
+}
+const _: () = assert!(core::mem::size_of::<TileGemmDesc>() == 56);
+
 /// One node of a userspace-built dependency graph (docs/LIBRHEO.md Phase C,
 /// docs/ARCHITECTURE.md 3 object 6), kept in sync with librheo's `compute` arm.
 /// A cell writes an array of these into one of its buffers and submits it with

@@ -18,8 +18,12 @@
 //!   of the same shapes produce different program hashes but the same shape
 //!   class.
 //!
-//! The graph-path stage (EngineExecutor over `OP_GRAPH_SUBMIT` ops 4/5) is
-//! added by the kernel slice (docs/TILES.md 6).
+//! - **The graph path** (docs/TILES.md 6): the same 64x64x64 program lowered
+//!   by [`EngineExecutor`] to graph ops 4/5 over `OP_GRAPH_SUBMIT` - the
+//!   kernel engine's receipt must equal the CpuExecutor's for the identical
+//!   program; malformed descriptors (k=0, wrong dtype, VA=0) complete
+//!   `STATUS_DENIED` cleanly (never a fault); a recognised-but-driverless
+//!   engine index returns `EngineUnavailable`, honest.
 
 #![no_std]
 #![no_main]
@@ -29,9 +33,12 @@ extern crate alloc;
 use alloc::vec;
 use core::sync::atomic::{AtomicI32, Ordering};
 
+use librheo::compute::GraphBuilder;
 use librheo::mem::MemKind;
+use librheo::sys::{self, TileGemmDesc};
 use librheo::tile::{
-    self, CpuExecutor, Dtype, F32, I8, I32, TileBuf, TileProgram, TileShape, TileSim,
+    self, CpuExecutor, Dtype, EngineExecutor, F32, I8, I32, TileBuf, TileError, TileProgram,
+    TileShape, TileSim,
 };
 use librheo::{println, rt};
 
@@ -268,5 +275,99 @@ async fn work() {
         if err > bound {
             return fail(56);
         }
+    }
+
+    // ---- The graph path: the same program on the kernel engine ---------
+    // (docs/TILES.md 6). One 64x64x64 program, two executors, one receipt.
+    let mut ga: TileBuf<I8> = match TileBuf::alloc(MemKind::Ddr, 64, 64) {
+        Some(b) => b,
+        None => return fail(60),
+    };
+    let mut gb_: TileBuf<I8> = match TileBuf::alloc(MemKind::Ddr, 64, 64) {
+        Some(b) => b,
+        None => return fail(61),
+    };
+    let gc: TileBuf<I32> = match TileBuf::alloc(MemKind::Ddr, 64, 64) {
+        Some(b) => b,
+        None => return fail(62),
+    };
+    ga.fill_with(|i, j| ((i * 5 + j * 3) & 0xFF) as u8 as i8);
+    gb_.fill_with(|i, j| ((i * 11 + j * 2) & 0xFF) as u8 as i8);
+    let mut gp = TileProgram::new();
+    let g1 = gp.bind(&ga, tile::Space::Host);
+    let g2 = gp.bind(&gb_, tile::Space::Host);
+    let g3 = gp.bind(&gc, tile::Space::Host);
+    if gp
+        .gemm(
+            g1,
+            g2,
+            g3,
+            TileShape {
+                m: 16,
+                n: 16,
+                k: 16,
+            },
+        )
+        .is_err()
+        || gp.reduce(g3).is_err()
+    {
+        return fail(63);
+    }
+    let cpu_report = match exec.run(&gp).await {
+        Ok(r) => r,
+        Err(_) => return fail(64),
+    };
+    let eng_report = match (EngineExecutor { engine: 0 }).run(&gp).await {
+        Ok(r) => r,
+        Err(_) => return fail(65),
+    };
+    // Receipt equality across executors: the FNV of C and the reduce sum.
+    if cpu_report.checksums != eng_report.checksums || cpu_report.reduced != eng_report.reduced {
+        return fail(66);
+    }
+
+    // A recognised device engine without a driver cell is unavailable, not
+    // faked; so is an out-of-range index.
+    match (EngineExecutor { engine: 999 }).run(&gp).await {
+        Err(TileError::EngineUnavailable(_)) => {}
+        _ => return fail(67),
+    }
+
+    // Malformed descriptors complete STATUS_DENIED cleanly - never a fault.
+    let bad = TileGemmDesc {
+        a_va: ga.base_va(),
+        b_va: gb_.base_va(),
+        c_va: gc.base_va(),
+        m: 64,
+        n: 64,
+        k: 0, // zero dim
+        a_stride: 64,
+        b_stride: 64,
+        c_stride: 64,
+        dtype_in: 0,
+        dtype_acc: 2,
+    };
+    let mut bb = GraphBuilder::new();
+    bb.tile_gemm(&bad as *const TileGemmDesc as u64);
+    match bb.submit().await {
+        Err(s) if s == sys::STATUS_DENIED => {}
+        _ => return fail(68),
+    }
+    let bad2 = TileGemmDesc {
+        dtype_acc: 3, // F32 accumulate: refused, the kernel is integer-only
+        k: 64,
+        ..bad
+    };
+    let mut bb2 = GraphBuilder::new();
+    bb2.tile_gemm(&bad2 as *const TileGemmDesc as u64);
+    match bb2.submit().await {
+        Err(s) if s == sys::STATUS_DENIED => {}
+        _ => return fail(69),
+    }
+    let mut bb3 = GraphBuilder::new();
+    bb3.tile_gemm(0); // NULL descriptor VA
+    match bb3.submit().await {
+        Err(s) if s == sys::STATUS_DENIED => {}
+        _ => return fail(70),
     }
 }

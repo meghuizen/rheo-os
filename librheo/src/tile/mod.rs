@@ -870,6 +870,79 @@ async fn reduce_buf(s: BufMeta) -> u64 {
 }
 
 // ============================================================================
+// EngineExecutor: the graph lowering - the device-portable artifact.
+// ============================================================================
+
+/// Lower the SAME [`TileProgram`] to dependency-graph nodes (ops 4/5,
+/// docs/TILES.md 6) and submit over the queue. Engine 0 - the kernel's CPU
+/// engine - executes today; a recognised device engine (GPU/NPU/TPU/FPGA)
+/// returns [`TileError::EngineUnavailable`] until its contained driver cell
+/// exists (GPU-HARDWARE.md 5) - never a faked run. The kernel's v1 tile
+/// contract is GEMM (int8->i32 only) and reduce; other ops on this path are
+/// [`TileError::UnsupportedOp`] - the CpuExecutor runs them as library calls.
+pub struct EngineExecutor {
+    pub engine: u64,
+}
+
+impl EngineExecutor {
+    pub async fn run(&self, prog: &TileProgram<'_>) -> Result<RunReport, TileError> {
+        let n = compute::Engine::count();
+        if self.engine >= n || self.engine != 0 {
+            return Err(TileError::EngineUnavailable(self.engine as u32));
+        }
+        let mut checksums = Vec::with_capacity(prog.ops.len());
+        let mut reduced = 0u64;
+        for op in &prog.ops {
+            match *op {
+                OpEnc::Gemm { a, b, c, .. } => {
+                    let (ma, mb, mc) = (prog.meta(a), prog.meta(b), prog.meta(c));
+                    if ma.dtype != Dtype::I8 || mc.dtype != Dtype::I32 {
+                        return Err(TileError::UnsupportedDtype);
+                    }
+                    let desc = crate::sys::TileGemmDesc {
+                        a_va: ma.base_va,
+                        b_va: mb.base_va,
+                        c_va: mc.base_va,
+                        m: ma.rows as u32,
+                        n: mb.cols as u32,
+                        k: ma.cols as u32,
+                        a_stride: ma.stride as u32,
+                        b_stride: mb.stride as u32,
+                        c_stride: mc.stride as u32,
+                        dtype_in: ma.dtype as u32,
+                        dtype_acc: mc.dtype as u32,
+                    };
+                    let mut gb = compute::GraphBuilder::new();
+                    gb.tile_gemm(&desc as *const crate::sys::TileGemmDesc as u64);
+                    let receipt = gb.submit().await.map_err(TileError::Kernel)?;
+                    checksums.push(receipt);
+                }
+                OpEnc::Reduce { src } => {
+                    let s = prog.meta(src);
+                    let desc = crate::sys::BufReduceDesc {
+                        va: s.base_va,
+                        elems: (s.rows * s.cols) as u64,
+                        dtype: s.dtype as u32,
+                        _pad: 0,
+                    };
+                    // The kernel reduce is contiguous; a strided buffer's
+                    // logical window is not - the library path serves it.
+                    if s.stride != s.cols {
+                        return Err(TileError::UnsupportedOp);
+                    }
+                    let mut gb = compute::GraphBuilder::new();
+                    gb.buf_reduce(&desc as *const crate::sys::BufReduceDesc as u64);
+                    reduced = gb.submit().await.map_err(TileError::Kernel)?;
+                    checksums.push(reduced);
+                }
+                _ => return Err(TileError::UnsupportedOp),
+            }
+        }
+        Ok(RunReport { reduced, checksums })
+    }
+}
+
+// ============================================================================
 // TileContract + TileSim + the autotune key (docs/TILES.md 3, 7, 8).
 // ============================================================================
 

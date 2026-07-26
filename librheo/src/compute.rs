@@ -283,6 +283,19 @@ impl GraphBuilder {
     pub fn select(&mut self, cond: In, val: In) -> NodeRef {
         self.push(3, cond, val)
     }
+    /// Buffer-carrying reduce node (op 4, docs/TILES.md 6): `desc_va` is the
+    /// cell VA of a [`sys::BufReduceDesc`]; the node's result is the wrapping
+    /// sum. The descriptor must stay alive until [`submit`](Self::submit)
+    /// completes.
+    pub fn buf_reduce(&mut self, desc_va: u64) -> NodeRef {
+        self.push(4, In::Imm(desc_va), In::Imm(0))
+    }
+    /// Tiled int8 GEMM node (op 5, docs/TILES.md 6): `desc_va` is the cell VA
+    /// of a [`sys::TileGemmDesc`]; the node's result is the FNV-1a receipt of
+    /// C. The descriptor and buffers must stay alive until submit completes.
+    pub fn tile_gemm(&mut self, desc_va: u64) -> NodeRef {
+        self.push(5, In::Imm(desc_va), In::Imm(0))
+    }
 
     pub fn len(&self) -> usize {
         self.nodes.len()
