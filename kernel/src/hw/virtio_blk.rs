@@ -236,6 +236,9 @@ impl PciXport {
     fn cc_w32(&self, field: u32, v: u32) {
         self.write(self.common_bar, self.common_off + field, 4, v);
     }
+    fn cc_r32(&self, field: u32) -> u32 {
+        self.read(self.common_bar, self.common_off + field, 4)
+    }
     fn cc_r16(&self, field: u32) -> u16 {
         self.read(self.common_bar, self.common_off + field, 2) as u16
     }
@@ -317,12 +320,18 @@ unsafe fn init_mmio(base: usize) -> Option<VirtioBlk> {
         status |= S_DRIVER;
         w32(base, STATUS, status);
 
-        // Negotiate: require VIRTIO_F_VERSION_1 (feature bit 32 -> sel 1, bit 0).
+        // Negotiate: require VIRTIO_F_VERSION_1 (feature bit 32 -> sel 1,
+        // bit 0), and also ack VIRTIO_F_ACCESS_PLATFORM (bit 33 -> sel 1,
+        // bit 1) when the device offers it - the bit that makes the device
+        // route its DMA through a platform IOMMU (docs/GPU-HARDWARE.md 4).
+        // When `iommu_platform=off` (every other test) the device does not
+        // offer it, so `ap` is 0 and behaviour is unchanged.
+        w32(base, DEVICE_FEATURES_SEL, 1);
+        let ap = r32(base, DEVICE_FEATURES) & 0x2;
         w32(base, DRIVER_FEATURES_SEL, 1);
-        w32(base, DRIVER_FEATURES, 1);
+        w32(base, DRIVER_FEATURES, 1 | ap);
         w32(base, DRIVER_FEATURES_SEL, 0);
         w32(base, DRIVER_FEATURES, 0);
-        let _ = (DEVICE_FEATURES, DEVICE_FEATURES_SEL);
 
         status |= S_FEATURES_OK;
         w32(base, STATUS, status);
@@ -463,12 +472,17 @@ fn init_pci(bus: u8, dev: u8, func: u8) -> Option<VirtioBlk> {
     x.cc_w8(CC_DEVICE_STATUS, S_ACK as u8);
     x.cc_w8(CC_DEVICE_STATUS, (S_ACK | S_DRIVER) as u8);
 
-    // Require VIRTIO_F_VERSION_1 (feature bit 32 -> select 1, bit 0).
+    // Require VIRTIO_F_VERSION_1 (feature bit 32 -> select 1, bit 0), and
+    // ack VIRTIO_F_ACCESS_PLATFORM (bit 33 -> select 1, bit 1) when offered
+    // - the bit that routes device DMA through a platform IOMMU
+    // (docs/GPU-HARDWARE.md 4). Not offered under `iommu_platform=off`, so
+    // `ap` is 0 and every other test is unchanged.
+    x.cc_w32(CC_DEVICE_FEATURE_SELECT, 1);
+    let ap = x.cc_r32(CC_DEVICE_FEATURE) & 0x2;
     x.cc_w32(CC_DRIVER_FEATURE_SELECT, 1);
-    x.cc_w32(CC_DRIVER_FEATURE, 1);
+    x.cc_w32(CC_DRIVER_FEATURE, 1 | ap);
     x.cc_w32(CC_DRIVER_FEATURE_SELECT, 0);
     x.cc_w32(CC_DRIVER_FEATURE, 0);
-    let _ = (CC_DEVICE_FEATURE_SELECT, CC_DEVICE_FEATURE);
 
     x.cc_w8(CC_DEVICE_STATUS, (S_ACK | S_DRIVER | S_FEATURES_OK) as u8);
     if x.cc_r8(CC_DEVICE_STATUS) & S_FEATURES_OK as u8 == 0 {

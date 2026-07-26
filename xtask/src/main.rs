@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 46] = [
+const TEST_KERNELS: [&str; 47] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -68,6 +68,7 @@ const TEST_KERNELS: [&str; 46] = [
     "linuxunix",
     "linuxinet",
     "gpuhw",
+    "iommu",
 ];
 
 /// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
@@ -255,6 +256,29 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "ati-vga",
             "-device",
             "bochs-display",
+        ],
+        // iommu (docs/GPU-HARDWARE.md 4, BUILD-ORDER.md step 12): VT-d DMA
+        // remapping. x86-64 q35 gets `-device intel-iommu` (caching-mode=on
+        // so the vIOMMU faults + requires invalidation, the mode that
+        // reports out-of-grant DMA) plus a virtio-blk-pci disk as the DMA
+        // source. intel-iommu must precede the devices it covers. arm/riscv
+        // `virt` surface no DMAR base, so the kernel skips-with-reason and
+        // needs no IOMMU device (a plain virtio-blk keeps the probe honest).
+        ("iommu", Arch::X86_64) => &[
+            "-device",
+            "intel-iommu,caching-mode=on",
+            "-drive",
+            "file=tests/fixtures/ext4.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-pci,drive=blk0,disable-legacy=on,iommu_platform=on",
+        ],
+        ("iommu", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-drive",
+            "file=tests/fixtures/ext4.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-device,drive=blk0",
         ],
         // pmem (docs/MEMORY.md real-PMEM path): a real QEMU nvdimm whose
         // persistent span the kernel discovers via the ACPI NFIT and backs a

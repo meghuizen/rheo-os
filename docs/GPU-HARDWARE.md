@@ -1,7 +1,9 @@
 # Real GPU Hardware - PCIe, IOMMU, VRAM, and the Contained Driver Cell
 
 **Status:** Building. Section 12 **stage 1 is done** (the `gpuhw` test, all
-three ISAs): PCIe bridge recursion with kernel-programmed bus numbers, BAR
+three ISAs) and **stage 2's x86-64 IOMMU is done** (the `iommu` test:
+VT-d DMA remapping - a virtio-blk DMA is mediated by an IOMMU domain and an
+out-of-grant DMA faults; ARM SMMUv3 next, RISC-V skip-with-reason): PCIe bridge recursion with kernel-programmed bus numbers, BAR
 sizing + opt-in assignment, the capability walk (MSI/MSI-X/PCIe/FLR),
 vendor recognition across the major GPU vendors (`kernel/src/hw/gpu.rs` -
 AMD proven against QEMU's real `ati-vga` device model; NVIDIA/Intel
@@ -68,7 +70,7 @@ the tree.
 | Declared preemption contract | `Preemption::{Instruction, OpBoundary}` declared; a registered GPU engine declares `OpBoundary` (the accelerator contract) |
 | Graphs execute across engines (object 6) | `graph.rs` runs up to 32 nodes sequentially on one `&Engine`; `SqEntry.engine_id` is in the ABI but read nowhere |
 | GPUs enumerated as engines | **Stage 1, built:** `hw/pci.rs` recurses bridges (programming secondary bus numbers where firmware left them zero), sizes BARs by the mask probe, walks capabilities (MSI/MSI-X/PCIe/FLR), and offers opt-in BAR assignment (`assign_pci_bars`); `hw/gpu.rs` classifies every display-class function by vendor AND silicon family (NVIDIA Pascal/Turing/Ampere/Ada/Hopper/Blackwell, AMD GCN/RDNA/CDNA, Intel Xe) into the machine inventory, each with a per-vendor driver front-end (`vendor_driver`) declaring its lowering path (ACCELERATORS.md 4); each recognised GPU registers in the engine table. Proven by the `gpuhw` test on all three ISAs |
-| Every engine DMA mediated and grant-checked (ACCELERATORS.md 1, doctrine 1) | **Zero IOMMU code.** All device DMA is a raw `virt_to_phys` handed to the device (virtio-blk/net/gpu) |
+| Every engine DMA mediated and grant-checked (ACCELERATORS.md 1, doctrine 1) | **Stage 2, x86-64 built:** `hw/iommu.rs` brings up VT-d (root/context/second-level tables + queued invalidation + TES) and the `iommu` test proves a virtio-blk DMA is mediated by the domain - succeeds when granted, faults when revoked. The existing virtio drivers still hand raw `virt_to_phys` (identity IOVA==PA); ARM SMMUv3 is the next backend |
 | Device memory as typed kinds (MEMORY.md 2) | `MemKind::{Hbm, Cxl}` silently DDR-backed; `MemKind::DeviceBar` refused by a literal `kind == 4` check at the syscall boundary (`kernel/src/user.rs`) |
 | Engine introspection | `SYS_ENGINE_INFO(out_va, index)` enumerates the engine table - the CPU, then every recognised GPU with its PCI vendor ID - and returns the count |
 | A real GPU device round-trip | virtio-gpu 2D driver (`hw/virtio_gpu.rs`, DISPLAY.md 12): kernel-resident, test-installed, synchronous busy-poll, `OP_GPU_PRESENT` is a CPU memcpy into a fixed 128x128 framebuffer |
@@ -164,10 +166,27 @@ GICv3 ITS / IMSIC) lands there, everything above it is portable.
 
 This section is the load-bearing one, and it is deliberately
 **device-neutral**: NIC and NVMe containment cite it unchanged. It is the
-repo's first concrete IOMMU design; until BUILD-ORDER.md step 12 is
-implemented this section is normative, and when step 12 lands it lifts into
+repo's first concrete IOMMU design; when step 12 fully lands it lifts into
 its own IOMMU.md with this section becoming a pointer (promotion clause at
 the end).
+
+**Built (stage 2, x86-64): VT-d DMA remapping** (`kernel/src/hw/iommu.rs`,
+the `iommu` test). The `intel-iommu` register base is discovered from the
+ACPI DMAR table; the driver builds a root table, a shared context table,
+and a second-level page-table domain (identity over low RAM, 2 MiB
+superpages), enables **queued invalidation** (QEMU's caching-mode IOMMU
+only tears down its device shadow mappings via QI, not the register-based
+path), and sets translation-enable (TES). The proof is a real device
+(virtio-blk, negotiating `VIRTIO_F_ACCESS_PLATFORM` so its DMA is subject
+to the IOMMU): a block read **succeeds** through the identity domain
+(DMA mediated, not blocked), then after the domain is **revoked** (mapped
+to nothing) the same read **faults** - QEMU logs `vtd_iommu_translate:
+detected translation failure` and the driver reads the fault back from the
+fault-recording register. That is BUILD-ORDER step 12's done-when: a device
+DMAs only into granted memory, and an out-of-grant DMA faults. ARM64
+(SMMUv3) and RISC-V (no QEMU IOMMU model in 8.2) surface no DMAR base and
+skip-with-reason; **SMMUv3 is the next backend**. The design below is the
+full target this first backend realizes.
 
 The claim to make true: ACCELERATORS.md 1 says "every engine DMA is
 mediated and grant-checked," and BOOT.md 1 makes a missing or disabled
@@ -671,12 +690,13 @@ kernel that CI runs:
   register interface - program 640x480x32 + LFB, render into the linear
   framebuffer, read pixels back, on all three ISAs). MSI-X *routing* (vectors to vcores) is not in stage 1;
   only capability presence is recorded.
-- **Stage 2 - IOMMU:** domains + the grant-to-mapping path + fault events
-  against `intel-iommu` (x86-64) and `smmuv3` (ARM64), both already on
-  the DEVELOPMENT.md launch lines; an `iommu` test kernel proves a device
-  DMA **inside** a granted range succeeds and one **outside** it faults as
-  a typed event. This *is* BUILD-ORDER step 12's done-when. RISC-V:
-  skip-with-reason (no QEMU IOMMU model - section 4).
+- **Stage 2 - IOMMU (x86-64 done):** the `iommu` test kernel brings up
+  VT-d against `-device intel-iommu` and proves a device DMA **inside** a
+  granted (identity) domain succeeds and one **outside** it (after revoke)
+  faults, read back from the fault-recording register - BUILD-ORDER step
+  12's done-when, on x86-64. ARM64 `smmuv3` is the next backend (a distinct
+  register/structure layout); RISC-V skips-with-reason (no QEMU IOMMU model
+  - section 4).
 - **Stage 3 - the driver cell:** virtio-gpu **re-homed** from the kernel
   into a driver cell holding BAR-window grants (virtio-pci's BARs, no more
   config-space tunnel) and queue-memory grants, with the kernel keeping
@@ -698,7 +718,7 @@ proof this design has.
 | Capability | QEMU-provable (model) | Lab-gated | Per-ISA notes |
 |---|---|---|---|
 | PCIe walk, BAR assign, vendor recognition | **proven** (`gpuhw`: ati-vga + bochs + virtio behind a root port) | timing only | all three ISAs |
-| IOMMU domains, out-of-grant fault | yes (`intel-iommu`, `smmuv3`) | ATS/PRI | **riscv skip-with-reason: no QEMU IOMMU model** |
+| IOMMU domains, out-of-grant fault | **proven x86-64** (`iommu` test, `intel-iommu`: VT-d + QI, virtio-blk DMA faults on revoke) | ATS/PRI | **arm smmuv3: next backend; riscv skip-with-reason: no QEMU IOMMU model** |
 | Driver-cell BAR containment | yes (stage 3, virtio-gpu re-homed) | vendor blob | all three ISAs |
 | VRAM (`Hbm`) real backing | no VRAM device model - honest DDR stand-in, labeled | yes | - |
 | Firmware measurement / SPDM | no | yes | - |

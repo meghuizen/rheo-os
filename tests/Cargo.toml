@@ -235,6 +235,14 @@ path = "src/linuxinet.rs"
 name = "gpuhw"
 path = "src/gpuhw.rs"
 
+# IOMMU containment (docs/GPU-HARDWARE.md 4, BUILD-ORDER.md step 12): VT-d
+# DMA remapping - a virtio-blk DMA succeeds through an identity domain and
+# faults when the domain is revoked. x86-64 real (intel-iommu); arm/riscv
+# skip-with-reason (no DMAR register base surfaced).
+[[bin]]
+name = "iommu"
+path = "src/iommu.rs"
+
 [[bin]]
 name = "smp"
 path = "src/smp.rs"

@@ -20,6 +20,7 @@ pub mod acpi;
 pub mod block;
 pub mod fdt;
 pub mod gpu;
+pub mod iommu;
 pub mod pci;
 pub mod virtio_blk;
 pub mod virtio_gpu;
@@ -158,6 +159,9 @@ pub struct Inventory {
     pub mem: [MemRegion; MAX_MEM_REGIONS],
     pub nnodes: usize,
     pub ecam_base: u64,
+    /// VT-d remapping-hardware register base (first DRHD in the ACPI DMAR
+    /// table), 0 if no IOMMU was discovered (docs/GPU-HARDWARE.md 4).
+    pub iommu_base: u64,
     pub npci: usize,
     pub pci: [PciDevice; MAX_PCI_DEVICES],
     pub ngpu: usize,
@@ -184,6 +188,7 @@ impl Inventory {
             }; MAX_MEM_REGIONS],
             nnodes: 0,
             ecam_base: 0,
+            iommu_base: 0,
             npci: 0,
             pci: [PciDevice {
                 seg: 0,

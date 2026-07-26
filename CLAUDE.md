@@ -84,7 +84,17 @@ transport measurement, reported live by `SYS_ENGINE_INFO`) and a **real Bochs
 640x480x32 + LFB, framebuffer render + pixel read-back on all three ISAs),
 so every GPU device model QEMU has is genuinely driven - virtio-gpu by the
 Phase H 2D driver, AMD through its framebuffer aperture, Bochs by a working
-2D modeset.
+2D modeset. **Real-GPU stage 2 (the IOMMU) is done on x86-64**
+(docs/GPU-HARDWARE.md 4, BUILD-ORDER step 12): `kernel/src/hw/iommu.rs`
+discovers the VT-d register base from the ACPI DMAR table and brings up DMA
+remapping - root/context/second-level page tables, queued invalidation
+(QEMU's caching-mode IOMMU only tears down device shadow mappings via QI),
+translation-enable - and the `iommu` test proves containment with a real
+device: a virtio-blk cell (negotiating `VIRTIO_F_ACCESS_PLATFORM`) reads
+successfully through an identity domain, then the same read FAULTS once the
+domain is revoked, read back from the VT-d fault-recording register. ARM
+SMMUv3 is the next backend; RISC-V skips-with-reason (no QEMU IOMMU model in
+8.2).
 
 The **strand runtime** (`runtime/`, BUILD-ORDER.md step 7,
 docs/CONCURRENCY.md) is the userspace library that brings native async and
@@ -740,7 +750,13 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               recursion + BAR sizing/assignment + capability walk + vendor
               recognition - a real AMD ati-vga, Bochs, virtio-gpu behind a
               root port; NVIDIA/Intel skip-with-reason - + GPU engine
-              registration), bench-core, and
+              registration), iommu (real-GPU stage 2, docs/GPU-HARDWARE.md
+              4/12 + BUILD-ORDER step 12: VT-d DMA remapping - discover the
+              ACPI DMAR base, build root/context/second-level tables + queued
+              invalidation + translation-enable, and prove a virtio-blk DMA
+              is mediated by the domain - succeeds when granted, FAULTS when
+              revoked; x86-64 real via intel-iommu, arm/riscv skip-with-
+              reason), bench-core, and
               the interactive
               lsh bin (+ harness.rs, vfs_personality.rs); fixtures/ holds the
               ext4 test image (+ gen-ext4.sh); linux-fixtures/ holds the

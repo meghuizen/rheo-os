@@ -110,6 +110,7 @@ fn walk_sdt(sdt: u64, is_xsdt: bool, inv: &mut Inventory) {
             b"MCFG" => parse_mcfg(table, inv),
             b"SRAT" => parse_srat(table, inv),
             b"NFIT" => parse_nfit(table, inv),
+            b"DMAR" => parse_dmar(table, inv),
             _ => {}
         }
     }
@@ -150,6 +151,30 @@ fn parse_nfit(nfit: u64, inv: &mut Inventory) {
                 let size = rd64(nfit + off + 40);
                 inv.add_mem(base, size, MemKind::Pmem, 0);
             }
+        }
+        off += slen;
+    }
+}
+
+/// DMAR -> the VT-d remapping-hardware register base (docs/GPU-HARDWARE.md
+/// 4, the IOMMU containment mechanism). The table header (36) is followed
+/// by host_address_width(1) + flags(1) + reserved(10), then remapping
+/// structures; the first DRHD (type 0) carries the register base at offset
+/// 8 within it. Only present when QEMU is started with `-device
+/// intel-iommu`; absent otherwise, leaving `iommu_base` 0 (skip-with-reason).
+fn parse_dmar(dmar: u64, inv: &mut Inventory) {
+    let len = rd32(dmar + 4) as u64;
+    let mut off = 48; // header(36) + haw(1) + flags(1) + reserved(10)
+    while off + 4 <= len {
+        let stype = rd8(dmar + off) as u16 | ((rd8(dmar + off + 1) as u16) << 8);
+        let slen = (rd8(dmar + off + 2) as u16 | ((rd8(dmar + off + 3) as u16) << 8)) as u64;
+        if slen == 0 {
+            break;
+        }
+        // Type 0 = DRHD (DMA Remapping Hardware Unit Definition): the
+        // register base is a u64 at offset 8 within the structure.
+        if stype == 0 && slen >= 16 && inv.iommu_base == 0 {
+            inv.iommu_base = rd64(dmar + off + 8);
         }
         off += slen;
     }
