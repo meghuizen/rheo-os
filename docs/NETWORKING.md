@@ -8,6 +8,36 @@ NIC/DPU. The design goal is that a packet nobody holds a grant for costs
 approximately nothing, and that a flood against one tenant cannot perturb
 another.
 
+## 0. What is built (Phase G): the NIC data path, raw frames
+
+The **NIC driver + a raw-frame async path** are real; the **IP/TCP/QUIC stack
+stays deferred as a service** (sections 2-3), exactly as the position above
+requires - the kernel owns the queue plumbing, not the protocols.
+
+- A hand-written **virtio-net driver** (`kernel/src/hw/virtio_net.rs`), mirroring
+  the virtio-blk driver over the same **two transports** - virtio-mmio on
+  arm/riscv `virt`, virtio-pci on x86-64 q35 (through the `VIRTIO_PCI_CAP_PCI_CFG`
+  config tunnel, no BAR mapping). Reset + minimal feature negotiation
+  (`VIRTIO_F_VERSION_1` + `VIRTIO_NET_F_MAC`; no mergeable-rx-buffers or
+  checksum/GSO offload), an RX and a TX **split virtqueue**, and the 12-byte v1
+  `virtio_net_hdr`. DMA uses **physical** addresses (`virt_to_phys`) since the
+  kernel moved to the higher half. Polled (no device IRQ yet - a later refinement,
+  like virtio-blk).
+- librheo's **`net`** is now a real async surface: `mac()`, `send(frame)`,
+  `recv(buf)` over three queue opcodes (`OP_NET_TX`/`OP_NET_RX`/`OP_NET_MAC`)
+  bridged to the driver in `kernel_process`, completing with the strand token -
+  the same async model as the Phase B `io` opcodes. `connect`/`listen` stay
+  `Unsupported` stubs: a socket/IP/TCP layer is a **service** (section 2).
+- Proof: the `librheonet` test kernel (all three ISAs) - a librheo cell asks the
+  NIC for its MAC, sends a **broadcast ARP request** for the SLIRP gateway
+  `10.0.2.2`, and **receives SLIRP's ARP reply** (a real, deterministic,
+  network-free RX proof over QEMU `-netdev user`), asserting the reply's ethertype
+  + opcode + sender IP and exiting `0x42`.
+- Deferred (documented): the full transport stack (IP/ARP-cache/TCP/QUIC/TLS as a
+  library in a cell, section 2), a first-class socket `ObjectKind` + steering-table
+  grants (section 1), header/payload split (section 1), a device RX interrupt, and
+  everything in sections 4-7 (eBPF dataplane, DDoS staging, DPU offload).
+
 ## 1. NIC queues are the primitive
 
 - A network grant = a set of hardware RX/TX queue pairs, IOMMU-mapped into

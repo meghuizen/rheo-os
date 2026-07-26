@@ -1,35 +1,93 @@
-//! Networking (docs/LIBRHEO.md Phase F) - **deferred, a documented stub**.
+//! Raw-frame networking (docs/LIBRHEO.md Phase G, docs/NETWORKING.md) - async
+//! send/receive of **raw Ethernet frames** over the same submit/complete
+//! machinery as `io`: an `OP_NET_*` submission parks a strand on the completion
+//! token and the vcore runs other strands until the reactor wakes it.
 //!
-//! librheo's networking is designed as async sockets over the *same*
-//! submit/complete machinery as `io` (an `Op` -> a completion future), so a
-//! service parks a strand on a receive completion exactly like a file read. But
-//! the transport underneath - a virtio-net driver, a loopback path, an address/
-//! socket kernel object - does not exist yet, and networking is a **service**
-//! (docs/ARCHITECTURE.md), not part of the always-linked foundation. Rather than
-//! sink Phase F into a network stack, the surface is stubbed here with the
-//! intended shape, and the real transport is future work (a `net` service cell
-//! over virtio-net, with the socket as an `ObjectKind` and connect/accept as the
-//! IO.md-6 cross-cell connect, reusing Phase E's `ipc` mechanism).
-//!
-//! Nothing here performs I/O; every call reports the feature is unavailable.
+//! This is the NIC data path - the queue plumbing the kernel owns
+//! (docs/NETWORKING.md 1: "NIC queues are the primitive"). Everything above raw
+//! frames - ARP/IP/TCP/QUIC/TLS - is a **service / a transport library in a
+//! cell** (docs/NETWORKING.md 2), not part of this foundation, and stays
+//! deferred: [`connect`]/[`listen`] remain [`Unsupported`] stubs pending a
+//! socket object + the blessed transport cell. What is real here is `send`,
+//! `recv`, and `mac` bridged to the kernel's virtio-net driver.
 
-/// The error every stubbed networking call returns until the transport lands.
+use crate::rt;
+use crate::sys;
+
+/// A 6-byte Ethernet MAC address.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Mac(pub [u8; 6]);
+
+/// A networking error (the transport-level failures a raw frame can hit).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct NetError;
+
+/// The error the (still-deferred) socket calls return - IP/TCP is a service.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Unsupported;
 
-/// A socket address (the shape a future API takes). Inert today.
+/// A socket address (the shape a future socket API takes). Inert today.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SocketAddr {
     pub ip: [u8; 4],
     pub port: u16,
 }
 
-/// Would open an async stream socket. Returns [`Unsupported`] - no transport yet.
+fn put_u64(a: &mut [u8; 24], off: usize, v: u64) {
+    a[off..off + 8].copy_from_slice(&v.to_le_bytes());
+}
+fn put_u32(a: &mut [u8; 24], off: usize, v: u32) {
+    a[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+/// The NIC's MAC address (async: an `OP_NET_MAC` completion).
+pub async fn mac() -> Result<Mac, NetError> {
+    let mut m = [0u8; 6];
+    let mut a = [0u8; 24];
+    put_u64(&mut a, 0, m.as_mut_ptr() as u64);
+    let cqe = rt::submit_and_await(sys::OP_NET_MAC, a).await;
+    if cqe.status == sys::STATUS_OK && cqe.result == 6 {
+        Ok(Mac(m))
+    } else {
+        Err(NetError)
+    }
+}
+
+/// Send one raw Ethernet `frame` (`OP_NET_TX`). Returns the byte count.
+pub async fn send(frame: &[u8]) -> Result<usize, NetError> {
+    let mut a = [0u8; 24];
+    put_u64(&mut a, 0, frame.as_ptr() as u64);
+    put_u32(&mut a, 8, frame.len() as u32);
+    let cqe = rt::submit_and_await(sys::OP_NET_TX, a).await;
+    if cqe.status == sys::STATUS_OK {
+        Ok(cqe.result as usize)
+    } else {
+        Err(NetError)
+    }
+}
+
+/// Poll for one raw Ethernet frame into `buf` (`OP_NET_RX`). Returns the frame
+/// length, or `0` if no packet is available (the reactor's polled RX path - the
+/// caller re-`recv`s to wait; a device-IRQ wake is a later refinement). Above
+/// this a service layers a real socket wait (docs/NETWORKING.md).
+pub async fn recv(buf: &mut [u8]) -> Result<usize, NetError> {
+    let mut a = [0u8; 24];
+    put_u64(&mut a, 0, buf.as_mut_ptr() as u64);
+    put_u32(&mut a, 8, buf.len() as u32);
+    let cqe = rt::submit_and_await(sys::OP_NET_RX, a).await;
+    if cqe.status == sys::STATUS_OK {
+        Ok(cqe.result as usize)
+    } else {
+        Err(NetError)
+    }
+}
+
+/// Would open an async stream socket. [`Unsupported`] - IP/TCP is a service.
 pub fn connect(_addr: SocketAddr) -> Result<(), Unsupported> {
     Err(Unsupported)
 }
 
-/// Would bind/listen for connections. Returns [`Unsupported`] - no transport yet.
+/// Would bind/listen for connections. [`Unsupported`] - IP/TCP is a service.
 pub fn listen(_addr: SocketAddr) -> Result<(), Unsupported> {
     Err(Unsupported)
 }

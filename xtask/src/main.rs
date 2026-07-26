@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 29] = [
+const TEST_KERNELS: [&str; 30] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -51,6 +51,7 @@ const TEST_KERNELS: [&str; 29] = [
     "linuxproc",
     "linuxdyn",
     "librheoproc",
+    "librheonet",
 ];
 
 /// Extra QEMU args for a given test kernel. `blockfs` needs a virtio-blk disk
@@ -91,6 +92,26 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "file=target/librheodata.bin,if=none,id=blk0,format=raw",
             "-device",
             "virtio-blk-pci,drive=blk0,disable-legacy=on",
+        ],
+        // librheonet (docs/LIBRHEO.md Phase G, docs/NETWORKING.md): a virtio-net
+        // NIC on a SLIRP user netdev - deterministic + network-free. The guest
+        // sends a broadcast ARP for the gateway 10.0.2.2; SLIRP answers with an
+        // ARP reply the driver receives (a real, reproducible headless RX proof).
+        // Same two transports as blockfs: virtio-mmio on arm/riscv, virtio-pci
+        // on x86 (disable-legacy=on pins the modern layout the driver expects).
+        ("librheonet", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-device,netdev=n0",
+        ],
+        ("librheonet", Arch::X86_64) => &[
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-pci,netdev=n0,disable-legacy=on",
         ],
         _ => &[],
     }

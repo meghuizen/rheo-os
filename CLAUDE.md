@@ -477,6 +477,28 @@ IOAPIC/LAPIC does not re-deliver reliably; the timer + the riscv/arm UART RX are
 all interrupt-driven), and the `net` stack - docs/LIBRHEO.md has the full A-F
 accounting. **librheo A-F is complete.**
 
+**Phase G** turns the Phase F `net` stub into the real **NIC data path - raw
+Ethernet frames over a virtio-net driver** (docs/NETWORKING.md, LIBRHEO.md Phase
+G); the IP/TCP/QUIC stack stays a **service**, deferred. A hand-written
+**virtio-net driver** (`kernel/src/hw/virtio_net.rs`) mirrors virtio-blk over the
+**two transports** - virtio-mmio on arm/riscv `virt`, virtio-pci on x86-64 q35
+(via the `VIRTIO_PCI_CAP_PCI_CFG` config tunnel, no BAR mapping) - with reset +
+**minimal** feature negotiation (`VIRTIO_F_VERSION_1` + `VIRTIO_NET_F_MAC`; no
+mergeable-rx-buffers or checksum/GSO offload), an **RX** and a **TX** split
+virtqueue, the 12-byte v1 `virtio_net_hdr`, and the MAC from device config; DMA
+uses **physical** addresses (`virt_to_phys`), polled (a device RX IRQ is a later
+refinement). Three **queue opcodes** (`OP_NET_TX`/`OP_NET_RX`/`OP_NET_MAC`, no new
+kernel object) bridge a cell's async submissions to the driver in `kernel_process`,
+completing with the strand token - the Phase B `io` model. librheo's **`net`** is
+now real: `mac`/`send`/`recv` of raw frames (`connect`/`listen` stay `Unsupported`
+- IP/TCP is a service). The `librheonet` test proves it on **all three ISAs**: a
+librheo cell reads the NIC MAC, sends a **broadcast ARP request** for the SLIRP
+gateway `10.0.2.2`, and **receives SLIRP's ARP reply** (a deterministic,
+network-free RX proof over QEMU `-netdev user`), asserting ethertype + opcode +
+sender IP and exiting `0x42`. Deferred: the full transport stack (IP/TCP/QUIC/TLS
+in a cell), a socket `ObjectKind` + steering grants, header/payload split, and the
+device RX interrupt. **librheo A-G is complete.**
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
 proofs, and the hardware-lab performance numbers. **SMP secondary-core
@@ -536,7 +558,8 @@ kernel/       the no_std kernel library + boot demo bin
               docs/LIBRHEO.md Phase D), svc
               (shell/resource/POSIX-file syscalls), hw (ACPI/FDT/PCIe
               discovery + the machine Inventory; block BlockDevice trait +
-              virtio_blk driver), elf + load (ELF loader for native
+              virtio_blk driver; virtio_net raw-frame NIC driver -
+              docs/NETWORKING.md), elf + load (ELF loader for native
               programs), user run loop (with per-cell syscall
               personalities), nproc (native process model: SYS_SPAWN/WAIT +
               cooperative cross-cell scheduler - docs/LIBRHEO.md Phase F),
@@ -578,7 +601,9 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               linuxdyn (L7: an unmodified dynamically-linked glibc C hello over
               PT_INTERP + ld-linux + fd-backed mmap), librheoproc (librheo Phase
               F: native spawn/wait + one-shot timer + the lrsh shell + the
-              embedded spine-only cell), bench-core, and the interactive
+              embedded spine-only cell), librheonet (librheo Phase G: raw-frame
+              networking - virtio-net driver + net::send/recv/mac, an ARP round
+              trip via SLIRP), bench-core, and the interactive
               lsh bin (+ harness.rs, vfs_personality.rs); fixtures/ holds the
               ext4 test image (+ gen-ext4.sh); linux-fixtures/ holds the
               built-from-source glibc test binaries (rusthello/ + rustthreads/
@@ -605,14 +630,16 @@ librheo/      the native userspace foundation library (docs/LIBRHEO.md):
               TimingReport)/term (Phase D byte-stream input/edit/render)/ipc
               (Phase E cross-cell Channel + sealed-buffer share)/display (Phase E
               Surface/Compositor/InputEvent)/proc (Phase F spawn/wait/args/env)/
-              time (Phase F clock + async sleep/timeout)/net (Phase F stub) +
+              time (Phase F clock + async sleep/timeout)/net (Phase G raw-frame
+              send/recv/mac over OP_NET_* - docs/NETWORKING.md) +
               crt0 (feature-gated: default=full, --no-default-features=embedded
               spine) + the librheo-demo (Phase A), librheo-data (Phase B
               mini-DuckDB scan), librheo-compute (Phase C parallel compute + graph
               + QoS), librheo-term (Phase D terminal), librheo-wl (Phase E
-              compositor demo), and Phase F: librheo-orch (spawn/wait/timer proof),
+              compositor demo), Phase F: librheo-orch (spawn/wait/timer proof),
               lrsh (the librheo-native shell), librheo-echo/librheo-child (native
-              coreutils it spawns), librheo-embed (the embedded spine-only cell)
+              coreutils it spawns), librheo-embed (the embedded spine-only cell),
+              and librheo-net (Phase G ARP round trip over virtio-net)
               programs
 json/         rheo-json: a dependency-free, zero-copy JSON parser (scalar +
               SSE2 string-scan), no_std, host-tested + benchmarked

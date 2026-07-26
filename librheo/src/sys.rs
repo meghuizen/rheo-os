@@ -392,6 +392,12 @@ pub const OP_FSTAT: u8 = 6;
 /// Submit a userspace-built dependency graph to the CPU engine (docs/LIBRHEO.md
 /// Phase C). See `compute::GraphBuilder`.
 pub const OP_GRAPH_SUBMIT: u8 = 7;
+/// Raw-frame networking opcodes (docs/NETWORKING.md, LIBRHEO.md Phase G). See
+/// `net` for the typed async layer. `OP_NET_TX` sends one Ethernet frame,
+/// `OP_NET_RX` polls for one (result 0 = none), `OP_NET_MAC` reports the MAC.
+pub const OP_NET_TX: u8 = 8;
+pub const OP_NET_RX: u8 = 9;
+pub const OP_NET_MAC: u8 = 10;
 /// `SqEntry.flags` bit: the op's data rides inline in the payload (IO.md 1).
 pub const FLAG_INLINE: u8 = 1 << 0;
 /// Durability-class flag bits (docs/IO.md). Advisory: the kernel ignores them

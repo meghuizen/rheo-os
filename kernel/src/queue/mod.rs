@@ -70,6 +70,22 @@ pub const OP_FSTAT: u8 = 6;
 /// `result` = the node count. Both VAs are the cell's own mapped memory (its
 /// address space is active during the `SYS_DOORBELL` trap), so no bounce.
 pub const OP_GRAPH_SUBMIT: u8 = 7;
+// ---- raw-frame networking opcodes (docs/NETWORKING.md, LIBRHEO.md Phase G) ----
+// A cell's async `net::send`/`recv`/`mac` (over the strand reactor) bridged to
+// the kernel's virtio-net driver during the `SYS_DOORBELL` trap. The buffer VAs
+// are the cell's own mapped memory (its address space is active during the
+// drain), so TX reads and RX writes land there directly - no kernel bounce.
+// Networking above raw frames (IP/TCP/QUIC) is a **service**, not a kernel
+// object (docs/NETWORKING.md 1-2); the kernel owns only the queue plumbing.
+/// `net_tx(buf_va, len)`: payload `[buf_va u64@0][len u32@8]`; `result` = bytes
+/// sent. Sends the `len` bytes at `buf_va` as one Ethernet frame.
+pub const OP_NET_TX: u8 = 8;
+/// `net_rx(buf_va, len)`: payload `[buf_va u64@0][len u32@8]`; `result` = the
+/// received frame length (0 = no packet available - the cell re-submits to poll).
+pub const OP_NET_RX: u8 = 9;
+/// `net_mac(buf_va)`: payload `[buf_va u64@0]`; writes the 6-byte MAC at `buf_va`,
+/// `result` = 6.
+pub const OP_NET_MAC: u8 = 10;
 
 /// `SqEntry.flags` bit: the op's data rides inline in the payload rather than
 /// by reference at `buf_va` (docs/IO.md 1 - the inline-vs-by-reference
@@ -461,8 +477,8 @@ impl QueuePair {
 /// per-opcode gate is what a *narrowed* (read-only) queue cap would enforce.
 fn opcode_right(opcode: u8) -> u32 {
     match opcode {
-        OP_READ | OP_FSTAT | OP_OPEN | OP_CLOSE => READ,
-        _ => WRITE, // OP_NOP, OP_ECHO, OP_WRITE, unknown
+        OP_READ | OP_FSTAT | OP_OPEN | OP_CLOSE | OP_NET_RX | OP_NET_MAC => READ,
+        _ => WRITE, // OP_NOP, OP_ECHO, OP_WRITE, OP_NET_TX, unknown
     }
 }
 
@@ -578,6 +594,22 @@ fn run_opcode(entry: &SqEntry) -> (u32, u32) {
             // SAFETY: both VAs are the submitting cell's own mapped memory,
             // reachable because its address space is active during the drain.
             crate::svc::graph_submit(nodes_va, count, results_va)
+        }
+        // Raw-frame networking (docs/NETWORKING.md, LIBRHEO.md Phase G): bridge
+        // to the virtio-net driver. The VAs are the cell's own mapped memory.
+        OP_NET_TX => {
+            let buf_va = rd_u64(p, 0);
+            let len = rd_u32(p, 8) as u64;
+            crate::hw::virtio_net::tx(buf_va, len)
+        }
+        OP_NET_RX => {
+            let buf_va = rd_u64(p, 0);
+            let len = rd_u32(p, 8) as u64;
+            crate::hw::virtio_net::rx(buf_va, len)
+        }
+        OP_NET_MAC => {
+            let buf_va = rd_u64(p, 0);
+            crate::hw::virtio_net::mac(buf_va)
         }
         _ => (STATUS_BAD_OPCODE, 0),
     }

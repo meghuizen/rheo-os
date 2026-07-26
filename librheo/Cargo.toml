@@ -63,6 +63,11 @@ path = "src/bin/librheo-child.rs"
 name = "lrsh"
 path = "src/bin/lrsh.rs"
 
+# Phase G: raw-frame networking over a real virtio-net NIC (ARP round trip).
+[[bin]]
+name = "librheo-net"
+path = "src/bin/librheo-net.rs"
+
 # The embedded proof - built `--no-default-features` to prove librheo scales down.
 [[bin]]
 name = "librheo-embed"

@@ -761,7 +761,51 @@ price of process isolation. The **terminal keystroke->echo** path is the Phase D
 plus the userland `term` decode/render; it is proven by `librheoterm` (a genuine
 0%-CPU park on riscv64, poll elsewhere).
 
-## Final honest accounting - the whole librheo A-F
+## Phase G - networking: the NIC data path (raw frames)
+
+Phase F left `net` a documented stub. Phase G makes the **NIC data path real** -
+the high-value, tractable piece - while keeping the **IP/TCP/QUIC stack deferred
+as a service** (docs/NETWORKING.md 1-2: the kernel owns queue plumbing, not
+protocols). This is the DPDK/ef_vi *native* shape: a cell drives raw frames over
+its queue; a transport library layers on top.
+
+### Kernel surface added (Phase G)
+
+- A hand-written **virtio-net driver** (`kernel/src/hw/virtio_net.rs`), the exact
+  virtio-blk template over **two transports** - virtio-mmio on arm/riscv `virt`,
+  virtio-pci on x86-64 q35 (through the `VIRTIO_PCI_CAP_PCI_CFG` config tunnel, no
+  BAR mapping). Reset + **minimal** feature negotiation (`VIRTIO_F_VERSION_1` +
+  `VIRTIO_NET_F_MAC`; no mergeable-rx-buffers, no checksum/GSO offload), an **RX**
+  and a **TX** split virtqueue, the 12-byte v1 `virtio_net_hdr`, and the MAC read
+  from device config. DMA uses **physical** addresses (`virt_to_phys`) - the rings
+  and buffers live in kernel RAM reached through the linear map. Polled (a device
+  RX interrupt is a later refinement, like virtio-blk).
+- Three **queue opcodes** (`OP_NET_TX`/`OP_NET_RX`/`OP_NET_MAC`, no new kernel
+  object) bridge a cell's async submissions to the driver in `kernel_process`,
+  completing with the strand token - the same async model as the Phase B `io`
+  opcodes. Per-opcode rights (TX needs WRITE, RX/MAC need READ). The frame VAs are
+  the cell's own mapped memory (its address space is active during the drain), so
+  TX reads and RX writes land there directly.
+
+### librheo module (Phase G)
+
+`net` is now a real async surface: `mac()`, `send(frame)`, `recv(buf) -> len`
+(len 0 = no packet, the polled RX path - a device-IRQ wake is the refinement).
+`connect`/`listen` stay `Unsupported` stubs - a socket/IP/TCP layer is a service.
+
+### Proof + honesty (Phase G)
+
+The `librheonet` test kernel (all three ISAs): a librheo cell asks the NIC for its
+MAC, sends a **broadcast ARP request** for the SLIRP gateway `10.0.2.2`, and
+**receives SLIRP's ARP reply** - a real, deterministic, network-free RX proof over
+QEMU `-netdev user` - asserting the reply's ethertype + opcode + sender IP and
+exiting `0x42`. Honest deferrals: the **full transport stack** (IP/ARP-cache/TCP/
+QUIC/TLS as a library in a cell), a first-class **socket** `ObjectKind` + steering
+grants, **header/payload split**, and the **device RX interrupt** - all documented
+in docs/NETWORKING.md. The mechanism (a NIC driver + typed async raw-frame queue
+opcodes) is the deliverable; the stack rides on it.
+
+## Final honest accounting - the whole librheo A-G
 
 librheo is now a **complete native userspace foundation** (docs/ARCHITECTURE.md's
 10-object model expressed as a Rust library a program links). A program today can:
@@ -789,6 +833,9 @@ librheo is now a **complete native userspace foundation** (docs/ARCHITECTURE.md'
   keep **time** (`time`: monotonic clock + async `sleep`/`timeout`), run a
   **librheo-native shell** (`lrsh`), and **scale down to embedded** (spine-only,
   ~9x smaller) - **Phase F**.
+- send and receive **raw Ethernet frames** over a real virtio-net NIC (`net`:
+  `mac`/`send`/`recv` over `OP_NET_*` queue opcodes) - the NIC data path; the
+  IP/TCP stack is a service - **Phase G**.
 
 What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
 
@@ -796,7 +843,8 @@ What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
   park-on-token, `io` OP_* completions, batched doorbell coalescing, the Phase D
   console block-and-wake (**a genuine 0%-CPU WFI park on riscv64**), `Child::wait`
   and `time::sleep` as reactor-serviced parks (the parent's other strands run
-  until quiescent, then the cell blocks).
+  until quiescent, then the cell blocks), and the Phase G `net` **raw-frame
+  send/recv** (`OP_NET_*` completions over a real virtio-net NIC; RX is polled).
 - **Sync-translated / cooperative** (single-CPU, honest): the **timer is now
   interrupt-driven on all three ISAs** (riscv Sstc, aarch64 CNTV, x86-64 LAPIC LVT
   - a genuine 0%-CPU park); the cross-cell IPC channel is synchronous with an
@@ -808,8 +856,10 @@ What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
   (GICv3)** - a genuine `wfi` park - and stays a **poll on x86-64** (its QEMU TCG +
   split-irqchip IOAPIC/LAPIC does not re-deliver reliably; documented, honest).
 - **Deferred (documented)**: a **real GPU** (virtio-gpu scanout; the compositor
-  framebuffer is in-memory), a **full network stack** (`net` is a stub;
-  networking is a service over virtio-net), **SMP** secondary-core bring-up +
+  framebuffer is in-memory), the **full network stack** (Phase G lands the NIC
+  data path - a virtio-net driver + raw-frame `net::send`/`recv`/`mac`; IP/TCP/QUIC
+  stays a service/transport-library in a cell, plus a socket object + a device RX
+  interrupt), **SMP** secondary-core bring-up +
   work-stealing + reservation enforcement + **priority-inheritance** locks (task
   #27), a **symmetric async IPC channel**, real **HBM/CXL/PMEM** (emulated on DDR)
   and NUMA (single-node), durability/latency **contracts** (advisory - no durable/
@@ -820,7 +870,7 @@ What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
   in place (the queue object, the grant object, the `ipc` channel, the interrupt
   path, the cooperative scheduler).
 
-librheo A-F is proven by **six in-QEMU test kernels on all three ISAs**
+librheo A-G is proven by **seven in-QEMU test kernels on all three ISAs**
 (`librhearun`, `librheodata`, `librheocompute`, `librheoterm`, `librheowl`,
-`librheoproc`), each asserting exact behaviour, kept green alongside the whole
-suite (29 kernels x 3 ISAs).
+`librheoproc`, `librheonet`), each asserting exact behaviour, kept green alongside
+the whole suite (30 kernels x 3 ISAs).

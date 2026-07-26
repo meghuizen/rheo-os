@@ -21,6 +21,7 @@ pub mod block;
 pub mod fdt;
 pub mod pci;
 pub mod virtio_blk;
+pub mod virtio_net;
 
 use crate::arch;
 

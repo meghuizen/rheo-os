@@ -125,6 +125,10 @@ name = "librheoproc"
 path = "src/librheoproc.rs"
 
 [[bin]]
+name = "librheonet"
+path = "src/librheonet.rs"
+
+[[bin]]
 name = "shell-smoke"
 path = "src/shell_smoke.rs"
 
