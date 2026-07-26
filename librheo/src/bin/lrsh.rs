@@ -1,18 +1,18 @@
-//! `lrsh` - the librheo-native shell (docs/LIBRHEO.md Phase F), the integration
-//! capstone. It is built **entirely** on librheo - no Linux personality: it
-//! reads command lines over the Phase D console-input path (parking on input,
-//! never spinning), parses them, runs builtins (`echo`/`cd`/`exit`), and for any
-//! other command **spawns** a native ELF from `/bin` with its argv (Phase F
-//! `proc::spawn`) and **awaits** its exit (`proc::Child::wait`), printing the
-//! child's exit code. Everything runs on the async reactor: while the shell
-//! blocks for input or for a child, the vcore is free for other strands.
+//! `lrsh` - the librheo-native shell (docs/LIBRHEO.md Phase F/J), the integration
+//! capstone. Built **entirely** on librheo - no Linux personality. As of Phase J
+//! it drives the full `term` line editor: it decodes keystrokes with
+//! [`KeyReader`](librheo::term::KeyReader) (parking on input via the reactor,
+//! never spinning), edits the line with [`LineEditor`](librheo::term::LineEditor)
+//! (in-line cursor moves, backspace, word/line kill, **history recall** with
+//! Up/Down, and a **command-name completion hook** on Tab), repaints with the
+//! buffered [`Renderer`](librheo::term::Renderer), and on Enter runs builtins
+//! (`echo`/`cd`/`exit`) or **spawns** `/bin/<cmd>` (Phase F `proc::spawn`) and
+//! awaits its exit. Everything runs on the async reactor: while the shell blocks
+//! for input or a child, the vcore is free for other strands.
 //!
-//! Scope (honest, docs/LIBRHEO.md Phase F): the line reader is a minimal
-//! raw-byte reader (newline-terminated, backspace-aware); the full `term`
-//! line-editor + history + escape decoding (Phase D) is available and is the
-//! documented next integration, as are pipelines/redirection over cross-cell
-//! channels (Phase E `ipc`). This capstone proves the spawn/wait spine a
-//! bash-quality shell is built on.
+//! Scope (honest, docs/LIBRHEO.md Phase J): pipelines/redirection between spawned
+//! cells use `proc::spawn_piped` (the Phase J cross-cell channel); wiring a full
+//! `a | b` chain into the shell's parser is the documented next step.
 
 #![no_std]
 #![no_main]
@@ -23,52 +23,67 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use librheo::term::{Edit, KeyReader, LineEditor, Renderer};
 use librheo::{println, proc, rt, sys};
 
 /// Exit code at end-of-input if no `exit` builtin was run (the test's success
 /// sentinel for a clean scripted session).
 const EOF_CODE: u64 = 0x42;
 
+/// Command names the Tab completer knows (builtins + spawnable coreutils). A real
+/// shell would also scan `/bin`; this fixed set is the completion-hook proof.
+const COMMANDS: &[&str] = &["echo", "child", "cd", "exit"];
+
+/// The completion hook: complete a bare leading word that is a **unique** prefix
+/// of a known command name (e.g. `ec` -> `echo`). Ambiguous or already-spaced
+/// lines are left unchanged.
+fn complete(line: &str) -> Option<String> {
+    if line.is_empty() || line.contains(' ') {
+        return None;
+    }
+    let mut hit: Option<&str> = None;
+    for &c in COMMANDS {
+        if c.starts_with(line) {
+            if hit.is_some() {
+                return None; // ambiguous - do not guess
+            }
+            hit = Some(c);
+        }
+    }
+    hit.map(String::from)
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn main() -> i32 {
     rt::block_on(async {
-        let mut line: Vec<u8> = Vec::new();
-        loop {
-            let mut buf = [0u8; 64];
-            // Park on console input (0% CPU where the UART RX interrupt is wired,
-            // poll otherwise) - the Phase D block-and-wake.
-            let n = rt::read_console(buf.as_mut_ptr(), buf.len()).await;
-            if n == 0 {
-                // End of input: run any trailing line, then exit cleanly.
-                if !line.is_empty() {
-                    run_line(&line).await;
+        let mut reader = KeyReader::new();
+        let mut editor = LineEditor::new().with_completer(complete);
+        let mut render = Renderer::new("$ ");
+        render.paint("", 0);
+
+        // One strand runs the read-edit-eval loop; it parks on console input
+        // (0% CPU where the UART RX interrupt is wired) between keystrokes.
+        while let Some(key) = reader.next_key().await {
+            match editor.apply(key) {
+                Edit::Commit(line) => {
+                    render.newline();
+                    run_line(&line).await; // may `exit` and never return
+                    render.paint("", 0);
                 }
-                sys::exit(EOF_CODE);
-            }
-            for &c in &buf[..n] {
-                match c {
-                    b'\n' | b'\r' => {
-                        run_line(&line).await; // may `exit` and never return
-                        line.clear();
-                    }
-                    0x7f | 0x08 => {
-                        line.pop();
-                    }
-                    _ => line.push(c),
-                }
+                Edit::Redraw => render.paint(&editor.line(), editor.cursor()),
+                Edit::Eof => break,
+                Edit::Noop => {}
             }
         }
+        // End of input without an `exit`: leave cleanly.
+        sys::exit(EOF_CODE);
     });
-    // block_on returns only if the loop broke without exiting (it does not).
     EOF_CODE as i32
 }
 
-/// Parse and run one command line.
-async fn run_line(line: &[u8]) {
-    let Ok(s) = core::str::from_utf8(line) else {
-        return;
-    };
-    let mut words = s.split_whitespace();
+/// Parse and run one committed command line.
+async fn run_line(line: &str) {
+    let mut words = line.split_whitespace();
     let Some(cmd) = words.next() else {
         return; // blank line
     };
@@ -97,9 +112,7 @@ async fn run_line(line: &[u8]) {
             match proc::spawn(&path, &argv, &[]) {
                 Ok(child) => {
                     let code = child.wait().await;
-                    let mut msg = String::new();
-                    let _ = core::fmt::write(&mut msg, format_args!("[exit {code}]"));
-                    println!("{msg}");
+                    println!("[exit {code}]");
                 }
                 Err(_) => println!("lrsh: {cmd}: not found"),
             }

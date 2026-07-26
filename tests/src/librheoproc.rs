@@ -8,9 +8,12 @@
 //!    holding a cell-spawn capability, spawns `/bin/echo` and three `/bin/child`
 //!    cells (argv fan-out), awaits each, reduces their exit codes to 12, and
 //!    proves a `time::sleep` wakes on the timer. Exits `0x42`.
-//! 2. **the shell** (`lrsh`): a shell built entirely on librheo, fed a scripted
-//!    session; it runs the `echo` builtin, **spawns** `/bin/child` and prints its
-//!    exit code, then `exit`s `0x42`. Exact transcript + exit asserted.
+//! 2. **the shell** (`lrsh`): a shell built entirely on librheo, driving the
+//!    **full `term` line editor** (Phase J), fed scripted keystrokes that
+//!    exercise typing, a **backspace edit**, **Up-arrow history recall**, and
+//!    **Tab completion**; each committed line runs the `echo` builtin or
+//!    **spawns** `/bin/child`. The committed-command evidence + exit `0x42` are
+//!    asserted.
 //! 3. **the embedded minimal cell** (`librheo-embed`, built
 //!    `--no-default-features`): a spine-only cell doing a direct queue round-trip.
 //!    Exits `0x42`; asserted substantially smaller (loadable size) than a
@@ -80,9 +83,17 @@ static EMBED: &[u8] = bin!("librheo-embed");
 
 const EXPECTED_EXIT: u64 = 0x42;
 
-/// The shell is fed this scripted session (played as if typed): the `echo`
-/// builtin, then a spawn of `/bin/child 8`, then `exit`.
-static SCRIPT: &[u8] = b"echo hi there\nchild 8\nexit\n";
+/// The shell is fed this scripted keystroke session (played as if typed),
+/// driving the **full `term` line editor** (Phase J): typing, a **backspace
+/// edit**, **Up-arrow history recall**, and **Tab completion**, each committed
+/// line running a builtin or a spawned coreutil.
+///   `echo hi there`<CR>          -> echo builtin prints "hi there"
+///   `child 9`<BS>`8`<CR>         -> edits to "child 8", spawns it (exit 8)
+///   <Up><CR>                     -> recalls "child 8" from history, runs it again
+///   `ec`<Tab>` done`<CR>         -> completes "ec"->"echo", prints "done"
+///   `exit`<CR>                   -> exit 0x42
+/// Backspace is DEL (0x7f); Up is CSI A (ESC [ A); Tab is 0x09.
+static SCRIPT: &[u8] = b"echo hi there\rchild 9\x7f8\r\x1b[A\rec\t done\rexit\r";
 
 static mut OBJECTS: ObjectTable = ObjectTable::new();
 static mut CAPS: CapTable = CapTable::new();
@@ -153,6 +164,25 @@ fn run_cell(image: &[u8], spawn_cap: bool, script: Option<&'static [u8]>) -> Out
     }
 }
 
+/// Count non-overlapping occurrences of `needle` in `hay` (for asserting the
+/// lrsh editor session's committed-command evidence).
+fn count(hay: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return 0;
+    }
+    let mut n = 0;
+    let mut i = 0;
+    while i + needle.len() <= hay.len() {
+        if &hay[i..i + needle.len()] == needle {
+            n += 1;
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    n
+}
+
 fn expect_exit(label: &str, outcome: Outcome) {
     match outcome {
         Outcome::Exited(code) => assert!(
@@ -220,19 +250,48 @@ extern "C" fn kernel_main() -> ! {
         println!("librheoproc: timer idle-park proven (kernel idled at WFI, woke on timer IRQ)");
     }
 
-    // --- scenario 2: the librheo-native shell ---
+    // --- scenario 2: the librheo-native shell (full term editor, Phase J) ---
     vfs_personality::clear_stdout();
     let outcome = run_cell(LRSH, true, Some(SCRIPT));
     let got = vfs_personality::captured_stdout();
-    let want: &[u8] = b"hi there\nchild 8\n[exit 8]\n";
     expect_exit("lrsh", outcome);
+    // The editor's repaint emits ANSI escapes/prompts interleaved with command
+    // output, so assert the *evidence* each edited command line ran correctly
+    // (each command's output is written contiguously, so substring/count checks
+    // are exact for the load-bearing bytes):
+    //  - the echo builtin ran ("hi there");
+    //  - the backspace edit produced "child 8" (not "child 9") - spawned twice
+    //    (once typed+edited, once recalled from history via Up), each exit 8;
+    //  - Tab completion turned "ec" into "echo" (so "echo done" printed "done",
+    //    not a "not found" for a bogus "ec").
     assert!(
-        got == want,
-        "lrsh transcript mismatch\n  got:      {:?}\n  expected: {:?}",
-        core::str::from_utf8(got),
-        core::str::from_utf8(want),
+        count(got, b"hi there\n") == 1,
+        "lrsh: echo builtin did not run"
     );
-    println!("librheoproc: lrsh OK (builtin echo + spawn/wait a coreutil)");
+    assert!(
+        count(got, b"child 8\n") == 2,
+        "lrsh: expected 'child 8' twice (edit + history recall), got {}",
+        count(got, b"child 8\n")
+    );
+    assert!(
+        count(got, b"[exit 8]\n") == 2,
+        "lrsh: expected two '[exit 8]' (child ran twice with exit 8)"
+    );
+    // The intermediate "child 9" appears in the editor's repaint (before the
+    // backspace), so the proof the edit took effect is that no "child 9"
+    // *command* ran - its output "child 9\n" and "[exit 9]" are both absent.
+    assert!(
+        count(got, b"child 9\n") == 0 && count(got, b"[exit 9]") == 0,
+        "lrsh: backspace edit failed - a 'child 9' command ran"
+    );
+    assert!(
+        count(got, b"done\n") == 1 && count(got, b"not found") == 0,
+        "lrsh: Tab completion failed - 'ec' did not complete to 'echo'"
+    );
+    println!(
+        "librheoproc: lrsh OK (full term editor: typing + backspace edit + Up \
+         history + Tab completion, builtins + spawn/wait)"
+    );
 
     // --- scenario 3: the embedded minimal cell (no spawn capability) ---
     vfs_personality::clear_stdout();

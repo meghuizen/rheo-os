@@ -965,6 +965,28 @@ channel and streams the 12 bytes `"ABCDEFGHIJKL"` back over the async `Sender`; 
 orchestrator reads them over the async `Receiver` (acking each), reaps the child,
 asserts it reconstructed exactly that stream, and exits `0x42`.
 
+### The full `term` line editor wired into `lrsh`
+
+`lrsh` (the librheo-native shell) previously read raw newline-terminated console
+lines. Phase J replaces that with the **full Phase D `term` editor**: it decodes
+keystrokes with `KeyReader` (parking on input via the reactor - 0% CPU idle where
+the UART RX interrupt is wired), edits the line with `LineEditor` (in-line cursor
+moves, backspace, word/line kill, **Up/Down history recall**, and a **Tab
+completion hook**), and repaints with the buffered minimal-diff `Renderer`.
+Committed lines still run builtins (`echo`/`cd`/`exit`) or **spawn** `/bin/<cmd>`
+and await the exit (Phase F) - so `lrsh` is now a genuinely usable line-editing
+shell, not a raw reader. The completion hook completes a bare leading word that is
+a unique prefix of a known command (`ec` -> `echo`).
+
+**Proof** (`librheoproc` scenario 2, all three ISAs): the shell is fed scripted
+keystrokes - `echo hi there`<CR>; `child 9`<BS>`8`<CR> (a backspace edit to
+`child 8`); <Up><CR> (history recall of `child 8`); `ec`<Tab>` done`<CR>
+(completion to `echo done`); `exit`<CR>. The test asserts the committed-command
+evidence: the echo builtin ran, `child 8` ran **twice** (the edit + the history
+recall) each with exit 8, no `child 9` command ran (the backspace took effect),
+and Tab completion produced `echo` (so `done` printed, not a "not found") - then
+exit `0x42`.
+
 What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
 
 - **Async-real**: the queue reactor (submit/doorbell/drain/complete), strand
@@ -996,13 +1018,14 @@ What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
   #27), real **HBM/CXL/PMEM** (emulated on DDR)
   and NUMA (single-node), durability/latency **contracts** (advisory - no durable/
   RT backend in QEMU), a **first-class file/socket capability** (fds are `FileOps`
-  handles today), the **timer IRQ** and the **x86/arm UART RX IRQ**, and the full
-  `term` editor + history wired into `lrsh`. These are engineering, not redesign:
-  every one has its seam
+  handles today), the **timer IRQ** and the **x86/arm UART RX IRQ**. These are
+  engineering, not redesign: every one has its seam
   in place (the queue object, the grant object, the `ipc` channel, the interrupt
   path, the cooperative scheduler).
 
-librheo A-H is proven by **eight in-QEMU test kernels on all three ISAs**
+librheo A-J is proven by **ten in-QEMU test kernels on all three ISAs**
 (`librhearun`, `librheodata`, `librheocompute`, `librheoterm`, `librheowl`,
-`librheoproc`, `librheonet`, `librheogpu`), each asserting exact behaviour, kept
-green alongside the whole suite (31 kernels x 3 ISAs).
+`librheoproc`, `librheonet`, `librheogpu`, `librheoipc`, `librheopipe`), each
+asserting exact behaviour, kept green alongside the whole suite (34 kernels x 3
+ISAs). Phase J's third refinement - the full `term` editor - is proven inside the
+`librheoproc` shell scenario, not a separate kernel.

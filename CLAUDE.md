@@ -463,6 +463,15 @@ the shared frames on exit after the parent drained them); two sibling spawned
 stages await a directed switch/SMP (#27). The `librheopipe` test spawns
 `/bin/pipesrc`, which streams `"ABCDEFGHIJKL"` back over the inherited channel; the
 orchestrator reconstructs+verifies it and exits `0x42` on **all three ISAs**.
+**(3) The full `term` line editor in `lrsh`**: the librheo-native shell now drives
+the Phase D editor - `KeyReader` (parking on input) + `LineEditor` (in-line cursor
+edits, backspace, word/line kill, **Up/Down history**, a **Tab command-name
+completion hook**) + the buffered `Renderer` - instead of a raw line read; committed
+lines still run builtins or spawn `/bin/<cmd>`. The `librheoproc` shell scenario
+feeds scripted keystrokes (typing, a backspace edit `child 9`->`child 8`, Up-arrow
+history recall, `ec`<Tab>->`echo`) and asserts the committed-command evidence
+(`child 8` ran twice, no `child 9` command, completion produced `echo`) + exit
+`0x42` on **all three ISAs**.
 
 **Phase F** closes librheo as a **complete foundation**: a native **process
 model**, **time**, a **librheo-native shell**, an **embedded** proof, and honest
@@ -488,16 +497,16 @@ It is **feature-gated**: `default=["full"]`; an **embedded** cell builds
 `--no-default-features` (spine only: cap/rt/mem/sys) - `librheo-embed` does a direct
 queue round-trip and is **~9x smaller** loadable than a full binary. **`lrsh`** is
 the librheo-native shell (builtins + `spawn`/`wait` of native coreutils over the
-Phase D console path). The `librheoproc` test proves it on **all three ISAs**: an
+Phase D console path; **Phase J** wires in the full `term` line editor - see
+below). The `librheoproc` test proves it on **all three ISAs**: an
 orchestrator spawns `/bin/echo` + three `/bin/child` cells (argv fan-out), reduces
 exit codes to 12, and a `time::sleep` wakes on the timer (asserting a genuine
-`wfi`/`hlt` idle-park on all three ISAs); `lrsh` runs a scripted
-session (exact transcript + exit `0x42`); and the spine-only `librheo-embed`
+`wfi`/`hlt` idle-park on all three ISAs); `lrsh` runs a scripted keystroke
+session through the term editor (committed-command evidence + exit `0x42`); and the spine-only `librheo-embed`
 round-trips. Benchmarks (icount, per TOOLING.md): full async round-trip ~1,433
 (x86-64) / ~2,048 (riscv64) instructions, spawn+wait ~263k (x86-64) / ~539k
 (riscv64) - process create is dominated by ELF stream-load + child crt0, the honest
-price of a new address space. Honest deferrals: cross-cell stdout pipelines between
-spawned cells (reuses Phase E channels), full `term` editor wired into `lrsh`, the
+price of a new address space. Honest deferrals: the
 **x86-64 UART RX interrupt** (poll fallback - its QEMU TCG split-irqchip
 IOAPIC/LAPIC does not re-deliver reliably; the timer + the riscv/arm UART RX are
 all interrupt-driven), and the `net` stack - docs/LIBRHEO.md has the full A-F
