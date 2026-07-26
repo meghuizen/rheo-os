@@ -748,6 +748,29 @@ pub unsafe fn restore_user_fp(area: *const u8) {
     unsafe { asm!("fxrstor [{p}]", p = in(reg) area, options(nostack, readonly)) };
 }
 
+/// Bytes reserved per cell for a saved U-mode FP/SIMD image. Sized for the
+/// widest x86 save format (an XSAVE area with AVX-512 is ~2.5 KiB); the current
+/// FXSAVE image uses the first 512 bytes. 64-aligned when the holder aligns it.
+pub const FP_AREA_LEN: usize = 4096;
+
+/// Initialize a cell's FP save area to a clean FXSAVE image: x87 control word
+/// 0x037F, MXCSR 0x1F80 (all exceptions masked, round-to-nearest even), every
+/// register zero. A freshly-spawned cell has never had its FP state saved, so
+/// its area would otherwise be all zeros - and `fxrstor` of a zero area loads
+/// MXCSR=0, which *unmasks* every SIMD exception and faults on the first FP op.
+/// This writes the ABI-default state a process expects at entry instead.
+///
+/// # Safety
+/// `area` must point to at least `FP_AREA_LEN` writable, 16-byte-aligned bytes.
+pub unsafe fn fp_area_init(area: *mut u8) {
+    unsafe {
+        core::ptr::write_bytes(area, 0, FP_AREA_LEN);
+        // FXSAVE layout: FCW at offset 0 (u16), MXCSR at offset 24 (u32).
+        (area as *mut u16).write(0x037F);
+        (area.add(24) as *mut u32).write(0x1F80);
+    }
+}
+
 /// (syscall number in rax, arguments a0..a5). Linux-style argument
 /// registers: rdi, rsi, rdx, r10, r8, r9 (r10 not rcx, which `syscall`
 /// clobbers).

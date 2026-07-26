@@ -727,6 +727,22 @@ pub unsafe fn restore_user_fp(area: *const u8) {
     }
 }
 
+/// Bytes reserved per cell for a saved U-mode FP/SIMD image (V0-V31 + FPCR +
+/// FPSR = 528 bytes; rounded up for alignment/headroom). SVE state is much
+/// larger and not enabled.
+pub const FP_AREA_LEN: usize = 1024;
+
+/// Initialize a cell's FP/SIMD save area to a clean state (all V-regs, FPCR,
+/// FPSR zero - the AArch64 reset default). Unlike x86's MXCSR, a zeroed FPCR
+/// masks all exceptions, so a zeroed area is already a valid clean image; this
+/// just makes re-install explicit.
+///
+/// # Safety
+/// `area` must point to at least `FP_AREA_LEN` writable bytes.
+pub unsafe fn fp_area_init(area: *mut u8) {
+    unsafe { core::ptr::write_bytes(area, 0, FP_AREA_LEN) };
+}
+
 /// (syscall number in x8, arguments a0..a5 = x0..x5).
 pub fn decode_syscall(frame: &TrapFrame) -> (u64, [u64; 6]) {
     (

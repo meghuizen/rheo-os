@@ -207,6 +207,41 @@ pub const MAX_CELLS: usize = 16;
 static mut CELLS: [RunCell; MAX_CELLS] = [EMPTY; MAX_CELLS];
 static mut CURRENT: usize = 0;
 static mut EXITED: usize = 0;
+
+/// A native cell's saved U-mode FP/SIMD state, for a cross-cell switch
+/// (`SYS_SWITCH` / the `nproc` scheduler). Sized and aligned for the widest
+/// per-ISA save format. Kept **out** of `RunCell` on purpose: `RunCell` is
+/// `Copy` and copied on every switch (`let peer = cells()[peer]`), so an inline
+/// multi-KiB array would make each switch memcpy the whole image. The kernel is
+/// soft-float, so at a switch the live registers still hold the outgoing cell's
+/// values (docs/LIBRHEO.md; the Linux personality's per-thread FP in
+/// `linux::thread` is the analogous mechanism for L4 threads).
+#[repr(C, align(64))]
+struct FpArea([u8; arch::FP_AREA_LEN]);
+
+static mut CELL_FP: [FpArea; MAX_CELLS] = [const { FpArea([0; arch::FP_AREA_LEN]) }; MAX_CELLS];
+
+/// Pointer to cell `idx`'s FP save area.
+fn cell_fp(idx: usize) -> *mut u8 {
+    // SAFETY: single CPU, synchronous traps; `idx < MAX_CELLS`.
+    unsafe { (*core::ptr::addr_of_mut!(CELL_FP))[idx].0.as_mut_ptr() }
+}
+
+/// Save native cell `idx`'s live U-mode FP/SIMD state into its area (the kernel
+/// is soft-float, so the registers hold `idx`'s values at the switch point).
+/// Harmless if `idx` is exiting - the saved image is simply never restored.
+pub fn save_native_fp(idx: usize) {
+    // SAFETY: `cell_fp(idx)` is a valid, sufficiently-aligned area.
+    unsafe { arch::save_user_fp(cell_fp(idx)) };
+}
+
+/// Restore native cell `idx`'s U-mode FP/SIMD state before resuming it. For a
+/// cell that has never run, the area was set to a clean image by `fp_area_init`
+/// at install time, so this loads the ABI-default FP state.
+pub fn restore_native_fp(idx: usize) {
+    // SAFETY: `cell_fp(idx)` holds a valid image (saved, or `fp_area_init`ed).
+    unsafe { arch::restore_user_fp(cell_fp(idx)) };
+}
 /// The cell `run` was entered with (docs/LINUX-COMPAT.md L6): the top of the
 /// Linux process tree. Only its exit ends the whole run; a forked child's exit
 /// makes it a zombie and reschedules another cell (`linux::proc`).
@@ -761,6 +796,10 @@ pub unsafe fn install(
         chan_role: 0,
     };
     *cell_grants(idx) = [EMPTY_GRANT; MAX_GRANTS_PER_CELL];
+    // Clean FP state, so the first cross-cell switch into this cell restores an
+    // ABI-default FPU rather than a zeroed area (docs/LIBRHEO.md).
+    // SAFETY: `cell_fp(idx)` is a valid, aligned `FP_AREA_LEN` area.
+    unsafe { arch::fp_area_init(cell_fp(idx)) };
 }
 
 /// Record the mapped queue-pair region VA and capability id for cell `idx`
@@ -925,6 +964,9 @@ pub unsafe fn install_spawned(
         chan_role: 0,
     };
     *cell_grants(idx) = [EMPTY_GRANT; MAX_GRANTS_PER_CELL];
+    // Clean FP state for the spawned child's first entry (see `install`).
+    // SAFETY: `cell_fp(idx)` is a valid, aligned `FP_AREA_LEN` area.
+    unsafe { arch::fp_area_init(cell_fp(idx)) };
 }
 
 /// Repoint cell `idx` at a new context-0 frame (after `execve`).
@@ -1102,6 +1144,12 @@ pub fn on_user_trap(
             let peer = cur ^ 1;
             let peer_cell = cells()[peer];
             assert!(peer_cell.present, "SYS_SWITCH with no peer cell");
+            // Swap FP/SIMD state across the cross-cell boundary: save this
+            // cell's live registers, load the peer's (docs/LIBRHEO.md). The
+            // areas live in kernel memory, so this is independent of which
+            // address space is active.
+            save_native_fp(cur);
+            restore_native_fp(peer);
             unsafe {
                 *core::ptr::addr_of_mut!(CURRENT) = peer;
                 (*peer_cell.aspace).activate();

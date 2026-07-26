@@ -114,12 +114,12 @@ mod imp;
 
 pub use imp::linux_abi;
 pub use imp::{
-    CLONE_BACKWARDS, FRAME_POOL_BASE, LINUX_UNAME_MACHINE, NAME, PagingRoot,
+    CLONE_BACKWARDS, FP_AREA_LEN, FRAME_POOL_BASE, LINUX_UNAME_MACHINE, NAME, PagingRoot,
     SIGACTION_HAS_RESTORER, SIGTRAMP_VA, TrapFrame, VIRTIO_MMIO_BASE, VIRTIO_MMIO_COUNT,
     VIRTIO_MMIO_STRIDE, clone_child_frame, context_init, context_switch, cpu_feature_names,
     cpu_report, cycles, decode_syscall, discover, doorbell_count, doorbell_trap, enable_timer_irq,
-    enable_uart_rx_irq, enter_user_first, exit, has_hwrng, hwrng_name, hwrng_u64, idle_wait,
-    mmio_map_window, paging_activate, paging_activate_kernel, paging_for_each_user_leaf,
+    enable_uart_rx_irq, enter_user_first, exit, fp_area_init, has_hwrng, hwrng_name, hwrng_u64,
+    idle_wait, mmio_map_window, paging_activate, paging_activate_kernel, paging_for_each_user_leaf,
     paging_kernel_init, paging_map, paging_map_frame, paging_new_root, paging_protect,
     paging_unmap_frame, pci_cfg_read32, pci_cfg_write32, pci_mmio_window, phys_to_virt,
     pmem_map_window, restore_rt_frame, restore_user_fp, return_to_kernel, save_user_fp,

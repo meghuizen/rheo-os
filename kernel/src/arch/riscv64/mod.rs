@@ -722,6 +722,20 @@ pub unsafe fn restore_user_fp(area: *const u8) {
     }
 }
 
+/// Bytes reserved per cell for a saved U-mode FP image (f0-f31 + fcsr = 264
+/// bytes; rounded up for alignment/headroom). Vector (RVV) state is not enabled.
+pub const FP_AREA_LEN: usize = 512;
+
+/// Initialize a cell's FP save area to a clean state (all f-regs and fcsr zero -
+/// the reset default; a zeroed fcsr masks nothing but RISC-V has no trapping FP
+/// exceptions, so zero is a valid clean image). Explicit for re-install.
+///
+/// # Safety
+/// `area` must point to at least `FP_AREA_LEN` writable bytes.
+pub unsafe fn fp_area_init(area: *mut u8) {
+    unsafe { core::ptr::write_bytes(area, 0, FP_AREA_LEN) };
+}
+
 /// x86-only `arch_prctl` TLS hook (docs/LINUX-COMPAT.md L1). Unreachable on
 /// RISC-V: the asm-generic table has no `arch_prctl` number, and U-mode sets
 /// its own `tp` (a saved GPR), so glibc never asks the kernel. Present only
