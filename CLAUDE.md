@@ -74,7 +74,11 @@ model and report skip-with-reason. The stage closes with the tree's first
 real vendor-GPU MMIO: the AMD framebuffer aperture mapped via
 `arch::mmio_map_window` (a second x86-64 fixed window beside the pmem one;
 the missing 1..2 GiB gigapage on RISC-V; `phys_to_virt` on ARM64), written
-through and read back on all three ISAs.
+through and read back on all three ISAs; plus opt-in **attach measurement**
+(`hw::gpu_attach_measure`: ticks/KiB streamed through each aperture - a
+transport measurement, reported live by `SYS_ENGINE_INFO`) and a **Bochs
+dispi register handshake** (ID 0xB0C5), so every GPU device model QEMU has
+is genuinely driven at some level.
 
 The **strand runtime** (`runtime/`, BUILD-ORDER.md step 7,
 docs/CONCURRENCY.md) is the userspace library that brings native async and

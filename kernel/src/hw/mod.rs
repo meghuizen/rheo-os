@@ -324,6 +324,14 @@ pub fn assign_pci_bars() -> usize {
     pci::assign_bars(inventory_mut())
 }
 
+/// Opt-in GPU attach measurement (docs/GPU-HARDWARE.md 9): stream writes
+/// through each recognised GPU's framebuffer aperture and record ticks
+/// per KiB in its inventory record. Call after BARs decode
+/// (`assign_pci_bars`); `SYS_ENGINE_INFO` reports the result live.
+pub fn gpu_attach_measure() {
+    gpu::attach_measure(inventory_mut())
+}
+
 /// Print the discovered inventory to the console.
 pub fn print_summary() {
     let inv = inventory();

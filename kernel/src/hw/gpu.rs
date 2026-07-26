@@ -87,6 +87,13 @@ pub struct GpuDevice {
     pub msix: bool,
     pub flr: bool,
     pub driver: GpuDriver,
+    /// Ticks per KiB written through the framebuffer aperture, measured by
+    /// `attach_measure` (0 = unmeasured). Honest scope: this measures the
+    /// CPU-driven MMIO *transport* to device memory - the attach contract's
+    /// "offload proves itself" applied to the only path exercisable without
+    /// a vendor driver cell - not GPU compute throughput
+    /// (docs/GPU-HARDWARE.md 9).
+    pub measured_cost_ticks: u64,
 }
 
 impl GpuDevice {
@@ -100,6 +107,7 @@ impl GpuDevice {
         msix: false,
         flr: false,
         driver: GpuDriver::None,
+        measured_cost_ticks: 0,
     };
 
     /// A short human name for the recognised silicon, per vendor. This is
@@ -184,6 +192,7 @@ pub fn probe(inv: &mut Inventory) {
             msix: d.msix,
             flr: d.flr,
             driver,
+            measured_cost_ticks: 0,
         };
         inv.ngpu += 1;
     }
@@ -192,6 +201,42 @@ pub fn probe(inv: &mut Inventory) {
 /// Whether any recognised GPU of the given vendor is present.
 pub fn vendor_present(inv: &Inventory, vendor: GpuVendor) -> bool {
     inv.gpus[..inv.ngpu].iter().any(|g| g.vendor == vendor)
+}
+
+/// Attach-time measurement for every recognised GPU with a decodable
+/// framebuffer BAR (docs/GPU-HARDWARE.md 9, the "offload proves itself"
+/// rule applied to the only path exercisable without a vendor driver
+/// cell): stream 64 KiB of u32 writes through the aperture via the
+/// per-ISA MMIO window and record ticks per KiB. Opt-in, like
+/// `assign_pci_bars` - call it after BARs decode; boots that skip it
+/// leave every `measured_cost_ticks` an honest 0 (unmeasured).
+pub fn attach_measure(inv: &mut Inventory) {
+    const PROBE_BYTES: usize = 64 * 1024;
+    for gi in 0..inv.ngpu {
+        let d = inv.pci[inv.gpus[gi].pci];
+        // The framebuffer BAR: the largest sized memory BAR with a base.
+        let mut best: Option<super::PciBar> = None;
+        for b in d.bars.iter() {
+            if !b.io && b.size as usize >= PROBE_BYTES && b.base != 0 {
+                match best {
+                    Some(cur) if cur.size >= b.size => {}
+                    _ => best = Some(*b),
+                }
+            }
+        }
+        let Some(bar) = best else { continue };
+        let va = crate::arch::mmio_map_window(bar.base as usize, PROBE_BYTES);
+        let words = PROBE_BYTES / 4;
+        let p = va as *mut u32;
+        let start = crate::time::monotonic();
+        for i in 0..words {
+            // SAFETY: [va, va+PROBE_BYTES) maps BAR device memory sized by
+            // the mask probe (size checked above). Volatile: MMIO.
+            unsafe { p.add(i).write_volatile(i as u32) };
+        }
+        let elapsed = crate::time::monotonic().wrapping_sub(start);
+        inv.gpus[gi].measured_cost_ticks = elapsed / (PROBE_BYTES as u64 / 1024);
+    }
 }
 
 /// Print the GPU inventory, one line per function, with the honest

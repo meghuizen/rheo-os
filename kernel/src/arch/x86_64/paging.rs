@@ -338,8 +338,11 @@ pub fn pmem_map_window(base_pa: usize, len: usize) -> usize {
 /// A separate fixed VA (PML4[385]) keeps it disjoint from the pmem window;
 /// only the kernels that call `mmio_map_window` install it. `base_pa` is
 /// aligned down to 2 MiB and the returned VA carries the offset back in.
-/// Honest QEMU note: TCG models no caches, so the missing uncached
-/// attribute is invisible here; real hardware wants PAT/UC pages (lab).
+/// One mapping is live at a time - a new call retargets the same window,
+/// so finish with one BAR before mapping the next (all callers are
+/// sequential bring-up/measure paths). Honest QEMU note: TCG models no
+/// caches, so the missing uncached attribute is invisible here; real
+/// hardware wants PAT/UC pages (lab).
 const MMIO_WINDOW_VA: usize = 0xFFFF_C080_0000_0000;
 
 pub fn mmio_map_window(base_pa: usize, len: usize) -> usize {

@@ -159,6 +159,53 @@ extern "C" fn kernel_main() -> ! {
         bar0.base
     );
 
+    // --- Attach measurement: offload proves itself (transport) ---------
+    // Ticks per KiB streamed through each GPU's framebuffer aperture -
+    // the attach contract's measurement applied to the only path
+    // exercisable without a vendor driver cell. SYS_ENGINE_INFO reports
+    // it live (the engine table IS the inventory).
+    hw::gpu_attach_measure();
+    let inv = hw::inventory();
+    for g in &inv.gpus[..inv.ngpu] {
+        println!(
+            "gpuhw: {} aperture measured {} ticks/KiB",
+            g.model(),
+            g.measured_cost_ticks
+        );
+    }
+    let amd = inv.gpus[..inv.ngpu]
+        .iter()
+        .find(|g| g.vendor == gpu::GpuVendor::Amd)
+        .unwrap();
+    assert!(
+        amd.measured_cost_ticks > 0,
+        "AMD aperture should have a measured cost"
+    );
+
+    // --- Bochs dispi handshake: a second vendor's registers driven -----
+    // The bochs-display exposes the Bochs VBE "dispi" interface in its
+    // MMIO BAR (QEMU docs/specs/standard-vga.txt: 16-bit registers at
+    // 0x500 + index*2). Register 0 is the interface ID: 0xB0C0..0xB0C5.
+    let bochs = inv.gpus[..inv.ngpu]
+        .iter()
+        .find(|g| g.vendor == gpu::GpuVendor::QemuBochs)
+        .unwrap();
+    let bdev = &inv.pci[bochs.pci];
+    let mmio_bar = bdev
+        .bars
+        .iter()
+        .find(|b| !b.io && !b.prefetch && b.size > 0 && b.base != 0)
+        .expect("bochs-display MMIO BAR");
+    let mmio_va = arch::mmio_map_window(mmio_bar.base as usize, mmio_bar.size as usize);
+    // SAFETY: mmio_va maps the sized MMIO BAR; 0x500 is inside its 4 KiB.
+    let dispi_id = unsafe { ((mmio_va + 0x500) as *const u16).read_volatile() };
+    println!("gpuhw: bochs dispi id = {:#06x}", dispi_id);
+    assert_eq!(
+        dispi_id & 0xFFF0,
+        0xB0C0,
+        "bochs dispi interface ID handshake failed"
+    );
+
     // --- Engine registration: CPU + every recognised GPU ---------------
     let n = svc::engine_count();
     println!("gpuhw: engines registered = {}", n);

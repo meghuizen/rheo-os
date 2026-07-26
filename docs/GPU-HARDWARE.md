@@ -647,8 +647,18 @@ kernel that CI runs:
   gap between the boot map's device gigapage and RAM; plain
   `phys_to_virt` on ARM64), written through, and read back - the full
   enumeration -> BAR -> mapping -> decode -> device-memory path on real
-  AMD-vendor silicon emulation. MSI-X *routing* (vectors to vcores) is
-  not in stage 1; only capability presence is recorded.
+  AMD-vendor silicon emulation. Two more increments ride the same seam:
+  **attach measurement** (`hw::gpu_attach_measure`, opt-in) streams 64 KiB
+  through each GPU's aperture and records ticks/KiB - the section 9
+  "offload proves itself" rule applied to the only path exercisable
+  without a vendor driver cell, honestly a *transport* measurement, not
+  compute - reported live by `SYS_ENGINE_INFO` (the engine table IS the
+  inventory); and a **Bochs dispi register handshake** (the 16-bit ID
+  register at MMIO-BAR + 0x500 answers 0xB0C5), so every GPU device model
+  QEMU has is genuinely driven at some level: virtio-gpu by the Phase H
+  2D driver, AMD through its framebuffer aperture, Bochs through its
+  register file. MSI-X *routing* (vectors to vcores) is not in stage 1;
+  only capability presence is recorded.
 - **Stage 2 - IOMMU:** domains + the grant-to-mapping path + fault events
   against `intel-iommu` (x86-64) and `smmuv3` (ARM64), both already on
   the DEVELOPMENT.md launch lines; an `iommu` test kernel proves a device
