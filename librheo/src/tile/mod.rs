@@ -27,36 +27,56 @@ use crate::rt;
 // Dtypes: the element format rides the buffer type (docs/TILES.md 2).
 // ============================================================================
 
-/// Element formats. `I8/U8/I32/F32` are native (executable on the CPU
-/// executor today); `F16/Bf16/F8E4M3/I4Block32` are declared - types now,
-/// executable when an engine lowers them (a GEMM over a declared dtype does
-/// not compile: no [`MmaInput`] impl).
+/// Element formats - the full quantization matrix (docs/TILES.md 2). Integer
+/// and F32 are native (a whole-byte CPU `Repr` the executor slices and
+/// computes on today). The narrow formats are **storage dtypes**: the tile
+/// layer converts to/from them deterministically (bit-exact
+/// [`kernels`](super::kernels)), and MMA *over* them is a device-engine
+/// lowering (declared - a GEMM over a non-native input is a compile error,
+/// no [`MmaInput`] impl, so "no engine here runs this" is a build error).
+///
+/// Widths: int4/fp8 formats are 8-bit slots except the block-packed int4
+/// (2 codes/byte). TF32 ("bfloat32") is carried in an f32 slot with a
+/// reduced mantissa.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[repr(u32)]
 pub enum Dtype {
+    // Native integer + f32.
     I8 = 0,
     U8 = 1,
     I32 = 2,
     F32 = 3,
+    // 16-bit floats.
     F16 = 4,
     Bf16 = 5,
+    // 8-bit floats: E4M3 (fp8) and E5M2 (the "bfloat8" truncation format).
     F8E4M3 = 6,
-    I4Block32 = 7,
+    F8E5M2 = 7,
+    // TF32 / "bfloat32": f32 range, 10-bit mantissa, stored in an f32 slot.
+    Tf32 = 8,
+    // 4-bit integer, block-quantized, two codes per byte.
+    I4Block32 = 9,
 }
 
 impl Dtype {
-    /// Element width in bits (I4Block32 is sub-byte: 4).
+    /// Element width in bits (I4Block32 is sub-byte: 4; Tf32 occupies an f32
+    /// slot: 32).
     pub fn bits(self) -> usize {
         match self {
-            Dtype::I8 | Dtype::U8 | Dtype::F8E4M3 => 8,
-            Dtype::I32 | Dtype::F32 => 32,
+            Dtype::I8 | Dtype::U8 | Dtype::F8E4M3 | Dtype::F8E5M2 => 8,
             Dtype::F16 | Dtype::Bf16 => 16,
+            Dtype::I32 | Dtype::F32 | Dtype::Tf32 => 32,
             Dtype::I4Block32 => 4,
         }
     }
     /// Bytes for `n` elements (rounded up for sub-byte formats).
     pub fn bytes(self, n: usize) -> usize {
         (n * self.bits()).div_ceil(8)
+    }
+    /// Whether the CPU executor computes on this dtype today (vs. only
+    /// converts to/from it as storage).
+    pub fn is_native(self) -> bool {
+        matches!(self, Dtype::I8 | Dtype::U8 | Dtype::I32 | Dtype::F32)
     }
 }
 
@@ -68,6 +88,8 @@ pub struct F32;
 pub struct F16;
 pub struct Bf16;
 pub struct F8E4M3;
+pub struct F8E5M2;
+pub struct Tf32;
 pub struct I4Block32;
 
 /// A type-level dtype tag.
@@ -82,11 +104,11 @@ macro_rules! dtyped {
 dtyped! {
     I8 => Dtype::I8, U8 => Dtype::U8, I32 => Dtype::I32, F32 => Dtype::F32,
     F16 => Dtype::F16, Bf16 => Dtype::Bf16, F8E4M3 => Dtype::F8E4M3,
-    I4Block32 => Dtype::I4Block32,
+    F8E5M2 => Dtype::F8E5M2, Tf32 => Dtype::Tf32, I4Block32 => Dtype::I4Block32,
 }
 
 /// Natively representable dtypes (a whole-byte in-memory `Repr` the CPU can
-/// slice). Declared dtypes have no `Native` impl - no CPU view exists.
+/// slice). Declared/storage dtypes have no `Native` impl - no CPU view.
 pub trait Native: Dtyped {
     type Repr: Copy + Default + 'static;
 }
@@ -348,6 +370,12 @@ enum OpEnc {
         dst: u32,
         block: usize,
     },
+    /// Element-format conversion (F32 <-> a narrow float storage dtype),
+    /// bit-exact via the kernels. The dtype pair is read from the buffers.
+    Cast {
+        src: u32,
+        dst: u32,
+    },
 }
 
 /// A tile program: buffers bound by reference (the `'p` lifetime ties the
@@ -505,6 +533,42 @@ impl<'p> TileProgram<'p> {
         Ok(())
     }
 
+    /// Convert element format between F32 and a narrow float storage dtype
+    /// (F16, Bf16, F8E4M3, F8E5M2, Tf32) - the storage half of the format
+    /// (docs/TILES.md 2). Exactly one side must be F32; the other is the
+    /// storage format. Same logical shape. Bit-exact and deterministic.
+    pub fn cast<S: Dtyped, D: Dtyped>(
+        &mut self,
+        src: BufId<S>,
+        dst: BufId<D>,
+    ) -> Result<(), TileError> {
+        let (s, d) = (self.meta(src.0), self.meta(dst.0));
+        if s.rows != d.rows || s.cols != d.cols {
+            return Err(TileError::Shape);
+        }
+        let ok = matches!(
+            (s.dtype, d.dtype),
+            (Dtype::F32, Dtype::F16)
+                | (Dtype::F16, Dtype::F32)
+                | (Dtype::F32, Dtype::Bf16)
+                | (Dtype::Bf16, Dtype::F32)
+                | (Dtype::F32, Dtype::F8E4M3)
+                | (Dtype::F8E4M3, Dtype::F32)
+                | (Dtype::F32, Dtype::F8E5M2)
+                | (Dtype::F8E5M2, Dtype::F32)
+                | (Dtype::F32, Dtype::Tf32)
+                | (Dtype::Tf32, Dtype::F32)
+        );
+        if !ok {
+            return Err(TileError::UnsupportedDtype);
+        }
+        self.ops.push(OpEnc::Cast {
+            src: src.0,
+            dst: dst.0,
+        });
+        Ok(())
+    }
+
     pub fn len(&self) -> usize {
         self.ops.len()
     }
@@ -535,6 +599,7 @@ impl<'p> TileProgram<'p> {
                     dst,
                     block,
                 } => (5, [src, scales, dst], [block, 0, 0]),
+                OpEnc::Cast { src, dst } => (6, [src, dst, 0], [0, 0, 0]),
             };
             bytes.push(tag);
             for id in ids {
@@ -657,9 +722,73 @@ impl CpuExecutor {
                     rt::yield_now().await;
                     checksums.push(fnv_buf(d));
                 }
+                OpEnc::Cast { src, dst } => {
+                    let (s, d) = (prog.meta(src), prog.meta(dst));
+                    cast_buf(s, d);
+                    rt::yield_now().await;
+                    checksums.push(fnv_buf(d));
+                }
             }
         }
         Ok(RunReport { reduced, checksums })
+    }
+}
+
+/// Element-format conversion between F32 and a narrow storage dtype, applied
+/// over the logical rows x cols window (row-wise, honoring strides). Bit-exact
+/// via the canonical kernels; the pair was validated at build.
+fn cast_buf(s: BufMeta, d: BufMeta) {
+    for r in 0..s.rows {
+        let src_row = s.base_va as usize + s.dtype.bytes(r * s.stride);
+        let dst_row = d.base_va as usize + d.dtype.bytes(r * d.stride);
+        for c in 0..s.cols {
+            // SAFETY: element (r, c) of both bound buffers, per-dtype width.
+            unsafe {
+                match (s.dtype, d.dtype) {
+                    (Dtype::F32, Dtype::F16) => {
+                        let v = *((src_row + 4 * c) as *const f32);
+                        *((dst_row + 2 * c) as *mut u16) = kernels::f32_to_f16_bits(v);
+                    }
+                    (Dtype::F16, Dtype::F32) => {
+                        let b = *((src_row + 2 * c) as *const u16);
+                        *((dst_row + 4 * c) as *mut f32) = kernels::f16_bits_to_f32(b);
+                    }
+                    (Dtype::F32, Dtype::Bf16) => {
+                        let v = *((src_row + 4 * c) as *const f32);
+                        *((dst_row + 2 * c) as *mut u16) = kernels::f32_to_bf16_bits(v);
+                    }
+                    (Dtype::Bf16, Dtype::F32) => {
+                        let b = *((src_row + 2 * c) as *const u16);
+                        *((dst_row + 4 * c) as *mut f32) = kernels::bf16_bits_to_f32(b);
+                    }
+                    (Dtype::F32, Dtype::F8E4M3) => {
+                        let v = *((src_row + 4 * c) as *const f32);
+                        *((dst_row + c) as *mut u8) = kernels::f32_to_f8e4m3_bits(v);
+                    }
+                    (Dtype::F8E4M3, Dtype::F32) => {
+                        let b = *((src_row + c) as *const u8);
+                        *((dst_row + 4 * c) as *mut f32) = kernels::f8e4m3_bits_to_f32(b);
+                    }
+                    (Dtype::F32, Dtype::F8E5M2) => {
+                        let v = *((src_row + 4 * c) as *const f32);
+                        *((dst_row + c) as *mut u8) = kernels::f32_to_f8e5m2_bits(v);
+                    }
+                    (Dtype::F8E5M2, Dtype::F32) => {
+                        let b = *((src_row + c) as *const u8);
+                        *((dst_row + 4 * c) as *mut f32) = kernels::f8e5m2_bits_to_f32(b);
+                    }
+                    (Dtype::F32, Dtype::Tf32) => {
+                        let v = *((src_row + 4 * c) as *const f32);
+                        *((dst_row + 4 * c) as *mut f32) = kernels::f32_to_tf32(v);
+                    }
+                    (Dtype::Tf32, Dtype::F32) => {
+                        let v = *((src_row + 4 * c) as *const f32);
+                        *((dst_row + 4 * c) as *mut f32) = v;
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 }
 
@@ -1122,6 +1251,14 @@ impl TileSim {
                     r.elem_ops += elems as u64;
                     r.bytes_in += (elems + 4 * elems.div_ceil(block)) as u64;
                     r.bytes_out += (elems * 4) as u64;
+                    r.yields += 1;
+                }
+                OpEnc::Cast { src, dst } => {
+                    let (s, d) = (prog.meta(src), prog.meta(dst));
+                    let elems = s.rows * s.cols;
+                    r.elem_ops += elems as u64;
+                    r.bytes_in += s.dtype.bytes(elems) as u64;
+                    r.bytes_out += d.dtype.bytes(elems) as u64;
                     r.yields += 1;
                 }
             }

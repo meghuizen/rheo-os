@@ -54,6 +54,23 @@ static mut RNG_KBUF: [u8; 1024] = [0; 1024];
 static HEAP: runtime::Heap = runtime::Heap::empty();
 static mut HEAP_MEM: [u8; 512 * 1024] = [0; 512 * 1024];
 
+// The canonical tile kernels (docs/TILES.md) - the same source include the
+// kernel engine and librheo executor use, so the P5 path lengths measure
+// exactly the shipped code.
+#[path = "../../librheo/src/tile/kernels.rs"]
+#[allow(dead_code)]
+mod tile_kernels;
+
+// P5 tile-bench buffers (off the boot stack, like RNG_KBUF). 64x64 is the
+// largest GEMM the benches use; A/B are i8, C is i32.
+static mut TA: [i8; 64 * 64] = [0; 64 * 64];
+static mut TB: [i8; 64 * 64] = [0; 64 * 64];
+static mut TC: [i32; 64 * 64] = [0; 64 * 64];
+static mut TRED: [i32; 1024] = [0; 1024];
+static mut TQF: [f32; 1024] = [0.0; 1024];
+static mut TQI: [i8; 1024] = [0; 1024];
+static mut TQS: [f32; 1024 / 32] = [0.0; 1024 / 32];
+
 fn report(name: &str, ops: u64, ticks: u64) {
     let milli = ticks * 1000 / ops;
     println!("BENCH {name} ops={ops} ticks={ticks} per_op_milliticks={milli}");
@@ -314,8 +331,180 @@ extern "C" fn kernel_main() -> ! {
     }
     report("p4_strand_switch", 2 * STRANDS as u64, switch_best);
 
+    // ---------------------------------------------------------------- P5
+    // Tile-op path lengths (docs/TILES.md). Custom loops with controlled op
+    // counts: a 64^3 GEMM is 262k MACs, far too heavy for the 1024x32
+    // `bench()` loop under icount. Each reports per-op instruction length.
+    bench_p5();
+
     println!("bench-core: DONE");
     arch::exit(arch::ExitCode::Success)
+}
+
+/// Best of `BATCHES` runs of `body`, reported as `ops` operations.
+fn measure(name: &str, ops: u64, iters: usize, mut body: impl FnMut()) {
+    let mut best = u64::MAX;
+    for _ in 0..BATCHES {
+        let start = arch::cycles();
+        for _ in 0..iters {
+            body();
+        }
+        let elapsed = arch::cycles() - start;
+        if elapsed < best {
+            best = elapsed;
+        }
+    }
+    report(name, ops, best);
+}
+
+/// One 64^3 int8 GEMM tiled at `block`, calling the canonical kernel per
+/// (m,n,k) block - the same loop the executors run, isolated for icount.
+fn tiled_gemm64(block: usize) {
+    let (a, b, c) = unsafe {
+        (
+            core::ptr::addr_of!(TA) as *const i8,
+            core::ptr::addr_of!(TB) as *const i8,
+            core::ptr::addr_of_mut!(TC) as *mut i32,
+        )
+    };
+    // Zero C.
+    for i in 0..64 * 64 {
+        unsafe { *c.add(i) = 0 };
+    }
+    let mut i0 = 0;
+    while i0 < 64 {
+        let bm = block.min(64 - i0);
+        let mut j0 = 0;
+        while j0 < 64 {
+            let bn = block.min(64 - j0);
+            let mut p0 = 0;
+            while p0 < 64 {
+                let bk = block.min(64 - p0);
+                // SAFETY: block stays inside the 64x64 statics.
+                unsafe {
+                    tile_kernels::gemm_i8_i32(
+                        a.add(i0 * 64 + p0),
+                        64,
+                        b.add(p0 * 64 + j0),
+                        64,
+                        c.add(i0 * 64 + j0),
+                        64,
+                        bm,
+                        bn,
+                        bk,
+                    );
+                }
+                p0 += block;
+            }
+            j0 += block;
+        }
+        i0 += block;
+    }
+}
+
+fn bench_p5() {
+    // Deterministic fills.
+    unsafe {
+        for i in 0..64 * 64 {
+            TA[i] = ((i * 31 + 7) & 0x7F) as i8;
+            TB[i] = ((i * 17 + 3) & 0x7F) as i8;
+        }
+        for i in 0..1024 {
+            TRED[i] = i as i32;
+            TQF[i] = (i as f32) * 0.1 - 50.0;
+        }
+    }
+
+    // One 16^3 tile (4096 MACs), the executor's inner block.
+    measure("p6_tile_gemm_i8_16", 256, 256, || {
+        // SAFETY: 16x16 stays inside the 64x64 statics.
+        unsafe {
+            tile_kernels::gemm_i8_i32(
+                core::ptr::addr_of!(TA) as *const i8,
+                64,
+                core::ptr::addr_of!(TB) as *const i8,
+                64,
+                core::ptr::addr_of_mut!(TC) as *mut i32,
+                64,
+                16,
+                16,
+                16,
+            );
+        }
+    });
+
+    // Reduce over 4 KiB (1024 i32).
+    measure("p6_tile_reduce_4kib", 1024, 1024, || {
+        // SAFETY: exactly 1024 i32 in TRED.
+        let s = unsafe {
+            tile_kernels::reduce_wrapping(core::ptr::addr_of!(TRED) as *const u8, 1024, 2)
+        };
+        core::hint::black_box(s);
+    });
+
+    // Quantize 4 KiB f32 -> i8, block 32.
+    measure("p6_tile_quant_4kib", 256, 256, || {
+        // SAFETY: TQF/TQI are 1024 elems, TQS is 32 scales.
+        unsafe {
+            tile_kernels::quant_f32_i8(
+                core::ptr::addr_of!(TQF) as *const f32,
+                core::ptr::addr_of_mut!(TQI) as *mut i8,
+                core::ptr::addr_of_mut!(TQS) as *mut f32,
+                1024,
+                32,
+            );
+            // Observe the output so the quantize is not elided.
+            core::hint::black_box(TQI[0]);
+            core::hint::black_box(TQS[0]);
+        }
+    });
+
+    // The full svc::graph_submit path for one 32^3 TileGemm node - the
+    // kernel engine's tile execution measured end to end (validate +
+    // dispatch + FNV receipt), callable directly in kernel context.
+    let desc = kernel::abi::TileGemmDesc {
+        a_va: unsafe { core::ptr::addr_of!(TA) } as u64,
+        b_va: unsafe { core::ptr::addr_of!(TB) } as u64,
+        c_va: unsafe { core::ptr::addr_of_mut!(TC) } as u64,
+        m: 32,
+        n: 32,
+        k: 32,
+        a_stride: 64,
+        b_stride: 64,
+        c_stride: 64,
+        dtype_in: 0,
+        dtype_acc: 2,
+    };
+    let node = kernel::abi::GraphNode {
+        op: 5,
+        a_is_node: 0,
+        b_is_node: 0,
+        _pad: 0,
+        a: &desc as *const kernel::abi::TileGemmDesc as u64,
+        b: 0,
+    };
+    let mut result = [0u64; 1];
+    measure("p6_graph_tilegemm_32", 64, 64, || {
+        let r = kernel::svc::graph_submit(
+            &node as *const kernel::abi::GraphNode as u64,
+            1,
+            result.as_mut_ptr() as u64,
+        );
+        core::hint::black_box(r);
+    });
+
+    // The same 64^3 GEMM at three tilings - the TileSim op-count leg. The
+    // MAC count is identical (262144), but finer tiling runs more tile trips
+    // (block8: 8^3=512, block16: 4^3=64, block32: 2^3=8), and each trip
+    // carries call + zero + loop overhead. So under icount the path length
+    // DECREASES as the block grows - and it ranks the tilings in the SAME
+    // order as TileSim's `tile_trips` (block32 < block16 < block8), which is
+    // the op-count leg validating the sim's overhead model (docs/TILES.md 7).
+    // The RESULT is tiling-invariant (proven in `librheotile`); the COST is
+    // not, and the sim predicts the cost ordering.
+    measure("p6_gemm64_block8", 1, 4, || tiled_gemm64(8));
+    measure("p6_gemm64_block16", 1, 4, || tiled_gemm64(16));
+    measure("p6_gemm64_block32", 1, 4, || tiled_gemm64(32));
 }
 
 const USER_ITERS: u64 = 2048;

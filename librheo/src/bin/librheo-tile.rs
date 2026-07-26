@@ -12,7 +12,9 @@
 //! - **TileSim determinism + exactness**: the simulator's counts equal the
 //!   closed-form formulas, twice (identical runs).
 //! - **Quantization round-trip**: f32 -> i8 (block 32) -> f32 within the
-//!   per-block scale/2 error bound.
+//!   per-block scale/2 error bound; and the full narrow-format matrix
+//!   (F16, Bf16, FP8 E4M3, FP8 E5M2, TF32) cast from F32 and back, each
+//!   within its per-format bound.
 //! - **Reduce + copy + requantize**: exact receipts over known data.
 //! - **Contracts + autotune key**: engine 0 is the measured CPU; two tilings
 //!   of the same shapes produce different program hashes but the same shape
@@ -37,8 +39,8 @@ use librheo::compute::GraphBuilder;
 use librheo::mem::MemKind;
 use librheo::sys::{self, TileGemmDesc};
 use librheo::tile::{
-    self, CpuExecutor, Dtype, EngineExecutor, F32, I8, I32, TileBuf, TileError, TileProgram,
-    TileShape, TileSim,
+    self, Bf16, CpuExecutor, Dtype, EngineExecutor, F8E4M3, F8E5M2, F16, F32, I8, I32, Tf32,
+    TileBuf, TileError, TileProgram, TileShape, TileSim,
 };
 use librheo::{println, rt};
 
@@ -370,4 +372,62 @@ async fn work() {
         Err(s) if s == sys::STATUS_DENIED => {}
         _ => return fail(70),
     }
+
+    // ---- The full quantization matrix: narrow-format round-trips -------
+    // Every storage dtype the user needs (F16, Bf16, FP8 E4M3, FP8 E5M2,
+    // TF32/"bfloat32") converted from F32 and back, with a per-format error
+    // bound. Values are chosen inside each format's representable range so
+    // the round-trip is tight (docs/TILES.md 2).
+    const NF: usize = 64;
+    let mut fin: TileBuf<F32> = match TileBuf::alloc(MemKind::Ddr, 1, NF) {
+        Some(b) => b,
+        None => return fail(80),
+    };
+    // Values in [-8, 8) with a fractional part - representable in all five.
+    fin.fill_with(|_, j| (j as f32) * 0.125 - 4.0);
+
+    // (bound, code): the max abs error each format may introduce on this
+    // data. F16: 2^-3 near 8 (10-bit mantissa). Bf16: 2^-4*8 (7-bit).
+    // FP8 E4M3: ~1/8 of the value (3-bit). E5M2: ~1/2 (2-bit). TF32: tiny.
+    // f16 -> code 81, bf16 82, e4m3 83, e5m2 84, tf32 85.
+    macro_rules! roundtrip {
+        ($nd:ty, $bound:expr, $code:expr) => {{
+            let store: TileBuf<$nd> = match TileBuf::alloc(MemKind::Ddr, 1, NF) {
+                Some(b) => b,
+                None => return fail($code),
+            };
+            let back: TileBuf<F32> = match TileBuf::alloc(MemKind::Ddr, 1, NF) {
+                Some(b) => b,
+                None => return fail($code),
+            };
+            let mut p = TileProgram::new();
+            let a = p.bind(&fin, tile::Space::Host);
+            let s = p.bind(&store, tile::Space::Host);
+            let b = p.bind(&back, tile::Space::Host);
+            if p.cast(a, s).is_err() || p.cast(s, b).is_err() {
+                return fail($code);
+            }
+            if exec.run(&p).await.is_err() {
+                return fail($code);
+            }
+            let (orig, got) = (fin.as_slice(), back.as_slice());
+            for i in 0..NF {
+                let err = orig[i] - got[i];
+                let err = if err < 0.0 { -err } else { err };
+                if err > $bound {
+                    return fail($code);
+                }
+            }
+        }};
+    }
+    roundtrip!(F16, 0.02, 81);
+    roundtrip!(Bf16, 0.13, 82);
+    roundtrip!(F8E4M3, 0.55, 83);
+    roundtrip!(F8E5M2, 1.1, 84);
+    roundtrip!(Tf32, 0.01, 85);
+
+    // A GEMM over a storage dtype must NOT compile - that is proven by the
+    // absence of an MmaInput impl (compile-time), so there is nothing to
+    // assert at runtime; the standard flow is cast/dequant -> native GEMM.
+    println!("librheo-tile: dtype matrix F16/Bf16/FP8-E4M3/FP8-E5M2/TF32 round-trips OK");
 }

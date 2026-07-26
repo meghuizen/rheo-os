@@ -44,6 +44,13 @@ path = "src/bin/librheo-compute.rs"
 name = "librheo-tile"
 path = "src/bin/librheo-tile.rs"
 
+# The tile battle tier (docs/TILES.md 10): production-shaped workloads
+# (scaled 7B-class GEMMs, an attention block, paged-KV, columnar reduce) +
+# soak/boundary/pipeline-depth stress.
+[[bin]]
+name = "librheo-tilebattle"
+path = "src/bin/librheo-tilebattle.rs"
+
 [[bin]]
 name = "librheo-term"
 path = "src/bin/librheo-term.rs"

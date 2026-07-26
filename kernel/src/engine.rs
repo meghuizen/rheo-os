@@ -18,7 +18,12 @@ use crate::time;
 /// rule holds; the file is dependency-free by contract). The library
 /// executor, this engine, bench-core, and the host comparison all run the
 /// same bytes.
+// The kernel engine uses only `gemm_i8_i32` and `reduce_wrapping`; the file
+// also carries the quant/cast kernels the librheo executor and host
+// comparison use, so most are dead in this crate - expected for a shared
+// source include.
 #[path = "../../librheo/src/tile/kernels.rs"]
+#[allow(dead_code)]
 mod tile_kernels;
 
 /// The integer operations an engine can execute. A dependency-graph node

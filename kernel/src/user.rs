@@ -133,13 +133,32 @@ const EMPTY_GRANT: GrantSlot = GrantSlot {
     cap_id: 0,
 };
 
-const MAX_GRANTS_PER_CELL: usize = 16;
+// Live typed-memory grants a cell may hold at once (docs/TILES.md 12): a
+// fixed per-cell table, not a proof-relevant limit, so sized for real
+// workloads - a tile attention program holds ~11 buffers, a warehouse or
+// compositor cell more. Raised 16 -> 64 (still small: ~40 B/slot). Whether
+// 64 suffices for the largest real cell is an open sizing question flagged
+// in docs/TILES.md 12.
+const MAX_GRANTS_PER_CELL: usize = 64;
 static mut CELL_GRANTS: [[GrantSlot; MAX_GRANTS_PER_CELL]; MAX_CELLS] =
     [[EMPTY_GRANT; MAX_GRANTS_PER_CELL]; MAX_CELLS];
 
 fn cell_grants(cur: usize) -> &'static mut [GrantSlot; MAX_GRANTS_PER_CELL] {
     // SAFETY: single CPU, synchronous traps; no concurrent access.
     unsafe { &mut (*core::ptr::addr_of_mut!(CELL_GRANTS))[cur] }
+}
+
+/// Free the grant slot whose reservation base is `va` (an exact match on a
+/// `SYS_GRANT` base), if any - called from `SYS_MUNMAP` so a cell reclaims
+/// slots as it drops grants. A `va` that matches no grant (an ordinary anon
+/// `SYS_MMAP` region) is a no-op.
+fn release_grant_at(cur: usize, va: usize) {
+    for slot in cell_grants(cur).iter_mut() {
+        if slot.in_use && slot.base == va {
+            *slot = EMPTY_GRANT;
+            return;
+        }
+    }
 }
 
 /// One admitted CPU reservation a native cell holds (docs/LIBRHEO.md Phase C,
@@ -1146,6 +1165,11 @@ pub fn on_user_trap(
         }
         SYS_MUNMAP => {
             unmap_range(args[0] as usize, args[1] as usize);
+            // Release any grant slot whose reservation this munmap tore down,
+            // so a cell that allocates and drops many typed grants (e.g. a
+            // tile program churning TileBufs) does not leak the fixed
+            // per-cell slot table. Frames were already returned above.
+            release_grant_at(cur, args[0] as usize);
             arch::set_syscall_ret(unsafe { &mut *frame }, 0);
             frame
         }

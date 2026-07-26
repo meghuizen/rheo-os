@@ -53,23 +53,45 @@ hardware (section 10, `comparison/tiles`).
 Dtype rides the buffer type (GPU-HARDWARE.md 11): `TileBuf<I8>` and
 `TileBuf<F32>` are different types, and a GEMM whose inputs disagree with
 its accumulator is a **compile error at program build**, not a garbage
-result at runtime. The dtype set:
+result at runtime. The full dtype matrix:
 
-- **Native** (representable and executable on the CPU executor today):
-  `I8`, `U8`, `I32`, `F32`. Integer paths are exact everywhere; `F32`
-  executes as soft-float in a cell (the bare targets are soft-float -
-  honest and slow, stated).
-- **Declared** (types now, executable when an engine lowers them):
-  `F16`, `Bf16`, `F8E4M3`, `I4Block32`. These have no MMA implementation
-  trait, so `gemm` over them does not compile - the type system saying
-  "no engine here can run this" at build time.
+| Dtype | Bits | Role | On the CPU executor today |
+|---|---|---|---|
+| `I8` / `U8` | 8 | integer | native compute (GEMM/reduce) |
+| `I32` | 32 | integer accumulator | native compute |
+| `F32` | 32 | float | native compute (soft-float in a cell) |
+| `F16` | 16 | IEEE half | storage: convert to/from F32, bit-exact |
+| `Bf16` | 16 | bfloat16 | storage: convert to/from F32 |
+| `F8E4M3` | 8 | fp8 (bias 7, sat +-448) | storage: convert to/from F32 |
+| `F8E5M2` | 8 | fp8 / "bfloat8" (has inf) | storage: convert to/from F32 |
+| `Tf32` | 32 slot | tensor-float / "bfloat32" (10-bit mantissa) | storage: convert to/from F32 |
+| `I4Block32` | 4 | block-quant int4 (2 codes/byte) | storage: quant/dequant to/from F32 |
+
+Two tiers, both real now:
+
+- **Native** (`I8/U8/I32/F32`): the executor computes on these directly.
+  Integer paths are exact on every ISA; `F32` runs soft-float in a cell
+  (honest and slow, stated).
+- **Storage** (`F16/Bf16/F8E4M3/F8E5M2/Tf32/I4Block32`): the tile layer
+  **converts** to and from these with bit-exact, deterministic kernels
+  (`cast` for the floats, `quant`/`dequant` for the block-quant integers)
+  - so every quantization size a workload needs is a real, tested format
+  today. What is *deferred* is **MMA directly over** a storage dtype:
+  `gemm` requires an `MmaInput` impl, which only the native inputs have,
+  so a GEMM over F16/fp8/int4 is a compile error until a device engine
+  lowers it - "no engine here can run this," said at build time. The
+  standard flow works now: cast/dequant to a native dtype, GEMM, cast
+  back.
 
 The workhorse is **int8 x int8 -> i32** - the production quantized-
 inference GEMM, integer-exact on every ISA, and the only dtype pair the
-kernel slice accepts (section 6). Quantize/dequantize (per-block
-symmetric f32 <-> i8 with allocation-visible scale planes) and integer
-requantize (shift + clamp i32 -> i8) are **program ops**, scheduled and
-counted like any tile op - never silent format coercion.
+kernel slice accepts (section 6). Quantize/dequantize and integer
+requantize (shift + clamp i32 -> i8) and the float casts are all
+**program ops**, scheduled and counted like any tile op - never silent
+format coercion. The narrow-float conversions are pure bit math (RNE
+rounding, saturation, NaN/inf handling per format), so they are
+soft-float-safe and identical across the three ISAs; each is proven by a
+round-trip bound in `librheotile`.
 
 ## 3. The TileContract
 
@@ -325,6 +347,36 @@ with the framework already in place.
   precedent.
 - **Single vcore**: pipelining is cooperative interleaving until SMP
   (task #27).
+### Capacity caps - flagged for real-workload sizing
+
+Each `TileBuf` holds a memory grant, so a tile workload presses on two
+fixed kernel tables. **These are sizing questions, not fundamental
+limits** - the numbers below are chosen for headroom, and whether they
+suffice for the largest real cell (a full inference server, a warehouse
+scan over hundreds of column chunks) is an open question a real
+deployment should re-measure and raise if needed:
+
+| Cap | Where | Value | Nature | If a real workload needs more |
+|---|---|---|---|---|
+| Live grants per cell | `MAX_GRANTS_PER_CELL` (`kernel/src/user.rs`) | 64 | fixed per-cell table slot count; reclaimed on grant drop (`SYS_MUNMAP` slot-free path) | raise the constant - it is not proof-relevant, ~40 B/slot |
+| Total kernel objects | `MAX_OBJECTS` (`kernel/src/capability`) | 512 | monotonic id counter, **does not yet reclaim** a destroyed object's id | raise the constant for headroom; the real fix is object-id reclamation |
+
+The **live** grant count (buffers held at once) is bounded by the first
+cap - the battle tier scopes its stages so no more than ~16 grants are
+live together, well under 64. The **cumulative** object count (every
+grant ever created in a cell's life) is bounded by the second - a cell
+that churns grants forever eventually exhausts it, because the object
+counter is monotonic. The battle tier reuses buffers across its 100-run
+soak rather than reallocating, which is the honest way to run many
+pipelines under a monotonic cap and is also simply the right pattern
+(allocate once, compute many times).
+
+Object-id **reclamation** (so a long-running cell can create and destroy
+grants indefinitely) is the real fix and is deliberately out of scope
+here: it is a capability-core change that must bump the object epoch on
+reuse to keep revocation sound (ARCHITECTURE.md 8.2), so it belongs in a
+focused change against the `cap-invariants` proof test, not a tile
+feature. Raising `MAX_OBJECTS` buys headroom in the meantime.
 - **Device engines are enumerated, not executing**: GPUs (with real
   vendor IDs), NPU/TPU-class accelerators (PCI class 0x12), and FPGAs
   ride the same contract and the same graph lowering; execution awaits
