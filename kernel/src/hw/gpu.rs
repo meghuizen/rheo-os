@@ -72,6 +72,148 @@ pub enum GpuDriver {
     None,
 }
 
+/// The silicon architecture family, recognised per vendor from the PCI
+/// device ID (docs/ACCELERATORS.md 4). The families are the ones the
+/// per-vendor lowering path (`VendorDriver::lowering`) actually branches on
+/// (NVIDIA tensor-core generations, AMD's GCN/RDNA/CDNA split, Intel Xe),
+/// so recognition is concrete per generation, not just per vendor ID. The
+/// ID ranges are the documented public conventions; a real driver cell
+/// carries the vendor's exhaustive table, this is the kernel-side coarse
+/// classification that picks the driver strategy.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum GpuArch {
+    // NVIDIA tensor-core generations (device-id high nibble tracks the chip
+    // family: 0x1x Pascal, 0x1exx/0x1fxx Turing, 0x2xxx Ampere, 0x26xx Ada,
+    // 0x23xx Hopper).
+    NvPascal,
+    NvTuring,
+    NvAmpere,
+    NvAda,
+    NvHopper,
+    NvBlackwell,
+    // AMD.
+    AmdGcn,  // pre-RDNA (incl. the legacy ati-vga parts QEMU models)
+    AmdRdna, // consumer graphics
+    AmdCdna, // MI-series compute (MI300 etc.)
+    // Intel.
+    IntelXe,
+    /// Recognised vendor, family not classified (or a paravirtual device).
+    Unknown,
+}
+
+impl GpuArch {
+    pub fn name(&self) -> &'static str {
+        match self {
+            GpuArch::NvPascal => "pascal",
+            GpuArch::NvTuring => "turing",
+            GpuArch::NvAmpere => "ampere",
+            GpuArch::NvAda => "ada",
+            GpuArch::NvHopper => "hopper",
+            GpuArch::NvBlackwell => "blackwell",
+            GpuArch::AmdGcn => "gcn",
+            GpuArch::AmdRdna => "rdna",
+            GpuArch::AmdCdna => "cdna",
+            GpuArch::IntelXe => "xe",
+            GpuArch::Unknown => "unknown",
+        }
+    }
+}
+
+/// Classify silicon family from (vendor, device id). The NVIDIA/AMD/Intel
+/// ranges follow the public device-id conventions each vendor uses; QEMU
+/// exposes none of these real parts, so on this emulator only the AMD
+/// legacy `ati-vga` IDs (GCN-era predecessors) land on a concrete family -
+/// the rest are the classification a driver cell would apply to real
+/// hardware. Honest: this picks a lowering *strategy*, it does not execute.
+pub fn classify_arch(vendor: GpuVendor, device_id: u16) -> GpuArch {
+    match vendor {
+        GpuVendor::Nvidia => match device_id >> 8 {
+            0x13 | 0x15 | 0x17 | 0x1b | 0x1c | 0x1d => GpuArch::NvPascal,
+            0x1e | 0x1f | 0x21 => GpuArch::NvTuring,
+            0x20 | 0x22 | 0x24 | 0x25 => GpuArch::NvAmpere,
+            0x26..=0x28 => GpuArch::NvAda,
+            0x23 => GpuArch::NvHopper,
+            0x29 | 0x2b => GpuArch::NvBlackwell,
+            _ => GpuArch::Unknown,
+        },
+        GpuVendor::Amd => match device_id {
+            // The two parts QEMU's ati-vga models (Rage 128 / RV100) are
+            // pre-GCN, but they are the AMD/ATI family the driver strategy
+            // groups with GCN-era 2D for our purposes.
+            0x5046 | 0x5159 => GpuArch::AmdGcn,
+            // RDNA consumer (Navi): 0x73xx/0x74xx. CDNA compute (MI): 0x74xx
+            // Instinct + 0x29xx. Coarse public convention.
+            0x7300..=0x73ff => GpuArch::AmdRdna,
+            0x7400..=0x74ff => GpuArch::AmdCdna,
+            _ => GpuArch::AmdGcn,
+        },
+        GpuVendor::Intel => GpuArch::IntelXe,
+        _ => GpuArch::Unknown,
+    }
+}
+
+/// A per-vendor driver front-end (docs/GPU-HARDWARE.md 5, ACCELERATORS.md
+/// 4): the named strategy by which this vendor's silicon would be driven
+/// from a contained driver cell, plus whether that path can run in the
+/// current environment. This is the vendor-specific layer made concrete for
+/// every major vendor - the kernel records the strategy and attach
+/// requirement; the actual command submission lives in the driver cell.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct VendorDriver {
+    /// The lowering path this vendor uses (ACCELERATORS.md 4).
+    pub lowering: &'static str,
+    /// The in-tree driver that can drive it here, if any.
+    pub driver: GpuDriver,
+    /// Honest one-line status for the current environment.
+    pub status: &'static str,
+}
+
+/// The driver front-end for a recognised GPU. Every major vendor resolves
+/// to a concrete strategy; only virtio-gpu resolves to an in-tree driver
+/// today, and the real-vendor entries state exactly what each awaits
+/// (docs/GPU-HARDWARE.md 5-7).
+pub fn vendor_driver(vendor: GpuVendor, driver: GpuDriver) -> VendorDriver {
+    if driver == GpuDriver::VirtioGpu {
+        return VendorDriver {
+            lowering: "virtio-gpu 2D control queue",
+            driver: GpuDriver::VirtioGpu,
+            status: "driven in-tree (Phase H 2D driver)",
+        };
+    }
+    match vendor {
+        GpuVendor::Nvidia => VendorDriver {
+            lowering: "PTX/SASS via contained ptxas, tensor-core/TMA tile IR",
+            driver: GpuDriver::None,
+            status: "awaits GSP firmware + driver cell (no QEMU model)",
+        },
+        GpuVendor::Amd => VendorDriver {
+            lowering: "MFMA via ROCm/LLVM (CDNA); RDNA graphics",
+            driver: GpuDriver::None,
+            status: "aperture + registers driven here; compute awaits driver cell",
+        },
+        GpuVendor::Intel => VendorDriver {
+            lowering: "Vulkan-compute floor, native Xe lowering as justified",
+            driver: GpuDriver::None,
+            status: "awaits driver cell (no QEMU model)",
+        },
+        GpuVendor::QemuBochs => VendorDriver {
+            lowering: "Bochs dispi register interface (2D framebuffer)",
+            driver: GpuDriver::None,
+            status: "registers driven here (dispi handshake)",
+        },
+        GpuVendor::Virtio => VendorDriver {
+            lowering: "virtio-gpu 2D control queue",
+            driver: GpuDriver::VirtioGpu,
+            status: "driven in-tree (Phase H 2D driver)",
+        },
+        GpuVendor::Other => VendorDriver {
+            lowering: "none",
+            driver: GpuDriver::None,
+            status: "unrecognised",
+        },
+    }
+}
+
 /// One recognised GPU function (docs/GPU-HARDWARE.md 2). `pci` indexes the
 /// inventory's PCI table; `vram_bytes`/`mmio_bytes` come from the BAR mask
 /// probe (aperture sizes, not necessarily full VRAM - resizable BAR is the
@@ -82,6 +224,7 @@ pub struct GpuDevice {
     pub vendor: GpuVendor,
     pub vendor_id: u16,
     pub device_id: u16,
+    pub arch: GpuArch,
     pub vram_bytes: u64,
     pub mmio_bytes: u64,
     pub msix: bool,
@@ -102,6 +245,7 @@ impl GpuDevice {
         vendor: GpuVendor::Other,
         vendor_id: 0,
         device_id: 0,
+        arch: GpuArch::Unknown,
         vram_bytes: 0,
         mmio_bytes: 0,
         msix: false,
@@ -187,6 +331,7 @@ pub fn probe(inv: &mut Inventory) {
             vendor,
             vendor_id: d.vendor,
             device_id: d.device,
+            arch: classify_arch(vendor, d.device),
             vram_bytes: vram,
             mmio_bytes: mmio,
             msix: d.msix,
@@ -239,39 +384,50 @@ pub fn attach_measure(inv: &mut Inventory) {
     }
 }
 
-/// Print the GPU inventory, one line per function, with the honest
-/// skip-with-reason lines for the major vendors QEMU cannot model.
+/// Print the GPU inventory, one line per function (with silicon family +
+/// the vendor driver strategy), then the per-vendor strategy for every
+/// major vendor - including the ones with no QEMU device model, so the
+/// vendor-specific layer is visible whether or not a device is present.
 pub fn print_summary(inv: &Inventory) {
     for g in &inv.gpus[..inv.ngpu] {
         let d = &inv.pci[g.pci];
+        let vd = vendor_driver(g.vendor, g.driver);
         crate::println!(
-            "gpu: {:02x}:{:02x}.{} {} [{:04x}:{:04x}] vram={} KiB mmio={} KiB msix={} flr={} driver={:?}",
+            "gpu: {:02x}:{:02x}.{} {} ({}) [{:04x}:{:04x}] vram={} KiB mmio={} KiB msix={} flr={} -> {}",
             d.bus,
             d.dev,
             d.func,
             g.model(),
+            g.arch.name(),
             g.vendor_id,
             g.device_id,
             g.vram_bytes / 1024,
             g.mmio_bytes / 1024,
             g.msix,
             g.flr,
-            g.driver
+            vd.status
         );
     }
-    for (vendor, why) in [
-        (GpuVendor::Nvidia, "no QEMU device model"),
-        (
-            GpuVendor::Intel,
-            "no QEMU device model (igd is passthrough-only)",
-        ),
+    // The per-vendor driver front-end for every major vendor, present or
+    // not - the strategy is real code even where no device exists here.
+    for vendor in [
+        GpuVendor::Nvidia,
+        GpuVendor::Amd,
+        GpuVendor::Intel,
+        GpuVendor::Virtio,
     ] {
-        if !vendor_present(inv, vendor) {
-            crate::println!(
-                "gpu: {}: no device present ({}) - recognised by ID, skip-with-reason",
-                vendor.name(),
-                why
-            );
-        }
+        let vd = vendor_driver(vendor, GpuDriver::None);
+        let present = if vendor_present(inv, vendor) {
+            "present"
+        } else {
+            "absent (no QEMU model)"
+        };
+        crate::println!(
+            "gpu: vendor {}: {} lowering=[{}] - {}",
+            vendor.name(),
+            present,
+            vd.lowering,
+            vd.status
+        );
     }
 }

@@ -50,6 +50,61 @@ extern "C" fn kernel_main() -> ! {
     assert!(!gpu::vendor_present(inv, gpu::GpuVendor::Nvidia));
     assert!(!gpu::vendor_present(inv, gpu::GpuVendor::Intel));
 
+    // --- Silicon-family classification (per-vendor, per generation) ----
+    // The AMD part QEMU models classifies to a concrete family; the
+    // NVIDIA/Intel classifiers are exercised directly against known IDs so
+    // the per-generation recognition is proven even with no such device.
+    let amd = inv.gpus[..inv.ngpu]
+        .iter()
+        .find(|g| g.vendor == gpu::GpuVendor::Amd)
+        .unwrap();
+    assert_eq!(amd.arch, gpu::GpuArch::AmdGcn, "ati-vga -> GCN-era family");
+    // NVIDIA: an Ampere ID (A100 = 0x20B0) and an Ada ID (RTX 4090 = 0x2684).
+    assert_eq!(
+        gpu::classify_arch(gpu::GpuVendor::Nvidia, 0x20B0),
+        gpu::GpuArch::NvAmpere
+    );
+    assert_eq!(
+        gpu::classify_arch(gpu::GpuVendor::Nvidia, 0x2684),
+        gpu::GpuArch::NvAda
+    );
+    assert_eq!(
+        gpu::classify_arch(gpu::GpuVendor::Nvidia, 0x2330),
+        gpu::GpuArch::NvHopper
+    );
+    // AMD CDNA (MI300 = 0x74a0) and RDNA (Navi 0x73bf).
+    assert_eq!(
+        gpu::classify_arch(gpu::GpuVendor::Amd, 0x74A0),
+        gpu::GpuArch::AmdCdna
+    );
+    assert_eq!(
+        gpu::classify_arch(gpu::GpuVendor::Amd, 0x73BF),
+        gpu::GpuArch::AmdRdna
+    );
+    // Intel is Xe.
+    assert_eq!(
+        gpu::classify_arch(gpu::GpuVendor::Intel, 0x56A0),
+        gpu::GpuArch::IntelXe
+    );
+
+    // --- Per-vendor driver front-end: a concrete strategy for each -----
+    // Every major vendor resolves to a named lowering path (ACCELERATORS.md
+    // 4); only virtio resolves to an in-tree driver today.
+    for v in [
+        gpu::GpuVendor::Nvidia,
+        gpu::GpuVendor::Amd,
+        gpu::GpuVendor::Intel,
+        gpu::GpuVendor::Virtio,
+    ] {
+        let vd = gpu::vendor_driver(v, gpu::GpuDriver::None);
+        assert!(!vd.lowering.is_empty(), "vendor has no lowering strategy");
+        assert!(!vd.status.is_empty());
+    }
+    assert_eq!(
+        gpu::vendor_driver(gpu::GpuVendor::Virtio, gpu::GpuDriver::VirtioGpu).driver,
+        gpu::GpuDriver::VirtioGpu
+    );
+
     // --- Bridge recursion: the virtio GPU lives behind a root port -----
     let virtio = inv.gpus[..inv.ngpu]
         .iter()

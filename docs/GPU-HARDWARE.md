@@ -67,7 +67,7 @@ the tree.
 | Engines attested + benchmarked at attach (ACCELERATORS.md 1) | The CPU `Engine` attach = a 4096-iteration integer-Add micro-benchmark (`engine.rs`); GPU engines register with an honest zero measured cost (no execution path yet) |
 | Declared preemption contract | `Preemption::{Instruction, OpBoundary}` declared; a registered GPU engine declares `OpBoundary` (the accelerator contract) |
 | Graphs execute across engines (object 6) | `graph.rs` runs up to 32 nodes sequentially on one `&Engine`; `SqEntry.engine_id` is in the ABI but read nowhere |
-| GPUs enumerated as engines | **Stage 1, built:** `hw/pci.rs` recurses bridges (programming secondary bus numbers where firmware left them zero), sizes BARs by the mask probe, walks capabilities (MSI/MSI-X/PCIe/FLR), and offers opt-in BAR assignment (`assign_pci_bars`); `hw/gpu.rs` classifies every display-class function by vendor (NVIDIA/AMD/Intel/virtio/Bochs) into the machine inventory; each recognised GPU registers in the engine table. Proven by the `gpuhw` test on all three ISAs |
+| GPUs enumerated as engines | **Stage 1, built:** `hw/pci.rs` recurses bridges (programming secondary bus numbers where firmware left them zero), sizes BARs by the mask probe, walks capabilities (MSI/MSI-X/PCIe/FLR), and offers opt-in BAR assignment (`assign_pci_bars`); `hw/gpu.rs` classifies every display-class function by vendor AND silicon family (NVIDIA Pascal/Turing/Ampere/Ada/Hopper/Blackwell, AMD GCN/RDNA/CDNA, Intel Xe) into the machine inventory, each with a per-vendor driver front-end (`vendor_driver`) declaring its lowering path (ACCELERATORS.md 4); each recognised GPU registers in the engine table. Proven by the `gpuhw` test on all three ISAs |
 | Every engine DMA mediated and grant-checked (ACCELERATORS.md 1, doctrine 1) | **Zero IOMMU code.** All device DMA is a raw `virt_to_phys` handed to the device (virtio-blk/net/gpu) |
 | Device memory as typed kinds (MEMORY.md 2) | `MemKind::{Hbm, Cxl}` silently DDR-backed; `MemKind::DeviceBar` refused by a literal `kind == 4` check at the syscall boundary (`kernel/src/user.rs`) |
 | Engine introspection | `SYS_ENGINE_INFO(out_va, index)` enumerates the engine table - the CPU, then every recognised GPU with its PCI vendor ID - and returns the count |
@@ -309,6 +309,16 @@ tale, and ACCELERATORS.md 6 already refuses it.
 registers with the kernel the way the POSIX personality's `FileOps` does
 (`kernel/src/svc.rs`): a small function-pointer vtable, kernel-resident
 today, a documented bridge to a fully message-driven service later.
+
+**Built in stage 1: the per-vendor front-end.** `hw/gpu.rs::vendor_driver`
+resolves every recognised vendor to a concrete `VendorDriver` - its
+lowering strategy (NVIDIA PTX/SASS + tensor-core tile IR, AMD MFMA via
+ROCm/LLVM, Intel Vulkan-compute floor, virtio's 2D control queue), which
+in-tree driver can drive it (virtio-gpu only, today), and an honest
+per-environment status. The silicon family (`classify_arch` -> `GpuArch`)
+picks that strategy per generation, not just per vendor ID. This is the
+kernel-side half of the interface above; it names what each vendor needs
+without executing any vendor command stream (which stays in the cell).
 
 ```rust
 /// What a driver cell registers. The kernel calls these; everything else

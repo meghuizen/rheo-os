@@ -63,9 +63,12 @@ do it; x86 q35's `-kernel` path runs SeaBIOS, which got there first), sizes
 every BAR by the mask probe, walks the capability list (MSI/MSI-X/PCIe/FLR),
 and offers opt-in BAR assignment from a per-ISA host-bridge window
 (`hw::assign_pci_bars`, invisible to boots that skip it); `kernel/src/hw/gpu.rs`
-recognises every display-class function by vendor - NVIDIA / AMD / Intel /
-virtio / Bochs - into the inventory, and each recognised GPU registers in the
-engine table behind `SYS_ENGINE_INFO(out_va, index)` enumeration (kind + PCI
+recognises every display-class function by vendor AND silicon family (NVIDIA
+Pascal/Turing/Ampere/Ada/Hopper/Blackwell, AMD GCN/RDNA/CDNA, Intel Xe) into
+the inventory, resolves a per-vendor driver front-end (`vendor_driver`
+declaring each vendor's lowering path per ACCELERATORS.md 4), and each
+recognised GPU registers in the engine table behind
+`SYS_ENGINE_INFO(out_va, index)` enumeration (kind + PCI
 vendor ID + declared op-boundary preemption, an honest zero measured cost -
 recognised and registered, not yet driven). The `gpuhw` test proves it on all
 three ISAs against QEMU's real `ati-vga` (AMD, 0x1002), a Bochs display, and
