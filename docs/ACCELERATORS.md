@@ -1,7 +1,9 @@
 # Accelerators - GPU, NPU, TPU, FPGA, DPU
 
 **Status:** Draft v0.1. Expands ARCHITECTURE.md object 4 (engine) and 4.11;
-see TARGET-ARCHITECTURES.md section 5 for the hardware matrix.
+see TARGET-ARCHITECTURES.md section 5 for the hardware matrix. Physical-GPU
+bring-up (PCIe, IOMMU, VRAM, firmware, driver-cell containment) is designed
+in GPU-HARDWARE.md.
 
 Position: every accelerator is an **engine** - a first-class kernel object,
 scheduled alongside CPU vcores, sharing one address-space abstraction and one

@@ -669,4 +669,6 @@ Real VIRGL/3D, the cursor plane (cursorq), multi-scanout, EDID/mode
 negotiation, vsync-interrupt→typed-event delivery, an IOMMU-mapped
 grant-checked scanout DMA, and an actual visible framebuffer on hardware. The
 deliverable is the 2D scanout command round-trip + the compositor present
-wiring.
+wiring. The driver's kernel residency is a bring-up seam in tension with
+ARCHITECTURE.md 5; its migration into a contained driver cell is
+GPU-HARDWARE.md 12 (stage 3).
