@@ -125,7 +125,7 @@ pub use imp::{
     pci_cfg_write32, phys_to_virt, pmem_map_window, restore_rt_frame, restore_user_fp,
     return_to_kernel, save_user_fp, serial_init, serial_read_byte, serial_write_byte,
     set_syscall_ret, set_user_fs_base, setup_rt_frame, sig_tramp_code, spin_loop, ticks_to_ns,
-    timer_arm, timer_disarm, timer_expired, timer_irq_enabled, timer_wait, trap_init,
+    timer_arm, timer_disarm, timer_expired, timer_irq_enabled, timer_now_ns, timer_park, trap_init,
     trapframe_kernel_sp, trapframe_new, trapframe_zeroed, uart_inject_and_wait, uart_irq_enabled,
     user_fs_base, user_sp, virt_to_phys,
 };

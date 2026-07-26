@@ -691,6 +691,10 @@ impl VirtioNet {
             }
             self.tx_last_used = (*vq).used.idx;
         }
+        // A transmit usually means a reply is imminent (an ARP request, a DNS
+        // query, a TCP segment), so it counts as link activity for the receive
+        // path's hot tier (docs/NETSTACK.md 16, the adaptive poll policy).
+        crate::net_rx::note_activity();
         true
     }
 

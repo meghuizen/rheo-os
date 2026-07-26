@@ -29,9 +29,12 @@ library level.
     via the GICv3; x86-64 still polls - its QEMU TCG split-irqchip IOAPIC/LAPIC
     does not re-deliver reliably). A cell blocking on a deadline (`SYS_ARM_TIMER`)
     parks until the **timer interrupt** fires (RISC-V Sstc `stimecmp`; ARM64 CNTV
-    virtual timer via the GICv3; x86-64 LAPIC LVT one-shot) - interrupt-driven on
-    **all three ISAs**. Both are genuine 0%-CPU parks. The general per-queue
-    completion IRQ is future work.
+    virtual timer via the GICv3) - a genuine 0%-CPU park on those two ISAs;
+    x86-64's LAPIC one-shot is driven over an x2APIC MSR block that QEMU TCG leaves
+    inert, so it falls back to a cooperative deadline check (verified at bring-up,
+    docs/NETSTACK.md 16 Phase N2h). Every deadline goes through the kernel **timer
+    arbiter** (`kernel/src/ktimer.rs`), the single owner of the one-shot. The general
+    per-queue completion IRQ is future work.
 
 ## 2. Completion contracts
 

@@ -34,6 +34,10 @@ pub fn timer_interrupt_driven() -> bool {
 
 /// Whether the kernel actually idled at WFI during the last interrupt-driven
 /// `arm_timer` (the Phase F idle-park assertion). False in the busy-wait build.
+///
+/// Recorded when a park **genuinely halted the CPU** (rheo-net N2h): it used to be
+/// set on intent, just before the wait, which reported an idle on a machine whose
+/// one-shot could not fire at all.
 pub fn timer_did_idle() -> bool {
     TIMER_IDLED.load(Ordering::Relaxed) != 0
 }
@@ -51,13 +55,21 @@ pub fn uptime_ticks() -> u64 {
 
 /// `SYS_ARM_TIMER`: block until `deadline_ns` nanoseconds of monotonic time
 /// elapse from the call, then return (docs/LIBRHEO.md Phase F). Where a hardware
-/// timer interrupt is wired ([`timer_interrupt_driven`]) the kernel arms the
-/// per-ISA timer and halts at WFI until it fires - a genuine 0%-CPU park, the
-/// OS's second interrupt (riscv Sstc `stimecmp` today; x86 LAPIC / aarch64 CNTV
-/// are the documented next step). Otherwise it falls back to a **cooperative
-/// deadline check** against the monotonic cycle counter (honest, not 0%-idle).
-/// Honors docs/POWER.md: the kernel waits here only when a real deadline was
-/// requested (librheo arms a timer only for an actual `sleep`/`timeout`).
+/// timer interrupt is wired ([`timer_interrupt_driven`]) the kernel registers the
+/// deadline with the **timer arbiter** ([`crate::ktimer`]) and halts at WFI until
+/// it fires - a genuine 0%-CPU park, the OS's second interrupt. Otherwise it falls
+/// back to a **cooperative deadline check** against the monotonic cycle counter
+/// (honest, not 0%-idle). Honors docs/POWER.md: the kernel waits here only when a
+/// real deadline was requested (librheo arms a timer only for an actual
+/// `sleep`/`timeout`).
+///
+/// The deadline goes through the arbiter rather than straight to
+/// `arch::timer_arm`/`timer_wait` (rheo-net N2h, docs/NETSTACK.md 16): the
+/// hardware has **one** one-shot, and arming it directly here used to cancel a
+/// receive deadline or a poll slice another subsystem had armed - and be cancelled
+/// by them. The arbiter arms only the nearest deadline and re-arms the nearest
+/// remaining one whenever a client completes, so a cell's sleep and a network
+/// deadline now coexist.
 ///
 /// The busy-wait fallback is deterministic under QEMU `-icount`: each spin
 /// advances the instruction count, which advances the cycle counter, so the
@@ -67,9 +79,23 @@ pub fn arm_timer(deadline_ns: u64) {
         return;
     }
     if arch::timer_irq_enabled() {
-        // Genuine 0%-CPU park: arm the hardware timer and halt at WFI.
-        TIMER_IDLED.store(1, Ordering::Relaxed);
-        arch::timer_wait(deadline_ns);
+        // Genuine 0%-CPU park: register the deadline and halt at WFI until the
+        // arbiter reports *this* client's deadline elapsed (another client's
+        // nearer deadline may wake the CPU first; that is not our deadline).
+        use crate::ktimer::{self, TimerClient};
+        ktimer::register(TimerClient::CellSleep, deadline_ns);
+        while !ktimer::expired(TimerClient::CellSleep) {
+            if ktimer::park(false) {
+                // The CPU really halted - only then is this a 0%-CPU park.
+                TIMER_IDLED.store(1, Ordering::Relaxed);
+            } else {
+                // Either another client's deadline just came due (re-checked above)
+                // or the remaining delta is below the one-shot's resolution: spin
+                // out the last ticks rather than halting with no wake source.
+                arch::spin_loop(1);
+            }
+        }
+        ktimer::cancel(TimerClient::CellSleep);
         return;
     }
     let start = arch::cycles();

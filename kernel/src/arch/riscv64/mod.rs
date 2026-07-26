@@ -386,9 +386,12 @@ static mut TIMER_TARGET: u64 = 0;
 
 /// Arm the S-mode timer for `deadline_ns` from now, without waiting. The timer
 /// runs in the `time`/`stimecmp` domain (10 MHz), distinct from `cycles()` (the
-/// retired-instruction counter), so the deadline is converted here. Pair with
-/// [`timer_expired`] + [`timer_disarm`] to halt on the timer *and* another
-/// interrupt source (docs/NETSTACK.md: a receive with a deadline).
+/// retired-instruction counter), so the deadline is converted here.
+///
+/// **Private mechanism of the timer arbiter** (`kernel/src/ktimer.rs`), the
+/// kernel's single owner of the one-shot: a subsystem that arms this directly
+/// cancels whatever another subsystem armed (docs/NETSTACK.md 16). Register a
+/// deadline with the arbiter instead.
 pub fn timer_arm(deadline_ns: u64) {
     let delta = ((deadline_ns as u128 * TIMEBASE_HZ as u128) / 1_000_000_000) as u64;
     let target = rdtime().wrapping_add(delta.max(1));
@@ -411,14 +414,20 @@ pub fn timer_disarm() {
     unsafe { asm!("csrw 0x14d, {0}", in(reg) u64::MAX) };
 }
 
-/// Arm the S-mode timer for `deadline_ns` from now and halt at `wfi` until it
-/// fires (a genuine 0%-CPU park). Called only when [`timer_irq_enabled`].
-pub fn timer_wait(deadline_ns: u64) {
-    timer_arm(deadline_ns);
-    while !timer_expired() {
-        idle_wait(); // wfi, then take + service the pending interrupt
-    }
-    timer_disarm();
+/// Monotonic now in nanoseconds **in the timer's own domain** - the `time` CSR at
+/// [`TIMEBASE_HZ`], the same domain [`timer_arm`]'s delta is expressed in. Note
+/// this is *not* `ticks_to_ns(cycles())`: `cycles()` reads the retired-cycle CSR,
+/// a different counter. The timer arbiter (`kernel/src/ktimer.rs`) compares its
+/// deadlines against this.
+pub fn timer_now_ns() -> u64 {
+    ((rdtime() as u128 * 1_000_000_000) / TIMEBASE_HZ as u128) as u64
+}
+
+/// Halt the CPU until an enabled interrupt fires - the timer one-shot the arbiter
+/// armed, or any other wired source. Called only by `kernel/src/ktimer.rs`, which
+/// owns the hardware one-shot (docs/NETSTACK.md 16).
+pub fn timer_park() {
+    idle_wait(); // wfi, then take + service the pending interrupt
 }
 
 /// Deliver a scripted byte through the real UART RX interrupt (16550 loopback),
@@ -478,7 +487,7 @@ extern "C" fn riscv_trap_handler(scause: u64, sepc: u64, stval: u64) -> u64 {
     if scause == SCAUSE_S_TIMER {
         // The kernel's second interrupt (docs/LIBRHEO.md Phase F): the S-mode
         // timer (Sstc). Disarm by pushing stimecmp far out (clears STIP); the
-        // waiter in `timer_wait` observes the elapsed deadline and returns.
+        // arbiter (`ktimer::service`) observes the elapsed deadline and returns.
         unsafe { asm!("csrw 0x14d, {0}", in(reg) u64::MAX) };
         return sepc;
     }
@@ -967,8 +976,8 @@ extern "C" fn riscv_user_trap(scause: u64, stval: u64, frame: *mut TrapFrame) ->
     if scause & (1 << 63) != 0 {
         match scause {
             SCAUSE_S_EXT => handle_ext_irq(),
-            // Disarm the timer (pushing stimecmp out clears STIP); a kernel-side
-            // `timer_wait` observes the elapsed deadline itself.
+            // Disarm the timer (pushing stimecmp out clears STIP); the kernel-side
+            // arbiter (`ktimer::service`) observes the elapsed deadline itself.
             SCAUSE_S_TIMER => unsafe { asm!("csrw 0x14d, {0}", in(reg) u64::MAX) },
             _ => {}
         }

@@ -293,11 +293,17 @@ extern "C" fn kernel_main() -> ! {
                 net_rx::did_idle(),
                 "timer-backed mode but the wait never halted the CPU - it spun"
             );
+            let p = net_rx::policy();
             println!(
                 "nethostcfg: receive waits were timer-backed idles - no NIC RX interrupt on this \
-                 ISA, so the kernel halted for {} us slices between polls (a real halt, not a \
-                 spin, and not a NIC interrupt)",
-                kernel::net_rx::TIMER_SLICE_NS / 1_000
+                 ISA, so the kernel halted between polls (a real halt, not a spin, and not a NIC \
+                 interrupt): {:?} profile, {} us warm slices then {} us cold, {} slice(s) halted \
+                 for, {} escalation(s)",
+                net_rx::profile(),
+                p.warm_slice_ns / 1_000,
+                p.cold_slice_ns / 1_000,
+                net_rx::timer_slices(),
+                net_rx::escalations()
             );
         }
         _ => println!(

@@ -663,14 +663,24 @@ mirroring the Linux personality's `linux::proc` (docs/LINUX-COMPAT.md L6) for
   the Linux personality's job, L5); a native fault is terminal for the child.
 - **`SYS_ARM_TIMER` (47)** - `arm_timer(deadline_ns)`. Blocks until `deadline_ns`
   of monotonic time elapse. The "arm timer" verb, a one-shot deadline - now the
-  OS's **second interrupt**, **interrupt-driven on all three ISAs** (the kernel
-  arms the per-ISA timer and halts at `wfi`/`hlt` until it fires - a **genuine
-  0%-CPU park**): **riscv** the Sstc `stimecmp` CSR (S timer interrupt,
-  `scause` = int | 5); **aarch64** the CNTV virtual timer (`CNTV_CVAL_EL0` /
-  `CNTV_CTL_EL0`, PPI 27 through the GICv3 redistributor); **x86-64** the LAPIC
-  one-shot LVT timer (vector 0x20, rate calibrated once against the TSC), driven in
-  x2APIC mode. Where the timer IRQ is not wired it falls back to a cooperative
+  OS's **second interrupt**, and a **genuine 0%-CPU park on riscv64 and aarch64**
+  (the kernel arms the per-ISA timer and halts at `wfi` until it fires): **riscv**
+  the Sstc `stimecmp` CSR (S timer interrupt, `scause` = int | 5); **aarch64** the
+  CNTV virtual timer (`CNTV_CVAL_EL0` / `CNTV_CTL_EL0`, PPI 27 through the GICv3
+  redistributor). **x86-64** drives the LAPIC one-shot LVT timer (vector 0x20) over
+  the **x2APIC MSR block**, and this was documented as working on all three ISAs -
+  but rheo-net N2h made bring-up *verify* it and found that QEMU 8.2 TCG `-cpu max`
+  reports **no x2APIC** (CPUID.01H:ECX[21] = 0), which makes the whole MSR block
+  inert: the one-shot never fires and its count reads 0 (i.e. "already expired"), so
+  a `SYS_ARM_TIMER` on x86-64 used to return **immediately**. `enable_timer_irq()`
+  now probes the interrupt and reports the timer only if it arrives; x86-64
+  therefore takes the fallback honestly, and reaching the LAPIC through its xAPIC
+  **MMIO** page is a separate phase (docs/NETSTACK.md 16, Phase N2h).
+  Where the timer IRQ is not wired it falls back to a cooperative
   deadline check against the monotonic counter (deterministic under QEMU `-icount`).
+  All deadlines are registered with the kernel **timer arbiter**
+  (`kernel/src/ktimer.rs`), the single owner of the hardware one-shot - before N2h a
+  cell's sleep and a network deadline cancelled each other (docs/NETSTACK.md 16).
   Opt-in (`arch::enable_timer_irq`, called only by the Phase F test). Honors
   docs/POWER.md: the kernel arms the timer only when a real deadline was requested
   (librheo arms a timer only for an actual `sleep`/`timeout`). The `librheoproc`
@@ -1012,9 +1022,10 @@ What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
   **receive now parks too** (rheo-net N2d: the NIC RX interrupt + `SYS_WAIT_NET` +
   a reactor network slot; a genuine WFI park on riscv64/aarch64, a bounded kernel
   poll on x86-64 - docs/NETSTACK.md §16).
-- **Sync-translated / cooperative** (single-CPU, honest): the **timer is now
-  interrupt-driven on all three ISAs** (riscv Sstc, aarch64 CNTV, x86-64 LAPIC LVT
-  - a genuine 0%-CPU park); the cross-cell IPC channel now has a **fully symmetric
+- **Sync-translated / cooperative** (single-CPU, honest): the **timer is
+  interrupt-driven on riscv64 (Sstc) and aarch64 (CNTV)** - a genuine 0%-CPU park,
+  verified at bring-up since N2h - and falls back to a cooperative deadline check on
+  x86-64, whose x2APIC MSR block is inert under QEMU TCG (docs/NETSTACK.md 16); the cross-cell IPC channel now has a **fully symmetric
   async `Sender`/`Receiver`** (Phase J: it parks on the reactor - the in-cell wait
   is a genuine park, only the cell-boundary hand-off stays a cooperative
   `SYS_SWITCH`); parallel `compute` strands **interleave** on one CPU
@@ -1026,11 +1037,12 @@ What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
   **NIC receive line** (rheo-net N2d) is the third interrupt source and splits the
   same way - interrupt-driven on riscv64 (APLIC->IMSIC) and aarch64 (GICv3 SPI),
   **not wired** on x86-64 (its virtio-pci NIC is driven through the config tunnel with
-  no mapped BAR for an MSI-X table). x86-64's receive wait is nevertheless **not a
-  spin**: it borrows the interrupt it *does* have and halts at `hlt` for a 500 us LAPIC
-  slice between receive-queue polls (`net_rx::IdleMode::TimerIdle`, docs/NETSTACK.md
-  16) - a real halt at a low duty cycle, reported as timer-backed and never as
-  NIC-interrupt-driven.
+  no mapped BAR for an MSI-X table). x86-64's receive wait was documented as borrowing
+  the timer interrupt it *does* have (`net_rx::IdleMode::TimerIdle`, a `hlt` for a
+  500 us LAPIC slice between polls); N2h verified that and found the LAPIC inert on
+  this QEMU, so x86-64 is honestly `IdleMode::Poll` - the CPU spins, reported, never
+  claimed as a halt. The slice tiers themselves are real and exercised on riscv64 and
+  aarch64 (docs/NETSTACK.md 16, Phase N2h).
 - **Deferred (documented)**: **real VIRGL/3D + the full display pipeline** (Phase
   H lands the virtio-gpu 2D scanout round-trip - create-2d/attach/set-scanout/
   transfer/flush + `display::Scanout` present; the cursor plane, multi-scanout,

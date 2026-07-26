@@ -204,7 +204,9 @@ pub fn enable_virtio_net_irq(_slot: usize) -> bool {
     false
 }
 
-/// Whether the LAPIC timer interrupt is wired (false = busy-wait path).
+/// Whether the LAPIC timer interrupt is wired **and verified to fire** (false =
+/// the honest cooperative/poll path). Set by [`enable_timer_irq`] only after the
+/// bring-up self-test below has seen a real one-shot interrupt arrive.
 pub fn timer_irq_enabled() -> bool {
     // SAFETY: single CPU; set once before any cell runs.
     unsafe { *core::ptr::addr_of!(TIMER_ENABLED) }
@@ -215,58 +217,135 @@ pub fn timer_irq_enabled() -> bool {
 fn lapic_init() {
     // SAFETY: kernel context; plain MSR writes.
     unsafe {
-        // Enable x2APIC: IA32_APIC_BASE |= EN (11) | EXTD (10).
-        let base = paging_rdmsr(MSR_APIC_BASE) | (1 << 11) | (1 << 10);
-        paging_wrmsr(MSR_APIC_BASE, base);
+        // Enable x2APIC. The SDM requires two steps - xAPIC (EN) first, then
+        // x2APIC (EN|EXTD); a direct disabled -> x2APIC transition is illegal.
+        let base = paging_rdmsr(MSR_APIC_BASE);
+        paging_wrmsr(MSR_APIC_BASE, base | (1 << 11));
+        paging_wrmsr(MSR_APIC_BASE, base | (1 << 11) | (1 << 10));
         // Software-enable the LAPIC + set the spurious vector (SVR bit 8 + 0xFF).
         paging_wrmsr(MSR_X2APIC_SVR, 0x100 | VEC_SPURIOUS as u64);
         set_idt_gate(VEC_SPURIOUS, spurious_irq_stub as *const () as u64);
     }
 }
 
-/// Bring up the LAPIC one-shot timer interrupt (vector 0x20). Called only by the
-/// Phase F timer test.
+/// Whether CPUID reports x2APIC support (CPUID.01H:ECX[21]). Without it the whole
+/// 0x800-block MSR interface is inert - see [`enable_timer_irq`].
+fn x2apic_supported() -> bool {
+    (core::arch::x86_64::__cpuid_count(1, 0).ecx >> 21) & 1 == 1
+}
+
+/// LAPIC timer interrupts observed (incremented by the handler). Used by the
+/// bring-up self-test, so the claim "this ISA has a timer interrupt" rests on an
+/// interrupt the kernel actually took.
+static TIMER_FIRES: AtomicU64 = AtomicU64::new(0);
+
+/// Bring up the LAPIC one-shot timer interrupt (vector 0x20), **and verify it**.
+/// Called only by the kernels that arm a deadline.
+///
+/// The verification is the point (rheo-net N2h, docs/NETSTACK.md 16). This ISA's
+/// timer is driven entirely through the **x2APIC MSR block** (0x800+), chosen
+/// because an MSR needs no mapping and so works whichever page-table root is
+/// active when the interrupt lands. But QEMU 8.2's TCG `-cpu max` reports
+/// **CPUID.01H:ECX[21] = 0** (no x2APIC), and QEMU then treats the entire 0x800
+/// MSR block as inert: the EXTD bit never latches in IA32_APIC_BASE, writes to
+/// TMICT/LVT/SVR are dropped, and TMCCT (the current count) reads **0**.
+///
+/// That last detail is what made this worth verifying rather than asserting.
+/// `timer_expired()` reads TMCCT, and 0 means "the one-shot elapsed" - so an inert
+/// timer reported *every* deadline as already expired. Every deadline on this ISA
+/// was therefore satisfied instantly (a `SYS_ARM_TIMER` sleep that did not sleep)
+/// while `timer_irq_enabled()` still claimed a hardware timer. So bring-up now
+/// **probes**: arm a one-shot, briefly unmask, and see whether the interrupt
+/// arrives. `TIMER_ENABLED` is set only if it does, and the portable code above
+/// then falls back honestly (a cooperative deadline check for `SYS_ARM_TIMER`, the
+/// bounded poll for a receive wait) instead of pretending to park.
+///
+/// The fix for the *capability* - reaching the LAPIC through its xAPIC MMIO page
+/// (0xFEE00000) instead, which QEMU does model - needs that page mapped into every
+/// cell root and is its own phase; it is not attempted here. RISC-V (Sstc) and
+/// ARM64 (CNTV via the GICv3) are genuine and unaffected.
 pub fn enable_timer_irq() {
     lapic_init();
     set_idt_gate(VEC_TIMER, timer_irq_stub as *const () as u64);
-    // SAFETY: kernel context; x2APIC enabled by lapic_init.
+    // SAFETY: kernel context; x2APIC MSRs + the standard unmask/halt idiom.
     unsafe {
         // Divide config = 1 (bits: 0b1011 -> divide by 1).
         paging_wrmsr(MSR_X2APIC_TIMER_DIV, 0b1011);
         // LVT timer: vector 0x20, one-shot (bits 17-18 = 0), unmasked.
         paging_wrmsr(MSR_X2APIC_LVT_TIMER, VEC_TIMER as u64);
-        paging_wrmsr(MSR_X2APIC_TIMER_INIT, 0); // disarmed until timer_wait
-        *core::ptr::addr_of_mut!(TIMER_ENABLED) = true;
+        paging_wrmsr(MSR_X2APIC_TIMER_INIT, 0); // disarmed until the arbiter arms
+
+        // --- the self-test: does a one-shot actually fire? ---
+        let usable = if !x2apic_supported() {
+            false
+        } else {
+            TIMER_FIRES.store(0, Ordering::Relaxed);
+            let t0 = cycles();
+            paging_wrmsr(MSR_X2APIC_TIMER_INIT, PROBE_COUNT);
+            asm!("sti");
+            // Bounded by wall time, so a timer that never fires costs one short
+            // window at boot and nothing else.
+            while TIMER_FIRES.load(Ordering::Relaxed) == 0
+                && ticks_to_ns(cycles().wrapping_sub(t0)) < PROBE_WINDOW_NS
+            {
+                core::hint::spin_loop();
+            }
+            asm!("cli");
+            paging_wrmsr(MSR_X2APIC_TIMER_INIT, 0);
+            TIMER_FIRES.load(Ordering::Relaxed) > 0
+        };
+        *core::ptr::addr_of_mut!(TIMER_ENABLED) = usable;
+        if !usable {
+            crate::println!(
+                "x86-64: LAPIC one-shot timer unavailable (CPUID x2APIC={}), no timer interrupt \
+                 on this machine - deadlines fall back to the cooperative/poll path",
+                x2apic_supported() as u8
+            );
+        }
     }
 }
 
+/// Initial count for the bring-up probe, and the wall-clock window it waits for
+/// the interrupt in. The count is small enough to fire promptly at any plausible
+/// APIC clock; the window is the honest upper bound on boot cost when it never does.
+const PROBE_COUNT: u64 = 1 << 16;
+const PROBE_WINDOW_NS: u64 = 20_000_000; // 20 ms
+
 /// The LAPIC timer interrupt handler (called from `timer_irq_stub`): the
-/// one-shot has fired, so just EOI; the waiter in `timer_wait` observes the
-/// elapsed deadline and returns.
+/// one-shot has fired, so record it (the bring-up self-test reads the count) and
+/// EOI; the arbiter (`ktimer::service`) observes the elapsed deadline and returns.
 #[unsafe(no_mangle)]
 extern "C" fn x86_timer_irq() {
+    TIMER_FIRES.fetch_add(1, Ordering::Relaxed);
     // SAFETY: kernel context; x2APIC EOI is a plain MSR write.
     unsafe { paging_wrmsr(MSR_X2APIC_EOI, 0) };
 }
 
-/// Arm the LAPIC one-shot timer for `deadline_ns` from now and halt at `hlt`
-/// until it fires (a genuine 0%-CPU park). The LAPIC timer counts the APIC bus
-/// clock; we calibrate its rate against the TSC (`cycles()` + `ticks_to_ns`)
-/// once, then convert. Called only when [`timer_irq_enabled`].
-pub fn timer_wait(deadline_ns: u64) {
-    timer_arm(deadline_ns);
-    // The one-shot fires once (current count hits 0); wake hlt and EOI. The loop
-    // guards against an unrelated interrupt waking hlt early.
-    while !timer_expired() {
-        // SAFETY: kernel context; the standard enable-halt-disable idle idiom.
-        unsafe { asm!("sti; hlt; cli", options(nomem, nostack)) };
-    }
-    timer_disarm();
+/// Monotonic now in nanoseconds **in the timer's own domain** - the TSC, which is
+/// what [`timer_arm`]'s LAPIC count is calibrated against. The timer arbiter
+/// (`kernel/src/ktimer.rs`) compares its deadlines against this.
+pub fn timer_now_ns() -> u64 {
+    ticks_to_ns(cycles())
 }
 
-/// Arm the LAPIC one-shot timer for `deadline_ns` from now, without waiting. Pair
-/// with [`timer_expired`] + [`timer_disarm`] to halt on the timer *and* another
-/// interrupt source (docs/NETSTACK.md: a receive with a deadline).
+/// Halt the CPU until an interrupt fires - the LAPIC one-shot the arbiter armed
+/// (the standard enable-halt-disable idle idiom). Called only by
+/// `kernel/src/ktimer.rs`, which owns the hardware one-shot (docs/NETSTACK.md 16);
+/// it halts only with a deadline armed, since on this ISA nothing else is wired to
+/// wake `hlt`.
+pub fn timer_park() {
+    // SAFETY: kernel context; the standard enable-halt-disable idle idiom.
+    unsafe { asm!("sti; hlt; cli", options(nomem, nostack)) };
+}
+
+/// Arm the LAPIC one-shot timer for `deadline_ns` from now, without waiting. The
+/// LAPIC timer counts the APIC bus clock; its rate is calibrated against the TSC
+/// (`cycles()` + `ticks_to_ns`) once, then converted.
+///
+/// **Private mechanism of the timer arbiter** (`kernel/src/ktimer.rs`), the
+/// kernel's single owner of the one-shot: a subsystem that arms this directly
+/// cancels whatever another subsystem armed (docs/NETSTACK.md 16). Register a
+/// deadline with the arbiter instead.
 pub fn timer_arm(deadline_ns: u64) {
     let count = lapic_timer_count(deadline_ns);
     // SAFETY: kernel context; x2APIC timer MSR (one-shot, starts counting down).
@@ -1156,6 +1235,19 @@ pub fn cycles() -> u64 {
 /// 1 GHz assumption. glibc reads this only for coarse timing, so exact TSC
 /// frequency is not load-bearing for the fixtures.
 pub fn ticks_to_ns(ticks: u64) -> u64 {
+    ((ticks as u128 * 1_000_000_000) / tsc_hz() as u128) as u64
+}
+
+/// The TSC frequency in Hz, read once from CPUID leaf 0x16 and cached. Cached
+/// because the timer arbiter converts a TSC reading to nanoseconds on every
+/// deadline check, including inside the receive path's bounded busy-poll tier
+/// (docs/NETSTACK.md 16), and CPUID is a VM exit / serialising instruction.
+fn tsc_hz() -> u64 {
+    static TSC_HZ: AtomicU64 = AtomicU64::new(0);
+    let cached = TSC_HZ.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
     use core::arch::x86_64::__cpuid_count;
     let max_leaf = __cpuid_count(0, 0).eax;
     let mhz = if max_leaf >= 0x16 {
@@ -1168,7 +1260,8 @@ pub fn ticks_to_ns(ticks: u64) -> u64 {
     } else {
         1_000_000_000
     };
-    ((ticks as u128 * 1_000_000_000) / hz as u128) as u64
+    TSC_HZ.store(hz, Ordering::Relaxed);
+    hz
 }
 
 /// Calibration loop with a known instruction count: exactly 2

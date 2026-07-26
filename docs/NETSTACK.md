@@ -1398,16 +1398,9 @@ else                                               -> IdleMode::Poll
 - **`Poll`** - neither interrupt available: the honest bounded poll, where the CPU
   spins. Still deadline-honouring.
 
-**The timer slice is 500 microseconds** (`net_rx::TIMER_SLICE_NS`). The trade-off both
-ways: receive latency grows by at most one slice, and 500 us is invisible next to the
-millisecond-scale round trips this path serves (ARP, DHCP, DNS, a TCP RTO) and next to
-QEMU's own emulation jitter; in the other direction the slice must be well above the
-cost of arming the timer and re-polling the device (a handful of MSR/MMIO accesses,
-microseconds under QEMU TCG) so that **the halt dominates** and the duty cycle is
-around a percent instead of 100%. 500 us sits two orders of magnitude above the one and
-two below the other - shorter spends the saving back on bookkeeping, longer starts to
-show up as latency. A slice is also clamped to the remaining time, so it never
-overshoots the deadline.
+The slice was originally a single constant of **500 microseconds**. It is now chosen by
+an **adaptive, profile-aware policy** - see *Phase N2h* at the end of this section,
+which also removes the timer conflict this design had.
 
 ### Per-ISA wait status (honest)
 
@@ -1415,8 +1408,14 @@ overshoots the deadline.
 |---|---|---|---|
 | **RISC-V 64** | virtio-mmio (slot 7 on QEMU `virt`) | APLIC-S source `1+slot` in MSI mode -> this hart's IMSIC S-file (identity `16+slot`) -> `sip.SEIP`; dispatched by identity in `handle_ext_irq` | **NIC-interrupt-driven**, halts at `wfi` - genuine 0%-CPU park |
 | **ARM64** | virtio-mmio (slot 31 on QEMU `virt`) | GICv3 SPI `16+slot` (INTID `48+slot`) -> GICD -> `ICC_IAR1_EL1`, EOI via `ICC_EOIR1_EL1` | **NIC-interrupt-driven**, halts at `wfi` - genuine 0%-CPU park |
-| **x86-64** | virtio-**pci** (q35, driven through the `VIRTIO_PCI_CAP_PCI_CFG` tunnel) | **none wired** - see below | **timer-backed idle**: `hlt` for a 500 us LAPIC slice between receive-queue polls. A real halt, ~1% duty cycle - woken by the timer, *not* by the NIC |
+| **x86-64** | virtio-**pci** (q35, driven through the `VIRTIO_PCI_CAP_PCI_CFG` tunnel) | **none wired** - see below | **bounded poll**, the CPU spins. It was documented here as a "timer-backed idle" (`hlt` for a 500 us LAPIC slice); N2h **verified** that claim and found the LAPIC one-shot inert on this QEMU - see *Phase N2h* below |
 | *(no timer either)* | any | none | **bounded poll**, the CPU spins - the honest last resort |
+
+The `TimerIdle` mode itself is real and exercised - just not by x86-64 today. The
+`netwait` kernel runs its N2h policy phase **before wiring the NIC RX interrupt**, so
+on RISC-V and ARM64 the receive wait genuinely takes the timer-slice path there (300+
+real `wfi` halts per run, asserted); once the NIC line is up those ISAs rightly prefer
+the indefinite 0%-CPU park.
 
 x86-64's *NIC* interrupt is a documented gap, not a claim. The NIC there is driven
 *entirely through PCI configuration space* because PVH boot has no firmware to program
@@ -1498,6 +1497,189 @@ real; neither is dressed up as the other.
 - **Zero-copy receive**: the wait still copies from the virtqueue buffer into the
   cell's buffer. Landing payloads directly in a cell's arena pages (header/payload
   split + grant DMA) is N6.
+
+### Phase N2h (done): the kernel timer arbiter + the adaptive receive-poll policy
+
+N2d left two real defects in the wait path. Both are internal mechanism - **no new
+kernel object, no new verb, no new dependency, no per-ISA code outside `arch/`**.
+
+#### Defect 1: two subsystems, one hardware timer
+
+Every ISA has exactly **one** programmable one-shot behind `arch::timer_arm` /
+`timer_expired` / `timer_disarm` (RISC-V Sstc `stimecmp`, ARM64 `cntv_cval_el0`,
+x86-64 the LAPIC one-shot). Two independent subsystems armed it **directly**:
+
+- `net_rx::wait_frame` - the receive deadline, and the poll slices above;
+- `time::arm_timer` - `SYS_ARM_TIMER`, i.e. every cell's `sleep`/`timeout`/`interval`.
+
+Last-armer-wins, and each **disarmed the timer on its way out**. So the inner
+requester's completion destroyed the outer requester's deadline, and told it two lies
+at once: nothing was left armed to wake a halt, *and* `arch::timer_expired()` - which
+compares against the last-armed target, or on x86-64 reads a zeroed count - reported
+"your deadline elapsed" long before it had. **A lost deadline and a false expiry.**
+
+It was latent only because the OS is single-CPU cooperative and no path yet had two
+deadlines outstanding at once. It becomes fatal the moment a transport **paces
+continuously** (BBR) while a TCP RTO and a receive slice are also outstanding, so it
+is fixed before that is built.
+
+#### The arbiter (`kernel/src/ktimer.rs`, portable)
+
+> **Single-owner invariant: `ktimer` is the only caller of `arch::timer_arm` /
+> `timer_expired` / `timer_disarm` / `timer_park` in the kernel.**
+
+- A **fixed, allocation-free** table of five slots, one per `TimerClient`: `RxPoll`
+  (a receive poll slice), `RxDeadline` (a `SYS_WAIT_NET` timeout), `CellSleep`
+  (`SYS_ARM_TIMER`), `NetTimer` (the timer wheel / TCP RTO), and `Pacer` - **reserved
+  for BBR**, so the pacer is a `register` call rather than another subsystem reaching
+  for the hardware.
+- API: `register(client, in_ns)` / `cancel(client)` / `expired(client)` /
+  `pending(client)` / `service()` / `park(other_source)` / `now_ns()`.
+- The hardware is armed for the **nearest** deadline across all clients only.
+  `service()` marks **every** due client (not just the one the hardware was armed for,
+  so two deadlines in the same instant are both honoured) and then re-arms the nearest
+  **remaining** one. A `cancel` does the same - it can never disarm somebody else's
+  deadline. `ktimer::preserved()` counts exactly those survivals: the deadlines the old
+  pattern threw away.
+- Deadlines are **monotonic ns in the hardware timer's own domain**
+  (`arch::timer_now_ns()`, a new per-ISA seam). That matters on RISC-V, where the timer
+  runs on the `time` CSR at 10 MHz while `arch::cycles()` is the retired-instruction
+  counter - comparing across the two would make "20 ms" mean something different per
+  ISA. With **no** timer interrupt at all the arbiter touches no hardware and honours
+  every deadline by comparison, which is what the bounded-poll path needs.
+- `park` never halts on a one-shot that cannot fire: it re-arms the remaining delta
+  before every halt and refuses to halt while the hardware still reports its one-shot
+  elapsed. The timer and `now_ns` share a *domain* but not a *device* (x86-64 counts
+  the LAPIC's own clock, calibrated against the TSC), so a one-shot can fire slightly
+  early; that costs an extra wakeup, never a wedge.
+- **Enforcement is by construction**, not by a lint: the old
+  `arch::timer_wait(deadline)` - the arm-wait-disarm helper each subsystem called - is
+  **gone** from all three ISAs, replaced by `arch::timer_park()` (halt once, no arming,
+  no disarming). There is no per-ISA path left that can own the timer behind the
+  arbiter's back. Call sites rerouted: `net_rx::wait_frame` (the deadline **and** the
+  slices) and `time::arm_timer`.
+- **SMP** (task #27): the natural shape is one arbiter **per CPU** (each CPU has its
+  own one-shot) - the table moves into `smp.rs` per-CPU state with `this_cpu()`
+  selecting it, and a cross-CPU deadline becomes an IPI. Not built now; nothing here
+  assumes a global table beyond the statics.
+
+#### Defect 2: one fixed 500 us slice for every deployment
+
+A single constant is wrong in both directions - too much latency for `hft`, too many
+wakeups for `embedded` - and N waiters would mean N timers and N wakeups. The slice is
+now a **NAPI-style escalation** over three tiers, per deployment profile:
+
+| tier | when | what it does |
+|---|---|---|
+| **hot** | activity (a received frame, a NIC interrupt, **a transmit**) within `hot_window_ns` | a **bounded busy-poll** of at most `spin_polls` receive-queue checks - turns "one slice" of latency into spin granularity for back-to-back traffic |
+| **warm** | after the spin budget | `warm_slices` short timer slices |
+| **cold** | after those | long slices forever after - an idle link costs almost nothing |
+
+Where the **NIC interrupt** exists, warm/cold are a single **indefinite park** instead
+(the device is the wake source, so no slice is needed), and the hot tier is *not* used
+unless the profile explicitly opts in (`busy_poll_with_irq`, only `hft`): where a
+halted CPU can be woken by the device, a genuine 0%-CPU park beats burning cycles, so
+spinning there is a choice a deployment makes rather than a default.
+
+The constants mirror the `rheo-net` crate's profile features **by name and intent** (a
+kernel cannot read a userspace crate's cargo features, so the profile is selected
+kernel-side with `net_rx::set_profile`, defaulting to `Edge` exactly as the crate
+defaults to `edge`):
+
+| profile | hot window | spin polls | warm slice x count | cold slice | busy-poll with IRQ |
+|---|---|---|---|---|---|
+| `Hft` | 500 us | 4096 | 20 us x 16 | 100 us | **yes** |
+| `Edge` (default) | 100 us | 256 | 100 us x 8 | 1 ms | no |
+| `Warehouse` | 250 us | 512 | 250 us x 4 | 2 ms | no |
+| `Embedded` | 0 (never) | 0 | 2 ms x 1 | 10 ms | no |
+
+The trade-off, stated plainly: a slice bounds added receive latency, so short slices
+buy latency with wakeups; a wakeup costs an arm plus a device re-poll (microseconds
+under QEMU TCG), so the slice must stay well above that for **the halt to dominate**
+and the duty cycle to stay near a percent. `hft` spends CPU and power for
+sub-microsecond wakeups on a busy link; `embedded` gives up milliseconds to halt nearly
+all the time; `warehouse` batches; `edge` sits between.
+
+**One shared poll timer, by construction**: the slice is the single `RxPoll` arbiter
+slot, so N waiters can never become N timers (the thundering herd). Under today's
+single-CPU cooperative model there is at most one waiter, so that is a structural
+property, not something a test can exercise yet - stated rather than faked.
+
+#### Observability (so the duty cycle is measured, not claimed)
+
+`net_rx::spin_polls()`, `timer_slices()`, `halts()`, `escalations()`, `tier()`,
+`profile()`, `policy()`, `is_hot()`; and `ktimer::arms()`, `firings()`, `parks()`,
+`preserved()`. The N2d honesty accessors are unchanged in meaning:
+`interrupt_driven()` is still exactly "the NIC RX interrupt is wired", `did_idle()`
+"the wait halted", `idle_mode()` which mode ran - except that `did_idle()` is now set
+**only when a park genuinely halted the CPU**, where before it was set on intent just
+before the wait.
+
+#### What verification found on x86-64 (honest)
+
+Making the halt measurable rather than claimed immediately exposed a pre-existing
+defect. x86-64 drives its timer through the **x2APIC MSR block** (chosen because an
+MSR needs no mapping, so it works whichever page-table root is active when the
+interrupt lands). But QEMU 8.2's TCG `-cpu max` reports **CPUID.01H:ECX[21] = 0** (no
+x2APIC), and QEMU then treats the whole 0x800 MSR block as inert: the EXTD bit never
+latches in `IA32_APIC_BASE`, LVT/TMICT writes are dropped, and **TMCCT reads 0**.
+`timer_expired()` reads TMCCT, and 0 means "elapsed" - so on x86-64 **every** deadline
+read as already expired. Consequences, now fixed or disclosed:
+
+- `SYS_ARM_TIMER` returned **immediately** on x86-64: a cell's `time::sleep(1s)` did
+  not sleep. It now takes the cooperative deadline check and waits the real duration.
+- the receive wait's "timer-backed idle, ~1% duty cycle" was a spin that reported
+  `did_idle() == true`. It is now `IdleMode::Poll` - the CPU spins, reported, never
+  claimed.
+- `arch::enable_timer_irq()` on x86-64 now **probes**: arm a one-shot, briefly unmask,
+  and set `TIMER_ENABLED` only if the interrupt actually arrives (bounded by a 20 ms
+  window at boot). The claim "this ISA has a timer interrupt" rests on an interrupt the
+  kernel took. RISC-V (Sstc) and ARM64 (CNTV via the GICv3) pass unchanged and remain
+  genuine.
+- the same "claimed, not verified" pattern was in `librheo-orch`: it slept **4 us** and
+  asserted a WFI park. No machine can halt on a deadline nearer than the cost of arming
+  and checking it, so the park never happened. The sleep is now 2 ms and the park is
+  **genuinely proven** on RISC-V and ARM64.
+
+Reaching the LAPIC through its **xAPIC MMIO page** (0xFEE00000), which QEMU does
+model, is the fix for the *capability*; it needs that page mapped into every cell root
+and is its own phase. It may also revisit the x86-64 UART-RX/IOAPIC conclusion, since
+that diagnosis ("the LAPIC ISR/IRR read 0") was made through the same inert MSRs.
+
+#### The proof (`netwait`, all 3 ISAs)
+
+Kernel-side, before the cell runs (so the receive queue is provably empty - nothing has
+been transmitted yet) and before the NIC RX interrupt is wired (so the timer-slice
+tiers are reachable on RISC-V and ARM64):
+
+- **(A) the defect, reproduced.** Using the raw `arch::timer_*` primitives - the
+  pre-N2h pattern - an inner requester's arm+wait+disarm destroys an outer 20 ms
+  deadline and `arch::timer_expired()` then reports it elapsed ~1.4 ms in. Asserted as
+  a *false* expiry, so the old code demonstrably fails the property the arbiter holds.
+  Skipped with a reason where no verified one-shot exists (x86-64), since an inert timer
+  reports every deadline expired and would prove nothing.
+- **(B) three concurrent deadlines through the arbiter** (1 ms `RxPoll`, 5 ms
+  `NetTimer`, 15 ms `CellSleep`): the nearest fires first **and alone**; releasing it
+  leaves the other two armed; each subsequent one fires at or after **its own**
+  deadline, in order; the table is empty at the end; and `preserved() >= 2` - two
+  completions each re-armed a survivor.
+- **(C) the production shape**: a 30 ms `CellSleep` outstanding **across a full 5 ms
+  `net_rx` receive wait` - which registers and cancels a receive deadline and poll
+  slices of its own - is asserted still pending when the wait returns, then fires at
+  its own 30 ms. This is the exact interaction that was broken.
+- **the escalation**: the tier law asserted as a pure function
+  (`policy.tier(budget, spins, slices)`) across both boundaries per profile, then
+  observed - a 60 ms `Hft` wait on an empty queue records 4096 spin polls, then
+  (RISC-V/ARM64, no NIC IRQ yet) **319-331 genuine timer-slice halts**, 2 escalations,
+  ending in `Cold`; the `Embedded` contrast does the same wait with **0** spin polls and
+  halts only. x86-64 shows the spin tier and 0 halts, honestly (no timer).
+- **no regression**: RISC-V and ARM64 still assert `irq_count() > 0` (only ever
+  incremented from the ISA's interrupt vector) plus `did_idle()` for the cell's own
+  NIC-interrupt parks.
+
+A genuine **mid-spin arrival** is not asserted: QEMU offers no way to script a frame
+arriving at a chosen microsecond, so the mechanism is proven and the arrival is not
+faked.
 
 ## 17. Phase N4a (done): the network service cell + concurrent fan-out
 
@@ -1751,9 +1933,10 @@ park-until-frame primitive with a deadline. On **riscv64/aarch64** the kernel
 genuinely halts at WFI until the NIC's RX interrupt fires; on **x86-64** there is no
 NIC RX interrupt (its NIC is virtio-pci through the config tunnel: no mapped BAR for an
 MSI-X table, and legacy INTx rides the QEMU-TCG IOAPIC path that does not re-deliver),
-so the wait takes the **timer-backed idle** - `hlt` for a 500 us LAPIC slice between
-receive-queue polls, a real halt rather than a spin, honoured against the caller's
-deadline. Identical honesty to §16, which has the per-ISA table.
+so the wait takes the honest **bounded poll** - the CPU spins, with the caller's
+deadline still honoured to the nanosecond. (It was documented here as a timer-backed
+idle; N2h verified that claim and found the x86-64 LAPIC one-shot inert under QEMU TCG.)
+Identical honesty to §16, which has the per-ISA table.
 
 ### What is on the wire
 
@@ -2179,10 +2362,12 @@ result:
 The kernel then asserts the **wait mode** it actually used, which follows
 deterministically from the two interrupt predicates: `NicInterrupt` on riscv64 and
 aarch64 (with `did_idle()`, and 3-4 genuine device interrupts taken per run - a count
-only incrementable from the ISA's interrupt vector), `TimerIdle` on x86-64 (with
-`did_idle()` true and `interrupt_driven()` asserted **false**, so the halt is never
-dressed up as a NIC interrupt). That is the per-ISA claim of §16 checked at runtime
-rather than only written down.
+only incrementable from the ISA's interrupt vector), and the bounded `Poll` mode on
+x86-64 with `interrupt_driven()` asserted **false**, so a halt is never dressed up as a
+NIC interrupt. (x86-64 was `TimerIdle` here until N2h verified its LAPIC one-shot and
+found it inert - the mode follows the two interrupt predicates, so the assertion tracked
+the change automatically.) That is the per-ISA claim of §16 checked at runtime rather
+than only written down.
 
 ### What N4c defers (explicit)
 

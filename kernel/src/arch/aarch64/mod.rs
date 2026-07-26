@@ -315,7 +315,7 @@ extern "C" fn aarch64_irq_handler() {
             }
             PL011_ICR.write_volatile((1 << 4) | (1 << 6)); // clear RXIC | RTIC
         } else if id == TIMER_INTID {
-            // Mask the timer output so it stops asserting; timer_wait disarms.
+            // Mask the timer output so it stops asserting; the arbiter re-arms.
             asm!("msr cntv_ctl_el0, {0}", in(reg) 0b11u64); // ENABLE | IMASK
         } else if *core::ptr::addr_of!(NET_IRQ_ENABLED) && id == *core::ptr::addr_of!(NET_INTID) {
             // The NIC's receive line (docs/NETSTACK.md, rheo-net N2d): acknowledge
@@ -363,9 +363,12 @@ pub fn uart_inject_and_wait(b: u8) {
 /// The CNTVCT deadline the timer is currently armed for (0 = disarmed).
 static mut TIMER_TARGET: u64 = 0;
 
-/// Arm the CNTV virtual timer for `deadline_ns` from now, without waiting. Pair
-/// with [`timer_expired`] + [`timer_disarm`] to halt on the timer *and* another
-/// interrupt source (docs/NETSTACK.md: a receive with a deadline).
+/// Arm the CNTV virtual timer for `deadline_ns` from now, without waiting.
+///
+/// **Private mechanism of the timer arbiter** (`kernel/src/ktimer.rs`), the
+/// kernel's single owner of the one-shot: a subsystem that arms this directly
+/// cancels whatever another subsystem armed (docs/NETSTACK.md 16). Register a
+/// deadline with the arbiter instead.
 pub fn timer_arm(deadline_ns: u64) {
     // SAFETY: kernel context; generic-timer system registers.
     unsafe {
@@ -397,14 +400,29 @@ pub fn timer_disarm() {
     unsafe { asm!("msr cntv_ctl_el0, xzr") };
 }
 
-/// Arm the CNTV virtual timer for `deadline_ns` from now and halt at `wfi` until
-/// it fires (a genuine 0%-CPU park). Called only when [`timer_irq_enabled`].
-pub fn timer_wait(deadline_ns: u64) {
-    timer_arm(deadline_ns);
-    while !timer_expired() {
-        idle_wait(); // wfi, then take + service the pending IRQ (masks the timer)
+/// Monotonic now in nanoseconds **in the timer's own domain** - the virtual
+/// counter at CNTFRQ_EL0, the same domain [`timer_arm`]'s delta is expressed in
+/// (here it happens to be the same counter [`cycles`] reads). The timer arbiter
+/// (`kernel/src/ktimer.rs`) compares its deadlines against this.
+pub fn timer_now_ns() -> u64 {
+    // SAFETY: reading the generic-timer counter + frequency (always accessible).
+    unsafe {
+        let freq: u64;
+        asm!("mrs {0}, cntfrq_el0", out(reg) freq);
+        let now: u64;
+        asm!("isb", "mrs {0}, cntvct_el0", out(reg) now);
+        if freq == 0 {
+            return now;
+        }
+        ((now as u128 * 1_000_000_000) / freq as u128) as u64
     }
-    timer_disarm();
+}
+
+/// Halt the CPU until an enabled interrupt fires - the timer one-shot the arbiter
+/// armed, or any other wired source. Called only by `kernel/src/ktimer.rs`, which
+/// owns the hardware one-shot (docs/NETSTACK.md 16).
+pub fn timer_park() {
+    idle_wait(); // wfi, then take + service the pending IRQ (masks the timer)
 }
 
 // ----------------------------------------------------------------- traps

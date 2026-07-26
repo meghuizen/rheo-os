@@ -63,8 +63,15 @@ extern "C" fn main() -> i32 {
         AGG.store(sum, Ordering::Relaxed);
 
         // 3. the one-shot timer: the clock advances across a sleep.
+        //
+        // The deadline is milliseconds, not microseconds, on purpose. The kernel can
+        // only *halt* on a deadline that is further away than the cost of arming and
+        // checking it - a few microseconds under QEMU TCG - so a 4 us sleep was
+        // always already elapsed by the first check and the CPU never idled, even
+        // though the test claimed a WFI park (rheo-net N2h made that flag truthful:
+        // `time::timer_did_idle()` is now set only when a park genuinely halted).
         let start = time::now();
-        time::sleep(Duration::from_micros(4)).await;
+        time::sleep(Duration::from_millis(2)).await;
         if start.elapsed_ticks() > 0 {
             SLEPT.store(1, Ordering::Relaxed);
         }
