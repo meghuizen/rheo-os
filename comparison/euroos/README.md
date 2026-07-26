@@ -248,8 +248,12 @@ never for discarding free entropy, since mixing into a pool cannot
 reduce it.
 
 What rheo-os could take - and this is the strongest EuroOS-to-rheo
-lesson in this whole document: **jitter entropy with conservative
-crediting is the real fix for the no-hwrng fallback.** The RISC-V
+lesson in this whole document (**since implemented**: the credited
+multi-source pool with the hard gate, conservative jitter crediting,
+virtio-rng, and the firmware seed landed in `kernel/src/rng/pool.rs` +
+`kernel/src/hw/virtio_rng.rs`; the table above describes the earlier
+state): **jitter entropy with conservative crediting is the real fix
+for the no-hwrng fallback.** The RISC-V
 S-mode path today seeds from a cycle-counter loop that is flagged in
 the code as deterministic under QEMU icount - a structural floor, not
 entropy - and TIME-IDENTITY.md already says such a board needs a

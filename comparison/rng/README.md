@@ -77,3 +77,32 @@ TLS nonce, ECDSA nonce, UUID, cookie) and ~1.3x faster on bulk.
   length on all three ISAs is measured separately and deterministically by
   `cargo xtask bench` (the `rng_*` lines): ~23-25 instructions per byte for
   the scalar ChaCha20 DRBG, consistent across x86-64/ARM64/RISC-V.
+
+## The entropy-source companion (entropy_bench.rs)
+
+`run.sh` also builds and runs `entropy_bench.rs`, which measures the
+*sources* feeding the pool (docs/TIME-IDENTITY.md 4) rather than the draw
+path:
+
+- **Jitter quality and rate**, using the exact estimator the kernel ships
+  (`kernel/src/rng/pool.rs::estimate_jitter_bits`, mirrored): on the Xeon
+  host above, ~19.5M credited bits/s at a credit density of 0.20
+  bits/sample (bound 0.25) - the 256-bit seeding gate is reachable on
+  jitter alone in ~13 us. Under QEMU `-icount` the same estimator credits
+  ~0, which is the honest answer for deterministic emulation.
+- **Estimator sanity**: constant input credits 0; the per-window cap holds.
+- **Acceleration headroom**: a runtime-dispatched AVX2 8-block ChaCha20,
+  verified bit-for-bit against the scalar kernel core, then measured -
+  ~2150 MB/s vs ~505 MB/s scalar (4.3x) on this host. The kernel cannot
+  take this path yet (its targets are soft-float; SIMD needs U-mode
+  FP/SIMD state handling), so this number is the recorded headroom for
+  when that lands, and the dispatch pattern (verify, then select the
+  widest path that wins) is the crypto-dispatch rule of
+  TARGET-ARCHITECTURES.md 4 in miniature.
+
+The in-kernel entropy-path lengths are on the `entropy_*` lines of
+`cargo xtask bench`: one credited 32-byte absorb ~2.7k instructions, the
+branchless health-test batch over 64 hwrng words ~21k (seed/reseed only),
+the jitter estimate over a 64-delta window ~0.8k, and the per-event
+fast-mix stir **14 instructions** - cheap enough for the PTY input and
+virtio completion paths it sits on.

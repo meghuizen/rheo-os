@@ -46,6 +46,7 @@ static mut WORKER_STACK: [u8; 16 * 1024] = [0; 16 * 1024];
 static mut RNG_DRBG: Drbg = Drbg::ZERO;
 static mut RNG_BUF32: [u8; 32] = [0; 32];
 static mut RNG_KBUF: [u8; 1024] = [0; 1024];
+static mut ENTROPY_WORDS: [u64; 64] = [0; 64];
 
 // Heap for the strand-runtime (P4) bench: spawn/join allocate.
 #[global_allocator]
@@ -271,6 +272,33 @@ extern "C" fn kernel_main() -> ! {
     bench("rng_u64_plus_doorbell", || {
         core::hint::black_box(drbg.next_u64());
         arch::doorbell_trap();
+    });
+    // Entropy-pool path lengths (TIME-IDENTITY.md 4): the cost of feeding
+    // the pool, not of drawing from a DRBG. entropy_absorb_32B is one
+    // credited absorb (header + one chunk, two ChaCha blocks);
+    // entropy_health_64w is the branchless SP 800-90B-style test batch over
+    // 64 hwrng words; entropy_jitter_est is the credit estimator over a
+    // 64-delta window; entropy_mix_event is the per-event fast-mix stir
+    // that sits on I/O paths (must stay a handful of instructions).
+    let mut epool = kernel::rng::pool::EntropyPool::new();
+    let mut echunk = [0u8; 32];
+    drbg.fill_bytes(&mut echunk);
+    bench("entropy_absorb_32B", || {
+        epool.absorb(kernel::rng::pool::Source::HwRng, &echunk, 0);
+        core::hint::black_box(&epool);
+    });
+    let ewords = unsafe { &mut *core::ptr::addr_of_mut!(ENTROPY_WORDS) };
+    for w in ewords.iter_mut() {
+        *w = drbg.next_u64();
+    }
+    bench("entropy_health_64w", || {
+        core::hint::black_box(kernel::rng::pool::health_ok(ewords));
+    });
+    bench("entropy_jitter_est", || {
+        core::hint::black_box(kernel::rng::pool::estimate_jitter_bits(ewords));
+    });
+    bench("entropy_mix_event", || {
+        kernel::rng::mix_event(core::hint::black_box(0x5EED_5EED_5EED_5EEDu64));
     });
 
     // ------------------------------------------------------------- P4

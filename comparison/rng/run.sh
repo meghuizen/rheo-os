@@ -5,6 +5,11 @@
 # icount benches which measure instruction path length only.
 set -e
 dir=$(dirname "$0")
-out=$(mktemp -d)/getrandom_bench
-rustc -O -C target-cpu=native -o "$out" "$dir/getrandom_bench.rs"
-exec "$out"
+tmp=$(mktemp -d)
+rustc -O -C target-cpu=native -o "$tmp/getrandom_bench" "$dir/getrandom_bench.rs"
+"$tmp/getrandom_bench"
+echo
+# The entropy-source companion: jitter quality/rate + the AVX2 headroom
+# measurement (runtime-dispatched, verified against the scalar core).
+rustc -O -o "$tmp/entropy_bench" "$dir/entropy_bench.rs"
+exec "$tmp/entropy_bench"

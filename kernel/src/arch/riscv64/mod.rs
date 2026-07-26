@@ -185,8 +185,9 @@ pub const VIRTIO_MMIO_COUNT: usize = 8;
 /// `seed` CSR at 0x015) is an M-mode CSR; S-mode access must be granted by
 /// M-mode via mseccfg.sseed, which this OpenSBI/QEMU configuration does not
 /// enable, so reading it would trap. A real RISC-V board with Zkr and the
-/// mseccfg grant (or an SBI entropy call) would return true here. The root
-/// DRBG falls back accordingly (rng::SeedSource::Fallback).
+/// mseccfg grant (or an SBI entropy call) would return true here. Seeding
+/// on this ISA therefore leans on the other pool sources - the firmware
+/// `/chosen/rng-seed` and virtio-rng (docs/TIME-IDENTITY.md 4).
 pub fn has_hwrng() -> bool {
     false
 }

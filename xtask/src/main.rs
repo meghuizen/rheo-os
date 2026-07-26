@@ -118,6 +118,10 @@ impl Arch {
                 "4",
                 "-device",
                 "isa-debug-exit,iobase=0xf4,iosize=0x04",
+                // Host-fed entropy for the kernel pool (TIME-IDENTITY.md 4);
+                // modern-only layout for the PCI-config-tunnel driver.
+                "-device",
+                "virtio-rng-pci,disable-legacy=on",
             ],
             Arch::Aarch64 => &[
                 "-machine",
@@ -132,6 +136,12 @@ impl Arch {
                 "4",
                 "-semihosting-config",
                 "enable=on,target=native",
+                // Host-fed entropy over modern virtio-mmio (the driver only
+                // speaks version 2; QEMU defaults to the legacy layout).
+                "-global",
+                "virtio-mmio.force-legacy=false",
+                "-device",
+                "virtio-rng-device",
             ],
             Arch::Riscv64 => &[
                 "-machine",
@@ -144,6 +154,11 @@ impl Arch {
                 "4",
                 "-bios",
                 "default",
+                // Host-fed entropy over modern virtio-mmio (see aarch64).
+                "-global",
+                "virtio-mmio.force-legacy=false",
+                "-device",
+                "virtio-rng-device",
             ],
         }
     }

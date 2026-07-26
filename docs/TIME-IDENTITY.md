@@ -5,18 +5,39 @@
 SECURITY-IDENTITY.md.
 
 **Implemented (section 4):** the ChaCha20 per-cell DRBG with fast key
-erasure (`kernel/src/rng/`), hardware seeding with health tests, and
-non-blocking draws. See `kernel/src/rng/mod.rs`, the `rng` test kernel, and
-the host comparison in `comparison/rng/` (rheo-os ~4.8x faster than Linux
-`getrandom` on key/nonce-sized draws). The "library call, not a syscall"
-fast path (section 4) is proven at the primitive level - the host benchmark
-calls the DRBG directly - but the lsh `rand` builtin currently draws via
-`SYS_RANDOM`: linking the DRBG into a U-mode cell needs the strand runtime's
-`.user` heap + `mem*` shims (the `.user.text` window forbids the out-of-line
-calls a full DRBG emits), which is the same deferred U-mode-runtime
-integration noted in CONCURRENCY.md.
-Deferred: continuous background reseed scheduling, checkpoint/restore reseed
-(no checkpoint yet), attested seed configuration, virtio-rng feeding.
+erasure (`kernel/src/rng/`), seeded from a **credited multi-source entropy
+pool** (`kernel/src/rng/pool.rs`) with a **hard gate**: the root DRBG is
+instantiated - and any random byte handed out - only once 256 credited bits
+have been gathered. Sources, mixed in the Linux many-mediocre-sources style
+(every available source contributes; credit is per-source and conservative):
+the per-ISA hardware RNG (RDSEED/RDRAND, RNDR) vetted by continuous
+SP 800-90B-style health tests written branchless (no secret-dependent
+branches); the firmware boot seed (`/chosen/rng-seed` from the device tree,
+the path real RISC-V firmware and QEMU both fill); a **virtio-rng driver**
+(`kernel/src/hw/virtio_rng.rs`, both virtio-mmio and the virtio-pci
+config-window transport, all three ISAs); **timing-jitter entropy** credited
+conservatively at 1/4 bit per noisy delta (delta-of-delta, low-nibble test) -
+under QEMU `-icount` the estimator self-reports ~0 bits, so deterministic
+emulation never earns credit it does not have; and uncredited event timing
+(PTY input arrival, virtio completion times) folded in for defense in depth.
+Where a source is absent its slot is skipped; where all credited sources are
+absent the pool refuses to seed and consumers get an error, never weak bytes
+(the attestation stance of BOOT.md 4 enforced locally). See the `rng` test
+kernel, the `entropy_*`/`rng_*` lines of `cargo xtask bench`, and the host
+comparison in `comparison/rng/` (~4.8x faster than Linux `getrandom` on
+key/nonce-sized draws; the AVX2 multi-block path there measures the SIMD
+headroom the soft-float kernel targets cannot use yet). The "library call,
+not a syscall" fast path is proven at the primitive level - the host
+benchmark calls the DRBG directly - but the lsh `rand` builtin currently
+draws via `SYS_RANDOM`: linking the DRBG into a U-mode cell needs the strand
+runtime's `.user` heap + `mem*` shims (the `.user.text` window forbids the
+out-of-line calls a full DRBG emits), which is the same deferred
+U-mode-runtime integration noted in CONCURRENCY.md.
+Deferred: scheduled background reseed (reseed is on-demand +
+draw-count-triggered today), checkpoint/restore reseed (no checkpoint yet),
+attested seed configuration, TPM/board-TRNG drivers (the pool has their
+source slots reserved), in-kernel SIMD ChaCha (needs U-mode FP/SIMD state
+handling first).
 
 Position: three problems OSes habitually blur, kept strictly apart - **what
 time is it** (clock sync), **what order did things happen** (causality), and

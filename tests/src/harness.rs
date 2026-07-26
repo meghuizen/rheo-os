@@ -86,7 +86,12 @@ pub unsafe fn build_shell_cell(
     // Seed the cell's per-cell DRBG from the root (docs/TIME-IDENTITY.md 4):
     // the kernel seeds at cell creation; the cell then draws bytes as a
     // library call over this state, no syscall.
-    kernel::rng::derive_cell_drbg().fill_bytes(&mut store.io.rng_key);
+    // The hard seeding gate holds here too: a cell is never created with a
+    // weak key. In the QEMU test environment a source is always present
+    // (hwrng, the firmware seed, or virtio-rng).
+    kernel::rng::derive_cell_drbg()
+        .expect("rng unseeded: no credited entropy source on this machine")
+        .fill_bytes(&mut store.io.rng_key);
 
     let stack_top = stack_addr + STACK_BYTES;
     let frame = arch::trapframe_new(entry as usize, stack_top, io_addr, kernel_sp);

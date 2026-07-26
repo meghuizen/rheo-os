@@ -17,6 +17,7 @@ use crate::time;
 use crate::{mm, pty, user};
 
 static mut DRBG: Drbg = Drbg::ZERO;
+static mut DRBG_OK: bool = false;
 static mut EVENTS: EventStream = EventStream::new();
 static mut ADMISSION: Admission = Admission::new();
 static mut ENGINE: Engine = Engine::cpu();
@@ -25,9 +26,35 @@ static mut READY: bool = false;
 /// One-time init: seed the per-cell DRBG and attach (measure) the engine.
 pub fn init() {
     unsafe {
-        *core::ptr::addr_of_mut!(DRBG) = rng::derive_cell_drbg();
+        if let Some(d) = rng::derive_cell_drbg() {
+            *core::ptr::addr_of_mut!(DRBG) = d;
+            *core::ptr::addr_of_mut!(DRBG_OK) = true;
+        } else {
+            crate::println!("svc: rng unseeded - SYS_RANDOM will refuse (returns 0)");
+        }
         (*core::ptr::addr_of_mut!(ENGINE)).attach();
         *core::ptr::addr_of_mut!(READY) = true;
+    }
+}
+
+/// SYS_RANDOM: a draw from the service DRBG. The hard seeding gate
+/// (docs/TIME-IDENTITY.md 4) means an unseeded host returns 0 and logs,
+/// never weak bytes; a late-arriving source is picked up by retrying the
+/// derive on the next call.
+fn random_u64() -> u64 {
+    // SAFETY: single-vcore kernel; the service DRBG is only touched here
+    // and in init.
+    unsafe {
+        if !*core::ptr::addr_of!(DRBG_OK) {
+            match rng::derive_cell_drbg() {
+                Some(d) => {
+                    *core::ptr::addr_of_mut!(DRBG) = d;
+                    *core::ptr::addr_of_mut!(DRBG_OK) = true;
+                }
+                None => return 0,
+            }
+        }
+        (*core::ptr::addr_of_mut!(DRBG)).next_u64()
     }
 }
 
@@ -43,7 +70,7 @@ pub fn handle(nr: u64, args: &[u64; 6]) -> Option<u64> {
         SYS_READLINE => Some(read_line(arg)),
         SYS_WRITE => Some(write(arg)),
         SYS_UPTIME => Some(time::uptime_ticks()),
-        SYS_RANDOM => Some(unsafe { (*core::ptr::addr_of_mut!(DRBG)).next_u64() }),
+        SYS_RANDOM => Some(random_u64()),
         SYS_MEMINFO => {
             let (free, total) = mm::frames::stats();
             Some(((free as u64) << 32) | total as u64)

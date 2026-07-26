@@ -97,9 +97,14 @@ pub fn setup_stack(
         str_vas[i] = write_bytes(page, &mut off, s, true);
     }
 
-    // 16 random bytes for AT_RANDOM, just above the pointer block.
+    // 16 random bytes for AT_RANDOM, just above the pointer block. The hard
+    // seeding gate applies: glibc uses AT_RANDOM for stack-protector canaries
+    // and pointer guards, so an unseeded host must not exec, not exec weakly.
     let mut rnd = [0u8; 16];
-    crate::rng::derive_cell_drbg().fill_bytes(&mut rnd);
+    match crate::rng::derive_cell_drbg() {
+        Some(mut d) => d.fill_bytes(&mut rnd),
+        None => panic!("linux: exec refused - rng unseeded (no credited entropy source)"),
+    }
     let random_va = write_bytes(page, &mut off, &rnd, false);
 
     // The auxv pairs (type, value), AT_NULL last. AT_PHDR is emitted only if

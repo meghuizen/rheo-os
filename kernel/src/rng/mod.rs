@@ -1,27 +1,38 @@
 //! Cryptographic randomness (docs/TIME-IDENTITY.md 4, ARCHITECTURE.md 3
-//! object 9). A ChaCha20 DRBG with fast key erasure replaces the old
-//! SplitMix64 placeholder:
+//! object 9). A ChaCha20 DRBG with fast key erasure over a **credited
+//! multi-source entropy pool** with a **hard seeding gate**:
 //!
 //! - **Cryptographically strong**: ChaCha20 keystream (rng::chacha, verified
 //!   against the RFC 8439 vector), the same primitive Linux's CRNG uses.
 //! - **Forward secret**: every refill consumes the first 32 keystream bytes
 //!   to re-key, so recovering the current state never reveals past output
 //!   (fast key erasure, as in Linux `get_random_bytes` and BoringSSL).
-//! - **Non-blocking**: generation always returns from the buffered keystream;
-//!   only *seeding* touches the entropy source, and even that is bounded-
-//!   retry with a fallback - there is no blocking "entropy pool" (the doc's
-//!   "seeding is the only critical moment").
-//! - **Hardware-seeded when available**: the root DRBG is seeded from the
-//!   per-ISA hardware RNG (x86 RDSEED/RDRAND, ARM64 RNDR) after SP 800-90B
-//!   style health tests; where no usable hwrng exists (RISC-V S-mode has no
-//!   access to the Zkr seed CSR here) it falls back to a documented floor.
-//! - **Per-cell streams**: each cell gets its own DRBG derived from the root,
-//!   so a cell reads random bytes as a library call over its own state - no
-//!   shared pool, no cross-cell side channel, no syscall on the fast path.
+//! - **Multi-source, credited** (rng::pool): the hardware RNG (RDSEED /
+//!   RDRAND / RNDR, vetted by branchless SP 800-90B-style health tests),
+//!   the firmware boot seed (`/chosen/rng-seed` from the device tree), a
+//!   virtio-rng device (hw::virtio_rng, all three ISAs), timing jitter
+//!   credited conservatively (1/4 bit per noisy delta - honestly ~0 under
+//!   deterministic QEMU icount), and uncredited event timing. Every present
+//!   source is mixed; credit is the gate.
+//! - **Hard gate, no weak fallback**: until 256 credited bits arrive the
+//!   root does not exist, `derive_cell_drbg` returns None, and consumers
+//!   refuse rather than mint weak keys (BOOT.md 4's attestation stance,
+//!   enforced locally). Seeding is the only blocking moment; after it,
+//!   generation always returns from buffered keystream.
+//! - **Per-cell streams**: each cell gets its own DRBG derived from the
+//!   root, so a cell reads random bytes as a library call over its own
+//!   state - no shared pool, no cross-cell side channel, no syscall on the
+//!   fast path.
+//! - **Branchless hot paths**: the ChaCha core, the pool conditioner, the
+//!   health tests, and the jitter estimator contain no secret-dependent
+//!   branches (constant indices, `ct_eq64` masks); `fill_bytes` branches
+//!   only on public buffer positions.
 
 pub mod chacha;
+pub mod pool;
 
 use crate::arch;
+use pool::{EntropyPool, Source};
 
 /// Output bytes handed out between refills. Each refill produces 32 bytes to
 /// re-key plus this many output bytes of keystream.
@@ -29,6 +40,11 @@ const OUT: usize = 256;
 /// Keystream bytes per refill: 32 (rekey) + OUT, rounded up to whole blocks.
 const KS_BLOCKS: usize = (32 + OUT).div_ceil(64); // 5 blocks = 320 bytes
 const KS_BYTES: usize = KS_BLOCKS * 64;
+
+/// Root draws between opportunistic reseeds (derives are rare, so this
+/// mostly matters for long-lived hosts; SP 800-90A's reseed-interval idea
+/// applied to the root).
+const ROOT_RESEED_INTERVAL: u64 = 512;
 
 /// A ChaCha20 deterministic random bit generator with fast key erasure.
 #[derive(Copy, Clone)]
@@ -59,7 +75,7 @@ impl Drbg {
         }
     }
 
-    /// Seed from 64 bits. A compatibility shim (tests, weak fallbacks) that
+    /// Seed from 64 bits. A compatibility shim (tests, benchmarks) that
     /// spreads the value across the key with SplitMix64 diffusion; it is NOT
     /// a substitute for `from_key` fed by real entropy.
     pub fn from_seed(seed: u64) -> Drbg {
@@ -152,183 +168,200 @@ fn splitmix(seed: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-// ------------------------------------------------------- root seeding
+// ------------------------------------------------------- root management
 
-/// Where the root DRBG's seed came from (reported by the `rand` tooling and
-/// the boot attestation story - a host must be able to say what seeded it).
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum SeedSource {
-    /// Seeded from the hardware RNG, health tests passed.
-    Hwrng,
-    /// Hardware RNG present but failed health/liveness - fell back.
-    HwrngRejected,
-    /// No usable hardware RNG; documented weak floor.
-    Fallback,
-    /// Not yet seeded.
-    None,
+/// How the root stands: credited bits, contributing sources, and whether
+/// the hard gate has been passed. This is what the boot attestation story
+/// reports - a host must be able to say what seeded it.
+#[derive(Copy, Clone, Debug)]
+pub struct SeedReport {
+    pub seeded: bool,
+    pub credited_bits: u32,
+    /// Bitmask over `pool::SOURCE_NAMES`.
+    pub sources: u32,
 }
 
+static mut POOL: EntropyPool = EntropyPool::new();
 static mut ROOT: Drbg = Drbg::ZERO;
-static mut SEED_SOURCE: SeedSource = SeedSource::None;
+static mut SEEDED: bool = false;
+static mut ROOT_DRAWS: u64 = 0;
+static mut VIRTIO: Option<crate::hw::virtio_rng::VirtioRng> = None;
 
-/// Seed the root DRBG. Called once during arch::init, before any cell runs.
+fn pool_mut() -> &'static mut EntropyPool {
+    // SAFETY: single-vcore kernel (SMP bring-up is future work).
+    unsafe { &mut *core::ptr::addr_of_mut!(POOL) }
+}
+
+/// Seed the root DRBG from every available source. Called once during
+/// arch::init, after hw discovery (the firmware tables and PCI bus must be
+/// up) and before any cell runs.
 pub fn init() {
-    let mut key = [0u8; 32];
-    let src = gather_seed(&mut key);
+    let p = pool_mut();
+
+    // 1. Hardware RNG instruction, health-tested, full credit on pass.
+    absorb_hwrng(p, 64);
+
+    // 2. Firmware boot seed (`/chosen/rng-seed`): what real firmware and
+    //    QEMU both provide on device-tree platforms. Full credit, capped.
+    if let Some(seed) = crate::hw::fdt::rng_seed() {
+        let credit = core::cmp::min(seed.len() as u32 * 8, pool::THRESHOLD_BITS);
+        p.absorb(Source::FirmwareSeed, seed, credit);
+    }
+
+    // 3. virtio-rng: host-fed entropy on any of the three ISAs' QEMU
+    //    machines (and cloud guests). Full credit per delivered byte.
+    let dev = crate::hw::virtio_rng::probe();
+    if let Some(ref d) = dev {
+        absorb_virtio(p, d);
+    }
+    // SAFETY: single-vcore init.
+    unsafe { *core::ptr::addr_of_mut!(VIRTIO) = dev };
+
+    // 4. Timing jitter, conservatively credited (honest zero under icount).
+    pool::gather_jitter(p, 32);
+
+    // 5. Always-mixed, never-credited: the cycle counter and any early
+    //    event timing. Mixing cannot reduce the pool; only credit gates.
+    p.absorb(Source::Event, &arch::cycles().to_le_bytes(), 0);
+    pool::drain_events(p);
+
+    try_instantiate();
+    let r = seed_report();
+    if !r.seeded {
+        crate::println!(
+            "rng: UNSEEDED - {} of {} credited bits; refusing to serve random bytes",
+            r.credited_bits,
+            pool::THRESHOLD_BITS
+        );
+    }
+}
+
+/// Instantiate (or leave) the root according to the pool gate.
+fn try_instantiate() {
+    // SAFETY: single-vcore kernel.
     unsafe {
-        *core::ptr::addr_of_mut!(ROOT) = Drbg::from_key(key);
-        *core::ptr::addr_of_mut!(SEED_SOURCE) = src;
-    }
-    for b in key.iter_mut() {
-        unsafe { core::ptr::write_volatile(b, 0) };
-    }
-}
-
-/// How the root DRBG was seeded.
-pub fn seed_source() -> SeedSource {
-    unsafe { *core::ptr::addr_of!(SEED_SOURCE) }
-}
-
-/// Mint a fresh per-cell DRBG derived from the root.
-pub fn derive_cell_drbg() -> Drbg {
-    let root = unsafe { &mut *core::ptr::addr_of_mut!(ROOT) };
-    root.derive()
-}
-
-/// Pull fresh entropy from the hardware RNG (if any) and fold it into the
-/// root. Continuous reseeding; safe to call periodically. Returns true if
-/// hardware entropy was actually mixed in.
-pub fn reseed_root() -> bool {
-    let mut pool = [0u64; 8];
-    let got = gather_hwrng(&mut pool);
-    if got >= 4 && health_ok(&pool[..got]) {
-        let mut chunk = [0u8; 32];
-        fold(&pool[..got], &mut chunk);
-        let root = unsafe { &mut *core::ptr::addr_of_mut!(ROOT) };
-        root.reseed(&chunk);
-        true
-    } else {
-        false
+        if *core::ptr::addr_of!(SEEDED) {
+            return;
+        }
+        if let Some(key) = pool_mut().squeeze_key() {
+            *core::ptr::addr_of_mut!(ROOT) = Drbg::from_key(key);
+            *core::ptr::addr_of_mut!(SEEDED) = true;
+        }
     }
 }
 
-/// Collect raw hwrng samples into `pool`; returns how many were obtained.
-fn gather_hwrng(pool: &mut [u64]) -> usize {
+/// Pull hwrng words through the health tests into the pool. Words are
+/// credited at full width only when the whole batch passes; a failing
+/// batch is still mixed, at zero credit.
+fn absorb_hwrng(p: &mut EntropyPool, want_words: usize) -> bool {
     if !arch::has_hwrng() {
-        return 0;
+        return false;
     }
+    let mut pool_words = [0u64; 64];
+    let want = core::cmp::min(want_words, 64);
     let mut got = 0;
-    for slot in pool.iter_mut() {
+    while got < want {
         match arch::hwrng_u64() {
             Some(v) => {
-                *slot = v;
+                pool_words[got] = v;
                 got += 1;
             }
             None => break,
         }
     }
-    got
+    if got < 8 {
+        return false;
+    }
+    let ok = pool::health_ok(&pool_words[..got]);
+    let mut bytes = [0u8; 64 * 8];
+    for (i, w) in pool_words[..got].iter().enumerate() {
+        bytes[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+    }
+    let credit = if ok { got as u32 * 64 } else { 0 };
+    p.absorb(Source::HwRng, &bytes[..got * 8], credit);
+    ok
 }
 
-/// Build a 256-bit seed key. Prefers the hardware RNG; validates it with
-/// SP 800-90B style health tests before trusting it.
-fn gather_seed(key: &mut [u8; 32]) -> SeedSource {
-    if arch::has_hwrng() {
-        let mut pool = [0u64; 64];
-        let got = gather_hwrng(&mut pool);
-        if got >= 32 && health_ok(&pool[..got]) {
-            fold(&pool[..got], key);
-            return SeedSource::Hwrng;
-        }
-        fallback_key(key);
-        return SeedSource::HwrngRejected;
+/// Pull one buffer from virtio-rng into the pool at full credit.
+fn absorb_virtio(p: &mut EntropyPool, d: &crate::hw::virtio_rng::VirtioRng) -> bool {
+    let mut buf = [0u8; 64];
+    let n = d.fill(&mut buf);
+    if n == 0 {
+        return false;
     }
-    fallback_key(key);
-    SeedSource::Fallback
+    p.absorb(Source::VirtioRng, &buf[..n], n as u32 * 8);
+    true
 }
 
-/// SP 800-90B style health checks on full-entropy 64-bit words: Repetition
-/// Count Test (no consecutive repeats), Adaptive Proportion Test (no value
-/// over-represented in the window), and a stuck-at check (bits vary).
-fn health_ok(s: &[u64]) -> bool {
-    // Repetition Count Test.
-    let mut i = 1;
-    while i < s.len() {
-        if s[i] == s[i - 1] {
-            return false;
-        }
-        i += 1;
+/// The current seed report (see `SeedReport`).
+pub fn seed_report() -> SeedReport {
+    // SAFETY: single-vcore kernel.
+    let p = pool_mut();
+    SeedReport {
+        seeded: unsafe { *core::ptr::addr_of!(SEEDED) },
+        credited_bits: p.credited_bits(),
+        sources: p.sources(),
     }
-    // Adaptive Proportion Test: with 64-bit full-entropy words even two
-    // matches in the window is astronomically unlikely, so cap occurrences.
-    let cutoff = (s.len() / 8).max(2);
-    let mut i = 0;
-    while i < s.len() {
-        let mut c = 0;
-        let mut j = 0;
-        while j < s.len() {
-            if s[j] == s[i] {
-                c += 1;
+}
+
+/// Has the hard gate been passed?
+pub fn is_seeded() -> bool {
+    // SAFETY: single-vcore kernel.
+    unsafe { *core::ptr::addr_of!(SEEDED) }
+}
+
+/// Stir an event timestamp into the fast pool (see pool::mix_event).
+/// Re-exported so I/O paths depend on `rng`, not on pool internals.
+#[inline]
+pub fn mix_event(v: u64) {
+    pool::mix_event(v);
+}
+
+/// Mint a fresh per-cell DRBG derived from the root, or None while the
+/// hard gate holds. Derives count as root draws and trigger opportunistic
+/// reseeds so long-lived hosts keep folding fresh entropy in.
+pub fn derive_cell_drbg() -> Option<Drbg> {
+    // SAFETY: single-vcore kernel.
+    unsafe {
+        if !*core::ptr::addr_of!(SEEDED) {
+            // A source may have come alive since init (e.g. events).
+            reseed_root();
+            if !*core::ptr::addr_of!(SEEDED) {
+                return None;
             }
-            j += 1;
         }
-        if c > cutoff {
-            return false;
+        let draws = core::ptr::addr_of_mut!(ROOT_DRAWS);
+        *draws += 1;
+        if (*draws).is_multiple_of(ROOT_RESEED_INTERVAL) {
+            reseed_root();
         }
-        i += 1;
+        Some((*core::ptr::addr_of_mut!(ROOT)).derive())
     }
-    // Stuck-at: no bit is constant across the whole window.
-    let mut orv = 0u64;
-    let mut andv = u64::MAX;
-    for &v in s {
-        orv |= v;
-        andv &= v;
-    }
-    orv != 0 && andv != u64::MAX
 }
 
-/// Absorb `pool` entropy into a 256-bit key by ChaCha20 diffusion: seed a
-/// working DRBG from the first words, then reseed it with the rest so every
-/// sample influences the output, and squeeze out 32 bytes.
-fn fold(pool: &[u64], key: &mut [u8; 32]) {
-    let mut k = [0u8; 32];
-    let mut i = 0;
-    while i < 4 {
-        let v = pool[i % pool.len()];
-        k[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
-        i += 1;
-    }
-    let mut d = Drbg::from_key(k);
-    let mut idx = 0;
-    while idx < pool.len() {
-        let mut chunk = [0u8; 32];
-        let mut j = 0;
-        while j < 4 {
-            let v = pool[(idx + j) % pool.len()];
-            chunk[j * 8..j * 8 + 8].copy_from_slice(&v.to_le_bytes());
-            j += 1;
-        }
-        d.reseed(&chunk);
-        idx += 4;
-    }
-    d.fill_bytes(key);
-}
+/// Gather fresh entropy from every live source and fold it into the pool
+/// (and the root, if seeded); instantiates the root if the gate is newly
+/// passed. Returns true if any *credited* entropy was mixed in.
+pub fn reseed_root() -> bool {
+    let p = pool_mut();
 
-/// Last-resort seed with no hardware RNG. Mixes the cycle counter through a
-/// timing loop. NOTE: under QEMU -icount this is deterministic (no real
-/// jitter), so it is a structural floor, not a source of real entropy - a
-/// board without hwrng needs a genuine jitter/TRNG source (TIME-IDENTITY.md).
-fn fallback_key(key: &mut [u8; 32]) {
-    let mut acc = 0x9E37_79B9_7F4A_7C15u64 ^ arch::cycles();
-    let mut d = Drbg::from_seed(acc);
-    let mut r = 0;
-    while r < 64 {
-        acc ^= arch::cycles().rotate_left((acc & 63) as u32);
-        let mut chunk = [0u8; 32];
-        let mut dd = Drbg::from_seed(acc);
-        dd.fill_bytes(&mut chunk);
-        d.reseed(&chunk);
-        r += 1;
+    // Each helper reports whether it mixed *credited* entropy; the ledger
+    // itself is capped, so "fresh credit arrived" must be tracked per call.
+    let mut credited = absorb_hwrng(p, 8);
+    // SAFETY: single-vcore kernel; VIRTIO is set once during init.
+    if let Some(d) = unsafe { (*core::ptr::addr_of!(VIRTIO)).as_ref() } {
+        credited |= absorb_virtio(p, d);
     }
-    d.fill_bytes(key);
+    credited |= pool::jitter_once(p) > 0;
+    pool::drain_events(p);
+    try_instantiate();
+    // SAFETY: single-vcore kernel.
+    unsafe {
+        if *core::ptr::addr_of!(SEEDED)
+            && let Some(key) = pool_mut().squeeze_key()
+        {
+            (*core::ptr::addr_of_mut!(ROOT)).reseed(&key);
+        }
+    }
+    credited
 }

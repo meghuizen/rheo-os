@@ -1,13 +1,16 @@
 //! In-QEMU test kernel for the cryptographic RNG (docs/TIME-IDENTITY.md 4).
-//! Verifies the ChaCha20 core against the RFC 8439 test vector, then the
-//! DRBG's determinism, independence, reseed, and statistical sanity, and
-//! reports the hardware-RNG seed source discovered on this machine.
+//! Verifies the ChaCha20 core against the RFC 8439 test vector, the DRBG's
+//! determinism, independence, reseed, and statistical sanity, and then the
+//! credited multi-source entropy pool: the hard seeding gate, the branchless
+//! health tests, the conservative jitter estimator, the per-source credit
+//! ledger, and the live sources on this machine (hwrng / firmware seed /
+//! virtio-rng).
 
 #![no_std]
 #![no_main]
 
-use kernel::rng::{self, Drbg, SeedSource, chacha};
-use kernel::{arch, println};
+use kernel::rng::{self, Drbg, chacha, pool};
+use kernel::{arch, hw, println};
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
@@ -20,7 +23,10 @@ extern "C" fn kernel_main() -> ! {
     test_reseed();
     test_next_u64_matches_fill();
     test_statistical_sanity();
-    test_hwrng_and_seed_source();
+    test_pool_gate();
+    test_health_tests();
+    test_jitter_estimator();
+    test_live_sources();
 
     println!("rng: PASS");
     arch::exit(arch::ExitCode::Success)
@@ -142,16 +148,100 @@ fn test_statistical_sanity() {
     println!("rng: statistical sanity OK ({ones} set bits of {total_bits}, {nseen}/256 bytes)");
 }
 
-/// Report the hardware RNG and root seed source. When a hwrng is present its
-/// words must vary (not stuck); the root must then be hardware-seeded.
-fn test_hwrng_and_seed_source() {
-    let src = rng::seed_source();
-    println!(
-        "rng: hwrng={} present={} root_seed_source={:?}",
-        arch::hwrng_name(),
-        arch::has_hwrng(),
-        src
+/// The hard gate on a scratch pool: no key below the threshold, a key at
+/// it, and the credit ledger/source mask must track absorbs exactly.
+fn test_pool_gate() {
+    let mut p = pool::EntropyPool::new();
+    assert!(!p.ready(), "fresh pool claims ready");
+    assert!(p.squeeze_key().is_none(), "unseeded pool handed out a key");
+
+    // 128 credited bits: mixed, recorded, still gated.
+    p.absorb(pool::Source::HwRng, &[0xAAu8; 16], 128);
+    assert!(p.credited_bits() == 128, "credit ledger wrong");
+    assert!(p.sources() & 1 != 0, "source bit not recorded");
+    assert!(p.squeeze_key().is_none(), "gate leaked at 128 bits");
+
+    // Zero-credit material mixes but never counts.
+    p.absorb(pool::Source::Event, &[0x55u8; 64], 0);
+    assert!(p.credited_bits() == 128, "zero-credit absorb was credited");
+
+    // Crossing the threshold opens the gate; squeezing ratchets the pool
+    // (two squeezes differ - forward secrecy of the pool key).
+    p.absorb(pool::Source::FirmwareSeed, &[0x77u8; 16], 128);
+    assert!(p.ready(), "256 credited bits but not ready");
+    let k1 = p.squeeze_key().expect("ready pool refused to squeeze");
+    let k2 = p.squeeze_key().expect("second squeeze refused");
+    assert!(k1 != k2, "pool key did not ratchet between squeezes");
+    println!("rng: pool hard gate + credit ledger OK");
+}
+
+/// The branchless SP 800-90B-style health tests must reject stuck and
+/// repeating hwrng output and accept varied words.
+fn test_health_tests() {
+    assert!(!pool::health_ok(&[0u64; 16]), "all-zero passed health");
+    assert!(!pool::health_ok(&[u64::MAX; 16]), "all-ones passed health");
+    let mut rep = [0x1234_5678_9ABC_DEF0u64; 16];
+    rep[0] = 1; // still 15 consecutive repeats
+    assert!(!pool::health_ok(&rep), "repeating words passed health");
+    // Varied words from the (deterministic) DRBG pass.
+    let mut d = Drbg::from_seed(42);
+    let mut varied = [0u64; 16];
+    for v in varied.iter_mut() {
+        *v = d.next_u64();
+    }
+    assert!(pool::health_ok(&varied), "varied words failed health");
+    println!("rng: branchless health tests OK");
+}
+
+/// The jitter estimator must credit 0 for constant timing and stay under
+/// its conservative bound (1/4 bit per sample) for noisy input.
+fn test_jitter_estimator() {
+    assert!(
+        pool::estimate_jitter_bits(&[100u64; 64]) == 0,
+        "constant deltas earned jitter credit"
     );
+    // Fully noisy synthetic deltas: at most len/4 bits by construction.
+    let mut d = Drbg::from_seed(7);
+    let mut noisy = [0u64; 64];
+    for v in noisy.iter_mut() {
+        *v = d.next_u64();
+    }
+    let bits = pool::estimate_jitter_bits(&noisy);
+    assert!(bits <= 16, "jitter credit above the 1/4-bit bound: {bits}");
+    // Live gather into a scratch pool must respect the same cap and must
+    // report ~0 under deterministic icount (cycles advance uniformly).
+    let mut p = pool::EntropyPool::new();
+    let live = pool::gather_jitter(&mut p, 4);
+    assert!(live <= 64, "live jitter overcredited: {live}");
+    println!("rng: jitter estimator conservative OK (live rounds credited {live} bits)");
+}
+
+/// The machine must be seeded through real sources, and each present
+/// source must behave: hwrng varies, virtio-rng delivers, reseed mixes.
+fn test_live_sources() {
+    let r = rng::seed_report();
+    println!(
+        "rng: seed report: seeded={} credited={} bits, sources={:#06b}",
+        r.seeded, r.credited_bits, r.sources
+    );
+    for (i, name) in pool::SOURCE_NAMES.iter().enumerate() {
+        if r.sources & (1 << i) != 0 {
+            println!("rng:   source[{i}] {name} contributed");
+        }
+    }
+
+    // Every QEMU test machine has at least one credited source: RDRAND
+    // (x86), RNDR (arm64), or the firmware seed / virtio-rng (riscv).
+    assert!(r.seeded, "no credited entropy source seeded this machine");
+    assert!(
+        r.credited_bits >= pool::THRESHOLD_BITS,
+        "seeded below threshold?"
+    );
+    assert!(
+        rng::derive_cell_drbg().is_some(),
+        "seeded root refused a derive"
+    );
+
     if arch::has_hwrng() {
         let mut samples = [0u64; 16];
         let mut got = 0;
@@ -169,18 +259,33 @@ fn test_hwrng_and_seed_source() {
             }
         }
         assert!(!all_equal, "hwrng stuck: all words identical");
-        assert!(
-            src == SeedSource::Hwrng,
-            "hwrng present but root not hardware-seeded ({src:?})"
-        );
-        // Continuous reseed must succeed with a live source.
-        assert!(rng::reseed_root(), "root reseed from hwrng failed");
-        println!("rng: hwrng live + root hardware-seeded OK");
-    } else {
-        assert!(
-            src == SeedSource::Fallback,
-            "no hwrng but seed source is {src:?}"
-        );
-        println!("rng: no hwrng, documented fallback seed OK");
+        println!("rng: hwrng live OK ({})", arch::hwrng_name());
     }
+
+    // virtio-rng: probe again directly; where the device exists it must
+    // deliver bytes that are not all identical.
+    if let Some(dev) = hw::virtio_rng::probe() {
+        let mut a = [0u8; 32];
+        let n = dev.fill(&mut a);
+        assert!(n > 0, "virtio-rng present but delivered 0 bytes");
+        let first = a[0];
+        assert!(
+            a[..n].iter().any(|&b| b != first),
+            "virtio-rng bytes all identical"
+        );
+        println!("rng: virtio-rng live OK ({n} bytes)");
+    } else {
+        println!("rng: no virtio-rng device on this machine");
+    }
+
+    if let Some(seed) = hw::fdt::rng_seed() {
+        println!("rng: firmware rng-seed present ({} bytes)", seed.len());
+    }
+
+    // Continuous reseed with a live source must mix credited entropy.
+    assert!(
+        rng::reseed_root(),
+        "reseed mixed no credited entropy despite live sources"
+    );
+    println!("rng: multi-source seeding OK");
 }

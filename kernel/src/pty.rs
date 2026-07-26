@@ -58,6 +58,10 @@ fn next_byte() -> Option<u8> {
     match src {
         Source::Serial => loop {
             if let Some(b) = arch::serial_read_byte() {
+                // Input arrival time is an entropy event (uncredited mix,
+                // docs/TIME-IDENTITY.md 4) - human/host timing, like
+                // Linux's add_input_randomness.
+                crate::rng::mix_event(arch::cycles() ^ b as u64);
                 return Some(b);
             }
             core::hint::spin_loop();

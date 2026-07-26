@@ -51,6 +51,25 @@ fn name_is(name: &str, prefix: &str) -> bool {
 static mut RISCV_ISA: [u8; 64] = [0; 64];
 static mut RISCV_ISA_LEN: usize = 0;
 
+/// The firmware boot seed: `/chosen/rng-seed`, which real firmware and QEMU
+/// both fill on device-tree platforms. Captured for the entropy pool
+/// (docs/TIME-IDENTITY.md 4); the pool credits and conditions it.
+static mut RNG_SEED: [u8; 64] = [0; 64];
+static mut RNG_SEED_LEN: usize = 0;
+
+/// The `/chosen/rng-seed` bytes, if the firmware provided any.
+pub fn rng_seed() -> Option<&'static [u8]> {
+    // SAFETY: written once during single-threaded discovery, read-only after.
+    unsafe {
+        let len = *core::ptr::addr_of!(RNG_SEED_LEN);
+        if len == 0 {
+            return None;
+        }
+        let p = core::ptr::addr_of!(RNG_SEED) as *const u8;
+        Some(core::slice::from_raw_parts(p, len))
+    }
+}
+
 pub fn riscv_isa() -> &'static str {
     unsafe {
         let len = *core::ptr::addr_of!(RISCV_ISA_LEN);
@@ -94,6 +113,8 @@ pub fn parse(dtb: usize, inv: &mut Inventory) {
                     NodeKind::Memory
                 } else if name_is(name, "pci") || name_is(name, "pcie") {
                     NodeKind::Pci
+                } else if name_is(name, "chosen") {
+                    NodeKind::Chosen
                 } else {
                     NodeKind::Other
                 };
@@ -161,6 +182,11 @@ pub fn parse(dtb: usize, inv: &mut Inventory) {
                             });
                         }
                     }
+                    NodeKind::Chosen => {
+                        if pname == "rng-seed" && len > 0 {
+                            save_rng_seed(p, data, len);
+                        }
+                    }
                     NodeKind::Other => {}
                 }
             }
@@ -177,6 +203,7 @@ enum NodeKind {
     Cpu,
     Memory,
     Pci,
+    Chosen,
 }
 
 /// Decode a `reg` property as (address, size) pairs and call `f` per pair.
@@ -208,6 +235,17 @@ fn read_cells(p: *const u8, off: usize, cells: u32) -> u64 {
         1 => be32(p, off) as u64,
         2 => be64(p, off),
         _ => be64(p, off),
+    }
+}
+
+fn save_rng_seed(p: *const u8, data: usize, len: usize) {
+    unsafe {
+        let dst = core::ptr::addr_of_mut!(RNG_SEED) as *mut u8;
+        let n = len.min(64);
+        for i in 0..n {
+            dst.add(i).write(p.add(data + i).read());
+        }
+        *core::ptr::addr_of_mut!(RNG_SEED_LEN) = n;
     }
 }
 

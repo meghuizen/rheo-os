@@ -25,14 +25,19 @@ ring 3), isolation MMU-enforced, with a cross-cell directed switch.
 
 The full single-host **kernel object model** is implemented: memory grants
 (typed, commit/decommit/seal), a monotonic clock + interval wall clock +
-**cryptographic per-cell entropy** (a ChaCha20 DRBG with fast key erasure,
-seeded from the hardware RNG - RDSEED/RDRAND on x86-64, RNDR on ARM64 -
-after SP 800-90B health tests, non-blocking, falling back to a documented
-floor where no hwrng exists; the design's "library call over the cell's own
-DRBG state, not a syscall" path is proven at the primitive level in the host
-comparison, while the lsh `rand` builtin currently draws via `SYS_RANDOM` -
-linking the full DRBG into a U-mode cell awaits the runtime's `.user` heap +
-`mem*` shims, per docs/TIME-IDENTITY.md 4), typed event
+**cryptographic per-cell entropy** (a ChaCha20 DRBG with fast key erasure
+over a credited multi-source entropy pool with a hard seeding gate - no
+random bytes until 256 credited bits arrive, no weak fallback: the hardware
+RNG (RDSEED/RDRAND on x86-64, RNDR on ARM64) vetted by branchless
+SP 800-90B-style health tests, the firmware `/chosen/rng-seed`, a
+virtio-rng driver (`kernel/src/hw/virtio_rng.rs`, both transports, all
+three ISAs), conservatively-credited timing jitter (honestly ~0 under
+icount), and uncredited event timing off the PTY/virtio paths; the design's
+"library call over the cell's own DRBG state, not a syscall" path is proven
+at the primitive level in the host comparison, while the lsh `rand` builtin
+currently draws via `SYS_RANDOM` - linking the full DRBG into a U-mode cell
+awaits the runtime's `.user` heap + `mem*` shims, per
+docs/TIME-IDENTITY.md 4), typed event
 streams with flow context, EDF-admitted reservations, leases with fencing
 tokens + epoch revocation, and a dependency graph executed on a compute
 engine (attest-by-measurement). On
