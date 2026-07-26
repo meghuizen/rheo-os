@@ -481,8 +481,26 @@ pub fn smp_start_secondary(_hw_id: u32) -> Result<(), &'static str> {
 /// Feature names; bit i corresponds to index i in CpuReport.features.
 pub fn cpu_feature_names() -> &'static [&'static str] {
     &[
-        "sse", "sse2", "sse3", "ssse3", "sse4.1", "sse4.2", "avx", "avx2", "avx512f", "aes", "sha",
-        "rdrand", "rdseed", "xsave", "fsgsbase", "nx", "pcid", "pdpe1gb", "x2apic",
+        "sse",
+        "sse2",
+        "sse3",
+        "ssse3",
+        "sse4.1",
+        "sse4.2",
+        "avx",
+        "avx2",
+        "avx512f",
+        "aes",
+        "sha",
+        "rdrand",
+        "rdseed",
+        "xsave",
+        "fsgsbase",
+        "nx",
+        "pcid",
+        "pdpe1gb",
+        "x2apic",
+        "avx512vnni",
     ]
 }
 
@@ -524,6 +542,7 @@ pub fn cpu_report(_inv: &crate::hw::Inventory) -> crate::hw::CpuReport {
     set(16, l1.ecx & (1 << 17) != 0); // pcid
     set(17, le.edx & (1 << 26) != 0); // 1 GiB pages
     set(18, l1.ecx & (1 << 21) != 0); // x2apic
+    set(19, l7.ecx & (1 << 11) != 0); // avx512_vnni
     report
 }
 
@@ -742,6 +761,30 @@ static mut XSAVE_MASK: u64 = 0;
 pub fn fp_xsave_mask() -> u64 {
     // SAFETY: written once at boot before any cell/thread runs; single CPU.
     unsafe { *core::ptr::addr_of!(XSAVE_MASK) }
+}
+
+/// Portable `SIMD_*` tier mask a cell reads (docs/TILES.md 4): the widths the
+/// kernel **enabled and validated**, not merely what CPUID claims. A tier is
+/// reported only if CPUID has it AND its XSAVE state component is in the boot
+/// mask - so a cell never dispatches to a path whose registers the kernel would
+/// not save across a cell switch.
+pub fn fp_simd_tiers() -> u64 {
+    use crate::abi::{SIMD_AVX2, SIMD_AVX512F, SIMD_AVX512VNNI, SIMD_SSE2};
+    let mask = fp_xsave_mask();
+    let avx_ok = mask & (1 << 2) != 0; // XCR0.AVX (YMM state saved)
+    let avx512_ok = mask & ((1 << 5) | (1 << 6) | (1 << 7)) == (1 << 5) | (1 << 6) | (1 << 7);
+    let l7 = core::arch::x86_64::__cpuid_count(7, 0);
+    let mut t = SIMD_SSE2; // the hard-float x86 baseline
+    if avx_ok && l7.ebx & (1 << 5) != 0 {
+        t |= SIMD_AVX2;
+    }
+    if avx512_ok && l7.ebx & (1 << 16) != 0 {
+        t |= SIMD_AVX512F;
+        if l7.ecx & (1 << 11) != 0 {
+            t |= SIMD_AVX512VNNI;
+        }
+    }
+    t
 }
 
 /// Save the live U-mode FP/SIMD state for a context switch (docs/LINUX-COMPAT.md

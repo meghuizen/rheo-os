@@ -129,9 +129,11 @@ A `TileProgram` is built once and lowered per engine:
 
 - **CpuExecutor** - the library-call lowering (the TIME-IDENTITY.md 4
   "library call, not syscall" pattern applied to compute): the program
-  runs in the cell, strand-parallel over disjoint output row-bands, with
-  scalar inner kernels today and SIMD when U-mode vector-state
-  save/restore exists (see the optimization-path note below).
+  runs in the cell, strand-parallel over disjoint output row-bands, with a
+  **runtime-dispatched** inner kernel - scalar, or a wider SIMD tier
+  (AVX2/AVX-512 on x86) chosen by a boot probe now that cells are
+  hard-float and the kernel saves vector state across cell switches (see
+  the optimization-path note below).
 
 ### Optimization paths - the widest ISA the hardware actually has
 
@@ -160,17 +162,34 @@ Two rules make this honest:
   GEMM biases A by +128 and subtracts the resulting `128*sum(b)` back -
   exact integer arithmetic, verified against the scalar kernel.
 
-Where each runs, honestly: the tiers are **exercised and measured on the
-host** (`comparison/tiles` - VNNI ~3.9x, AVX-512 ~2.9x, AVX2 ~1.7x over
-scalar on a 512^3 int8 GEMM with B packed), because that is where real
-vector units and caches exist. **On-OS, a cell's CpuExecutor stays scalar
-until U-mode vector-state save/restore is implemented** (no ISA saves it
-across a cell trap yet, so a cell using wide vectors would corrupt state -
-the json/src/scan.rs precedent). The kernel already *detects* the features
-(`arch::cpu_feature_names`, the inventory's CPU report), so the dispatch's
-input exists; only the safe-execution seam is missing. The day U-mode
-vector state lands, the same dispatch selects the wide kernels in a cell
-with no API change.
+Where each runs, honestly:
+
+- **On the host** (`comparison/tiles`) all four tiers are measured with
+  real vector units and caches - VNNI ~3.9x, AVX-512 ~2.9x, AVX2 ~1.7x over
+  scalar on a 512^3 int8 GEMM with B packed.
+- **On-OS, in a cell**, in-cell SIMD now runs (the "boundary" that used to
+  block it is fixed). librheo cells build **hard-float** (SSE2 / NEON /
+  F+D baseline), the kernel enables AVX/AVX-512 for U-mode when CPUID
+  reports it and **saves/restores the vector state across every cell
+  switch** with XSAVE (the kernel itself stays soft-float, so ring 3 owns
+  the FP/vector registers). `librheo::tile::simd` runtime-dispatches the
+  GEMM block: a boot **probe** queries the kernel's validated feature
+  report (`SYS_CPUINFO` -> `CpuFeatures.simd`), runs a **functionality
+  test** (each tier bit-exact vs scalar - the on-boot form of the host
+  fuzz) and a **micro-benchmark**, and caches the fastest passing tier,
+  scalar otherwise. The `librheotile` test asserts that on x86-64 the AVX2
+  kernel ran **functionally** (bit-exact vs scalar) on-OS - not that it was
+  *selected*, because the benchmark honestly picks by measured speed and
+  under QEMU TCG (no modeled SIMD speedup) scalar can win.
+
+Honest coverage of the wider tiers on-OS: QEMU 8.2.2 TCG exposes **AVX2 but
+not AVX-512**, so in the emulator the cell selects and exercises AVX2, and
+the AVX-512/VNNI tiers - compiled in and dispatched by the same feature
+check - light up only on real hardware (where `comparison/tiles` proves
+them bit-exact). VNNI's `dpbusd` wants the packed-B dot-product layout;
+the strided-B tile executor uses the widening-multiply AVX2/AVX-512 path.
+ARM SVE/SME and RISC-V V are the equivalent future tiers (NEON/F+D are the
+current ARM/RISC-V baseline).
 - **EngineExecutor** - lowers the SAME program to dependency-graph nodes
   (section 6) and submits over the queue (`OP_GRAPH_SUBMIT`). This is the
   device-portable artifact: engine 0 (the CPU engine) executes it today;
@@ -374,14 +393,20 @@ with the framework already in place.
 
 - **Runs today**: the CPU tile path - strand-parallel library executor
   and the kernel graph ops - on all three ISAs, integer-exact, with
-  deterministic icount path lengths. F32 runs soft-float in cells.
+  deterministic icount path lengths. F32 runs hard-float in cells.
 - **QEMU has no cache hierarchy**, so tiling's locality win is invisible
   there by construction; it is demonstrated on the host
   (`comparison/tiles`) with real caches, and only there.
-- **In-cell SIMD is blocked** on U-mode vector-state save/restore (no
-  ISA has it yet); the SIMD inner kernel exists host-side behind a
-  feature flag with a differential fuzz proof, per the rheo-json
-  precedent.
+- **In-cell SIMD now runs.** librheo cells build hard-float (SSE2 / NEON /
+  F+D baseline); the kernel enables AVX/AVX-512 for U-mode on CPUID and
+  saves/restores the vector state across cell switches with XSAVE (the
+  kernel stays soft-float). `tile::simd` runtime-dispatches the GEMM block
+  after a boot probe (functionality-checks each tier bit-exact vs scalar,
+  benchmarks, picks the fastest); `librheotile` asserts the AVX2 kernel ran
+  bit-exact on-OS. Honest limits: QEMU TCG exposes AVX2 but not AVX-512
+  (so AVX-512/VNNI light up only on real hardware, where `comparison/tiles`
+  proves them), and TCG models no SIMD speedup, so under emulation the
+  benchmark may keep scalar - the selection adapts to the real host.
 - **Single vcore**: pipelining is cooperative interleaving until SMP
   (task #27).
 ### Capacity caps - flagged for real-workload sizing

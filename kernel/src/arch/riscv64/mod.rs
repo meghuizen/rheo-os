@@ -736,6 +736,13 @@ pub unsafe fn fp_area_init(area: *mut u8) {
     unsafe { core::ptr::write_bytes(area, 0, FP_AREA_LEN) };
 }
 
+/// Portable `SIMD_*` tier mask a cell reads (docs/TILES.md 4). RISC-V cells use
+/// scalar F/D (hard-float baseline); the vector extension (RVV) is not enabled,
+/// so there is no SIMD tier to advertise - the tile executor runs scalar.
+pub fn fp_simd_tiers() -> u64 {
+    0
+}
+
 /// x86-only `arch_prctl` TLS hook (docs/LINUX-COMPAT.md L1). Unreachable on
 /// RISC-V: the asm-generic table has no `arch_prctl` number, and U-mode sets
 /// its own `tp` (a saved GPR), so glibc never asks the kernel. Present only

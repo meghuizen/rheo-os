@@ -15,6 +15,7 @@
 //! interleaving, not overlap (SMP is task #27).
 
 pub mod kernels;
+pub mod simd;
 
 use alloc::vec::Vec;
 use core::marker::PhantomData;
@@ -841,8 +842,12 @@ async fn gemm_banded_i8(ma: BufMeta, mb: BufMeta, mc: BufMeta, block: TileShape,
                         let bk = block.k.min(k - p0);
                         // SAFETY: this band owns C rows [i0, i0+bm) - bands
                         // are disjoint in m; A/B are read-only here.
+                        // Dispatch to the best SIMD tier for this cell (AVX2 /
+                        // AVX-512 on capable x86, scalar elsewhere) - chosen
+                        // once by `simd::probe` and bit-identical to the scalar
+                        // kernel (docs/TILES.md 4).
                         unsafe {
-                            kernels::gemm_i8_i32(
+                            simd::gemm_i8_i32(
                                 (a_va as *const i8).add(i0 * a_s + p0),
                                 a_s,
                                 (b_va as *const i8).add(p0 * b_s + j0),

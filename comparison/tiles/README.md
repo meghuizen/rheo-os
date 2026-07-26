@@ -85,11 +85,14 @@ simply falls back; the kernels are still compiled in.
   ~2.3x slower than coarse ones) and grows with problem size past cache. A
   production kernel would add register blocking, packing, and SIMD (the
   AVX2 path here is a correctness demo, not a tuned microkernel).
-- **In-cell SIMD is host-only.** The AVX2 kernel runs in this comparison,
-  not in a rheo-os cell: U-mode vector-state save/restore is not yet
-  implemented on any ISA (`json/src/scan.rs` states the same for its SSE2
-  path), so the on-OS build stays scalar. The differential fuzz is exactly
-  why that is safe to defer — the SIMD path is proven equivalent.
+- **In-cell SIMD now runs on-OS too.** librheo cells build hard-float and
+  the kernel saves/restores vector state across cell switches, so
+  `librheo::tile::simd` dispatches AVX2 (and AVX-512 on capable hardware)
+  inside a rheo-os cell — the `librheotile` test asserts the AVX2 kernel is
+  bit-exact on-OS (docs/TILES.md 4). This host comparison still measures the
+  wall-clock speedup (QEMU TCG models no SIMD speedup, and exposes AVX2 but
+  not AVX-512, so the wider tiers are only *measurable* here); the
+  differential fuzz proves every tier equivalent to scalar.
 - **No vendor-BLAS number is run here.** cuBLAS/oneDNN/OpenBLAS figures, if
   cited anywhere, are *published references*, never a fabricated local
   number — the `comparison/json` rule.

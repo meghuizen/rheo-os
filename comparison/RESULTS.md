@@ -142,9 +142,12 @@ Host fastest→slowest and sim least→most-bytes **both rank
 `[256,128,64,32,16]`** - the traffic model ranks tilings as the host
 measures (the co-design loop's traffic leg). Differential fuzz: 10,000
 random shapes, tiled == naive. AVX2 inner kernel == scalar, bit-for-bit,
-2,000 shapes. Honest: the scalar `no_std` kernel is not a tuned BLAS, and
-in-cell SIMD awaits U-mode vector state (host-only for now, proven
-equivalent) - `comparison/tiles/README.md` has the full caveats.
+2,000 shapes. Honest: the scalar `no_std` kernel is not a tuned BLAS.
+**In-cell SIMD now runs on-OS** - librheo cells are hard-float and the
+kernel saves vector state across cell switches, so `tile::simd` dispatches
+AVX2 in a cell (the `librheotile` test asserts it bit-exact); AVX-512/VNNI
+light up on real hardware (QEMU TCG has AVX2 only), proven here on the host.
+`comparison/tiles/README.md` has the full caveats.
 
 ## 6. Verdict on viability, as of this commit
 

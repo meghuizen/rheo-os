@@ -195,8 +195,10 @@ soft-float) build std via a repo-held, idempotent rust-src patch
 routes rheo to the single-threaded portable fallbacks (SMP deferred) with real
 rheo arms for the heap (a hole-list allocator over `SYS_MMAP`), non-blocking
 `stdio` (fds over the M2 syscalls), and `process::exit` (`SYS_EXIT_GROUP`); a
-crt0 (`rheo-rt`) provides `_start`. Float-heavy programs await U-mode FP/SIMD
-enablement. Also built
+crt0 (`rheo-rt`) provides `_start`. The `rheo_os-*` std targets stay soft-float
+(the kernel now enables U-mode FP/SIMD and saves it across switches, and
+**librheo** cells build hard-float - see the tile framework below; flipping the
+std targets to hard-float is a follow-on). Also built
 alongside as an M4-prep workload: **rheo-json** (`json/`), a dependency-free
 zero-copy JSON parser that runs on the OS and is benchmarked against simdjson
 (docs/JSON.md).
@@ -653,10 +655,17 @@ receipts) and `librheotilebattle` the production-shaped battle tier (scaled
 7B-class layer GEMMs, an attention block, paged-KV prefix sharing, the
 librheodata columnar reduce as tiles, a 100-run soak, boundary shapes, a
 64-deep pipeline fence) - both on **all three ISAs**; `p6_*` benches report the
-per-tile-op path lengths. Honest: the CpuExecutor is scalar (in-cell SIMD
-awaits U-mode vector state; the AVX2 host kernel is proven equivalent by
-differential fuzz); pipelining is cooperative interleaving (SMP #27); device
-engines are enumerated, not executing. The battle tier surfaced two real
+per-tile-op path lengths. **In-cell SIMD now runs**: librheo cells build
+hard-float (SSE2/NEON/F+D baseline), the kernel enables AVX/AVX-512 for U-mode
+on CPUID and saves/restores vector state across cell switches with XSAVE (the
+kernel stays soft-float), and `tile::simd` runtime-dispatches the GEMM after a
+boot probe (functionality-checks each tier bit-exact vs scalar, benchmarks,
+picks the fastest, scalar fallback) - `librheotile` asserts the AVX2 kernel ran
+bit-exact on-OS. Honest: QEMU TCG exposes AVX2 but not AVX-512 (so AVX-512/VNNI
+light up only on real hardware, host-proven in comparison/tiles) and models no
+SIMD speedup (so under emulation the probe's benchmark may keep scalar - the
+selection adapts to the real host); pipelining is cooperative interleaving (SMP
+#27); device engines are enumerated, not executing. The battle tier surfaced two real
 latent fixes - a grant-slot leak on `SYS_MUNMAP` (freed frames but not the
 per-cell table slot) and an f16-subnormal rounding bug - and the per-cell
 grant table (16->64) and object table (128->512) caps were raised for

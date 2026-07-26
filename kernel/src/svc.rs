@@ -125,7 +125,23 @@ pub fn handle(nr: u64, args: &[u64; 6]) -> Option<u64> {
             Some(n as u64)
         }
         SYS_CPUINFO => {
-            print_cpuinfo();
+            // out_va == 0: print for the shell. out_va != 0: write a
+            // machine-readable CpuFeatures a cell reads to pick its SIMD path
+            // (docs/TILES.md 4). Mechanism only - exposes the discovered CPU
+            // report + the FP widths the kernel validated at boot.
+            if arg == 0 {
+                print_cpuinfo();
+            } else {
+                let inv = crate::hw::inventory();
+                let feats = crate::abi::CpuFeatures {
+                    features: inv.cpu.features,
+                    simd: crate::arch::fp_simd_tiers(),
+                    vendor: inv.cpu.vendor,
+                };
+                // SAFETY: `arg` is a writable VA in the calling cell; the cell
+                // provides a buffer of at least size_of::<CpuFeatures>().
+                unsafe { (arg as *mut crate::abi::CpuFeatures).write(feats) };
+            }
             Some(0)
         }
         SYS_LSPCI => {

@@ -743,6 +743,22 @@ pub unsafe fn fp_area_init(area: *mut u8) {
     unsafe { core::ptr::write_bytes(area, 0, FP_AREA_LEN) };
 }
 
+/// Portable `SIMD_*` tier mask a cell reads (docs/TILES.md 4). ARM64 reports
+/// NEON (Advanced SIMD) when present - it is enabled at EL0 (CPACR_EL1.FPEN)
+/// and is the cell's baseline vector unit; the tile executor auto-vectorises to
+/// it. SVE is not enabled (wide, VL-dependent state), so no SVE tier.
+pub fn fp_simd_tiers() -> u64 {
+    let pfr0: u64;
+    // SAFETY: reading an ID register at EL1.
+    unsafe { asm!("mrs {0}, id_aa64pfr0_el1", out(reg) pfr0, options(nomem, nostack)) };
+    let simd = (pfr0 >> 20) & 0xF; // AdvSIMD field; 0xF = absent
+    if simd != 0xF {
+        crate::abi::SIMD_NEON
+    } else {
+        0
+    }
+}
+
 /// (syscall number in x8, arguments a0..a5 = x0..x5).
 pub fn decode_syscall(frame: &TrapFrame) -> (u64, [u64; 6]) {
     (

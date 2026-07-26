@@ -68,6 +68,27 @@ extern "C" fn main() -> i32 {
     if code != 0 {
         return code;
     }
+    // Prove in-cell SIMD genuinely ran on the hardware path (docs/TILES.md 4).
+    // The probe executes each available tier in-cell and checks it bit-exact vs
+    // scalar (`functional_tiers`); the tiled GEMM in `work` then ran through the
+    // *selected* tier and was asserted equal to the naive reference. Assert on
+    // FUNCTIONALITY, not selection: the selection is by micro-benchmark, and
+    // under QEMU TCG (which models no SIMD speedup) scalar can legitimately win,
+    // so the selected tier is honestly host-dependent. If the kernel reports
+    // AVX2, the AVX2 kernel must have run correctly on-OS.
+    let feats = sys::cpu_features();
+    let tier = tile::simd::tier();
+    let func = tile::simd::functional_tiers();
+    println!(
+        "librheo-tile: SIMD selected = {}, functional mask {:#x}, kernel simd mask {:#x}",
+        tile::simd::tier_name(tier),
+        func,
+        feats.simd
+    );
+    #[cfg(target_arch = "x86_64")]
+    if feats.simd & sys::SIMD_AVX2 != 0 && func & (1 << tile::simd::AVX2) == 0 {
+        return 90; // AVX2 available but its on-OS output did not match scalar
+    }
     println!(
         "librheo-tile: tile framework OK ({N}x{N}x{N} block {}x8 strands)",
         BLOCK.m
