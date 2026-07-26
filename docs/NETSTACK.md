@@ -2786,3 +2786,96 @@ features); the other arms are compile-checked. Honest.
   timer table, mirroring the N4a channel slots.
 - **Byte-rate admission** as a reservation, and everything §21.5 names as its
   precondition.
+
+## 22. Decisions re-made after the hard-float merge
+
+Three of this stack's choices were premised on **every target being soft-float**.
+That premise is gone: librheo cells now build hard-float (SSE2 / NEON / F+D, with
+AVX/AVX-512 for U-mode where CPUID reports it) and the kernel swaps the vector
+register file across every native cross-cell switch (docs/TILES.md 4,
+docs/LIBRHEO.md "FP/SIMD across the native cross-cell switch"). Each choice was
+therefore re-derived rather than inherited. Two are **kept, with better reasons than
+before**; one was tried, verified to work, and still not shipped.
+
+### 22.1 Integer-only congestion-control math - kept, and now a hard constraint
+
+CUBIC's integer cube root and BBRv3's fixed-point gains (§21) were written integer
+because the targets were soft-float. Re-derived, the constraint is *stronger* than
+convenience:
+
+- `cc`, `bbr`, `pacer`, `tcp` are in the crate's **always-compiled** half - they
+  link in the librheo-free **codec** posture (`--no-default-features`), and that
+  posture is what links **beside a kernel binary** for the N4b `svc::SocketOps`
+  bridge (§18). The kernel is soft-float. Floating-point in a controller would put
+  soft-float emulation - and FP register *use* - inside a kernel binary.
+- That is not merely bloat. The FP save/restore mechanism rests on the premise "the
+  kernel does not touch FP, so at a switch the live registers still hold the
+  outgoing cell's values". A controller running FP **in kernel context** would
+  falsify that premise and make the saved image the kernel's values, not the cell's.
+  The hard-float work did not relax this constraint; it made it load-bearing.
+- Determinism: the §21 / N2b proofs assert **hand-computed cwnd and pacing-rate
+  trajectories** (docs/ENGINEERING.md 4). Integer arithmetic is bit-identical on all
+  three ISAs; float would make an oracle ISA-dependent on rounding.
+
+Hard-float cells change nothing here, because a controller is not where vector width
+pays - the work is a handful of multiplies per ACK, not a kernel over a buffer.
+
+### 22.2 Forced software crypto backends - kept as default; hardware AES **verified working** and recorded
+
+N3a (§3) pins `aes_force_soft`, `polyval_force_soft` and
+`curve25519_dalek_backend="serial"` because the intrinsics backends miscompiled
+under LLVM on `x86_64-unknown-none` ("Do not know how to split the result of this
+operator"). Re-evaluated against main's hard-float cell target, measured rather than
+assumed:
+
+| experiment | result |
+|---|---|
+| hardware backends, `targets/rheo_cell-x86_64.json`, no force-soft cfgs | **builds clean** - the N3a miscompile does **not** reproduce. The blocker was the *soft-float bare target*, not LLVM. |
+| same, inspect the binary | **0** AES instructions emitted. The `aes` crate's `cpufeatures` autodetect does not select its `ni` backend in this configuration, so there is no win *and* no fallback question. |
+| add `-C target-feature=+aes,+pclmul` (baseline) | **477 AES instructions** emitted (`aesenc`/`aesenclast`/`aesimc`/`aeskeygenassist`). |
+| run that binary in the `netcrypto` kernel | **all N3a vectors pass** on-OS, including AES-128-GCM and AES-256-GCM against the NIST/GCM-spec vectors, plus tamper rejection. |
+
+So hardware AES **works on this OS**. It is nonetheless *not* the default, for
+reasons that are about the shape of the enablement, not its correctness:
+
+- `+aes` at **baseline** has no graceful fallback: on a CPU without AES-NI the cell
+  takes `#UD`, it does not fall back to software. That contradicts the pattern this
+  tree settled on for exactly this class of decision (docs/ENGINEERING.md 1: the
+  XCR0 read-back keeps only the bits that stuck; `tile::simd` probes each tier
+  bit-exact against scalar before selecting). The cell target's own metadata says
+  AVX/AVX-512/VNNI are *runtime-dispatched, not baseline* - crypto should not be the
+  exception.
+- The win is a **wall-clock throughput** claim, and QEMU cannot measure that
+  (docs/TOOLING.md 4, docs/ENGINEERING.md 10). It is real on hardware and
+  unquantified here; nothing in this repo may state a number for it.
+- It would move three kernels (`netcrypto`, `nettls`, `nethttp`) to a new build
+  posture as a side effect of a merge.
+
+**Follow-on (named, not done):** a runtime-dispatched AES path in the `tile::simd`
+shape - boot probe, each backend verified bit-exact against the software one, select
+the fastest that passes, software otherwise. It needs either a wrapper around
+RustCrypto's internal autodetect or an AES-NI kernel of our own, so it is a phase.
+Until then the software backends stay: the scalar portable path, identical on all
+three ISAs, which is what N3a wanted anyway.
+
+### 22.3 SWAR in the HTTP/DNS scanner - kept, for a structural reason
+
+N5a (§19) chose portable SWAR for `http1::scan` partly because no sanctioned SIMD
+dispatch existed for `net` (json's SSE2 uses `cfg(target_arch)`, which
+docs/TARGET-ARCHITECTURES.md 4 denies outside the kernel's arch layer). Main now
+ships `librheo::tile::simd` - runtime dispatch **plus** a boot probe. Reusing it was
+assessed and is **not possible**, for a reason that is not a preference:
+
+`http1` is in the crate's **always-compiled** half, because it must link in the
+codec posture (`--no-default-features`) where the N4b `SocketOps` bridge links
+beside a kernel binary - and that posture **drops librheo entirely**
+(`hosted = ["dep:librheo"]`). Depending on `librheo::tile::simd` from `http1` would
+break the codec posture and with it the N4b bridge. Separately, `tile::simd`
+dispatches *GEMM* kernels chosen by a benchmark at a librheo cell's startup; a byte
+scanner is a different kernel with a different probe.
+
+**Follow-on (named, not done):** if a SIMD scanner is wanted, the sanctioned shape
+is a `net`-local dispatch module *mirroring* `tile::simd`'s probe rather than reusing
+it, and it must keep the existing discipline either way - the scalar version stays
+the oracle, with fuzz equivalence over both paths (20,000 buffers today). The SWAR
+path remains the portable floor every ISA gets with no `cfg` and no detection.

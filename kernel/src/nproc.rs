@@ -402,7 +402,10 @@ pub fn yield_cell(cur: usize) -> Sched {
     else {
         return Sched::Ret(0);
     };
-    user::switch_to_cell(next);
+    // The native cross-cell switch, FP/SIMD register file included: this is a
+    // hard-float cell's hand-off point (docs/LIBRHEO.md, docs/ENGINEERING.md 3),
+    // and a service cell reaches it on every client round.
+    user::switch_native_cell(cur, next);
     complete_block(next);
     Sched::Switch(user::cell_frame(next))
 }
@@ -467,11 +470,6 @@ fn process_exit(cell: usize, code: u64) -> *mut TrapFrame {
 /// runnable cell, and completes its pending `SYS_WAIT`. Panics only on a true
 /// deadlock (a scheduling bug, surfaced loudly).
 fn reschedule(leaving: usize) -> *mut TrapFrame {
-    // Save the outgoing cell's live FP/SIMD state (harmless if it is exiting);
-    // the incoming cell's is restored after the address-space switch below. The
-    // native analogue of the Linux `thread::save_current_fp` in `linux::proc`.
-    user::save_native_fp(leaving);
-
     // Wake blocked parents whose awaited child is now a zombie.
     for i in 0..MAX_CELLS {
         if procs()[i].state == PState::Blocked {
@@ -489,8 +487,10 @@ fn reschedule(leaving: usize) -> *mut TrapFrame {
         panic!("nproc: no runnable cell (native process scheduler deadlock)");
     };
 
-    user::switch_to_cell(n);
-    user::restore_native_fp(n);
+    // Save the outgoing cell's live FP/SIMD state (harmless if it is exiting)
+    // and load the incoming cell's - the native analogue of the Linux
+    // personality's `thread::save_current_fp`/`restore_current` in `linux::proc`.
+    user::switch_native_cell(leaving, n);
     complete_block(n);
     user::cell_frame(n)
 }

@@ -1100,3 +1100,64 @@ No new kernel object: it composes Cell (object 1) with QueuePair (object 3), the
 same way the L6 pipe and Phase J channel inheritance already do. Honest scope stays
 what Phase J stated - the in-cell wait is a genuine reactor park; the cell-boundary
 hand-off is cooperative, single-CPU (SMP is task #27).
+
+## FP/SIMD across the native cross-cell switch
+
+Cells build **hard-float** (docs/TILES.md 4: SSE2 / NEON / F+D baseline, with
+AVX/AVX-512 enabled for U-mode where CPUID reports it), while the kernel stays
+soft-float. That combination is what makes the switch a correctness problem: at a
+cross-cell hand-off the physical FP/SIMD register file still holds the **outgoing**
+cell's values, because nothing in the kernel has overwritten them. A cell that
+hands the CPU on with live values in its vector registers therefore reads back its
+*peer's* values when it resumes - no fault, no log, wrong numbers.
+
+**The invariant.** `user::switch_native_cell(from, to)` is the *only* native
+cross-cell switch: it activates `to`'s address space **and** swaps the register
+file (save `from`'s live registers into `from`'s kernel-side area, load `to`'s
+image). Every native path goes through it:
+
+| path | driver |
+|---|---|
+| `SYS_SWITCH` | the directed `cur ^ 1` hand-off (Phase E/J) |
+| `nproc::reschedule` | `SYS_WAIT`, and a child's exit or fault (Phase F) |
+| `nproc::yield_cell` | `SYS_YIELD` - the round-robin yield (rheo-net N4a: a service cell's client fan-out, and the strand reactor's channel idle path) |
+| `user::run` | a cell's *first* entry loads its image (the clean ABI-default one `arch::fp_area_init` wrote at install) |
+
+The swap lives **inside** that one function rather than being repeated at each call
+site, per docs/ENGINEERING.md 3 (one owner, enforced by construction). The bare
+`user::switch_to_cell` does the address space only and is documented as the
+**Linux** personality's switch: a Linux cell holds up to 8 contexts with an FP area
+each, so `linux::proc` brackets it with `linux::thread::save_current_fp` /
+`restore_current` instead.
+
+**Why this needed finding rather than assuming.** `SYS_YIELD` and the FP
+save/restore were developed independently, on separate branches. `SYS_YIELD` is a
+*third* switch path that did not exist when the FP work was written, so merging the
+two produced a tree that compiled, passed all 168 existing checks, and silently
+corrupted vector registers on exactly the path a service cell uses most. Nothing
+detected it because no cell held live FP state across a yield - the defect was
+latent, not absent.
+
+**The proof** (docs/ENGINEERING.md 1 - evidence the code cannot fake) is a phase of
+the `librheoipc` kernel. Both hard-float cells run a **single** `asm!` block that
+
+1. loads 16 vector registers from a per-role pattern that differs from the peer's
+   in **every byte** (256 bytes of register file on x86-64/ARM64 via `xmm0`-`xmm15`
+   / `q0`-`q15`, 128 on RISC-V via `f0`-`f15`),
+2. executes `SYS_YIELD` - so the peer runs and loads *its* pattern into those same
+   physical registers,
+3. stores the register file back out.
+
+One block means the compiler cannot spill or reload around the switch: what comes
+out came out of the registers. Four rounds per cell, and the verdict distinguishes
+**"read back the peer's pattern"** from ordinary corruption, because the former is
+precisely what an unswapped switch produces. Kernel-side, `user::fp_swaps()` counts
+swaps *only* inside `restore_native_fp`, and the test asserts it is at least one per
+yield. Verified in both directions: with the swap wired the register file is
+bit-identical on all three ISAs; with `yield_cell` reverted to the bare
+`switch_to_cell`, 7 of 8 rounds report the peer's pattern and the kernel panics.
+
+Scope: single-context native cells (a Linux cell's per-context FP is `linux::thread`
+above). The two schedulers are disjoint - `nproc` only ever selects native cells -
+so a switch never crosses a personality. SVE / RVV state is not enabled, so the
+areas are sized for NEON / the D extension / an XSAVE image (docs/TILES.md 4).

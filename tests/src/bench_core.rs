@@ -360,13 +360,11 @@ fn measure(name: &str, ops: u64, iters: usize, mut body: impl FnMut()) {
 /// One 64^3 int8 GEMM tiled at `block`, calling the canonical kernel per
 /// (m,n,k) block - the same loop the executors run, isolated for icount.
 fn tiled_gemm64(block: usize) {
-    let (a, b, c) = unsafe {
-        (
-            core::ptr::addr_of!(TA) as *const i8,
-            core::ptr::addr_of!(TB) as *const i8,
-            core::ptr::addr_of_mut!(TC) as *mut i32,
-        )
-    };
+    let (a, b, c) = (
+        core::ptr::addr_of!(TA) as *const i8,
+        core::ptr::addr_of!(TB) as *const i8,
+        core::ptr::addr_of_mut!(TC) as *mut i32,
+    );
     // Zero C.
     for i in 0..64 * 64 {
         unsafe { *c.add(i) = 0 };
@@ -463,9 +461,9 @@ fn bench_p5() {
     // kernel engine's tile execution measured end to end (validate +
     // dispatch + FNV receipt), callable directly in kernel context.
     let desc = kernel::abi::TileGemmDesc {
-        a_va: unsafe { core::ptr::addr_of!(TA) } as u64,
-        b_va: unsafe { core::ptr::addr_of!(TB) } as u64,
-        c_va: unsafe { core::ptr::addr_of_mut!(TC) } as u64,
+        a_va: core::ptr::addr_of!(TA) as u64,
+        b_va: core::ptr::addr_of!(TB) as u64,
+        c_va: core::ptr::addr_of_mut!(TC) as u64,
         m: 32,
         n: 32,
         k: 32,

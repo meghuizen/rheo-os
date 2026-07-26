@@ -242,6 +242,20 @@ fn cell_fp(idx: usize) -> *mut u8 {
     unsafe { (*core::ptr::addr_of_mut!(CELL_FP))[idx].0.as_mut_ptr() }
 }
 
+/// Count of native FP/SIMD register-file swaps performed by
+/// [`switch_native_cell`] (and of the initial loads done by [`run`]). Bumped
+/// *only* inside the swap itself, so a test can assert the swap really ran on
+/// every switch rather than infer it from the code (docs/ENGINEERING.md 1).
+static mut FP_SWAPS: u64 = 0;
+
+/// How many times a native cell's FP/SIMD register file has been swapped
+/// (docs/LIBRHEO.md; the `librheoipc` FP regression phase asserts this is at
+/// least the number of cross-cell yields it drove).
+pub fn fp_swaps() -> u64 {
+    // SAFETY: single CPU, synchronous traps.
+    unsafe { *core::ptr::addr_of!(FP_SWAPS) }
+}
+
 /// Save native cell `idx`'s live U-mode FP/SIMD state into its area (the kernel
 /// is soft-float, so the registers hold `idx`'s values at the switch point).
 /// Harmless if `idx` is exiting - the saved image is simply never restored.
@@ -256,6 +270,35 @@ pub fn save_native_fp(idx: usize) {
 pub fn restore_native_fp(idx: usize) {
     // SAFETY: `cell_fp(idx)` holds a valid image (saved, or `fp_area_init`ed).
     unsafe { arch::restore_user_fp(cell_fp(idx)) };
+    // SAFETY: single CPU, synchronous traps.
+    unsafe { *core::ptr::addr_of_mut!(FP_SWAPS) += 1 };
+}
+
+/// **The** native cross-cell switch: make `to` the current cell, activate its
+/// address space, and swap the U-mode FP/SIMD register file with it - save
+/// `from`'s live registers into `from`'s area, load `to`'s image.
+///
+/// Every native path that hands the CPU from one cell to another must go through
+/// here: `SYS_SWITCH` (the directed `cur^1` hand-off), the `nproc` scheduler's
+/// `reschedule` (`SYS_WAIT` / a child's exit or fault) and its round-robin
+/// `SYS_YIELD` (rheo-net N4a: a service cell serving N clients, and the
+/// reactor's channel idle path). The FP swap is *inside* this function rather
+/// than repeated at each call site on purpose (docs/ENGINEERING.md 3, one owner
+/// enforced by construction): a hard-float cell that yields with live values in
+/// its vector registers would otherwise silently read back the peer's values -
+/// no fault, no log, wrong numbers. That is exactly the defect a textual merge
+/// of the FP work with `SYS_YIELD` produced.
+///
+/// The save areas live in kernel memory, so the swap is independent of which
+/// address space is active. Cells are single-context here; the **Linux**
+/// personality's cross-cell switch keeps its own per-*context* FP handling
+/// (`linux::thread::save_current_fp`/`restore_current` around
+/// [`switch_to_cell`]), because a Linux cell holds up to 8 contexts with an FP
+/// area each.
+pub fn switch_native_cell(from: usize, to: usize) {
+    save_native_fp(from);
+    switch_to_cell(to);
+    restore_native_fp(to);
 }
 /// The cell `run` was entered with (docs/LINUX-COMPAT.md L6): the top of the
 /// Linux process tree. Only its exit ends the whole run; a forked child's exit
@@ -883,6 +926,12 @@ pub fn run(idx: usize) -> (usize, Outcome) {
         *core::ptr::addr_of_mut!(CURRENT) = idx;
         *core::ptr::addr_of_mut!(TOP_CELL) = idx;
         (*cell.aspace).activate();
+        // Load this cell's own FP/SIMD image before its first instruction: the
+        // clean ABI-default one `fp_area_init` wrote at install for a fresh
+        // cell, or its saved image if a previous `run` left it mid-flight. A
+        // test kernel that runs several cells in sequence would otherwise hand
+        // the next one whatever the last left in the vector registers.
+        restore_native_fp(idx);
         arch::enter_user_first(cell.frame);
     }
     // enter_user_first returns via return_to_kernel after an exit/fault.
@@ -1013,10 +1062,15 @@ pub fn set_cell_frame(idx: usize, frame: *mut TrapFrame) {
     cells()[idx].frame = frame;
 }
 
-/// Make cell `idx` the current cell and activate its address space - the Linux
-/// process scheduler's cross-cell switch (docs/LINUX-COMPAT.md L6), the same
-/// mechanism the native `SYS_SWITCH` uses, driven from `crate::linux::proc`
-/// instead of a syscall arm.
+/// Make cell `idx` the current cell and activate its address space - the
+/// address-space half of a cross-cell switch, and nothing else.
+///
+/// This is the **Linux** personality's cross-cell switch (docs/LINUX-COMPAT.md
+/// L6), driven from `crate::linux::proc`, which brackets it with its own
+/// per-context FP/TLS swap (`linux::thread::save_current_fp` /
+/// `restore_current`). A **native** caller must use [`switch_native_cell`]
+/// instead, which also swaps the FP/SIMD register file; calling this directly
+/// from a native path leaks one cell's vector registers into another.
 pub fn switch_to_cell(idx: usize) {
     unsafe {
         *core::ptr::addr_of_mut!(CURRENT) = idx;
@@ -1190,16 +1244,9 @@ pub fn on_user_trap(
             let peer = cur ^ 1;
             let peer_cell = cells()[peer];
             assert!(peer_cell.present, "SYS_SWITCH with no peer cell");
-            // Swap FP/SIMD state across the cross-cell boundary: save this
-            // cell's live registers, load the peer's (docs/LIBRHEO.md). The
-            // areas live in kernel memory, so this is independent of which
-            // address space is active.
-            save_native_fp(cur);
-            restore_native_fp(peer);
-            unsafe {
-                *core::ptr::addr_of_mut!(CURRENT) = peer;
-                (*peer_cell.aspace).activate();
-            }
+            // The one native cross-cell switch: address space **and** FP/SIMD
+            // register file (docs/LIBRHEO.md).
+            switch_native_cell(cur, peer);
             peer_cell.frame
         }
         // A spawned native child's exit makes it a zombie and reschedules

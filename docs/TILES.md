@@ -172,7 +172,21 @@ Where each runs, honestly:
   F+D baseline), the kernel enables AVX/AVX-512 for U-mode when CPUID
   reports it and **saves/restores the vector state across every cell
   switch** with XSAVE (the kernel itself stays soft-float, so ring 3 owns
-  the FP/vector registers). `librheo::tile::simd` runtime-dispatches the
+  the FP/vector registers). "Every" is enforced by construction and
+  proven, not asserted: **one** function, `user::switch_native_cell`, does
+  the address-space switch *and* the FP/SIMD swap, and every native path
+  goes through it - `SYS_SWITCH`, the `nproc` scheduler's `reschedule`
+  (`SYS_WAIT` / a child's exit or fault) and its round-robin `SYS_YIELD`
+  (rheo-net N4a: a service cell's client fan-out, and the strand
+  reactor's channel idle path). `user::run` loads a cell's image before
+  its first instruction. The `librheoipc` kernel proves it: two hard-float
+  cells pin a distinct pattern in 16 vector registers, `SYS_YIELD` to each
+  other, and assert the register file comes back **bit-identical** - with
+  the "read back the *peer's* pattern" case reported separately, because
+  that is precisely what an unswapped switch produces. See docs/LIBRHEO.md
+  ("FP/SIMD across the native cross-cell switch") for why `SYS_YIELD` is
+  the path that had to be found rather than assumed.
+  `librheo::tile::simd` runtime-dispatches the
   GEMM block: a boot **probe** queries the kernel's validated feature
   report (`SYS_CPUINFO` -> `CpuFeatures.simd`), runs a **functionality
   test** (each tier bit-exact vs scalar - the on-boot form of the host

@@ -59,6 +59,18 @@ RT-reservation mutexes in the L4 suite), and multiple *vcores* (real SMP
 parallelism) still awaits secondary-core bring-up. The native strand runtime
 (sections 1-3) remains the single-vcore userspace scheduler.
 
+**Native cells get the same guarantee, per cell rather than per context.** A
+native cell is single-context, and cells build **hard-float** while the kernel
+stays soft-float (docs/TILES.md 4), so at a cross-cell hand-off the physical
+vector register file still holds the outgoing cell's values. `user::switch_native_cell`
+is the one native switch and swaps that register file along with the address
+space - `SYS_SWITCH`, the `nproc` scheduler (`SYS_WAIT` / child exit) and the
+round-robin `SYS_YIELD` all route through it, so a strand that yields the vcore
+across a cell boundary keeps its FP state. The Linux path above keeps its own
+per-*context* swap, because one Linux cell time-shares the registers between up
+to 8 contexts. Both mechanisms and the proof are in docs/LIBRHEO.md ("FP/SIMD
+across the native cross-cell switch").
+
 **The first real wakeups (docs/LIBRHEO.md Phase D/F).** Until Phase D, "park on a
 token" was closed only by a synchronous doorbell drain - a reactor with nothing
 ready could only spin, because the kernel had **no interrupts on any ISA**. Phase

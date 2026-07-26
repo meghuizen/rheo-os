@@ -12,6 +12,17 @@ The design lives in `docs/` and is the source of truth. Read
 `docs/ARCHITECTURE.md` first; `docs/BUILD-ORDER.md` says what gets built in
 what order; `docs/DEVELOPMENT.md` covers the day-to-day mechanics.
 
+**`docs/ENGINEERING.md` is the engineering standard** - how a change lands
+here: observe-never-infer (a capability is claimed only from evidence the
+code cannot fake), waits expressed as deadlines not iteration counts, one
+owner per shared resource, deterministic proofs with hand-computed oracles
+and live paths as a bonus that degrades with a printed reason, rejections as
+deliverables, saying exactly what is true (built / proven / partially proven
+/ deferred), and composing before extending so existing proofs stay valid
+unchanged. Every rule there was forced by a real defect in this tree and is
+cited with its scar. Read it before writing code, and follow its section 12
+checklist for each slice of work.
+
 ## Current state
 
 BUILD-ORDER.md steps 0-5 are done, plus slices of 6-10, and a native
@@ -1044,6 +1055,44 @@ per-cell table slot) and an f16-subnormal rounding bug - and the per-cell
 grant table (16->64) and object table (128->512) caps were raised for
 real-workload headroom, both flagged in docs/TILES.md 12.
 
+The **hard-float / FP / SIMD merge** brought the tiles workstream and the
+rheo-net workstream together, and closed the one defect that only existed once
+they were in the same tree. FP/SIMD save-restore across the native cross-cell
+switch was written when there were two switch paths; rheo-net N4a had since
+added a third, **`SYS_YIELD`** - the round-robin yield a service cell's client
+fan-out and the strand reactor's channel idle path both drive. A textual merge
+compiled, passed all 168 pre-existing checks, and **silently corrupted a
+hard-float cell's vector registers on exactly that path** (no fault, no log,
+wrong numbers). The fix makes the invariant structural: `user::switch_native_cell`
+is the *only* native cross-cell switch and swaps the register file *and* the
+address space, so `SYS_SWITCH`, `nproc::reschedule` (`SYS_WAIT` / child exit or
+fault), `SYS_YIELD` and a cell's first entry via `user::run` all carry it; the
+bare `switch_to_cell` is documented as the **Linux** personality's switch, which
+keeps its own per-*context* FP (a Linux cell has up to 8). The proof is a phase
+of `librheoipc`: two hard-float cells pin a per-role pattern in 16 vector
+registers inside a **single** `asm!` block that also contains the `SYS_YIELD`
+(so the compiler cannot spill around the switch), and assert the register file
+returns **bit-identical** - 256 bytes on x86-64/ARM64, 128 on RISC-V, on all
+three ISAs - with the "read back the *peer's* pattern" case reported separately
+because that is what an unswapped switch produces, plus a kernel-side swap
+counter bumped only inside the restore. Verified in both directions: reverting
+`yield_cell` to the bare switch makes 7 of 8 rounds report the peer's pattern
+and panics the kernel. The merge also re-made three choices that had been
+premised on soft-float-only (docs/NETSTACK.md 22): **integer-only CC math** is
+kept and is now a *hard* constraint, not a convenience - `cc`/`bbr`/`pacer`/`tcp`
+link in the librheo-free codec posture *beside a kernel binary* for the N4b
+bridge, and FP in kernel context would falsify the very premise the FP
+save/restore rests on; **forced software crypto backends** stay the default
+after the hardware path was tried and **verified working** (it builds clean on
+the hard-float cell target - the N3a LLVM miscompile does not reproduce there -
+and with `+aes` at baseline emits 477 AES instructions and passes every N3a
+vector on-OS, AES-GCM included), because baseline `+aes` has **no graceful
+fallback** where this tree's own pattern is probe-verify-fall-back, and because
+the throughput win is unmeasurable under QEMU; and **SWAR** stays in the HTTP
+scanner because `http1` must link in the codec posture, which drops librheo
+entirely, so `librheo::tile::simd` is structurally unreachable from it. Both
+follow-ons are named in docs/NETSTACK.md 22 rather than half-done.
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
 proofs, and the hardware-lab performance numbers. **SMP** (docs/SMP.md,
@@ -1357,9 +1406,18 @@ targets/      rheo-os custom target specs + the std port: rheo_os-*.json,
 
 ## Rules
 
+- **The engineering standard.** `docs/ENGINEERING.md` governs *how* work
+  lands - evidence, scope language, additivity. Its section 12 checklist
+  applies to every slice.
 - **Docs first.** A change that adds a kernel object or verb must pass the
   admission rule in `docs/ARCHITECTURE.md` section 6 and be reflected there
   before it lands in code.
+- **One native cross-cell switch.** Every path that hands the CPU from one
+  native cell to another goes through `user::switch_native_cell`, which
+  swaps the FP/SIMD register file as well as the address space. Cells are
+  hard-float and the kernel is soft-float, so a bare `switch_to_cell` from a
+  native path silently corrupts vector registers (docs/LIBRHEO.md "FP/SIMD
+  across the native cross-cell switch").
 - **Portability.** Only `kernel/src/arch/` and `kernel/arch/` may differ per
   ISA. A change that needs per-ISA code anywhere else is an architecture bug
   (docs/TARGET-ARCHITECTURES.md 4). Every change must build and boot on all
