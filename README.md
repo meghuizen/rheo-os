@@ -194,6 +194,7 @@ roadmap; `docs/DEVELOPMENT.md` is the practical how-to.
 | `docs/NETWORKING.md` | Cell-owned NICs, QUIC/TLS, WASM dataplane, DDoS pipeline |
 | `docs/ACCELERATORS.md` | Engine contract, GPU/NPU/TPU/FPGA/DPU, driver cell containment |
 | `docs/GPU-HARDWARE.md` | Real PCIe GPUs: enumeration/BARs, IOMMU containment, VRAM backing, firmware trust, driver cells, tile/inference memory contract |
+| `docs/TILES.md` | One tile program, every engine: the unified tile framework (dtypes, contracts, executors, TileSim, battle tier) |
 | `docs/AI-ARCHITECTURE.md` | Kernel vs service vs library split, model objects, KV paging, tile IR |
 | `docs/GRAPHICS.md` | Vulkan mapping, compositor cells, HID, display scope |
 | `docs/DISPLAY.md` | Frame buffers, vsync events, double/triple buffering, VRR, frame pacing, input-to-photon latency |

@@ -38,6 +38,12 @@ path = "src/bin/librheo-data.rs"
 name = "librheo-compute"
 path = "src/bin/librheo-compute.rs"
 
+# The tile framework proof (docs/TILES.md): TileBuf/TileProgram/CpuExecutor/
+# TileSim + (with the kernel slice) the engine-graph lowering.
+[[bin]]
+name = "librheo-tile"
+path = "src/bin/librheo-tile.rs"
+
 [[bin]]
 name = "librheo-term"
 path = "src/bin/librheo-term.rs"

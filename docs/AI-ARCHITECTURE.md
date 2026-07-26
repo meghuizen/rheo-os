@@ -71,7 +71,9 @@ in the trusted base, and "AI-driven kernel scheduling" mysticism
 
 ## 4. The compilation stack and the tile IR
 
-Unified dispatch happens at the IR, not the binary:
+The implemented tile surface (the framework, contracts, executors, graph
+ops, and the battle tests) is TILES.md; this section is the compilation-
+stack design above it. Unified dispatch happens at the IR, not the binary:
 
 ```
 Graph IR      operators, dependencies, conditional edges

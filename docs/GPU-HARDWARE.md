@@ -645,13 +645,15 @@ detail bolted on top - it changes what the memory system stores and moves:
   the attach benchmark's per-dtype GEMM classes (section 9) tell placement
   what the quantized path is actually worth on this silicon.
 
-Honesty: none of this section is implemented - there is no tile compiler
-in-tree, and the CPU engine's four integer ops (section 2) are the only
-executable node type. The contract matters now because sections 3-10 are
-designed against it: per-dtype benchmark classes, block-granular grants,
-driver-cell page tables, and P2P loading exist in this document *because*
-this is the workload they must carry (BUILD-ORDER step 18's gate is
-serving a 7B model within 15% of vLLM).
+Honesty: the tile layer now exists as the librheo framework + two
+graph-node ops executable on the CPU engine (TILES.md - the tile model,
+contracts, executors, and battle tier live there); there is still no tile
+*compiler* in-tree, and no device engine executes tiles. The contract
+matters because sections 3-10 are designed against it: per-dtype
+benchmark classes, block-granular grants, driver-cell page tables, and
+P2P loading exist in this document *because* this is the workload they
+must carry (BUILD-ORDER step 18's gate is serving a 7B model within 15%
+of vLLM).
 
 ---
 
