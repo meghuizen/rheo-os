@@ -4,9 +4,11 @@
 **N1c's caching DNS client**, **N1e's TTL / hop-limit + traceroute**, **N1d's
 local sockets** (native `net::local` + Linux AF_UNIX), **N2a's native TCP core**,
 **N2b's congestion control** (Reno + CUBIC), **N2c's two transports** (the smoltcp
-blessed cell + the native sharded framing - §13), and the **L8-INET** personality
+blessed cell + the native sharded framing - §13), the **L8-INET** personality
 slice (AF_INET/AF_INET6 sockets + a minimal epoll over the **loopback** interface -
-§10(C), docs/LINUX-COMPAT.md) are done; the full
+§10(C), docs/LINUX-COMPAT.md), and **N3a's crypto primitive layer** (from-scratch
+ChaCha20-Poly1305 + doc-named RustCrypto SHA-2/HKDF/X25519/Ed25519/AES-GCM, each
+RFC/NIST-vector-proven - §14) are done; the full
 roadmap (N1-N8) is below. This document is the architecture + roadmap + crypto posture;
 `docs/NETWORKING.md` holds the doctrine (the kernel owns queue plumbing + grant
 checks + steering, and no network stack).
@@ -92,10 +94,35 @@ surface.
 - **Doc-name audited crates** for the rest (each named here per the no-deps rule),
   `no_std` where possible, wrapped behind rheo-net's own async/capability API so
   the external surface stays native: RustCrypto **aes-gcm**, **sha2**, **hkdf**,
-  **x25519-dalek**, **ed25519-dalek**, **poly1305**; a **rustls**-class TLS; a
+  **x25519-dalek**, **ed25519-dalek**; a **rustls**-class TLS; a
   **boringtun**-core-class WireGuard. **smoltcp** is the blessed correctness-first
   transport for control/low-rate cells (Redox precedent); the HFT/warehouse hot
   lines use a native, sharded, zero-copy transport instead.
+- **The primitive layer is built and vector-proven** (Phase N3a, §14). The final
+  pinned inventory - all behind the `net` crate's `crypto` feature (off by
+  default; built separately by xtask), `no_std`, `default-features = false`:
+
+  | Primitive | Provider | Version | RFC/NIST vector |
+  | --- | --- | --- | --- |
+  | ChaCha20 block/keystream | **from-scratch** (our own) | - | RFC 8439 §2.3.2 |
+  | Poly1305 MAC | **from-scratch** | - | RFC 8439 §2.5.2 |
+  | ChaCha20-Poly1305 AEAD | **from-scratch** | - | RFC 8439 §2.8.2 |
+  | SHA-256 / SHA-384 | `sha2` | 0.10.8 | NIST / RFC 6234 |
+  | HKDF (HMAC-SHA256) | `hkdf` | 0.12.4 | RFC 5869 TC1 |
+  | X25519 | `x25519-dalek` | 2.0.1 | RFC 7748 §5.2 / §6.1 |
+  | Ed25519 | `ed25519-dalek` | 2.1.1 | RFC 8032 §7.1 |
+  | AES-128/256-GCM | `aes-gcm` | 0.10.3 | GCM-spec / NIST TC4 / TC16 |
+
+  The dalek crates pull `curve25519-dalek` 4.1.3; aes-gcm pulls `aes` 0.8.4 +
+  `ghash`/`polyval` 0.6.2. **Build note (the N2c smoltcp-style risk, cleared):**
+  the crates build `no_std` on all three bare targets, but on
+  `x86_64-unknown-none` the default target features select intrinsics backends
+  (AES-NI / CLMUL / AVX2 SIMD) that **miscompile under LLVM** ("Do not know how to
+  split the result of this operator"). The crypto build therefore forces the
+  **software** backends via `RUSTFLAGS` cfgs (`aes_force_soft`,
+  `polyval_force_soft`, `curve25519_dalek_backend="serial"`, applied uniformly on
+  all three ISAs) - the scalar portable path this posture wants anyway. No crate
+  needed a from-scratch fallback; all five are crate-backed as named.
 - **Two randomness classes, never conflated** (mixing them is a silent
   nonce-reuse break): the ChaCha20 fast DRBG is for **non-secret** randomness only
   (cookies, DNS transaction ids, hash seeds, backoff jitter). **Protocol key
@@ -169,7 +196,14 @@ kernels stay green.
     (integrated over the raw-frame NIC path, a live smoltcp UDP round trip to
     SLIRP's DNS) and the native sharded transport framing (connections hashed to
     shards, shared-nothing). §13.
-- **N3 - TLS 1.3 + HTTPS.** Crypto crates wired; keys-as-capabilities.
+- **N3 - TLS 1.3 + HTTPS.** Crypto crates wired; keys-as-capabilities. Split:
+  - **N3a (done): the crypto primitive layer** (§14). The AEAD/hash/KDF/
+    key-exchange/signature primitives the security transports need, each proven
+    against its RFC/NIST test vector on 3 ISAs: from-scratch ChaCha20-Poly1305 +
+    doc-named RustCrypto SHA-2 / HKDF / X25519 / Ed25519 / AES-GCM, the
+    two-randomness-class API, and the nonce-reuse guard.
+  - **N3b: the TLS 1.3 handshake + record layer + X.509** over N3a's primitives,
+    then an HTTPS GET.
 - **N4 - Service-cell model + fan-out + host services** (DHCP + zeroconf + NTP).
 - **N5 - App protocols.** HTTP/2, gRPC, Arrow Flight (warehouse), Kafka.
 - **N6 - Perf substrate.** NIC RX IRQ, zero-copy DMA + offload/multiqueue/RSS,
@@ -947,3 +981,112 @@ doc-named userspace dependency (pinned, `no_std`, feature-gated); no
 - **Parallel sharding:** structural only under the single CPU (above) - SMP (#27).
 - The per-epoch **keyed** shard hash (§8.3) and a cross-shard queue-pair steering
   path are later-phase refinements; N2c ships the deterministic FNV framing.
+
+## 14. Phase N3a (done): the crypto primitive layer
+
+N3a establishes the crypto foundation the security transports (TLS 1.3 /
+WireGuard / IPsec, N3b+) build on, per the §3 **hybrid** posture. It adds **no
+kernel object, no verb, no kernel change** (crypto is pure userspace), **no
+`cfg(target_arch)`** (portable Rust; the crates handle their own arch internally),
+and the crypto crates are **doc-named dependencies** (§3, pinned, `no_std`,
+feature-gated behind the `net` crate's `crypto` feature so the base stack + every
+existing test are unaffected). The TLS handshake itself is **N3b** - out of scope
+here; N3a is the vetted primitives.
+
+### What the `net` crate adds (`net::crypto`, feature `crypto`)
+
+- **`chacha`** - ChaCha20 block + `xor_keystream` + `poly1305_key` (from scratch;
+  the same constant-time ARX core the kernel/librheo DRBGs carry, exposing a
+  caller nonce + block counter for the AEAD framing).
+- **`poly1305`** - the 130-bit one-time MAC (from scratch; the public-domain
+  "donna" 5×26-bit-limb form, `u64` partial products, `2^130 ≡ 5` reduction,
+  constant-time tag compare).
+- **`chachapoly`** - the ChaCha20-Poly1305 AEAD (from scratch, RFC 8439 §2.8:
+  block-0 Poly1305 key, payload from counter 1, the `aad ‖ pad ‖ ct ‖ pad ‖
+  len64 ‖ len64` MAC input, encrypt-then-MAC with a constant-time verify on open).
+- **`hash`** (`sha2`), **`kdf`** (`hkdf` HMAC-SHA256 + HKDF-Expand-Label),
+  **`kx`** (`x25519-dalek`), **`sign`** (`ed25519-dalek`), **`aesgcm`**
+  (`aes-gcm`) - the audited crates wrapped behind rheo-net's own API.
+- **`aead`** - the `Aead` seam (both AEADs implement it) + the **nonce-safe**
+  `SealingKey`/`OpeningKey`.
+- **`rand`** - the two-randomness-class boundary + the fork-epoch guard.
+
+### Crate-backed vs from-scratch (the honest split)
+
+From-scratch (ours): ChaCha20, Poly1305, ChaCha20-Poly1305. Crate-backed:
+SHA-256/384 (`sha2` 0.10.8), HKDF (`hkdf` 0.12.4), X25519 (`x25519-dalek` 2.0.1),
+Ed25519 (`ed25519-dalek` 2.1.1), AES-128/256-GCM (`aes-gcm` 0.10.3). **All five
+crate-backed primitives build `no_std` on all three bare targets** - none needed a
+from-scratch fallback. The one build hazard (the §3 build note): the intrinsics
+backends miscompile under LLVM on `x86_64-unknown-none`, so the build forces the
+**software** backends via `RUSTFLAGS` cfgs on all three ISAs (the scalar path the
+posture wants). The `netcrypto-demo` bin is built by a dedicated xtask step
+(`build_crypto_demo`) with those cfgs, exactly as N2c's smoltcp cell is.
+
+### Two randomness classes, structurally separated
+
+Conflating public randomness with key material is a silent nonce-reuse / key-leak
+break, so the API keeps them in **distinct types with no bridge**:
+
+- **Public** (`rand::PublicRandom`) - a fast ChaCha20 side-stream (seeded once
+  from the attested per-cell DRBG) yielding **non-secret** integers/bytes only
+  (DNS txids, cookies, hash seeds, jitter). It exposes no method that returns a
+  key type.
+- **Keys** (`kdf`) - derive via **HKDF over a transcript**, keyed from
+  `kdf::Ikm`, whose only constructors are `from_attested()` (the attested per-cell
+  DRBG) or `import()` (an explicit pre-shared / DH secret / test vector). There is
+  **no path from `PublicRandom` to `Ikm`** - a public value cannot become keying
+  material, enforced at compile time by the type system.
+
+### The nonce-reuse hazard guard
+
+A single `(key, nonce)` must never encrypt two messages. `aead::SealingKey` owns a
+**monotonic 64-bit counter** and chooses the 96-bit nonce itself
+(`iv_prefix ‖ counter`); the caller never supplies a nonce, so it cannot be
+replayed, and the counter refuses to wrap. **Fork / checkpoint-restore** is the
+other hazard (a restored image replays its counter): a `SealingKey` snapshots the
+process **fork epoch** at creation, the cell calls `rand::bump_fork_epoch()` after
+a fork/restore, and any surviving key then **refuses to seal**
+(`NonceError::ReseedRequired`) until reseeded. Full checkpoint integration is later;
+the API already forbids a replayed nonce. The low-level `Aead::seal`/`open` take an
+explicit nonce - used only to replay the published RFC/NIST vectors.
+
+### The proof (`netcrypto` test kernel, all 3 ISAs)
+
+A `netcrypto-demo` cell (loaded like `netcore`, but **pure compute - no netdev**)
+runs every primitive against its published vector, exiting `0x42` only if all pass:
+
+1. **ChaCha20 block** = RFC 8439 §2.3.2 keystream.
+2. **Poly1305** = RFC 8439 §2.5.2 tag.
+3. **ChaCha20-Poly1305 AEAD** = RFC 8439 §2.8.2 ciphertext + tag, **plus** a
+   decrypt round trip and a tampered-tag **and** tampered-ciphertext rejection.
+4. **SHA-256 + SHA-384** of `"abc"` = the NIST / RFC 6234 digests.
+5. **HKDF-SHA256** = RFC 5869 Test Case 1 PRK + OKM.
+6. **X25519** = RFC 7748 §5.2 scalar mult **and** §6.1 a full Diffie-Hellman
+   (both public keys derived, both sides' shared secret matched).
+7. **Ed25519** = RFC 8032 §7.1 TEST 1 (empty message: derive pubkey, sign, verify)
+   **and** TEST 3 (2-byte message), **plus** a tampered-signature and
+   tampered-message rejection.
+8. **AES-128-GCM** (GCM-spec / NIST TC4) **and** **AES-256-GCM** (TC16) encrypt +
+   tag, decrypt round trip, and a tampered-tag rejection.
+9. **Two randomness classes**: a key schedule from a fixed IKM derives
+   deterministically (and a different IKM differs); `public_random()` is a
+   distinct non-deterministic stream never equal to a key.
+10. **Nonce-safe `SealingKey`**: two seals get **distinct** nonces, each opens
+    correctly, and a `bump_fork_epoch()` makes the key refuse to seal.
+
+Every expected value is a real published vector, **independently verified** before
+being hardcoded (never computed by the crate under test). No kernel object / verb /
+kernel change; the crypto crates are doc-named userspace deps (pinned, `no_std`,
+feature-gated); no `cfg(target_arch)`.
+
+### Deferred to N3b (explicit)
+
+The **TLS 1.3 handshake** state machine + record layer (built on these
+primitives), **X.509** certificate parsing + path validation, and the
+**WireGuard/IPsec** protocol machinery. A **rustls-class** TLS and a
+**boringtun-core-class** WireGuard remain the doc-named options for the protocol
+layer (§3). Constant-time review of the from-scratch Poly1305/ChaCha20 against a
+hardware side-channel model, and the arch crypto-instruction dispatch
+(AES-NI/VAES/ARM-CE/RISC-V-vector, with the scalar path as the always-present
+fallback and benchmark), ride with the perf substrate (N6/N8).

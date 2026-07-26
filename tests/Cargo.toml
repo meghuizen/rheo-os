@@ -214,6 +214,14 @@ path = "src/nettcpcc.rs"
 name = "netsmoltcp"
 path = "src/netsmoltcp.rs"
 
+# rheo-net Phase N3a (docs/NETSTACK.md §3): the crypto primitive layer - every
+# primitive proven against its RFC/NIST test vector (ChaCha20-Poly1305, SHA-2,
+# HKDF, X25519, Ed25519, AES-GCM) + round-trip/tamper checks + the
+# two-randomness-class + nonce-safe API. Pure compute - needs no netdev.
+[[bin]]
+name = "netcrypto"
+path = "src/netcrypto.rs"
+
 # Linux-personality L8 (docs/LINUX-COMPAT.md L8): AF_UNIX sockets - an unmodified
 # static-glibc C fixture doing socketpair+fork and bind/listen/connect/accept.
 [[bin]]

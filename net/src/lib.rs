@@ -76,7 +76,15 @@
 //!   of N shards, connections hashed to shards by their [`shard::FourTuple`],
 //!   shared-nothing (structural on the single CPU, not parallel - SMP is #27).
 //!
-//! Still deferred (per docs/NETSTACK.md): TLS 1.3 (N3); full NewReno partial-ACK
+//! **Phase N3a** adds the crypto primitive layer (feature `crypto`, off by
+//! default):
+//! - [`crypto`]: from-scratch ChaCha20-Poly1305 (RFC 8439) + doc-named RustCrypto
+//!   SHA-2 / HKDF / X25519 / Ed25519 / AES-GCM, each proven against its RFC/NIST
+//!   test vector; the two-randomness-class API ([`crypto::rand`] vs
+//!   [`crypto::kdf`]) and the nonce-reuse guard ([`crypto::aead::SealingKey`]).
+//!   The TLS 1.3 handshake over these primitives is N3b.
+//!
+//! Still deferred (per docs/NETSTACK.md): TLS 1.3 (N3b); full NewReno partial-ACK
 //! recovery, CUBIC HyStart / fast-convergence, and BBR; negative caching; and the
 //! *live* ICMPv6 path (the v6 codec is unit-proven; SLIRP cannot generate v6
 //! errors).
@@ -104,3 +112,9 @@ pub mod wire;
 /// unaffected when it is off (the default). Present only when a cell opts in.
 #[cfg(feature = "smoltcp")]
 pub mod smoltcp_cell;
+
+/// The N3a crypto primitive layer (docs/NETSTACK.md §3). Gated behind the
+/// `crypto` feature so the base stack + every existing test are unaffected when
+/// it is off (the default). Present only when a cell opts in.
+#[cfg(feature = "crypto")]
+pub mod crypto;

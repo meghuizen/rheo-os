@@ -33,6 +33,24 @@ smoltcp = { version = "=0.13.1", default-features = false, features = [
     "alloc",
 ], optional = true }
 
+# rheo-net N3a crypto primitives (docs/NETSTACK.md §3, the hybrid crypto posture).
+# The ChaCha20-Poly1305 AEAD is from-scratch (ChaCha20 is already ours, Poly1305 is
+# small); these audited RustCrypto crates supply SHA-2 / HKDF / X25519 / Ed25519 /
+# AES-GCM. Each is doc-named in NETSTACK.md §3 per the no-deps rule, pinned,
+# `default-features = false` so they build `no_std` for the three bare soft-float
+# targets (no `getrandom`/`std` pulled), and all are behind the `crypto` feature so
+# the base stack + every existing test are unaffected when it is off (the default).
+sha2 = { version = "=0.10.8", default-features = false, optional = true }
+hkdf = { version = "=0.12.4", default-features = false, optional = true }
+aes-gcm = { version = "=0.10.3", default-features = false, features = [
+    "aes",
+    "alloc",
+], optional = true }
+x25519-dalek = { version = "=2.0.1", default-features = false, features = [
+    "static_secrets",
+], optional = true }
+ed25519-dalek = { version = "=2.1.1", default-features = false, optional = true }
+
 # Profile feature gates (docs/NETSTACK.md): a deployment links only the layers
 # its profile needs. For N1a every profile pulls the same L2/L3 core (the
 # modules are always compiled); the gates are declared now so later phases
@@ -51,9 +69,37 @@ warehouse = []
 # N2c: the smoltcp blessed transport cell (docs/NETSTACK.md 13). Off by default
 # so the from-scratch stack + every existing test are unaffected.
 smoltcp = ["dep:smoltcp"]
+# N3a: the crypto primitive layer (docs/NETSTACK.md §3). ChaCha20-Poly1305 is
+# from-scratch; the audited RustCrypto crates supply the rest. Off by default so
+# the base stack + every existing test are unaffected; built separately by xtask.
+crypto = [
+    "dep:sha2",
+    "dep:hkdf",
+    "dep:aes-gcm",
+    "dep:x25519-dalek",
+    "dep:ed25519-dalek",
+]
 
 [lib]
 name = "rheo_net"
+
+# The crypto build (docs/NETSTACK.md §3, N3a) is compiled on x86_64 with
+# `RUSTFLAGS=--cfg aes_force_soft --cfg polyval_force_soft
+# --cfg curve25519_dalek_backend="serial"` (xtask's `build_crypto_demo`) to route
+# aes / aes-gcm's polyval-GHASH / curve25519-dalek onto their **portable software**
+# backends - the `x86_64-unknown-none` default target features otherwise select
+# intrinsics backends (AES-NI / CLMUL / AVX2 SIMD) that miscompile under LLVM
+# ("Do not know how to split the result of this operator"). Soft backends are the
+# scalar fallback our doctrine wants anyway (docs/NETSTACK.md §3). Those RUSTFLAGS
+# reach this crate too, so declare the custom cfgs as known - otherwise
+# `unexpected_cfgs` would fire on rheo-net under clippy `-D warnings`. rheo-net
+# never reads them.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(aes_force_soft)',
+    'cfg(polyval_force_soft)',
+    'cfg(curve25519_dalek_backend, values("serial", "simd", "fiat"))',
+] }
 
 # The N1a proof cell: reads the NIC MAC, resolves the SLIRP gateway via net::arp
 # (a real ARP round trip through the stack), and round-trips IPv4/IPv6 headers +
@@ -123,3 +169,13 @@ path = "src/bin/nettcpcc-demo.rs"
 name = "netsmoltcp-demo"
 path = "src/bin/netsmoltcp-demo.rs"
 required-features = ["smoltcp"]
+
+# The N3a crypto proof cell: runs every crypto primitive against its RFC/NIST test
+# vector (ChaCha20-Poly1305, SHA-256/384, HKDF, X25519, Ed25519, AES-GCM) + the
+# round-trip / tamper-reject checks + the two-randomness-class + nonce-safe API.
+# Pure compute (no netdev). Requires the `crypto` feature (built separately by
+# xtask with the force-soft cfgs); loaded by the `netcrypto` test kernel.
+[[bin]]
+name = "netcrypto-demo"
+path = "src/bin/netcrypto-demo.rs"
+required-features = ["crypto"]

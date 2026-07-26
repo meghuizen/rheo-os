@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 45] = [
+const TEST_KERNELS: [&str; 46] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -65,6 +65,7 @@ const TEST_KERNELS: [&str; 45] = [
     "nettcp",
     "nettcpcc",
     "netsmoltcp",
+    "netcrypto",
     "linuxunix",
     "linuxinet",
 ];
@@ -603,6 +604,53 @@ fn build_smoltcp_demo(arch: Arch) -> bool {
     matches!(cmd.status().map(|s| s.success()), Ok(true))
 }
 
+/// Build the `netcrypto-demo` bin with the `crypto` feature (docs/NETSTACK.md §3,
+/// Phase N3a). Like `build_smoltcp_demo`, `build_userland` (default features)
+/// skips it via `required-features = ["crypto"]`, so this dedicated step builds
+/// just that one bin with the RustCrypto tree, into the same release path the
+/// `netcrypto` test kernel `include_bytes!`s.
+///
+/// The `--cfg *_force_soft` / `curve25519_dalek_backend="serial"` flags force the
+/// **software** AES / GHASH / curve25519 backends: `x86_64-unknown-none`'s default
+/// target features otherwise select intrinsics backends (AES-NI / CLMUL / AVX2)
+/// that miscompile under LLVM ("Do not know how to split the result of this
+/// operator"). The soft backends are the scalar portable path our doctrine wants
+/// anyway (docs/NETSTACK.md §3), applied uniformly on all three ISAs so behaviour
+/// is identical everywhere. Setting env RUSTFLAGS replaces `.cargo/config.toml`'s
+/// `[target]` flags, so x86_64's relocation/code-model are re-supplied here.
+fn build_crypto_demo(arch: Arch) -> bool {
+    println!(
+        "[xtask] building netcrypto-demo (--features crypto, soft backends) for {}",
+        arch.name()
+    );
+    let mut rustflags = String::from(
+        "--cfg aes_force_soft --cfg polyval_force_soft \
+         --cfg curve25519_dalek_backend=\"serial\"",
+    );
+    // x86_64-unknown-none needs its config.toml model flags re-supplied (env
+    // RUSTFLAGS overrides, does not merge with, the [target] config rustflags).
+    if arch == Arch::X86_64 {
+        rustflags.push_str(" -C relocation-model=static -C code-model=small");
+    }
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "build",
+        "-p",
+        "rheo-net",
+        "--bin",
+        "netcrypto-demo",
+        "--features",
+        "crypto",
+        "--release",
+        "--target",
+        arch.target(),
+        "-Zbuild-std=core,alloc,compiler_builtins",
+        "-Zbuild-std-features=compiler-builtins-mem",
+    ]);
+    cmd.env("RUSTFLAGS", rustflags);
+    matches!(cmd.status().map(|s| s.success()), Ok(true))
+}
+
 /// Build a real-std program (`manifest`) for the rheo-os target of `arch`, so
 /// a test can embed the ELF (docs/USERLAND.md M4/M5). Applies the rust-src std
 /// patch first (idempotent) and uses `-Zbuild-std=std` against the custom JSON
@@ -913,6 +961,12 @@ fn build(arch: Arch, release: bool) -> bool {
     // The N2c smoltcp cell (docs/NETSTACK.md §13): built separately with the
     // `smoltcp` feature (the default `build_userland` skips it via required-features).
     if !build_smoltcp_demo(arch) {
+        return false;
+    }
+    // The N3a crypto cell (docs/NETSTACK.md §3): built separately with the
+    // `crypto` feature + the force-soft backend cfgs (build_userland skips it via
+    // required-features).
+    if !build_crypto_demo(arch) {
         return false;
     }
     // The librheodata (Phase B) dataset the test kernel reads off the live disk.
