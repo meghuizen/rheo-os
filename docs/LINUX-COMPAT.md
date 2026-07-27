@@ -1094,12 +1094,61 @@ fixup path.
   (task #132), not a missing syscall or a memory bug - the entire load path
   (streaming, demand paging, 7-library dynamic linking, the 128 GiB Gigacage,
   `clone3`, the event loop) works. The `linuxbun` harness accepts this specific,
-  tightly-bounded partial (exit 134 **and** empty output); when #132 lands, Bun
-  should print `rheo:42` and exit 0, and the strict branch takes over. x86-64 only
-  (no arm64/riscv64 bun build). Node completes fully because its thread coordination
-  happens to align with blocking points (per-context blocking above); Bun's does
-  not - the honest difference between "syscall-driven concurrency" and "requires
-  true parallelism".
+  tightly-bounded partial (exit 134 **and** empty output). x86-64 only (no
+  arm64/riscv64 bun build).
+
+  **That attribution has since been tested, and it does not hold.** Timer preemption
+  landed (docs/SUBSTRATE.md 15, S3'), the worker measurably **does** get the CPU when
+  it is enabled - 66 preemptions taken, all of them to a sibling context of Bun's own
+  cell - and Bun aborts **identically with preemption disabled**: same exit 134, same
+  empty output, at the same point. So "the worker never got the CPU" was a true
+  observation and a *wrong diagnosis*: it was the first difference anyone measured
+  between Bun and Node, not the cause of the abort. What the cause is, is now
+  genuinely unknown, and saying so is better than substituting the next plausible
+  guess (docs/ENGINEERING.md 1). The prediction "when #132 lands it should print
+  `rheo:42`" is withdrawn as disproven rather than quietly restated about a later
+  milestone.
+
+  The `linuxbun` boot therefore stays **cooperative** - that is the scheduler its
+  partial is characterised against. Enabling preemption is not a no-op: Bun gets
+  *further*, all the way to printing its startup banner, and then fails differently.
+  Widening an accepted partial to cover a second unexplained failure would turn a
+  bounded disclosure into a blanket one.
+
+  The experiment paid for itself in four real defects, each fixed:
+
+  - **The vector-register file was saved after the scheduler's bookkeeping** rather
+    than before it. The kernel is soft-float, but that bounds the floating point it
+    *emits*, not the vector registers `compiler_builtins`' `mem*` routines and
+    ordinary struct moves use on x86-64 - so anything between the interrupt and the
+    save clobbers what is about to be saved, and a preemption arrives at an arbitrary
+    instruction inside the cell's own vector code. The symptom was not a fault at the
+    switch: it was the *resumed* context computing with someone else's registers,
+    which showed up as Bun dying with `Illegal instruction` at a nonsense address. The
+    save is now the first action on every preemption path (a fourth path into the
+    `SYS_YIELD` FP scar, docs/LIBRHEO.md).
+  - **`getrusage` was refused**, and Bun printed `Sys: 8589934ms` from the `-ENOSYS`
+    return reinterpreted as microseconds. A fabricated measurement is worse than a
+    refusal, and a zeroed struct would be worse for the same reason, so it now reports
+    the counters this kernel has (elapsed CPU as `utime` - there is no user/system
+    split to report, and guessing a ratio would invent the distinction - the cell's own
+    committed frames as `maxrss`, its fault count) with the rest 0 *because they are 0*.
+  - **`MADV_DONTDUMP`/`MADV_DODUMP` were refused** where this OS can provide their
+    entire observable effect: it produces no core dumps. JSC marks the 128 GiB
+    Gigacage `MADV_DONTDUMP`, which is the sane thing to do with mostly-untouched
+    address space.
+  - **The timer wheel's bulk re-file path skipped its trailing bucket expiry.** Taken
+    when more than a level-0 revolution has elapsed with nothing serviced, it left an
+    already-due timer to fire on the *next* service - after timers with later
+    deadlines. It broke the one property the wheel exists to guarantee, and only after
+    a long stall, so it presented as a rare load-dependent flake in `substrate`
+    (observed failing while the host was building three ISAs) rather than as a bug. A
+    transport would have applied a later RTO before an earlier one.
+
+  **Node completes fully - and now does so under preemption**, with 30 slices taken to
+  sibling contexts, exact stdout and exit 0. That is the more useful half of the
+  experiment: a preemption kernel that only ever preempts a purpose-built spinner has
+  not been tested by anything.
 
 ## 6. Fixture build matrix (reproducibility)
 
