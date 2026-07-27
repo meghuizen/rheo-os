@@ -416,6 +416,102 @@ pub extern "C" fn user_spinner(params_va: usize) -> ! {
     loop {}
 }
 
+/// The **scratch-register spinner** (x86-64 only): spin with known sentinels in the
+/// two registers `sysretq` consumes, and report whether they survived.
+///
+/// `SYSRET` takes its RIP from RCX and its RFLAGS from R11 - it *consumes* them - which
+/// is correct for returning from a `syscall` (the instruction is defined to clobber
+/// both) and wrong for resuming a context stopped anywhere else. Timer preemption
+/// creates exactly such frames, and if a *sibling's syscall* later switches to one, the
+/// syscall trampoline is the path it comes back through. The symptom is not a fault: it
+/// is the resumed cell computing with two wrong registers.
+///
+/// So this cell pins a sentinel in each, spins comparing them against copies held in
+/// R8/R9, and writes a nonzero `status` the moment either differs. The whole loop -
+/// sentinel load, compare, back-edge - is **one `asm!` block**, so the compiler cannot
+/// spill and reload RCX/R11 around the interesting window; that is the same discipline
+/// the FP/SIMD `SYS_YIELD` proof needed (docs/LIBRHEO.md), and for the same reason: a
+/// register-preservation property is only observable if the register is genuinely live
+/// across the switch.
+///
+/// `iters` is the spin count and `ticks` the shared page (a marker is appended before
+/// and after, so the kernel can see the cell reached the loop). On the other ISAs
+/// `eret`/`sret` restore the whole register file from the frame and consume nothing, so
+/// there is nothing to check and this reports success immediately - stated rather than
+/// silently skipped.
+#[unsafe(link_section = ".user.text")]
+#[unsafe(no_mangle)]
+pub extern "C" fn user_scratch_spinner(params_va: usize) -> ! {
+    let p = params_va as *mut Params;
+    // SAFETY: the cell's own mapped Params page and the shared order page.
+    unsafe {
+        let rounds = (*p).iters;
+        let shared = (*p).ticks as *mut u8;
+        order_append(shared, b'C');
+        (*p).status = spin_scratch(rounds);
+        order_append(shared, b'D');
+        (*p).ops = 1;
+        syscall(SYS_EXIT, 0);
+    }
+    loop {}
+}
+
+/// Sentinels chosen so a corrupted value is unmistakable: both halves nonzero, neither
+/// a plausible RIP or RFLAGS, and different from each other. Small enough to be
+/// materialised by a 32-bit immediate (a 64-bit constant would need a `.rodata` pool a
+/// cell cannot reach - the defect the plain spinner hit first).
+const SCRATCH_RCX: u64 = 0x5EC0_1234;
+const SCRATCH_R11: u64 = 0x0BAD_5678;
+
+/// Spin `rounds` times with the sentinels live in RCX and R11; return 0 if both
+/// survived every iteration, 1 if either was seen changed.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn spin_scratch(rounds: u64) -> u64 {
+    let bad: u64;
+    // SAFETY: pure register arithmetic in the cell's own context; no memory touched.
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "cmp rcx, r8",
+            "jne 3f",
+            "cmp r11, r9",
+            "jne 3f",
+            "dec rdx",
+            "jnz 2b",
+            "xor eax, eax",
+            "jmp 4f",
+            "3:",
+            "mov eax, 1",
+            "4:",
+            inout("rcx") SCRATCH_RCX => _,
+            inout("r11") SCRATCH_R11 => _,
+            in("r8") SCRATCH_RCX,
+            in("r9") SCRATCH_R11,
+            inout("rdx") rounds.max(1) => _,
+            out("rax") bad,
+            options(nostack, nomem),
+        );
+    }
+    bad
+}
+
+/// Nothing to check off x86-64: `eret`/`sret` restore the whole register file from the
+/// frame and consume no register, so no equivalent hazard exists. The loop still runs,
+/// so the cell is preemptable and the phase's other assertions hold.
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn spin_scratch(rounds: u64) -> u64 {
+    let mut acc = 1u64;
+    let mut i = 0u64;
+    while i < rounds {
+        acc = acc.wrapping_add(i ^ 0x5f).wrapping_mul(3);
+        i += 1;
+    }
+    // Consumed so the loop is not dead code; the result is not a property.
+    if acc == 0 { 0 } else { 0 }
+}
+
 /// Arithmetic operations per spin round in [`user_spinner`].
 ///
 /// Sized so the whole loop is **many** preemption slices long, not one or two. The

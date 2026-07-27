@@ -1885,6 +1885,20 @@ pub fn on_user_trap(
             if cause == FaultCause::Segv && crate::linux::fill_fault(cur, fault_addr) {
                 return frame;
             }
+            // A fault that demand paging could not satisfy is about to become a signal
+            // or kill the process, so this is the last point at which the *cause* is
+            // still visible. Report it with the scheduler state alongside, because the
+            // two questions a reader has are "where did it fault" and "was it
+            // preempted" - and correlating those from separate logs is exactly what
+            // made the intermittent Node segfault under preemption unattributable
+            // (docs/LINUX-COMPAT.md). One line, only on the path that is already
+            // failing, so it costs nothing in the common case.
+            let (_, taken, _, to_sib, to_cell) = crate::sched::preempt::counters();
+            crate::println!(
+                "linux: unhandled {:?} fault in cell {cur} ctx {} at {fault_addr:#x}                  (preemptions taken {taken}: {to_sib} sibling, {to_cell} cell)",
+                cause,
+                crate::linux::thread::current_context(cur)
+            );
             return match crate::linux::deliver_fault(cur, cause, fault_addr, frame) {
                 crate::linux::FaultOutcome::Resume(f) => f,
                 // A default (uncaught) fatal fault ends the process. For the top

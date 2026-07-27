@@ -504,22 +504,33 @@ presented as a rare load-dependent flake in `substrate` (observed failing while 
 was building three ISAs) rather than as a bug; a transport would have applied a later
 RTO before an earlier one.
 
-**Node completes under preemption - but only ~7 runs in 8.** With dispatch enabled it
-repeatedly ran to its correct answer with 17-31 slices genuinely taken to sibling
-contexts mid-run; then one run died with **SIGSEGV and no output**, same binary, same
-kernel, same command, and four immediate re-runs passed. That is a residual state-save
-gap on the preemption path, not a Node property, and it is recorded with its rate rather
-than filed as a flake. Already ruled out: the vector-register file (saved first on every
-preemption path), the GPR set (`common_trap`'s ring-3 capture is the fault path's own
-code, sharing its stack offsets with the exception stubs), and the resume instruction
-(IRET, not SYSRET). Not ruled out: a preemption landing inside signal delivery or
-between the steps of `rt_sigreturn` (Node installs handlers, and FP across a handler is
-a documented L5 gap), and whether a timer interrupt can land in ring 0 mid-syscall at a
-point the ring-0 handler's assumptions do not cover. **The `linuxnode` boot is
-cooperative again** until it is found - an occasional segfault in the suite is worse
-than a capability not exercised, because it trains everyone to re-run a red test - and
-the deterministic `preempt` kernel, which carries its own negative control, remains the
-proof and does not depend on it.
+**Node completes under preemption, after a real defect was found and fixed.** It was
+intermittent first - about one run in eight died with SIGSEGV and no output - and the
+cause was the x86-64 choice of *return instruction*. `SYSRET` takes its RIP from RCX and
+its RFLAGS from R11, i.e. it **consumes** them, which is right for returning from a
+`syscall` (defined to clobber both) and wrong for resuming a context stopped anywhere
+else; so `syscall_entry` never saved RCX/R11 and `sysret_resume` reconstructed them from
+the rip/rflags slots. Airtight before preemption, because every frame a syscall trap
+handed back was either the caller's own or a peer that had also last stopped at a
+syscall. **A preempted frame is neither** - captured at an arbitrary instruction with
+those registers live - and a sibling's `SYS_YIELD` selects it through exactly that
+trampoline. The symptom is not a fault: it is the resumed context computing with two
+wrong registers. Third appearance of one family (the other two: `iret_resume` for
+faults, and the FP-save ordering above) - "a resume path correct for one provenance used
+for another". Fixed **by provenance, not by tagging**: the trampoline compares the frame
+it is about to resume against the frame it entered on and resumes a different one
+through `IRET`, so there is no flag a future producer of frames can forget; and
+`syscall_entry` now also writes the rcx/r11 slots with the values SYSRET would
+synthesise, so a syscall-origin frame resumes bit-identically either way. The fast path
+keeps SYSRET; only a switch pays for IRET. ARM64/RISC-V need no equivalent (`eret`/`sret`
+consume nothing). Proven **both directions** by a `preempt` phase that pins sentinels in
+RCX/R11 inside one `asm!` block containing the spin loop while a sibling yields: 54
+cross-cell syscall resumes leave them intact, and reverting the comparison fails
+**deterministically** - which is what turns a one-in-eight flake into a property.
+
+The `linuxnode` boot runs **preemptively with its JIT enabled**, 12 consecutive clean
+runs after the fix - though it is the property proven by `preempt`'s scratch-register
+phase, not the run count, that makes it shippable.
 
 **Node.js now runs with its JIT ENABLED** (docs/ARCHITECTURE.md 5.1). W^X was a hard
 invariant - `MapPerm` had three variants and no RWX - and it is now the **default with
@@ -2035,10 +2046,15 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               per-ISA wait-mode assertion - NIC-interrupt park on riscv64/aarch64,
               timer-backed idle on x86-64),
               preempt (docs/SUBSTRATE.md 15 S3': timer preemption + queue-driven
-              dispatch - two cells run a compute loop that issues NO syscall,
-              with the cooperative case asserted as the negative control in the
-              same binary: cell 0 unbroken for all 24 rounds and cell 1 never
-              scheduled, then with dispatch on the shared order vector
+              dispatch, plus the **scratch-register** property - a cell pins
+              sentinels in RCX/R11 inside one asm! block containing its spin loop
+              while a sibling yields, so a preempted frame resumed through SYSRET
+              (which consumes both) fails deterministically; x86-64 only, the
+              other two skip-with-reason since eret/sret consume nothing. The
+              preemption itself: two cells run a compute loop that issues NO
+              syscall, with the cooperative case asserted as the negative control
+              in the same binary - cell 0 unbroken for all 24 rounds and cell 1
+              never scheduled, then with dispatch on the shared order vector
               interleaves and the longest run drops to 2-9),
               schedidle (docs/ARCHITECTURE-DEBT.md 2.4, the keystone: the
               scheduler idle state - two cells share one page read-write and each

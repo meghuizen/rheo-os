@@ -70,6 +70,8 @@ use kernel::capability::{CapTable, ObjectTable};
 use kernel::sched::{dispatch, preempt};
 use kernel::user::{self, Outcome};
 use kernel::user_progs::user_spinner;
+#[cfg(target_arch = "x86_64")]
+use kernel::user_progs::{user_peer, user_scratch_spinner};
 use kernel::{arch, idle, ktimer, println};
 
 #[unsafe(link_section = ".user.bss")]
@@ -190,6 +192,80 @@ fn run_pair(queue_driven: bool) -> (Outcome, bool, usize) {
 /// Count occurrences of `c` in the order vector.
 fn count_marks(c: u8) -> usize {
     order().iter().filter(|&&x| x == c).count()
+}
+
+#[cfg(target_arch = "x86_64")]
+/// Yield rounds the peer performs in the scratch-register phase. Each one is a
+/// **syscall** that hands the CPU to the other cell, which is the path under test.
+const YIELDS: u64 = 64;
+
+#[cfg(target_arch = "x86_64")]
+/// Spin iterations for the scratch spinner: long enough that the peer's yields land
+/// inside its loop many times over.
+const SCRATCH_ITERS: u64 = 4_000_000;
+
+/// A preempted cell, resumed by a **sibling's syscall**, must come back with its
+/// scratch registers intact. Returns `(outcome, status, saw_loop)`.
+#[cfg(target_arch = "x86_64")]
+fn run_scratch_pair() -> (Outcome, u64, bool) {
+    dispatch::enable(true);
+    let shared = reset_shared();
+    // SAFETY: single-threaded kernel; the stores/tables are unique `.user`/`.bss`
+    // allocations outliving the run.
+    unsafe {
+        let objects = &mut *core::ptr::addr_of_mut!(OBJECTS);
+        let caps = &mut *core::ptr::addr_of_mut!(CAPS);
+        *objects = ObjectTable::new();
+        *caps = CapTable::new();
+        let kernel_sp = (*core::ptr::addr_of!(KSTACK)).top();
+
+        let a = core::ptr::addr_of_mut!(STORE_A);
+        let b = core::ptr::addr_of_mut!(STORE_B);
+        let (mut aspace_a, _oa, mut frame_a) = build_cell(
+            &mut *a,
+            objects,
+            caps,
+            kernel_sp,
+            1,
+            user_scratch_spinner,
+            0,
+            SCRATCH_ITERS,
+        );
+        // The peer yields in a loop: every `SYS_YIELD` is a syscall trap that returns
+        // the *other* cell's frame, which is precisely the resume path that consumes
+        // RCX/R11 on x86-64.
+        let (mut aspace_b, _ob, mut frame_b) =
+            build_cell(&mut *b, objects, caps, kernel_sp, 2, user_peer, 0, YIELDS);
+        aspace_a.map_user_range(shared as usize, 4096, MapPerm::UserRw);
+        aspace_b.map_user_range(shared as usize, 4096, MapPerm::UserRw);
+        (*a).params.ticks = shared;
+        (*b).params.ticks = shared;
+        // The peer's post-loop park deadline; it must outlive the spinner so the run
+        // ends on the spinner's exit rather than the peer's.
+        (*b).params.qp_addr = 2_000_000_000;
+
+        user::reset();
+        ktimer::reset();
+        idle::reset();
+        user::install(
+            0,
+            &aspace_a,
+            caps,
+            objects,
+            (*a).qp.qp.as_ptr(),
+            core::ptr::addr_of_mut!(frame_a),
+        );
+        user::install(
+            1,
+            &aspace_b,
+            caps,
+            objects,
+            (*b).qp.qp.as_ptr(),
+            core::ptr::addr_of_mut!(frame_b),
+        );
+        let (_idx, outcome) = user::run(0);
+        (outcome, (*a).params.status, (*a).params.ops == 1)
+    }
 }
 
 /// The longest run of a single repeated byte in the order vector.
@@ -320,6 +396,58 @@ extern "C" fn kernel_main() -> ! {
          round-robin would not have chosen), {charged_ns} ns charged to vcores"
     );
 
+    // ---- phase 4: a preempted cell keeps the registers SYSRET consumes ----
+    //
+    // On x86-64 `sysretq` takes its RIP from RCX and its RFLAGS from R11 - it consumes
+    // them - which is right for returning from a `syscall` and wrong for resuming a
+    // context stopped anywhere else. Preemption is the first producer of such frames,
+    // and a *sibling's* `SYS_YIELD` is the path one comes back through: the syscall
+    // trampoline hands back a frame that is not the one it entered on.
+    //
+    // The symptom is not a fault at the switch - it is the resumed cell computing with
+    // two wrong registers, which is why it presented as an intermittent segfault in a
+    // real workload with no pattern (docs/LINUX-COMPAT.md). This phase makes it a
+    // property: sentinels are pinned in RCX and R11 inside one `asm!` block that also
+    // contains the spin, so the compiler cannot spill around the window, and the cell
+    // reports the moment either differs.
+    #[cfg(not(target_arch = "x86_64"))]
+    println!(
+        "preempt: SKIP the scratch-register phase on {} - `eret`/`sret` restore the \
+         whole register file from the frame and consume no register, so the hazard \
+         SYSRET creates does not exist here and there is nothing to assert",
+        arch::NAME
+    );
+    #[cfg(target_arch = "x86_64")]
+    scratch_phase();
+
     println!("preempt: PASS");
     arch::exit(arch::ExitCode::Success);
+}
+
+/// Phase 4, x86-64 only (see the skip above).
+#[cfg(target_arch = "x86_64")]
+fn scratch_phase() {
+    let (outcome, status, saw_loop) = run_scratch_pair();
+    assert!(
+        matches!(outcome, Outcome::Exited(0)),
+        "scratch phase: the spinner did not exit cleanly ({outcome:?})"
+    );
+    assert!(
+        saw_loop,
+        "scratch phase: the spinner never reached its loop, so nothing was checked"
+    );
+    let yields = count_marks(b'S');
+    assert!(
+        yields > 0,
+        "scratch phase: the peer never yielded, so no cross-cell syscall resume          happened and the property was not exercised ({:?})",
+        order()
+    );
+    assert_eq!(
+        status, 0,
+        "scratch phase: a preempted cell was resumed with RCX/R11 clobbered - the          syscall trampoline resumed a frame it did not enter on through SYSRET          ({yields} peer yields)"
+    );
+    let (_, taken, _, to_sibling, to_cell) = preempt::counters();
+    println!(
+        "preempt: a preempted cell resumed by a sibling's {yields} SYS_YIELDs kept          RCX and R11 intact ({taken} preemptions, {to_sibling} sibling, {to_cell}          cell) OK"
+    );
 }

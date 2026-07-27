@@ -1173,29 +1173,46 @@ fixup path.
     (observed failing while the host was building three ISAs) rather than as a bug. A
     transport would have applied a later RTO before an earlier one.
 
-  **Node completes fully under preemption - but only about seven runs in eight.** With
-  queue-driven dispatch enabled it repeatedly ran to its correct answer with 17-31
-  slices genuinely taken to sibling contexts mid-run, which was the useful half of the
-  experiment (a preemption kernel that only ever preempts a purpose-built spinner has
-  not been tested by anything). Then one run died with **SIGSEGV and no output at all**,
-  same binary, same kernel, same command. Four immediate re-runs passed.
+  **Node under preemption was intermittent - about one run in eight died with SIGSEGV
+  and no output - and the cause was found and fixed.** It is worth recording as a
+  worked example, because the wrong conclusion was available and cheap: "preemption is
+  inherently risky, leave it off".
 
-  That is a **residual state-save gap on the preemption path**, not a Node property, and
-  it is recorded here with its rate rather than filed as a flake. What is already ruled
-  out: the vector-register file (saved first on every preemption path, see above), the
-  general-purpose set (`common_trap`'s ring-3 capture is the same code the fault path
-  uses, and its stack offsets are shared with the exception stubs), and the resume
-  instruction (IRET, not SYSRET). What is not ruled out: a preemption landing inside
-  signal delivery or between the steps of `rt_sigreturn` - Node installs handlers, and
-  FP state across a handler is a documented L5 gap - and the x86-64 `IA32_FMASK`
-  question of whether a timer interrupt can land in ring 0 mid-syscall at a point the
-  ring-0 handler's assumptions do not cover.
+  The bug was on x86-64, in the choice of *return instruction*. `SYSRET` takes its RIP
+  from RCX and its RFLAGS from R11 - it **consumes** them - which is exactly right for
+  returning from a `syscall`, since the instruction is defined to clobber both, and
+  exactly wrong for resuming a context that was stopped somewhere else. `syscall_entry`
+  therefore never saved RCX/R11 into the frame at all, and `sysret_resume`
+  reconstructed them from the rip/rflags slots.
 
-  The `linuxnode` boot is therefore **cooperative again** until the gap is found. An
-  occasional segfault in the suite is worse than a capability not exercised, because it
-  trains everyone to re-run a red test. The deterministic `preempt` kernel - two cells,
-  no syscalls, with the cooperative case asserted as its own negative control - remains
-  the proof that preemption works, and it does not depend on this.
+  Before preemption that was airtight: every frame a *syscall* trap handed back was
+  either the caller's own or a peer that had itself last stopped at a syscall, so
+  RCX/R11 were clobberable in both cases. **A preempted context's frame is neither** -
+  it is captured at an arbitrary instruction with those registers live - and if a
+  sibling's `SYS_YIELD` (or any switching syscall) later selects it, the syscall
+  trampoline is the path it comes back through. The symptom is not a fault at the
+  switch: it is the resumed context computing with two wrong registers, which is why it
+  presented as an occasional segfault with no pattern. This is the third appearance of
+  the same family - the `iret_resume`-for-faults fix and the FP-save-ordering fix above
+  are the other two - and the family is "a resume path that is correct for one
+  provenance being used for another".
+
+  The fix is by **provenance, not by tagging**: after the dispatcher returns, the
+  trampoline compares the frame it is about to resume against the frame it entered on,
+  and resumes a *different* one through `IRET`. There is no flag for a future producer
+  of frames to forget to set. `syscall_entry` additionally writes the rcx/r11 slots with
+  the values SYSRET would synthesise, so a syscall-origin frame resumes bit-identically
+  either way and the comparison is the only thing that decides. The syscall fast path
+  keeps SYSRET; only a switch pays for IRET. ARM64 and RISC-V need no equivalent, since
+  `eret`/`sret` restore the whole register file and consume nothing.
+
+  Proven in both directions by a new phase of the `preempt` kernel: a cell pins
+  sentinels in RCX and R11 **inside one `asm!` block that also contains its spin loop**
+  (so the compiler cannot spill and reload them around the window - the same discipline
+  the FP/SIMD `SYS_YIELD` proof needed) while a sibling yields in a loop. With the fix
+  the sentinels survive 54 cross-cell syscall resumes; with the comparison reverted the
+  phase fails **deterministically**, which is what turns a one-in-eight flake into a
+  property. The phase skips-with-reason on the two ISAs where the hazard cannot exist.
 
 ## 6. Fixture build matrix (reproducibility)
 

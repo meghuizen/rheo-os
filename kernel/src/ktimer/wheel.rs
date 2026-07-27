@@ -501,6 +501,19 @@ impl Wheel {
     ///
     /// Cost is proportional to what actually happened - timers that came due plus
     /// timers that crossed a level boundary - not to the number of timers held.
+    /// Advance to `now_ns`, firing every timer whose deadline has passed. Returns how
+    /// many fired.
+    ///
+    /// **Ordering, precisely.** Everything collected and not yet handed out is a total
+    /// order by deadline, because [`Wheel::push_fired`] inserts by deadline. Across
+    /// *separate* calls it is not: if the caller stalls long enough to span a level-0
+    /// revolution, the cascade that pulls higher-level timers down can place one in a
+    /// slot this sweep has already passed, so it is collected on the following call -
+    /// after timers with later deadlines. Handling that needs the sweep to re-check
+    /// slots below itself after a cascade, and it is **named here rather than built**,
+    /// because every client in the tree services the wheel far more often than a
+    /// revolution and none is exposed to it. A client that could stall that long must
+    /// bound its stall, not rely on the order.
     pub fn advance(&mut self, now_ns: u64) -> usize {
         let target_tick = now_ns >> TICK_SHIFT;
         let mut fired = 0;

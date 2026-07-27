@@ -35,6 +35,16 @@ syscall_entry:
     mov %r15, 112(%rax)
     mov %rcx, 120(%rax)                /* return rip */
     mov %r11, 128(%rax)                /* rflags */
+    /* And into the rcx/r11 slots as well, which SYSRET-resume does not read but
+       IRET-resume does. SYSCALL is defined to clobber RCX and R11, so user code
+       cannot rely on them across it and *any* value here is ABI-legal - but writing
+       the ones SYSRET would synthesise makes the two resume paths produce a
+       bit-identical register file for a syscall-origin frame. That equivalence is
+       what lets the resume path below be chosen by frame provenance instead of by
+       tracking how each frame was made. Leaving them unwritten would mean an
+       IRET-resumed syscall frame restored whatever stale bytes the slot held. */
+    mov %rcx, 16(%rax)                 /* rcx slot = return rip */
+    mov %r11, 80(%rax)                 /* r11 slot = rflags */
     mov USER_RSP_SCRATCH(%rip), %rcx
     mov %rcx, 136(%rax)                /* user rsp */
     pop %rcx                           /* rcx = stashed syscall number */
@@ -43,9 +53,43 @@ syscall_entry:
     xor %edi, %edi                     /* kind = Syscall (0) */
     xor %esi, %esi                     /* fault_addr = 0 */
     mov %rax, %rdx                     /* frame */
+    /* Remember the frame this trap entered on. Two pushes, so rsp stays 16-aligned
+       for the call; the second is the alignment word. */
+    push %rax
+    push %rax
     call x86_user_trap                 /* -> resume frame in rax, or 0 */
+    pop %rcx                           /* alignment word */
+    pop %rcx                           /* rcx = the frame we entered on */
     test %rax, %rax
     jz return_to_kernel_asm
+    /* **A frame other than the one we entered on resumes through IRET, never
+       SYSRET.**
+     *
+     * SYSRET takes its RIP from RCX and its RFLAGS from R11, i.e. it *consumes* those
+     * two registers. That is exactly right for returning from a syscall - SYSCALL is
+     * defined to clobber them - and exactly wrong for resuming a context that was
+     * stopped somewhere else, where RCX is the count for every `rep` string op and R11
+     * is ordinary scratch.
+     *
+     * Timer preemption made this reachable. Before it, every frame handed back by a
+     * *syscall* trap was either the caller's own (a plain return) or a peer that had
+     * itself last stopped at a syscall - so RCX/R11 were clobberable in both cases and
+     * SYSRET was always legal. A preempted context's frame is neither: it was captured
+     * at an arbitrary instruction with live RCX/R11, and if a sibling's syscall later
+     * switches to it, this is the path it comes back through. The symptom is not a
+     * fault here - it is the resumed context computing with two wrong registers, which
+     * is why it presented as Node segfaulting in roughly one run in eight with no
+     * pattern (docs/LINUX-COMPAT.md).
+     *
+     * Deciding by *provenance* - "is this the frame I entered on?" - rather than by
+     * tagging frames is what keeps this impossible to get wrong: a new producer of
+     * frames cannot forget to set a flag, because there is no flag. The syscall fast
+     * path keeps SYSRET; only a switch pays for IRET.
+     *
+     * ARM64 and RISC-V need no equivalent: `eret`/`sret` restore the whole register
+     * file from the frame and consume nothing. */
+    cmp %rax, %rcx
+    jne iret_resume                    /* rax = frame */
     /* fall through to sysret_resume with rax = frame */
 
 .global sysret_resume

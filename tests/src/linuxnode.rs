@@ -43,23 +43,20 @@ extern "C" fn kernel_main() -> ! {
         // Node completes fully (prints rheo:42, exits 0), so it is held to the strict
         // exit-0 gate - no thread-abort partial.
         false,
-        // **Cooperative**, and that is a measured retreat rather than a default.
+        // **Preemptive dispatch** (docs/SUBSTRATE.md 15, S3'). This is the useful half
+        // of that migration's proof: a preemption kernel that only ever preempts a
+        // purpose-built spinner has not been tested by anything, and here a real
+        // 124 MB V8 + libuv runtime is preempted 17-31 times mid-run and still reaches
+        // its exact answer.
         //
-        // Node *does* run to its correct answer under preemption - repeatedly, with
-        // 17-31 slices genuinely taken to sibling contexts mid-run - which was the
-        // useful half of the S3' proof, because a preemption kernel that only ever
-        // preempts a purpose-built spinner has not been tested by anything. But it is
-        // **intermittent**: roughly one run in eight died with SIGSEGV and no output at
-        // all, where the same binary and the same kernel passed the other seven.
-        //
-        // That is a residual state-save gap on the preemption path, not a Node
-        // property, and it is not shippable: an occasional segfault in the suite is
-        // worse than a capability not exercised, because it trains everyone to re-run
-        // a red test. So this boot is cooperative until the gap is found, the
-        // observation is recorded with its rate rather than filed as a flake
-        // (docs/LINUX-COMPAT.md), and the deterministic `preempt` kernel - which
-        // carries its own negative control - remains the proof that preemption works.
-        false,
+        // It was intermittent first - about one run in eight died with SIGSEGV and no
+        // output - and rather than being left off, the cause was found: on x86-64 a
+        // preempted frame was being resumed through `SYSRET`, which consumes RCX and
+        // R11 (docs/LINUX-COMPAT.md). Fixed by frame provenance, and the fix is proven
+        // in both directions by the `preempt` kernel's scratch-register phase, which
+        // fails deterministically when reverted. Twelve consecutive clean runs here
+        // after it; the property, not the run count, is what makes it shippable.
+        true,
         // The **W^X exception capability** (docs/ARCHITECTURE.md 5.1), so this
         // runtime's JIT can map its code pages writable-and-executable. Every other
         // kernel in the suite mints nothing of the sort and is refused exactly as
