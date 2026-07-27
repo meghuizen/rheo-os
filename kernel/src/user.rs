@@ -694,10 +694,17 @@ pub fn unmap_range(va: usize, len: usize) -> usize {
         let mut a = base;
         let mut n = 0;
         while a < end {
-            if let Some(pa) = aspace.unmap(a)
-                && frames::free_if_pool(pa)
-            {
-                n += 1;
+            // Route each frame back to the pool it came from: a `Pmem` grant's
+            // frames belong to `frames_pmem`, and `frames::free` asserts on a
+            // non-pool address, so getting this wrong is a kernel panic from a
+            // cell's `SYS_DECOMMIT`.
+            if let Some(pa) = aspace.unmap(a) {
+                if crate::mm::frames_pmem::contains(pa) {
+                    crate::mm::frames_pmem::free(pa);
+                    n += 1;
+                } else if frames::free_if_pool(pa) {
+                    n += 1;
+                }
             }
             a += frames::FRAME_SIZE;
         }
@@ -721,6 +728,69 @@ pub fn unmap_range(va: usize, len: usize) -> usize {
 /// charge is trued up - unlike a fresh `mmap`, a reprotect cannot be rolled back
 /// without discarding page contents the cell already had (docs/ENGINEERING.md 12).
 pub fn commit_range(va: usize, len: usize, perm: MapPerm) -> bool {
+    commit_range_from(va, len, perm, Backing::Ddr)
+}
+
+/// Which physical allocator a commit draws its fresh frames from.
+///
+/// `SYS_GRANT` takes a typed [`abi`-level kind](crate::mm::grant::MemKind) and
+/// records it, but every commit used to call `frames::alloc` regardless - so a
+/// cell asking for `Pmem` got DDR **with nothing said**, which is exactly what
+/// docs/ENGINEERING.md 7 forbids and what docs/MEMORY.md 2.1 claims is real
+/// (docs/ARCHITECTURE-DEBT.md 3.6, "object 5 implemented twice"). The kind now
+/// reaches the allocator.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum Backing {
+    /// The DDR frame pool (`mm::frames`) - the default for every path that has
+    /// no typed grant behind it.
+    Ddr,
+    /// The persistent-memory pool (`mm::frames_pmem`), backed by a real nvdimm
+    /// region discovered from firmware. Falls back to DDR **with a printed
+    /// reason** where no such region exists (arm/riscv `virt` expose no nvdimm).
+    Pmem,
+}
+
+impl Backing {
+    /// The backing an `abi` `MemKind` discriminant selects.
+    ///
+    /// HBM (1), CXL (2) and Remote (5) are **emulated as DDR** - QEMU models no
+    /// such memory and the tree says so (docs/MEMORY.md 2.1). They are reported
+    /// once each rather than silently aliased, so a cell's log shows what it
+    /// actually got. DeviceBar (4) never reaches here: `grant_create` refuses it.
+    fn from_kind(kind: u8) -> Backing {
+        match kind {
+            3 => Backing::Pmem,
+            _ => Backing::Ddr,
+        }
+    }
+}
+
+/// One-shot "you asked for X and got DDR" notices, so the fallback is visible
+/// exactly once per kind instead of per page (docs/ENGINEERING.md 7).
+static mut BACKING_NOTICE: [bool; 6] = [false; 6];
+
+/// Report, once, that `kind` is not backed by its own memory here and why.
+fn note_backing_fallback(kind: u8, reason: &str) {
+    // SAFETY: single CPU, synchronous trap.
+    let seen = unsafe { &mut *core::ptr::addr_of_mut!(BACKING_NOTICE) };
+    let k = (kind as usize).min(5);
+    if seen[k] {
+        return;
+    }
+    seen[k] = true;
+    let name = match kind {
+        1 => "Hbm",
+        2 => "Cxl",
+        3 => "Pmem",
+        5 => "Remote",
+        _ => "Ddr",
+    };
+    crate::println!("mm: grant kind {name} backed by DDR ({reason})");
+}
+
+/// [`commit_range`] with an explicit backing store - the path a typed memory
+/// grant takes, so `MemKind::Pmem` genuinely lands on the nvdimm pool.
+pub fn commit_range_from(va: usize, len: usize, perm: MapPerm, backing: Backing) -> bool {
     if len == 0 {
         return true;
     }
@@ -747,13 +817,23 @@ pub fn commit_range(va: usize, len: usize, perm: MapPerm) -> bool {
             // the page's contents; otherwise allocate a fresh zeroed frame.
             let pa = match aspace.unmap(a) {
                 Some(pa) => pa,
-                None => match frames::alloc() {
-                    Some(pa) => {
-                        fresh += 1;
-                        pa
+                None => {
+                    // A `Pmem` grant draws from the nvdimm pool; if the pool is
+                    // absent or exhausted the commit falls back to DDR, and the
+                    // frame is still charged to the cell either way (the budget
+                    // is about the cell, not about which pool paid).
+                    let got = match backing {
+                        Backing::Pmem => crate::mm::frames_pmem::alloc().or_else(frames::alloc),
+                        Backing::Ddr => frames::alloc(),
+                    };
+                    match got {
+                        Some(pa) => {
+                            fresh += 1;
+                            pa
+                        }
+                        None => break,
                     }
-                    None => break,
-                },
+                }
             };
             aspace.map_user_frame(a, pa, perm);
             a += frames::FRAME_SIZE;
@@ -1004,7 +1084,24 @@ fn grant_commit(cur: usize, cap_id: u32, offset: usize, len: usize) -> u64 {
     if sealed || offset.saturating_add(len) > glen {
         return u64::MAX;
     }
-    commit_range(base + offset, len, MapPerm::UserRw);
+    // The grant's typed kind decides the physical pool. Before this, every
+    // commit went to DDR and a `Pmem` grant was a silent lie
+    // (docs/ARCHITECTURE-DEBT.md 3.6).
+    let kind = cell_grants(cur)
+        .iter()
+        .find(|s| s.in_use && s.cap_id == cap_id)
+        .map(|s| s.kind)
+        .unwrap_or(0);
+    let backing = Backing::from_kind(kind);
+    if backing == Backing::Pmem && crate::mm::frames_pmem::region().is_none() {
+        note_backing_fallback(kind, "no nvdimm region on this machine");
+    } else if kind == 1 || kind == 2 || kind == 5 {
+        note_backing_fallback(kind, "emulated - QEMU models no such memory");
+    }
+    // Mirrors the pre-existing behaviour: the commit result is not reported to
+    // the cell by this verb (a partial commit leaves the pages it did map). The
+    // return value is consumed to keep that explicit rather than accidental.
+    let _ = commit_range_from(base + offset, len, MapPerm::UserRw, backing);
     0
 }
 

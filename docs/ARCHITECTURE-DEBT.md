@@ -246,14 +246,29 @@ feature.
   `SYS_WAIT_INPUT` parks on, while `pty`'s polls and blocks inside the cooked
   line read. Unifying those is a console-path change needing its own proof, and
   calling it de-duplication would have hidden that.
-- **Object 5 implemented twice, and the shipped path ignores the memory kind.**
-  `mm/grant.rs` is the typed implementation but is used **only by tests**; the
-  path a cell reaches (`SYS_GRANT` -> `grant_create`, `user.rs:470-526`) uses a
-  different struct and commits through the **DDR** allocator - `frames_pmem` is
-  never consulted. So "PMEM real where a QEMU nvdimm is exposed" is true of the
-  test-only type and **false of `SYS_GRANT`**: a cell asking for `Pmem` silently
-  gets DDR with no printed reason, which is exactly what `ENGINEERING.md` §7
-  forbids. **(A)**
+- ~~**Object 5 implemented twice, and the shipped path ignores the memory
+  kind.**~~ **CLOSED.** `mm/grant.rs` is the typed implementation but was used
+  **only by tests**; the path a cell reaches (`SYS_GRANT` -> `grant_create`) used
+  a different struct and committed through the **DDR** allocator - `frames_pmem`
+  was never consulted. So "PMEM real where a QEMU nvdimm is exposed" was true of
+  the test-only type and **false of `SYS_GRANT`**.
+
+  Fixed: `commit_range_from(.., Backing)` takes the pool explicitly, `grant_commit`
+  derives it from the grant's recorded kind, and `SYS_DECOMMIT` routes each frame
+  back to the pool it came from (getting *that* wrong would have been a kernel
+  panic from a cell, since `frames::free` asserts on a non-pool address). Where no
+  nvdimm exists the fallback to DDR is **printed once per kind**, as are the
+  emulated-as-DDR kinds (Hbm/Cxl/Remote) - §7 wants the fallback visible, not
+  merely documented. The librheo doc that claimed `Pmem` was DDR-backed like the
+  others is corrected.
+
+  Proven by `pmem`, which now runs a **cell** (`librheo-pmem`) through the real
+  `SYS_GRANT`/`SYS_COMMIT` path and asserts kernel-side, on evidence the cell
+  cannot influence, that the kernel's own pmem free count fell by the pages the
+  cell committed: **4 frames from the nvdimm pool** on x86-64, and the
+  printed-reason DDR fallback with **0** pmem frames consumed on arm/riscv.
+  Observed failing with the fix reverted: *"SYS_GRANT(Pmem) drew 0 pmem frames,
+  expected at least 4 - the typed kind never reached the allocator"*.
 - **`SYS_GRANT_SHARE` hardcodes `cur ^ 1`** (`user.rs:607`) while `SYS_CONNECT`
   gained a slot argument for fan-out - so zero-copy sharing does not compose with
   a multi-client service, contradicting a documented claim. **(B)**

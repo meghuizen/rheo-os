@@ -96,6 +96,13 @@ path = "src/bin/librheo-netwait.rs"
 name = "librheo-gpu"
 path = "src/bin/librheo-gpu.rs"
 
+# The typed-grant proof (docs/ARCHITECTURE-DEBT.md 3.6): a cell asks SYS_GRANT
+# for MemKind::Pmem and commits it, so the `pmem` test kernel can assert on the
+# other side of the trap that the frames came from the nvdimm pool.
+[[bin]]
+name = "librheo-pmem"
+path = "src/bin/librheo-pmem.rs"
+
 # Phase J: symmetric async IPC - two cells ping-pong typed messages over the
 # async Sender/Receiver, parking on the reactor (no busy switch).
 [[bin]]
