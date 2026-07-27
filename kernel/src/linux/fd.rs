@@ -63,6 +63,24 @@ enum FdKind {
     /// L3); `pos` is the read cursor. glibc/rustix read AT_EXECFN etc. from here
     /// when the kernel provides no PR_GET_AUXV, which is how the upstream
     /// coreutils multicall binary learns its own name to dispatch a utility.
+    /// `/proc/self/maps` - the cell's own mapping table, rendered on open from its
+    /// VMA list (docs/LINUX-COMPAT.md).
+    ///
+    /// A **real** map, not a plausible one: every line comes from a record the
+    /// personality actually holds, so the addresses, lengths and permissions are the
+    /// ones the page tables were built from. That distinction is the whole reason this
+    /// is synthesized in the kernel rather than seeded as a file on the test image -
+    /// a static `maps` would be a fabricated memory layout, and a runtime that reads
+    /// it to locate its own code would be misled rather than refused
+    /// (docs/ENGINEERING.md 1).
+    ///
+    /// Rendered once at open, into the same per-cell buffer `/proc/self/auxv` uses a
+    /// sibling of, because a reader expects a consistent snapshot: generating each
+    /// `read` afresh from a list the program is concurrently changing would hand back
+    /// a map that never existed at any instant.
+    ProcMaps {
+        pos: usize,
+    },
     ProcAuxv {
         pos: usize,
     },
@@ -180,6 +198,15 @@ const REMOTE_RECV_TIMEOUT_NS: u64 = 2_000_000_000;
 /// reports `ETIMEDOUT` at the deadline.
 const REMOTE_CONNECT_TIMEOUT_NS: u64 = 3_000_000_000;
 
+/// Room for the rendered `/proc/self/maps` snapshot.
+///
+/// A line is ~60 bytes and a dynamically linked runtime has a few dozen mappings, so
+/// 8 KiB holds well over a hundred. A cell with more is **truncated at a line
+/// boundary** and the fact is printed, rather than the buffer being grown to a size
+/// nothing has needed: a half-line would make the last entry a lie, whereas a short
+/// map is honestly short.
+const MAPS_MAX: usize = 8192;
+
 /// Room for the serialized auxv served through `/proc/self/auxv` (matches
 /// `linux::stack::AUXV_BYTES_MAX`).
 const AUXV_MAX: usize = 20 * 16;
@@ -241,6 +268,9 @@ pub struct FdTable {
     /// the stack (with its auxv) is built.
     auxv: [u8; AUXV_MAX],
     auxv_len: usize,
+    /// The rendered `/proc/self/maps` snapshot, and its length.
+    maps: [u8; MAPS_MAX],
+    maps_len: usize,
 }
 
 impl Default for FdTable {
@@ -256,6 +286,8 @@ impl FdTable {
             flags: [FdFlags::new(ACC_RDWR); NFD],
             auxv: [0; AUXV_MAX],
             auxv_len: 0,
+            maps: [0; MAPS_MAX],
+            maps_len: 0,
         }
     }
 
@@ -291,6 +323,29 @@ impl FdTable {
             }
         }
         n
+    }
+
+    /// Open a `/proc/self/maps` descriptor over `snapshot`, which the caller renders
+    /// from the cell's VMA list.
+    ///
+    /// The rendering happens in the caller, not here, because the VMA list is a sibling
+    /// field of this table inside `LinuxState` and only the dispatcher holds both. That
+    /// is also why the snapshot is taken at **open**: a reader expects one consistent
+    /// map, and regenerating it per `read` from a list the program is concurrently
+    /// changing would hand back a layout that never existed at any instant.
+    ///
+    /// Returns the fd, or `-EMFILE` when the table is full. `truncated` is reported by
+    /// the caller.
+    pub fn open_maps(&mut self, snapshot: &[u8], flags: u64) -> i64 {
+        let Some(slot) = self.free_slot(0) else {
+            return -EMFILE;
+        };
+        let n = snapshot.len().min(MAPS_MAX);
+        self.maps[..n].copy_from_slice(&snapshot[..n]);
+        self.maps_len = n;
+        self.fds[slot] = FdKind::ProcMaps { pos: 0 };
+        self.set_open_flags(slot, flags);
+        slot as i64
     }
 
     /// Store the cell's serialized auxv for `/proc/self/auxv` reads.
@@ -470,6 +525,15 @@ impl FdTable {
                 crate::rng::derive_cell_drbg().fill_bytes(buf);
                 count as i64
             }
+            FdKind::ProcMaps { pos } => {
+                let end = self.maps_len;
+                let n = (end - pos.min(end)).min(count as usize);
+                if !crate::uaccess::copy_out(buf_va, &self.maps[pos..pos + n]) {
+                    return -EFAULT;
+                }
+                self.fds[slot] = FdKind::ProcMaps { pos: pos + n };
+                n as i64
+            }
             FdKind::ProcAuxv { pos } => {
                 let end = self.auxv_len;
                 let n = (end - pos.min(end)).min(count as usize);
@@ -570,8 +634,8 @@ impl FdTable {
                 count as i64
             }
             FdKind::Null | FdKind::Zero | FdKind::Urandom => count as i64,
-            FdKind::ProcAuxv { .. } => -EBADF, // read-only
-            FdKind::Pipe { writer: false, .. } => -EBADF, // read end not writable
+            FdKind::ProcMaps { .. } | FdKind::ProcAuxv { .. } => -EBADF, // read-only
+            FdKind::Pipe { writer: false, .. } => -EBADF,                // read end not writable
             FdKind::Pipe { idx, writer: true } => match pipe::write(idx as usize, buf_va, count) {
                 pipe::WriteNb::Done(n) => n,
                 pipe::WriteNb::WouldBlock => -EAGAIN,
@@ -950,7 +1014,7 @@ impl FdTable {
                 None => -EBADF,
             },
             FdKind::Console(_) | FdKind::Null | FdKind::Zero | FdKind::Urandom => -ESPIPE,
-            FdKind::ProcAuxv { .. } | FdKind::Pipe { .. } => -ESPIPE,
+            FdKind::ProcMaps { .. } | FdKind::ProcAuxv { .. } | FdKind::Pipe { .. } => -ESPIPE,
             FdKind::SockFresh
             | FdKind::SockListen { .. }
             | FdKind::SockConn { .. }
@@ -978,7 +1042,7 @@ impl FdTable {
                 // A character device: mode S_IFCHR|0620, zero size.
                 Stat::new(dirent::S_IFCHR | 0o620, 0, 1, 1, 1000, 1000, 0, 4096, 0, 0)
             }
-            FdKind::ProcAuxv { .. } => {
+            FdKind::ProcMaps { .. } | FdKind::ProcAuxv { .. } => {
                 // A read-only regular file sized to the auxv byte stream.
                 let size = self.auxv_len as u64;
                 Stat::new(
@@ -1075,7 +1139,9 @@ impl FdTable {
             FdKind::Console(_) | FdKind::Null | FdKind::Zero | FdKind::Urandom => {
                 Ok((dirent::S_IFCHR | 0o620, 0, 0))
             }
-            FdKind::ProcAuxv { .. } => Ok((dirent::S_IFREG | 0o444, self.auxv_len as u64, 0)),
+            FdKind::ProcMaps { .. } | FdKind::ProcAuxv { .. } => {
+                Ok((dirent::S_IFREG | 0o444, self.auxv_len as u64, 0))
+            }
             FdKind::Pipe { .. } => Ok((dirent::S_IFIFO | 0o600, 0, 0)),
             FdKind::SockFresh
             | FdKind::SockListen { .. }
@@ -2206,6 +2272,7 @@ impl FdTable {
             | FdKind::Null
             | FdKind::Zero
             | FdKind::Urandom
+            | FdKind::ProcMaps { .. }
             | FdKind::ProcAuxv { .. } => true,
             // An epoll fd is readable when one of its watches is - which is what
             // makes `poll`ing an epoll fd work at all.

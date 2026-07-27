@@ -1712,7 +1712,85 @@ fn build_runtime_disk_fixture(
     for l in libs {
         debugfs(&format!("write {LIBDIR}/{l} lib/{l}"));
     }
+    seed_runtime_procfs(out_dir, &debugfs);
     println!("[xtask] built {test} ext4 image for x86_64 ({img}; real {dst} + glibc set)");
+}
+
+/// Seed the small `/proc` and `/sys` files a language runtime reads at startup.
+///
+/// These are **not** a procfs. They are a handful of static text files with the values
+/// this kernel genuinely has, placed on the image so a runtime's startup probes get an
+/// answer instead of `ENOENT`. Which ones matter was measured, not guessed: the Linux
+/// personality now prints the path of every refused `open`, and the real Bun binary was
+/// observed probing exactly these before it aborted (docs/LINUX-COMPAT.md, GOAL-BUN).
+///
+/// Each value is true of this kernel:
+///
+/// - `/sys/devices/system/cpu/online` = `0-0`. One CPU schedules cells; SMP bring-up
+///   runs a second core for bounded work but nothing is dispatched to it (docs/SMP.md
+///   10), so a runtime sizing a thread pool from this gets the number of cores it can
+///   actually be scheduled on.
+/// - `/proc/sys/vm/overcommit_memory` = `0` (heuristic). Accurate: `mmap` reserves
+///   without committing and frames arrive on fault (demand paging), which is what
+///   heuristic overcommit describes.
+/// - `/proc/sys/vm/mmap_min_addr` = `65536`, the conventional floor, and true here -
+///   nothing is mapped below it.
+/// - `/proc/self/cgroup` = `0::/`. There are no cgroups, and that is the cgroup-v2
+///   spelling of "the root, unconstrained" - the answer an unconstrained Linux process
+///   gets, not a placeholder.
+/// - `/proc/stat` = one `cpu` aggregate line plus `cpu0`. The jiffy fields are zero
+///   because this kernel keeps no per-CPU jiffy accounting; a reader counting `cpuN`
+///   lines - which is what a runtime uses this for - gets the right count.
+///
+/// Deliberately **not** provided: `/proc/self/maps`, which Bun also probes. A static
+/// file there would be a fabricated memory map, and the honest version is generated
+/// from the cell's own VMA list by the personality - real work, named in
+/// docs/LINUX-COMPAT.md rather than faked here. Same for `/etc/localtime`: glibc
+/// falls back to UTC on `ENOENT`, which is correct, since this kernel has no timezone
+/// database and inventing one would be worse than the fallback.
+fn seed_runtime_procfs(out_dir: &str, debugfs: &dyn Fn(&str)) {
+    debugfs("mkdir /proc");
+    debugfs("mkdir /proc/self");
+    debugfs("mkdir /proc/sys");
+    debugfs("mkdir /proc/sys/vm");
+    debugfs("mkdir /sys");
+    debugfs("mkdir /sys/devices");
+    debugfs("mkdir /sys/devices/system");
+    debugfs("mkdir /sys/devices/system/cpu");
+    debugfs("mkdir /sys/fs");
+    debugfs("mkdir /sys/fs/cgroup");
+    let files: &[(&str, &str)] = &[
+        ("cpu_online", "0-0\n"),
+        ("overcommit_memory", "0\n"),
+        ("mmap_min_addr", "65536\n"),
+        ("cgroup", "0::/\n"),
+        // cgroup-v2 memory limits. `max` is the v2 spelling of "no limit", which is
+        // true: nothing constrains a cell's memory but its own frame budget, and a
+        // runtime that reads these sizes its heap from them (Bun does, having been
+        // told `0::/` above). A number would be a fabricated limit.
+        ("memory_max", "max\n"),
+        ("memory_high", "max\n"),
+        (
+            "stat",
+            "cpu  0 0 0 0 0 0 0 0 0 0\ncpu0 0 0 0 0 0 0 0 0 0 0\nintr 0\nctxt 0\nbtime 0\nprocesses 1\n",
+        ),
+    ];
+    for (name, body) in files {
+        let path = format!("{out_dir}/procseed-{name}");
+        if std::fs::write(&path, body).is_err() {
+            continue;
+        }
+        let dest = match *name {
+            "cpu_online" => "sys/devices/system/cpu/online",
+            "overcommit_memory" => "proc/sys/vm/overcommit_memory",
+            "mmap_min_addr" => "proc/sys/vm/mmap_min_addr",
+            "cgroup" => "proc/self/cgroup",
+            "memory_max" => "sys/fs/cgroup/memory.max",
+            "memory_high" => "sys/fs/cgroup/memory.high",
+            _ => "proc/stat",
+        };
+        debugfs(&format!("write {path} {dest}"));
+    }
 }
 
 /// Build the L7 **dynamically-linked** glibc fixture (docs/LINUX-COMPAT.md L7):

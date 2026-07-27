@@ -453,8 +453,7 @@ so preemption is the CPU changing hands, not two contexts running at once); one 
 waiter per cell (the copied pollset is per-cell; `epoll`, which Node uses, is
 unlimited).
 
-**The real Bun binary loads deep into JavaScriptCore, and its old diagnosis is
-withdrawn** (GOAL-BUN,
+**The real Bun binary EVALUATES JavaScript and exits 0** (GOAL-BUN,
 docs/LINUX-COMPAT.md, the `linuxbun` test - a **partial**): the actual
 `/root/.bun/bin/bun` (v1.3, dynamic, 99 MB, JavaScriptCore + a Zig runtime) streams
 off a live ext4 disk (~3,500 fills), dynamically links its whole library set, and
@@ -463,112 +462,46 @@ reservation the kernel now demand-fills (the Linux mmap window was raised to
 80..252 GiB for it, and a failed eager commit no longer leaks a phantom VMA), spawns
 a worker via **`clone3`** (now implemented: it decodes `struct clone_args` and routes
 to the same context-creation path as `clone`), and sets up its libuv event loop
-(`BUN_JSC_useJIT=0`, host-verified zero RWX). It then `abort()`s **before evaluating**.
-The whole load path works (streaming, demand paging, 7-library dynamic linking, the
-Gigacage, `clone3`, the event loop) and `linuxbun` accepts that bounded partial - exit
-134 **and** empty output, so any other failure still fails.
+(`BUN_JSC_useJIT=0`, host-verified zero RWX). It **evaluates
+`console.log("rheo:"+(40+2))`, prints exactly `rheo:42`, and exits 0** - with its JIT
+enabled (through the capability-gated W^X exception, below) and under preemption. Held to
+the same strict gate as Node; no partial is accepted.
 
-**What it aborts on is now honestly unknown.** The previous answer was measured and
-plausible - all 205 of its syscalls came from the main thread and the worker it spawned
-never got the CPU, so the cooperative scheduler was blamed and the prediction was "when
-#132 lands, Bun prints `rheo:42`". **Timer preemption has since landed** (see the
-substrate section below), the worker measurably *does* get the CPU (66 preemptions,
-all to a sibling context of Bun's own cell), and Bun aborts **identically with
-preemption disabled** - same exit, same empty output, same point. The starved worker was
-the first difference anyone measured between Bun and Node, not the cause. The prediction
-is withdrawn rather than reattached to a later milestone (docs/ENGINEERING.md 1), and
-the `linuxbun` boot stays cooperative because that is the scheduler its partial is
-characterised against - turning preemption on is not a no-op (Bun gets *further*, all the
-way to printing its banner) but it then fails differently, and widening an accepted
-partial to cover a second unexplained failure would turn a bounded disclosure into a
-blanket one.
+**Three wrong diagnoses, and the measurement that ended them.** Worth recording, because
+each guess cost a full experiment. (1) **The scheduler**: all 205 of Bun's startup
+syscalls came from its main thread and the worker it spawned never got the CPU, so the
+cooperative scheduler was blamed and the prediction written down was "when preemption
+lands, Bun prints `rheo:42`". Preemption landed, the worker measurably got the CPU (66
+preemptions to a sibling context), and Bun aborted *identically with preemption
+disabled*. (2) **The JIT**: W^X refused JavaScriptCore's RWX arena, so that was blamed
+next; the arena is now granted and Bun aborted at the same point again. (3) After two
+eliminations, the honest position was that the cause was unknown.
 
-The experiment paid for itself in three real defects, each fixed: the **vector-register
-file was saved after the scheduler's bookkeeping** rather than before it (the kernel is
-soft-float, but that bounds the floating point it *emits*, not the vector registers
-`compiler_builtins`' `mem*` routines and ordinary struct moves use on x86-64 - so
-anything between the interrupt and the save clobbers what is about to be saved; the save
-is now the first action on every preemption path, a fourth path into the `SYS_YIELD` FP
-scar); **`getrusage` was refused**, and Bun printed `Sys: 8589934ms` from the `-ENOSYS`
-return reinterpreted as microseconds - a fabricated measurement, worse than a refusal -
-so it now reports the counters this kernel actually has (elapsed CPU, the cell's own
-committed frames as `maxrss`, its fault count) with the rest 0 *because they are 0*; and
-**`MADV_DONTDUMP`/`MADV_DODUMP` were refused** where this OS can provide their entire
-observable effect, since it produces no core dumps (JSC marks the 128 GiB Gigacage
-`MADV_DONTDUMP`, which is the sane thing to do with mostly-untouched address space);
-and the **timer wheel's bulk re-file path skipped its trailing bucket expiry** - taken
-when more than a level-0 revolution has elapsed with nothing serviced, it left an
-already-due timer to fire on the *next* service, after timers with later deadlines,
-breaking the one property the wheel exists to guarantee. Only after a long stall, so it
-presented as a rare load-dependent flake in `substrate` (observed failing while the host
-was building three ISAs) rather than as a bug; a transport would have applied a later
-RTO before an earlier one.
+What ended it was not a fourth guess but **evidence**. The personality now prints the
+path of every refused `open` and dumps the last 24 syscalls before a fatal signal; the
+trace showed glibc's `abort()` preamble (`rt_sigprocmask`, `gettid`, `getpid`, `tgkill`)
+preceded by a run of probes, and the refused-path log named them. **`/proc/self/maps` was
+the one that mattered** - JavaScriptCore reads its own memory map, and a JS engine that
+cannot find its own mappings cannot proceed. It is now **synthesized from the cell's real
+VMA list** (`vma::render_maps` -> `FdKind::ProcMaps`), rendered once at open so a reader
+gets one consistent snapshot; every line comes from a record the personality actually
+holds, which is why it is generated rather than seeded as a file - a static `maps` would
+be a fabricated memory layout, and a runtime reading it to locate its own code would be
+misled rather than refused. Alongside it, the disk fixture seeds the handful of `/proc`
+and `/sys` values this kernel genuinely has (`cpu/online` = `0-0`,
+`overcommit_memory` = 0 - accurate, since `mmap` reserves and frames arrive on fault -
+`mmap_min_addr` = 65536, `cgroup` = `0::/`, cgroup `memory.max`/`memory.high` = `max`,
+and a `/proc/stat` whose `cpuN` line count is right while its jiffy fields are 0 because
+this kernel keeps no jiffy accounting).
 
-**Node completes under preemption, after a real defect was found and fixed.** It was
-intermittent first - about one run in eight died with SIGSEGV and no output - and the
-cause was the x86-64 choice of *return instruction*. `SYSRET` takes its RIP from RCX and
-its RFLAGS from R11, i.e. it **consumes** them, which is right for returning from a
-`syscall` (defined to clobber both) and wrong for resuming a context stopped anywhere
-else; so `syscall_entry` never saved RCX/R11 and `sysret_resume` reconstructed them from
-the rip/rflags slots. Airtight before preemption, because every frame a syscall trap
-handed back was either the caller's own or a peer that had also last stopped at a
-syscall. **A preempted frame is neither** - captured at an arbitrary instruction with
-those registers live - and a sibling's `SYS_YIELD` selects it through exactly that
-trampoline. The symptom is not a fault: it is the resumed context computing with two
-wrong registers. Third appearance of one family (the other two: `iret_resume` for
-faults, and the FP-save ordering above) - "a resume path correct for one provenance used
-for another". Fixed **by provenance, not by tagging**: the trampoline compares the frame
-it is about to resume against the frame it entered on and resumes a different one
-through `IRET`, so there is no flag a future producer of frames can forget; and
-`syscall_entry` now also writes the rcx/r11 slots with the values SYSRET would
-synthesise, so a syscall-origin frame resumes bit-identically either way. The fast path
-keeps SYSRET; only a switch pays for IRET. ARM64/RISC-V need no equivalent (`eret`/`sret`
-consume nothing). Proven **both directions** by a `preempt` phase that pins sentinels in
-RCX/R11 inside one `asm!` block containing the spin loop while a sibling yields: 54
-cross-cell syscall resumes leave them intact, and reverting the comparison fails
-**deterministically** - which is what turns a one-in-eight flake into a property.
+The lesson is the cheapness of the fix relative to the guesses: two large,
+correctly-built mechanisms were driven to completion on the strength of a plausible
+story, and a one-line "print the path that failed" would have answered it first
+(docs/ENGINEERING.md 1 - observe, never infer). Both diagnostics are kept.
 
-The `linuxnode` boot runs **preemptively with its JIT enabled**, 12 consecutive clean
-runs after the fix - though it is the property proven by `preempt`'s scratch-register
-phase, not the run count, that makes it shippable.
-
-**Node.js now runs with its JIT ENABLED** (docs/ARCHITECTURE.md 5.1). W^X was a hard
-invariant - `MapPerm` had three variants and no RWX - and it is now the **default with
-one capability-gated exception**: a cell may hold a writable-and-executable mapping
-only if it holds a `MemoryGrant` capability carrying `RIGHT_WRITE | RIGHT_EXECUTE`,
-which is exactly what "may hold memory that is simultaneously writable and executable"
-means in the rights vocabulary that already existed. No new right, no new object, and
-**no ambient authority** - the capability is minted by whoever launches the cell, a
-cell cannot widen its own, and it is epoch-revocable like any other. `MapPerm` gains a
-fourth variant `UserRwx` so no path can produce such a mapping by forgetting a check:
-it has to *name* it, and every `match` in the tree had to be updated, which is the
-point. `linuxnode` mints it and runs the real `node` with no `--jitless` at all: V8
-tiers up to Sparkplug, gets its code page, evaluates and exits 0. Every other kernel in
-the suite mints nothing of the sort and its RWX request is refused `-EPERM` with a
-printed reason, exactly as before - which is what makes this a capability rather than a
-setting, and the `security` kernel's W^X assertions pass unchanged. Both the grant and
-the refusal are logged, because a silently-granted exception is indistinguishable from
-a missing check.
-
-The measured trace that forced the design, kept because it is the evidence: running
-`node` without `--jitless` and *without* the capability fatals with a V8 native stack
-trace giving the exact site:
-`Runtime_BytecodeBudgetInterrupt_Ignition` -> `BaselineBatchCompiler::CompileBatch` ->
-`Compiler::CompileBaseline` -> `BaselineCompiler::Build` ->
-`Factory::CodeBuilder::BuildInternal` -> `MemoryAllocator::AllocatePage` ->
-`SetPermissionsOnExecutableMemoryChunk` -> `v8::base::OS::SetPermissions`, dying on
-`Check failed: 12 == errno`. So V8 gets through Ignition and into tiering up to
-Sparkplug before the single `mprotect(PROT_WRITE|PROT_EXEC)` is refused - the long-
-standing claim "the one `mprotect(RWX)` V8 would issue is refused" is now a cited trace
-rather than an assertion. V8 *requires* `ENOMEM` from a failed `SetPermissions` and
-fatals on anything else, so our `-EPERM` (the errno a hardened Linux returns) gives a
-hard abort instead of V8's own graceful path; returning `ENOMEM` to steer it somewhere
-nicer would be fabricating a reason, so it is not done. And unmodified Node 22 can use
-neither a W->X flip nor a dual mapping, because
-`v8_enable_write_protect_code_memory` is **compile-time** in this build - which is why
-the answer had to be an authority somebody is given rather than a redirection: the
-three options were never run a stock JIT, allow RWX for everyone, or make it a
-capability, and only the third keeps the property auditable.
+Still refused and correctly so: `/etc/localtime` (glibc falls back to UTC, which is right
+- there is no timezone database and inventing one is worse than the fallback),
+`bunfig.toml`, the `glibc-hwcaps` probes, `trace_marker`, `/proc/self/statm`.
 
 **timerfd is done** (docs/LINUX-COMPAT.md L8-TIMERFD, GOAL-TIMERFD):
 `timerfd_create`/`settime`/`gettime` - the **timer source of libuv**, and thus of

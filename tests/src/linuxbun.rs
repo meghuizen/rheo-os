@@ -10,34 +10,44 @@
 //! low-level interpreter with **no executable allocation** (the JSC equivalent of
 //! `node --jitless`, host-verified to issue zero RWX mappings).
 //!
-//! Bun demonstrably streams off ext4, demand-pages, dynamically links its whole
-//! library set, brings up JavaScriptCore **including the 128 GiB Gigacage** (a
-//! `MAP_NORESERVE` reservation the kernel now demand-fills, GOAL-BUN), spawns a
-//! worker thread via **`clone3`** (now implemented), and sets up its libuv event
-//! loop - then `abort()`s before evaluating. The harness accepts that bounded
-//! partial (exit 134 + no output) as a skip-with-reason.
+//! **Bun evaluates JavaScript and exits 0**, with its JIT enabled and under
+//! preemption: it streams off ext4, demand-pages, dynamically links its whole library
+//! set, brings up JavaScriptCore including the 128 GiB Gigacage, spawns a worker via
+//! `clone3`, runs its libuv event loop, prints exactly `rheo:42`. Held to the same
+//! strict gate as Node - no partial is accepted.
 //!
-//! **Why it aborts is currently unknown, and that is a correction.** The previous
-//! answer was the preemptive-SMP frontier: every one of Bun's 205 syscalls came from
-//! its main thread and the worker it spawned never got the CPU, so the cooperative
-//! scheduler was blamed and the prediction was "when task #132 lands, Bun prints
-//! `rheo:42`". Preemption has since landed (docs/SUBSTRATE.md 15, S3'); this boot
-//! enables it; the worker measurably gets the CPU (66 preemptions, all to a sibling
-//! context of Bun's own cell) - and Bun aborts **identically with preemption
-//! disabled**, same exit, same empty output, same point. The starved worker was the
-//! first difference anyone measured between Bun and Node, not the cause. The
-//! prediction is withdrawn rather than reattached to a later milestone
-//! (docs/ENGINEERING.md 1).
+//! ## Three wrong diagnoses, and the measurement that ended them
 //!
-//! **Its JIT is now enabled too, and that changed nothing either.** The cell holds
-//! the W^X exception capability (docs/ARCHITECTURE.md 5.1), so JavaScriptCore's RWX
-//! arena is granted - the `mmap` succeeds and is logged - and Bun still aborts at the
-//! same point with the same exit and the same empty output. Two independent
-//! explanations have now been tested and neither held.
+//! Worth recording, because this abort was blamed on three different things and each
+//! guess cost a full experiment:
 //!
-//! `linuxnode`, which shares this harness, **does** complete - with its JIT enabled,
-//! through the same capability - so the mechanism is exercised here by a runtime that
-//! finishes, not only by one that does not.
+//! 1. **The scheduler.** Every one of Bun's 205 startup syscalls came from its main
+//!    thread and the worker it spawned never got the CPU, so the cooperative scheduler
+//!    was blamed and the prediction was "when preemption lands, Bun prints `rheo:42`".
+//!    Preemption landed; the worker measurably got the CPU (66 preemptions to a sibling
+//!    context); Bun aborted **identically with preemption disabled**.
+//! 2. **The JIT.** W^X refused JavaScriptCore's RWX arena, so that was blamed next.
+//!    The arena is now granted through the capability-gated exception
+//!    (docs/ARCHITECTURE.md 5.1) - and Bun aborted at the same point again.
+//! 3. **Nothing in particular.** After two eliminations the honest position was that
+//!    the cause was unknown.
+//!
+//! What ended it was not a fourth guess but **evidence**: the personality now prints
+//! the path of every refused `open` and dumps the last syscalls before a fatal signal.
+//! The trace showed glibc's `abort()` preamble - `rt_sigprocmask`, `gettid`, `getpid`,
+//! `tgkill` - preceded by a series of probes, and the refused-path log named them.
+//! `/proc/self/maps` was the one that mattered: **JavaScriptCore reads its own memory
+//! map**, and a JS engine that cannot find its own mappings cannot proceed. The Linux
+//! personality now synthesizes it from the cell's real VMA list.
+//!
+//! The lesson is the cheapness of the fix relative to the guesses. Two large,
+//! correctly-built mechanisms were driven to completion on the strength of a plausible
+//! story, and a one-line "print the path that failed" would have answered it first
+//! (docs/ENGINEERING.md 1 - observe, never infer).
+//!
+//! Still refused, and correctly: `/etc/localtime` (glibc falls back to UTC, which is
+//! right - there is no timezone database and inventing one is worse), `bunfig.toml`
+//! (no config), the `glibc-hwcaps` probes, `trace_marker`, and `/proc/self/statm`.
 //!
 //! **x86-64 only** (no arm64/riscv64 bun build - those skip-with-reason). The proof
 //! lives in the shared [`disk_runtime`] harness; this bin is the `bun`-specific
@@ -66,13 +76,14 @@ extern "C" fn kernel_main() -> ! {
         // abort is unchanged). Accept that specific, bounded partial - exit 134
         // **and** no output, so any other failure still fails - as a
         // skip-with-reason; see [`disk_runtime::prove`].
-        true,
-        // Cooperative, which is the scheduler this partial is characterised against
-        // (module docs). Turning preemption on is not a no-op here - Bun gets
-        // *further*, all the way to printing its banner - but it then fails
-        // differently, and widening an accepted partial to cover a second unexplained
-        // failure would turn a bounded disclosure into a blanket one.
+        // **No partial accepted any more.** Bun evaluates its input and exits 0, so it
+        // is held to the same strict gate as Node (see the module docs for what the
+        // three withdrawn diagnoses cost, and what the fourth turned out to be).
         false,
+        // **Preemptive dispatch** (docs/SUBSTRATE.md 15, S3'), as for Node: JSC's
+        // worker and its main thread are now scheduled preemptively rather than only
+        // at blocking points.
+        true,
         // The **W^X exception capability** (docs/ARCHITECTURE.md 5.1), so this
         // runtime's JIT can map its code pages writable-and-executable. Every other
         // kernel in the suite mints nothing of the sort and is refused exactly as

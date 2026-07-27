@@ -1075,144 +1075,73 @@ fixup path.
   preemption, #27); one context per cell may block on `poll` at a time (the copied
   `pollset` is per-cell - `epoll`, which Node uses, has no such limit).
 
-- **The real Bun binary loads and initialises to the concurrency frontier**
-  (GOAL-BUN, task #175, the `linuxbun` test - a **partial** pass). The actual
-  `/root/.bun/bin/bun` (v1.3, dynamic, 99 MB, JavaScriptCore + a Zig runtime)
-  streams off a live ext4 disk over virtio-blk-pci (~3,500 block-cache fills, none
-  resident whole), its `ld-linux` links the whole library set, and JSC initialises
-  **including its 128 GiB Gigacage** (a single `MAP_NORESERVE` reservation the
-  kernel now demand-fills - the mmap window was raised to 80..252 GiB for it, and a
-  failed eager commit no longer leaks a phantom VMA), spawns a worker thread via
-  **`clone3`** (now implemented), and sets up its libuv event loop. It runs
-  `BUN_JSC_useJIT=0` (host-verified to issue zero RWX mappings, the JSC equivalent
-  of `--jitless`). Then it `abort()`s (SIGABRT) **before evaluating** - and the
-  cause is measured, not guessed: **every one of its 205 syscalls came from the
-  main thread; the worker it spawned never got the CPU**. Our scheduler is
-  cooperative single-CPU (it switches to a sibling only when the current context
-  blocks), and Bun's main thread requires the worker to have made progress
-  *concurrently* before it ever blocks. That is the **preemptive-SMP frontier**
-  (task #132), not a missing syscall or a memory bug - the entire load path
-  (streaming, demand paging, 7-library dynamic linking, the 128 GiB Gigacage,
-  `clone3`, the event loop) works. The `linuxbun` harness accepts this specific,
-  tightly-bounded partial (exit 134 **and** empty output). x86-64 only (no
-  arm64/riscv64 bun build).
+- **The real Bun binary evaluates JavaScript and exits 0** (GOAL-BUN, task #175, the
+  `linuxbun` test - now a **full** pass). The actual `/root/.bun/bin/bun` (v1.3,
+  dynamic, 99 MB, JavaScriptCore + a Zig runtime) streams off a live ext4 disk over
+  virtio-blk-pci (~9,300 block-cache fills, none resident whole), its `ld-linux` links
+  the whole library set, JSC initialises **including its 128 GiB Gigacage** (a single
+  `MAP_NORESERVE` reservation the kernel demand-fills), it spawns a worker via
+  `clone3`, runs its libuv event loop, and prints exactly `rheo:42`. Its **JIT is
+  enabled** - JavaScriptCore's RWX arena is granted through the capability-gated W^X
+  exception (docs/ARCHITECTURE.md 5.1) - and it runs **under preemption**. x86-64 only
+  (no arm64/riscv64 bun build; those skip-with-reason).
 
-  **That attribution has since been tested, and it does not hold.** Timer preemption
-  landed (docs/SUBSTRATE.md 15, S3'), the worker measurably **does** get the CPU when
-  it is enabled - 66 preemptions taken, all of them to a sibling context of Bun's own
-  cell - and Bun aborts **identically with preemption disabled**: same exit 134, same
-  empty output, at the same point. So "the worker never got the CPU" was a true
-  observation and a *wrong diagnosis*: it was the first difference anyone measured
-  between Bun and Node, not the cause of the abort. What the cause is, is now
-  genuinely unknown, and saying so is better than substituting the next plausible
-  guess (docs/ENGINEERING.md 1). The prediction "when #132 lands it should print
-  `rheo:42`" is withdrawn as disproven rather than quietly restated about a later
-  milestone.
+  ### Three wrong diagnoses, and the measurement that ended them
 
-  The `linuxbun` boot therefore stays **cooperative** - that is the scheduler its
-  partial is characterised against. Enabling preemption is not a no-op: Bun gets
-  *further*, all the way to printing its startup banner, and then fails differently.
-  Widening an accepted partial to cover a second unexplained failure would turn a
-  bounded disclosure into a blanket one.
+  This is worth recording in full, because the abort was blamed on three different
+  things and each guess cost a complete experiment.
 
-  The experiment paid for itself in four real defects, each fixed:
+  1. **The scheduler.** Instrumentation showed all 205 of Bun's startup syscalls came
+     from its main thread while the worker it spawned never got the CPU. The cooperative
+     scheduler was blamed, and the prediction written into this document was "when task
+     #132 lands, Bun should print `rheo:42` and exit 0". Timer preemption landed
+     (docs/SUBSTRATE.md 15, S3'); the worker measurably got the CPU - 66 preemptions,
+     all to a sibling context of Bun's own cell - and Bun aborted **identically with
+     preemption disabled**: same exit, same empty output, same point.
+  2. **The JIT.** W^X refused JavaScriptCore's RWX code arena, so that became the next
+     explanation. The arena is now granted through the capability-gated exception, the
+     `mmap` succeeds and is logged - and Bun aborted at the same point again.
+  3. **Unknown.** After two eliminations the honest position was that the cause was not
+     known, and that is what this section said.
 
-  - **The vector-register file was saved after the scheduler's bookkeeping** rather
-    than before it. The kernel is soft-float, but that bounds the floating point it
-    *emits*, not the vector registers `compiler_builtins`' `mem*` routines and
-    ordinary struct moves use on x86-64 - so anything between the interrupt and the
-    save clobbers what is about to be saved, and a preemption arrives at an arbitrary
-    instruction inside the cell's own vector code. The symptom was not a fault at the
-    switch: it was the *resumed* context computing with someone else's registers,
-    which showed up as Bun dying with `Illegal instruction` at a nonsense address. The
-    save is now the first action on every preemption path (a fourth path into the
-    `SYS_YIELD` FP scar, docs/LIBRHEO.md).
-  - **`getrusage` was refused**, and Bun printed `Sys: 8589934ms` from the `-ENOSYS`
-    return reinterpreted as microseconds. A fabricated measurement is worse than a
-    refusal, and a zeroed struct would be worse for the same reason, so it now reports
-    the counters this kernel has (elapsed CPU as `utime` - there is no user/system
-    split to report, and guessing a ratio would invent the distinction - the cell's own
-    committed frames as `maxrss`, its fault count) with the rest 0 *because they are 0*.
-  - **`MADV_DONTDUMP`/`MADV_DODUMP` were refused** where this OS can provide their
-    entire observable effect: it produces no core dumps. JSC marks the 128 GiB
-    Gigacage `MADV_DONTDUMP`, which is the sane thing to do with mostly-untouched
-    address space.
-  - **V8's JIT now runs**, through the capability-gated W^X exception
-    (docs/ARCHITECTURE.md 5.1): `linuxnode` mints a `MemoryGrant` capability carrying
-    `WRITE | EXECUTE` into the cell and runs the real `node` with **no `--jitless`**,
-    so V8 tiers up to Sparkplug, gets its writable-executable code page, evaluates and
-    exits 0. Every other kernel in the suite mints nothing of the sort and its RWX
-    request is refused `-EPERM` with a printed reason exactly as before. The trace
-    below is what forced that design and is kept as its evidence.
-  - **V8's JIT reaches baseline compilation and dies at one call** *without* the
-    capability. Running `node`
-    *without* `--jitless` produces a V8 fatal whose native stack trace names the exact
-    site: `Runtime_BytecodeBudgetInterrupt_Ignition` ->
-    `BaselineBatchCompiler::CompileBatch` -> `Compiler::CompileBaseline` ->
-    `BaselineCompiler::Build` -> `Factory::CodeBuilder::BuildInternal` ->
-    `MemoryAllocator::AllocatePage` -> `SetPermissionsOnExecutableMemoryChunk` ->
-    `v8::base::OS::SetPermissions`, which fatals on `Check failed: 12 == errno`. So
-    V8 gets all the way through Ignition and into tiering up to Sparkplug before the
-    single `mprotect(PROT_WRITE|PROT_EXEC)` is refused - the claim "the one
-    `mprotect(RWX)` V8 would issue is refused" is now a cited trace rather than an
-    assertion. Two things follow. V8 *requires* `ENOMEM` from a failed
-    `SetPermissions` and fatals on anything else, so our `-EPERM` (the errno a
-    hardened Linux returns) produces a hard abort rather than V8's own graceful
-    path - and returning `ENOMEM` to steer a program down a nicer path would be
-    fabricating a reason, so it is not done. And unmodified Node 22 cannot use a
-    W->X flip or a dual mapping: `v8_enable_write_protect_code_memory` is a
-    **compile-time** option in this build, so JIT here needs either a rebuilt V8 or a
-    doctrine change to W^X (ARCHITECTURE.md 5), which is a decision the admission rule
-    in ARCHITECTURE.md 6 reserves and which docs/ARCHITECTURE-DEBT.md 4.0 already
-    flags as "deliberately not decided".
-  - **The timer wheel's bulk re-file path skipped its trailing bucket expiry.** Taken
-    when more than a level-0 revolution has elapsed with nothing serviced, it left an
-    already-due timer to fire on the *next* service - after timers with later
-    deadlines. It broke the one property the wheel exists to guarantee, and only after
-    a long stall, so it presented as a rare load-dependent flake in `substrate`
-    (observed failing while the host was building three ISAs) rather than as a bug. A
-    transport would have applied a later RTO before an earlier one.
+  What ended it was **evidence, not a fourth guess**. Two diagnostics were added, both
+  cheap and both kept: the personality prints the **path** of every refused `open`, and
+  dumps the last 24 syscalls (number and return) before a fatal signal. The trace showed
+  glibc's `abort()` preamble - `rt_sigprocmask`, `gettid`, `getpid`, then `tgkill` -
+  preceded by a run of probes, and the refused-path log named every one of them.
 
-  **Node under preemption was intermittent - about one run in eight died with SIGSEGV
-  and no output - and the cause was found and fixed.** It is worth recording as a
-  worked example, because the wrong conclusion was available and cheap: "preemption is
-  inherently risky, leave it off".
+  **`/proc/self/maps` was the one that mattered.** JavaScriptCore reads its own memory
+  map; a JS engine that cannot locate its own mappings cannot proceed. It is now
+  synthesized from the cell's **real VMA list** (`vma::render_maps` ->
+  `fd::FdKind::ProcMaps`), rendered once at open so a reader gets a consistent snapshot
+  rather than a layout that never existed at any instant. Synthesized rather than seeded
+  as a file on the test image for a reason worth stating: a static `maps` would be a
+  fabricated memory layout, and a runtime reading it to find its own code would be
+  **misled rather than refused**, which is strictly worse (docs/ENGINEERING.md 1). The
+  `dev` and `inode` columns are 0 and the path column is `[anon]`/`[file]`, because a
+  mapping here names a `filemap` handle rather than a device inode - plausible numbers
+  there would be fabricated identity a program might try to match.
 
-  The bug was on x86-64, in the choice of *return instruction*. `SYSRET` takes its RIP
-  from RCX and its RFLAGS from R11 - it **consumes** them - which is exactly right for
-  returning from a `syscall`, since the instruction is defined to clobber both, and
-  exactly wrong for resuming a context that was stopped somewhere else. `syscall_entry`
-  therefore never saved RCX/R11 into the frame at all, and `sysret_resume`
-  reconstructed them from the rip/rflags slots.
+  Alongside it the disk fixture seeds the small set of `/proc` and `/sys` values this
+  kernel genuinely has, each true rather than plausible:
+  `/sys/devices/system/cpu/online` = `0-0` (one CPU schedules cells),
+  `/proc/sys/vm/overcommit_memory` = 0 (heuristic - accurate, since `mmap` reserves and
+  frames arrive on fault), `/proc/sys/vm/mmap_min_addr` = 65536 (nothing is mapped
+  below it), `/proc/self/cgroup` = `0::/` and cgroup `memory.max`/`memory.high` = `max`
+  (there are no cgroups, and that is the v2 spelling of unconstrained), and a
+  `/proc/stat` whose `cpuN` line count is right while its jiffy fields are 0 **because
+  they are 0**.
 
-  Before preemption that was airtight: every frame a *syscall* trap handed back was
-  either the caller's own or a peer that had itself last stopped at a syscall, so
-  RCX/R11 were clobberable in both cases. **A preempted context's frame is neither** -
-  it is captured at an arbitrary instruction with those registers live - and if a
-  sibling's `SYS_YIELD` (or any switching syscall) later selects it, the syscall
-  trampoline is the path it comes back through. The symptom is not a fault at the
-  switch: it is the resumed context computing with two wrong registers, which is why it
-  presented as an occasional segfault with no pattern. This is the third appearance of
-  the same family - the `iret_resume`-for-faults fix and the FP-save-ordering fix above
-  are the other two - and the family is "a resume path that is correct for one
-  provenance being used for another".
+  **The lesson is the cheapness of the fix relative to the guesses.** Two large,
+  correctly-built mechanisms - preemption and the W^X capability - were each driven to
+  completion on the strength of a plausible story about this one program, and a one-line
+  "print the path that failed" would have answered it before either. Both mechanisms are
+  worth having on their own merits, which is the only reason the cost was not wasted.
 
-  The fix is by **provenance, not by tagging**: after the dispatcher returns, the
-  trampoline compares the frame it is about to resume against the frame it entered on,
-  and resumes a *different* one through `IRET`. There is no flag for a future producer
-  of frames to forget to set. `syscall_entry` additionally writes the rcx/r11 slots with
-  the values SYSRET would synthesise, so a syscall-origin frame resumes bit-identically
-  either way and the comparison is the only thing that decides. The syscall fast path
-  keeps SYSRET; only a switch pays for IRET. ARM64 and RISC-V need no equivalent, since
-  `eret`/`sret` restore the whole register file and consume nothing.
-
-  Proven in both directions by a new phase of the `preempt` kernel: a cell pins
-  sentinels in RCX and R11 **inside one `asm!` block that also contains its spin loop**
-  (so the compiler cannot spill and reload them around the window - the same discipline
-  the FP/SIMD `SYS_YIELD` proof needed) while a sibling yields in a loop. With the fix
-  the sentinels survive 54 cross-cell syscall resumes; with the comparison reverted the
-  phase fails **deterministically**, which is what turns a one-in-eight flake into a
-  property. The phase skips-with-reason on the two ISAs where the hazard cannot exist.
+  Still refused, and correctly: `/etc/localtime` (glibc falls back to UTC, which is right
+  - there is no timezone database here and inventing one is worse than the fallback),
+  `bunfig.toml`, the `glibc-hwcaps` micro-architecture probes, `trace_marker`, and
+  `/proc/self/statm`.
 
 ## 6. Fixture build matrix (reproducibility)
 

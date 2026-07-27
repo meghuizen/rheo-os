@@ -645,6 +645,14 @@ pub fn exit_group(cell: usize, code: u64) -> Ctl {
 /// Terminated by an uncaught fatal signal (WIFSIGNALED). For the top cell the
 /// run ends reporting 128+signo (matching the L5 default-disposition behavior).
 pub fn exit_signaled(cell: usize, signo: u32) -> Ctl {
+    // A death by signal is the case with the least evidence attached - `abort()` in
+    // particular leaves no fault address and often no output - so the syscall tail is
+    // printed here (docs/LINUX-COMPAT.md).
+    crate::println!(
+        "linux: cell {cell} pid {} died on signal {signo}",
+        pid(cell)
+    );
+    super::dump_trace("the fatal signal");
     let status = signo & 0x7f; // WIFSIGNALED (WEXITSTATUS 0)
     process_exit(cell, status, 128 + signo as u64)
 }

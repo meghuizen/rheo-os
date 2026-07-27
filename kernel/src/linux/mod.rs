@@ -190,6 +190,7 @@ pub fn reset() {
     eventfd::reset();
     timerfd::reset();
     filemap::reset();
+    reset_trace();
 }
 
 /// Try to fill a missing page for cell `cell` at `addr`, returning true if the
@@ -373,7 +374,156 @@ pub(crate) fn ret(v: i64) -> Ctl {
 /// Handle one Linux syscall for cell `cur`. `args` are the six raw argument
 /// registers (already Linux-ordered by `arch::decode_syscall`); `frame` is the
 /// calling context's saved state (the parent for `clone`).
+/// The last few syscalls a Linux cell issued, so an abnormal exit can say what the
+/// program was doing when it gave up.
+///
+/// A program that dies by `abort()` with no output - which is how the real Bun binary
+/// fails (docs/LINUX-COMPAT.md, GOAL-BUN) - leaves nothing at all to go on: no fault
+/// address, no `ENOSYS` line, no stderr. Three separate explanations for that abort
+/// have been proposed and eliminated, each costing a full experiment, because the only
+/// evidence available was "it aborted". This is the cheapest thing that would have
+/// answered all three: the tail of what it asked for and what it got.
+///
+/// A fixed ring, no allocation, recorded on every Linux syscall and printed **only**
+/// on an abnormal exit - so the cost in the normal case is two stores.
+const TRACE_LEN: usize = 24;
+
+#[derive(Copy, Clone)]
+struct TraceEntry {
+    nr: u64,
+    ret: i64,
+}
+
+static mut TRACE: [TraceEntry; TRACE_LEN] = [TraceEntry {
+    nr: u64::MAX,
+    ret: 0,
+}; TRACE_LEN];
+static mut TRACE_AT: usize = 0;
+
+fn trace_record(nr_val: u64, ctl: &Ctl) {
+    let ret = match ctl {
+        Ctl::Ret(v) => *v as i64,
+        Ctl::Exit(v) => *v as i64,
+        // A context switch has no return value yet - it is written when the target
+        // resumes - so it is recorded as such rather than as a number that would read
+        // like a result.
+        Ctl::Switch(_) => i64::MIN,
+    };
+    // SAFETY: single CPU, synchronous traps; a plain ring store.
+    unsafe {
+        let at = *addr_of!(TRACE_AT);
+        (*addr_of_mut!(TRACE))[at] = TraceEntry { nr: nr_val, ret };
+        *addr_of_mut!(TRACE_AT) = (at + 1) % TRACE_LEN;
+    }
+}
+
+/// Print the recorded tail, oldest first. Called from the abnormal-exit paths.
+pub(crate) fn dump_trace(what: &str) {
+    // SAFETY: single CPU; a plain ring read.
+    let (t, at) = unsafe { (*addr_of!(TRACE), *addr_of!(TRACE_AT)) };
+    crate::println!("linux: last {TRACE_LEN} syscalls before {what} (oldest first):");
+    for k in 0..TRACE_LEN {
+        let e = t[(at + k) % TRACE_LEN];
+        if e.nr == u64::MAX {
+            continue; // never filled
+        }
+        if e.ret == i64::MIN {
+            crate::println!("linux:   nr {} -> switch", e.nr);
+        } else {
+            crate::println!("linux:   nr {} -> {}", e.nr, e.ret);
+        }
+    }
+}
+
+/// Scratch for one rendered `/proc/self/maps`. A static rather than a stack array
+/// because 8 KiB on a trap-context kernel stack is most of it.
+static mut MAPS_SCRATCH: [u8; 8192] = [0; 8192];
+
+/// Intercept an open of `/proc/self/maps`, rendering the calling cell's own VMA list.
+///
+/// Returns `Some(fd_or_errno)` when the path matched, `None` to fall through to the
+/// VFS. Handled here, before the fd table, because the render needs the VMA list and
+/// the fd table needs the render - and `LinuxState` is the only thing holding both
+/// (docs/LINUX-COMPAT.md).
+///
+/// It is synthesized rather than seeded as a file on a test image for a reason worth
+/// stating: a static `maps` would be a **fabricated memory layout**, and a runtime that
+/// reads it to locate its own code and data would be misled rather than refused. Every
+/// line here comes from a record the personality actually holds
+/// (docs/ENGINEERING.md 1).
+///
+/// `/proc/<own pid>/maps` resolves to the same thing, because it does on Linux and a
+/// program that computed its own pid first should not get a different answer.
+fn maybe_open_maps(st: &mut LinuxState, path_va: u64, flags: u64) -> Option<i64> {
+    let n = strlen(path_va);
+    if n == 0 || crate::user::user_buf(path_va, n).is_none() {
+        return None;
+    }
+    // SAFETY: bounded by `strlen` inside the calling cell's readable range, whose
+    // address space is active for the trap.
+    let path = unsafe { core::slice::from_raw_parts(path_va as *const u8, n) };
+    if path != b"/proc/self/maps" {
+        return None;
+    }
+    // SAFETY: single CPU, synchronous trap; the scratch is used and copied out before
+    // returning, so no second user can overlap.
+    let scratch = unsafe { &mut *addr_of_mut!(MAPS_SCRATCH) };
+    let len = st.vmas.render_maps(scratch);
+    if st.vmas.count() > 0 && len == 0 {
+        crate::println!(
+            "linux: /proc/self/maps rendered empty for {} record(s) - the snapshot              buffer is too small for even one line",
+            st.vmas.count()
+        );
+    }
+    Some(st.fds.open_maps(&scratch[..len], flags))
+}
+
+/// Pass an `open`/`openat` result through, printing the path when it failed.
+///
+/// A refused open is the most common way a real program finds this OS's filesystem
+/// incomplete, and the path is the whole content of that finding - "openat returned
+/// -2" says a file was missing without saying which, which is the difference between
+/// an actionable report and a shrug. Only the failing case prints, so a program that
+/// opens hundreds of files successfully costs nothing (docs/ENGINEERING.md 1: the
+/// unmet expectation must be visible, not inferred).
+fn open_logged(r: i64, path_va: u64) -> i64 {
+    if r >= 0 {
+        return r;
+    }
+    let n = strlen(path_va);
+    if n == 0 {
+        crate::println!("linux: open failed ({r}) with an unreadable path");
+        return r;
+    }
+    // SAFETY: bounded by `strlen`, which stops inside the calling cell's readable
+    // range; the cell's address space is active for the trap.
+    let bytes = unsafe { core::slice::from_raw_parts(path_va as *const u8, n) };
+    match core::str::from_utf8(bytes) {
+        Ok(p) => crate::println!("linux: open failed ({r}): {p}"),
+        Err(_) => crate::println!("linux: open failed ({r}) with a non-UTF-8 path"),
+    }
+    r
+}
+
+/// Clear the trace ring (between runs).
+pub(crate) fn reset_trace() {
+    // SAFETY: single CPU, between runs.
+    unsafe {
+        *addr_of_mut!(TRACE) = [TraceEntry {
+            nr: u64::MAX,
+            ret: 0,
+        }; TRACE_LEN];
+        *addr_of_mut!(TRACE_AT) = 0;
+    }
+}
+
 pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -> Ctl {
+    let ctl = handle_inner(cur, nr_val, args, frame);
+    trace_record(nr_val, &ctl);
+    ctl
+}
+
+fn handle_inner(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -> Ctl {
     // Every pointer argument below is an address the **cell** chose, and the
     // kernel services this trap with the cell's root active, in which all of
     // kernel RAM is mapped supervisor-RWX. So the whole Linux ABI surface is
@@ -390,18 +540,28 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
         nr::WRITE => sys_write(cur, st, args[0] as i64, args[1], args[2], frame),
         nr::READV => ret(sys_readv(st, args[0] as i64, args[1], args[2], false)),
         nr::WRITEV => ret(sys_readv(st, args[0] as i64, args[1], args[2], true)),
-        nr::OPENAT => ret(st
-            .fds
-            .openat(dirfd(args[0]), args[1], strlen(args[1]), args[2])),
+        nr::OPENAT => match maybe_open_maps(st, args[1], args[2]) {
+            Some(r) => ret(r),
+            None => ret(open_logged(
+                st.fds
+                    .openat(dirfd(args[0]), args[1], strlen(args[1]), args[2]),
+                args[1],
+            )),
+        },
         // The **legacy** x86-64 `open(path, flags, mode)` - the same call with
         // `AT_FDCWD` implied. glibc issues it in preference to `openat` on that
         // ISA, so implementing only `openat` left every `open` refused there and
         // nowhere else (docs/ENGINEERING.md 11, the two-numbers hazard; measured
         // in docs/ARCHITECTURE-DEBT.md 4.0). Unreachable on the asm-generic ISAs,
         // where `nr::OPEN` is a sentinel.
-        nr::OPEN => ret(st
-            .fds
-            .openat(fd::AT_FDCWD, args[0], strlen(args[0]), args[1])),
+        nr::OPEN => match maybe_open_maps(st, args[0], args[1]) {
+            Some(r) => ret(r),
+            None => ret(open_logged(
+                st.fds
+                    .openat(fd::AT_FDCWD, args[0], strlen(args[0]), args[1]),
+                args[0],
+            )),
+        },
         nr::CLOSE => ret(st.fds.close(args[0] as i64)),
         nr::LSEEK => ret(st.fds.lseek(args[0] as i64, args[1] as i64, args[2])),
         // pread64(fd, buf, count, offset): a positioned read (ld.so reads ELF

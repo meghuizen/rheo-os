@@ -755,6 +755,84 @@ impl VmaList {
             page += run;
         }
     }
+
+    /// Render this list in Linux `/proc/self/maps` format into `out`, returning the
+    /// bytes written.
+    ///
+    /// Every line is derived from a record actually held, so the addresses, lengths and
+    /// permissions are the ones the page tables were built from - the point of
+    /// generating this rather than seeding a static file (see
+    /// [`crate::linux::fd::FdKind::ProcMaps`]).
+    ///
+    /// The format is the fields a reader parses: `start-end perms offset dev inode
+    /// path`. `offset` is the mapping's file offset where there is one and 0 otherwise;
+    /// `dev` and `inode` are zero, because a mapping here names a `filemap` entry
+    /// rather than a device inode and inventing plausible numbers would be fabricating
+    /// identity a program might then try to match. The path column is `[anon]` or
+    /// `[file]` for the same reason - the list holds a backing-store *handle*, not the
+    /// path it was opened from, so printing a filename would mean guessing one.
+    ///
+    /// Truncates at a **line boundary** if `out` fills, so the last entry is never a
+    /// half-line; the caller reports the truncation.
+    pub fn render_maps(&self, out: &mut [u8]) -> usize {
+        let mut n = 0usize;
+        for m in self.live() {
+            let start = n;
+            let mut w = |b: u8| {
+                if n < out.len() {
+                    out[n] = b;
+                    n += 1;
+                }
+            };
+            let mut hex = |v: usize, w: &mut dyn FnMut(u8)| {
+                // Lowercase, no leading zeros, at least one digit - `%lx`, which is
+                // what the format specifies and what every parser expects.
+                let mut buf = [0u8; 16];
+                let mut i = 0;
+                let mut v = v;
+                loop {
+                    buf[i] = b"0123456789abcdef"[v & 0xf];
+                    i += 1;
+                    v >>= 4;
+                    if v == 0 {
+                        break;
+                    }
+                }
+                while i > 0 {
+                    i -= 1;
+                    w(buf[i]);
+                }
+            };
+            hex(m.base, &mut w);
+            w(b'-');
+            hex(m.end(), &mut w);
+            w(b' ');
+            w(if m.prot & 1 != 0 { b'r' } else { b'-' });
+            w(if m.prot & 2 != 0 { b'w' } else { b'-' });
+            w(if m.prot & 4 != 0 { b'x' } else { b'-' });
+            // MAP_SHARED is 0x01; everything here is private, and `p` is what a reader
+            // checks for a copy-on-write mapping.
+            w(if m.flags & 1 != 0 { b's' } else { b'p' });
+            w(b' ');
+            hex(m.file_off as usize, &mut w);
+            for b in b" 00:00 0 " {
+                w(*b);
+            }
+            for b in if m.file.is_some() {
+                &b"[file]"[..]
+            } else {
+                &b"[anon]"[..]
+            } {
+                w(*b);
+            }
+            w(b'\n');
+            if n >= out.len() {
+                // The line did not fit: drop it whole rather than emit a fragment.
+                return start;
+            }
+        }
+        n
+    }
 }
 
 impl Default for VmaList {
