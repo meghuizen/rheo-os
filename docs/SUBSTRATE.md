@@ -32,9 +32,9 @@ the way. The evidence, from this tree's own history:
 | `MAX_CELL_CHANNELS = 4` | per-cell channel table | "4 clients is the fixed-array ceiling" (N4a, verbatim) |
 | 5-slot timer arbiter | `kernel/src/ktimer.rs` | One slot per *purpose*; N2e already defers "two concurrent timer waiters in one cell" |
 | 4-entry UDP/TCP/ARP registries | N4b bridge | Fixed statics again |
-| Magic VA map | `load.rs`/`user.rs` | image 1-4 GiB, stack 8 GiB, mmap 12 GiB *bounded at* queue 16 GiB, file-mmap 20 GiB, channels 24 GiB, grants 32 GiB, ld.so 64 GiB - the unbounded mmap cursor already walked into the queue region once (ARCHITECTURE-DEBT.md 4.0 blocker 2's history) |
-| `USER_VA_MAX = 2^38` | `user.rs:79` | Sv39's 256 GiB, imposed on all three ISAs; V8 alone reserves a 4 GiB cage + code ranges and real servers map terabytes of files |
-| Single cooperative CPU | everywhere | SMP is bring-up only; reservations admitted, unenforced; a blocking Linux thread parks its whole cell |
+| Magic VA map | `load.rs`/`user.rs` | image 1-4 GiB, stack 8 GiB, mmap 12 GiB *bounded at* queue 16 GiB, file-mmap 20 GiB, channels 24 GiB, grants 32 GiB, ld.so 64 GiB - the unbounded mmap cursor already walked into the queue region once (ARCHITECTURE-DEBT.md 4.0 blocker 2's history), and the map was stretched *again* (mmap window raised to 80..252 GiB) so JSC's 128 GiB Gigacage would fit (GOAL-BUN) |
+| `USER_VA_MAX = 2^38` | `user.rs:79` | Sv39's 256 GiB, imposed on all three ISAs; V8 reserves a 4 GiB cage + code ranges, JSC reserves a **128 GiB** Gigacage (now measured on this OS), and real servers map terabytes of files |
+| Single cooperative CPU | everywhere | SMP is bring-up only; reservations admitted, unenforced. Per-context blocking (LINUX-COMPAT.md L4 `pblock`) has since landed - it is what made real Node.js complete - but the **measured** frontier stands: the real Bun binary issued all 205 of its syscalls from its main thread and aborted, because its spawned worker never got a CPU (GOAL-BUN, SMP.md 10.1). Syscall-driven concurrency works; true parallelism does not exist |
 | Soft-float `rheo_os-*` std targets | `targets/*.json` | A *ported* native program computes floats slower than the same code run unmodified under the Linux personality - backwards |
 | Eager paging, eager fork, fixed stacks | closed one by one | Demand paging, COW, stack-growth all had to be *retrofitted*; each was a real workload blocker first |
 
@@ -152,33 +152,55 @@ Linux threads map onto vcores so a blocking thread parks a vcore, never the
 cell. Timer preemption closes task #27; a compute-bound cell can no longer
 starve the machine.
 
-The per-core vcore scheduler is specified concretely, three classes:
+The scheduler design is owned in detail by **SCHEDULING.md 11** (the
+CachyOS/EEVDF/BORE production learnings, recorded on main) and the
+implementation plan by **SMP.md 10** (phase 2, task #132). This pillar
+adopts both rather than restating them; the load-bearing points:
 
-1. **Reserved class - EDF** over admitted reservations (object 7).
-   Unchanged math, finally enforced. Admission still refuses over-commit
-   (the system-wide ledger already exists).
-2. **Fair class - EEVDF** (earliest eligible virtual deadline first).
-   Virtual deadlines give latency-sized timeslices with no global tick,
-   which is exactly the tickless model SCHEDULING.md 1 already requires -
-   and it is the scheduler Linux itself moved to, so the comparison in
-   section 2 is like-for-like.
-3. **Burstiness on top - BORE, adapted.** Each vcore carries a burst score
-   derived from the CPU time it accumulated *before explicitly
-   relinquishing* (parking on a queue completion, `SYS_WAIT_*`,
-   `SYS_YIELD`, a channel receive). The score adjusts the vcore's EEVDF
-   weight/deadline: interactive, bursty work (a keystroke handler, an HTTP
-   accept loop, an event loop) preempts quickly; long CPU-bound work (a
-   GEMM, a compaction) keeps throughput. This OS is unusually well-shaped
-   for BORE: on Linux, "went to sleep" must be inferred inside a kernel
-   that also runs the IO; here every relinquish is an explicit,
-   already-counted syscall-boundary transition (the idle / ktimer / reactor
-   counters), so the score is **observed, never guessed**
-   (ENGINEERING.md 1). The same burst signal is exported read-only to the
-   in-cell strand runtime as a hint, so both levels of the two-level
-   scheduler (SCHEDULING.md 3) act on one metric.
+1. **One deadline-ordered ready queue, not two schedulers**
+   (SCHEDULING.md 11.3): reserved work carries *hard* EDF deadlines
+   (object 7 - the admission math unchanged and finally enforced);
+   best-effort work carries *virtual* EEVDF deadlines
+   (`eligible + slice/weight`); residual work is the tail of the same
+   order (a virtual deadline at +infinity). No priority axis exists to
+   lie on, and no CFS-style fairness engine is bolted beside the
+   reservation one.
+2. **BORE burstiness as the weight term** (SCHEDULING.md 11.4): the burst
+   score is `bitlen(burst_cycles >> offset)` - a cheap **integer log2**
+   in a nice-like 0..39 range, EMA-smoothed, with a spawned/forked child
+   **inheriting its parent's observed burst** so a build's children
+   cannot swamp interactive cells. The evidence source already exists:
+   the per-context blocking machinery (`thread.rs` `pblock` - the change
+   that made real Node.js run) marks exactly "cycles since this context
+   last voluntarily relinquished". Observed, never guessed
+   (ENGINEERING.md 1), never a task-declared hint. The same signal is
+   exported read-only to the in-cell strand runtime, so both levels of
+   the two-level scheduler act on one metric.
+3. **The dispatch policy is a pluggable seam** (the sched_ext lesson,
+   SCHEDULING.md 11.2): one `Policy` seam selected per pool at boot - the
+   `net` crate's hft/edge/warehouse/embedded precedent - not a scheduler
+   baked into the kernel. One workload, one policy.
+4. **Deliberately not taken** (SCHEDULING.md 11.5): cross-LLC global load
+   balancing (the multikernel partitions cores; a global balancer is the
+   shared mutable state 1a exists to avoid) and any periodic-tick fair
+   scheduler (the timer wheel's one-shots drive timeslices, not HZ).
+5. **The implementation gate is the SMP-safety audit** (SMP.md 10.2):
+   every shared `static mut` gets one owner, one lock, or per-CPU
+   partitioning *before* a secondary core schedules anything; `ktimer`/
+   `net_rx`/`input` become per-CPU; the single-CPU build compiles the
+   locks out, so the cooperative path stays byte-identical and remains
+   the proof baseline. The cooperative pick order stays round-robin until
+   preemption lands (SCHEDULING.md 11.6) - latency-awareness would change
+   nothing measurable on one cooperative CPU and would break the
+   deterministic proof oracles.
 
-This pillar is the concurrency 10x: the current ceiling is one core,
-cooperative, with no responsiveness model at all.
+This pillar is the concurrency 10x, and it is no longer a projection - it
+is the **measured frontier**: the real Bun binary loads, links its seven
+libraries, builds its 128 GiB Gigacage, spawns its worker via `clone3`,
+and aborts precisely because that worker never gets a CPU - all 205
+syscalls issued from the main thread (GOAL-BUN, SMP.md 10.1). Node.js
+completes only because its coordination happens to align with blocking
+points. The distance between "Node runs" and "Bun runs" *is* this pillar.
 
 ---
 
@@ -214,6 +236,12 @@ Three load-bearing reasons, ranked:
 3. the N4b codec posture - the integer-only tcp/cc/bbr stack links beside
    the kernel binary, and FP there would falsify the premise the
    save/restore proof rests on (NETSTACK.md 22).
+
+The scheduler frontier independently confirms the choice: BORE's burst
+score is a **bit-length (integer log2)**, not a float - it lands natively
+in this kernel's no-FPU fixed-point discipline, unlike a CFS-style
+`vruntime` that wants division (SCHEDULING.md 11.4). The most modern
+responsiveness heuristic in production Linux needs no kernel FP at all.
 
 **Escape hatch, designed now, built only on evidence**: a scoped
 `kernel_fp_begin`/`kernel_fp_end` bracket (the Linux mechanism) for a
@@ -354,6 +382,52 @@ adds the *capacity* to actually run them:
 
 ---
 
+## 10a. Cross-cut: the RNG on Substrate 2
+
+The RNG design survives the re-founding almost untouched - the two-level
+shape was right the first time: a kernel root ChaCha20 DRBG with fast key
+erasure, seeded from the hardware source (RDSEED/RDRAND, RNDR) only after
+SP 800-90B health tests, continuously reseeded, with **every**
+`SYS_RANDOM`/`getrandom`/`/dev/urandom` read served by deriving a fresh
+child DRBG from the root per call (`rng::derive_cell_drbg`) - so
+kernel-served randomness holds no per-cell state that could go stale or be
+duplicated; and in userspace, librheo's per-cell DRBG as a **library
+call** (TIME-IDENTITY.md 4), seeded once over `SYS_RANDOM`, no syscall on
+the hot path. Four touches, one per pillar that reaches it:
+
+- **SMP (pillar 3)**: the multikernel rule - cores share no mutable
+  kernel state - applies to the root DRBG. Each per-core kernel instance
+  derives its own root from the boot root and reseeds it from the
+  hardware source independently, so `getrandom` never takes a cross-core
+  lock (the same per-CPU move SMP.md 10.2 makes for `ktimer`). Userspace
+  mirrors it: one DRBG per **vcore** in the librheo runtime, so parallel
+  strands never contend.
+- **Fork duplication (pillar 2's COW) - the one real hazard**: COW `fork`
+  duplicates a userspace DRBG's memory, so parent and child would emit
+  **identical random streams**. Today it is latent: native cells only
+  `spawn` (fresh crt0 seed - safe by construction), glibc's
+  `arc4random`/`getrandom` go to the kernel root (safe), `/dev/urandom`
+  is kernel-served (safe). It becomes real for Linux programs carrying
+  their own userspace CSPRNG - OpenSSL being the big one, which protects
+  itself with `MADV_WIPEONFORK`. That lands on the **`madvise` slice the
+  Node/Bun walkthrough already scheduled**: `WIPEONFORK` zeroes the page
+  at fork and OpenSSL reseeds itself. The RNG is that slice's second
+  customer.
+- **Hard float (pillar 4) doesn't touch it**: ChaCha20 is pure integer
+  add-rotate-xor, so the FP-free kernel loses nothing. Cells can adopt
+  integer-SIMD ChaCha (4-block parallel) through the existing
+  `tile::simd` probe-dispatch pattern if throughput ever demands it.
+- **Metrics (pillar 7)**: health-test failures, reseed counts, and the
+  seed-source tier (hwrng vs documented floor) become typed events in the
+  histogram pipeline, not log lines.
+
+Honest deferrals: VM snapshot/clone resume duplicates DRBG state the same
+way fork does - the answer is reseed-on-restore keyed off a generation
+signal (vmgenid), owned by VIRTUALIZATION.md; and riscv64's documented
+seed floor lifts when QEMU models the Zkr `seed` CSR.
+
+---
+
 ## 11. The dependency policy, re-founded as tiers - and the library shelf
 
 The blanket "no new dependencies casually" rule was right for the bring-up
@@ -437,36 +511,55 @@ kernels. Proxy: a `flashattn` phase in the battle kernel - a scaled FA2
 block, async-double-buffered across strands, bit-exact vs a naive
 reference.
 
-**Node.js and Bun (JIT included) - covered, two personality gaps found.**
-Traced against the *measured* binary (ARCHITECTURE-DEBT.md 4.0: 262 MiB
-ET_EXEC, AVX-512, 12.8 MiB stack, 41 startup syscalls):
+**Node.js and Bun - no longer a paper walkthrough: both real binaries have
+now run on the OS** (GOAL-NODE done, GOAL-BUN partial - LINUX-COMPAT.md 5),
+and the measured results validate the pillars item by item:
 
-- 262 MiB image -> demand-paged ELF (landed) + full-lower-half VA
-  (pillar 2). V8 reserves a 4 GiB pointer-compression cage plus code
-  ranges; Bun/JSC reserves large spans - the fixed magic regions are
-  exactly what such reservations collide with.
-- JIT -> the **dual-mapping decision**: the same frames mapped RW at one VA
-  and RX at another (JSC supports dual-map JIT), so W^X stays
-  constitutional *per mapping* and no `UserRwx` variant is added; the
-  RW->RX flip path already works as the fallback. This resolves
-  ARCHITECTURE-DEBT.md 4.0's "deliberately not decided" with the answer
-  that keeps the constitution intact at full JIT speed. Mechanism: a
+- **Node.js v22 (124 MB, V8 + libuv) runs unmodified and exits 0** on
+  x86-64: streamed off a live ext4 disk (~15,000 block-cache fills, never
+  resident whole), seven shared libraries linked, V8 initialised, the
+  event loop served, `rheo:42` printed. The real blocker was not a syscall
+  but **per-context blocking** (a proc-level block used to park the whole
+  cell, freezing the worker the main thread waited on) - which has landed.
+  It runs `--jitless`: the one thing doctrine refuses in the whole 49-call
+  trace is V8's single `mprotect(RWX)`.
+- **Bun v1.3 (99 MB, JSC + Zig) loads to the concurrency frontier**: the
+  full load path works - streaming, demand paging, dynamic linking, the
+  **128 GiB Gigacage** as one `MAP_NORESERVE` reservation demand-filled
+  (which forced the mmap window to be hand-raised to 80..252 GiB - the
+  magic-VA map stretched yet again; pillar 2 deletes this class of edit),
+  `clone3`, the event loop - then it aborts because its worker never gets
+  a CPU. **That abort is pillar 3's absence, measured** (SMP.md 10.1).
+- JIT -> the **dual-mapping decision** stands, now grounded in the trace:
+  the same frames mapped RW at one VA and RX at another (JSC supports
+  dual-map JIT; V8's equivalent is a write-then-flip RW->RX code space,
+  which already works), so W^X stays constitutional *per mapping* and no
+  `UserRwx` variant is added. `--jitless` is the honest interim - the
+  interpreter runs today; the dual-map/flip JIT is what lets the engines
+  *optimise* (LINUX-COMPAT.md names exactly this follow-on). Mechanism: a
   second mapping of an existing grant with disjoint permissions -
   composition, no new object.
+- io_uring -> **refused `ENOSYS` deliberately, and that is the right
+  answer**: libuv probes it and falls back to epoll+threadpool (the real
+  Node trace shows exactly that fallback). This OS's native async ABI is
+  the queue-pair ring (pillar 5); io_uring compatibility would be a second
+  ring grafted beside it. The refusal is a design statement the traces
+  now confirm costs nothing.
 - AVX-512 -> pillar 4's CPUID-sized XSAVE.
 - libuv threadpool + worker_threads -> `MAX_THREADS = 8` dies with
   pillar 1; threads become vcores (pillar 3).
-- The event loop -> epoll/eventfd2 (landed) + the pillar-7 wheel (Node
-  arms thousands of coarse timers).
+- The event loop -> epoll/eventfd2/timerfd (landed) + the pillar-7 wheel
+  (Node arms thousands of coarse timers).
 
 **Gaps found**: (a) **`madvise`** - V8/JSC trim heaps with
 `MADV_DONTNEED`/`MADV_FREE`; it is not dispatched today, and with demand
 paging landed it is cheap to honour (decommit the range) - a named
-personality slice. (b) **FP/SIMD state across a signal handler** is
+personality slice (it also carries `MADV_WIPEONFORK`, which the RNG
+section below needs). (b) **FP/SIMD state across a signal handler** is
 documented as not saved (L5) - a JIT taking a profiling signal
-mid-vector-loop corrupts itself; real the moment Bun runs, so it is
-scheduled with stage S4, not left as a footnote. Proxy: the sysx-style
-startup-trace replay fixture extended with madvise and a
+mid-vector-loop corrupts itself; real the moment Bun runs full-speed, so
+it is scheduled with stage S4, not left as a footnote. Proxy: the
+sysx-style startup-trace replay fixture extended with madvise and a
 signal-under-SIMD assertion.
 
 **Kafka-class / HTTPS-TLS / JSON** (from the workload contract): the
@@ -544,11 +637,16 @@ unedited, and names its own proof kernel.
   map; `mmapx`-class collision tests pass with regions allocated, not
   fixed; switch path length drops measured by `bench`.
 - **S3 - vcores + preemption + the wheel + metrics.** The multikernel
-  scheduler (EEVDF+BORE+EDF), timer wheel, histogram pipeline - the
-  scheduler needs both on day one. Proof: `schedidle`-class oracles across
-  cores; a spinning cell no longer starves siblings (closes #27); N
-  concurrent timers honoured in order; burst score assertions from counted
-  relinquish events.
+  scheduler (the SCHEDULING.md 11.3 single deadline order: EDF hard +
+  EEVDF virtual + BORE weights), timer wheel, histogram pipeline - the
+  scheduler needs both on day one. The implementation plan is SMP.md 10
+  (task #132), whose first deliverable is the SMP-safety audit, not a
+  scheduler. Proof: `schedidle`-class oracles across cores; a spinning
+  cell no longer starves siblings (closes #27); N concurrent timers
+  honoured in order; burst-score assertions from counted relinquish
+  events - and the exit gate is already written: the real Bun binary's
+  `linuxbun` test flips from its accepted partial (exit 134, worker
+  starved) to the strict branch (`rheo:42`, exit 0).
 - **S4 - hard-float std + FP engineering.** Target flips, XSAVE
   optimization, FP residency, FP-across-signals fixed. Proof: `stdrun`
   gains a float-heavy phase; the librheoipc register-pattern proof re-run
@@ -558,11 +656,13 @@ unedited, and names its own proof kernel.
   live disk; per-vcore submission never crosses cores (counter-asserted).
 - **S6 - NUMA pools + core classes.** Placement proven in QEMU
   (chosen-node assertions), P/E and latency measured at the lab.
-- **S7 - workload gates.** Bun/Claude Code startup, a TLS echo server
-  across vcores with jitter histograms, a Kafka-shaped append-log bench on
-  one NVMe queue, an OCI bundle running a Node workload under a
-  `PrincipalId`, the `flashattn` tile phase - all as gates, none as design
-  inputs.
+- **S7 - workload gates.** Real Node.js already runs to completion
+  (`--jitless`, GOAL-NODE) and real Bun already loads (GOAL-BUN), so the
+  S7 gates move up a rung: Bun evaluating at full JIT speed via the
+  dual-map path, Claude Code startup, a TLS echo server across vcores
+  with jitter histograms, a Kafka-shaped append-log bench on one NVMe
+  queue, an OCI bundle running a Node workload under a `PrincipalId`, the
+  `flashattn` tile phase - all as gates, none as design inputs.
 
 ---
 
