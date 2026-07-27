@@ -518,6 +518,28 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   nothing left to wake it. The refactor was reverted and the fix became four lines
   at the call site. A seam that looks like two steps may be one; the way to find
   out is to run it, not to read it.
+- **A raw struct copy is not an inheritance.** `linux::dup_state` duplicates a whole
+  `LinuxState` with one `copy_nonoverlapping`, which is fast, total, and touches no
+  refcount. Every refcounted thing reachable from that struct therefore needs an
+  explicit addref beside the copy. Pipes had one; the backing stores behind file
+  mappings did not, so a forked child's records named registry entries it held no
+  reference to. The cost landed on the **parent**: the child's exit gave back one
+  reference per record, the entry was freed, and the parent's next fault on an
+  untouched page filled with zeros - a plausible-looking read, no fault, no log, in
+  the process that did nothing wrong. A bulk copy is where this class of bug lives,
+  because it silently keeps working as new refcounted fields are added.
+- **A reference taken needs a release site you can name.** The addref above is only
+  half a fix: without a matching release the references leak. It was tempting to
+  rely on "the slot gets cleared when it is reused" - but a reaped cell's slot is not
+  cleared, and the next `fork` overwrites it wholesale, so "eventually" was never.
+  The release went where the exit already reclaims the process's frames, which is the
+  only place that reads as symmetric. If you cannot point at the line that gives a
+  reference back, you have written a leak.
+- **Two ways to do one thing, one of them unreachable, is a bug waiting for a
+  caller.** `VmaList` had a `copy_from` that did the fork inheritance correctly and
+  nothing called it, because the real fork path is the bulk copy above. It looked
+  like the feature was present. Delete the unreachable one rather than leaving a
+  reader to guess which is live.
 
 ## 12. Never dereference an address the caller chose
 

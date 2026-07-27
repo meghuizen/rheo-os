@@ -200,10 +200,11 @@ syscalls).
 
 ### Limits (and why demand paging is the real answer)
 
-Everything a Linux cell maps is committed **eagerly** - the whole image, the whole
-initial stack, every accessible `mmap`. There is no page-fault handler that commits
-on first touch, so a program costs frames in proportion to its *size*, not to what
-it *uses*. Three numbers therefore bound what can run:
+Most of what a Linux cell maps is still committed **eagerly** - the whole image, the
+whole initial stack, every anonymous `mmap` - so a program costs frames in proportion
+to its *size*, not to what it *uses*. **File-backed `mmap` is the exception and is
+now demand-paged** (see "Demand paging" below), which is what lets `ld.so` map a real
+`libc` without paying for it. Three numbers therefore still bound what can run:
 
 | Constant | Value | What it bounds |
 |---|---|---|
@@ -222,12 +223,65 @@ parses at ~`0xBFE0_0000` with `-m 1G`) and a pool that reached one would overwri
 it. Raising further means checking that first.
 
 **This is a limit raise, not a design change**, and it does not remove the
-underlying constraint - it moves it. The proper fix is **demand paging**: a user
-page-fault handler that allocates a frame on first touch, so an image's untouched
-pages cost nothing, plus a guard-page stack that grows on demand instead of being
-mapped whole. The fault plumbing already exists for signals (`on_user_trap` maps a
-fault cause to SIGSEGV, L5); demand paging is the branch taken *before* that, and
-it is a later rung of work.
+underlying constraint - it moves it. The proper fix is demand paging, below.
+
+### Demand paging
+
+A **resumable user page fault** commits a page on first touch. `on_user_trap` calls
+`linux::fill_fault` *before* the L5 fault-to-signal branch: if the personality can
+fill the page it returns the same frame and the faulting instruction re-executes;
+otherwise the fault becomes SIGSEGV exactly as before. The handler
+(`linux::mem::fault`) asks three questions in order, and the order is the whole
+correctness argument:
+
+1. **Is anything mapped here?** No VMA record means a genuine SIGSEGV - the
+   commonest one being a null dereference.
+2. **Is the page already present?** Then this fault was a *permission* refusal, not a
+   missing page. `FaultCause` carries no read/write bit, so the page tables are the
+   source of truth (`AddressSpace::is_mapped` over `arch::paging_mapped`). Guessing
+   here repopulates and re-faults forever, with no diagnostic - measured at 78,780
+   fills in the revert probe.
+3. **Does the mapping permit any access?** A `PROT_NONE` record is a *reservation*
+   (glibc reserves large arenas that way and commits sub-ranges with `mprotect`);
+   populating one hands out memory the program deliberately made inaccessible.
+
+**What is demand-paged today: file-backed `MAP_PRIVATE` `mmap`.** The mapping owns a
+VFS handle in `linux::filemap` rather than remembering the caller's fd, because
+`ld.so` closes the fd immediately after `mmap` - on Linux a mapping references the
+*file*. That registry is global, fixed-size and refcounted (the `pipe`/`epoll`/
+`eventfd` pattern, **no kernel object**), with one reference per live `Vma` record:
+taken at `fork` (`VmaList::inherit_files` beside `fds::inherit_pipe_ends`) and given
+back at exit and at `munmap`. Both halves matter - without the `fork` addref a
+child's exit frees an entry the *parent* still maps, and the parent's next untouched
+page reads zeros with no fault and no log.
+
+**Two things the kernel had to gain for this to be safe.** A cell hands the kernel
+pointers into its own memory, and with presence lazy the *kernel* becomes a reader of
+a page nothing has faulted in - a load fault at a kernel PC, which is not resumable
+here (this is why Linux has `copy_from_user` and a fixup table). The F1 hardening
+already routes every cell-supplied pointer through one set of helpers, so those gained
+"ensure present" beside "in range": asked once at the seam, not at ~60 dereferences.
+Placement was the whole problem - in the bare range predicates it cost a ~2,900x
+amplification, because `unmap_range` uses them only to *bound* a range and so
+materialised every page immediately before freeing it; on the dereference helpers it
+costs 0 kernel pre-faults, measured every run. Second, x86-64's ring-3 fault resume
+used `sysretq`, which *consumes* RCX and R11 - fine while signal delivery was the only
+fault resume (a handler entry does not re-execute anything), fatal for the first path
+that genuinely re-executes. Faults now resume through `iret_resume`.
+
+Proof: `mmapdp` in `linuxproc` on all three ISAs - 64 file pages mapped, exactly 5
+filled, each carrying its own per-page file byte (so the offset arithmetic holds at
+the top of the mapping), 100 rereads of a filled page costing nothing, a write to a
+filled read-only page still SIGSEGV, a page still filling from the file after a forked
+sharer exited, and the registry back where it started. Plus `linuxdyn`, where `ld.so`
+maps a real 1.5-2.1 MB `libc` and an unmodified dynamic glibc binary runs.
+
+**Still eager, and named as such:** the ELF image itself (`load::load_elf_linux`
+streams every `PT_LOAD` into a frame at load time - for an `ET_EXEC`-with-`PT_INTERP`
+binary that is where a large image's cost lands), `fork` (an eager copy of every
+committed page, not COW), and the initial stack (mapped whole rather than a guard page
+that grows on fault). All three ride the same handler and are the next rungs;
+docs/ARCHITECTURE-DEBT.md 4.0 blocker 2 tracks them.
 
 ## 5. Milestones
 

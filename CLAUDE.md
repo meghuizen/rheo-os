@@ -982,7 +982,8 @@ stack is sized from the image's own **`PT_GNU_STACK`** request, 8 MiB being only
 floor for an image that asks for nothing; docs/LINUX-COMPAT.md). QEMU gives 1 GiB and the
 pool base sits 64 MiB into RAM, so the headroom is deliberate - firmware puts blobs near
 the *top* of RAM (RISC-V `virt`'s DTB at ~`0xBFE0_0000`). This is a **limit raise, not a
-design change**; the proper fix is **demand paging**, a later rung. Found worse than
+design change**; the proper fix is **demand paging**, which has since landed for
+file-backed `mmap` (see the demand-paging paragraph below). Found worse than
 described along the way: **`poll` does not compute readiness at all** - every open fd is
 reported ready and the timeout is ignored - which is simultaneously what lets glibc's
 resolver reach its blocking `recvfrom` and the reason creation-time
@@ -1271,6 +1272,45 @@ boundary, so a compute-bound cell still holds the CPU until timer preemption (#2
 and a Linux *thread*-level block still parks the whole cell rather than only the
 calling context. Proven by `schedidle` and `linuxpoll` on all three ISAs, both
 observed failing without the fix.
+
+**Demand paging** (docs/LINUX-COMPAT.md "Demand paging",
+docs/ARCHITECTURE-DEBT.md 4.0 blocker 2) makes a **file-backed `MAP_PRIVATE` `mmap`
+cost what the program touches, not what it reserved**. `mmap` used to read every page
+into a fresh frame before returning - not a size problem to answer with a bigger pool,
+the wrong design at any size. A **resumable user page fault** now fills a page on first
+touch: `on_user_trap` calls `linux::fill_fault` *before* the L5 fault-to-signal branch,
+and `linux::mem::fault` asks three questions in order - is anything mapped here (no
+record = a genuine SIGSEGV), **is the page already present** (then this was a
+*permission* refusal, and since `FaultCause` carries no read/write bit the page tables
+are the source of truth via `AddressSpace::is_mapped`/`arch::paging_mapped` - guessing
+repopulates and re-faults forever, measured at 78,780 fills in the revert probe), and
+does the mapping permit any access (a `PROT_NONE` record is a *reservation* glibc
+commits later with `mprotect`). A mapping owns a VFS handle in **`linux::filemap`**
+rather than the caller's fd, because `ld.so` closes the fd immediately after `mmap` - a
+global, fixed-size, refcounted registry, **no kernel object** (the `pipe`/`epoll`/
+`eventfd` pattern), one reference per live `Vma` record, taken at `fork`
+(`VmaList::inherit_files`, beside `fds::inherit_pipe_ends`) and given back at exit and
+`munmap`. Both halves are load-bearing: without the `fork` addref a child's exit frees
+an entry the **parent** still maps, and the parent's next untouched page reads zeros
+with no fault and no log. Two kernel prerequisites had to land with it - a cell hands
+the kernel pointers into its own memory, so the **kernel** becomes a reader of an
+absent page (a load fault at a kernel PC, not resumable here - this is why Linux has
+`copy_from_user` + a fixup table); the F1 pointer helpers gained "ensure present"
+beside "in range", **on the dereference helpers only**, because putting it on the bare
+range predicates cost a ~2,900x amplification (`unmap_range` bounds a range with them
+and so materialised every page just before freeing it) versus **0** kernel pre-faults
+where it now sits, measured every run. And x86-64's ring-3 fault resume used `sysretq`,
+which *consumes* RCX/R11 - harmless while signal delivery was the only fault resume,
+fatal for the first path that genuinely re-executes; faults now resume via
+`iret_resume`. Proven by `mmapdp` in `linuxproc` on **all three ISAs** (64 file pages
+mapped, exactly **5** filled, each carrying its own per-page byte so the offset
+arithmetic holds at the top of the mapping; 100 rereads free; a write to a *filled*
+read-only page still SIGSEGV; a page still filling from the file after a forked sharer
+exited; the registry back where it started) and by `linuxdyn`, where `ld.so` maps a real
+1.5-2.1 MB `libc`. Honest and named: the **ELF image itself** is still streamed eagerly
+at load time (for an `ET_EXEC`-with-`PT_INTERP` binary that is where a large image's
+cost lands), `fork` is still an eager page copy rather than COW, and the initial stack
+is mapped whole rather than growing on fault - all three ride this same handler.
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus

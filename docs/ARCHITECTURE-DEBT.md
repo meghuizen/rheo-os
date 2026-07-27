@@ -478,8 +478,22 @@ so was its claim of 182 MiB of `.bss`, which measurement shows does not exist.
    probe). `linux::filemap` holds the VFS handles that *mappings* own, because
    `ld.so` closes the fd immediately after `mmap`. `Vma` carries the backing and
    offset under a one-reference-per-record rule. Proven by `mmapdp` in `linuxproc`
-   on all three ISAs (64 pages mapped, 4 filled) and by `linuxdyn`, where `ld.so`
+   on all three ISAs (64 pages mapped, 5 filled) and by `linuxdyn`, where `ld.so`
    maps a real 1.5-2.1 MB `libc` and an unmodified dynamic glibc binary runs.
+
+   One of that rule's two halves was **missing at HEAD, independently of the image
+   work**, and is now fixed and shipped: `mmap` of a file survives `fork`, and
+   `dup_state` copies a whole `LinuxState` with one `copy_nonoverlapping` that
+   touches no refcount. It addref'd pipes and nothing else, so a child's records
+   named backing-store entries it held no reference to; the child's exit gave back
+   one per record, the entry was freed, and the **parent** - which did nothing wrong
+   - then faulted on an untouched page and got zeros. `VmaList::inherit_files()`
+   takes the reference at `fork` and `process_exit` clears the exiting process's VMA
+   list where it already reclaims its frames, so the lifetime is symmetric. Both
+   halves are proven by `mmapdp`: after the forked sharer exits, the parent reads a
+   page no phase has touched and asserts its own file byte. Observed failing when
+   reverted - `dp: page 20 reads 00 ... want 54` without the inherit, and a registry
+   still holding an entry at the end of the run without the release.
 
    That slice also uncovered and fixed a **latent x86-64 defect**: a ring-3 fault
    resumed through `sysretq`, which consumes RCX and R11. Harmless while signal
@@ -510,11 +524,10 @@ so was its claim of 182 MiB of `.bss`, which measurement shows does not exist.
    reset-ordering hazard (a `user::reset()` after loading cleared the registry, so every
    page came back zero - an illegal instruction at the entry point); a segment with a
    `.bss` tail in one record (now demand-paged only when `filesz == memsz`, which is the
-   measured target's shape, and a bss tail is tens of KiB); and the real blocker -
-   `dup_state` raw-copies a `LinuxState` and addrefs *pipes* but never the **backing
-   stores**, so a child's exit freed an entry the **parent** still faulted against. With
-   `VmaList::inherit_files()` beside `fds::inherit_pipe_ends()`, `procdemo` and the whole
-   fork/execve/pipe chain pass.
+   measured target's shape, and a bss tail is tens of KiB); and the real blocker - the
+   fork refcount above, which turned out to be a live defect on its own and is
+   **shipped separately, with its own proof**, rather than waiting on the image work.
+   With it, `procdemo` and the whole fork/execve/pipe chain pass.
 
    The fourth is open and is why it is not merged: with the image demand-paged,
    `mmapdp`'s mmap-region fill count rises from 4 to **61** for a 64-page mapping with 4
