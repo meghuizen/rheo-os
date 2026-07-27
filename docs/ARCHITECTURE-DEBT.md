@@ -406,14 +406,26 @@ docs/LINUX-COMPAT.md for the semantics and the fixtures):
   - Two mechanisms could let a child wait while the parent signals it, and both
     turned out to be broken - the next two entries. Neither was known before
     trying to write this proof.
-- **Pipe reader/writer counts are not refcounted across `fork` (A).** A child that
-  blocks reading an inherited pipe is judged *satisfiable* by
-  `Block::PipeRead => pipe::has_data(idx) || pipe::writers(idx) == 0` even though
-  the parent still holds the write end, so its `read` returns **0 = EOF** instead
-  of blocking. Found while trying to prove cross-process `kill`; the child exited
-  with the "no signal arrived" code before the parent could signal it. The same
-  suspicion was already recorded for remote sockets ("handles are not refcounted
-  across `dup`/`fork`") - it is the pipe path too.
+- **A forked child exits instead of waiting - cause NOT yet identified (B).**
+  *Retracted claim, kept as a correction.* This entry first asserted that pipe
+  reader/writer counts are not refcounted across `fork`, which would make a child
+  blocked on an inherited pipe satisfiable via `writers(idx) == 0` and its `read`
+  return 0 = EOF. **That is wrong**: `linux::dup_state` (called by
+  `proc::fork`) does call `fds.inherit_pipe_ends()`, `pipe::add_end` is real, and
+  `dup` bumps the same counts via `bump_if_pipe`. The refcounting is implemented.
+
+  What was actually **observed**, and still is unexplained: in a fixture where the
+  parent forks and the child is meant to wait to be signalled, the child reached
+  `Zombie` with `wstatus 0x400` (exit 4 = "no signal arrived") *before* the parent
+  reached its `kill`. That held across three child designs - a read on an inherited
+  pipe, a read on a pipe the child created itself after the fork, and a bounded
+  `sched_yield` loop. The third is explained by the next entry; the first two are
+  not.
+
+  Recorded this way on purpose. The inference was published one step ahead of the
+  evidence, which is the same mistake `ENGINEERING.md` §1 exists to catch when
+  someone else makes it - a plausible mechanism is not a diagnosis. Whoever picks
+  this up should start from the observation, not from the retracted cause.
 - **`sched_yield` does not yield across cells (B).** It reschedules among a cell's
   own contexts (L4 threads), so a child looping `sched_yield()` runs to completion
   before the parent is scheduled at all. A cooperative cross-cell scheduler needs

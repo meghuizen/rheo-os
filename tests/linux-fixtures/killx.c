@@ -53,8 +53,11 @@ int main(int argc, char **argv) {
    * cell resume) and behaved correctly on riscv64, then failed on x86-64 in a way
    * that was not root-caused inside the slice. Shipping a signal path that is
    * broken on one ISA is worse than shipping neither, so it was reverted and
-   * recorded with everything learned - docs/ARCHITECTURE-DEBT.md 4. What remains
-   * here is `/proc/self/exe`, which is proven on all three ISAs. */
+   * recorded with everything learned - docs/ARCHITECTURE-DEBT.md 4. (The x86-64
+   * cause is now known for the `readlinkat` half of that slice: glibc there
+   * issues the legacy `readlink` (89), not `readlinkat` (267). Whether `kill` has
+   * an independent x86-64 problem is still open.) What remains here is
+   * `/proc/self/exe`, which is proven on all three ISAs. */
 
   /* Hand over to the re-exec'd self for the `/proc/self/exe` phase: the path is
    * only recorded by `execve`, and a directly-loaded cell has none. stdout is a
