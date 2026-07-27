@@ -642,12 +642,22 @@ fixup path.
     access, openat/pread64/fstat on /lib, mmap fd-backed + MAP_FIXED, mprotect
     for RELRO, arch_prctl/set_tid_address/set_robust_list, rseq→ENOSYS,
     prlimit64) then main's write + exit_group.
-  - Accommodations, disclosed: **`execve` of a dynamic binary is not wired** -
-    the streaming `execve` path stays static/static-PIE only; the `linuxdyn`
-    proof loads the dynamic binary directly. A dynamic **Rust** `std` hello is
-    not built (it additionally needs `libgcc_s.so.1`/`libm.so.6` seeded); the C
-    hello is the L7 proof. **MAP_SHARED of a file** stays unmodeled (ld.so uses
-    PRIVATE).
+  - **`execve` of a dynamic binary is now wired** (GOAL-DISK-2): the streaming
+    `execve` path (`load::exec_elf_from_vfs_demand` → `exec_elf_inner`) parses
+    `PT_INTERP`, reads the interpreter path from the program's fd at the segment
+    offset (the streaming path holds only the header buffer, not the whole
+    image), and streams the interpreter at `LINUX_INTERP_BASE` demand-paged - the
+    same handling `load_elf_linux` gives the initial-load path, factored so the
+    two share `stream_elf_at`. `linuxdyn` now proves **both**: phase 1 loads
+    `dhello` directly (initial-load), phase 2 `execve`s `/bin/dhello` from the VFS
+    (streaming), each asserting exact stdout + exit 12 on all three ISAs, with the
+    recorded-page witness confirming program + interpreter are both demand-paged.
+  - Accommodations, disclosed: a dynamic **Rust** `std` hello is not built (it
+    additionally needs `libgcc_s.so.1`/`libm.so.6` seeded); the C hello is the L7
+    proof. `execve` from an ext4 mount **off a live disk** (composing the
+    streaming loader with the block-cached ext4 of GOAL-DISK) is the remaining
+    rung, tracked as GOAL-DISK-2. **MAP_SHARED of a file** stays unmodeled (ld.so
+    uses PRIVATE).
 
 - **L8 [done]** - **AF_UNIX (Unix domain) sockets** - the first slice of the
   socket surface (docs/NETSTACK.md rheo-net Phase N1d). Like every prior

@@ -355,12 +355,17 @@ libc's stdio/malloc bss locks keep file garbage and self-deadlock), plus
 gitignored dir (never committed) and seeded into a ramfs `/lib`; a missing
 runtime lib makes that ISA skip-with-reason (static coverage stays). The
 `linuxdyn` test runs a stock **dynamically-linked glibc C hello** (gcc default
-PIE, unmodified) on **all three ISAs**, exact stdout + exit asserted. This closes
+PIE, unmodified) on **all three ISAs**, exact stdout + exit asserted - **both**
+loaded directly (initial-load) **and `execve`d from the VFS** (the streaming
+`execve` path now parses `PT_INTERP` and streams the interpreter demand-paged,
+sharing `stream_elf_at` with the initial-load path - GOAL-DISK-2). This closes
 "unmodified Linux binaries run" for the common dynamic case; the whole
 **L0-L7 Linux personality is complete** - unpatched static and dynamic glibc C,
 unpatched Rust `std`, and the real upstream uutils/coreutils all run as cells,
-kernel-resident like `svc.rs` and adding no kernel object (`execve` of a *dynamic*
-binary and a dynamic Rust/uutils-0.9.x fixture are the documented next steps).
+kernel-resident like `svc.rs` and adding no kernel object (`execve` **from an
+ext4 mount off a live disk** - composing the streaming loader with the
+block-cached ext4 - and a dynamic Rust/uutils-0.9.x fixture are the documented
+next steps).
 **L8 has begun** (docs/LINUX-COMPAT.md L8, docs/NETSTACK.md rheo-net Phase N1d):
 **AF_UNIX (Unix domain) sockets** - `socket`/`socketpair`/`bind`/`listen`/
 `accept`/`connect`/`sendmsg`/`recvmsg` on SOCK_STREAM, sockets as per-cell fds

@@ -576,7 +576,7 @@ fn exec_from_vfs(
     if demand {
         rec.begin(crate::linux::filemap::open(path_va, path_len));
     }
-    let r = exec_elf_inner(ops, fd, aspace, &mut rec);
+    let r = exec_elf_inner(ops, fd, aspace, &mut rec, demand);
     rec.finish();
     (ops.close)(fd);
     r
@@ -591,6 +591,7 @@ fn exec_elf_inner(
     fd: u64,
     aspace: &mut AddressSpace,
     rec: &mut SegRecorder,
+    demand: bool,
 ) -> Option<LinuxImage> {
     // Read the header region (ELF header + phdr table) into a kernel buffer.
     let mut hdr = [0u8; HDR_BUF];
@@ -620,22 +621,91 @@ fn exec_elf_inner(
     })?;
     let image_end = (image_end + FRAME_SIZE - 1) & !(FRAME_SIZE - 1);
     let phdr = elf.phdr_vaddr().map(|v| v as usize + bias).unwrap_or(0);
-    let entry = elf.entry() as usize + bias;
-    // `execve` of a dynamically-linked binary (PT_INTERP) is not handled on the
-    // streaming path yet - the L7 `linuxdyn` proof loads the dynamic binary
-    // directly (`load_elf_linux`), not via `execve` (docs/LINUX-COMPAT.md L7).
+    let main_entry = elf.entry() as usize + bias;
+
+    // Dynamically linked? Mirror `load_elf_linux`: a `PT_INTERP` names the ELF
+    // interpreter (`ld-linux-*.so`). Stream it in as a second `ET_DYN` at
+    // `LINUX_INTERP_BASE` and start execution there; ld.so then maps + relocates
+    // the program and libc at runtime over fd-backed `mmap` (docs/LINUX-COMPAT.md
+    // L7). `AT_BASE` = the interpreter's bias, `AT_ENTRY` stays the main program's
+    // entry, `AT_PHDR` the program's phdr - all biased by the program's own bias
+    // above. No kernel relocation (ld.so self-relocates). This is the streaming
+    // `execve` twin of the `load_elf_linux` initial-load path, so an `execve`d
+    // dynamic binary (a shell launching a dynamic program) now works, not only a
+    // dynamic binary loaded as a cell's initial image.
+    let (entry, at_base) = match elf.interp() {
+        Some((off, filesz)) => {
+            let interp_entry = load_interp_streamed(ops, fd, off, filesz, aspace, rec, demand)?;
+            (interp_entry, LINUX_INTERP_BASE)
+        }
+        None => (main_entry, bias),
+    };
+
     Some(LinuxImage {
         entry,
-        bias,
+        bias: at_base,
         phdr,
         phent: elf.phentsize(),
         phnum: elf.phnum(),
-        at_entry: entry,
+        at_entry: main_entry,
         image_end,
         stack_want: elf.stack_size().unwrap_or(0),
         segs: rec.segs,
         nsegs: rec.nsegs,
     })
+}
+
+/// Streaming twin of [`load_interp`]: load the ELF interpreter for an `execve`d
+/// dynamic binary. The streaming path holds only the header buffer, not the whole
+/// image, so the `PT_INTERP` path string is read from the main program's `fd` at the
+/// segment's file offset (rather than from an in-memory image). Streams the
+/// interpreter at [`LINUX_INTERP_BASE`] and returns its (biased) entry point.
+///
+/// `demand` matches the main program's choice: a Linux `execve` demand-pages the
+/// interpreter too (it becomes the recorder's second store); a native `SYS_SPAWN`
+/// - which has no `PT_INTERP` in practice - would stream it eagerly.
+fn load_interp_streamed(
+    ops: &crate::svc::FileOps,
+    main_fd: u64,
+    off: usize,
+    filesz: usize,
+    aspace: &mut AddressSpace,
+    rec: &mut SegRecorder,
+    demand: bool,
+) -> Option<usize> {
+    // The interp path is a short NUL-terminated string; a real toolchain emits
+    // ~30 bytes ("/lib64/ld-linux-x86-64.so.2"). A pathological longer path fails
+    // cleanly here rather than being truncated.
+    let mut pathbuf = [0u8; 256];
+    if filesz == 0 || filesz > pathbuf.len() {
+        return None;
+    }
+    (ops.lseek)(main_fd, off as i64, 0); // SEEK_SET
+    let got = (ops.read)(main_fd, pathbuf.as_mut_ptr() as u64, filesz as u64);
+    if got <= 0 {
+        return None;
+    }
+    let got = got as usize;
+    let path_len = pathbuf[..got].iter().position(|&b| b == 0).unwrap_or(got);
+    if path_len == 0 {
+        return None;
+    }
+    let path_va = pathbuf.as_ptr() as u64;
+    let fd = (ops.open)(path_va, path_len as u64, 0);
+    if fd < 0 {
+        return None;
+    }
+    let fd = fd as u64;
+    // The interpreter is the recorder's second store, with its own handle - the
+    // mapping's, not this `fd`, which is closed below. `pathbuf` is a kernel stack
+    // buffer, which is what `filemap::open` requires (it opens immediately and keeps
+    // an fd, not the path bytes).
+    if demand {
+        rec.begin(crate::linux::filemap::open(path_va, path_len as u64));
+    }
+    let r = stream_elf_at(ops, fd, LINUX_INTERP_BASE, aspace, rec);
+    (ops.close)(fd);
+    r
 }
 
 /// Map one `PT_LOAD` segment, reading its file bytes page-by-page from `fd`

@@ -113,7 +113,8 @@ fn captured() -> &'static [u8] {
 }
 
 /// Run `image` (a dynamically-linked binary) with `argv`/`envp` under a fresh
-/// Linux cell, capturing stdout; returns (outcome, captured bytes).
+/// Linux cell, capturing stdout; the **initial-load** path (`load_elf_linux`, whole
+/// image in a kernel buffer). Returns the outcome.
 fn run(image: &[u8], argv: &[&[u8]], envp: &[&[u8]]) -> Outcome {
     // Reset **before** loading: `user::reset` clears the mapped-file registry the
     // loader registers the image in, so resetting afterwards leaves the cell's records
@@ -122,6 +123,34 @@ fn run(image: &[u8], argv: &[&[u8]], envp: &[&[u8]]) -> Outcome {
     user::reset();
     let mut aspace = AddressSpace::new(1);
     let img = load::load_elf_linux(image, &mut aspace).expect("load dynamic Linux ELF");
+    run_image(img, aspace, argv, envp)
+}
+
+/// Run a dynamically-linked binary via the **streaming `execve`** path
+/// (`exec_elf_from_vfs_demand`): the program and its `PT_INTERP` interpreter are
+/// both streamed from the VFS and demand-paged, exactly as a shell `execve`ing a
+/// dynamic program does. Proves the streaming loader handles `PT_INTERP`
+/// (docs/LINUX-COMPAT.md L7, docs/ARCHITECTURE-DEBT.md 4.0 blocker 2).
+fn run_execve(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Outcome {
+    user::reset();
+    let mut aspace = AddressSpace::new(1);
+    let ops = svc::file_ops().expect("file ops registered");
+    // `path` is a `'static` &str (kernel .rodata), which is where
+    // `exec_elf_from_vfs_demand` requires the path to live.
+    let img =
+        load::exec_elf_from_vfs_demand(ops, path.as_ptr() as u64, path.len() as u64, &mut aspace)
+            .expect("streaming execve of a dynamic Linux ELF");
+    run_image(img, aspace, argv, envp)
+}
+
+/// Shared tail: assert both files are demand-paged, lay out the stack, install the
+/// Linux cell and run it.
+fn run_image(
+    img: load::LinuxImage,
+    mut aspace: AddressSpace,
+    argv: &[&[u8]],
+    envp: &[&[u8]],
+) -> Outcome {
     // Both files must be demand-paged, not just the program. A dynamically linked
     // binary is the program plus its **interpreter**, and the interpreter comes from
     // the VFS rather than from a kernel buffer - a different loader path, so it needs
@@ -192,6 +221,10 @@ extern "C" fn kernel_main() -> ! {
     }
     fs::write(INTERP_PATH, LD_SO).expect("seed ld.so");
     fs::write("/lib/libc.so.6", LIBC).expect("seed libc.so.6");
+    // The dynamic program on the VFS at /bin/dhello, so it can be `execve`d
+    // (streamed) as well as loaded directly.
+    sys::mkdir("/bin").expect("mkdir /bin");
+    fs::write("/bin/dhello", DHELLO).expect("seed /bin/dhello");
     svc::set_file_ops(vfs_personality::ops());
 
     println!(
@@ -229,6 +262,35 @@ extern "C" fn kernel_main() -> ! {
         Outcome::Faulted(addr) => panic!("dhello: faulted at {addr:#x}"),
     }
     println!("linuxdyn: dhello OK (PT_INTERP + ld.so + fd-backed mmap)");
+
+    // Phase 2: the same dynamic binary via the **streaming `execve`** path -
+    // program + interpreter both streamed from the VFS and demand-paged, the way a
+    // shell launching a dynamic program does. Proves the streaming loader handles
+    // PT_INTERP (docs/ARCHITECTURE-DEBT.md 4.0 blocker 2, task GOAL-DISK-2).
+    unsafe {
+        STDOUT_LEN = 0;
+    }
+    linux::set_stdout_tap(Some(tap));
+    let outcome = run_execve(
+        "/bin/dhello",
+        &[b"dhello"],
+        &[b"LD_LIBRARY_PATH=/lib", b"PATH=/bin"],
+    );
+    linux::set_stdout_tap(None);
+    match outcome {
+        Outcome::Exited(code) => {
+            let got = captured();
+            assert!(
+                got == want_out,
+                "dhello (execve): stdout mismatch\n  got:      {:?}\n  expected: {:?}",
+                core::str::from_utf8(got),
+                core::str::from_utf8(want_out),
+            );
+            assert!(code == 12, "dhello (execve): exit {code}, expected 12");
+        }
+        Outcome::Faulted(addr) => panic!("dhello (execve): faulted at {addr:#x}"),
+    }
+    println!("linuxdyn: dhello via streaming execve OK (PT_INTERP streamed from the VFS)");
 
     println!("linuxdyn: PASS");
     arch::exit(arch::ExitCode::Success)

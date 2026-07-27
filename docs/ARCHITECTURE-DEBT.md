@@ -626,13 +626,20 @@ so was its claim of 182 MiB of `.bss`, which measurement shows does not exist.
    kernel's path, unchanged), so both the resident and the streaming source are proven.
 
    What (b) does **not** yet do, and is named: the streaming path proven here is the
-   **mount + read** path (`blockfs`), not yet an `execve` *from* a streamed mount - the
-   streaming `execve` path does not load a `PT_INTERP` interpreter (only the from-slice
-   `load_elf_linux` does), which a dynamic binary from disk needs; and the registry
-   ceiling (`MAX_MAPPED_FILES` 8) sits right at main + `ld.so` + 5 libs. Cost, measured
-   not assumed: a `read_at` for a 2-4 byte field is one LRU lookup, and a miss is one
-   `LINE/SECTOR`-sector device read; a data read copies straight from the covering
-   line. Wiring the streamed mount into the demand-paged loader is the next rung.
+   **mount + read** path (`blockfs`), not yet an `execve` *from* a streamed mount. One
+   of the two obstacles is **now removed** (GOAL-DISK-2): the streaming `execve` path
+   (`load::exec_elf_inner`) parses `PT_INTERP` and streams the interpreter demand-paged,
+   the same handling the from-slice `load_elf_linux` had - factored to share
+   `stream_elf_at` - so a dynamically-linked binary now `execve`s from the VFS, proven
+   by `linuxdyn`'s second phase (`/bin/dhello` execve'd, exact stdout + exit, both
+   program and interpreter demand-paged, all three ISAs). What remains for (b): compose
+   that streaming loader with the block-cached ext4 (mount an ext4 image off the live
+   virtio-blk disk through the `BlockCache` and `execve` a binary from it), and the
+   registry ceiling (`MAX_MAPPED_FILES` 8) sits right at main + `ld.so` + 5 libs. Cost,
+   measured not assumed: a `read_at` for a 2-4 byte field is one LRU lookup, a miss is
+   one `LINE/SECTOR`-sector device read, and a data read copies straight from the
+   covering line. Composing the streamed mount with the demand-paged loader is the next
+   rung.
 3. ~~**Seven syscalls the personality does not dispatch**~~ **CLOSED.** Measured
    from the real startup trace rather than guessed, and all seven now dispatched:
 
