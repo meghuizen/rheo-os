@@ -327,10 +327,30 @@ Three blockers are **design decisions**, not unfinished work:
    diagnostic**. The `mprotect` RW->RX flip path does work, so a flipping JIT is
    viable where an RWX one is not. Either add `UserRwx` (a doctrine change
    needing a §6 pass) or run with the JIT off via an environment variable.
-2. **No VMA list at all.** `mmap` is a forward bump cursor (`mem.rs:106-112`), so
-   nothing detects that a large reservation spans `LINUX_INTERP_BASE` where ld.so
-   and libc live. Silent corruption, not an error. The user VA ceiling is
-   **256 GiB on every ISA** (`user.rs:62`, Sv39's user half applied uniformly).
+2. **No VMA list at all** - *the silent-corruption half is now closed.* `mmap` is
+   a forward bump cursor (`mem.rs`), so nothing detects placement collisions. The
+   cursor was also **unbounded**, which is what made it dangerous rather than
+   merely crude: a long enough run of allocations left the 12 GiB mmap region,
+   crossed the cell's queue-pair region at 16 GiB and its channel regions at
+   24 GiB, and reached `LINUX_INTERP_BASE` at 64 GiB where `ld.so` and `libc.so.6`
+   live - handing a program addresses aliasing its own dynamic linker with no
+   error. 4 GiB of mappings is enough to get there.
+
+   Fixed: the region is bounded at the queue VA (`MMAP_END`), `mmap` and `mremap`
+   both report `-ENOMEM` past it, and a caller-chosen `MAP_FIXED` overlapping the
+   queue or channel regions is refused `-EINVAL` with a printed reason - that is
+   the one case a bump cursor cannot protect against. The interpreter's own span is
+   deliberately *not* in the refusal set, because `ld.so` legitimately maps within
+   it (L7). Proven by `mmapx.c` in `linuxproc` on all three ISAs, observed failing
+   reverted (*"oversized reservation was accepted"*).
+
+   **Still open, and still needed for Claude Code:** a real VMA list - per-mapping
+   records with permissions, first-fit placement, reuse of freed spans, and the
+   region lookup a **page fault handler** needs to know what to fault in and with
+   what protection. The bound makes the failure mode correct; it does not make
+   placement correct, and it does not enable demand paging (blocker 3). The user VA
+   ceiling is **256 GiB on every ISA** (`user.rs:62`, Sv39's user half applied
+   uniformly).
 3. **No resumable page fault.** (The missing *idle state* was the other half of
    this and is now closed - §2.4.) `on_user_trap` still maps every user fault to a
    signal or termination, so nothing is demand-paged and nothing grows on fault -

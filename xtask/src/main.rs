@@ -1192,6 +1192,11 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         // pid 0/-1, and `readlinkat` was a hardcoded -ENOENT. Part of the
         // `linuxproc` proof (it execve's itself for the exe-path phase).
         ("killx.c", "killx"),
+        // The mmap region is bounded and MAP_FIXED cannot replace the kernel's
+        // rings (docs/ARCHITECTURE-DEBT.md 4, blocker 2): the cursor used to run
+        // out of its region, through the queue and into ld.so, silently. Part of
+        // the `linuxproc` proof.
+        ("mmapx.c", "mmapx"),
         // A futex wait that must END BY ITSELF (docs/LINUX-COMPAT.md L4, the
         // `futex` row): `pthread_cond_timedwait` on a never-signalled condvar.
         // Part of the `linuxthreads` proof.

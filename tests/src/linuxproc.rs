@@ -44,6 +44,7 @@ static CECHO: &[u8] = fixture::linux!("cecho");
 static RSH: &[u8] = fixture::linux!("rsh");
 static FCNTLX: &[u8] = fixture::linux!("fcntlx");
 static KILLX: &[u8] = fixture::linux!("killx");
+static MMAPX: &[u8] = fixture::linux!("mmapx");
 static COREUTILS: &[u8] = fixture::linux!("cu/bin/coreutils");
 
 // -- stdout capture, wired to the Linux personality's stdout tap --
@@ -234,6 +235,38 @@ extern "C" fn kernel_main() -> ! {
     println!(
         "linuxproc: /proc/self/exe OK - resolves to the execve'd path, a real \
          non-link reports EINVAL, an absent path ENOENT"
+    );
+
+    // --- the mmap region is bounded (docs/ARCHITECTURE-DEBT.md 4, blocker 2).
+    // `mmap` is a forward bump cursor with no accounting and it used to be
+    // *unbounded*, so a long enough run of allocations left the 12 GiB region,
+    // crossed the cell's queue-pair region at 16 GiB and its channel regions at
+    // 24 GiB, and reached the ELF interpreter at 64 GiB where ld.so and libc.so.6
+    // live - handing a program addresses that alias its own dynamic linker, with
+    // no error. 4 GiB of mappings is enough to get there, which a ~100 MB binary
+    // reaches easily.
+    //
+    // The bound is the answer to the *failure mode*, not to placement: a real VMA
+    // list with first-fit and reuse of freed spans is still open. What is asserted
+    // is that an impossible request is refused with an errno the caller can act
+    // on, that a caller-chosen MAP_FIXED cannot replace the kernel's own rings,
+    // and that an ordinary mapping still works.
+    let want_mmap: &[u8] = b"mmap: small anonymous mapping usable\n\
+        mmap: oversized reservation ENOMEM\n\
+        mmap: MAP_FIXED over the queue region EINVAL\n\
+        mmapx OK\n";
+    let (code, out) = run_capture(MMAPX, &[b"mmapx"]);
+    assert!(
+        out == want_mmap,
+        "mmapx: stdout mismatch\n  got:      {:?}\n  expected: {:?}",
+        core::str::from_utf8(out),
+        core::str::from_utf8(want_mmap),
+    );
+    assert!(code == 0, "mmapx: exit {code}, expected 0");
+    println!(
+        "linuxproc: mmap bound OK - an ordinary mapping works, a request larger \
+         than the region is ENOMEM instead of running into ld.so, and MAP_FIXED \
+         over the cell's queue region is EINVAL"
     );
 
     println!("linuxproc: PASS");

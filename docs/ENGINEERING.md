@@ -351,6 +351,18 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   copy is individually cheap, which is why it happens - and each one is a place a
   future change can diverge silently. When you find yourself writing something
   that already exists, the correct cost to pay is the import, once.
+- **A sentinel scheme needs a uniqueness check, and "clippy was clean" has a
+  timestamp.** The Linux personality represents each x86-64-only verb by an
+  unreachable `u64::MAX - n` sentinel in the asm-generic table, so one portable
+  `match` compiles on all three ISAs. Adding `READLINK` as `MAX - 7` collided with
+  `EPOLL_CREATE` and made `epoll_create` **dead code on two ISAs** - silently,
+  because the boot tests only exercise `epoll_create1`. Clippy does report it as an
+  unreachable pattern; I had run clippy in that slice *before* adding the
+  constant, and reported the slice as lint-clean on the strength of that run. Two
+  rules follow: re-run the gate after the last edit, not after the last edit you
+  remember; and where a scheme's correctness is "all these values differ", assert
+  it (`const _: () = { ... }` over the whole set) rather than leaving it to review
+  - the guard here was verified to fire by reintroducing the collision.
 - **A mechanical rename is not an edit to a proof.** Moving `arch::init` to
   `kernel::boot::init` touched 61 call sites, 59 of them test kernels - which
   looks like it violates "re-run the *old* proofs unchanged" (section 8). It does

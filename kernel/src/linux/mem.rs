@@ -27,6 +27,52 @@ const MAP_ANONYMOUS: u64 = 0x20;
 /// address space, so the same VA in two cells is isolated.
 const MMAP_BASE: usize = 0x3_0000_0000;
 
+/// **End** of the per-cell mmap region - the first address the bump cursor may
+/// not reach (docs/ARCHITECTURE-DEBT.md 4, blocker 2).
+///
+/// The cursor used to be unbounded. `mmap` is a forward bump with no accounting,
+/// so a large enough run of allocations walked straight through the cell's
+/// **queue-pair** region (16 GiB), its **channel** regions (24 GiB) and then the
+/// **ELF interpreter** at [`load::LINUX_INTERP_BASE`] (64 GiB), where `ld.so` and
+/// `libc.so.6` live - handing a program addresses that alias its own dynamic
+/// linker. Silent corruption, and against a ~100 MB binary not a remote
+/// possibility: 4 GiB of mappings is enough to reach the queue.
+///
+/// 16 GiB is the queue region, so that is the ceiling: the whole 4 GiB from 12 to
+/// 16 GiB is the mmap region, and past it `mmap` reports `-ENOMEM`, which is an
+/// answer a caller can act on. A real VMA list with first-fit placement and reuse
+/// of freed spans is the proper fix and is still open; this is the bound that
+/// makes the *failure mode* correct in the meantime.
+const MMAP_END: usize = crate::load::USER_QUEUE_VA;
+const _: () = assert!(MMAP_BASE < MMAP_END);
+
+/// Spans a cell's `mmap` must never place a mapping over, because something else
+/// already owns them. Checked for `MAP_FIXED` (a caller-chosen address), which the
+/// bump cursor cannot protect against.
+///
+/// The ELF interpreter's span is deliberately **not** here: `ld.so` legitimately
+/// maps within its own region, and refusing that would break every dynamically
+/// linked binary (docs/LINUX-COMPAT.md L7). The queue and channel regions are
+/// kernel-owned rings mapped into the cell; a program targeting one is either
+/// confused or hostile, and either way must be refused rather than allowed to
+/// replace the kernel's frames.
+fn reserved_overlap(base: usize, bytes: usize) -> Option<&'static str> {
+    let end = base.saturating_add(bytes);
+    let hits = |s: usize, n: usize| base < s + n && s < end;
+    if hits(
+        crate::load::USER_QUEUE_VA,
+        crate::queue::QueuePair::REGION_SIZE,
+    ) {
+        return Some("the cell's queue-pair region");
+    }
+    let chan = crate::load::channel_slot_va(0);
+    let chan_span = crate::abi::MAX_CELL_CHANNELS * crate::queue::QueuePair::REGION_SIZE;
+    if hits(chan, chan_span) {
+        return Some("the cell's cross-cell channel region");
+    }
+    None
+}
+
 fn page_up(x: usize) -> usize {
     (x + FRAME_SIZE - 1) & !(FRAME_SIZE - 1)
 }
@@ -104,10 +150,33 @@ pub fn mmap(
     let anon = flags & MAP_ANONYMOUS != 0;
 
     let base = if fixed {
-        (addr as usize) & !(FRAME_SIZE - 1)
+        let b = (addr as usize) & !(FRAME_SIZE - 1);
+        // A caller-chosen address is the one case the bump cursor cannot protect
+        // against: refuse the kernel-owned rings rather than let the cell replace
+        // their frames (docs/ARCHITECTURE-DEBT.md 4).
+        if let Some(what) = reserved_overlap(b, bytes) {
+            crate::println!("linux: mmap MAP_FIXED at {b:#x} refused - overlaps {what}");
+            return -EINVAL;
+        }
+        b
     } else {
         let b = st.mmap_cursor;
-        st.mmap_cursor = b + bytes;
+        // Bounded (docs/ARCHITECTURE-DEBT.md 4, blocker 2): the cursor used to run
+        // forward without limit, through the queue region, the channel regions and
+        // then ld.so. `-ENOMEM` is an answer glibc acts on; silently aliasing the
+        // dynamic linker is not.
+        let Some(next) = b.checked_add(bytes) else {
+            return -ENOMEM;
+        };
+        if next > MMAP_END {
+            crate::println!(
+                "linux: mmap of {bytes:#x} refused - the {:#x}..{MMAP_END:#x} mmap \
+                 region is exhausted at {b:#x}",
+                MMAP_BASE
+            );
+            return -ENOMEM;
+        }
+        st.mmap_cursor = next;
         b
     };
 
@@ -200,11 +269,23 @@ pub fn mremap(st: &mut LinuxState, old_addr: u64, old_size: u64, new_size: u64, 
     if flags & MREMAP_MAYMOVE == 0 {
         return -ENOMEM;
     }
+    // Same bound as `mmap`: the cursor is shared, so an unbounded `mremap` would
+    // walk into the queue region and ld.so exactly as an unbounded `mmap` did
+    // (docs/ARCHITECTURE-DEBT.md 4, blocker 2).
     let base = st.mmap_cursor;
+    let Some(next) = base.checked_add(new_len) else {
+        return -ENOMEM;
+    };
+    if next > MMAP_END {
+        crate::println!(
+            "linux: mremap of {new_len:#x} refused - the mmap region is exhausted at {base:#x}"
+        );
+        return -ENOMEM;
+    }
     if !user::map_anon_at(base, new_len, MapPerm::UserRw) {
         return -ENOMEM;
     }
-    st.mmap_cursor = base + new_len;
+    st.mmap_cursor = next;
     // Copy the old contents; both ranges are mapped in the active cell root.
     // SAFETY: trap context, cell address space active; `old_len` bytes of the
     // source are mapped and `new_len >= old_len` bytes of the destination are.

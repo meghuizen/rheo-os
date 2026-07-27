@@ -144,7 +144,7 @@ pub mod nr {
     /// No legacy `readlink` in the asm-generic table (only `readlinkat`), so this
     /// is an unreachable sentinel - the dispatch arm compiles on every ISA and
     /// matches only where the number is real.
-    pub const READLINK: u64 = u64::MAX - 7;
+    pub const READLINK: u64 = u64::MAX - 9;
 }
 
 /// The asm-generic `struct epoll_event` is naturally aligned (16 bytes; the
@@ -227,3 +227,35 @@ impl Stat {
         }
     }
 }
+
+/// Every x86-64-only verb is represented here by an **unreachable sentinel** so
+/// one portable `match` compiles on all three ISAs. The scheme has a sharp edge:
+/// two sentinels with the same value make the *second* arm dead code, silently.
+/// That happened - `READLINK` was added as `MAX - 7`, colliding with
+/// `EPOLL_CREATE`, which made `epoll_create` unreachable on this table. Clippy
+/// reports it as an unreachable pattern, but only if clippy runs after the
+/// constant is added, and the boot tests did not exercise the shadowed arm.
+///
+/// So the invariant is now checked at compile time instead of by review.
+const _: () = {
+    let all = [
+        nr::POLL,
+        nr::FORK,
+        nr::VFORK,
+        nr::PIPE,
+        nr::DUP2,
+        nr::ACCESS,
+        nr::READLINK,
+        nr::EPOLL_CREATE,
+        nr::EPOLL_WAIT,
+    ];
+    let mut i = 0;
+    while i < all.len() {
+        let mut j = i + 1;
+        while j < all.len() {
+            assert!(all[i] != all[j], "duplicate asm-generic syscall sentinel");
+            j += 1;
+        }
+        i += 1;
+    }
+};
