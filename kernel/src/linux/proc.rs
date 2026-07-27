@@ -43,6 +43,15 @@ enum Block {
         count: u64,
         idx: usize,
     },
+    /// `read` on an `eventfd` whose counter is zero (docs/LINUX-COMPAT.md
+    /// L8-EVENTFD). Parked until some other cell writes it; `ev` is the registry
+    /// index, which is kernel state, so the scheduler can judge satisfiability
+    /// without the waiter's address space active.
+    EventFdRead {
+        buf_va: u64,
+        count: u64,
+        ev: u8,
+    },
     /// `write` on a full pipe whose read ends are still open.
     PipeWrite {
         buf_va: u64,
@@ -228,6 +237,15 @@ pub fn for_each_live(skip_top: bool, mut f: impl FnMut(usize)) {
             f(i);
         }
     }
+}
+
+/// How many Linux processes are alive right now - the `procs` field `sysinfo`
+/// reports. Counts runnable and blocked, not zombies: a zombie is not a process
+/// any more, it is a status waiting to be read.
+pub fn live_count() -> usize {
+    let mut n = 0;
+    for_each_live(false, |_| n += 1);
+    n
 }
 
 /// Mark `cell` as terminated by an uncaught fatal signal **without** handing the
@@ -575,6 +593,14 @@ pub fn block_pipe_read(cur: usize, buf_va: u64, count: u64, idx: usize) -> Ctl {
     reschedule(cur)
 }
 
+/// Park `cur` on an eventfd read whose counter is zero; the scheduler completes
+/// the read (with `cur`'s address space active) once a peer writes the counter.
+pub fn block_eventfd_read(cur: usize, buf_va: u64, count: u64, ev: u8) -> Ctl {
+    procs()[cur].state = PState::Blocked;
+    procs()[cur].block = Block::EventFdRead { buf_va, count, ev };
+    reschedule(cur)
+}
+
 /// Park `cur` on a full pipe write; completed when space frees or read ends close.
 pub fn block_pipe_write(cur: usize, buf_va: u64, count: u64, idx: usize) -> Ctl {
     procs()[cur].state = PState::Blocked;
@@ -702,7 +728,10 @@ fn sources_of(i: usize) -> crate::idle::Sources {
     match procs()[i].block {
         Block::None => 0,
         // A pipe/socket ring or a child exit is another *process*'s doing.
-        Block::Wait { .. } | Block::PipeRead { .. } | Block::PipeWrite { .. } => idle::PEER,
+        Block::Wait { .. }
+        | Block::PipeRead { .. }
+        | Block::PipeWrite { .. }
+        | Block::EventFdRead { .. } => idle::PEER,
         Block::Timer { .. } => idle::TIMER,
         Block::Console { .. } => idle::CONSOLE,
         // Computed when the block was registered, from the descriptors it watches.
@@ -745,6 +774,7 @@ fn block_name(i: usize) -> &'static str {
         Block::Wait { .. } => "wait4 (child exit)",
         Block::PipeRead { .. } => "read (empty pipe/socket)",
         Block::PipeWrite { .. } => "write (full pipe/socket)",
+        Block::EventFdRead { .. } => "read (eventfd counter zero)",
         Block::Timer { .. } => "nanosleep (deadline)",
         Block::Console { .. } => "read (console)",
         Block::Poll { .. } => "poll (fd readiness)",
@@ -758,6 +788,7 @@ fn satisfiable(i: usize) -> bool {
         Block::Wait { want, .. } => find_zombie_child(i, want).is_some() || !has_child(i, want),
         Block::PipeRead { idx, .. } => pipe::has_data(idx) || pipe::writers(idx) == 0,
         Block::PipeWrite { idx, .. } => pipe::has_space(idx) || pipe::readers(idx) == 0,
+        Block::EventFdRead { ev, .. } => super::eventfd::readable(ev),
         Block::Timer { deadline_ns } => super::cell_clock_ns(false) >= deadline_ns,
         Block::Console { .. } => crate::input::has_data() || crate::input::at_eof(),
         Block::Poll {
@@ -812,6 +843,15 @@ fn complete_block(n: usize) {
             pipe::ReadNb::Done(n) => n,
             pipe::ReadNb::WouldBlock => 0, // woken only when satisfiable; treat as EOF
         },
+        Block::EventFdRead { buf_va, count, ev } => {
+            match super::eventfd::read(ev, buf_va, count) {
+                Ok(super::eventfd::ReadNb::Done) => 8,
+                // Woken only when readable, so this cannot normally happen; report
+                // -EAGAIN rather than a fabricated byte count if it ever does.
+                Ok(super::eventfd::ReadNb::WouldBlock) => -super::errno::EAGAIN,
+                Err(e) => e,
+            }
+        }
         Block::PipeWrite { buf_va, count, idx } => match pipe::write(idx, buf_va, count) {
             pipe::WriteNb::Done(n) => n,
             pipe::WriteNb::WouldBlock => 0,

@@ -47,6 +47,7 @@ static KILLX: &[u8] = fixture::linux!("killx");
 static MMAPX: &[u8] = fixture::linux!("mmapx");
 static YIELDX: &[u8] = fixture::linux!("yieldx");
 static STACKX: &[u8] = fixture::linux!("stackx");
+static SYSX: &[u8] = fixture::linux!("sysx");
 static COREUTILS: &[u8] = fixture::linux!("cu/bin/coreutils");
 
 // -- stdout capture, wired to the Linux personality's stdout tap --
@@ -354,6 +355,55 @@ extern "C" fn kernel_main() -> ! {
         "linuxproc: PT_GNU_STACK OK - an image asking for 12 MiB of stack is \
          given 12 MiB and told 12 MiB, and 9280 KiB of it is actually written \
          through - past the old fixed 8 MiB default, which faulted here"
+    );
+
+    // --- the seven syscalls the real Claude Code binary issues that the
+    // personality did not dispatch (docs/ARCHITECTURE-DEBT.md 4.0, blocker 3).
+    // Measured from its startup `strace`, not guessed. Six are advisory; the
+    // seventh, `eventfd2`, is the epoll event loop's only wakeup path, so
+    // refusing it does not degrade the program - it removes the mechanism.
+    //
+    // Each refusal is asserted as a refusal. `sched_setscheduler(SCHED_FIFO)`
+    // returning 0 would tell a program it had real-time scheduling on a
+    // cooperative scheduler, which is the stub-that-reports-success class this
+    // programme is removing (docs/ENGINEERING.md 7).
+    //
+    // The legacy-`open` line differs by ISA, deliberately: syscall 2 exists only
+    // on the x86-64 table, and that ISA-only existence *was* the defect - glibc
+    // issues `open` in preference to `openat` there, so a personality with only
+    // `openat` refused every `open` on one ISA and nowhere else.
+    let _ = sys::mkdir("/etc"); // an existing /etc is fine
+    fs::write("/etc/sysx.txt", b"sysx").expect("seed /etc/sysx.txt");
+    let open_line: &[u8] = if cfg!(target_arch = "x86_64") {
+        b"open: legacy open(2) works\n"
+    } else {
+        b"open: no legacy open on this ABI (openat only)\n"
+    };
+    let want_rest: &[u8] =
+        b"eventfd: empty not readable, 1+6 read as 7, drained, short read EINVAL\n\
+        eventfd: dup shares the counter\n\
+        eventfd: semaphore mode yields 1 per read\n\
+        sysinfo: real totals, free <= total, mem_unit 1, procs >= 1\n\
+        sched: SCHED_OTHER ok, SCHED_FIFO EPERM, range 0..0\n\
+        close_range: closed the range and nothing beyond it\n\
+        clone3/rseq: refused ENOSYS deliberately\n\
+        sysx OK\n";
+    let (code, out) = run_capture(SYSX, &[b"sysx"]);
+    assert!(
+        out.starts_with(open_line) && &out[open_line.len()..] == want_rest,
+        "sysx: stdout mismatch\n  got:      {:?}\n  expected: {:?} then {:?}",
+        core::str::from_utf8(out),
+        core::str::from_utf8(open_line),
+        core::str::from_utf8(want_rest),
+    );
+    assert!(code == 0, "sysx: exit {code}, expected 0");
+    println!(
+        "linuxproc: measured-syscall set OK - eventfd2 is a real shared counter \
+         (empty is NOT pollable-readable, a dup shares it, EFD_SEMAPHORE \
+         decrements), sysinfo reports the real frame pool, sched_setscheduler \
+         accepts the policy in force and refuses real-time with EPERM, \
+         close_range closes exactly its range, and clone3/rseq are refused \
+         deliberately rather than falling through the unknown-number path"
     );
 
     println!("linuxproc: PASS");

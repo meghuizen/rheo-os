@@ -23,6 +23,7 @@
 pub mod dirent;
 pub mod epoll;
 pub mod errno;
+pub mod eventfd;
 pub mod fd;
 pub mod inetsock;
 pub mod mem;
@@ -165,6 +166,7 @@ pub fn reset() {
     unixsock::reset();
     inetsock::reset();
     epoll::reset();
+    eventfd::reset();
 }
 
 /// Deep-copy cell `from`'s Linux state into cell `to` (the `fork` inheritance
@@ -279,6 +281,15 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
         nr::OPENAT => ret(st
             .fds
             .openat(dirfd(args[0]), args[1], strlen(args[1]), args[2])),
+        // The **legacy** x86-64 `open(path, flags, mode)` - the same call with
+        // `AT_FDCWD` implied. glibc issues it in preference to `openat` on that
+        // ISA, so implementing only `openat` left every `open` refused there and
+        // nowhere else (docs/ENGINEERING.md 11, the two-numbers hazard; measured
+        // in docs/ARCHITECTURE-DEBT.md 4.0). Unreachable on the asm-generic ISAs,
+        // where `nr::OPEN` is a sentinel.
+        nr::OPEN => ret(st
+            .fds
+            .openat(fd::AT_FDCWD, args[0], strlen(args[0]), args[1])),
         nr::CLOSE => ret(st.fds.close(args[0] as i64)),
         nr::LSEEK => ret(st.fds.lseek(args[0] as i64, args[1] as i64, args[2])),
         // pread64(fd, buf, count, offset): a positioned read (ld.so reads ELF
@@ -461,6 +472,28 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
         nr::SCHED_YIELD => thread::sched_yield(cur),
         nr::SCHED_GETAFFINITY => ret(sys_sched_getaffinity(args[1], args[2])),
         nr::PRCTL => ret(sys_prctl(args[0])),
+        // Scheduling *policy*, honestly (docs/ARCHITECTURE-DEBT.md 4.0, blocker 3).
+        // This scheduler has exactly one class - cooperative round-robin - so
+        // SCHED_OTHER at priority 0 is what every context already runs under and
+        // asking for it succeeds. Asking for SCHED_FIFO/RR is a *real-time*
+        // guarantee nothing here can keep, so it is refused `-EPERM` (the errno an
+        // unprivileged Linux process gets, and one every caller already handles)
+        // rather than accepted and dropped.
+        nr::SCHED_SETSCHEDULER => ret(sys_sched_setscheduler(args[1], args[2])),
+        nr::SCHED_GETSCHEDULER => Ctl::Ret(SCHED_OTHER),
+        // The priority range of the *only* policy there is, so both ends are 0.
+        nr::SCHED_GET_PRIORITY_MAX | nr::SCHED_GET_PRIORITY_MIN => {
+            ret(sys_sched_priority_bound(args[0]))
+        }
+        nr::SYSINFO => ret(sys_sysinfo(args[0])),
+        nr::EVENTFD2 => ret(st.fds.eventfd_create(args[0], args[1])),
+        nr::CLOSE_RANGE => ret(st.fds.close_range(args[0], args[1], args[2])),
+        // Defined-but-never-dispatched before, so these logged `ENOSYS nr=<n>` as if
+        // the number were unknown. They are known, and refusing them is the
+        // *correct* answer - glibc's documented fallbacks are `clone` for `clone3`
+        // and "no restartable sequences" for `rseq` - so say so deliberately
+        // instead of by accident (docs/ARCHITECTURE-DEBT.md 4.0, blocker 3).
+        nr::CLONE3 | nr::RSEQ => err(errno::ENOSYS),
 
         // -- resource limits --
         nr::PRLIMIT64 => ret(sys_prlimit64(cur, args[1], args[2], args[3])),
@@ -618,7 +651,7 @@ fn ptr_args_ok(nr_val: u64, args: &[u64; 6]) -> bool {
         // same helpers.
         nr::READV | nr::WRITEV => rd(1, args[2].saturating_mul(16)),
         nr::OPENAT | nr::FACCESSAT | nr::FACCESSAT2 => rd(1, 1),
-        nr::ACCESS | nr::CHDIR => rd(0, 1),
+        nr::ACCESS | nr::CHDIR | nr::OPEN => rd(0, 1),
         nr::FSTAT => wr(1, 1),
         nr::NEWFSTATAT => rd(1, 1) && wr(2, 1),
         nr::STATX => rd(1, 1) && wr(4, 1),
@@ -674,6 +707,9 @@ fn ptr_args_ok(nr_val: u64, args: &[u64; 6]) -> bool {
         nr::SCHED_GETAFFINITY => wr(2, args[1]),
         nr::PRLIMIT64 => rd_opt(2, 16) && wr_opt(3, 16),
         nr::GETRLIMIT => wr(1, 16),
+        nr::SYSINFO => wr(0, core::mem::size_of::<SysInfo>() as u64),
+        // eventfd read/write carry an 8-byte value through the *fd* path, which
+        // does its own bounding in `linux::eventfd`; the create call takes scalars.
 
         // -- signals --
         nr::RT_SIGACTION => rd_opt(1, 1) && wr_opt(2, 1),
@@ -760,6 +796,22 @@ fn sys_read(cur: usize, st: &mut LinuxState, fd: i64, buf: u64, count: u64) -> C
                     err(errno::EAGAIN)
                 }
             }
+        };
+    }
+    // An eventfd read drains a counter, and a zero counter is not readable
+    // (docs/LINUX-COMPAT.md L8-EVENTFD). Same rule as a pipe: park when a peer
+    // could write it, report -EAGAIN when nothing could.
+    if let Some(ev) = st.fds.eventfd_of(fd) {
+        return match eventfd::read(ev, buf, count) {
+            Ok(eventfd::ReadNb::Done) => ret(8),
+            Ok(eventfd::ReadNb::WouldBlock) => {
+                if !nb && proc::runnable_peer_exists(cur) {
+                    proc::block_eventfd_read(cur, buf, count, ev)
+                } else {
+                    err(errno::EAGAIN)
+                }
+            }
+            Err(e) => ret(e),
         };
     }
     // **Blocking stdin** (docs/ARCHITECTURE-DEBT.md 2.4). An empty console used to
@@ -1355,6 +1407,120 @@ fn sys_sched_getaffinity(cpusetsize: u64, mask: u64) -> i64 {
         *(mask as *mut u8) = 1; // CPU 0 online
     }
     n as i64
+}
+
+/// The only scheduling policy this kernel has: `SCHED_OTHER` (Linux value 0) -
+/// cooperative round-robin at syscall boundaries (docs/LINUX-COMPAT.md L4).
+const SCHED_OTHER: u64 = 0;
+
+/// `sched_setscheduler(pid, policy, param)`: accept the policy that is already in
+/// force, refuse the ones that are not (docs/ARCHITECTURE-DEBT.md 4.0, blocker 3).
+///
+/// `SCHED_OTHER` with priority 0 *is* what every context runs under, so asking for
+/// it is satisfied. `SCHED_FIFO`/`SCHED_RR` ask for a real-time guarantee this
+/// scheduler cannot keep (there is no preemption yet - task #27), and the honest
+/// answer is the same `-EPERM` an unprivileged Linux process gets, which every
+/// caller already handles, rather than a success that changes nothing. An unknown
+/// policy number is `-EINVAL`.
+fn sys_sched_setscheduler(policy: u64, param_va: u64) -> i64 {
+    const SCHED_FIFO: u64 = 1;
+    const SCHED_RR: u64 = 2;
+    const SCHED_BATCH: u64 = 3;
+    const SCHED_IDLE: u64 = 5;
+    match policy {
+        SCHED_OTHER => {
+            // `struct sched_param { int sched_priority; }`. SCHED_OTHER requires 0;
+            // anything else is EINVAL on Linux too.
+            if param_va == 0 {
+                return -errno::EINVAL;
+            }
+            let Some(p) = crate::user::user_in::<i32>(param_va) else {
+                return -errno::EFAULT;
+            };
+            // SAFETY: range-checked readable in the active cell.
+            if unsafe { p.read() } != 0 {
+                return -errno::EINVAL;
+            }
+            0
+        }
+        SCHED_FIFO | SCHED_RR | SCHED_BATCH | SCHED_IDLE => -errno::EPERM,
+        _ => -errno::EINVAL,
+    }
+}
+
+/// `sched_get_priority_max`/`_min(policy)`: both ends of the only policy's range.
+/// `SCHED_OTHER` has a single priority, 0, on Linux as well; a policy this kernel
+/// refuses to *set* still has a well-defined range, so report it rather than
+/// failing (the two calls are informational).
+fn sys_sched_priority_bound(policy: u64) -> i64 {
+    // OTHER/FIFO/RR/BATCH/IDLE all report 0 here: OTHER genuinely has one priority,
+    // and the real-time policies have no priorities at all on this scheduler.
+    match policy {
+        0..=5 if policy != 4 => 0, // 4 (SCHED_ISO) does not exist in Linux either
+        _ => -errno::EINVAL,
+    }
+}
+
+/// Linux `struct sysinfo` (`include/uapi/linux/sysinfo.h`). Every field is
+/// `__kernel_long_t`/`__kernel_ulong_t`, so on all three LP64 targets the layout
+/// is identical - which is why this lives here and not in `arch::linux_abi`
+/// (unlike `struct stat`, whose x86-64 layout really does differ).
+#[repr(C)]
+#[derive(Default)]
+struct SysInfo {
+    uptime: i64,
+    loads: [u64; 3],
+    totalram: u64,
+    freeram: u64,
+    sharedram: u64,
+    bufferram: u64,
+    totalswap: u64,
+    freeswap: u64,
+    procs: u16,
+    pad: u16,
+    _pad2: u32,
+    totalhigh: u64,
+    freehigh: u64,
+    mem_unit: u32,
+    _f: [u8; 4],
+}
+
+// The ABI is 112 bytes on LP64. Asserted rather than trusted: a wrong size here
+// would have glibc read past the end of what the kernel wrote.
+const _: () = assert!(core::mem::size_of::<SysInfo>() == 112);
+
+/// `sysinfo(info)`: real numbers, from the frame pool and the monotonic clock
+/// (docs/ARCHITECTURE-DEBT.md 4.0, blocker 3). Bun reads `totalram`/`freeram` to
+/// size its heap, so a zeroed or invented answer sizes the heap wrongly - this is
+/// the reverse of a harmless stub.
+///
+/// Honest: `sharedram`/`bufferram`/`totalhigh`/`freehigh` are genuinely 0 here (no
+/// page cache, no highmem), swap is 0 because there is none, and `loads` is 0
+/// because no load average is computed - each of those is the true value, not a
+/// placeholder. `procs` counts live Linux processes.
+fn sys_sysinfo(info_va: u64) -> i64 {
+    let Some(out) = crate::user::user_out::<SysInfo>(info_va) else {
+        return -errno::EFAULT;
+    };
+    let (free, total) = crate::mm::frames::stats();
+    let unit = crate::mm::frames::FRAME_SIZE as u64;
+    let si = SysInfo {
+        // Uptime in seconds, from the kernel's monotonic clock.
+        // The same clock domain the cell's own `clock_gettime(MONOTONIC)` reports,
+        // so a program comparing the two sees one timeline (docs/ENGINEERING.md 11).
+        uptime: (cell_clock_ns(false) / 1_000_000_000) as i64,
+        totalram: total as u64 * unit,
+        freeram: free as u64 * unit,
+        procs: proc::live_count() as u16,
+        // The *ram fields above are byte counts, so the unit is 1. glibc multiplies
+        // by this, so it must match how the fields were computed.
+        mem_unit: 1,
+        ..SysInfo::default()
+    };
+    // SAFETY: `out` was validated non-null, aligned and inside the calling cell's
+    // user VA range; its address space is active.
+    unsafe { out.write(si) };
+    0
 }
 
 /// prctl(option, ...): only thread naming (PR_SET_NAME/PR_GET_NAME) is

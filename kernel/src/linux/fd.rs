@@ -12,6 +12,7 @@ use crate::arch::{self, linux_abi::Stat};
 use crate::linux::dirent;
 use crate::linux::epoll;
 use crate::linux::errno::*;
+use crate::linux::eventfd;
 use crate::linux::inetsock::{self, AF_INET, AF_INET6};
 use crate::linux::pipe;
 use crate::linux::unixsock::{self, AF_UNIX, NAME_MAX, SOCK_DGRAM, SOCK_STREAM, SOCK_TYPE_MASK};
@@ -147,6 +148,14 @@ enum FdKind {
     /// per-personality epoll registry (`linux::epoll`).
     Epoll {
         ep: u8,
+    },
+    /// An `eventfd2` counter (docs/LINUX-COMPAT.md L8-EVENTFD): `ev` indexes the
+    /// per-personality registry (`linux::eventfd`). The counter deliberately lives
+    /// in the registry, not here - `dup`/`fork` make a second descriptor for the
+    /// *same* object, and a counter copied per descriptor would give two counters
+    /// that silently stop waking each other.
+    EventFd {
+        ev: u8,
     },
 }
 
@@ -359,6 +368,7 @@ impl FdTable {
                     ep, bound: true, ..
                 } => inetsock::addref_dgram(ep),
                 FdKind::Epoll { ep } => epoll::addref(ep),
+                FdKind::EventFd { ev } => eventfd::addref(ev),
                 _ => {}
             }
         }
@@ -497,6 +507,14 @@ impl FdTable {
             | FdKind::InetDgram { .. }
             | FdKind::InetUdpRemote { .. } => -ENOTCONN,
             FdKind::Epoll { .. } => -EINVAL,
+            // An eventfd read drains the counter. Non-blocking here, like a pipe:
+            // the parking path is `mod::sys_read`, which intercepts eventfd fds
+            // before reaching this table (readv falls through to this behaviour).
+            FdKind::EventFd { ev } => match eventfd::read(ev, buf_va, count) {
+                Ok(eventfd::ReadNb::Done) => 8,
+                Ok(eventfd::ReadNb::WouldBlock) => -EAGAIN,
+                Err(e) => e,
+            },
             FdKind::Vfs { vfs_fd, .. } => match svc::file_ops() {
                 Some(o) => (o.read)(vfs_fd as u64, buf_va, count),
                 None => -EBADF,
@@ -555,6 +573,7 @@ impl FdTable {
             | FdKind::InetDgram { .. }
             | FdKind::InetUdpRemote { .. } => -ENOTCONN,
             FdKind::Epoll { .. } => -EINVAL,
+            FdKind::EventFd { ev } => eventfd::write(ev, buf_va, count),
             FdKind::Vfs { vfs_fd, .. } => match svc::file_ops() {
                 Some(o) => (o.write)(vfs_fd as u64, buf_va, count),
                 None => -EBADF,
@@ -690,6 +709,7 @@ impl FdTable {
                 }
             }
             FdKind::Epoll { ep } => epoll::close(ep),
+            FdKind::EventFd { ev } => eventfd::close(ev),
             _ => {}
         }
         self.fds[slot] = FdKind::Closed;
@@ -754,6 +774,7 @@ impl FdTable {
                 ep, bound: true, ..
             } => inetsock::addref_dgram(ep),
             FdKind::Epoll { ep } => epoll::addref(ep),
+            FdKind::EventFd { ev } => eventfd::addref(ev),
             _ => {}
         }
     }
@@ -884,7 +905,8 @@ impl FdTable {
             | FdKind::InetDgram { .. }
             | FdKind::InetUdpRemote { .. }
             | FdKind::InetTcpRemote { .. }
-            | FdKind::Epoll { .. } => -ESPIPE,
+            | FdKind::Epoll { .. }
+            | FdKind::EventFd { .. } => -ESPIPE,
             FdKind::Closed => -EBADF,
         }
     }
@@ -930,6 +952,12 @@ impl FdTable {
             | FdKind::InetTcpRemote { .. }
             | FdKind::Epoll { .. } => {
                 Stat::new(S_IFSOCK | 0o600, 0, 1, 1, 1000, 1000, 0, 4096, 0, 0)
+            }
+            // An eventfd is an anonymous inode, which Linux reports as a regular
+            // file of size 0 - not a socket. glibc's `fstat` on it must not look
+            // like something you can `recv` from.
+            FdKind::EventFd { .. } => {
+                Stat::new(dirent::S_IFREG | 0o600, 0, 1, 1, 1000, 1000, 0, 4096, 0, 0)
             }
             FdKind::Vfs { vfs_fd, .. } => {
                 let Some(o) = svc::file_ops() else {
@@ -980,6 +1008,7 @@ impl FdTable {
             | FdKind::InetUdpRemote { .. }
             | FdKind::InetTcpRemote { .. }
             | FdKind::Epoll { .. } => Ok((S_IFSOCK | 0o600, 0)),
+            FdKind::EventFd { .. } => Ok((dirent::S_IFREG | 0o600, 0)),
             FdKind::Vfs { vfs_fd, .. } => {
                 let Some(o) = svc::file_ops() else {
                     return Err(-EBADF);
@@ -1153,6 +1182,79 @@ impl FdTable {
         slot as i64
     }
 
+    /// `eventfd2(initval, flags)`: a counter as a new fd
+    /// (docs/LINUX-COMPAT.md L8-EVENTFD). `EFD_CLOEXEC` and `EFD_NONBLOCK` are
+    /// honoured on the descriptor (the flags the descriptor owns); `EFD_SEMAPHORE`
+    /// belongs to the object and is passed to the registry. Any other flag bit is
+    /// `-EINVAL` rather than ignored - a dropped flag is a silent wrong answer.
+    pub fn eventfd_create(&mut self, initval: u64, flags: u64) -> i64 {
+        use eventfd::{EFD_CLOEXEC, EFD_NONBLOCK, EFD_SEMAPHORE};
+        if flags & !(EFD_CLOEXEC | EFD_NONBLOCK | EFD_SEMAPHORE) != 0 {
+            return -EINVAL;
+        }
+        let Some(ev) = eventfd::create(initval, flags & EFD_SEMAPHORE != 0) else {
+            return -ENFILE;
+        };
+        let Some(slot) = self.free_slot(3) else {
+            eventfd::close(ev);
+            return -EMFILE;
+        };
+        self.fds[slot] = FdKind::EventFd { ev };
+        self.flags[slot] = FdFlags::new(ACC_RDWR);
+        self.flags[slot].cloexec = flags & EFD_CLOEXEC != 0;
+        self.flags[slot].nonblock = flags & EFD_NONBLOCK != 0;
+        slot as i64
+    }
+
+    /// `close_range(first, last, flags)`: close every open descriptor in the
+    /// inclusive range (docs/ARCHITECTURE-DEBT.md 4.0, blocker 3).
+    ///
+    /// glibc falls back to a `close` loop on `-ENOSYS`, so this is a *performance*
+    /// call rather than a functional one - but a loop over 64 descriptors is 64
+    /// syscalls, and the call is trivial to serve correctly. Closed slots in the
+    /// range are skipped, not an error, exactly as Linux does. `CLOSE_RANGE_CLOEXEC`
+    /// (mark rather than close) is honoured; `CLOSE_RANGE_UNSHARE` needs an fd table
+    /// this personality does not share separately from the address space, so it is
+    /// refused `-EINVAL` rather than silently ignored.
+    pub fn close_range(&mut self, first: u64, last: u64, flags: u64) -> i64 {
+        const CLOSE_RANGE_UNSHARE: u64 = 1 << 1;
+        const CLOSE_RANGE_CLOEXEC: u64 = 1 << 2;
+        if flags & !CLOSE_RANGE_CLOEXEC != 0 {
+            // Includes CLOSE_RANGE_UNSHARE, deliberately.
+            let _ = CLOSE_RANGE_UNSHARE;
+            return -EINVAL;
+        }
+        if first > last {
+            return -EINVAL;
+        }
+        let lo = first as usize;
+        // `last` is commonly `UINT_MAX` ("everything above"), so clamp rather than
+        // iterate to it.
+        let hi = (last as usize).min(NFD - 1);
+        for slot in lo..=hi.max(lo) {
+            if slot >= NFD || matches!(self.fds[slot], FdKind::Closed) {
+                continue;
+            }
+            if flags & CLOSE_RANGE_CLOEXEC != 0 {
+                self.flags[slot].cloexec = true;
+            } else {
+                self.close(slot as i64);
+            }
+        }
+        0
+    }
+
+    /// The registry index behind `fd` if it is an eventfd - the hook `sys_read`
+    /// uses to intercept a blocking read before the non-blocking table path, the
+    /// same shape as [`Self::pipe_end`].
+    pub fn eventfd_of(&self, fd: i64) -> Option<u8> {
+        let slot = usize_fd(fd)?;
+        match self.fds[slot] {
+            FdKind::EventFd { ev } => Some(ev),
+            _ => None,
+        }
+    }
+
     /// epoll_ctl(epfd, op, fd, event): register/modify/remove a watched fd. Reads
     /// the `struct epoll_event` (`events` u32, then `data` u64 at the per-ISA
     /// offset - x86-64 packs it, ARM64/RISC-V align it).
@@ -1278,7 +1380,11 @@ impl FdTable {
             | FdKind::InetConn { .. }
             | FdKind::SockListen { .. }
             | FdKind::InetListen { .. }
-            | FdKind::InetDgram { .. } => idle::PEER,
+            | FdKind::InetDgram { .. }
+            // An eventfd's counter only ever changes because another *cell* wrote
+            // it (a sibling context writing it does not park the cell at all), so
+            // the wake source is a peer, exactly as for a pipe.
+            | FdKind::EventFd { .. } => idle::PEER,
             FdKind::InetUdpRemote { .. } | FdKind::InetTcpRemote { .. } => idle::NET,
             FdKind::Console(0) => idle::CONSOLE,
             // An epoll fd's own readiness is the union of what it watches; asking
@@ -1967,6 +2073,9 @@ impl FdTable {
             // An epoll fd is readable when one of its watches is - which is what
             // makes `poll`ing an epoll fd work at all.
             FdKind::Epoll { .. } => self.epoll_ready(fd) > 0,
+            // The whole point of an eventfd: readable exactly when the counter is
+            // non-zero, which is what an epoll loop parks on to be woken.
+            FdKind::EventFd { ev } => eventfd::readable(ev),
             _ => false,
         }
     }
@@ -1992,6 +2101,7 @@ impl FdTable {
             | FdKind::InetDgram { bound: true, .. }
             | FdKind::InetUdpRemote { .. }
             | FdKind::InetTcpRemote { .. } => true,
+            FdKind::EventFd { ev } => eventfd::writable(ev),
             _ => false,
         }
     }

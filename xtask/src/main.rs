@@ -1223,6 +1223,7 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         // and ld *ignores* the one it does not know with a warning, not an error -
         // so the wrong spelling links fine and produces a p_memsz of 0.
         ("stackx.c", "stackx", &["-Wl,-z,stack-size=12582912"]),
+        ("sysx.c", "sysx", NO_EXTRA),
     ] {
         let mut sc = Command::new(cc);
         sc.arg("-static").arg("-no-pie");

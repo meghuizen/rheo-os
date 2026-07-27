@@ -112,6 +112,21 @@ pub mod nr {
     pub const CLONE3: u64 = 435;
     pub const FACCESSAT2: u64 = 439;
 
+    // Measured from the real Claude Code startup trace
+    // (docs/ARCHITECTURE-DEBT.md 4.0, blocker 3).
+    /// The **legacy** `open`. glibc issues this in preference to `openat` on
+    /// x86-64, so implementing only `openat` left every `open` refused on this ISA
+    /// alone - the same two-numbers trap that made `readlink` fail here
+    /// (docs/ENGINEERING.md 11).
+    pub const OPEN: u64 = 2;
+    pub const SYSINFO: u64 = 99;
+    pub const SCHED_SETSCHEDULER: u64 = 144;
+    pub const SCHED_GETSCHEDULER: u64 = 145;
+    pub const SCHED_GET_PRIORITY_MAX: u64 = 146;
+    pub const SCHED_GET_PRIORITY_MIN: u64 = 147;
+    pub const EVENTFD2: u64 = 290;
+    pub const CLOSE_RANGE: u64 = 436;
+
     // epoll (docs/LINUX-COMPAT.md L8-INET). x86-64 legacy numbers.
     pub const EPOLL_CREATE: u64 = 213;
     pub const EPOLL_WAIT: u64 = 232;

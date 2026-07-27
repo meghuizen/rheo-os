@@ -104,6 +104,21 @@ pub mod nr {
     pub const CLONE3: u64 = 435;
     pub const FACCESSAT2: u64 = 439;
 
+    // Measured from the real Claude Code startup trace
+    // (docs/ARCHITECTURE-DEBT.md 4.0, blocker 3).
+    pub const SYSINFO: u64 = 179;
+    pub const SCHED_SETSCHEDULER: u64 = 119;
+    pub const SCHED_GETSCHEDULER: u64 = 120;
+    pub const SCHED_GET_PRIORITY_MAX: u64 = 125;
+    pub const SCHED_GET_PRIORITY_MIN: u64 = 126;
+    pub const EVENTFD2: u64 = 19;
+    pub const CLOSE_RANGE: u64 = 436;
+
+    /// Not part of this table: x86-64's legacy `open` (asm-generic ISAs have only
+    /// `openat`). Named as unreachable so portable dispatch can list it, like
+    /// `ACCESS` and `READLINK`.
+    pub const OPEN: u64 = u64::MAX - 10;
+
     // epoll (docs/LINUX-COMPAT.md L8-INET). asm-generic has create1/ctl/pwait
     // only (no legacy create/wait; those are named as unreachable sentinels
     // below so portable dispatch can list them).
@@ -248,6 +263,7 @@ const _: () = {
         nr::READLINK,
         nr::EPOLL_CREATE,
         nr::EPOLL_WAIT,
+        nr::OPEN,
     ];
     let mut i = 0;
     while i < all.len() {
