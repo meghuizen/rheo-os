@@ -399,11 +399,66 @@ feature.
 ## 4. Compatibility gap: unmodified Claude Code
 
 The binding goal. **Claude Code is no longer Node**: since v2.1.113 it ships as a
-Bun-compiled native ELF (JavaScriptCore), ~100 MB, dynamically-linked glibc,
-AVX2 baseline; npm only bootstraps it. Two immediate consequences: **Bun has no
-riscv64 build**, so the three-ISA invariant cannot hold for this goal
-(x86-64 + aarch64, riscv64 skip-with-reason); and `io_uring` is no longer a
-blocker (Bun >= 1.0.16 uses epoll).
+Bun-compiled native ELF (JavaScriptCore), dynamically-linked glibc; npm only
+bootstraps it. Two immediate consequences: **Bun has no riscv64 build**, so the
+three-ISA invariant cannot hold for this goal (x86-64 + aarch64, riscv64
+skip-with-reason); and `io_uring` is no longer a blocker (Bun >= 1.0.16 uses
+epoll).
+
+### 4.0 The binary, measured
+
+Everything below used to be estimated from the package description. It is now
+**measured against the real artifact** - `@anthropic-ai/claude-code-linux-x64`
+**2.1.220**, fetched from the npm registry, `readelf`'d, and `strace`'d running
+`claude --version` to completion on this host. The estimates were wrong in ways
+that change the plan, which is the reason to measure before building.
+
+| Property | Measured | Previously assumed |
+|---|---|---|
+| Size | **275,012,592 B (262 MiB)** | "~100 MB" - **2.6x under** |
+| ELF type | **`ET_EXEC`, non-PIE**, with `PT_INTERP` | (unstated) - the L2 stock-base path, not the L7 PIE path |
+| Base VA | `0x200000` (2 MiB) | (unstated) |
+| Interpreter | `/lib64/ld-linux-x86-64.so.2` (glibc) | glibc - correct |
+| `PT_LOAD` memsz | 25.2 MiB `R` + 55.2 MiB `RX` + **182 MiB `RW`** = **262 MiB** | (unstated) |
+| `PT_GNU_STACK` memsz | **`0xc35000` = 12.8 MiB** | (unstated) |
+| `PT_TLS` | filesz `0x23b8`, memsz `0x69f1` (has `.tbss`) | (unstated) |
+| Distinct startup syscalls | **41** | (unstated) |
+| SIMD | AVX2 **and AVX-512** (`vmovdqu64` x857) | "AVX2 baseline" - **AVX-512 not expected** |
+
+Four blockers follow, and they are now facts rather than predictions:
+
+1. **The stack is too small by 4.8 MiB.** `PT_GNU_STACK` asks for 12.8 MiB;
+   `stack::LINUX_STACK_PAGES` is 2048 = **8 MiB**. One constant, and the *first*
+   thing that would fail.
+2. **262 MiB of eagerly-copied private frames** against a 384 MiB per-cell budget
+   and a 512 MiB pool. It fits arithmetically and leaves almost nothing for the
+   heap, `ld.so`, `libc.so.6` or 182 MiB of `.bss`. On Linux those pages are
+   demand-paged from the file and most are never touched; here `mmap` of a file
+   reads every page eagerly. This is **exactly** what demand paging (blocker 3)
+   deletes, and it is why that rung comes before any attempt to run this.
+3. **Seven syscalls the personality does not dispatch**, measured from the real
+   startup trace rather than guessed:
+
+   | Syscall | Calls | Notes |
+   |---|---|---|
+   | `open` (x86-64 legacy **2**) | 2 | **A genuine defect of the two-numbers class** (`ENGINEERING.md` §11): glibc issues legacy `open` in preference to `openat`, and the personality implements only `openat`. The same trap that made `readlink` fail on x86-64 alone |
+   | `clone3` | 5 | Constant defined, never dispatched. glibc falls back to `clone` on `-ENOSYS`, so refusing honestly is correct and sufficient |
+   | `rseq` | 6 | Constant defined, never dispatched. Restartable sequences; `-ENOSYS` is the documented fallback |
+   | `sched_setscheduler` | 4 | No constant. JSC sets thread priorities; failure is non-fatal |
+   | `sysinfo` | 2 | No constant. Bun reads total/free memory to size its heap |
+   | `eventfd2` | 1 | No constant. **The epoll event loop's wakeup fd** - this one is load-bearing, not advisory |
+   | `close_range` | 1 | No constant. glibc falls back to a `close` loop |
+
+4. **AVX-512 is in the binary.** QEMU 8.2 TCG exposes AVX2 but not AVX-512
+   (docs/TILES.md 4, measured there). Whether that is fatal depends on whether
+   those 857 instructions sit behind JSC's runtime CPU dispatch - which has not
+   been established and must not be assumed either way.
+
+**What is *not* a blocker, contrary to the earlier note here**: the 120 s test
+timeout is an `xtask` constant, not a property of the world, and a `--version`
+run costs well under a second of syscall time on the host. The KVM lane (§4.1)
+matters for *interactive* rungs, not for proving that the binary loads and
+starts.
 
 Three blockers are **design decisions**, not unfinished work:
 
