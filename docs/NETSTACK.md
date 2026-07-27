@@ -1442,17 +1442,20 @@ receive wait genuinely takes the timer-slice path there (300+ real `wfi` halts p
 asserted); once the NIC line is up those ISAs rightly prefer the indefinite 0%-CPU park.
 x86-64 has no NIC line, so it stays in this mode.
 
-x86-64's *NIC* interrupt is a documented gap, not a claim. The NIC there is driven
-*entirely through PCI configuration space* because PVH boot has no firmware to program
-BARs - so there is no mapped BAR to hold an MSI-X table - and legacy INTx would ride
-the same IOAPIC path that, under QEMU TCG + `kernel-irqchip=split`, does not re-deliver
-reliably (the same reason the x86-64 UART RX line stays a poll, docs/LIBRHEO.md Phase
-D). Its **LAPIC timer, however, is genuinely interrupt-driven** (docs/SMP.md phase 1,
-over xAPIC MMIO), which is exactly what the timer-backed mode uses: x86-64 *can* idle,
-it just cannot idle on the NIC. **Programming the MSI-X table through the config
-tunnel** (the table lives in a BAR the tunnel can reach) remains the specific next
-step, and would move x86-64 from `TimerIdle` to `NicInterrupt`; docs/SMP.md 8 records
-what re-examining it on a working APIC found.
+x86-64's *NIC* interrupt is a documented gap, not a claim - and docs/SMP.md 8 narrowed
+what the gap actually is. The NIC there is driven *entirely through PCI configuration
+space* because PVH boot has no firmware to program BARs, so no BAR is assigned to hold
+an MSI-X table. The **second** half of the old justification - that legacy INTx would
+ride an IOAPIC path which, under QEMU TCG + `kernel-irqchip=split`, "does not
+re-deliver reliably" - is **disproved**: the x86-64 UART RX line now runs through that
+exact path (IO-APIC GSI 4 -> LAPIC vector), verified end to end at bring-up. And the
+first half is not an impossibility either, since `hw::assign_pci_bars` +
+`arch::mmio_map_window` already assign and map real BARs for the GPU work
+(docs/GPU-HARDWARE.md 12). What remains is ordinary driver work, not a platform limit:
+assign the virtio-net BAR, program the MSI-X table (or discover the q35 INTx routing),
+and wire the vector. Its **LAPIC timer, however, is genuinely interrupt-driven**
+(docs/SMP.md 5, over xAPIC MMIO), which is exactly what the timer-backed mode uses:
+x86-64 *can* idle, it just cannot yet idle on the NIC.
 
 Reporting stays deliberately unblurred: `net_rx::interrupt_driven()` means **"the NIC
 RX interrupt is wired"** and nothing else (false on x86-64); `net_rx::did_idle()` means
@@ -1655,7 +1658,7 @@ read as already expired. Consequences, now fixed or disclosed:
 - `SYS_ARM_TIMER` returned **immediately** on x86-64: a cell's `time::sleep(1s)` did
   not sleep. It now takes the cooperative deadline check and waits the real duration.
 - the receive wait's "timer-backed idle, ~1% duty cycle" was a spin that reported
-  `did_idle() == true`. It is now `IdleMode::Poll` - the CPU spins, reported, never
+  `did_idle() == true`. It became `IdleMode::Poll` - the CPU spins, reported, never
   claimed.
 - `arch::enable_timer_irq()` on x86-64 now **probes**: arm a one-shot, briefly unmask,
   and set `TIMER_ENABLED` only if the interrupt actually arrives (bounded by a 20 ms
@@ -1990,11 +1993,11 @@ service cell.
 A remote receive blocks in **`net_rx::wait_frame_slice`** - the N2d
 park-until-frame primitive with a deadline. On **riscv64/aarch64** the kernel
 genuinely halts at WFI until the NIC's RX interrupt fires; on **x86-64** there is no
-NIC RX interrupt (its NIC is virtio-pci through the config tunnel: no mapped BAR for an
-MSI-X table, and legacy INTx rides the QEMU-TCG IOAPIC path that does not re-deliver),
-so the wait takes the honest **bounded poll** - the CPU spins, with the caller's
-deadline still honoured to the nanosecond. (It was documented here as a timer-backed
-idle; N2h verified that claim and found the x86-64 LAPIC one-shot inert under QEMU TCG.)
+NIC RX interrupt (its NIC is virtio-pci through the config tunnel, with no BAR assigned
+to hold an MSI-X table), so the wait takes the **timer-backed idle** - a real `hlt`
+between receive-queue polls, with the caller's deadline honoured to the nanosecond. That
+mode has been wrong in both directions once: claimed on an inert LAPIC, correctly
+demoted by N2h to a bounded spin, and restored as a *measured* halt by docs/SMP.md 5.
 Identical honesty to §16, which has the per-ISA table.
 
 ### What is on the wire
@@ -2354,7 +2357,7 @@ Postures: the codecs and state machines are **always compiled** (pure parsing ov
 N4c's drivers wait for frames, and that is where the phase found a real defect. The
 first cut took a **drain count** (`claim(ll, polls_per_probe, ..)`,
 `mdns::query(.., polls)`, `dhcp::RECV_POLLS`), which cannot mean the same thing twice:
-one "drain" is an interrupt park on riscv64/aarch64 and a poll on x86-64, so the same
+one "drain" is a NIC-interrupt park on riscv64/aarch64 and a timer-backed idle on x86-64, so the same
 number bought a different amount of listening - and an unbounded amount of CPU - per
 ISA. Every such parameter is now a **duration** in nanoseconds, implemented over
 `wire::recv_frame_timeout` -> `librheo::net::recv_timeout` -> `SYS_WAIT_NET`, i.e. a

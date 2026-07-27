@@ -378,6 +378,90 @@ because it would move the PSCI helper out of the `smp` cargo feature and change 
 kernel's inventory. The bring-up driver meanwhile synthesises the target id (`boot + 1`)
 for exactly this case, which is why a genuine attempt was possible at all.
 
+## 8. Re-examining the x86-64 device interrupts
+
+Both x86-64 device-interrupt verdicts in this tree - the UART RX line and the NIC RX
+line - rested, wholly or partly, on the inert APIC. With a working one they had to be
+re-tested rather than inherited.
+
+### UART RX: the old verdict was wrong, and it now works
+
+**The old verdict** (docs/LIBRHEO.md Phase D): "q35 routes COM1's ISA IRQ 4 through
+the emulated IO-APIC, but under QEMU TCG + `kernel-irqchip=split` the LAPIC's ISR/IRR
+are not modeled (they read 0) and an IO-APIC-routed line delivers the first byte but
+does not reliably re-trigger."
+
+**Why it was wrong:** every one of those observations was made through the x2APIC MSR
+block. With no working EOI the first interrupt genuinely *is* the last - the in-service
+bit is never cleared, so the LAPIC never accepts another interrupt at that priority.
+"Does not re-deliver" was a symptom of the missing EOI, not a property of the IO-APIC.
+
+**What is there now:** `enable_uart_rx_irq` programs the IO-APIC redirection entry for
+GSI 4 (vector 0x21, fixed delivery, physical destination = the boot CPU's APIC id,
+active-high, edge-triggered, unmasked), enables the 16550's OUT2 gate and its
+received-data-available interrupt, installs the vector, and the handler drains the
+whole FIFO before EOI'ing the LAPIC. Draining in a loop matters for an edge-triggered
+line: a byte that arrived while the vector was being taken would otherwise sit in the
+FIFO with no new edge to announce it.
+
+**And it is probed, not asserted.** Bring-up puts the 16550 in loopback and writes a
+byte, then briefly unmasks and requires a counter that *only the interrupt vector*
+touches to move. `uart_irq_enabled()` is set only then; otherwise the redirection entry
+is re-masked, the device interrupt disabled, and the poll path kept - reported, never
+claimed. The probe's own byte is discarded by the handler so it cannot reach the console
+ring.
+
+**Observed** (`librheoterm`, x86_64): `UART RX interrupt verified over the IO-APIC
+(GSI 4 -> vector 0x21, xAPIC (MMIO) EOI) - a real interrupt arrived`, then `input mode:
+interrupt-driven (WFI idle)` and `idle-park proven (kernel idled at WFI, woke on UART
+IRQ)`. So `input::interrupt_driven()` is now **true on all three ISAs**.
+
+**One respect in which x86-64 is now the *best* of the three.** RISC-V and ARM64 both
+carry a documented QEMU caveat here: their loopback does not drive the
+interrupt-controller input line, so the deterministic test raises the controller line
+directly (the RISC-V IMSIC MSI, `GICD_ISPENDR` for the ARM SPI). On x86-64 QEMU's 16550
+loopback both delivers the byte into the receive FIFO **and** raises the ISA line, so
+the test exercises the entire device -> IO-APIC -> LAPIC -> vector -> EOI path with
+nothing poked by hand.
+
+### NIC RX: the gap is narrower than the old wording, and is still a gap
+
+**The old verdict** (docs/NETSTACK.md 16): the virtio-net NIC is driven entirely
+through the `VIRTIO_PCI_CAP_PCI_CFG` config tunnel because PVH boot has no firmware to
+program BARs, "so there is no mapped BAR to hold an MSI-X table, and legacy INTx would
+ride the same IOAPIC path that does not re-deliver reliably".
+
+**What re-examination establishes:**
+
+- the **second** clause is **disproved**. That IOAPIC path demonstrably re-delivers -
+  the UART RX line runs through it, verified end to end. Any future INTx attempt is no
+  longer blocked by this reasoning.
+- the **first** clause is no longer an impossibility either. BAR assignment and mapping
+  already exist and are already used: `hw::assign_pci_bars` programs BARs from a per-ISA
+  host-bridge window and `arch::mmio_map_window` maps them, which is how the AMD GPU's
+  framebuffer aperture is driven (docs/GPU-HARDWARE.md 12). The virtio-net driver
+  *chooses* not to need a BAR, which is a driver decision, not a platform limit.
+
+**What is therefore honestly true:** x86-64 still has **no NIC RX interrupt**, and the
+remaining work is ordinary driver work - assign the virtio-net BAR, program its MSI-X
+table (or discover the q35 INTx routing), wire the vector - not a QEMU or platform
+blocker. It is **not attempted here**: a claim about this line has to be earned by a
+probe of its own, exactly like the UART's, and inheriting one from the UART's success
+would be the same mistake in the other direction. `net_rx::interrupt_driven()` stays
+false on x86-64, and the receive wait keeps `IdleMode::TimerIdle` - a real `hlt`
+between polls, with the halts counted.
+
+### Interrupt tally after this phase
+
+| source | riscv64 | aarch64 | x86-64 |
+|---|---|---|---|
+| **UART RX** (console) | AIA: APLIC-S -> IMSIC -> `sip.SEIP` | GICv3 SPI 33 | **IO-APIC GSI 4 -> LAPIC vector 0x21** (new) |
+| **one-shot timer** | Sstc `stimecmp` | CNTV via GICv3 | **LAPIC LVT one-shot over xAPIC MMIO** (new) |
+| **NIC RX** | APLIC-S `1+slot` -> IMSIC | GICv3 SPI `16+slot` | **none** - the one remaining gap |
+
+Every entry is verified at bring-up by an interrupt the kernel took, on a counter only
+the interrupt vector writes.
+
 ## 9. What is proven vs deferred
 
 **Proven**
@@ -391,8 +475,8 @@ for exactly this case, which is why a genuine attempt was possible at all.
   things a primary looping through the same code could not produce.
 - A **probed**, not assumed, x86-64 APIC access mode and ARM64 PSCI conduit; both
   print what answered.
-- A genuinely interrupt-driven one-shot timer on all three ISAs, verified at
-  bring-up by an interrupt the kernel took (section 5).
+- A genuinely interrupt-driven one-shot timer **and** UART RX line on all three ISAs,
+  each verified at bring-up by an interrupt the kernel actually took (sections 5, 8).
 
 **Deferred**
 - Preemptive multi-core scheduling (the runtime stays single-CPU cooperative;
@@ -413,3 +497,6 @@ for exactly this case, which is why a genuine attempt was possible at all.
 - Cross-CPU IPIs for anything beyond bring-up (the natural next users are a per-CPU
   timer arbiter and a remote-TLB shootdown; docs/NETSTACK.md 16 notes the arbiter
   shape).
+- The **x86-64 NIC RX interrupt** - the last interrupt source any ISA is missing.
+  Section 8 records why the old justification no longer holds and what is actually
+  left to do.

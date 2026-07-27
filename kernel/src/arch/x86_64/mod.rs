@@ -156,8 +156,9 @@ const APIC_BASE_EXTD: u64 = 1 << 10;
 /// LAPIC register offsets in the xAPIC MMIO page (Intel SDM vol 3, table 11-1).
 /// The x2APIC MSR for the same register is `0x800 + (offset >> 4)`, which is what
 /// makes one set of constants serve both access modes.
-/// (`LAPIC_ID` and the ICR pair, which only AP bring-up needs, are defined with
-/// the `smp` feature's code below so a non-SMP build carries nothing unused.)
+/// (The ICR pair, which only AP bring-up needs, is defined with the `smp`
+/// feature's code below so a non-SMP build carries nothing unused.)
+const LAPIC_ID: usize = 0x020;
 const LAPIC_EOI: usize = 0x0B0;
 const LAPIC_TPR: usize = 0x080;
 const LAPIC_SVR: usize = 0x0F0;
@@ -195,9 +196,10 @@ static mut APIC_MODE: ApicMode = ApicMode::None;
 /// Kernel VA of the mapped local APIC register page (xAPIC mode only).
 static mut LAPIC_VA: usize = 0;
 
-/// Chosen interrupt vectors: LAPIC timer 0x20, LAPIC spurious 0xFF (both above
-/// the 32 CPU-exception vectors).
+/// Chosen interrupt vectors: LAPIC timer 0x20, UART RX 0x21, LAPIC spurious 0xFF
+/// (all above the 32 CPU-exception vectors).
 const VEC_TIMER: usize = 0x20;
+const VEC_UART: usize = 0x21;
 const VEC_SPURIOUS: usize = 0xFF;
 
 static mut TIMER_ENABLED: bool = false;
@@ -239,38 +241,211 @@ fn lapic_write(reg: usize, value: u32) {
 
 unsafe extern "C" {
     fn timer_irq_stub();
+    fn uart_irq_stub();
     fn spurious_irq_stub();
 }
 
-/// Whether the UART RX interrupt is wired (false = poll path). x86-64 polls (see
-/// the seam comment: the QEMU TCG IOAPIC/LAPIC does not re-deliver reliably).
-pub fn uart_irq_enabled() -> bool {
-    false
-}
-/// Bring up the UART RX interrupt - x86-64 stays on the poll path (see the seam
-/// comment). Called only by the Phase D test.
-pub fn enable_uart_rx_irq() {}
-/// Halt until the UART RX interrupt (only called when `uart_irq_enabled`, i.e.
-/// never on x86-64).
-pub fn idle_wait() {}
-/// Deliver a scripted byte through the UART RX interrupt (only called when
-/// `uart_irq_enabled`, i.e. never on x86-64).
-pub fn uart_inject_and_wait(_b: u8) {}
+// ------------------------------------------------- UART RX over the IO-APIC
+// docs/SMP.md 8, docs/LIBRHEO.md Phase D. COM1's ISA IRQ 4 is routed by the
+// emulated IO-APIC to a LAPIC vector. This was documented as poll-only on the
+// grounds that "under QEMU TCG + kernel-irqchip=split the LAPIC's ISR/IRR are not
+// modeled (they read 0) and an IO-APIC-routed line does not reliably re-trigger".
+// That diagnosis was made **through the inert x2APIC MSR block** (see the LAPIC
+// section above): with no working EOI the first interrupt would indeed be the last,
+// because the in-service bit is never cleared. With the APIC reached over xAPIC
+// MMIO the whole chain is testable, so bring-up now **probes it end to end** and
+// reports what happened.
 
-/// Whether the virtio-net RX interrupt is wired - **false on x86-64** (honest).
+/// IO-APIC register window (Intel ICH/82093AA): an index register and a data
+/// window. Offsets are into the mapped APIC window, whose base *is* the IO-APIC.
+const IOAPIC_REGSEL: usize = 0x00;
+const IOAPIC_IOWIN: usize = 0x10;
+/// Redirection-table entry `n` occupies index `0x10 + 2n` (low) and `+1` (high).
+const IOAPIC_REDTBL: u32 = 0x10;
+/// COM1 is ISA IRQ 4, and q35 wires GSI 4 to IO-APIC pin 4 (`gsi_handler` sends
+/// every ISA line to both the i8259 - masked here - and the IO-APIC). The ACPI
+/// MADT's interrupt-source-override table is **not** consulted; the only override
+/// QEMU emits is IRQ 0 -> GSI 2, which does not affect this line. Stated because
+/// it is an assumption, not a discovery.
+const UART_GSI: u32 = 4;
+
+/// Base of the mapped IO-APIC register page, or 0 if the APIC window is not up.
+static mut IOAPIC_VA: usize = 0;
+static mut UART_ENABLED: bool = false;
+/// UART RX interrupts observed, incremented **only** inside the interrupt vector -
+/// the unfakeable evidence the bring-up probe rests on.
+static UART_FIRES: AtomicU64 = AtomicU64::new(0);
+/// While set, the handler drains the UART byte and **discards** it, so the
+/// bring-up probe's own byte never reaches the console ring.
+static mut UART_PROBING: bool = false;
+
+/// SAFETY: `IOAPIC_VA` must be the mapped IO-APIC page.
+unsafe fn ioapic_write(index: u32, value: u32) {
+    unsafe {
+        let base = *core::ptr::addr_of!(IOAPIC_VA);
+        ((base + IOAPIC_REGSEL) as *mut u32).write_volatile(index);
+        ((base + IOAPIC_IOWIN) as *mut u32).write_volatile(value);
+    }
+}
+
+/// Whether the UART RX interrupt is wired **and verified to fire** (false = the
+/// honest poll path). Set by [`enable_uart_rx_irq`] only after the probe below has
+/// seen a real interrupt arrive through the IO-APIC.
+pub fn uart_irq_enabled() -> bool {
+    // SAFETY: single CPU; set once at bring-up.
+    unsafe { *core::ptr::addr_of!(UART_ENABLED) }
+}
+
+/// Bring up the UART RX interrupt (IO-APIC GSI 4 -> LAPIC vector 0x21) **and
+/// verify it end to end**. Called only by the Phase D test, so no other kernel is
+/// affected.
+///
+/// The probe is the point (docs/ENGINEERING.md 1). It puts the 16550 into loopback
+/// and writes a byte, which QEMU's serial model delivers into the receive FIFO and
+/// raises the ISA line for - so a successful probe exercises the *entire* chain the
+/// real path uses: device line -> IO-APIC redirection entry -> LAPIC -> IDT vector
+/// -> handler -> EOI. `UART_ENABLED` is set only if [`UART_FIRES`], which nothing
+/// but the interrupt vector touches, actually moved.
+pub fn enable_uart_rx_irq() {
+    lapic_probe();
+    if apic_mode() == ApicMode::None {
+        crate::println!(
+            "x86-64: no usable local APIC, so no UART RX interrupt - console input polls"
+        );
+        return;
+    }
+    // The APIC window's base is the IO-APIC page; the local APIC sits 2 MiB in.
+    // SAFETY: single CPU at bring-up; `apic_map_window` is idempotent.
+    unsafe { *core::ptr::addr_of_mut!(IOAPIC_VA) = apic_map_window() };
+    set_idt_gate(VEC_UART, uart_irq_stub as *const () as u64);
+
+    // SAFETY: kernel context; IO-APIC MMIO + 16550 port I/O.
+    unsafe {
+        // Redirection entry: vector 0x21, fixed delivery, physical destination,
+        // active-high, edge-triggered, unmasked; destination = this CPU's APIC id.
+        ioapic_write(IOAPIC_REDTBL + 2 * UART_GSI + 1, lapic_id() << 24);
+        ioapic_write(IOAPIC_REDTBL + 2 * UART_GSI, VEC_UART as u32);
+        // 16550: OUT2 gates the IRQ (QEMU's model checks it), ERBFI enables the
+        // received-data-available interrupt.
+        outb(COM1 + 4, 0x08); // MCR: OUT2
+        outb(COM1 + 1, 0x01); // IER: ERBFI
+    }
+
+    // --- the self-test: does a received byte actually raise the interrupt? ---
+    UART_FIRES.store(0, Ordering::Relaxed);
+    // SAFETY: kernel context; the probe byte is discarded by the handler.
+    let usable = unsafe {
+        *core::ptr::addr_of_mut!(UART_PROBING) = true;
+        let t0 = cycles();
+        outb(COM1 + 4, 0x18); // MCR: OUT2 + LOOP
+        outb(COM1, b'\0'); // received into the RX FIFO by loopback
+        outb(COM1 + 4, 0x08); // drop loopback
+        asm!("sti");
+        while UART_FIRES.load(Ordering::Relaxed) == 0
+            && ticks_to_ns(cycles().wrapping_sub(t0)) < PROBE_WINDOW_NS
+        {
+            core::hint::spin_loop();
+        }
+        asm!("cli");
+        *core::ptr::addr_of_mut!(UART_PROBING) = false;
+        UART_FIRES.load(Ordering::Relaxed) > 0
+    };
+    // SAFETY: single CPU; set once before any cell runs.
+    unsafe { *core::ptr::addr_of_mut!(UART_ENABLED) = usable };
+    if usable {
+        crate::println!(
+            "x86-64: UART RX interrupt verified over the IO-APIC (GSI {UART_GSI} -> vector \
+             {VEC_UART:#x}, {} EOI) - a real interrupt arrived",
+            apic_mode().name()
+        );
+    } else {
+        // Leave the line masked so a half-working route cannot surprise a later
+        // `sti` (the timer's idle path enables interrupts).
+        // SAFETY: kernel context; mask the redirection entry again.
+        unsafe {
+            ioapic_write(IOAPIC_REDTBL + 2 * UART_GSI, (1 << 16) | VEC_UART as u32);
+            outb(COM1 + 1, 0x00); // IER: no interrupts
+        }
+        crate::println!(
+            "x86-64: UART RX interrupt did not arrive through the IO-APIC (APIC access: {}) - \
+             console input polls, reported not claimed",
+            apic_mode().name()
+        );
+    }
+}
+
+/// The UART RX interrupt handler (called from `uart_irq_stub`): drain every byte
+/// the 16550 has into the portable RX ring, then EOI. Draining in a loop matters
+/// for an edge-triggered line - a byte that arrived while the vector was being
+/// taken would otherwise sit in the FIFO with no new edge to announce it.
+#[unsafe(no_mangle)]
+extern "C" fn x86_uart_irq() {
+    UART_FIRES.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: single CPU; a plain static read.
+    let probing = unsafe { *core::ptr::addr_of!(UART_PROBING) };
+    while let Some(b) = serial_read_byte() {
+        if !probing {
+            crate::input::rx_push(b);
+        }
+    }
+    lapic_write(LAPIC_EOI, 0);
+}
+
+/// Halt until the UART RX interrupt delivers a byte (only called when
+/// [`uart_irq_enabled`]): the standard enable-halt-disable idle idiom, so this is a
+/// genuine 0%-CPU park.
+pub fn idle_wait() {
+    // SAFETY: kernel context; the standard enable-halt-disable idle idiom.
+    unsafe { asm!("sti; hlt; cli", options(nomem, nostack)) };
+}
+
+/// Deliver a scripted byte through the **real** UART RX interrupt, halting at `hlt`
+/// until it is taken - the same path a live keystroke takes. Used by the
+/// deterministic Phase D test.
+///
+/// The byte goes in by 16550 loopback, which is a genuine receive: QEMU's serial
+/// model puts it in the receive FIFO and raises the ISA line, so the IO-APIC and
+/// the LAPIC do the same work they do for a typed character. (RISC-V and ARM64 have
+/// to raise their interrupt-controller input directly here, because QEMU's
+/// 16550/PL011 loopback does not drive those controllers' lines; on x86 it does,
+/// which is what makes this the more complete of the three.)
+pub fn uart_inject_and_wait(b: u8) {
+    // SAFETY: kernel context; 16550 port I/O + the unmask/halt/mask idiom.
+    unsafe {
+        outb(COM1 + 4, 0x18); // MCR: OUT2 + LOOP
+        outb(COM1, b); // received into the RX FIFO
+        outb(COM1 + 4, 0x08); // drop loopback (the byte stays in the FIFO)
+        asm!("sti; hlt; cli", options(nomem, nostack));
+    }
+}
+
+/// Whether the virtio-net RX interrupt is wired - **false on x86-64** (honest), and
+/// the one interrupt source this ISA still lacks (docs/SMP.md 8).
+///
 /// The NIC here is virtio-*pci* driven entirely through PCI config space (the
 /// `VIRTIO_PCI_CAP_PCI_CFG` tunnel, because PVH boot has no firmware to program
-/// BARs), so there is no mapped BAR to hold an MSI-X table, and legacy INTx would
-/// ride the same IOAPIC path that does not re-deliver reliably under QEMU TCG +
-/// `kernel-irqchip=split` (see the seam comment above).
+/// BARs), so **no BAR is assigned** to hold an MSI-X table. That is the whole of the
+/// remaining gap, and it is driver work rather than a platform limit:
 ///
-/// The **timer** interrupt here *is* genuine (the LAPIC one-shot below), so
-/// `SYS_WAIT_NET` does not spin: it takes the timer-backed idle mode
-/// (`net_rx::IdleMode::TimerIdle`) - poll the receive queue, halt at `hlt` for one
-/// short timer slice, re-poll - a real halt at a low duty cycle, honoured against the
-/// caller's deadline. It is reported as timer-backed, never as NIC-interrupt-driven
-/// (docs/NETSTACK.md 16 has the per-ISA table). Programming MSI-X through the config
-/// tunnel is the documented next step.
+/// - the old second half of this justification - "legacy INTx would ride an IOAPIC
+///   path that does not re-deliver reliably under QEMU TCG" - is **disproved**: the
+///   UART RX line above runs through exactly that path, verified end to end. The
+///   original observation had been made through the inert x2APIC MSR block, where a
+///   missing EOI genuinely makes the first interrupt the last;
+/// - and BAR assignment is not impossible either - `hw::assign_pci_bars` +
+///   `arch::mmio_map_window` already assign and map real BARs for the GPU work
+///   (docs/GPU-HARDWARE.md 12).
+///
+/// What is left is: assign the virtio-net BAR, program its MSI-X table (or discover
+/// the q35 INTx routing), and wire the vector. Not attempted here - a claim about
+/// this line has to be earned by a probe like the UART's, not by inheriting one.
+///
+/// Meanwhile the **timer** interrupt is genuine, so `SYS_WAIT_NET` does not spin: it
+/// takes the timer-backed idle mode (`net_rx::IdleMode::TimerIdle`) - poll the
+/// receive queue, halt at `hlt` for one timer slice, re-poll - a real halt at a low
+/// duty cycle, honoured against the caller's deadline. It is reported as
+/// timer-backed, never as NIC-interrupt-driven (docs/NETSTACK.md 16 has the per-ISA
+/// table).
 pub fn net_irq_enabled() -> bool {
     false
 }
@@ -280,8 +455,9 @@ pub fn net_irq_pending() -> bool {
     false
 }
 
-/// Bring up the virtio-net RX interrupt - x86-64 stays on the poll path (see
-/// [`net_irq_enabled`]). Returns false: not wired.
+/// Bring up the virtio-net RX interrupt - not wired on x86-64 (see
+/// [`net_irq_enabled`]). Returns false, so the portable wait picks its next-best
+/// mode (the timer-backed idle) rather than claiming a NIC park.
 pub fn enable_virtio_net_irq(_slot: usize) -> bool {
     false
 }
@@ -781,8 +957,6 @@ fn publish_ap_mode() {
 
 /// LAPIC registers only AP bring-up needs (see the register table above).
 #[cfg(feature = "smp")]
-const LAPIC_ID: usize = 0x020;
-#[cfg(feature = "smp")]
 const LAPIC_ICR_LOW: usize = 0x300;
 #[cfg(feature = "smp")]
 const LAPIC_ICR_HIGH: usize = 0x310;
@@ -791,7 +965,6 @@ const LAPIC_ICR_HIGH: usize = 0x310;
 /// register file answers at the same address (QEMU maps the APIC page per-CPU, as
 /// real hardware does), so this is a genuine hardware identity and not something
 /// the primary told the secondary. In xAPIC the id is in bits 24-31.
-#[cfg(feature = "smp")]
 fn lapic_id() -> u32 {
     match apic_mode() {
         ApicMode::XApic => lapic_read(LAPIC_ID) >> 24,

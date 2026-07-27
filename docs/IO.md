@@ -26,8 +26,9 @@ library level.
     interrupts**. A native cell blocking on console input (`SYS_WAIT_INPUT`)
     parks, and the kernel idles at `wfi`/`hlt` until the **UART RX interrupt**
     delivers a byte (RISC-V S-mode external via the AIA IMSIC; ARM64 PL011 SPI
-    via the GICv3; x86-64 still polls - its QEMU TCG split-irqchip IOAPIC/LAPIC
-    does not re-deliver reliably). A cell blocking on a deadline (`SYS_ARM_TIMER`)
+    via the GICv3; **x86-64** via the IO-APIC to a LAPIC vector, since docs/SMP.md 8
+    retired the "the TCG IOAPIC/LAPIC does not re-deliver" diagnosis - it had rested
+    on the inert x2APIC block). A cell blocking on a deadline (`SYS_ARM_TIMER`)
     parks until the **timer interrupt** fires - a genuine 0%-CPU park on **all three
     ISAs**: RISC-V Sstc `stimecmp`, ARM64 CNTV virtual timer via the GICv3, and the
     x86-64 LAPIC one-shot reached over the **xAPIC MMIO** page (docs/SMP.md phase 1;

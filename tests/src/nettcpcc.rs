@@ -111,6 +111,16 @@ fn pacer_arbiter_phase() {
     ktimer::register(TimerClient::NetTimer, d_net);
     ktimer::register(TimerClient::CellSleep, d_sleep);
 
+    // The two long deadlines must survive every pacer release - but "survive" means
+    // "is not marked due before its own time", which is the arbiter's guarantee. It
+    // is not "is still pending after 40 halts", because under emulation those halts
+    // can overshoot: QEMU is an ordinary host process and a loaded host can
+    // deschedule it for milliseconds, so 40 nominally-200-us releases may genuinely
+    // run past the 20 ms RTO, at which point marking it due is *correct*. Checking
+    // against each client's own deadline asserts the property instead of a timing
+    // coincidence (docs/ENGINEERING.md 4, 10); a *lost* deadline never becomes due at
+    // any elapsed time, and `preserved()` below counts the survivals directly.
+    let mut checked = 0u64;
     for i in 0..PACES {
         ktimer::register(TimerClient::Pacer, pace_ns);
         while !ktimer::expired(TimerClient::Pacer) {
@@ -118,16 +128,29 @@ fn pacer_arbiter_phase() {
                 arch::spin_loop(1);
             }
         }
-        // The two long deadlines survived this release - and every one before it.
-        assert!(
-            ktimer::pending(TimerClient::NetTimer) && !ktimer::expired(TimerClient::NetTimer),
-            "pacer release {i} lost the 20 ms network deadline"
-        );
-        assert!(
-            ktimer::pending(TimerClient::CellSleep) && !ktimer::expired(TimerClient::CellSleep),
-            "pacer release {i} lost the 40 ms cell-sleep deadline"
-        );
+        let elapsed = ktimer::now_ns().wrapping_sub(t0);
+        if elapsed < d_net {
+            assert!(
+                ktimer::pending(TimerClient::NetTimer) && !ktimer::expired(TimerClient::NetTimer),
+                "pacer release {i} lost the 20 ms network deadline"
+            );
+            checked += 1;
+        }
+        if elapsed < d_sleep {
+            assert!(
+                ktimer::pending(TimerClient::CellSleep) && !ktimer::expired(TimerClient::CellSleep),
+                "pacer release {i} lost the 40 ms cell-sleep deadline"
+            );
+        }
     }
+    // The point of the phase is that a *continuously re-armed* client cannot destroy
+    // another's deadline, so the run is only meaningful if many releases happened
+    // while the RTO was genuinely outstanding.
+    assert!(
+        checked >= PACES / 2,
+        "only {checked} of {PACES} pacer releases landed inside the 20 ms RTO - the \
+         continuous-re-arm property was not exercised"
+    );
     let paced_span = ktimer::now_ns().wrapping_sub(t0);
     assert!(
         paced_span >= PACES * pace_ns,

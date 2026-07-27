@@ -36,6 +36,14 @@ same rule: the LAPIC tick-rate calibration busy-spun a fixed window *inside the
 first `timer_arm`*, so the first `sleep` on a fresh kernel had its whole deadline
 consumed by bring-up cost and reported no park. Bring-up cost belongs at bring-up.
 
+**And the invalidated conclusion was re-tested, not just flagged.** The x86
+UART/IOAPIC verdict turned out to be wrong: with a working EOI that path
+re-delivers, so the UART RX line is now interrupt-driven there too, probed by a
+loopback byte and a handler-only counter (docs/SMP.md 8). x86 AP bring-up was
+blocked by the *same* inert registers, since INIT-SIPI-SIPI goes through the
+interrupt command register - one root cause behind three "separate" blockers. When
+a capability lie is found, every conclusion that touched it is a suspect.
+
 **The good pattern, already in the tree.** The x86 FP/XSAVE bring-up enables
 `XCR0`, **reads it back, and records only the bits that stuck** - graceful
 fallback to `FXSAVE`/SSE when a component is dropped. Enable, verify, keep what
@@ -298,7 +306,70 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   `while let Some(x) = next()` never terminated. Split bounded from unbounded and
   assert the boundedness.
 
-## 12. The checklist
+## 12. Never dereference an address the caller chose
+
+**Rule.** A raw address supplied by a **cell** may never be dereferenced in
+kernel mode. It must first be bounded: non-null, correctly aligned for the type,
+`base + len` free of overflow, and wholly inside the calling cell's user VA
+range. A rejected address is a **refused syscall** - the appropriate error, no
+write, no read, no fault, no panic. A `SAFETY` comment on such a dereference must
+cite the check that ran, never the caller's good behaviour.
+
+**The case.** There was no `access_ok` equivalent anywhere in the tree. Every
+out-parameter syscall, every queue-payload VA and every buffer handed to a
+personality handler wrote or read straight through a cell-supplied address, while
+the kernel serviced the trap in S-mode/EL1/ring 0 **with the calling cell's root
+active** - and every cell root maps all of kernel RAM supervisor-RWX through the
+linear map. So `SYS_GRANT(out_va = <any kernel VA>, ...)` was a 16-byte arbitrary
+kernel write with a cell-steerable first word, reachable from one line of
+unprivileged code. The `SAFETY` comments said "`out_va` is a user VA in the
+running cell's active address space" - an assumption about the caller, written as
+if it were a fact about the code. Two length arguments (`readv`'s `iovcnt`,
+`poll`'s `nfds`) were likewise walked unbounded.
+
+Three consequences worth separating, because each needs its own kind of check:
+
+- **A cell-supplied address** needs a range check (this rule).
+- **A cell-supplied length** needs a *budget*: `SYS_MMAP` computed
+  `len.div_ceil(4096)` pages and looped the frame allocator, which ended in
+  `panic!("frame pool exhausted")` - so `mmap(1 << 40)` took the machine down.
+  ARCHITECTURE.md 5 forbids an OOM killer; an OOM **panic** is strictly worse.
+  Allocation on a path a cell can drive must be *refusable*, must be charged
+  against a per-cell limit, and must leave a global reserve the kernel's own
+  allocations draw from. A partial failure rolls back.
+- **A cell-supplied address that names a resource** needs an *ownership* check,
+  not just a range check. `SYS_MUNMAP` freed whatever the page tables gave back;
+  three frame sets in a cell's address space are not its own (a shared channel
+  ring, a peer's shared sealed grant, its own queue-pair region), so this was a
+  cross-cell use-after-free, and the second free tripped a "double free"
+  assertion: a kernel panic from unprivileged code.
+
+**The good pattern, already in the tree.** `grant_resolve` - the gate on
+`SYS_COMMIT`/`DECOMMIT`/`SEAL` - resolves a cell-supplied handle by *checking a
+live capability with the right it needs* before touching anything. F3 was not a
+failure of that pattern but a failure to **extend** it: `SYS_MUNMAP` now goes
+through the same call, and a peer's shared grant is refused for free, because the
+capability minted into the peer carries READ and not MAP.
+
+**Required practice.**
+- One validation helper, portable, allocation-free, on the syscall path: a null
+  test, an alignment test, an overflow-checked add and one or two compares. No
+  page-table walk per syscall (the P1 grant-check budget is < 50 ns p99).
+- Derive the bound from the ISA with the **narrowest** user half, so "below the
+  kernel half" holds everywhere, and pin every region base below it with a
+  `const` assertion, so moving a region cannot silently escape the bound.
+- Validate *before* any state changes. A refused call must consume no capability,
+  no table slot, no frame, and no admission budget.
+- Bound the whole surface at **one** place per ABI. Spreading the
+  number-to-pointer-argument map over dozens of handlers is exactly what let this
+  go unchecked; the Linux personality is bounded at its single dispatch point.
+- Where a length is itself an argument, use it: that bounds the array walk too.
+- Prove it from an unprivileged cell, against evidence the cell cannot fake - a
+  canary word in memory it has no mapping for, a frame-pool count, a resource
+  that still works after the refusal - and prove the legitimate path still works
+  in the same test.
+
+## 13. The checklist
 
 Applied to every slice of work, in order. This is the unified practice the rest
 of this document argues for.
@@ -315,17 +386,21 @@ of this document argues for.
 6. Keep changes additive so existing proofs remain valid unchanged.
 7. Concentrate `unsafe` in small blocks with a `SAFETY` comment; keep per-ISA
    code inside the arch layer.
+8. **Never dereference a cell-supplied address, and never allocate or free on a
+   cell-supplied length or handle, without a check** - range, budget, ownership
+   (section 12). A `SAFETY` comment states the check that ran, not the caller's
+   good behaviour.
 
 **Proving it**
-8. Deterministic core assertions, unfakeable evidence, adversarial rejections
+9. Deterministic core assertions, unfakeable evidence, adversarial rejections
    each with a distinct error.
-9. Probe every capability claim; record the validated value, not the requested
-   one.
-10. Live paths additive, degrading with a printed reason; nothing synthesised.
-11. Full matrix green on all three ISAs; every pre-existing test still passing;
+10. Probe every capability claim; record the validated value, not the requested
+    one.
+11. Live paths additive, degrading with a printed reason; nothing synthesised.
+12. Full matrix green on all three ISAs; every pre-existing test still passing;
     formatter and linter clean across the documented target set.
 
 **Reporting it**
-12. State scope precisely: built / proven / partially proven / deferred, with
+13. State scope precisely: built / proven / partially proven / deferred, with
     what would close each gap. Attribute external numbers. Correct the record -
     including the docs - when measurement contradicts an earlier claim.

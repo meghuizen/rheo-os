@@ -408,7 +408,8 @@ committed line is exact - on all three ISAs.
   until at least one console input byte is available, copies up to `len` bytes
   into the cell buffer, and returns the count (0 = end of input). The first
   block-and-wake: the kernel idles here (WFI where the UART RX interrupt is wired,
-  a poll otherwise). This is **mechanism** (the arm-doorbell / completion-delivery
+  a poll where none is - which is now no ISA in this tree). This is **mechanism**
+  (the arm-doorbell / completion-delivery
   the plan names), not a new kernel object - it passes the docs/ARCHITECTURE.md 6
   admission rule.
 - **a kernel-side RX ring** (`kernel/src/input.rs`, portable) - received bytes are
@@ -430,9 +431,9 @@ finally closed by a real wakeup.
 This is the kernel's first hardware interrupt, and it is boot-critical, so it was
 brought up one ISA at a time behind an explicit, opt-in enable
 (`arch::enable_uart_rx_irq`, called only by the Phase D test) - the other test
-kernels never touch it and run exactly as before. **UART RX is now
-interrupt-driven on RISC-V and ARM64**; x86-64 stays on the poll fallback (its
-QEMU TCG interrupt controller does not re-deliver reliably - see below).
+kernels never touch it and run exactly as before. **UART RX is interrupt-driven on
+all three ISAs** - RISC-V and ARM64 from this phase, x86-64 since docs/SMP.md 8
+retired the diagnosis that had made it poll-only (see below).
 
 - **RISC-V 64 - interrupt-driven.** QEMU `virt` with `aia=aplic-imsic` routes the
   16550 UART's IRQ (source 10) through the **AIA**: the S-mode APLIC
@@ -471,15 +472,26 @@ QEMU TCG interrupt controller does not re-deliver reliably - see below).
   interrupt the PL011 would raise on receive - and the handler pushes the carried
   byte to the ring. The GIC delivery, the `wfi` idle, and the wakeup are all
   genuine; a live keystroke takes the full PL011->GIC path.
-- **x86-64 - poll (honest).** q35 routes COM1's ISA IRQ4 through the emulated
-  IOAPIC, but under QEMU's TCG + `kernel-irqchip=split` the LAPIC's ISR/IRR are
-  not modeled (they read 0) and IPIs are not delivered, so an IOAPIC-routed line
-  delivers the first byte but does not reliably re-trigger, and the self-IPI the
-  RISC-V/ARM ports use as their deterministic-test analog does not fire at all.
-  Rather than fake it, `SYS_WAIT_INPUT` polls COM1 (the CPU spins - honest, not
-  0%-idle). `input::interrupt_driven()` reports false. (The x86-64 **timer** IS
-  interrupt-driven - the LAPIC LVT timer, a CPU-local source, works fine; only the
-  IOAPIC-routed UART line is affected.)
+- **x86-64 - interrupt-driven** (since docs/SMP.md 8; it was poll-only here, and the
+  reason turned out to be wrong). q35 routes COM1's ISA IRQ 4 through the emulated
+  IO-APIC to a LAPIC vector. This was documented as poll-only because "under QEMU's
+  TCG + `kernel-irqchip=split` the LAPIC's ISR/IRR are not modeled (they read 0) and
+  an IO-APIC-routed line delivers the first byte but does not reliably re-trigger".
+  Every one of those observations was made **through the inert x2APIC MSR block**
+  (docs/ENGINEERING.md 1) - and with no working EOI the first interrupt genuinely is
+  the last, because the in-service bit is never cleared. Once the LAPIC is reached
+  over its **xAPIC MMIO** page the whole chain works: the kernel programs the
+  IO-APIC redirection entry for GSI 4 (vector 0x21, physical destination = the boot
+  CPU's APIC id, edge-triggered), enables the 16550's OUT2 gate and ERBFI, and
+  drains the FIFO in the handler before EOI'ing the LAPIC. `SYS_WAIT_INPUT` is a
+  **genuine 0%-CPU park** at `hlt`, and `librheoterm` asserts the idle-park on this
+  ISA too.
+  *No QEMU caveat here, unlike the other two:* QEMU's 16550 loopback both delivers
+  the byte into the receive FIFO **and** raises the ISA line, so the deterministic
+  test exercises the full device -> IO-APIC -> LAPIC -> vector path rather than
+  poking the interrupt controller directly. Bring-up **probes** exactly that
+  (loopback a byte, briefly unmask, require a handler-only counter to move) and
+  leaves the line masked and the poll path in place if it does not arrive.
 
 `input::interrupt_driven()` reports which mode an ISA is in; the test asserts the
 idle-park only where it is interrupt-driven, and prints the mode either way.
@@ -805,7 +817,9 @@ its queue; a transport library layers on top.
   from device config. DMA uses **physical** addresses (`virt_to_phys`) - the rings
   and buffers live in kernel RAM reached through the linear map. Polled at Phase G;
   the **device RX interrupt landed later** in rheo-net N2d (docs/NETSTACK.md §16) -
-  receive is interrupt-driven on riscv/arm, a kernel-side poll on x86-64.
+  receive is interrupt-driven on riscv/arm; on x86-64 there is still no NIC RX line,
+  so the wait is a timer-backed `hlt` idle between polls (docs/SMP.md 8 records what
+  re-examining that found).
 - Three **queue opcodes** (`OP_NET_TX`/`OP_NET_RX`/`OP_NET_MAC`, no new kernel
   object) bridge a cell's async submissions to the driver in `kernel_process`,
   completing with the strand token - the same async model as the Phase B `io`
@@ -833,7 +847,8 @@ exiting `0x42`. Honest deferrals: the **full transport stack** (IP/ARP-cache/TCP
 QUIC/TLS as a library in a cell), a first-class **socket** `ObjectKind` + steering
 grants and **header/payload split** - documented in docs/NETWORKING.md. (The
 **device RX interrupt**, deferred here, was built in rheo-net N2d, §16 of
-docs/NETSTACK.md: interrupt-driven on riscv/arm, poll on x86-64.) The mechanism (a NIC driver + typed async raw-frame queue
+docs/NETSTACK.md: NIC-interrupt-driven on riscv/arm; on x86-64 a timer-backed idle,
+since that ISA has no NIC RX line - docs/SMP.md 8.) The mechanism (a NIC driver + typed async raw-frame queue
 opcodes) is the deliverable; the stack rides on it.
 
 ## Phase H - a real GPU: virtio-gpu 2D driver + compositor scanout
@@ -1027,8 +1042,8 @@ What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
   until quiescent, then the cell blocks), and the Phase G `net` **raw-frame
   send/recv** (`OP_NET_*` completions over a real virtio-net NIC) - whose
   **receive now parks too** (rheo-net N2d: the NIC RX interrupt + `SYS_WAIT_NET` +
-  a reactor network slot; a genuine WFI park on riscv64/aarch64, a bounded kernel
-  poll on x86-64 - docs/NETSTACK.md §16).
+  a reactor network slot; a genuine WFI park on riscv64/aarch64, a timer-backed
+  `hlt` idle between polls on x86-64, which has no NIC RX line - docs/NETSTACK.md §16).
 - **Sync-translated / cooperative** (single-CPU, honest): the **timer is
   interrupt-driven on all three ISAs** - riscv64 (Sstc), aarch64 (CNTV) and, since
   docs/SMP.md phase 1, x86-64 (the LAPIC one-shot over xAPIC MMIO) - a genuine 0%-CPU
@@ -1038,33 +1053,33 @@ What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
   `SYS_SWITCH`); parallel `compute` strands **interleave** on one CPU
   rather than run on separate cores; reservations are **admitted** (the EDF math is
   real and refuses over-commit) but not yet **scheduled** (run-queue enforcement is
-  SMP work); the **console UART RX is interrupt-driven on riscv64 (AIA) and aarch64
-  (GICv3)** - a genuine `wfi` park - and stays a **poll on x86-64** (its QEMU TCG +
-  split-irqchip IOAPIC/LAPIC does not re-deliver reliably; documented, honest); the
-  **NIC receive line** (rheo-net N2d) is the third interrupt source and splits the
-  same way - interrupt-driven on riscv64 (APLIC->IMSIC) and aarch64 (GICv3 SPI),
-  **not wired** on x86-64 (its virtio-pci NIC is driven through the config tunnel with
-  no mapped BAR for an MSI-X table). x86-64's receive wait was documented as borrowing
-  the timer interrupt it *does* have (`net_rx::IdleMode::TimerIdle`, a `hlt` for a
-  500 us LAPIC slice between polls); N2h verified that and found the LAPIC inert on
-  this QEMU, so x86-64 is honestly `IdleMode::Poll` - the CPU spins, reported, never
-  claimed as a halt. The slice tiers themselves are real and exercised on riscv64 and
-  aarch64 (docs/NETSTACK.md 16, Phase N2h).
+  SMP work); the **console UART RX is interrupt-driven on all three ISAs** -
+  riscv64 (AIA), aarch64 (GICv3) and, since docs/SMP.md 8, x86-64 (IO-APIC GSI 4 ->
+  LAPIC vector, verified end to end at bring-up) - a genuine `wfi`/`hlt` park; the
+  **NIC receive line** (rheo-net N2d) is the third interrupt source and is the one that
+  still splits - interrupt-driven on riscv64 (APLIC->IMSIC) and aarch64 (GICv3 SPI),
+  **not wired** on x86-64, whose receive wait therefore takes
+  `net_rx::IdleMode::TimerIdle` (a real `hlt` on a timer slice between receive-queue
+  polls, measured: 21-1771 halts per run). That mode was once claimed on an inert
+  LAPIC and correctly demoted by N2h to `IdleMode::Poll`; docs/SMP.md 5 made the LAPIC
+  real, so it is a measured halt again. `interrupt_driven()` still reports **false**
+  there, because that predicate is about the NIC line and nothing else
+  (docs/NETSTACK.md 16, Phase N2h).
 - **Deferred (documented)**: **real VIRGL/3D + the full display pipeline** (Phase
   H lands the virtio-gpu 2D scanout round-trip - create-2d/attach/set-scanout/
   transfer/flush + `display::Scanout` present; the cursor plane, multi-scanout,
   EDID/mode negotiation, vsync-interrupt -> typed event, and a visible framebuffer
   stay future work), the **full network stack** (Phase G lands the NIC
   data path - a virtio-net driver + raw-frame `net::send`/`recv`/`mac`; IP/TCP/QUIC
-  stays a service/transport-library in a cell, plus a socket object + a device RX
-  interrupt), **SMP** secondary-core bring-up +
-  work-stealing + reservation enforcement + **priority-inheritance** locks (task
-  #27), real **HBM/CXL** (emulated on DDR; PMEM is now real nvdimm-backed on
+  stays a service/transport-library in a cell, plus a socket object + an **x86-64**
+  device RX interrupt - riscv64/aarch64 have theirs), **SMP** work-stealing +
+  reservation enforcement + **priority-inheritance** locks (task #27; secondary-core
+  bring-up itself is now done on all three ISAs, docs/SMP.md), real **HBM/CXL** (emulated on DDR; PMEM is now real nvdimm-backed on
   x86-64 - Phase J, docs/MEMORY.md 2.1)
   and NUMA (single-node), durability/latency **contracts** (advisory - no durable/
   RT backend in QEMU), a **first-class file/socket capability** (fds are `FileOps`
-  handles today), the **timer IRQ** and the **x86/arm UART RX IRQ**. These are
-  engineering, not redesign: every one has its seam
+  handles today), and the **x86-64 NIC RX interrupt** (the timer and UART RX IRQs
+  are done on all three ISAs). These are engineering, not redesign: every one has its seam
   in place (the queue object, the grant object, the `ipc` channel, the interrupt
   path, the cooperative scheduler).
 

@@ -77,8 +77,9 @@ ready could only spin, because the kernel had **no interrupts on any ISA**. Phas
 D adds the OS's **first block-and-wake**: a librheo `term` cell whose strand parks
 on console input drives the reactor to block in `SYS_WAIT_INPUT`, and the kernel
 **idles until the UART RX interrupt delivers a byte** (RISC-V S-mode external via
-the AIA IMSIC; ARM64 PL011 SPI via the GICv3) instead of spinning - a genuine
-0%-CPU park. Phase F adds the **second interrupt**, the **timer**: a strand
+the AIA IMSIC; ARM64 PL011 SPI via the GICv3; x86-64 ISA IRQ 4 via the IO-APIC,
+added in docs/SMP.md 8 once a working LAPIC EOI existed) instead of spinning - a
+genuine 0%-CPU park on all three ISAs. Phase F adds the **second interrupt**, the **timer**: a strand
 parking on a deadline (`time::sleep`/`SYS_ARM_TIMER`) idles until the per-ISA timer
 interrupt fires - **interrupt-driven on all three ISAs**: RISC-V Sstc `stimecmp`,
 ARM64 CNTV via the GICv3, and (since docs/SMP.md phase 1) the x86-64 LAPIC one-shot

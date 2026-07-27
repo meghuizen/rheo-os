@@ -453,10 +453,13 @@ APLIC in MSI mode -> S-mode IMSIC via the `siselect`/`sireg`/`stopei` CSRs ->
 (GICD + the boot CPU's GICR, CPU interface via `ICC_*_EL1`) and takes it in the
 current-EL-SPx vector slot, draining the byte and EOI'ing via `ICC_EOIR1_EL1`;
 cells run at EL0 with IRQ masked and the kernel unmasks (`daifclr`) only after
-`wfi`. Both are genuine 0%-CPU parks. **x86-64 stays a poll** - under QEMU's TCG +
-`kernel-irqchip=split` the LAPIC ISR/IRR are not modeled and IOAPIC-routed lines do
-not re-deliver reliably, so faking it would be dishonest (its *timer* IS
-interrupt-driven; only the IOAPIC-routed UART is affected). On top of the raw byte
+`wfi`. Both are genuine 0%-CPU parks. **x86-64 was a poll** here - under QEMU's TCG the
+LAPIC ISR/IRR looked unmodelled and IOAPIC-routed lines looked not to re-deliver, so
+faking it would have been dishonest - but **SMP phase 1 disproved that** (every one of
+those observations had been made through the inert x2APIC MSR block, where a missing
+EOI genuinely makes the first interrupt the last): x86-64 now routes COM1's ISA IRQ 4
+through the **IO-APIC** to vector 0x21 and halts at `hlt`, verified end to end at
+bring-up, so UART RX is interrupt-driven on all three ISAs (docs/SMP.md 8). On top of the raw byte
 substrate, librheo gained **`term`** - the
 byte-stream terminal discipline: `input` (a decoder: CSI/SS3 escape sequences ->
 typed `Key`s, UTF-8, control chars, async `next_key().await`), `edit` (a line
@@ -465,8 +468,8 @@ hook), and `render` (a buffered, minimal-diff renderer, batched writes). The
 `librheoterm` test drives a read-eval loop with scripted keystrokes (typing,
 backspace, cursor-left + insert, an arrow-key escape, Up-arrow history) and asserts
 the exact committed lines + exit on **all three ISAs**, plus the idle-park (kernel
-idled at `wfi`) on **RISC-V and ARM64**. Honest: RISC-V and ARM64 are
-interrupt-driven, each with a device-loopback caveat (QEMU's 16550/PL011 loopback
+idled at `wfi`/`hlt`) on **all three**. Honest: RISC-V and ARM64 each carry a
+device-loopback caveat (QEMU's 16550/PL011 loopback
 does not drive the interrupt-controller line, so the deterministic test raises the
 controller line directly - RISC-V the IMSIC MSI, ARM64 `GICD_ISPENDR` for SPI 33 -
 exactly the interrupt the device would raise; the byte is genuinely delivered and a
@@ -672,8 +675,10 @@ Per-ISA honesty (the wait has **three modes**, chosen by portable logic over the
 mode -> IMSIC -> `sip.SEIP`) and **aarch64** (GICv3 SPI `16+slot`) are genuinely
 **NIC-interrupt-driven** and halt at `wfi` - a real 0%-CPU park. **x86-64 has no NIC
 RX interrupt** (its NIC is virtio-*pci* driven through the `VIRTIO_PCI_CAP_PCI_CFG`
-tunnel with no mapped BAR for an MSI-X table, and legacy INTx rides the same QEMU-TCG
-IOAPIC path that does not re-deliver); its wait was documented as a **timer-backed
+tunnel with no BAR assigned to hold an MSI-X table; the other half of the old
+justification - "legacy INTx rides the QEMU-TCG IOAPIC path that does not re-deliver" -
+was **disproved** by SMP phase 1, which drives the UART RX line through exactly that
+path, docs/SMP.md 8); its wait was documented as a **timer-backed
 idle** borrowing the LAPIC (poll, `hlt` for a 500 us slice, re-poll), and **N2h verified
 that claim and it did not hold** - QEMU 8.2 TCG reports no x2APIC, so the LAPIC MSR
 block was inert and x86-64 was honestly `IdleMode::Poll`, a spin; **SMP phase 1** then
@@ -873,8 +878,8 @@ checksum, and the full RFC 793 `tcp::Connection`, whose **synchronous**
 drives straight from a syscall trap. Three small documented driver accessors were added
 (`virtio_net::send_frame_slice`/`recv_frame_slice`/`mac_addr`) plus a
 `net_rx::wait_frame_slice` twin, so a remote receive **parks** on the N2d
-park-until-frame primitive - a genuine WFI idle on riscv64/aarch64, the documented
-bounded poll on x86-64. The `linuxnet` test proves it on **all three ISAs**: an
+park-until-frame primitive - a genuine WFI idle on riscv64/aarch64, a timer-backed
+`hlt` idle on x86-64 (which has no NIC RX line). The `linuxnet` test proves it on **all three ISAs**: an
 **unmodified static-glibc C binary** (`inetremote.c`) hand-builds a DNS query,
 `sendto`s it to SLIRP's responder `10.0.2.3:53` and `recvfrom`s the reply, asserting
 its **structure** (txid echoed, QR set, sender `10.0.2.3:53` - never a resolved
@@ -1094,26 +1099,115 @@ scanner because `http1` must link in the codec posture, which drops librheo
 entirely, so `librheo::tile::simd` is structurally unreachable from it. Both
 follow-ons are named in docs/NETSTACK.md 22 rather than half-done.
 
+A **syscall-surface hardening** pass closed three critical defects an
+architecture audit found - all of them in the seam between a cell's arguments and
+the kernel's own memory, none of them visible to the capability core's own proofs
+(docs/ENGINEERING.md 12, docs/ARCHITECTURE.md 8.2). **(F1)** There was no
+`access_ok` equivalent in the tree: every out-parameter syscall, every queue
+payload VA and every buffer handed to a `svc::FileOps`/`SocketOps` handler was
+dereferenced in kernel mode at a **cell-supplied** address while the cell's root
+was active - and every cell root maps all kernel RAM supervisor-RWX - so
+`SYS_GRANT(out_va = <any kernel VA>)` was a 16-byte arbitrary kernel write with a
+steerable first word. `kernel/src/user.rs` now owns one portable, allocation-free
+check (`user_write_ok`/`user_read_ok` + `user_out`/`user_in`/`user_buf`/
+`user_slice`): null, alignment, overflow-checked add, and a range test against
+`USER_VA_MAX = 2^38` (RISC-V Sv39's user half - the narrowest of the three ISAs,
+with every loader region pinned below it by a `const` assert) plus the shared
+`.user` window, which on riscv64/x86-64 is linked high beside the kernel yet is
+genuinely mapped U into every cell root (writes restricted to its per-cell
+`.user.data`/`.user.bss`). Every named site is routed through it - the five
+`user.rs` out-parameters, `svc.rs`'s EngineInfo/CpuFeatures/ShellIo/DebugWrite/six
+FileOps forwards, `graph_submit` (node array, result array, tile descriptors, and
+each descriptor's own matrix VAs by their exact computed extents), and the whole
+`queue::run_opcode` payload surface (-> `STATUS_DENIED`) - and the Linux
+personality is bounded at its **single dispatch point** (`linux::ptr_args_ok`,
+-EFAULT) rather than at ~60 individual dereferences, which also bounded `readv`'s
+and `poll`'s previously **unbounded** iovcnt/nfds array walks. **(F2)**
+`SYS_MMAP`/`SYS_COMMIT` took `len` from the cell and looped a `frames::alloc` that
+ended in `panic!("frame pool exhausted")`, so `mmap(1 << 40)` took the machine
+down - worse than the OOM killer ARCHITECTURE.md 5 forbids, because it is an OOM
+*panic*. `frames::alloc` is now fallible (`Option`, every caller audited; the
+kernel-internal ones `expect` with the reason they cannot fail), guarded by a
+global reserve (`USER_RESERVE_FRAMES`, 8 MiB) and a per-cell budget
+(`MAX_FRAMES_PER_CELL`, 96 MiB), both checked before a frame is taken, with
+rollback on partial failure, so exhaustion is a clean refusal (`-ENOMEM` on the
+Linux paths). **(F3)** `SYS_MUNMAP` freed whatever the page tables returned, with
+no capability, ownership or bounds check - and three frame sets in a cell's
+address space are not its own (the shared channel ring, a peer's shared sealed
+grant, its own queue-pair region), so it was a cross-cell use-after-free whose
+second free tripped a "double free" assertion: a kernel panic from unprivileged
+code. It now routes through `grant_resolve` exactly like its `SYS_COMMIT`/
+`DECOMMIT`/`SEAL` siblings (a peer's grant is refused for free - the capability
+minted into the peer carries READ, not MAP), plus the cell's own anon/file-mmap
+bump regions; `unmap_range` refuses anything outside the cell's user VA range and
+frees through a new `frames::free_if_pool`. The **`security`** test kernel proves
+all three from a real unprivileged cell on all three ISAs against evidence the
+cell cannot fake (a canary in kernel `.bss` it has no mapping for, the frame-pool
+delta against a hand-computed baseline, a queue ring that still completes an
+`OP_NOP` after the refusal), each with a control phase showing the legitimate path
+intact; `librheowl` gained the cross-cell half - the compositor's attempt to free
+the **client's** sealed grant is refused and the zero-copy checksum still matches.
+Each phase was verified to **fail** with its fix reverted.
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
-proofs, and the hardware-lab performance numbers. **SMP** (docs/SMP.md,
-task #27) now has its foundation and a real RISC-V secondary: the portable
-**per-CPU state + kernel spinlock** (`kernel/src/smp.rs`: a `SpinLock<T>` +
-a per-CPU registry with `this_cpu()`, zero-impact on the single-CPU path)
-and a **genuine RISC-V secondary hart running kernel code** - brought up via
-SBI HSM `hart_start` onto the shared kernel address space, it claims a
-per-CPU registry slot, marks itself online, and writes a shared counter
-through the cross-core spinlock, which the primary reads back and asserts
-(the `smp` test, riscv64). ARM64 and x86-64 make a genuine, guarded bring-up
-attempt and skip-with-reason: ARM64's PSCI `CPU_ON` (`smc #0`) empirically
-**traps to EL1** (no EL3/EL2 firmware in this QEMU config; the SMC is guarded
-so the trap is observed, not fatal - CPU detection there is likewise
-EL1-limited to the boot CPU), and x86-64 APs need a 16-bit real-mode
-INIT-SIPI-SIPI trampoline below 1 MiB (not implemented; ACPI still enumerates
-the 4 APs). Still deferred: **preemptive multi-core scheduling** (the runtime
-stays single-CPU cooperative - the secondary does proof-of-life work and
-parks, it is not yet fed runnable cells) and making the shared kernel
-`static mut` state SMP-safe end to end.
+proofs, and the hardware-lab performance numbers.
+
+**SMP phase 1** (docs/SMP.md, task #27) closes secondary-core bring-up: **a genuine
+second core runs kernel code on all three ISAs**. The portable foundation
+(`kernel/src/smp.rs`: a `SpinLock<T>` + a per-CPU registry with `this_cpu()`,
+zero-impact on the single-CPU path) is unchanged; what landed is the per-ISA bring-up
+and, first, the **root cause that had blocked x86**. The LAPIC was driven only through
+the **x2APIC MSR block**, which QEMU 8.2 TCG leaves inert - the docs/ENGINEERING.md 1
+case study - and since INIT-SIPI-SIPI is sent through the *interrupt command register*,
+x86 SMP and the x86 timer were the **same** defect. The LAPIC driver now supports both
+access modes and **picks by observation**: request x2APIC, read `IA32_APIC_BASE` back,
+keep it only if `EXTD` latched; otherwise map the **xAPIC MMIO** page uncacheable
+(`paging::apic_map_window`, a third fixed window at PML4[386] whose PDPT is stamped into
+**every cell root**, so a handler reaches EOI whichever root is active) and require the
+register file to answer a write/read-back. Observed under this QEMU: **xAPIC (MMIO)**,
+x2APIC correctly declined.
+
+That unlocked four things. (1) A **genuine one-shot timer on x86-64**: `SYS_ARM_TIMER`
+halts at `hlt` and really sleeps, `netwait`'s pre-N2h regression no longer skips there,
+and the receive wait's `IdleMode::TimerIdle` is a *measured* halt again (21-1771 per run)
+rather than the spin N2h had honestly demoted it to. `ktimer` remains the **only** caller
+of `arch::timer_*` - the single-owner invariant is untouched. (2) **A real x86-64 AP**: a
+position-fixed 16-bit trampoline (`kernel/arch/x86_64/smp.S`) copied to a **verified**
+low page (usable RAM per the firmware map, clear of the PVH `hvm_start_info` and the ACPI
+RSDP), released by INIT-SIPI-SIPI, climbing real -> protected -> long on the primary's own
+`boot_page_tables`. Two triple faults were *observed and fixed* on the way: the AP set
+`EFER.LME` but not `NXE`, and kernel PTEs carry NX (a set bit 63 with NXE clear is a
+reserved-bit fault, so it died on its first LAPIC read); and swapping in the primary's
+`gdt64_ptr` failed because that is the 6-byte 32-bit form while `lgdt` in long mode reads
+2 + 8. The first is fixed *structurally* - the primary publishes its own CR4/EFER/CR0 and
+the AP adopts them verbatim, so the two cores cannot diverge. (3) **A real ARM64
+secondary**: the old verdict "PSCI `CPU_ON`: `smc #0` trapped to EL1" was true of the
+*instruction*, not of PSCI - QEMU's `virt` implements PSCI itself and picks the conduit
+from the machine config (**hvc** for the plain machine, smc only with
+`virtualization=on`), so bring-up now **probes** with `PSCI_VERSION` over each conduit,
+both still guarded by a temporary exception vector, and reports what answered (`hvc #0`,
+version 1.1); `CPU_ON` then enters an MMU-on trampoline that adopts the primary's
+MAIR/TCR/SCTLR verbatim. (4) The **x86-64 UART RX interrupt**, whose poll-only verdict
+had rested on the same inert registers - with a working EOI the IO-APIC path
+demonstrably re-delivers, so GSI 4 -> vector 0x21 is wired, probed by a 16550-loopback
+byte, and `input::interrupt_driven()` is **true on all three ISAs** (x86-64 is now the
+*most* complete of the three here: QEMU's 16550 loopback raises the ISA line itself, so
+nothing has to be poked into the interrupt controller by hand, unlike the riscv/arm
+caveats). No secondary is told its identity - each reads its own hart id / APIC id /
+MPIDR - and the `smp` test asserts the shared magic through the cross-core spinlock plus
+that the registry slot and the hardware id are **not** the primary's. Everything is
+behind the `kernel/smp` cargo feature; the non-smp library is **byte-identical**
+(verified). Honest: this is bring-up, **not** preemptive multi-core scheduling - each
+secondary does observable proof-of-life work and parks, nothing in the kernel is yet
+safe to run on two cores concurrently, the runtime stays single-CPU cooperative, and
+only **one** secondary is started (one dedicated stack per ISA). Still deferred: shared
+`static mut` state made SMP-safe end to end, per-CPU stacks + a start-all loop, a
+per-CPU register instead of the small id->index table, ARM64 CPU *enumeration* (probing
+`PSCI_AFFINITY_INFO`), cross-CPU IPIs beyond bring-up, and the **x86-64 NIC RX
+interrupt** - the last interrupt source any ISA lacks, now known to need ordinary driver
+work (assign the virtio-net BAR, program MSI-X or find the q35 INTx routing) rather than
+the platform limit the old wording implied.
 
 The `.user` linker window holds U-mode code (`.user.text`), shared
 read-only constants (`.user.rodata`), and per-cell data (`.user.bss`) in
@@ -1160,8 +1254,8 @@ kernel/       the no_std kernel library + boot demo bin
               (frames + frames_pmem real-nvdimm allocator + grants), time (clock), rng (ChaCha20 DRBG +
               hwrng seeding), event streams,
               sched (reservations), lease, engine, graph, pty, smp
-              (per-CPU state + a kernel SpinLock + RISC-V SBI-HSM secondary-hart
-              bring-up - docs/SMP.md), input
+              (per-CPU state + a kernel SpinLock + secondary-core bring-up on
+              all three ISAs - docs/SMP.md), input
               (kernel RX ring + the SYS_WAIT_INPUT park-until-input primitive -
               docs/LIBRHEO.md Phase D), ktimer (the kernel **timer arbiter**:
               the single owner of the per-ISA hardware one-shot - a fixed 5-slot
@@ -1192,11 +1286,19 @@ kernel/       the no_std kernel library + boot demo bin
   arch/       per-ISA assembly (boot, vectors/traps, context switch, user)
   link/       linker scripts per ISA (incl. the .user text/rodata/data window)
 tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
-              isolation-hw, resources, pmem (Phase J: a MemKind::Pmem grant
+              isolation-hw, security (the syscall-surface hardening audit,
+              docs/ENGINEERING.md 12: an unprivileged U-mode cell attempts an
+              out-parameter into kernel .bss - refused, canary intact - an absurd
+              SYS_MMAP - refused at zero frame cost - and a SYS_MUNMAP of its own
+              queue region / a kernel VA / the .user window / the channel + grant
+              regions - each refused, ring still serving; plus a control per
+              finding so the bound is not a break),
+              resources, pmem (Phase J: a MemKind::Pmem grant
               backed by a real QEMU nvdimm - x86-64 via the ACPI NFIT; arm/riscv
               skip-with-reason - docs/MEMORY.md 2.1), smp (per-CPU state + kernel spinlock +
-              a real RISC-V secondary hart; ARM64/x86-64 skip-with-reason -
-              docs/SMP.md), shell-smoke, hwinfo, rng, runtime,
+              a real secondary core on all three ISAs: SBI HSM on riscv64,
+              INIT-SIPI-SIPI + a real-mode AP trampoline on x86-64, PSCI CPU_ON
+              over the probed HVC conduit on aarch64 - docs/SMP.md), shell-smoke, hwinfo, rng, runtime,
               posix, blockfs (live virtio-blk disk), elfrun (load a native
               ELF), posixrun (native program over the POSIX syscalls),
               libcrun (a program linked against rheo-libc), jsonrun (a
@@ -1209,8 +1311,8 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               Phase C: parallel map_reduce + a userspace graph submitted to the
               CPU engine + reservation admission), librheoterm (librheo Phase D:
               the interrupt-driven console wakeup + the term byte-stream
-              discipline - scripted editing/history/escape, idle-park on RISC-V +
-              ARM64; x86-64 poll),
+              discipline - scripted editing/history/escape, idle-park on all three
+              ISAs),
               librheowl (librheo Phase E: the Wayland-class compositor demo -
               two cells share a typed cross-cell queue pair + pass a sealed
               buffer grant zero-copy + a flip completion, checksum-verified),
@@ -1408,7 +1510,7 @@ targets/      rheo-os custom target specs + the std port: rheo_os-*.json,
 ## Rules
 
 - **The engineering standard.** `docs/ENGINEERING.md` governs *how* work
-  lands - evidence, scope language, additivity. Its section 12 checklist
+  lands - evidence, scope language, additivity. Its section 13 checklist
   applies to every slice.
 - **Docs first.** A change that adds a kernel object or verb must pass the
   admission rule in `docs/ARCHITECTURE.md` section 6 and be reflected there

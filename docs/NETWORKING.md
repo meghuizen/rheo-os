@@ -165,7 +165,7 @@ network-stack-free** - the datapath is `rheo-net` linked in a new **codec** post
 the full RFC 793 `tcp::Connection`, whose synchronous
 `poll`/`on_wire_segment` seam drives straight from a syscall trap. A remote receive
 **parks** on the N2d `SYS_WAIT_NET` primitive (a genuine WFI idle on riscv64/aarch64,
-the documented bounded poll on x86-64). Proof: the `linuxnet` test kernel - an
+the documented timer-backed `hlt` idle on x86-64, which has no NIC RX line - docs/SMP.md 8). Proof: the `linuxnet` test kernel - an
 **unmodified static-glibc C binary** does a real DNS round trip to SLIRP's resolver
 `10.0.2.3:53` and a real remote TCP connect to a closed gateway port (SLIRP's reset
 becomes `ECONNREFUSED`), on all three ISAs. Honest scope: **UDP remote is complete**;

@@ -174,6 +174,7 @@ common_trap:
 .endm
 
 IRQ_STUB timer_irq_stub, x86_timer_irq
+IRQ_STUB uart_irq_stub, x86_uart_irq
 
 /* The LAPIC spurious vector requires no EOI and does no work: just return. */
 .global spurious_irq_stub
