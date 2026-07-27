@@ -540,6 +540,16 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   nothing called it, because the real fork path is the bulk copy above. It looked
   like the feature was present. Delete the unreachable one rather than leaving a
   reader to guess which is live.
+- **A shared loader is a shared decision.** `exec_elf_from_vfs` served both the Linux
+  `execve` and the *native* `SYS_SPAWN`. Making it demand-page the image was correct
+  for the personality that has a page-fault handler and silently wrong for the one
+  that does not: a native cell has no VMA list, so its child got an address space
+  full of holes and failed with no diagnostic. Two things fixed it, and the second is
+  the one that matters: the eager path kept the **old name**, so an unaware caller
+  still gets a correct image, and the lazy one is named for the obligation it imposes
+  (`..._demand`, "the caller must map what this returns"). When a function grows a
+  requirement, the name is where it belongs - a flag argument reads the same at both
+  call sites.
 - **A metric can stop being an oracle without changing.** `mmapdp` asserted that a
   64-page file mapping cost 4 demand fills, reading the *total* fill count. Correct
   while a file `mmap` was the only demand-paged thing in the address space. The moment

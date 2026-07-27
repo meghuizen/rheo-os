@@ -1319,10 +1319,23 @@ pages are zeros, not the next segment's bytes. `user::reset` must run **before**
 load, since it clears the registry the loader registers the image in (the old order
 zeroed every page - an illegal instruction at the entry point; `filemap::alive` now
 says so). Measured on riscv64: `rusthello`'s 201 image pages cost **16** frames at load
-instead of 201, and `linuxrun` asserts that inequality on all three ISAs. Honest and
-named: `fork` is still an eager page copy rather than COW, the initial stack is mapped
-whole rather than growing on fault, and **`execve` stays eager** because it streams from
-a VFS handle it closes on return - all three ride this same handler.
+instead of 201, and `linuxrun` asserts that inequality on all three ISAs. **`execve` and
+the ELF interpreter are demand-paged too**: both stream from the VFS, and the obstacle
+was never the streaming but recording against the *caller's* fd, which is closed on
+return - so a mapping opens its own handle over the path (the `mmap` precedent), the
+recorder holds two stores because a dynamically linked program is two files, and
+`exec_reinit` records as `install_cell` does. Witnessed by
+`load::recorded_pages()`/`eager_pages()`, since both paths run inside a syscall where a
+test can measure nothing directly: `linuxdyn` records 1 program + 1 `ld.so` segment (35
+pages recorded, 4 copied), `linuxproc`'s fork+execve phase 221 recorded to 21 copied.
+That slice also introduced and fixed a regression the matrix caught -
+`exec_elf_from_vfs` is shared with the **native** `SYS_SPAWN`, which has no VMA list, so
+a lazy image left its child with an address space full of holes; the eager and lazy loads
+are now separate functions, the eager one keeping the old name so an unaware caller gets
+a correct image. Honest and named: `fork` is still an eager page copy rather than COW,
+the initial stack is mapped whole rather than growing on fault, a segment with a `.bss`
+tail is copied, and a **native** cell's image is eager (no VMA list to map records
+with) - all ride this same handler.
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus

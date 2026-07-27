@@ -552,11 +552,36 @@ so was its claim of 182 MiB of `.bss`, which measurement shows does not exist.
       recorded in ENGINEERING.md 11: a metric that was a valid oracle can stop being
       one when the system around it changes, and the failure looks like a regression.
 
+   **Done: `execve` and the ELF interpreter.** Both stream from the VFS, and the
+   obstacle was never the streaming - it was recording against the *caller's* fd, which
+   is closed on return. A mapping now opens its **own** handle over the path (the `mmap`
+   precedent), `SegRecorder` holds two stores because a dynamically linked program is
+   two files, and `exec_reinit` records as `install_cell` does. `linuxdyn` records 1
+   program + 1 `ld.so` segment (35 pages recorded, 4 copied); `linuxproc`'s fork+execve
+   phase records 221 and copies 21. Both run inside a syscall where a test can measure
+   nothing directly, so `load::recorded_pages()`/`eager_pages()` are the witnesses, and
+   both assertions were observed failing when reverted.
+
+   That slice also **introduced and fixed a regression the matrix caught**:
+   `exec_elf_from_vfs` is shared with the *native* `SYS_SPAWN`, which has no VMA list,
+   so its child got a lazy image nothing mapped and `librheoproc` failed on x86-64 with
+   `echo_ok=0`. The eager and lazy loads are now separate functions - the eager one
+   keeps the old name, so an unaware caller gets a correct image, and the lazy one is
+   named for the obligation it imposes (ENGINEERING.md 11).
+
    **Still eager, and named:** **COW `fork`** (still an eager copy of every committed
-   page), a **guard-page + grow-on-fault stack** (the initial stack is mapped whole),
-   and **`execve`**, which streams from a VFS handle it closes on return - so recording
-   against that handle would name a closed file, and giving the mapping its own handle
-   is the `filemap::open` path. All three ride this same handler.
+   page), a **guard-page + grow-on-fault stack** (the initial stack is mapped whole), a
+   segment with a `.bss` tail, and every **native** cell's image. All ride this same
+   handler.
+
+   **What remains before the real target can be attempted**, from measuring it: the
+   275 MB binary cannot be `include_bytes!`d (a kernel image that large runs past the
+   frame-pool base 64 MiB into RAM), so it has to live on a disk - the `blockfs`
+   pattern, an ext4 image on virtio-blk reachable through `svc::FileOps`. With that,
+   `filemap::read_at` per fault is an lseek+read through the read-only ext4 driver, so
+   a full extent walk per page; a program touching 30 MiB is ~7,500 of those inside a
+   120 s boot-test budget, which is a thing to measure rather than assume. The registry
+   ceiling (`MAX_MAPPED_FILES` 8) also sits right at main + `ld.so` + 5 libs.
 3. ~~**Seven syscalls the personality does not dispatch**~~ **CLOSED.** Measured
    from the real startup trace rather than guessed, and all seven now dispatched:
 

@@ -285,9 +285,26 @@ entry and every page came back zeroed - which on RISC-V is an illegal instructio
 the entry point and nothing more informative. `filemap::alive` now makes a
 recurrence say so rather than hand out blank memory.
 
-**`execve` stays eager**, said rather than implied: it streams from a VFS handle it
-closes on return, so recording against that handle would name a closed file. Giving
-the mapping its own handle is the `filemap::open` path and a separate slice.
+**`execve` and the interpreter are demand-paged too.** Both stream from the VFS, and
+the obstacle was never the streaming - it was that recording against the *caller's*
+fd would name a file closed on return. So a mapping opens its **own** handle over the
+path, which is what `mmap` already does and for the same reason. `SegRecorder` holds up
+to two stores, because a dynamically linked program is two files (the program and
+`ld.so`); a third file is something `ld.so` maps itself through `mmap`, already lazy.
+`exec_reinit` records, as `install_cell` does - it was the only caller, so an
+`execve`d image used to record nothing.
+
+One trap is worth naming, because it was hit: `exec_elf_from_vfs` is shared with the
+**native** `SYS_SPAWN`, and a native cell has no VMA list, so a lazy image left its
+child with an address space full of holes and no diagnostic. The eager and lazy loads
+are now separate functions - the eager one keeps the old name so an unaware caller
+gets a correct image, and `exec_elf_from_vfs_demand` says in its name that the caller
+must map what it returns.
+
+Measured: `linuxdyn` records 1 program + 1 `ld.so` segment (35 pages recorded, 4
+copied), and `linuxproc`'s fork+execve phase records 221 pages and copies 21. Both
+paths run inside a syscall where a test can measure nothing directly, so
+`load::recorded_pages()`/`eager_pages()` are the witnesses.
 
 Measured on riscv64: `rusthello`'s 201 image pages cost **16 frames** at load
 (the one eager zero-tail segment plus page tables) instead of 201. `linuxrun`
@@ -317,9 +334,9 @@ maps a real 1.5-2.1 MB `libc` and an unmodified dynamic glibc binary runs.
 
 **Still eager, and named as such:** `fork` (an eager copy of every committed page,
 not COW), the initial stack (mapped whole rather than a guard page that grows on
-fault), `execve`'s streamed image, and a segment with a `.bss` tail. All ride the
-same handler and are the next rungs; docs/ARCHITECTURE-DEBT.md 4.0 blocker 2 tracks
-them.
+fault), a segment with a `.bss` tail, and every **native** cell's image (no VMA list
+to map records with). All ride the same handler and are the next rungs;
+docs/ARCHITECTURE-DEBT.md 4.0 blocker 2 tracks them.
 
 ## 5. Milestones
 
