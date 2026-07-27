@@ -504,13 +504,23 @@ so was its claim of 182 MiB of `.bss`, which measurement shows does not exist.
 
    With that in place, demand-paging the ELF image **works for the cases that were
    measured to matter**: `linuxrun` and `linuxdyn` pass with unmodified static and
-   *dynamically linked* glibc running from demand-paged images. It is still not merged,
-   because a third failure remains - `procdemo` (fork + pipe + execve) takes a SIGILL,
-   and it does so with `execve` left eager, so the interaction is with **`fork`**: a
-   demand-paged parent hands the child an address space missing most of the image while
-   the child's copied VMA records name the backing store. Two of the three failures on
-   this path are fixed (a reset-ordering hazard, and a segment with a `.bss` tail in one
-   record); the third is the next thing to chase.
+   *dynamically linked* glibc running from demand-paged images.
+
+   Four failures were found on that path and **three are fixed and verified**: a
+   reset-ordering hazard (a `user::reset()` after loading cleared the registry, so every
+   page came back zero - an illegal instruction at the entry point); a segment with a
+   `.bss` tail in one record (now demand-paged only when `filesz == memsz`, which is the
+   measured target's shape, and a bss tail is tens of KiB); and the real blocker -
+   `dup_state` raw-copies a `LinuxState` and addrefs *pipes* but never the **backing
+   stores**, so a child's exit freed an entry the **parent** still faulted against. With
+   `VmaList::inherit_files()` beside `fds::inherit_pipe_ends()`, `procdemo` and the whole
+   fork/execve/pipe chain pass.
+
+   The fourth is open and is why it is not merged: with the image demand-paged,
+   `mmapdp`'s mmap-region fill count rises from 4 to **61** for a 64-page mapping with 4
+   pages touched. 61 is close enough to the whole mapping to look like a real sweep
+   rather than glibc noise, and that count *is* the asserted property - so it gets
+   explained, not tuned around.
 
    **Still open:** the ELF image itself. `load::load_elf_linux` streams every
    `PT_LOAD` page into a frame at load time, and for an `ET_EXEC`-with-`PT_INTERP`
