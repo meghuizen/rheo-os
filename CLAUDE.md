@@ -1539,12 +1539,96 @@ oracles - on all three ISAs, with the whole pre-existing suite green **unedited*
 It found two real defects on the way: the wheel returned fired timers in
 allocation order rather than deadline order (a transport would apply a later RTO
 before an earlier one), and RISC-V's `cpu_index()` read an uninitialised `tp`.
-**Honest and load-bearing: none of it is wired in yet.** The fixed tables are
-still fixed arrays, the magic VA map is still the map, no vcore is dispatched, no
-second core schedules anything, and `metrics` records nothing until a boot enables
-it. Building a replacement and switching onto it are different risks; the
-migration is staged as S1'-S3' in docs/SUBSTRATE.md 15, and the exit gate is
-already written - `linuxbun` flipping from its accepted partial to `rheo:42`.
+**Two of the three migration stages have now begun** (docs/SUBSTRATE.md 15).
+
+**S1' - four fixed tables are gone.** The Linux **context tables**
+(`MAX_THREADS = 8`; `INITIAL_CONTEXTS` is now a reservation, not a ceiling), the
+per-cell **signal** contexts, the per-cell **VMA list** (`MAX_VMAS = 128` - measured
+as the wrong shape: V8's pointer-compression cage plus code ranges, JSC's Gigacage,
+and glibc's 64 MiB arena *per thread* put a JIT-bearing runtime past a hundred
+records before it runs a line of its own code, and a full table did not fail cleanly
+- `remove` dropped the tail of a split mapping), and the global **mapped-file
+registry** (`MAX_MAPPED_FILES = 64`, handle widened `u8` -> `u16`, since the width
+was the real ceiling once the table could grow and a wrapping handle points a mapping
+at *another file's* bytes - neither a fault nor a refusal). Three structural lessons,
+all recorded: a funded table **cannot be raw-copied** (`fork`'s
+`copy_nonoverlapping` of `LinuxState` duplicated the descriptor, so parent and child
+addressed one shared directory frame - each funded field now needs an explicit deep
+copy, and an unfundable child makes the fork `-EAGAIN`); **every slot-handback path
+becomes a release path** (two real leaks existed the moment the tables became funded
+- a reaped cell's context tables were only released by the between-runs reset, so
+every fork+exec pair leaked until the next boot); and **a global table's one-off
+growth must not land inside a per-operation measurement** (the registry growing
+lazily charged its frames to whichever operation was first, which broke `linuxrun`'s
+demand-paging assertion immediately - it is funded at its reset point now, so its
+storage is a boot cost). Also removed a silent truncation that predates the work:
+`apply_fork_advice` collected marked ranges into `[_; MAX_VMAS]` scratch and dropped
+anything past the end, so a `MADV_WIPEONFORK` region could quietly keep its parent's
+random state.
+
+**S3' - the ready queue dispatches, and a cell can be preempted on all three
+ISAs** (task #27's core). `sched::dispatch` is the **seam**: the two `reschedule`
+functions and `SYS_YIELD` ask the EEVDF+BORE queue for the *order* while the
+personality's own state stays the sole authority on *runnability*, reconciled at the
+pick so the two can never disagree; disabled, `pick` is the pre-migration round-robin
+expression for expression, so the migration turns on one boot at a time. CPU time is
+charged and every relinquish recorded **at the transition itself** - which is what
+makes the BORE score measured rather than inferred, because this kernel has no path
+from running to not-running that does not pass through a named call. `sched::preempt`
+takes the CPU away: the timer arbiter gains a `Preempt` slot, the interrupt handler
+sets one flag, and the portable `user::on_user_interrupt` decides at trap exit whether
+the CPU moves - a **sibling context of the same cell first** (the `linuxbun` shape),
+then another cell; splitting "note it" from "act on it" is not ceremony, since an
+interrupt can land while the kernel holds a reference into a funded table and a
+scheduler invoked from the handler would be reentrant. Each ISA needed a real change:
+riscv64's user trap already serviced U-mode interrupts, **aarch64's lower-EL IRQ slot
+was a *fatal* slot** and cells ran with `SPSR.I` set, and **x86-64 cells ran with `IF`
+clear** with a LAPIC stub that saved only caller-saved registers (the timer vector now
+routes through `common_trap`, reusing its ring-3 frame capture and IRET resume rather
+than writing a second one). Both mask changes are read at frame-construction time, so
+a cooperative boot's frames keep the pre-migration bits exactly. The **`preempt`**
+kernel proves it with its own negative control in the same binary: two cells run a
+compute loop that issues **no syscall at all**; cooperatively cell 0 runs all 24
+rounds unbroken and cell 1 never gets the CPU (asserted - that is what makes the other
+phase evidence of anything), and with dispatch on the shared order vector interleaves,
+the longest unbroken run dropping 24 -> 2-9 with 14-33 slices actually taken. An
+interleave is only producible if something took the CPU away mid-loop.
+
+**Still honest about what is not wired:** the fixed VA map is still the map (S2'
+untouched), dispatch is proven for native cells and **off by default** everywhere -
+enabling it for the *Linux* boots is what the `linuxbun` gate needs - `metrics`
+records nothing until a boot enables it, and no second core schedules anything. The
+exit gate is unchanged: `linuxbun` flipping from its accepted partial to `rheo:42`.
+
+**FlashAttention 2 and 3 run** (docs/TILES.md 13): the real exp softmax, filling
+the slot the integer attention block explicitly left open. `librheo/src/tile/fmath.rs`
+is `exp2f`/`expf` from scratch (range reduction + a degree-6 series, ~40 lines,
+stated 2e-7 bound) rather than the `libm` crate - `libm` gives correctly-rounded
+`expf` over the whole domain, and a softmax needs neither half of that (its argument
+is `x - rowmax`, non-positive and bounded, and the result is immediately divided by a
+sum of such results), while what a tile kernel *does* need is a function that inlines
+and vectorises rather than an opaque call per element. `librheo/src/tile/attn.rs`
+carries **FA2** (the online-softmax loop over K/V blocks - no `Tq x Tk` score matrix
+ever exists) and **FA3** (the same arithmetic pipelined over a double-buffered
+staging pair, prologue + swap at a fence); both share one `flash_row_resume`
+recurrence, which is also the entry point a **paged KV cache** needs (carry
+`(m, l, acc)` across non-contiguous pages). Proven by `librheotilebattle` on all
+three ISAs, bit-identical: `exp2f`/`expf` within 2e-7 of exact with both ends
+saturating; FA2 vs a naive materialise-and-softmax reference (bounded relatively,
+because the summation order genuinely differs - measured 0e0 at the test shape);
+**FA2 invariant to the block size** across `block_k` 1/7/16/32/64/Tk compared against
+the *single-block* result (the load-bearing property - the rescale is what makes
+tiling not change the answer, and comparing tilings only against each other would
+pass if they were all wrong the same way; worst 4.8e-7); FA3 equal to FA2 **with its
+staging-swap count hand-computed** (a pipeline that degenerated to one block would
+pass the other checks); every output inside its V column's range (a softmax output is
+a convex combination, so this is exact and independent of both implementations); a
+paged-KV split accumulation equal to one pass; and the query-row decomposition
+matching the whole batch. Honest: FA3's overlap is cooperative **interleaving**, not
+concurrency - its wall-clock win over FA2 awaits vcores on a second core, so the
+structure is proven ahead of the parallelism that pays for it; the inner loops are
+scalar (they are the oracle a `tile::simd` vector path is checked against); forward
+only (no backward pass, causal mask or dropout); f32 only.
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
@@ -1680,7 +1764,12 @@ kernel/       the no_std kernel library + boot demo bin
               hwrng seeding), event streams,
               sched (reservations + the **system-wide admission ledger**:
               a reservation must fit its cell AND the machine -
-              docs/ARCHITECTURE-DEBT.md 2.5), lease, engine, graph, pty, smp
+              docs/ARCHITECTURE-DEBT.md 2.5; plus bore/vcore - the BORE burst
+              score feeding one deadline-ordered EEVDF queue - and **dispatch**,
+              the seam where the two reschedulers ask that queue for the order
+              while the personality keeps authority over runnability, and
+              **preempt**, which takes the CPU from a cell that will not yield:
+              docs/SUBSTRATE.md pillar 3), lease, engine, graph, pty, smp
               (per-CPU state + a kernel SpinLock + secondary-core bring-up on
               all three ISAs - docs/SMP.md), input
               (kernel RX ring + the SYS_WAIT_INPUT park-until-input primitive -
@@ -1827,6 +1916,12 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               real DHCP lease reported, NTP/mDNS skip-with-reason) and the
               per-ISA wait-mode assertion - NIC-interrupt park on riscv64/aarch64,
               timer-backed idle on x86-64),
+              preempt (docs/SUBSTRATE.md 15 S3': timer preemption + queue-driven
+              dispatch - two cells run a compute loop that issues NO syscall,
+              with the cooperative case asserted as the negative control in the
+              same binary: cell 0 unbroken for all 24 rounds and cell 1 never
+              scheduled, then with dispatch on the shared order vector
+              interleaves and the longest run drops to 2-9),
               schedidle (docs/ARCHITECTURE-DEBT.md 2.4, the keystone: the
               scheduler idle state - two cells share one page read-write and each
               appends its own marker to an ordering vector, so the hand-computed
@@ -1916,7 +2011,10 @@ librheo/      the native userspace foundation library (docs/LIBRHEO.md):
               File/read_at/write_at/Contract)/store (Dataset)/compute
               (map_reduce/parallel_for/scan strand workers + Engine::info +
               GraphBuilder)/sched (Reservation + lattice-rt Priority/PeriodicTask/
-              TimingReport)/term (Phase D byte-stream input/edit/render)/ipc
+              TimingReport)/tile (the unified tile framework - docs/TILES.md; incl. fmath's
+              from-scratch exp2f/expf and attn's FlashAttention 2/3 over one
+              shared online-softmax recurrence, TILES.md 13)/term (Phase D
+              byte-stream input/edit/render)/ipc
               (Phase E cross-cell Channel + sealed-buffer share + Phase J symmetric
               async Sender/Receiver on the reactor + rheo-net N4a multi-slot
               Channel::open_slot: one end per client for a service cell)/display (Phase E

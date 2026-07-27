@@ -14,6 +14,8 @@
 //! save/restore; on the single-CPU cooperative runtime strand pipelining is
 //! interleaving, not overlap (SMP is task #27).
 
+pub mod attn;
+pub mod fmath;
 pub mod kernels;
 pub mod simd;
 

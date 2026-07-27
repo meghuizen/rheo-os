@@ -110,7 +110,21 @@ fn tbl() -> &'static mut Funded<MappedFile> {
     unsafe { &mut *core::ptr::addr_of_mut!(TBL) }
 }
 
-/// Close every handle and release the table's frames (called from `linux::reset`).
+/// Close every handle, release the table's frames, and **re-fund the initial
+/// capacity** (called from `linux::reset`).
+///
+/// The re-funding is not tidiness - it keeps the registry's storage a *boot* cost
+/// rather than a *per-load* one. Growing lazily inside the first `mmap`/load would
+/// otherwise charge the table's own frames to whatever operation happened to be
+/// first, which distorts every per-operation frame measurement in the tree: it broke
+/// `linuxrun`'s demand-paging assertion immediately (2 recorded pages against a load
+/// that "committed" 2 frames, both of which were actually this table), and a
+/// measurement that silently includes an unrelated one-off is worse than no
+/// measurement (docs/ENGINEERING.md 1).
+///
+/// A failure to re-fund is not an error here: the registry grows on demand anyway,
+/// and refusing to boot because a global table could not be pre-sized would turn a
+/// performance-accounting nicety into a hard dependency.
 pub fn reset() {
     let t = tbl();
     for i in 0..t.capacity() {
@@ -121,6 +135,8 @@ pub fn reset() {
         }
     }
     t.release();
+    t.set_owner(Owner::KERNEL);
+    t.reserve(INITIAL_MAPPED_FILES);
 }
 
 /// A slot for a new entry, growing the table when every existing one is used.

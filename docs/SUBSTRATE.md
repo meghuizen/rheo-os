@@ -539,18 +539,27 @@ section-2 principle held - and the walkthroughs caught three concrete items
 from starving interactive vcores: its burst score decays, preemption
 exists. Proxy: `librheotilebattle` re-run with vcores > 1, same oracles.
 
-**FlashAttention 2/3 with async - covered, one gap found.** FA2's shape
-(Q/K/V tile blocks, online softmax, high arithmetic intensity) maps onto
-the existing tile framework - the battle tier already runs an attention
-block with paged-KV sharing. FA3's shape (async producer/consumer
-pipelining, compute overlapped with data movement) maps onto strands +
-channels + double-buffered `TileBuf`s + the 64-deep pipeline fence, with
-real overlap arriving with vcores. **The gap**: online softmax needs fast
-`exp`, and the tree has no math library for `no_std` cells - hence libm on
-the shelf plus a SIMD-dispatched exp in `tile::simd` beside the GEMM
-kernels. Proxy: a `flashattn` phase in the battle kernel - a scaled FA2
-block, async-double-buffered across strands, bit-exact vs a naive
-reference.
+**FlashAttention 2/3 with async - covered, and now built** (TILES.md 13).
+The walkthrough found one gap - online softmax needs fast `exp`, and the
+tree had no math for `no_std` cells - and predicted libm on the shelf. The
+gap was real; the prediction was not taken. `libm` gives *correctly
+rounded* `expf` over the whole domain, and a softmax needs neither half of
+that (its argument is `x - rowmax`, always non-positive and bounded, and
+the result is immediately divided by a sum of such results), while what a
+tile kernel *does* need is a function that inlines and vectorises rather
+than an opaque call per element. So `tile::fmath` is ~40 lines of range
+reduction plus a degree-6 series with a **stated** error bound, asserted
+against hand-computed values.
+
+`tile::attn` then carries FA2 (the online-softmax block loop - no `Tq x Tk`
+matrix ever exists) and FA3 (the same arithmetic pipelined over a
+double-buffered staging pair), both proven in the battle tier on all three
+ISAs. The load-bearing assertion is **block-size invariance**: the block
+size is a tiling decision, the online rescale is what makes tiling not
+change the answer, and a bug in that rescale shows up there and essentially
+nowhere else. Honest: the pipeline's *overlap* is cooperative interleaving
+until vcores run on more than one core, so FA3's structure is proven ahead
+of the parallelism that pays for it.
 
 **Node.js and Bun - no longer a paper walkthrough: both real binaries have
 now run on the OS** (GOAL-NODE done, GOAL-BUN partial - LINUX-COMPAT.md 5),
@@ -684,6 +693,38 @@ kernel.
   `security` kernels re-run as the gate). **Done when:** no `MAX_*` capacity
   constant remains outside the accounting bounds, and a cell's table growth is
   refused as `-ENOMEM` attributable to that cell while a sibling is unaffected.
+
+  **Landed so far:** the Linux **context tables** (`MAX_THREADS = 8` gone -
+  `INITIAL_CONTEXTS` is a reservation, not a ceiling), the per-cell **signal**
+  contexts, the per-cell **VMA list** (`MAX_VMAS = 128` gone), and the global
+  **mapped-file registry** (`MAX_MAPPED_FILES = 64` gone, and its handle widened
+  `u8` -> `u16` - the width was the real ceiling once the table could grow, and a
+  wrapping handle would have pointed a mapping at another file's bytes, which is
+  neither a fault nor a refusal).
+
+  Three things the first migrations taught, all of them structural rather than
+  incidental:
+
+  1. **A funded table cannot be raw-copied.** `fork` clones a whole `LinuxState`
+     with one `copy_nonoverlapping`, which duplicates a `Funded`'s *descriptor* -
+     so parent and child would address one shared directory frame, every child
+     mapping would appear in the parent, and whichever exited first would free
+     frames the other still reads. Each funded field now needs an explicit deep
+     copy, and a child whose table cannot be funded makes the `fork` fail
+     (`-EAGAIN`) rather than run with a truncated copy.
+  2. **Every slot-handback path becomes a release path.** There is no drop glue on
+     a `Funded`, so a slot reused without releasing strands its frames. Two real
+     leaks existed the moment the tables became funded: a reaped cell's context
+     tables were only ever released by the between-runs reset (so every fork+exec
+     pair - the `rsh` suite is twelve - leaked until the next boot), and
+     `linux::reset` overwrote the VMA descriptor without releasing it.
+  3. **A global table's one-off growth must not land inside a per-operation
+     measurement.** Growing the mapped-file registry lazily charged its frames to
+     whatever operation happened to be first, which broke `linuxrun`'s
+     demand-paging assertion immediately (2 recorded pages against a load that
+     "committed" 2 frames, both of which were the registry). It is now funded at
+     its reset point, so its storage is a boot cost. A measurement that silently
+     includes an unrelated one-off is worse than no measurement.
 - **S2' - migrate placement onto `VaSpace`.** `load.rs`'s region bases,
   `user.rs`'s `MMAP_BASE`/`GRANT_BASE`/`FILEMMAP_BASE` and `linux::mem`'s
   window become allocations; `USER_VA_MAX` becomes `arch::USER_VA_TOP`. The ABI
@@ -697,6 +738,48 @@ kernel.
   10.2 safety audit gating both. **Done when:** the `linuxbun` test flips from
   its accepted partial to `rheo:42`/exit 0, which is the measured frontier
   (SMP.md 10.1).
+
+  **Landed: the queue dispatches, and a cell can be preempted on all three
+  ISAs.** Two pieces, both additive:
+
+  - `sched::dispatch` is the **seam**. The two `reschedule` functions and
+    `SYS_YIELD` ask the ready queue for the *order*; the personality's own state
+    (`PState`, the native process table) stays the sole authority on
+    *runnability*, reconciled at the pick so the two can never disagree. With
+    dispatch disabled, `pick` is the pre-migration round-robin expression for
+    expression - the same trade SMP.md records for the `smp` feature, and what
+    lets the migration be turned on one boot at a time. CPU time is charged and
+    every relinquish recorded **at the transition itself**, which is what makes
+    the BORE score measured rather than inferred: this kernel has no path from
+    running to not-running that does not pass through a named call.
+  - `sched::preempt` **takes the CPU away.** The arbiter gains a `Preempt` slot,
+    the interrupt handler sets one flag, and the portable
+    `user::on_user_interrupt` decides at trap exit whether the CPU moves - a
+    sibling context of the same cell first (the `linuxbun` shape), then another
+    cell. Splitting "note it" from "act on it" is not ceremony: an interrupt can
+    land while the kernel holds a reference into a funded table, so a scheduler
+    invoked from the handler would be reentrant.
+
+  Per-ISA, each of which needed a real change: riscv64's user trap already
+  serviced U-mode interrupts; **aarch64's lower-EL IRQ slot was a *fatal* slot**
+  and cells ran with `SPSR.I` set, so neither the vector nor the mask existed;
+  **x86-64 cells ran with `IF` clear** and the LAPIC stub saved only
+  caller-saved registers, so the timer vector now routes through `common_trap`
+  (reusing its ring-3 frame capture and IRET resume rather than writing a second
+  one). Both mask changes are read at frame-construction time, so a cooperative
+  boot's frames keep the pre-migration bits exactly.
+
+  Proven by the **`preempt`** kernel, which carries its own negative control in
+  the same binary: two cells run a compute loop that issues **no syscall at
+  all**. Cooperatively, cell 0 runs all 24 rounds unbroken and cell 1 never gets
+  the CPU - asserted, because that is what makes the other phase evidence of
+  anything. With dispatch on, the shared order vector interleaves and the longest
+  unbroken run drops from 24 to 2-9, with 14-33 slices actually taken. An
+  interleave is only producible if something took the CPU away mid-loop.
+
+  **Still to do for S3':** enabling dispatch for the *Linux* boots (it is proven
+  for native cells and off by default everywhere), which is what the `linuxbun`
+  gate needs; `metrics` enabled at boot; and the second core.
 
 - **S1 - funded metadata.** Statics -> typed slabs charged to cell budgets;
   no semantic change; every existing test green plus a new `substrate` test

@@ -437,8 +437,11 @@ with the framework already in place.
   (so AVX-512/VNNI light up only on real hardware, where `comparison/tiles`
   proves them), and TCG models no SIMD speedup, so under emulation the
   benchmark may keep scalar - the selection adapts to the real host.
-- **Single vcore**: pipelining is cooperative interleaving until SMP
-  (task #27).
+- **Single vcore**: pipelining is cooperative interleaving. Timer
+  preemption now exists (SUBSTRATE.md 15, S3'), so a compute-bound tile
+  program no longer starves a sibling cell - but preemption is not
+  parallelism, and two tiles computing at the same instant still awaits a
+  second core.
 ### Capacity caps - flagged for real-workload sizing
 
 Each `TileBuf` holds a memory grant, so a tile workload presses on two
@@ -474,3 +477,128 @@ feature. Raising `MAX_OBJECTS` buys headroom in the meantime.
   ride the same contract and the same graph lowering; execution awaits
   their contained driver cells (GPU-HARDWARE.md 5). Nothing here
   pretends otherwise.
+
+---
+
+## 13. FlashAttention 2 and 3
+
+The section 10 battle tier ran an attention *block* whose softmax slot was an
+integer requantize, and said so: "a true exp softmax is an F32 library map -
+stated". This is that map, and the two attention algorithms built on it -
+`librheo/src/tile/fmath.rs` and `librheo/src/tile/attn.rs`, proven by the
+`librheotilebattle` kernel on all three ISAs.
+
+### 13.1 Why attention needs its own kernel at all
+
+Attention for one head is `O = softmax(Q K^T / sqrt(d)) V`. Written directly it
+**materialises `S = Q K^T`**, which is `Tq x Tk` - quadratic in sequence length
+and, for any real context window, far larger than the inputs and outputs put
+together. At `Tq = Tk = 8192` that is 67 M f32 = 256 MiB for a matrix nothing
+wants to keep. It is not a GEMM problem: the tile framework's GEMM would happily
+compute `S`, and the cost is that `S` exists.
+
+FlashAttention's insight is that softmax does not need the whole row at once. Its
+normaliser is a *sum*, and a sum can be accumulated - provided the running maximum
+used for numerical stability is corrected as it moves. So the kernel walks `K`/`V`
+in blocks, carrying three running quantities per query row: the max `m`, the sum
+`l`, and the unnormalised output `acc`. For a block with scores `s`, with
+`m' = max(m, max(s))` and `c = exp(m - m')`:
+
+```
+l   <- l * c + sum_j exp(s_j - m')
+acc <- acc * c + sum_j exp(s_j - m') * V_j
+```
+
+and `O = acc / l` after the last block.
+
+### 13.2 The exp, and why not `libm`
+
+The obvious answer to "a cell has no `exp`" is the `libm` crate: pure Rust,
+`no_std`, builds on all three ISAs, so it clears the SUBSTRATE.md 11 Tier S bar.
+It is not taken, for a reason specific to this use.
+
+`libm` provides *correctly rounded* `expf` over the whole domain, and a softmax
+needs neither half of that: its argument is always `x - rowmax`, so non-positive
+and bounded, and its result is immediately divided by a sum of such results, so a
+few 1e-7 of relative error is invisible in the answer. What a tile kernel *does*
+need is a function that **inlines and vectorises** - the whole point of the
+framework is that the inner loop lowers to SIMD (`tile::simd`), and an opaque call
+per element defeats that.
+
+So `tile::fmath` is `exp2f` as the primitive (range reduction `x = n + r` with
+`|r| <= 0.5`, a degree-6 series for `2^r`, and `2^n` by exponent-field arithmetic)
+and `expf(x) = exp2f(x * log2 e)`. That is the order real attention kernels use:
+the `log2 e` factor folds into the score scale and costs nothing, while `2^n` is
+exact. The truncation error at `|r| = 0.5` is ~1.3e-8 relative, below `f32`
+epsilon; the asserted bound is **2e-7** (~3 ulps), loose enough not to be a
+rounding-order tripwire and tight enough that a wrong coefficient fails it. Both
+ends saturate (`0.0` below the subnormal range, `+inf` above), so an out-of-range
+score cannot turn one bad input into an all-NaN output row.
+
+### 13.3 FA2, FA3, and what distinguishes them
+
+They are not different algorithms. **FA2** is the loop above with the rescale on
+the accumulator rather than inside the inner loop (which is what distinguishes it
+from FA1). **FA3** is the same arithmetic **pipelined**: block `i+1` is staged into
+the idle half of a double buffer while block `i` is consumed from the other, so
+data movement overlaps compute instead of alternating with it. On a GPU that is
+warp specialisation; here it is a prologue, a swap at a fence, and two halves of a
+staging pair.
+
+Both share one function - `flash_row_resume` is the whole algorithm, and FA2 and
+FA3 differ only in where the rows it reads come from. That is deliberate: two
+implementations of one recurrence is exactly where a bug hides between them.
+
+`flash_row_resume` is also the entry point a **paged KV cache** needs
+(AI-ARCHITECTURE.md 3): a sequence's keys and values live in pages that are not
+contiguous, so a caller accumulates page by page, carrying `(m, l, acc)` across the
+gaps.
+
+### 13.4 The proof
+
+Seven properties in the battle tier, in increasing strength:
+
+1. `exp2f`/`expf` against hand-computed values, and both saturating ends.
+2. FA2 against a naive materialise-and-softmax reference - bounded **relatively**,
+   not bit-exactly. The summation order genuinely differs, and claiming bit
+   equality would be false (ENGINEERING.md 7). Measured: `0e0` at the test shape,
+   i.e. it happens to agree exactly, which is reported rather than asserted.
+3. **FA2 is invariant to the block size**, across `block_k` of 1, 7, 16, 32, 64 and
+   `Tk`, compared against the *single-block* result - the one that needs no rescale
+   at all. This is the load-bearing property: the block size is a tiling decision,
+   the online rescale is what makes tiling not change the answer, and a bug in that
+   rescale shows up here and essentially nowhere else. Comparing tilings only
+   against each other would pass if they were all wrong the same way. Worst
+   observed: 4.8e-7.
+4. FA3 agrees with FA2, **and its fence fired exactly the number of staging swaps
+   the tiling implies** (a hand-computed count - a pipeline that silently
+   degenerated to one block would still pass 2 and 3).
+5. Every output element lies inside the range of the corresponding `V` column,
+   because a softmax output is a **convex combination** of the `V` rows. Exact, and
+   independent of both implementations - it would catch a normalisation error that
+   happened to agree between them.
+6. A paged-KV **split accumulation** (`0..48`, then `48..128`, deliberately not a
+   block multiple) equals one pass over the whole range.
+7. FA2 decomposed over query-row chunks with a yield per row matches the
+   whole-batch result - the decomposition attention actually parallelises along.
+
+All bit-identical across x86-64, ARM64 and riscv64.
+
+### 13.5 Honest scope
+
+- **The overlap is interleaving, not concurrency.** One cooperative CPU, so FA3's
+  producer and consumer alternate rather than run at once, and its wall-clock win
+  over FA2 is not available until vcores dispatch on more than one core. What is
+  real and tested now is the *structure* - genuinely double-buffered staging, a
+  genuine prologue, a fence that fires the right number of times, and an identical
+  result. Building the pipeline before the parallelism is the right order; the
+  alternative is a pipeline whose first execution is also its first test.
+- **Scalar inner loops.** The dot product and the exp are scalar; `tile::simd` is
+  where a target-specific kernel goes, and the GEMM there is the precedent. Keeping
+  these scalar is what makes them the oracle a vector path is checked against.
+- **Forward only.** No backward pass, no causal mask, no dropout, no multi-head
+  batching loop - each is a caller-level loop over this kernel, and none is
+  claimed.
+- **f32 only.** The dtype matrix (section 4) covers the storage types; an
+  attention kernel over `bf16`/`fp8` accumulating in `f32` is the natural next
+  step and is not built.

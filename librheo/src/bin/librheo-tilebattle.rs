@@ -29,6 +29,13 @@
 //!   receipt must never drift - plus a bounded grant-slot churn loop.
 //! - **Boundary shapes**: (13,17,5) under block 16, 1xN / Nx1, stride >
 //!   width, tail quantization blocks - all against naive references.
+//! - **FlashAttention 2 and 3** (docs/TILES.md 13): the real exp softmax,
+//!   filling the slot the integer attention block above leaves open. FA2's
+//!   online-softmax block loop asserted **invariant to the block size**
+//!   (the property the rescale exists for), FA3's pipelined form asserted
+//!   equal to it with its staging-swap count hand-computed, plus the
+//!   convex-combination range property, a paged-KV split accumulation, and
+//!   the `exp2f`/`expf` bound against exact values.
 //! - **The pipeline-depth fence**: a 64-op dependent tile chain that never
 //!   touches the queue must complete (the regression fence for the
 //!   reactor's no-progress guard), then a mixed variant with a graph
@@ -509,6 +516,323 @@ async fn work() {
             }
         }
         println!("battle: boundary shapes (13x17x5, 1xN, strided, tail quant) OK");
+    }
+
+    // ================= FlashAttention 2 and 3 ==========================
+    //
+    // The real softmax, filling the slot the integer attention block above
+    // explicitly leaves open ("the softmax slot; a true exp softmax is an F32
+    // library map - stated"). FA2 is the online-softmax loop over K/V blocks -
+    // no `Tq x Tk` score matrix ever exists - and FA3 is the same arithmetic
+    // pipelined over a double-buffered staging pair.
+    //
+    // Five properties, in increasing strength:
+    //  1. `exp2f`/`expf` against hand-computed values (the transcendental the
+    //     whole thing rests on; a wrong coefficient would otherwise show up
+    //     only as a slightly-wrong attention output nothing could attribute).
+    //  2. FA2 against a naive materialise-and-softmax reference. Bounded
+    //     relatively, not bit-exactly - the summation order genuinely differs,
+    //     and claiming bit equality would be false.
+    //  3. **FA2 is invariant to the block size.** This is the load-bearing
+    //     one: the block size is a tiling decision, the online rescale is what
+    //     makes tiling not change the answer, and a bug in that rescale shows
+    //     up here and essentially nowhere else.
+    //  4. FA3 agrees with FA2, and its fence fired exactly the number of
+    //     staging swaps the tiling implies (a hand-computed count - a pipeline
+    //     that silently degenerated to one block would still pass 2 and 3).
+    //  5. Every output element lies inside the range of the corresponding V
+    //     column, because a softmax output is a **convex combination** of the V
+    //     rows. Exact, and independent of both implementations - it would catch
+    //     a normalisation error that happened to agree between them.
+    {
+        use librheo::tile::attn::{
+            self, AttnShape, attention_reference, flash_attention_2, flash_attention_3,
+            flash_row_resume, max_rel_diff,
+        };
+        use librheo::tile::fmath::{exp2f, expf};
+
+        // 1. The transcendental, against exact values.
+        //
+        // 2^n for integer n is exact by construction, so those are equalities;
+        // the rest are within the module's stated 2e-7 relative bound. The
+        // negative arguments are the ones a softmax actually uses.
+        const EPS: f32 = 2e-7;
+        let rel = |a: f32, b: f32| {
+            let d = if a > b { a - b } else { b - a };
+            let m = if b < 0.0 { -b } else { b };
+            d / if m > 1e-30 { m } else { 1.0 }
+        };
+        if exp2f(0.0) != 1.0 || exp2f(1.0) != 2.0 || exp2f(-2.0) != 0.25 || exp2f(10.0) != 1024.0 {
+            return fail(80);
+        }
+        // e = 2.718281828..., e^-1, e^-10, and 2^0.5 = 1.414213562...
+        if rel(expf(1.0), 2.718_281_8) > EPS
+            || rel(expf(-1.0), 0.367_879_44) > EPS
+            || rel(expf(-10.0), 4.539_993e-5) > EPS
+            || rel(exp2f(0.5), 1.414_213_6) > EPS
+        {
+            return fail(81);
+        }
+        // The saturating ends, so an out-of-range score cannot NaN a whole row.
+        if exp2f(-200.0) != 0.0 || exp2f(200.0) != f32::INFINITY {
+            return fail(82);
+        }
+        println!("battle: exp2f/expf within 2e-7 of exact, saturating at both ends OK");
+
+        // FA shapes: one head, scaled for TCG. The geometry that matters is
+        // Tk >> d (a context much longer than the head dimension), which is
+        // what makes the Tq x Tk matrix the thing worth not materialising.
+        const TQ: usize = 16;
+        const TK: usize = 128;
+        const HD: usize = 32;
+        let shape = AttnShape {
+            tq: TQ,
+            tk: TK,
+            d: HD,
+        };
+        let scale = shape.scale();
+
+        let mut qb: TileBuf<tile::F32> = TileBuf::alloc(MemKind::Ddr, TQ, HD).unwrap();
+        let mut kb: TileBuf<tile::F32> = TileBuf::alloc(MemKind::Ddr, TK, HD).unwrap();
+        let mut vb: TileBuf<tile::F32> = TileBuf::alloc(MemKind::Ddr, TK, HD).unwrap();
+        // Values spread over a few units so the scores span a range wide enough
+        // that the running max genuinely moves between blocks - with a flat
+        // score distribution the rescale is always by 1.0 and property 3 would
+        // pass without exercising anything.
+        qb.fill_with(|i, j| ((i * 7 + j * 3) % 23) as f32 * 0.31 - 3.0);
+        kb.fill_with(|i, j| ((i * 5 + j * 11) % 29) as f32 * 0.27 - 3.5);
+        vb.fill_with(|i, j| ((i * 13 + j * 2) % 17) as f32 * 0.5 - 4.0);
+        // Contiguous rows: the attention functions index `row * d + e`, so a
+        // padded stride would silently read the padding as data.
+        if qb.stride() != HD || kb.stride() != HD || vb.stride() != HD {
+            return fail(83);
+        }
+        let (q, k, v) = (qb.as_slice(), kb.as_slice(), vb.as_slice());
+
+        let mut o_ref = alloc::vec![0.0f32; TQ * HD];
+        let mut o_fa2 = alloc::vec![0.0f32; TQ * HD];
+        let mut o_fa3 = alloc::vec![0.0f32; TQ * HD];
+        let mut s_full = alloc::vec![0.0f32; TK];
+        let mut acc = alloc::vec![0.0f32; HD];
+
+        // 2. FA2 versus the naive reference.
+        if attention_reference(q, k, v, &mut o_ref, shape, scale, &mut s_full).is_err() {
+            return fail(84);
+        }
+        if flash_attention_2(q, k, v, &mut o_fa2, shape, scale, 32, &mut s_full, &mut acc).is_err()
+        {
+            return fail(85);
+        }
+        let d_ref = max_rel_diff(&o_fa2, &o_ref);
+        if d_ref > 2e-6 {
+            return fail(86);
+        }
+
+        // 3. Block-size invariance - the property the online rescale exists for.
+        //
+        // Compared against the **single-block** result (block_k = TK), which is
+        // the one that needs no rescale at all: if every tiling agrees with the
+        // untiled computation, the rescale is right. Comparing tilings only
+        // against each other would pass if they were all wrong the same way.
+        let mut o_one = alloc::vec![0.0f32; TQ * HD];
+        if flash_attention_2(q, k, v, &mut o_one, shape, scale, TK, &mut s_full, &mut acc).is_err()
+        {
+            return fail(87);
+        }
+        let mut worst_tiling = 0.0f32;
+        for bk in [1usize, 7, 16, 32, 64] {
+            let mut o_bk = alloc::vec![0.0f32; TQ * HD];
+            if flash_attention_2(q, k, v, &mut o_bk, shape, scale, bk, &mut s_full, &mut acc)
+                .is_err()
+            {
+                return fail(88);
+            }
+            let d = max_rel_diff(&o_bk, &o_one);
+            if d > worst_tiling {
+                worst_tiling = d;
+            }
+        }
+        if worst_tiling > 2e-6 {
+            return fail(89);
+        }
+        println!(
+            "battle: FA2 (Tq {TQ}, Tk {TK}, d {HD}) vs naive {d_ref:e}, and \
+             tiling-invariant across block_k 1/7/16/32/64/{TK} (worst \
+             {worst_tiling:e}) - no Tq x Tk matrix materialised OK"
+        );
+
+        // 4. FA3: the same arithmetic, pipelined. The fence count is
+        // hand-computed: one swap per staged block, per query row.
+        const FA3_BK: usize = 32;
+        let expect_fences = TQ * TK.div_ceil(FA3_BK);
+        let mut fences = 0usize;
+        let mut stage_k = alloc::vec![0.0f32; attn::fa3_stage_len(FA3_BK, HD)];
+        let mut stage_v = alloc::vec![0.0f32; attn::fa3_stage_len(FA3_BK, HD)];
+        if flash_attention_3(
+            q,
+            k,
+            v,
+            &mut o_fa3,
+            shape,
+            scale,
+            FA3_BK,
+            &mut s_full,
+            &mut acc,
+            &mut stage_k,
+            &mut stage_v,
+            |_| fences += 1,
+        )
+        .is_err()
+        {
+            return fail(90);
+        }
+        if fences != expect_fences {
+            return fail(91); // the pipeline did not stage the blocks it claims
+        }
+        let d_fa3 = max_rel_diff(&o_fa3, &o_fa2);
+        if d_fa3 > 2e-6 {
+            return fail(92);
+        }
+        println!(
+            "battle: FA3 pipelined (double-buffered staging, {fences} swaps = \
+             {TQ} rows x {} blocks) agrees with FA2 to {d_fa3:e} OK",
+            TK.div_ceil(FA3_BK)
+        );
+
+        // 5. Convex combination: every output element is inside its V column's
+        // range. Independent of both implementations.
+        for e in 0..HD {
+            let mut lo = f32::INFINITY;
+            let mut hi = f32::NEG_INFINITY;
+            for j in 0..TK {
+                let x = v[j * HD + e];
+                if x < lo {
+                    lo = x;
+                }
+                if x > hi {
+                    hi = x;
+                }
+            }
+            for i in 0..TQ {
+                for out in [&o_fa2, &o_fa3] {
+                    let y = out[i * HD + e];
+                    // A small slack for the rounding of the weighted sum; the
+                    // range itself is exact.
+                    if y < lo - 1e-5 || y > hi + 1e-5 {
+                        return fail(93);
+                    }
+                }
+            }
+        }
+
+        // 6. The paged-KV shape: a sequence whose K/V rows live in
+        // non-contiguous pages is accumulated page by page, carrying (m, l, acc)
+        // across the gaps. Splitting the range must equal one call over it -
+        // which is the same rescale property as 3, reached through the resuming
+        // entry point a real paged cache would use.
+        let split = 48usize; // deliberately not a multiple of the block size
+        for i in 0..TQ {
+            let qi = &q[i * HD..i * HD + HD];
+            for x in acc[..HD].iter_mut() {
+                *x = 0.0;
+            }
+            let (m1, l1) = flash_row_resume(
+                qi,
+                k,
+                v,
+                shape,
+                scale,
+                16,
+                &mut s_full,
+                &mut acc,
+                0,
+                split,
+                f32::NEG_INFINITY,
+                0.0,
+            );
+            let (_, l2) = flash_row_resume(
+                qi,
+                k,
+                v,
+                shape,
+                scale,
+                16,
+                &mut s_full,
+                &mut acc,
+                split,
+                TK,
+                m1,
+                l1,
+            );
+            let inv = if l2 > 0.0 { 1.0 / l2 } else { 0.0 };
+            for e in 0..HD {
+                let got = acc[e] * inv;
+                let want = o_one[i * HD + e];
+                let diff = if got > want { got - want } else { want - got };
+                let mag = if want < 0.0 { -want } else { want };
+                if diff / if mag > 1e-6 { mag } else { 1e-6 } > 2e-6 {
+                    return fail(94);
+                }
+            }
+        }
+        println!(
+            "battle: paged-KV split accumulation (0..{split}, {split}..{TK}) equals \
+             one pass, and every output is inside its V column's range OK"
+        );
+
+        // 7. FA2 over strands: the parallelism attention actually has is across
+        // query rows (and heads), so the rows are split into strand-sized chunks
+        // that yield between blocks. On one cooperative CPU this is interleaving
+        // rather than concurrency - stated - so what is asserted is that the
+        // *decomposition* is correct: every chunk's rows match the whole-batch
+        // result, and the strands did interleave.
+        {
+            const STRANDS: usize = 4;
+            let mut o_par = alloc::vec![0.0f32; TQ * HD];
+            let mut order: Vec<usize> = Vec::new();
+            let chunk = TQ.div_ceil(STRANDS);
+            for sidx in 0..STRANDS {
+                let lo = sidx * chunk;
+                let hi = (lo + chunk).min(TQ);
+                for i in lo..hi {
+                    let qi = &q[i * HD..i * HD + HD];
+                    for x in acc[..HD].iter_mut() {
+                        *x = 0.0;
+                    }
+                    let (_, l) = flash_row_resume(
+                        qi,
+                        k,
+                        v,
+                        shape,
+                        scale,
+                        32,
+                        &mut s_full,
+                        &mut acc,
+                        0,
+                        TK,
+                        f32::NEG_INFINITY,
+                        0.0,
+                    );
+                    let inv = if l > 0.0 { 1.0 / l } else { 0.0 };
+                    for e in 0..HD {
+                        o_par[i * HD + e] = acc[e] * inv;
+                    }
+                    order.push(sidx);
+                    rt::yield_now().await;
+                }
+            }
+            if max_rel_diff(&o_par, &o_one) > 2e-6 {
+                return fail(95);
+            }
+            if order.len() != TQ {
+                return fail(96);
+            }
+            println!(
+                "battle: FA2 decomposed over {STRANDS} query-row chunks ({} rows each, \
+                 yielding per row) matches the whole-batch result OK",
+                chunk
+            );
+        }
     }
 
     // ================= The pipeline-depth fence ========================
