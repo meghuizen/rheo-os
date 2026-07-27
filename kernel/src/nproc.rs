@@ -645,6 +645,9 @@ pub fn preempt_cell(cur: usize) -> Option<*mut TrapFrame> {
 fn schedulable(i: usize) -> bool {
     user::cell_present(i)
         && user::cell_is_native(i)
+        // A cell belongs to one core (docs/SMP.md 10.0). Constant-true on every
+        // single-core boot, because nothing there ever claims a cell.
+        && user::cell_on_this_cpu(i)
         && matches!(procs()[i].state, PState::Free | PState::Runnable)
 }
 

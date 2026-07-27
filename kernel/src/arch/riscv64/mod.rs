@@ -390,11 +390,19 @@ fn rdtime() -> u64 {
 /// a timer. If Sstc were absent the `stimecmp` write would trap - this is called
 /// only by the Phase F timer test, so no other kernel is affected.
 pub fn enable_timer_irq() {
+    enable_timer_irq_this_cpu();
+    // SAFETY: set once by the primary, before any secondary reads it.
+    unsafe { *core::ptr::addr_of_mut!(TIMER_ENABLED) = true };
+}
+
+/// Bring up **this hart's** timer interrupt. Every register involved is a per-hart
+/// CSR, so a secondary that wants a preemption slice must run this for itself - the
+/// primary cannot enable `sie.STIE` on another hart (docs/SMP.md 10.0).
+pub fn enable_timer_irq_this_cpu() {
     // SAFETY: kernel context; Sstc is present on `-cpu max` with menvcfg.STCE set.
     unsafe {
         asm!("csrw 0x14d, {0}", in(reg) u64::MAX); // stimecmp = never
         asm!("csrrs x0, sie, {0}", in(reg) 1u64 << 5); // sie.STIE
-        *core::ptr::addr_of_mut!(TIMER_ENABLED) = true;
     }
 }
 

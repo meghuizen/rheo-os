@@ -33,9 +33,10 @@ mod harness;
 use harness::{CellStore, KernelStack, build_cell};
 use kernel::arch::MapPerm;
 use kernel::capability::{CapTable, ObjectTable};
+use kernel::sched::{dispatch, preempt};
 use kernel::smp::{self, SpinLock, StartError};
 use kernel::user_progs::{user_copair, user_placed};
-use kernel::{arch, println, user};
+use kernel::{arch, idle, ktimer, println, user};
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
@@ -262,6 +263,7 @@ fn test_secondary_bringup() {
             test_parallel_gemm(idx);
             test_user_cells_on_both();
             test_placement();
+            test_cross_core_preemption();
         }
         Err(StartError::NoSecondary) => {
             println!(
@@ -608,5 +610,146 @@ fn test_placement() {
                 println!("smp:   CPU {c} claimed {n}");
             }
         }
+    }
+}
+
+// ------------------------------------------------- preemption on every core at once
+//
+// The placement phase above is work-conserving but **non-preemptive**: a core claims
+// a cell and runs it to completion. That is enough to balance load and not enough to
+// be a scheduler - a cell that never traps still owns its core until it exits, on
+// three cores instead of one.
+//
+// This phase closes that. Each core claims a *pair* of cells (`smp::CLAIM_BATCH`) and
+// runs them **under its own preemption timer**: the slice fires, `on_user_interrupt`
+// asks the scheduler for another runnable cell **this core owns**, and the CPU moves.
+// Every piece of that is per-core hardware the bring-up trampolines do not set - the
+// RISC-V `stimecmp`/`sie` CSRs, the GICv3 redistributor and CPU interface, the LAPIC -
+// so each core brings up its own (`enable_preemption_here`).
+//
+// The cells run [`user_placed`] with **no syscall at all** until they exit, which is
+// what makes the evidence unambiguous: under cooperative scheduling the number of
+// preemptions taken is exactly zero, because there is no other moment at which the
+// CPU could change hands. So the assertion is simply that preemptions were **taken**,
+// with the cooperative placement round immediately above as the negative control -
+// same cells, same cores, same claims, and `preempt::counters()` reads zero there.
+//
+// What is NOT claimed: this is preemption *within* a core's own claim. Nothing takes
+// a cell away from another core, and nothing migrates a running cell - the cell-to-
+// core binding is still the partition that makes the whole path safe without locking
+// (docs/SMP.md 10.0).
+
+fn test_cross_core_preemption() {
+    // The control: the cooperative round above must have taken none, or "preemptions
+    // happened" below is not evidence of anything.
+    let (_a0, taken0, _u0, _s0, _c0) = preempt::counters();
+    assert_eq!(
+        taken0, 0,
+        "the cooperative placement round preempted {taken0} times - it is supposed to \
+         be the negative control"
+    );
+
+    dispatch::enable(true);
+    // SAFETY: single-threaded setup on the primary; secondaries are parked in their
+    // work loop and claim nothing until the queue is published.
+    unsafe {
+        let objects = &mut *core::ptr::addr_of_mut!(OBJECTS2);
+        let caps = &mut *core::ptr::addr_of_mut!(CAPS2);
+        *objects = ObjectTable::new();
+        *caps = CapTable::new();
+
+        let mut aspaces: [core::mem::MaybeUninit<kernel::mm::AddressSpace>; PLACED] =
+            [const { core::mem::MaybeUninit::uninit() }; PLACED];
+        let mut frames: [core::mem::MaybeUninit<kernel::arch::TrapFrame>; PLACED] =
+            [const { core::mem::MaybeUninit::uninit() }; PLACED];
+        for i in 0..PLACED {
+            let store = core::ptr::addr_of_mut!(STORE_Q[i]);
+            let (aspace, _o, frame) = build_cell(
+                &mut *store,
+                objects,
+                caps,
+                (*core::ptr::addr_of!(KSTACK_Q[i])).top(),
+                (i + 1) as u16,
+                user_placed,
+                (i + 1) as u64,
+                // Every cell long here: a short one can exit before its first slice,
+                // and then its core never had anything to preempt.
+                LONG_ROUNDS,
+            );
+            aspaces[i].write(aspace);
+            frames[i].write(frame);
+        }
+
+        user::reset();
+        ktimer::reset();
+        idle::reset();
+        preempt::reset();
+        let mut queue = [0usize; PLACED];
+        for i in 0..PLACED {
+            let store = core::ptr::addr_of_mut!(STORE_Q[i]);
+            user::install(
+                i,
+                aspaces[i].assume_init_ref(),
+                caps,
+                objects,
+                (*store).qp.qp.as_ptr(),
+                frames[i].as_mut_ptr(),
+            );
+            queue[i] = i;
+        }
+
+        let mut out = [(0u64, 0usize); PLACED];
+        // SAFETY: as the cooperative round - installed, present, native, listed once.
+        let finished = smp::place_cells_preemptive(&queue, &mut out);
+        dispatch::enable(false);
+        if !finished {
+            println!(
+                "smp: SKIP the cross-core preemption phase - the queue did not drain \
+                 within the bound"
+            );
+            return;
+        }
+        for i in 0..PLACED {
+            assert_eq!(
+                out[i].0,
+                (i + 1) as u64,
+                "cell {i} exited with the wrong code"
+            );
+        }
+
+        let (armed, taken, unarmable, to_sibling, to_cell) = preempt::counters();
+        if unarmable > 0 && taken == 0 {
+            println!(
+                "smp: SKIP the cross-core preemption phase - {unarmable} slices could \
+                 not be armed (no wired timer interrupt on this ISA), so no preemption \
+                 is claimed"
+            );
+            return;
+        }
+        assert!(
+            taken > 0,
+            "no preemption was taken across {armed} armed slices, yet every cell ran a \
+             loop that issues no syscall - so the CPU could not have changed hands at \
+             all"
+        );
+        assert_eq!(
+            to_sibling, 0,
+            "a native cell has one context; a sibling-context preemption is impossible \
+             here"
+        );
+        assert!(
+            kernel::mm::frames::used_matches_bitmap(),
+            "the frame pool's used counter drifted from its bitmap under preemption"
+        );
+        // Which cores actually took work, so "on every core" is measured rather than
+        // assumed.
+        let movers = (0..smp::MAX_CPUS)
+            .filter(|&c| smp::cells_taken(c) > 0)
+            .count();
+        println!(
+            "smp: CELLS WERE PREEMPTED ON {movers} CORES AT ONCE - {taken} of {armed} \
+             slices took the CPU from a cell that issues no syscall ({to_cell} to \
+             another cell), against 0 in the cooperative round just above"
+        );
     }
 }

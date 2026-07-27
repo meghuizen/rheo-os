@@ -778,6 +778,32 @@ static PLACE_NEXT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "smp")]
 static PLACE_DONE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "smp")]
+/// Whether the current round runs its cells **preemptively**.
+static PLACE_PREEMPT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp")]
+/// Which cores have already brought up their own preemption timer this boot.
+static PREEMPT_READY: PerCpu<AtomicUsize> =
+    PerCpu::from_array([const { AtomicUsize::new(0) }; MAX_CPUS]);
+
+#[cfg(feature = "smp")]
+/// Bring up **this** core's preemption timer, once.
+///
+/// Everything it touches is per-core hardware - the RISC-V `stimecmp`/`sie` CSRs,
+/// this core's GICv3 redistributor and CPU interface, this core's LAPIC - and none
+/// of it is set by any bring-up trampoline, so a secondary that skipped this would
+/// run its cells to completion with no slice and the preemption would silently not
+/// happen (docs/SMP.md 10.0). The per-core "already done" flag makes it idempotent
+/// without a lock: only this core reads or writes its own slot.
+fn enable_preemption_here() {
+    // SAFETY: this core's own slot.
+    let flag = PREEMPT_READY.this();
+    if flag.swap(1, Ordering::AcqRel) == 1 {
+        return;
+    }
+    crate::sched::init_run_queue();
+    arch::enable_timer_irq_this_cpu();
+}
+#[cfg(feature = "smp")]
 /// Per-cell exit code, and which CPU ran it. Written by the core that ran the cell,
 /// at its own index - disjoint, so no lock.
 static PLACE_CODE: [AtomicUsize; MAX_PLACED_CELLS] =
@@ -791,7 +817,24 @@ static PLACE_TAKEN: PerCpu<AtomicUsize> =
     PerCpu::from_array([const { AtomicUsize::new(0) }; MAX_CPUS]);
 
 #[cfg(feature = "smp")]
+/// How many cells a core claims at once.
+///
+/// **More than one, on purpose.** A core holding a single cell has nothing to
+/// preempt *to*: the slice fires, the scheduler looks for another runnable cell this
+/// core owns, finds none, and the cell runs on. Claiming a pair is the smallest set
+/// that makes cross-core preemption a real thing to observe rather than a mechanism
+/// with no witness.
+pub const CLAIM_BATCH: usize = 2;
+
+#[cfg(feature = "smp")]
 /// Claim and run cells until the queue is empty. Runs on **any** core.
+///
+/// Claims come in batches of [`CLAIM_BATCH`] and the whole batch is stamped as this
+/// core's ([`crate::user::claim_cell`]) before any of it runs, so no other core's
+/// scheduler will ever see one of them. Within the batch the core runs them
+/// **preemptively** where the boot enabled dispatch and a timer interrupt: `run`
+/// unwinds when *some* cell of the batch exits, which need not be the one it was
+/// entered with, so the loop simply re-enters on whatever is left.
 ///
 /// # Safety
 /// Every queued cell must be installed, present and **native**, and no cell may
@@ -800,19 +843,57 @@ static PLACE_TAKEN: PerCpu<AtomicUsize> =
 unsafe fn drain_cells() {
     let n = PLACE_COUNT.load(Ordering::Acquire);
     let cpu = arch::cpu_index();
+    if PLACE_PREEMPT.load(Ordering::Acquire) == 1 {
+        enable_preemption_here();
+    }
     loop {
-        let k = PLACE_NEXT.fetch_add(1, Ordering::AcqRel);
-        if k >= n {
+        // Take a batch off the queue.
+        let mut slot = [usize::MAX; CLAIM_BATCH];
+        let mut cell = [usize::MAX; CLAIM_BATCH];
+        let mut got = 0;
+        while got < CLAIM_BATCH {
+            let k = PLACE_NEXT.fetch_add(1, Ordering::AcqRel);
+            if k >= n {
+                break;
+            }
+            slot[got] = k;
+            cell[got] = PLACE_CELLS.lock()[k];
+            got += 1;
+        }
+        if got == 0 {
             return;
         }
-        let cell = PLACE_CELLS.lock()[k];
-        // The caller's contract holds here: a present native cell this core now owns
-        // exclusively, because the `fetch_add` handed index `k` to nobody else.
-        let code = code_of(crate::user::run(cell).1);
-        PLACE_CODE[k].store(code as usize, Ordering::Release);
-        PLACE_CPU[k].store(cpu, Ordering::Release);
-        PLACE_TAKEN.this().fetch_add(1, Ordering::AcqRel);
-        PLACE_DONE.fetch_add(1, Ordering::Release);
+        // Stamp ownership before anything runs: from here no other core's pick can
+        // see these cells, which is what makes running them need no lock.
+        for c in cell.iter().take(got) {
+            crate::user::claim_cell(*c, cpu);
+        }
+
+        // Run until every cell of the batch has exited. `run` returns the cell that
+        // actually ended the run - under preemption that is whichever of the batch
+        // finished first, not necessarily the one entered.
+        let mut left = got;
+        while left > 0 {
+            let Some(pos) = (0..got).find(|&i| slot[i] != usize::MAX) else {
+                break;
+            };
+            // The caller's contract holds here: a present native cell this core owns
+            // exclusively, because the `fetch_add` handed its index to nobody else.
+            let (exited, outcome) = crate::user::run(cell[pos]);
+            let code = code_of(outcome);
+            // Attribute the outcome to whichever cell of the batch ended the run.
+            let Some(done) = (0..got).find(|&i| cell[i] == exited && slot[i] != usize::MAX) else {
+                // Not one of ours - impossible under the claim, but bailing out beats
+                // spinning if the invariant is ever broken.
+                break;
+            };
+            PLACE_CODE[slot[done]].store(code as usize, Ordering::Release);
+            PLACE_CPU[slot[done]].store(cpu, Ordering::Release);
+            slot[done] = usize::MAX;
+            left -= 1;
+            PLACE_TAKEN.this().fetch_add(1, Ordering::AcqRel);
+            PLACE_DONE.fetch_add(1, Ordering::Release);
+        }
     }
 }
 
@@ -827,6 +908,26 @@ unsafe fn drain_cells() {
 /// # Safety
 /// As [`drain_cells`]: each entry installed, present, native, and listed once.
 pub unsafe fn place_cells(cells: &[usize], out: &mut [(u64, usize)]) -> bool {
+    // SAFETY: the caller's contract.
+    unsafe { place_cells_inner(cells, out, false) }
+}
+
+#[cfg(feature = "smp")]
+/// [`place_cells`], but every core runs its claimed batch **preemptively**: it brings
+/// up its own preemption timer and the slice moves the CPU between the cells that
+/// core owns. Requires the boot to have enabled queue-driven dispatch.
+///
+/// # Safety
+/// As [`place_cells`].
+pub unsafe fn place_cells_preemptive(cells: &[usize], out: &mut [(u64, usize)]) -> bool {
+    // SAFETY: the caller's contract.
+    unsafe { place_cells_inner(cells, out, true) }
+}
+
+#[cfg(feature = "smp")]
+/// # Safety
+/// As [`place_cells`].
+unsafe fn place_cells_inner(cells: &[usize], out: &mut [(u64, usize)], preempt: bool) -> bool {
     let n = cells.len().min(MAX_PLACED_CELLS).min(out.len());
     {
         let mut q = PLACE_CELLS.lock();
@@ -842,6 +943,17 @@ pub unsafe fn place_cells(cells: &[usize], out: &mut [(u64, usize)]) -> bool {
     }
     PLACE_DONE.store(0, Ordering::Release);
     PLACE_NEXT.store(0, Ordering::Release);
+    if preempt {
+        // The **global** half of timer bring-up - the APIC mode probe, the IDT gate,
+        // the one-shot self-test - happens here, on the primary, before any secondary
+        // is told the round is preemptive. Four cores racing through it wrote one
+        // shared IDT concurrently and printed four interleaved copies of the probe's
+        // own line; each core still programs its own timer registers in
+        // `enable_preemption_here`, which is the part that genuinely is per core.
+        arch::enable_timer_irq();
+        enable_preemption_here();
+    }
+    PLACE_PREEMPT.store(usize::from(preempt), Ordering::Release);
     // Last, and with release ordering: a secondary polls this, so publishing the
     // count is what opens the queue. Setting it before the cursor was reset would
     // let a secondary claim against the previous round's cursor.

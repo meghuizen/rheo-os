@@ -180,7 +180,22 @@ iret_resume:                           /* rax = &frame */
     iretq
 
 /* enter_user_first(rdi = &frame): save callee-saved state so
-   return_to_kernel can unwind here, then drop to ring 3 via sysret. */
+   return_to_kernel can unwind here, then drop to ring 3.
+ *
+ * **Through IRET, never SYSRET.** `enter_user_first` is not a syscall return: the
+ * frame it is handed may have been captured anywhere. That was invisible while the
+ * only frames it saw were freshly built ones (`trapframe_new`, whose rcx/r11 slots
+ * are zero and irrelevant) or cells that had last stopped at a syscall. Multi-core
+ * placement made it reachable with a *preempted* frame: a core running two cells
+ * re-enters the survivor through here after the other exits, and SYSRET would take
+ * RIP from RCX and RFLAGS from R11 - overwriting exactly the two registers the
+ * interrupted instruction stream still needs. The symptom was not a fault: all four
+ * cores resumed their second cell with two corrupted registers and its bounded loop
+ * stopped terminating (docs/SMP.md 10.0).
+ *
+ * This is the third path into the same invariant, after the fault resume and the
+ * cross-cell switch, which is why the rule is now stated as one: **SYSRET is only
+ * for returning from the syscall it was entered by.** */
 .global enter_user_first
 enter_user_first:
     push %rbx
@@ -191,7 +206,7 @@ enter_user_first:
     push %r15
     mov %rsp, %gs:CPU_KERNEL_CTX
     mov %rdi, %rax
-    jmp sysret_resume
+    jmp iret_resume
 
 /* return_to_kernel_asm(): restore enter_user_first's state and return. */
 .global return_to_kernel_asm

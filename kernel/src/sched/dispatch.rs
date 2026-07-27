@@ -57,6 +57,7 @@
 use super::vcore::{Class, RunQueue, VcoreId};
 use crate::smp::PerCpu;
 use core::ptr::{addr_of, addr_of_mut};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Whether the run queue drives the cell pick.
 ///
@@ -89,10 +90,14 @@ static CURRENT: PerCpu<Running> = PerCpu::from_array([Running::NONE; crate::smp:
 
 /// Counters, so the seam's behaviour is observed rather than assumed
 /// (docs/ENGINEERING.md 1).
-static mut PICKS: u64 = 0;
-static mut RR_PICKS: u64 = 0;
-static mut DIVERGED: u64 = 0;
-static mut CHARGED_NS: u64 = 0;
+///
+/// Atomics: every CPU dispatching a cell adds to these, so a `+= 1` on a plain
+/// static would silently lose counts once more than one core runs cells
+/// (docs/SMP.md 10.2). Relaxed - they order nothing, they only have to be right.
+static PICKS: AtomicU64 = AtomicU64::new(0);
+static RR_PICKS: AtomicU64 = AtomicU64::new(0);
+static DIVERGED: AtomicU64 = AtomicU64::new(0);
+static CHARGED_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Turn queue-driven dispatch on or off. Off is the pre-migration behaviour,
 /// exactly.
@@ -115,15 +120,12 @@ pub fn enabled() -> bool {
 /// adopting the queue changed the order, and a proof that runs a mixed workload and
 /// finds it zero has learned that the queue is decorative.
 pub fn counters() -> (u64, u64, u64, u64) {
-    // SAFETY: single CPU; plain counter reads.
-    unsafe {
-        (
-            *addr_of!(PICKS),
-            *addr_of!(RR_PICKS),
-            *addr_of!(DIVERGED),
-            *addr_of!(CHARGED_NS),
-        )
-    }
+    (
+        PICKS.load(Ordering::Relaxed),
+        RR_PICKS.load(Ordering::Relaxed),
+        DIVERGED.load(Ordering::Relaxed),
+        CHARGED_NS.load(Ordering::Relaxed),
+    )
 }
 
 /// Clear the seam's per-CPU record and counters (between runs). Does **not** touch
@@ -141,12 +143,8 @@ pub fn reset() {
         // SAFETY: between runs, nothing else is running on any CPU.
         unsafe { *CURRENT.get_mut(cpu) = Running::NONE };
     }
-    // SAFETY: single CPU, between runs.
-    unsafe {
-        *addr_of_mut!(PICKS) = 0;
-        *addr_of_mut!(RR_PICKS) = 0;
-        *addr_of_mut!(DIVERGED) = 0;
-        *addr_of_mut!(CHARGED_NS) = 0;
+    for c in [&PICKS, &RR_PICKS, &DIVERGED, &CHARGED_NS] {
+        c.store(0, Ordering::Relaxed);
     }
 }
 
@@ -255,8 +253,7 @@ fn stop(voluntary: bool, still_runnable: bool) -> u64 {
     let q = unsafe { queue() };
     if delta > 0 {
         let _ = q.charge(id, delta);
-        // SAFETY: single CPU; a counter.
-        unsafe { *addr_of_mut!(CHARGED_NS) = (*addr_of!(CHARGED_NS)).saturating_add(delta) };
+        CHARGED_NS.fetch_add(delta, Ordering::Relaxed);
         if voluntary {
             // `BurstNs` is defined as "how long a vcore ran before *voluntarily*
             // relinquishing" - the distribution the burst score claims to
@@ -327,8 +324,7 @@ pub fn pick<F: Fn(usize) -> bool>(leaving: usize, cells: usize, runnable: F) -> 
             .find(|&i| runnable(i))
     };
     if !enabled() {
-        // SAFETY: single CPU; a counter.
-        unsafe { *addr_of_mut!(RR_PICKS) = (*addr_of!(RR_PICKS)).wrapping_add(1) };
+        RR_PICKS.fetch_add(1, Ordering::Relaxed);
         return round_robin();
     }
     let now = now_ns();
@@ -340,12 +336,9 @@ pub fn pick<F: Fn(usize) -> bool>(leaving: usize, cells: usize, runnable: F) -> 
         let cell = v.cell as usize;
         runnable(cell).then_some(cell)
     });
-    // SAFETY: single CPU; counters.
-    unsafe {
-        *addr_of_mut!(PICKS) = (*addr_of!(PICKS)).wrapping_add(1);
-        if chosen.is_some() && chosen != round_robin() {
-            *addr_of_mut!(DIVERGED) = (*addr_of!(DIVERGED)).wrapping_add(1);
-        }
+    PICKS.fetch_add(1, Ordering::Relaxed);
+    if chosen.is_some() && chosen != round_robin() {
+        DIVERGED.fetch_add(1, Ordering::Relaxed);
     }
     // Falling back to round-robin when the queue has no answer is deliberate and
     // is not a silent divergence: the queue only holds cells something called

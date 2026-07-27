@@ -1717,9 +1717,33 @@ code, that more than one core claimed work with the counts summing to the queue,
 that **some core claimed a second cell** - which a one-per-core hand-out cannot produce.
 Observed on all three ISAs: the core that took the long cell takes exactly 1 and the
 rest take 2-3 (reported, never asserted - TCG time-slices the vCPUs onto host threads).
-**Honest scope:** a claim runs to **completion** - no cross-core preemption, no
-migration of a running cell, no priority, and the per-CPU EEVDF+BORE queue still drives
-only the single-core `preempt` path. A **Linux** cell on a secondary is not attempted
+**And every core preempts its own cells.** A core claims a *batch* (2 - one cell has
+nothing to preempt *to*) and runs it under **its own** preemption timer, brought up by
+that core because every register involved is per-core hardware no trampoline sets:
+RISC-V's `stimecmp`/`sie` CSRs; ARM64's own GICv3 **redistributor**
+(`GICR_BASE + aff0 * 0x20000` - and the old global "GIC is up" flag covered the CPU
+interface too, so a secondary would have had none) plus its CNTV PPI; x86-64's
+`IA32_APIC_BASE` enable, TPR and **SVR software-enable** plus the LAPIC timer registers,
+while the *discovery* half (APIC-mode probe, IDT gate, one-shot self-test) stays global
+work the primary does once. The cells issue **no syscall at all**, so the cooperative
+placement round immediately above is the negative control and is asserted to have taken
+**zero** preemptions; with slices armed, **344-405 of ~700-820 slices take the CPU on 4
+cores at once** on all three ISAs. Two shared-state fixes landed with it: the `preempt`
+and `dispatch` counters became relaxed atomics (a `static mut += 1` is a lost update once
+every core dispatches), and the native `schedulable` predicate gained an **affinity
+test** - a cell belongs to one core (`user::claim_cell`/`cell_on_this_cpu`) so no other
+core's pick can see it, with an unclaimed cell visible to everyone, which is exactly the
+single-CPU behaviour. It also surfaced a **third instance of the SYSRET-provenance
+defect**: `enter_user_first` resumed through `sysret_resume`, which consumes RCX/R11 -
+invisible while every frame it saw was fresh or syscall-stopped, fatal the moment a core
+re-enters the survivor of a batch through a frame a *timer interrupt* captured. Not a
+fault: four cores resumed with two corrupted registers and their bounded loops stopped
+terminating. Found by reading the resume path once instrumentation localised the hang;
+`enter_user_first` uses `iret_resume` now, and the rule is stated once - **SYSRET is only
+for returning from the syscall it was entered by**.
+**Honest scope:** preemption is *within* a core's own claim - nothing takes a cell from
+another core, nothing migrates a running cell, and nothing balances between the per-CPU
+queues after the claim. A **Linux** cell on a secondary is not attempted
 (the cell/capability/object tables and the Linux per-cell state are still written for
 one CPU - the audit in docs/SMP.md 10.2 is the gate). What makes the native path safe is
 that a claimed cell is still a *partitioned* cell - one core, one slot, one address
@@ -1965,7 +1989,9 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               cores at once**, each in its own address space, witnessed by each
               reading the other's progress mid-run; then **start-all + cell
               placement** - 4 CPUs online, 8 runnable cells drained by whichever
-              core is free, the busiest claiming 3 - docs/SMP.md 10.0), shell-smoke, hwinfo, rng, runtime,
+              core is free; then **cross-core preemption** - each core preempts
+              between the cells it claimed, ~350-400 slices taken on 4 cores at
+              once against 0 in the cooperative control round - docs/SMP.md 10.0), shell-smoke, hwinfo, rng, runtime,
               posix, blockfs (live virtio-blk disk), elfrun (load a native
               ELF), posixrun (native program over the POSIX syscalls),
               libcrun (a program linked against rheo-libc), jsonrun (a

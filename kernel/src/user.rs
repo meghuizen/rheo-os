@@ -156,7 +156,20 @@ struct RunCell {
     /// **service cell** holds one slot per client, which is what makes fan-out
     /// possible. Fixed array - the kernel allocates nothing.
     chan: [ChanEnd; MAX_CELL_CHANNELS],
+    /// The CPU that **owns** this cell, or [`NO_CPU`] for "not claimed by anyone".
+    ///
+    /// A cell belongs to one core at a time: that is the partitioning discipline the
+    /// multikernel model rests on (docs/SCHEDULING.md 1a, docs/SMP.md 10.0), and it
+    /// is what makes running cells on several cores safe without locking the cell
+    /// table. Until something claims a cell this is [`NO_CPU`], and an unclaimed cell
+    /// is pickable by any core - which is exactly the single-CPU behaviour, so a boot
+    /// that never claims anything is unchanged.
+    cpu: usize,
 }
+
+/// "No CPU owns this cell." The default, and the value that preserves single-CPU
+/// behaviour exactly.
+pub const NO_CPU: usize = usize::MAX;
 
 /// One cross-cell channel end a cell holds (docs/NETSTACK.md, rheo-net N4a).
 #[derive(Copy, Clone)]
@@ -189,6 +202,7 @@ const EMPTY: RunCell = RunCell {
     grant_next: GRANT_BASE,
     filemmap_next: FILEMMAP_BASE,
     chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
+    cpu: NO_CPU,
 };
 
 /// Base VA of a native cell's typed memory-grant reservations (docs/LIBRHEO.md
@@ -1430,6 +1444,7 @@ pub unsafe fn install(
         grant_next: GRANT_BASE,
         filemmap_next: FILEMMAP_BASE,
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
+        cpu: NO_CPU,
     };
     *cell_grants(idx) = [EMPTY_GRANT; MAX_GRANTS_PER_CELL];
     // SAFETY: single CPU; a fresh cell starts with no frames charged.
@@ -1589,6 +1604,39 @@ pub fn cell_present(idx: usize) -> bool {
     cells()[idx].present
 }
 
+/// Give cell `idx` to CPU `cpu`: from now on only that core may pick it.
+///
+/// The claim is the whole of the multi-core safety argument for the native path
+/// (docs/SMP.md 10.0). Two cores running one cell would share its trap frame, its
+/// kernel stack and its FP save area, none of which is locked - so instead of
+/// locking them, a cell belongs to one core and the scheduler on every *other* core
+/// refuses to see it ([`cell_on_this_cpu`]).
+pub fn claim_cell(idx: usize, cpu: usize) {
+    cells()[idx].cpu = cpu;
+}
+
+/// The CPU that owns cell `idx`, or [`NO_CPU`].
+pub fn cell_cpu(idx: usize) -> usize {
+    cells()[idx].cpu
+}
+
+/// Whether the calling CPU may schedule cell `idx`.
+///
+/// True for a cell this core claimed, and true for an **unclaimed** cell - which is
+/// what keeps every single-core boot byte-identical, since nothing there ever calls
+/// [`claim_cell`] and the predicate is then constant.
+///
+/// Honest limitation: a cell *created* by a claimed cell (a `fork`, a `SYS_SPAWN`)
+/// is unclaimed, so it is visible to every core. No boot reaches that state today -
+/// the multi-core placement path runs only cells that neither fork nor spawn, and
+/// every boot that does fork runs on one core - but inheriting the parent's owner is
+/// the fix when one does, not a wider lock.
+#[inline]
+pub fn cell_on_this_cpu(idx: usize) -> bool {
+    let owner = cells()[idx].cpu;
+    owner == NO_CPU || owner == crate::smp::cpu_index()
+}
+
 /// Whether cell `idx` speaks the native ABI (docs/NETSTACK.md rheo-net N4a).
 /// `nproc::yield_cell` only ever hands the CPU to a native sibling; a Linux cell
 /// is scheduled by `linux::proc`.
@@ -1680,6 +1728,7 @@ pub unsafe fn install_spawned(
         grant_next: GRANT_BASE,
         filemmap_next: FILEMMAP_BASE,
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
+        cpu: NO_CPU,
     };
     *cell_grants(idx) = [EMPTY_GRANT; MAX_GRANTS_PER_CELL];
     // SAFETY: single CPU; a fresh cell starts with no frames charged.
@@ -1752,6 +1801,7 @@ pub unsafe fn install_forked(
         grant_next: GRANT_BASE,
         filemmap_next: FILEMMAP_BASE,
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
+        cpu: NO_CPU,
     };
     // As `install_spawned`: a forked child inherits its parent's burst score
     // (docs/SUBSTRATE.md pillar 3).

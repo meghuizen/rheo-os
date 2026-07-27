@@ -580,12 +580,14 @@ scheduler itself has not.
   yields. A wall-clock speedup would prove nothing under TCG, which time-slices the two
   vCPUs onto host threads; simultaneity is the available evidence and it is what is
   asserted.
-- **Cells run in user mode on secondary cores, and are placed on whichever core is
-  free** (the `smp` kernel, all three ISAs) - section 10.0. Every enumerable secondary
-  is started, two cells are proven running at the unprivileged level on two cores at the
-  same instant, and a queue of 8 runnable cells is drained by 4 cores that each claim
-  from it. Not yet the scheduler: a claim runs to completion, nothing migrates, and no
-  Linux cell is placed.
+- **Cells run in user mode on secondary cores, are placed on whichever core is free,
+  and are preempted there** (the `smp` kernel, all three ISAs) - section 10.0. Every
+  enumerable secondary is started, two cells are proven running at the unprivileged
+  level on two cores at the same instant, a queue of 8 runnable cells is drained by 4
+  cores that each claim from it, and each core then preempts between the cells it
+  claimed - 344-405 slices taken on 4 cores at once, against 0 in the cooperative
+  control round. Not yet the whole scheduler: nothing migrates a running cell between
+  cores, nothing balances after the claim, and no Linux cell is placed.
 
 ### 10.0 Cells run in user mode on a secondary core - built
 
@@ -674,16 +676,56 @@ online: the core that took the long cell takes exactly 1 and the rest take 2-3 -
 ratio is reported, never asserted, because TCG time-slices the vCPUs onto host threads
 and the split is a property of that scheduling, not of ours.
 
-**Honest scope.** A claim runs to **completion**: there is no preemption across cores,
-no migration of a cell already running, and no priority - `place_cells` is placement and
-load-balancing, not the EEVDF+BORE queue driving multi-core dispatch (that queue is
-per-CPU and still only drives the single-core `preempt` path). The audit in 10.2 is the
-gate for the rest: the cell table, the capability and object tables, and the Linux
-personality's per-cell state are all still written on the assumption of one CPU, so a
-**Linux** cell on a secondary is not attempted - the cells here are native. What makes
-the native path safe is unchanged and is the reason it could land first: a claimed cell
-is still a *partitioned* cell (one core, one slot, one address space, one kernel stack),
-the claim simply being made at run time instead of by hand.
+**And a claim no longer runs to completion: every core preempts its own cells.** A core
+claims a *batch* (`smp::CLAIM_BATCH` = 2 - one cell has nothing to preempt *to*) and runs
+it under **its own** preemption timer. Everything that needs is per-core hardware no
+bring-up trampoline sets, so each core brings up its own
+(`arch::enable_timer_irq_this_cpu`): the RISC-V `stimecmp`/`sie` CSRs; on ARM64 this
+core's GICv3 **redistributor** (the frame is per core at `GICR_BASE + aff0 * 0x20000`,
+and the old global "GIC is up" flag covered the CPU interface too, so a secondary would
+have had none at all) and its CNTV PPI; on x86-64 this core's `IA32_APIC_BASE` enable,
+TPR and **SVR software-enable** plus the LAPIC timer registers - while the *discovery*
+half (the APIC mode probe, the IDT gate, the one-shot self-test) stays global work the
+primary does once, because four cores racing through it wrote one shared IDT and printed
+four interleaved copies of the probe's own line.
+
+The cells issue **no syscall at all** until they exit, so the evidence is unambiguous:
+under cooperative scheduling the number of preemptions taken is exactly zero - there is
+no other moment at which the CPU could change hands - and the cooperative placement
+round immediately above is asserted to be exactly that. With slices armed, **344-405 of
+~700-820 slices take the CPU on 4 cores at once** on all three ISAs.
+
+Two shared-state fixes had to land with it. The `preempt` and `dispatch` counters were
+`static mut` `+= 1`, which is a lost update rather than a race that "cannot interleave"
+once every core dispatches; they are relaxed atomics now (docs/SMP.md 10.2's rule: a
+lock, a partition, or an atomic - never nothing). And the native scheduler's
+`schedulable` predicate gained the affinity test: a cell belongs to one core
+(`user::claim_cell` / `cell_on_this_cpu`), so no other core's pick can see it. An
+unclaimed cell is visible to everyone, which is exactly the single-CPU behaviour, so a
+boot that never claims anything is unchanged.
+
+**A third instance of the SYSRET-provenance defect surfaced here, and it is why the rule
+is now stated once.** `enter_user_first` resumed through `sysret_resume`, which takes RIP
+from RCX and RFLAGS from R11. That was invisible while the only frames it saw were freshly
+built or last stopped at a syscall. A core running two cells re-enters the survivor
+through `enter_user_first` after the other exits - and that frame was captured by a timer
+interrupt, with live RCX/R11. The symptom was not a fault: all four cores resumed their
+second cell with two corrupted registers and its bounded loop stopped terminating. It was
+found by *reading* the resume path after the instrumentation localised the hang to
+"re-entering the second cell of a batch", not by guessing at the symptom. `enter_user_first`
+resumes via `iret_resume` now, and the rule is: **SYSRET is only ever for returning from
+the syscall it was entered by** - the syscall fast path keeps it; nothing else may.
+
+**Honest scope.** Preemption is *within* a core's own claim. Nothing takes a cell away
+from another core, nothing migrates a running cell, and there is no priority across
+cores - the per-CPU EEVDF+BORE queue orders each core's own cells and nothing balances
+between queues after the claim. The audit in 10.2 is the gate for the rest: the cell
+table, the capability and object tables, and the Linux personality's per-cell state are
+all still written on the assumption of one CPU, so a **Linux** cell on a secondary is not
+attempted - the cells here are native. What makes the native path safe is unchanged and
+is the reason it could land first: a claimed cell is still a *partitioned* cell (one
+core, one slot, one address space, one kernel stack), the claim simply being made at run
+time instead of by hand.
 
 ### 10.1 The measured motivation (not a wish)
 

@@ -123,8 +123,20 @@ pub fn serial_read_byte() -> Option<u8> {
 // and the wakeup are all genuine; a live keystroke takes the full PL011->GIC path.
 
 const GICD_BASE: usize = 0x0800_0000 | KERNEL_VA_BASE;
-const GICR_BASE: usize = 0x080A_0000 | KERNEL_VA_BASE; // boot CPU redistributor
-const GICR_SGI_BASE: usize = GICR_BASE + 0x1_0000; // SGI/PPI frame
+const GICR_BASE: usize = 0x080A_0000 | KERNEL_VA_BASE; // CPU 0's redistributor
+/// Bytes between one CPU's redistributor and the next on QEMU `virt` (GICv3, no
+/// VLPI): two 64 KiB frames - RD_base then SGI_base.
+const GICR_STRIDE: usize = 0x2_0000;
+/// This CPU's SGI/PPI frame. A redistributor is **per core**, so a secondary that
+/// wrote CPU 0's would enable a PPI on the wrong core and leave its own masked -
+/// which looks exactly like "the timer interrupt is not delivered" (docs/SMP.md
+/// 10.0). Indexed by MPIDR affinity 0, the same value `cpu_index` reads.
+fn gicr_base_this_cpu() -> usize {
+    GICR_BASE + (mpidr_aff0() as usize) * GICR_STRIDE
+}
+fn gicr_sgi_base_this_cpu() -> usize {
+    gicr_base_this_cpu() + 0x1_0000
+}
 const UART_INTID: u32 = 33; // PL011 SPI 1
 const TIMER_INTID: u32 = 27; // CNTV PPI 11
 
@@ -164,24 +176,29 @@ fn mmio_r32(addr: usize) -> u32 {
 /// Bring up the GICv3 distributor + this CPU's redistributor + the CPU interface
 /// (system registers). Idempotent; shared by the UART and timer paths.
 fn gic_init() {
-    // SAFETY: single CPU, kernel context; GIC MMIO + ICC system registers.
+    // SAFETY: kernel context; GIC MMIO + ICC system registers.
     unsafe {
-        if *core::ptr::addr_of!(GIC_UP) {
-            return;
+        // The **distributor** is one shared block, so it is brought up once. The
+        // redistributor and the CPU interface below are **per core** and are done
+        // every time: a secondary calling this must wake its own redistributor and
+        // program its own ICC_* registers, and a global "already up" flag covering
+        // all three would leave it with no CPU interface at all (docs/SMP.md 10.0).
+        if !*core::ptr::addr_of!(GIC_UP) {
+            // Distributor: affinity routing (ARE) + Group1 enable.
+            mmio_w32(GICD_BASE, (1 << 4) | (1 << 1) | 1);
+            *core::ptr::addr_of_mut!(GIC_UP) = true;
         }
-        // Distributor: affinity routing (ARE) + Group1 enable.
-        mmio_w32(GICD_BASE, (1 << 4) | (1 << 1) | 1);
-        // Redistributor: wake the boot CPU (clear GICR_WAKER.ProcessorSleep,
-        // then wait for ChildrenAsleep to clear).
-        let waker = GICR_BASE + 0x0014;
+        // Redistributor: wake **this** CPU (clear GICR_WAKER.ProcessorSleep, then
+        // wait for ChildrenAsleep to clear). Idempotent on a core already awake.
+        let waker = gicr_base_this_cpu() + 0x0014;
         mmio_w32(waker, mmio_r32(waker) & !(1 << 1));
         while mmio_r32(waker) & (1 << 2) != 0 {}
         // CPU interface via system registers: SRE=1, PMR=0xFF, EOImode=0, Grp1 on.
+        // All per core.
         asm!("msr S3_0_C12_C12_5, {0}", "isb", in(reg) 1u64); // ICC_SRE_EL1.SRE
         asm!("msr S3_0_C4_C6_0, {0}", in(reg) 0xFFu64); // ICC_PMR_EL1
         asm!("msr S3_0_C12_C12_4, xzr"); // ICC_CTLR_EL1 (EOImode 0)
         asm!("msr S3_0_C12_C12_7, {0}", "isb", in(reg) 1u64); // ICC_IGRPEN1_EL1
-        *core::ptr::addr_of_mut!(GIC_UP) = true;
     }
 }
 
@@ -207,15 +224,13 @@ fn gicd_enable_spi(intid: u32) {
 
 /// Enable one PPI/SGI (INTID < 32) in this CPU's redistributor SGI frame.
 fn gicr_enable_ppi(intid: u32) {
+    let sgi = gicr_sgi_base_this_cpu();
     let bit = 1u32 << intid;
-    mmio_w32(
-        GICR_SGI_BASE + 0x0080,
-        mmio_r32(GICR_SGI_BASE + 0x0080) | bit,
-    ); // IGROUPR0: group1
-    let pri = GICR_SGI_BASE + 0x0400 + intid as usize;
+    mmio_w32(sgi + 0x0080, mmio_r32(sgi + 0x0080) | bit); // IGROUPR0: group1
+    let pri = sgi + 0x0400 + intid as usize;
     // SAFETY: byte MMIO register.
     unsafe { (pri as *mut u8).write_volatile(0x00) };
-    mmio_w32(GICR_SGI_BASE + 0x0100, bit); // ISENABLER0: enable
+    mmio_w32(sgi + 0x0100, bit); // ISENABLER0: enable
 }
 
 // PL011 registers used for RX interrupts.
@@ -295,12 +310,19 @@ pub fn enable_virtio_net_irq(slot: usize) -> bool {
 /// Bring up the CNTV virtual timer interrupt (PPI 27). Called only by the Phase F
 /// test.
 pub fn enable_timer_irq() {
+    enable_timer_irq_this_cpu();
+    // SAFETY: set once by the primary, before any secondary reads it.
+    unsafe { *core::ptr::addr_of_mut!(TIMER_ENABLED) = true };
+}
+
+/// Bring up **this core's** timer interrupt: its redistributor, its CPU interface,
+/// its CNTV PPI. All per core - a secondary that wants a preemption slice must run
+/// this for itself, because none of it is set by the PSCI entry (docs/SMP.md 10.0).
+pub fn enable_timer_irq_this_cpu() {
     gic_init();
     gicr_enable_ppi(TIMER_INTID);
     // SAFETY: kernel context; disarm the timer until the first `timer_wait`.
     unsafe { asm!("msr cntv_ctl_el0, xzr") };
-    // SAFETY: single CPU; set once.
-    unsafe { *core::ptr::addr_of_mut!(TIMER_ENABLED) = true };
 }
 
 /// The GICv3 IRQ handler (called from the current-EL-SPx IRQ vector slot while
@@ -577,7 +599,11 @@ static mut MPIDR_OF_CPU: [u32; crate::hw::MAX_CPUS] = [u32::MAX; crate::hw::MAX_
 /// This CPU's MPIDR_EL1 affinity level 0 - a **read-only hardware id**, so a
 /// core's identity comes from the silicon rather than from what the primary told
 /// it.
-#[cfg(feature = "smp")]
+///
+/// Not gated on the `smp` feature: the GIC redistributor is indexed by it, and
+/// which redistributor a core owns is a property of the hardware, not of a build
+/// configuration. On a single-CPU boot it reads 0 and every use below is the
+/// pre-existing constant exactly.
 fn mpidr_aff0() -> u32 {
     let mpidr: u64;
     // SAFETY: reads MPIDR_EL1, a read-only id register available at EL1.

@@ -62,7 +62,7 @@
 
 use crate::ktimer::{self, TimerClient};
 use crate::smp::PerCpu;
-use core::ptr::{addr_of, addr_of_mut};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Per-CPU "a preemption is due" flag, set by the timer interrupt and consumed at
 /// trap exit.
@@ -75,15 +75,22 @@ static PENDING: PerCpu<bool> = PerCpu::from_array([false; crate::smp::MAX_CPUS])
 
 /// Slices armed, preemptions actually taken, and slices that could not be armed
 /// because the ISA has no wired timer interrupt.
-static mut ARMED: u64 = 0;
-static mut TAKEN: u64 = 0;
-static mut UNARMABLE: u64 = 0;
+///
+/// Atomics rather than `static mut`, because these are *aggregate* counters: unlike
+/// [`PENDING`] above they are written by every CPU, and once cells run on more than
+/// one core a `+= 1` on a plain static is a lost update, not a race that "cannot
+/// interleave". A relaxed `fetch_add` is the right cost for a counter - it orders
+/// nothing and is what makes the totals mean what they say (docs/SMP.md 10.2: every
+/// shared static gets a lock, a partition, or - here - an atomic).
+static ARMED: AtomicU64 = AtomicU64::new(0);
+static TAKEN: AtomicU64 = AtomicU64::new(0);
+static UNARMABLE: AtomicU64 = AtomicU64::new(0);
 /// Preemptions that moved to a **sibling context** of the same cell, versus to
 /// another cell. Kept apart because they are different capabilities: the first is
 /// what an intra-process event loop with a worker needs (the `linuxbun` case), the
 /// second is what a multi-tenant machine needs.
-static mut TO_SIBLING: u64 = 0;
-static mut TO_CELL: u64 = 0;
+static TO_SIBLING: AtomicU64 = AtomicU64::new(0);
+static TO_CELL: AtomicU64 = AtomicU64::new(0);
 /// Times the preemption timer interrupt actually **arrived**.
 ///
 /// Distinct from `TAKEN` on purpose, and the distinction earns its keep: "the
@@ -91,20 +98,17 @@ static mut TO_CELL: u64 = 0;
 /// to switch to" are different faults with the same symptom, and a single counter
 /// cannot tell them apart. (It earned it immediately - the first bring-up run showed
 /// `armed=1, taken=0`, which could have been either.)
-static mut NOTES: u64 = 0;
+static NOTES: AtomicU64 = AtomicU64::new(0);
 
 /// (armed, taken, unarmable, to-sibling, to-cell).
 pub fn counters() -> (u64, u64, u64, u64, u64) {
-    // SAFETY: single CPU; plain counter reads.
-    unsafe {
-        (
-            *addr_of!(ARMED),
-            *addr_of!(TAKEN),
-            *addr_of!(UNARMABLE),
-            *addr_of!(TO_SIBLING),
-            *addr_of!(TO_CELL),
-        )
-    }
+    (
+        ARMED.load(Ordering::Relaxed),
+        TAKEN.load(Ordering::Relaxed),
+        UNARMABLE.load(Ordering::Relaxed),
+        TO_SIBLING.load(Ordering::Relaxed),
+        TO_CELL.load(Ordering::Relaxed),
+    )
 }
 
 /// Clear the flags and counters (between runs).
@@ -113,14 +117,8 @@ pub fn reset() {
         // SAFETY: between runs.
         unsafe { *PENDING.get_mut(cpu) = false };
     }
-    // SAFETY: single CPU, between runs.
-    unsafe {
-        *addr_of_mut!(ARMED) = 0;
-        *addr_of_mut!(TAKEN) = 0;
-        *addr_of_mut!(UNARMABLE) = 0;
-        *addr_of_mut!(NOTES) = 0;
-        *addr_of_mut!(TO_SIBLING) = 0;
-        *addr_of_mut!(TO_CELL) = 0;
+    for c in [&ARMED, &TAKEN, &UNARMABLE, &NOTES, &TO_SIBLING, &TO_CELL] {
+        c.store(0, Ordering::Relaxed);
     }
 }
 
@@ -138,13 +136,11 @@ pub fn arm(slice_ns: u64) {
         // Nothing here can enforce a slice, and saying so is the point: a slice
         // reported as armed but never delivered would make a cooperative run look
         // preemptive (docs/ENGINEERING.md 1).
-        // SAFETY: single CPU; a counter.
-        unsafe { *addr_of_mut!(UNARMABLE) = (*addr_of!(UNARMABLE)).wrapping_add(1) };
+        UNARMABLE.fetch_add(1, Ordering::Relaxed);
         return;
     }
     ktimer::register(TimerClient::Preempt, slice_ns);
-    // SAFETY: single CPU; a counter.
-    unsafe { *addr_of_mut!(ARMED) = (*addr_of!(ARMED)).wrapping_add(1) };
+    ARMED.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Cancel any outstanding preemption slice - the cell stopped for its own reasons
@@ -169,14 +165,13 @@ pub fn note() {
     // cores.
     unsafe {
         *PENDING.this_mut() = true;
-        *addr_of_mut!(NOTES) = (*addr_of!(NOTES)).wrapping_add(1);
     }
+    NOTES.fetch_add(1, Ordering::Relaxed);
 }
 
 /// How many preemption-timer interrupts arrived.
 pub fn notes() -> u64 {
-    // SAFETY: single CPU; a plain counter read.
-    unsafe { *addr_of!(NOTES) }
+    NOTES.load(Ordering::Relaxed)
 }
 
 /// Whether a preemption is due on this CPU.
@@ -199,13 +194,10 @@ pub fn take() -> bool {
 
 /// Count a preemption that actually moved the CPU, and to what.
 pub(crate) fn took(to_sibling: bool) {
-    // SAFETY: single CPU; counters.
-    unsafe {
-        *addr_of_mut!(TAKEN) = (*addr_of!(TAKEN)).wrapping_add(1);
-        if to_sibling {
-            *addr_of_mut!(TO_SIBLING) = (*addr_of!(TO_SIBLING)).wrapping_add(1);
-        } else {
-            *addr_of_mut!(TO_CELL) = (*addr_of!(TO_CELL)).wrapping_add(1);
-        }
+    TAKEN.fetch_add(1, Ordering::Relaxed);
+    if to_sibling {
+        TO_SIBLING.fetch_add(1, Ordering::Relaxed);
+    } else {
+        TO_CELL.fetch_add(1, Ordering::Relaxed);
     }
 }

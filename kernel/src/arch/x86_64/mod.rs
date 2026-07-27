@@ -556,6 +556,46 @@ fn lapic_probe() {
     set_idt_gate(VEC_SPURIOUS, spurious_irq_stub as *const () as u64);
 }
 
+/// Program **this core's** LAPIC timer registers.
+///
+/// The LAPIC register file is per core, so a secondary that wants a preemption slice
+/// must program its own - the primary's writes reach only the primary's
+/// (docs/SMP.md 10.0). Deliberately *only* the per-core registers: the mode probe,
+/// the IDT gate and the one-shot self-test in [`enable_timer_irq`] are global work
+/// the primary does once, and running them on four cores concurrently raced on the
+/// shared IDT and interleaved four copies of the probe's own console line.
+pub fn enable_timer_irq_this_cpu() {
+    let mode = apic_mode();
+    if mode == ApicMode::None {
+        return;
+    }
+    // **This core's own LAPIC has to be enabled first.** `IA32_APIC_BASE`, the task
+    // priority register and the spurious-vector register are all per core, and the AP
+    // trampoline sets none of them - it adopts the primary's CR0/CR4/EFER and nothing
+    // else. Without the SVR software-enable bit the core's LAPIC delivers nothing at
+    // all, so its timer is armed into a register file that is switched off: no
+    // interrupt, no preemption, and no error to say why (docs/SMP.md 10.0). The
+    // *discovery* of which access mode works stays global - it is a property of the
+    // machine - so only the enabling is repeated here.
+    // SAFETY: kernel context; `IA32_APIC_BASE` is architectural on every x86-64.
+    unsafe {
+        let base = paging_rdmsr(MSR_APIC_BASE) | APIC_BASE_EN;
+        let base = if mode == ApicMode::X2Apic {
+            base | APIC_BASE_EXTD
+        } else {
+            base
+        };
+        paging_wrmsr(MSR_APIC_BASE, base);
+    }
+    lapic_write(LAPIC_TPR, 0); // accept interrupts of every priority
+    lapic_write(LAPIC_SVR, 0x100 | VEC_SPURIOUS as u32); // software-enable + vector
+    // Divide config = 1 (bits: 0b1011 -> divide by 1).
+    lapic_write(LAPIC_TDCR, 0b1011);
+    // LVT timer: vector 0x20, one-shot (bits 17-18 = 0), unmasked.
+    lapic_write(LAPIC_LVT_TIMER, VEC_TIMER as u32);
+    lapic_write(LAPIC_TMICT, 0); // disarmed until the arbiter arms it
+}
+
 /// LAPIC timer interrupts observed (incremented by the handler). Used by the
 /// bring-up self-test, so the claim "this ISA has a timer interrupt" rests on an
 /// interrupt the kernel actually took.
@@ -580,11 +620,7 @@ static TIMER_FIRES: AtomicU64 = AtomicU64::new(0);
 pub fn enable_timer_irq() {
     lapic_probe();
     set_idt_gate(VEC_TIMER, timer_irq_stub as *const () as u64);
-    // Divide config = 1 (bits: 0b1011 -> divide by 1).
-    lapic_write(LAPIC_TDCR, 0b1011);
-    // LVT timer: vector 0x20, one-shot (bits 17-18 = 0), unmasked.
-    lapic_write(LAPIC_LVT_TIMER, VEC_TIMER as u32);
-    lapic_write(LAPIC_TMICT, 0); // disarmed until the arbiter arms it
+    enable_timer_irq_this_cpu();
 
     // --- the self-test: does a one-shot actually fire? ---
     let usable = if apic_mode() == ApicMode::None {
