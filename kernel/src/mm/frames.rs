@@ -33,6 +33,30 @@ static mut BITMAP: [u64; POOL_FRAMES / 64] = [0; POOL_FRAMES / 64];
 static mut NEXT_HINT: usize = 0;
 static mut INITIALIZED: bool = false;
 
+/// The allocator's mutual exclusion (docs/SMP.md 10.2, the SMP-safety audit).
+///
+/// The bitmap, the reference counts, the used counter and the search hint are **one
+/// data structure with four fields**, and every operation below reads and writes
+/// several of them. Two cores allocating at once without this would hand out the same
+/// frame twice: the bitmap test-and-set is not atomic, and even if it were, `USED`
+/// and `REFS` would drift from it - which is precisely what
+/// [`used_matches_bitmap`] exists to notice, except that by then two cells share a
+/// page neither knows about.
+///
+/// A `SpinLock<()>` rather than wrapping the state, because the state is four
+/// separate `static mut`s reached through `addr_of_mut!` and moving them inside the
+/// lock would be a large mechanical change to a file the isolation proofs depend on.
+/// The guard is the discipline: **every** function that touches those four statics
+/// takes it, which is checkable by grep, and the guard's lifetime is the critical
+/// section.
+///
+/// Unconditional, not `#[cfg(feature = "smp")]`. Locking is a property of the data
+/// structure, not of a build configuration (docs/SUBSTRATE.md pillar 3, the lesson
+/// that produced the `SYS_YIELD` FP defect: state whose safety depends on which
+/// features are enabled gets written twice and diverges). An uncontended acquire is
+/// one atomic exchange, which is not measurable next to zeroing a 4 KiB frame.
+static POOL_LOCK: crate::smp::SpinLock<()> = crate::smp::SpinLock::new(());
+
 /// How many mappings hold each allocated frame, for **copy-on-write `fork`**
 /// (docs/ARCHITECTURE-DEBT.md 4.0, blocker 2). One byte per frame = 128 KiB of
 /// static, which buys a `share`/`free` pair simple enough to reason about; a
@@ -111,6 +135,7 @@ pub fn user_available() -> usize {
 /// amount while the user reserve above is held may `expect` it, and each says
 /// why at its call site.
 pub fn alloc() -> Option<usize> {
+    let _g = POOL_LOCK.lock();
     unsafe {
         assert!(
             *core::ptr::addr_of!(INITIALIZED),
@@ -140,7 +165,8 @@ pub fn alloc() -> Option<usize> {
 /// (free frames, total frames) - the shell's `meminfo` builtin, the reservation
 /// memory floor, and the cell-allocation guard above.
 pub fn stats() -> (usize, usize) {
-    // SAFETY: single CPU, synchronous traps.
+    let _g = POOL_LOCK.lock();
+    // SAFETY: the pool lock is held, so no other core is mid-update.
     let used = unsafe { *core::ptr::addr_of!(USED) };
     (POOL_FRAMES - used, POOL_FRAMES)
 }
@@ -150,7 +176,10 @@ pub fn stats() -> (usize, usize) {
 /// the `security` test kernel after every allocation and free it drives
 /// (docs/ENGINEERING.md 1: observe, do not infer).
 pub fn used_matches_bitmap() -> bool {
-    // SAFETY: single CPU, synchronous traps.
+    let _g = POOL_LOCK.lock();
+    // SAFETY: the pool lock is held, so the bitmap and the counter are consistent
+    // with each other - without it this check could read a half-completed alloc and
+    // report a drift that does not exist.
     unsafe {
         let bitmap = &*core::ptr::addr_of!(BITMAP);
         let counted: usize = bitmap.iter().map(|w| w.count_ones() as usize).sum();
@@ -194,7 +223,8 @@ pub fn share(pa: usize) -> bool {
         return false;
     }
     let frame = (pa - arch::FRAME_POOL_BASE) / FRAME_SIZE;
-    // SAFETY: single CPU, synchronous traps.
+    let _g = POOL_LOCK.lock();
+    // SAFETY: the pool lock is held.
     unsafe {
         let refs = &mut *core::ptr::addr_of_mut!(REFS);
         if refs[frame] == 0 || refs[frame] == SHARE_MAX {
@@ -213,7 +243,8 @@ pub fn refs(pa: usize) -> u8 {
         return 0;
     }
     let frame = (pa - arch::FRAME_POOL_BASE) / FRAME_SIZE;
-    // SAFETY: single CPU.
+    let _g = POOL_LOCK.lock();
+    // SAFETY: the pool lock is held.
     unsafe { (*core::ptr::addr_of!(REFS))[frame] }
 }
 
@@ -227,6 +258,8 @@ pub fn free(pa: usize) {
     assert!(in_pool(pa), "frames::free of a non-pool address {pa:#x}");
     let offset = pa - arch::FRAME_POOL_BASE;
     let frame = offset / FRAME_SIZE;
+    let _g = POOL_LOCK.lock();
+    // SAFETY: the pool lock is held.
     unsafe {
         let bitmap = &mut *core::ptr::addr_of_mut!(BITMAP);
         assert!(bitmap[frame / 64] & (1 << (frame % 64)) != 0, "double free");

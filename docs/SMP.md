@@ -549,10 +549,40 @@ the interrupt vector writes.
 
 ## 10. Phase 2 design: preemptive multi-core scheduling (task #132)
 
-**Status: design only.** Nothing in this section is implemented. It is written
-docs-first (ARCHITECTURE.md 6 discipline for a change this large) so the work lands
-in reviewable slices against a fixed plan, and so the single-CPU cooperative path
-stays byte-identical until each prerequisite is genuinely safe.
+**Status: partly built.** Two prerequisites have landed and are proven; the
+scheduler itself has not.
+
+- **Timer preemption exists on all three ISAs** (docs/SUBSTRATE.md 15, S3', the
+  `preempt` kernel). A cell that issues no syscall can be taken off the CPU, and a
+  Linux cell's sibling *context* is preferred over another cell. That closes the
+  single-core half of task #27.
+- **The frame allocator is SMP-safe, and two cores do real work at the same time**
+  (the `smp` kernel, all three ISAs). `frames`' bitmap, reference counts, used counter
+  and search hint are one data structure with four fields, and every operation touches
+  several of them, so they are now behind a `SpinLock` - unconditionally, not behind
+  the `smp` feature, because locking is a property of the data structure rather than of
+  a build configuration (the lesson that produced the `SYS_YIELD` FP defect: state
+  whose safety depends on which features are enabled gets written twice and diverges).
+  On top of that, a secondary core computes half the output rows of an int8 GEMM while
+  the primary computes the other half, and the result is asserted **bit-identical** to
+  a single-core oracle.
+
+  The parallelism is proven by a **rendezvous**, not by timing: each core publishes a
+  flag and waits for the other's, and neither writes its flag after passing, so both
+  passing means both executed inside one interval - which a single core cannot produce,
+  since there is no kernel-context preemption to interleave them and neither side
+  yields. A wall-clock speedup would prove nothing under TCG, which time-slices the two
+  vCPUs onto host threads; simultaneity is the available evidence and it is what is
+  asserted.
+
+**What is still design only:** everything below about *scheduling* on the second core.
+A secondary takes one published job and parks - there is no per-CPU dispatch, no cell
+runs in user mode on a secondary, and the shared kernel state a *cell* touches (the
+cell table, the capability and object tables, the Linux personality's per-cell state)
+has not been audited. The section stays written docs-first (ARCHITECTURE.md 6
+discipline for a change this large) so the rest lands in reviewable slices against a
+fixed plan, and so the single-CPU cooperative path stays byte-identical until each
+prerequisite is genuinely safe.
 
 ### 10.1 The measured motivation (not a wish)
 

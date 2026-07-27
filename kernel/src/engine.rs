@@ -24,7 +24,7 @@ use crate::time;
 // source include.
 #[path = "../../librheo/src/tile/kernels.rs"]
 #[allow(dead_code)]
-mod tile_kernels;
+pub(crate) mod tile_kernels;
 
 /// The integer operations an engine can execute. A dependency-graph node
 /// carries one of these (docs/IO.md, docs/ARCHITECTURE.md 3 object 6).

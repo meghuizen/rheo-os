@@ -1637,8 +1637,33 @@ phase evidence of anything), and with dispatch on the shared order vector interl
 the longest unbroken run dropping 24 -> 2-9 with 14-33 slices actually taken. An
 interleave is only producible if something took the CPU away mid-loop.
 
+**Two cores now compute at the same time** (docs/SMP.md 10, the `smp` kernel, all
+three ISAs). Its prerequisite landed first: `frames`' bitmap, reference counts, used
+counter and search hint are one data structure with four fields that every operation
+touches several of, so they are behind a `SpinLock` - **unconditionally**, not behind
+the `smp` feature, because locking is a property of the data structure rather than of a
+build configuration (the lesson that produced the `SYS_YIELD` FP defect: state whose
+safety depends on which features are enabled gets written twice and diverges); an
+uncontended acquire is one atomic exchange, unmeasurable next to zeroing a frame. On
+top of it a secondary core computes half the output rows of an int8 GEMM - the tile
+framework's own `gemm_i8_i32`, shared verbatim - while the primary computes the other
+half, split by output rows so the two write disjoint ranges of C and the compute needs
+no lock at all; the result is asserted **bit-identical** to a single-core oracle, and
+the frame pool's used counter is asserted still to agree with its bitmap (the invariant
+a lost update breaks). The parallelism is proven by a **rendezvous rather than by
+timing**: each core publishes a flag and waits for the other's, neither writes its flag
+after passing, so both passing means both executed inside one interval - which a single
+core cannot produce, since there is no kernel-context preemption to interleave them and
+neither side yields. A wall-clock speedup would prove nothing under TCG (it time-slices
+the two vCPUs onto host threads), so simultaneity is the available evidence and it is
+what is asserted. **Honest scope:** a secondary takes one published job and parks -
+there is no per-CPU dispatch, no cell runs in **user mode** on a secondary, and the
+shared state a *cell* touches (the cell table, the capability/object tables, the Linux
+per-cell state) is not yet audited.
+
 **Still honest about what is not wired:** the fixed VA map is still the map (S2'
-untouched), dispatch is proven for native cells and **off by default** everywhere -
+untouched), dispatch is proven for native cells and **off by default** except the
+`linuxnode` boot -
 enabling it for the *Linux* boots is what the `linuxbun` gate needs - `metrics`
 records nothing until a boot enables it, and no second core schedules anything. The
 exit gate is unchanged: `linuxbun` flipping from its accepted partial to `rheo:42`.

@@ -403,6 +403,42 @@ pub fn secondary_run(hw_id: u32) {
     // is set - a check that per-CPU addressing works off the boot core.
     debug_assert!(this_cpu().is_online());
     SECONDARY_UP.fetch_add(1, Ordering::Release);
+    // Then wait for real work and do it. Before this, a secondary proved it could
+    // execute and parked - which demonstrates bring-up and nothing about whether the
+    // two cores can compute at the same time (docs/SMP.md 10).
+    secondary_work_loop();
+}
+
+#[cfg(feature = "smp")]
+/// The secondary's work loop: meet the primary at the rendezvous, compute its share
+/// of the published GEMM, signal done, park.
+///
+/// Bounded rather than infinite. A secondary that spun forever waiting for work would
+/// be correct in a running system and wrong in a boot test, where the primary finishes
+/// and exits QEMU - and worse, it would hold a core against the host for the rest of
+/// the run, which under TCG slows the primary down. One job then park is what this
+/// stage needs; a real dispatch loop belongs with per-CPU scheduling, not here.
+fn secondary_work_loop() {
+    let deadline = arch::timer_now_ns().wrapping_add(RV_TIMEOUT_NS);
+    loop {
+        // Copied out under the lock; the compute below must not hold it, because the
+        // primary is computing its own rows concurrently and would block on it.
+        let job = *JOB.lock();
+        if let Some(job) = job {
+            if rendezvous(&RV_SECONDARY, &RV_PRIMARY) {
+                // SAFETY: the primary's `run_gemm_with_secondary` contract - the
+                // buffers are valid for the exchange and these rows are disjoint from
+                // the primary's.
+                unsafe { gemm_rows(&job, job.lo, job.hi) };
+            }
+            JOBS_DONE.fetch_add(1, Ordering::Release);
+            return;
+        }
+        if arch::timer_now_ns() >= deadline {
+            return; // no work was published; park rather than spin the core forever
+        }
+        core::hint::spin_loop();
+    }
 }
 
 #[cfg(feature = "smp")]
@@ -410,6 +446,162 @@ pub fn secondary_run(hw_id: u32) {
 /// secondary's write.
 pub fn shared_value() -> u64 {
     *SHARED.lock()
+}
+
+// ------------------------------------------------- parallel work on two cores
+//
+// Proof-of-life on a second core says the core executes; it says nothing about
+// whether the two cores can do *useful work at the same time*. That needs three
+// things this section provides: a way to hand a secondary a job, a way to prove the
+// two ran **simultaneously** rather than one after the other, and a workload whose
+// result is checkable against a single-core oracle.
+//
+// The workload is the tile framework's own `gemm_i8_i32` - integer, so the answer is
+// bit-exact and the two cores' halves can be compared against a reference computed by
+// one core, and shared verbatim with the librheo executor, the kernel engine, the
+// benches and the host comparison (docs/TILES.md). Splitting a GEMM by output rows is
+// how it is actually parallelised: each core writes a disjoint row range of C and
+// reads all of A and B, so there is no write sharing at all and the only
+// synchronisation needed is the barrier at the end.
+
+#[cfg(feature = "smp")]
+/// A row-range slice of an int8 GEMM, published by the primary for a secondary.
+///
+/// Raw addresses rather than slices because it crosses cores through a static and
+/// must be `Copy` with no lifetime; the primary owns the buffers for the whole
+/// exchange, which is the contract [`submit_gemm`] documents.
+#[derive(Copy, Clone)]
+pub struct GemmJob {
+    /// Kernel VAs of A (m x k, i8), B (k x n, i8), C (m x n, i32).
+    pub a: usize,
+    pub b: usize,
+    pub c: usize,
+    /// Row strides in elements.
+    pub as_: usize,
+    pub bs: usize,
+    pub cs: usize,
+    /// Output rows this core owns: `[lo, hi)`.
+    pub lo: usize,
+    pub hi: usize,
+    pub n: usize,
+    pub k: usize,
+}
+
+#[cfg(feature = "smp")]
+static JOB: SpinLock<Option<GemmJob>> = SpinLock::new(None);
+#[cfg(feature = "smp")]
+/// Bumped by a secondary when its rows are done.
+static JOBS_DONE: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "smp")]
+/// The two halves of a **rendezvous**: each core announces itself and then waits for
+/// the other. Both can only pass if both are running at the same time.
+static RV_PRIMARY: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp")]
+static RV_SECONDARY: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp")]
+/// Set when a rendezvous half gave up, so a failure is a reported observation rather
+/// than a hang.
+static RV_TIMEOUT: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "smp")]
+/// How long a rendezvous half waits before giving up, in timer-domain nanoseconds.
+///
+/// Generous (2 s) because under QEMU's TCG the two cores are time-sliced by the host
+/// and a secondary can be descheduled for a long time. The bound exists so a
+/// single-core machine - where the rendezvous genuinely cannot complete - reports that
+/// instead of wedging the boot test into its 120 s timeout with no diagnostic.
+const RV_TIMEOUT_NS: u64 = 2_000_000_000;
+
+#[cfg(feature = "smp")]
+/// Announce this side of the rendezvous and wait for the other. Returns false on
+/// timeout.
+///
+/// **This is the parallelism proof.** Nothing about it depends on timing or on
+/// counting: the primary cannot pass until the secondary has written its flag, and
+/// the secondary cannot pass until the primary has written its own. Neither writes its
+/// flag after passing. So both passing means both cores executed inside the same
+/// interval - which one core cannot produce, with or without preemption, because
+/// neither side yields and kernel-context preemption does not exist here.
+fn rendezvous(mine: &AtomicUsize, theirs: &AtomicUsize) -> bool {
+    mine.store(1, Ordering::Release);
+    let deadline = arch::timer_now_ns().wrapping_add(RV_TIMEOUT_NS);
+    while theirs.load(Ordering::Acquire) == 0 {
+        if arch::timer_now_ns() >= deadline {
+            RV_TIMEOUT.fetch_add(1, Ordering::Release);
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    true
+}
+
+#[cfg(feature = "smp")]
+/// Publish `job` for a secondary and run the primary's own rows, then wait for the
+/// secondary. Returns `(rendezvous_held, secondary_finished)`.
+///
+/// # Safety
+/// `job`'s A/B/C addresses must be valid kernel VAs for the stated shapes, and must
+/// stay valid until this returns. The primary's rows and the secondary's rows must be
+/// **disjoint** in C - which is what makes this need no lock around the compute at
+/// all, and is the caller's obligation because only the caller knows the split.
+pub unsafe fn run_gemm_with_secondary(job: GemmJob, own_lo: usize, own_hi: usize) -> (bool, bool) {
+    JOBS_DONE.store(0, Ordering::Release);
+    RV_PRIMARY.store(0, Ordering::Release);
+    RV_SECONDARY.store(0, Ordering::Release);
+    RV_TIMEOUT.store(0, Ordering::Release);
+    *JOB.lock() = Some(job);
+
+    // Both cores meet here, so the compute below genuinely overlaps rather than the
+    // secondary starting after the primary has finished.
+    let met = rendezvous(&RV_PRIMARY, &RV_SECONDARY);
+
+    // SAFETY: the caller's contract - valid buffers, and these rows are disjoint from
+    // the secondary's.
+    unsafe { gemm_rows(&job, own_lo, own_hi) };
+
+    let deadline = arch::timer_now_ns().wrapping_add(RV_TIMEOUT_NS);
+    while JOBS_DONE.load(Ordering::Acquire) == 0 {
+        if arch::timer_now_ns() >= deadline {
+            return (met, false);
+        }
+        core::hint::spin_loop();
+    }
+    (met, true)
+}
+
+#[cfg(feature = "smp")]
+/// Compute output rows `[lo, hi)` of the job's GEMM.
+///
+/// # Safety
+/// As [`run_gemm_with_secondary`]: valid buffers, and `[lo, hi)` disjoint from any
+/// range another core is computing.
+unsafe fn gemm_rows(job: &GemmJob, lo: usize, hi: usize) {
+    if hi <= lo {
+        return;
+    }
+    // SAFETY: the caller's contract. The row offset is applied to A and C so this
+    // core touches only its own rows of C; B is read-only and shared.
+    unsafe {
+        crate::engine::tile_kernels::gemm_i8_i32(
+            (job.a as *const i8).add(lo * job.as_),
+            job.as_,
+            job.b as *const i8,
+            job.bs,
+            (job.c as *mut i32).add(lo * job.cs),
+            job.cs,
+            hi - lo,
+            job.n,
+            job.k,
+        );
+    }
+}
+
+#[cfg(feature = "smp")]
+/// Whether either rendezvous half timed out (so "both cores ran at once" is
+/// **not** claimed).
+pub fn rendezvous_timed_out() -> bool {
+    RV_TIMEOUT.load(Ordering::Acquire) != 0
 }
 
 #[cfg(feature = "smp")]
