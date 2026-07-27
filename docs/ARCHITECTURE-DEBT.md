@@ -625,17 +625,21 @@ so was its claim of 182 MiB of `.bss`, which measurement shows does not exist.
    demand, not a preload. An in-RAM `&[u8]` is still one `BlockSource` (the `posix`
    kernel's path, unchanged), so both the resident and the streaming source are proven.
 
-   What (b) does **not** yet do, and is named: the streaming path proven here is the
-   **mount + read** path (`blockfs`), not yet an `execve` *from* a streamed mount. One
-   of the two obstacles is **now removed** (GOAL-DISK-2): the streaming `execve` path
-   (`load::exec_elf_inner`) parses `PT_INTERP` and streams the interpreter demand-paged,
-   the same handling the from-slice `load_elf_linux` had - factored to share
-   `stream_elf_at` - so a dynamically-linked binary now `execve`s from the VFS, proven
-   by `linuxdyn`'s second phase (`/bin/dhello` execve'd, exact stdout + exit, both
-   program and interpreter demand-paged, all three ISAs). What remains for (b): compose
-   that streaming loader with the block-cached ext4 (mount an ext4 image off the live
-   virtio-blk disk through the `BlockCache` and `execve` a binary from it), and the
-   registry ceiling (`MAX_MAPPED_FILES` 8) sits right at main + `ld.so` + 5 libs. Cost,
+   The full **`execve`-off-a-live-disk** composition is **now proven** (GOAL-DISK-2b),
+   and the ext4 driver is now the `ext4plus` crate (`ext4fs`; the hand-rolled parser was
+   retired - see the ext4plus paragraph below). Two rungs came together: (1) the
+   streaming `execve` path (`load::exec_elf_inner`) parses `PT_INTERP` and streams the
+   interpreter demand-paged, the same handling the from-slice `load_elf_linux` had,
+   factored to share `stream_elf_at`; (2) the ext4 driver reads through the
+   `BlockSource`/`BlockCache`. `linuxdyn` proves it in three phases on all three ISAs:
+   phase 1 loads `dhello` from a slice, phase 2 `execve`s it from a ramfs VFS, and
+   **phase 3 `execve`s it from a real ext4 image on a live virtio-blk disk** - the
+   program, its `ld.so` interpreter and `libc.so.6` all stream off the disk on demand
+   through the 8 KiB block cache (447-590 cache fills, exact stdout + exit 12), none
+   resident whole. That is a dynamically-linked glibc binary running unmodified,
+   `execve`d straight off ext4 - the shape a shell launching Claude Code needs. Still
+   named: the `MAX_MAPPED_FILES` 8 ceiling sits right at main + `ld.so` + 5 libs (raise
+   when a real binary needs more). Cost,
    measured not assumed: a `read_at` for a 2-4 byte field is one LRU lookup, a miss is
    one `LINE/SECTOR`-sector device read, and a data read copies straight from the
    covering line. Composing the streamed mount with the demand-paged loader is the next

@@ -652,12 +652,17 @@ fixup path.
     `dhello` directly (initial-load), phase 2 `execve`s `/bin/dhello` from the VFS
     (streaming), each asserting exact stdout + exit 12 on all three ISAs, with the
     recorded-page witness confirming program + interpreter are both demand-paged.
+  - **`execve` off a live ext4 disk is done** (GOAL-DISK-2b): `linuxdyn` phase 3
+    mounts a real ext4 image on a virtio-blk disk through `ext4fs`/`ext4plus` + the
+    block cache and `execve`s `/bin/dhello` from it - the program, `ld.so` and
+    `libc.so.6` all stream off the disk on demand (447-590 block-cache fills per
+    ISA, exact stdout + exit 12, all three ISAs), none resident whole. That is the
+    shell-launches-a-dynamic-binary-off-disk shape the real target needs.
   - Accommodations, disclosed: a dynamic **Rust** `std` hello is not built (it
     additionally needs `libgcc_s.so.1`/`libm.so.6` seeded); the C hello is the L7
-    proof. `execve` from an ext4 mount **off a live disk** (composing the
-    streaming loader with the block-cached ext4 of GOAL-DISK) is the remaining
-    rung, tracked as GOAL-DISK-2. **MAP_SHARED of a file** stays unmodeled (ld.so
-    uses PRIVATE).
+    proof. `MAX_MAPPED_FILES` (8) must be raised for a binary that maps more than a
+    handful of files. **MAP_SHARED of a file** stays unmodeled (ld.so uses
+    PRIVATE).
 
 - **L8 [done]** - **AF_UNIX (Unix domain) sockets** - the first slice of the
   socket surface (docs/NETSTACK.md rheo-net Phase N1d). Like every prior

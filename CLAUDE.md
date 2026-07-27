@@ -361,17 +361,21 @@ libc's stdio/malloc bss locks keep file garbage and self-deadlock), plus
 gitignored dir (never committed) and seeded into a ramfs `/lib`; a missing
 runtime lib makes that ISA skip-with-reason (static coverage stays). The
 `linuxdyn` test runs a stock **dynamically-linked glibc C hello** (gcc default
-PIE, unmodified) on **all three ISAs**, exact stdout + exit asserted - **both**
-loaded directly (initial-load) **and `execve`d from the VFS** (the streaming
-`execve` path now parses `PT_INTERP` and streams the interpreter demand-paged,
-sharing `stream_elf_at` with the initial-load path - GOAL-DISK-2). This closes
+PIE, unmodified) on **all three ISAs**, exact stdout + exit asserted, **three
+ways**: loaded directly (initial-load), `execve`d from a ramfs VFS (the streaming
+`execve` path parses `PT_INTERP` and streams the interpreter demand-paged, sharing
+`stream_elf_at` with the initial-load path - GOAL-DISK-2), and **`execve`d off a
+real ext4 image on a live virtio-blk disk** (GOAL-DISK-2b: mounted via
+`ext4fs`/`ext4plus` + the block cache; the program, its `ld.so` and `libc.so.6`
+all stream off the disk on demand, none resident whole - 447-590 block-cache fills
+per ISA). That is a dynamically-linked glibc binary running unmodified, launched
+straight off ext4 - the shape a shell launching Claude Code needs. This closes
 "unmodified Linux binaries run" for the common dynamic case; the whole
 **L0-L7 Linux personality is complete** - unpatched static and dynamic glibc C,
 unpatched Rust `std`, and the real upstream uutils/coreutils all run as cells,
-kernel-resident like `svc.rs` and adding no kernel object (`execve` **from an
-ext4 mount off a live disk** - composing the streaming loader with the
-block-cached ext4 - and a dynamic Rust/uutils-0.9.x fixture are the documented
-next steps).
+kernel-resident like `svc.rs` and adding no kernel object (raising
+`MAX_MAPPED_FILES` for a binary that maps > 8 files, and a dynamic
+Rust/uutils-0.9.x fixture, are the documented next steps).
 **L8 has begun** (docs/LINUX-COMPAT.md L8, docs/NETSTACK.md rheo-net Phase N1d):
 **AF_UNIX (Unix domain) sockets** - `socket`/`socketpair`/`bind`/`listen`/
 `accept`/`connect`/`sendmsg`/`recvmsg` on SOCK_STREAM, sockets as per-cell fds
@@ -1614,7 +1618,10 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               refusing real-time with EPERM, close_range, and clone3/rseq refused
               deliberately),
               linuxdyn (L7: an unmodified dynamically-linked glibc C hello over
-              PT_INTERP + ld-linux + fd-backed mmap), librheoproc (librheo Phase
+              PT_INTERP + ld-linux + fd-backed mmap - three ways: loaded direct,
+              execve'd from a ramfs VFS, and (GOAL-DISK-2b) execve'd off a real
+              ext4 image on a live virtio-blk disk via ext4fs/ext4plus + the block
+              cache, streamed on demand), librheoproc (librheo Phase
               F: native spawn/wait + one-shot timer + the lrsh shell + the
               embedded spine-only cell), librheonet (librheo Phase G: raw-frame
               networking - virtio-net driver + net::send/recv/mac, an ARP round

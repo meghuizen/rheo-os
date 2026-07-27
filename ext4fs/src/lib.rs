@@ -116,9 +116,21 @@ impl FileSystem for Ext4Fs {
         if ino.metadata().is_dir() {
             return Err(Errno::IsDir);
         }
-        // Offset read straight from the inode - the streaming property: only the
-        // touched bytes are read, not the whole file.
-        ext4plus::prelude::read_at(&self.fs, &ino, buf, off).map_err(|_| Errno::Io)
+        // Fill `buf` completely (short of EOF): the `FileSystem::read_at` contract
+        // is fill-the-buffer (ramfs upholds it, and the ELF loader's `stream_*`
+        // paths read once and check `got == len`), but `ext4plus::read_at` returns
+        // block-granular short reads, so loop over it. The streaming property
+        // holds - only the requested bytes are read, not the whole file.
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = ext4plus::prelude::read_at(&self.fs, &ino, &mut buf[done..], off + done as u64)
+                .map_err(|_| Errno::Io)?;
+            if n == 0 {
+                break; // EOF
+            }
+            done += n;
+        }
+        Ok(done)
     }
 
     fn readdir(&self, node: NodeId) -> Result<Vec<DirEntry>, Errno> {

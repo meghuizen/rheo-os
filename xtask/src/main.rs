@@ -105,6 +105,34 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "-device",
             "virtio-blk-pci,drive=blk0,disable-legacy=on",
         ],
+        // linuxdyn phase 3 (GOAL-DISK-2b): a per-ISA ext4 image built by
+        // `build_dyn_disk_fixture` (gitignored), holding a dynamic glibc binary +
+        // ld.so + libc, mounted off a live virtio-blk disk through ext4fs/ext4plus
+        // and `execve`d. Same two transports as blockfs. If the image is a
+        // placeholder (no e2fsprogs/toolchain), the test detects a non-ext4 disk
+        // and skips phase 3.
+        ("linuxdyn", Arch::Riscv64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-drive",
+            "file=tests/linux-fixtures/build/riscv64/dyn-disk.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-device,drive=blk0",
+        ],
+        ("linuxdyn", Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-drive",
+            "file=tests/linux-fixtures/build/aarch64/dyn-disk.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-device,drive=blk0",
+        ],
+        ("linuxdyn", Arch::X86_64) => &[
+            "-drive",
+            "file=tests/linux-fixtures/build/x86_64/dyn-disk.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-pci,drive=blk0,disable-legacy=on",
+        ],
         // librheodata (docs/LIBRHEO.md Phase B): the columnar dataset on a live
         // virtio-blk disk, generated fresh by `gen_columnar_dataset` into
         // target/ (gitignored, never committed). Same transports as blockfs.
@@ -1083,6 +1111,18 @@ impl Arch {
             ),
         }
     }
+
+    /// The absolute path a dynamic binary's `PT_INTERP` names for this ISA (the
+    /// `ld-linux-*.so` path, verified with `readelf -p .interp`). Used to place
+    /// the interpreter at the right path inside the `linuxdisk` ext4 image so
+    /// ld.so is found on the mounted disk exactly as on Linux.
+    fn interp_path(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "/lib64/ld-linux-x86-64.so.2",
+            Arch::Aarch64 => "/lib/ld-linux-aarch64.so.1",
+            Arch::Riscv64 => "/lib/ld-linux-riscv64-lp64d.so.1",
+        }
+    }
 }
 
 /// Build the Linux-personality test fixtures from source (docs/LINUX-COMPAT.md
@@ -1251,8 +1291,116 @@ fn build_linux_fixtures(arch: Arch) -> bool {
     if !build_dyn_fixture(arch, cc, &out_dir) {
         return false;
     }
+    build_dyn_disk_fixture(arch, &out_dir);
 
     build_coreutils_fixture(arch)
+}
+
+/// Does an external tool exist on PATH? (xtask has zero deps, so probe by
+/// spawning it - `.output()` errors only when the binary is not found.)
+fn have_tool(name: &str) -> bool {
+    Command::new(name).arg("-V").output().is_ok()
+}
+
+/// Build the `linuxdisk` fixture: a real ext4 image (`mkfs.ext4` + `debugfs`)
+/// holding the dynamic hello at `/bin/dhello`, its interpreter at the ISA's
+/// `PT_INTERP` path, and `/lib/libc.so.6` - so the `linuxdisk` test mounts it off
+/// a live virtio-blk disk (through `ext4fs`/`ext4plus` + the block cache) and
+/// `execve`s a dynamically-linked binary straight from ext4 (GOAL-DISK-2b). The
+/// image is gitignored, like the `.so` fixtures it embeds.
+///
+/// Skipped-with-reason - a small zeroed placeholder image, so QEMU's `-drive`
+/// still has a file and the test detects a non-ext4 disk and skips - when the
+/// runtime libs are placeholders (the toolchain `.so`s were absent) or
+/// `mkfs.ext4`/`debugfs` are not installed. Never fails the build.
+fn build_dyn_disk_fixture(arch: Arch, out_dir: &str) {
+    let img = format!("{out_dir}/dyn-disk.img");
+    let ld = format!("{out_dir}/ld.so");
+    let libc = format!("{out_dir}/libc.so.6");
+    let dhello = format!("{out_dir}/dhello");
+    let placeholder = |img: &str| {
+        let _ = std::fs::write(img, vec![0u8; 64 * 1024]);
+    };
+    let big = |p: &str| {
+        std::fs::metadata(p)
+            .map(|m| m.len() > 4096)
+            .unwrap_or(false)
+    };
+
+    if !(big(&libc) && big(&ld)) {
+        eprintln!(
+            "[xtask] SKIP linuxdisk image for {}: runtime ld.so/libc not available \
+             (linuxdisk will skip this ISA)",
+            arch.name()
+        );
+        placeholder(&img);
+        return;
+    }
+    if !(have_tool("mkfs.ext4") && have_tool("debugfs")) {
+        eprintln!(
+            "[xtask] SKIP linuxdisk image for {}: mkfs.ext4/debugfs not installed \
+             (linuxdisk will skip this ISA)",
+            arch.name()
+        );
+        placeholder(&img);
+        return;
+    }
+
+    // A driver-parseable ext4 (the gen-ext4.sh flags): 1 KiB blocks, no
+    // journal/csum/64bit/htree/resize. 8 MiB holds libc (~2 MB) with slack.
+    let _ = std::fs::remove_file(&img);
+    let ok = matches!(
+        Command::new("dd")
+            .args([
+                "if=/dev/zero",
+                &format!("of={img}"),
+                "bs=1024",
+                "count=8192"
+            ])
+            .output()
+            .map(|o| o.status.success()),
+        Ok(true)
+    ) && matches!(
+        Command::new("mkfs.ext4")
+            .args([
+                "-q",
+                "-b",
+                "1024",
+                "-O",
+                "^has_journal,^metadata_csum,^64bit,^resize_inode,^dir_index,extent",
+                "-F",
+                &img,
+            ])
+            .output()
+            .map(|o| o.status.success()),
+        Ok(true)
+    );
+    if !ok {
+        placeholder(&img);
+        return;
+    }
+
+    // debugfs dest paths are relative to root (no leading slash). The
+    // interpreter goes at its PT_INTERP path (/lib64/... on x86, /lib/... else).
+    let interp_rel = arch.interp_path().trim_start_matches('/');
+    let debugfs = |cmd: &str| {
+        let _ = Command::new("debugfs")
+            .args(["-w", "-R", cmd, &img])
+            .output();
+    };
+    debugfs("mkdir /bin");
+    debugfs("mkdir /lib");
+    if arch.interp_path().starts_with("/lib64/") {
+        debugfs("mkdir /lib64");
+    }
+    debugfs(&format!("write {dhello} bin/dhello"));
+    debugfs(&format!("write {libc} lib/libc.so.6"));
+    debugfs(&format!("write {ld} {interp_rel}"));
+    println!(
+        "[xtask] built linuxdisk ext4 image for {} ({img}; interp {})",
+        arch.name(),
+        arch.interp_path()
+    );
 }
 
 /// Build the L7 **dynamically-linked** glibc fixture (docs/LINUX-COMPAT.md L7):

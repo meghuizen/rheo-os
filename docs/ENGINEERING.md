@@ -585,6 +585,20 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   differently-shaped existing proof already covers it; the effort belongs on the part
   that is genuinely open. Building the redundant one to show motion is the exact
   shortcut "no shortcuts" forbids.
+- **A dropped-in crate obeys its own contract, not yours - and a looping caller hides
+  the mismatch.** `ext4plus::read_at` returns **block-granular short reads** (up to one
+  block per call); the retired hand-rolled ext4 driver and `ramfs` both *fill the
+  buffer*. The `posix` tests and `blockfs` passed anyway, because the `std::fs`-shaped
+  `fs::read` facade **loops** until EOF and so absorbed the short reads. The ELF loader's
+  `stream_segment` does not loop - it reads once and asserts `got == len` - so it broke
+  the instant a binary was `execve`d off ext4plus (a 4096-byte header read returned 1024,
+  `got != len`, `None`), invisibly to every existing test. The lesson: when adapting an
+  external crate to an internal trait, pin down the trait's *contract* (here
+  `FileSystem::read_at` is fill-the-buffer, because a caller depends on it) and make the
+  adapter uphold it - do not assume the crate's method has the same semantics as the code
+  it replaces. The fix loops in `Ext4Fs::read_at`. It surfaced only because the disk
+  `execve` exercised the non-looping caller; a proof that runs the real caller, not just
+  the convenient facade, is what caught it.
 
 ## 12. Never dereference an address the caller chose
 

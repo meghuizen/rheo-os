@@ -21,17 +21,21 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::rc::Rc;
 use core::ptr::addr_of_mut;
 
+use ext4fs::Ext4Fs;
 use kernel::capability::{CapTable, ObjectTable};
+use kernel::hw::block::{self, BlockCache};
+use kernel::hw::virtio_blk::{self, VirtioBlk};
 use kernel::linux::{self, stack as linux_stack};
 use kernel::mm::AddressSpace;
 use kernel::queue::QueuePair;
 use kernel::svc;
 use kernel::user::{self, Outcome, Personality};
 use kernel::{arch, load, println};
-use posix::{RamFs, fs, mount, sys};
+use posix::{BlockSource, Errno, RamFs, fs, mount, sys};
 
 #[path = "vfs_personality.rs"]
 mod vfs_personality;
@@ -292,6 +296,88 @@ extern "C" fn kernel_main() -> ! {
     }
     println!("linuxdyn: dhello via streaming execve OK (PT_INTERP streamed from the VFS)");
 
+    // Phase 3 (GOAL-DISK-2b): the same dynamic binary `execve`d from a real ext4
+    // image on a **live virtio-blk disk**, mounted through ext4fs/ext4plus + the
+    // bounded block cache. This composes the two proven capabilities - the
+    // streaming PT_INTERP loader (phase 2) and block-cached ext4 (#167) - end to
+    // end: the program, its interpreter and libc all stream off the disk on
+    // demand, none resident whole. If no ext4 disk is attached (a placeholder
+    // image: no e2fsprogs or toolchain libs at build time), skip-with-reason.
+    disk_phase(want_out);
+
     println!("linuxdyn: PASS");
     arch::exit(arch::ExitCode::Success)
+}
+
+/// The kernel cache-line bridge to `posix::BlockSource` (the orphan-rule newtype,
+/// as in `blockfs`).
+struct Cached(BlockCache<VirtioBlk>);
+impl BlockSource for Cached {
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<(), Errno> {
+        self.0.read_at(off, buf).map_err(|_| Errno::Io)
+    }
+}
+
+fn disk_phase(want_out: &[u8]) {
+    let dev = match virtio_blk::probe() {
+        Some(d) => d,
+        None => {
+            println!(
+                "linuxdyn: SKIP disk phase on {} - no virtio-blk disk attached",
+                arch::NAME
+            );
+            return;
+        }
+    };
+    let cache = BlockCache::new(dev);
+    let disk = match Ext4Fs::new(Box::new(Cached(cache))) {
+        Ok(fs) => fs,
+        Err(_) => {
+            println!(
+                "linuxdyn: SKIP disk phase on {} - the virtio-blk disk holds no ext4 \
+                 image (placeholder; no e2fsprogs/toolchain at build time)",
+                arch::NAME
+            );
+            return;
+        }
+    };
+
+    // Mount the live ext4 disk as the cell's `/`, then stream-`execve` from it.
+    posix::reset();
+    mount::mount("/", Rc::new(disk));
+    let fills_before = block::cache_fills();
+    unsafe {
+        STDOUT_LEN = 0;
+    }
+    linux::set_stdout_tap(Some(tap));
+    let outcome = run_execve(
+        "/bin/dhello",
+        &[b"dhello"],
+        &[b"LD_LIBRARY_PATH=/lib", b"PATH=/bin"],
+    );
+    linux::set_stdout_tap(None);
+    match outcome {
+        Outcome::Exited(code) => {
+            let got = captured();
+            assert!(
+                got == want_out,
+                "dhello (disk): stdout mismatch\n  got:      {:?}\n  expected: {:?}",
+                core::str::from_utf8(got),
+                core::str::from_utf8(want_out),
+            );
+            assert!(code == 12, "dhello (disk): exit {code}, expected 12");
+        }
+        Outcome::Faulted(addr) => panic!("dhello (disk): faulted at {addr:#x}"),
+    }
+    // Streaming witness: the program + ld.so + libc came off the device on
+    // demand through the bounded cache, not a whole-image preload.
+    let fills = block::cache_fills() - fills_before;
+    assert!(
+        fills > 0,
+        "no device reads - the binary was not streamed off disk"
+    );
+    println!(
+        "linuxdyn: dhello via streaming execve OFF A LIVE ext4 DISK OK \
+         ({fills} block-cache fills through ext4plus)"
+    );
 }
