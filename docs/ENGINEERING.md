@@ -439,6 +439,16 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   the inference restored, it fails with the exact original message. That is the
   difference between "reasoned and code-reviewed" (section 7's honest but weaker
   label) and proven.
+- **A `fork` must add a reference to every refcounted thing it shares, and the cost of
+  missing one is paid by the *other* process.** `dup_state` copies a whole `LinuxState`
+  with `copy_nonoverlapping`, which duplicates every record while touching no counter -
+  so each shared resource needs an explicit inherit step. Pipes had one. When
+  demand-paged mappings arrived, their backing stores did not: the child's records named
+  entries it held no reference to, the child's exit released one per record and drove the
+  count to zero, and the **parent** then faulted against a freed entry and got a zero
+  page - a SIGILL long after the fork, in the process that did nothing wrong. Put the
+  inherit steps adjacent so the rule is visible as a list rather than remembered as a
+  habit.
 - **"Am I allowed to address this?" and "am I about to touch it?" are different
   questions.** Demand paging needed the kernel to make a user page present before
   dereferencing it. The tree already had one choke point for cell-supplied pointers, so
