@@ -636,6 +636,37 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   legitimately steer away from. The behavioural proof (exact transcript + exit 0 +
   `deadlock_waits() == 0`) is what actually excludes the ignored-timeout bug; the counter
   is the bonus witness, and a bonus witness must not be stricter than the invariant.
+- **A partial success must roll back the bookkeeping it already did.** `mmap`'s eager
+  path inserted the VMA record *first* (so a full table refuses before touching pages),
+  then committed frames - and on a commit failure it returned `-ENOMEM` without removing
+  the record. The span was then owned by a mapping that does not exist, lost until the
+  cell exited. It stayed invisible because every mapping small enough to commit also
+  succeeds; it took JavaScriptCore's 128 GiB reservation - which *cannot* be eagerly
+  committed - to expose it, and the symptom was not the failed call but the *next* dozen
+  mmaps landing at wrong addresses (the leaked span pushed first-fit past it). When a
+  call does bookkeeping then an action that can fail, the failure path owns the undo -
+  and the proof to write is not "the big call failed" but "the state after it is what it
+  was before" (here: the freed span is found again by the next allocation).
+- **"Refused deliberately" is only honest while every caller has a fallback.** `clone3`
+  returned `ENOSYS` on the reasoning that glibc's `pthread_create` falls back to legacy
+  `clone` - true, and verified, for glibc. It is false for a runtime that issues
+  `clone3` *directly* with no fallback (Bun's JavaScriptCore/Zig threading), where
+  `ENOSYS` is a hard thread-spawn failure and the process aborts. A refusal justified by
+  one caller's documented fallback is not a refusal justified for all callers; when a
+  second caller appears that the justification did not cover, the honest move is to
+  implement the call, not to widen the excuse. (The same shape as the two-numbers hazard:
+  a claim that holds for the inputs you tested is not a claim that holds.)
+- **Diagnose a stopping point by measurement, not by its most plausible symptom.** Bun's
+  `abort()` had many plausible causes - the Gigacage alignment, `sysinfo` sizing, a
+  missing syscall, a CPU-count of zero - and each looked likely in turn. None was it.
+  Logging the *current thread id* against every syscall settled it in one run: all 205
+  came from the main thread, so the worker it spawned via `clone3` never ran, and the
+  blocker is the cooperative single-CPU scheduler (preemptive SMP, #132), not anything
+  in the load path. `observe-never-infer` (section 1) applies to a program's stopping
+  point exactly as it does to a capability: a test that accepts the partial must name the
+  cause it *measured*, so "loaded to the concurrency frontier" is evidence, not a guess -
+  and the acceptance is bounded to that exact signature (exit 134 **and** empty output)
+  so a different failure still fails loudly.
 
 ## 12. Never dereference an address the caller chose
 
