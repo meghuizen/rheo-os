@@ -180,6 +180,27 @@ pub fn user_buf_mut(va: u64, len: usize) -> Option<u64> {
     }
 }
 
+/// The largest `n <= max` for which `[va, va+n)` is a **readable** range in the
+/// calling cell (0 if `va` is in no such range).
+///
+/// For the one argument shape whose length the caller never states - a
+/// NUL-terminated string - so the scan for its terminator carries a bound and
+/// cannot walk out of the cell's range (docs/ENGINEERING.md 12).
+#[inline]
+pub fn user_read_span(va: u64, max: usize) -> usize {
+    if va == 0 {
+        return 0;
+    }
+    if va < USER_VA_MAX {
+        return ((USER_VA_MAX - va) as usize).min(max);
+    }
+    let (window_start, window_end) = crate::mm::user_window();
+    if va >= window_start as u64 && va < window_end as u64 {
+        return ((window_end as u64 - va) as usize).min(max);
+    }
+    0
+}
+
 /// A validated writable byte slice over `[va, va+len)` in the calling cell.
 ///
 /// # Safety

@@ -505,11 +505,19 @@ fn strlen(va: u64) -> usize {
     if va == 0 {
         return 0;
     }
-    // SAFETY: trap context; `va` is a VA in the calling cell. Bounded scan.
+    // A NUL-terminated string is the one argument shape whose length the caller
+    // does not state, so the entry check (`ptr_args_ok`) can only bound its first
+    // byte. The scan therefore carries its own bound: it stops at the last byte
+    // still inside the cell's readable range, so a string placed at the very top
+    // of that range cannot walk the scan into the kernel half
+    // (docs/ENGINEERING.md 12).
+    let limit = crate::user::user_read_span(va, 4096);
+    // SAFETY: trap context, and `[va, va+limit)` was range-checked above as
+    // readable in the calling cell, whose address space is active.
     unsafe {
         let p = va as *const u8;
         let mut n = 0usize;
-        while n < 4096 && p.add(n).read() != 0 {
+        while n < limit && p.add(n).read() != 0 {
             n += 1;
         }
         n

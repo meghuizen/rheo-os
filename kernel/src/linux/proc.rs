@@ -312,8 +312,18 @@ fn copy_str_array(arr_va: u64, out: &mut [&'static [u8]; EXEC_PTR_MAX], off: &mu
     if arr_va == 0 {
         return 0;
     }
+    // Both the pointer array and every string it names are cell-supplied
+    // addresses (docs/ENGINEERING.md 12): the array is bounded to the fixed
+    // `EXEC_PTR_MAX` slots and range-checked, and each string's terminator scan
+    // is bounded by how much of the cell's readable range remains at that
+    // pointer. An out-of-range array or pointer stops the copy rather than
+    // reading kernel memory.
+    if crate::user::user_buf(arr_va, EXEC_PTR_MAX * 8).is_none() {
+        return 0;
+    }
     let mut count = 0usize;
-    // SAFETY: `arr_va` is a NULL-terminated pointer array in the active cell.
+    // SAFETY: `[arr_va, arr_va + EXEC_PTR_MAX*8)` was range-checked readable in
+    // the active cell above, and each `src` span is checked below.
     unsafe {
         let base = addr_of_mut!(EXEC_STR) as *mut u8;
         for (i, slot) in out.iter_mut().enumerate() {
@@ -321,10 +331,14 @@ fn copy_str_array(arr_va: u64, out: &mut [&'static [u8]; EXEC_PTR_MAX], off: &mu
             if p == 0 {
                 break;
             }
+            let span = crate::user::user_read_span(p, EXEC_STR_MAX);
+            if span == 0 {
+                break;
+            }
             let start = *off;
             let src = p as *const u8;
             let mut n = 0usize;
-            while *off < EXEC_STR_MAX - 1 {
+            while *off < EXEC_STR_MAX - 1 && n < span {
                 let b = src.add(n).read();
                 *base.add(*off) = b;
                 *off += 1;
