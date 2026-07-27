@@ -94,6 +94,7 @@ macro_rules! fixture {
 static POLLX: &[u8] = fixture!("pollx");
 static POLLDEAD: &[u8] = fixture!("polldead");
 static TIMERX: &[u8] = fixture!("timerx");
+static UVLOOP: &[u8] = fixture!("uvloop");
 
 static mut OBJECTS: ObjectTable = ObjectTable::new();
 static mut CAPS: CapTable = CapTable::new();
@@ -229,6 +230,36 @@ extern "C" fn kernel_main() -> ! {
     println!(
         "linuxpoll: timerx OK - timerfd blocking read parks on its deadline and \
          epoll_wait wakes on expiry (the libuv timer source)"
+    );
+
+    // ---- phase 1c: the libuv event-loop core ----
+    //
+    // One epoll set multiplexing all three wake sources a real loop uses at once -
+    // a periodic timerfd (TIMER), an eventfd (PEER), and a pipe (PEER) - proving
+    // they compose, which the per-mechanism phases above do not. The loop runs
+    // until it has seen the eventfd wake, the pipe read, and >=3 timer ticks; the
+    // milestones are deterministic, the per-iteration counts are not, so only the
+    // milestones are asserted.
+    let (outcome, got) = run_capture(UVLOOP, &[b"uvloop"]);
+    let want_uv = b"uvloop: eventfd woke\n\
+                    uvloop: pipe got hi\n\
+                    uvloop: 3 ticks\n\
+                    uvloop OK\n";
+    match outcome {
+        Outcome::Exited(code) => {
+            assert!(
+                got == want_uv,
+                "uvloop: stdout mismatch\n  got:      {:?}\n  expected: {:?}",
+                core::str::from_utf8(got),
+                core::str::from_utf8(want_uv),
+            );
+            assert!(code == 0, "uvloop: exit {code}, expected 0");
+        }
+        Outcome::Faulted(addr) => panic!("uvloop: faulted at {addr:#x}"),
+    }
+    println!(
+        "linuxpoll: uvloop OK - one epoll set multiplexes a timerfd, an eventfd and \
+         a pipe (the libuv event-loop core)"
     );
 
     // ---- phase 2: a wait nothing can ever satisfy ----
