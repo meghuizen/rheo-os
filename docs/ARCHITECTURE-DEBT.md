@@ -427,9 +427,30 @@ that change the plan, which is the reason to measure before building.
 
 Four blockers follow, and they are now facts rather than predictions:
 
-1. **The stack is too small by 4.8 MiB.** `PT_GNU_STACK` asks for 12.8 MiB;
-   `stack::LINUX_STACK_PAGES` is 2048 = **8 MiB**. One constant, and the *first*
-   thing that would fail.
+1. ~~**The stack is too small by 4.8 MiB.**~~ **CLOSED.** `PT_GNU_STACK` asks
+   for 12.8 MiB and `stack::LINUX_STACK_PAGES` was 2048 = 8 MiB. The fix is not
+   a bigger constant - raising it to 16 MiB would have fitted this binary and
+   left the next one to fail identically. `elf::stack_size()` reads
+   `PT_GNU_STACK`'s `p_memsz`, `load::LinuxImage` carries it, and
+   `stack::stack_pages_for()` maps `max(request, 8 MiB)` up to a **64 MiB
+   ceiling** - a bound, because the stack is mapped eagerly and charged to the
+   cell's frame budget, so a 2 GiB request would exhaust the pool at load with
+   no diagnostic; above the ceiling it is clamped **and logged**.
+
+   `LinuxState.stack_pages` carries the result and `rlimit_for` reads it, so
+   `RLIMIT_STACK` reports what was actually mapped. That second half is not
+   cosmetic: glibc sizes *thread* stacks from that number, so reporting more
+   than is mapped hands every thread a stack that faults.
+
+   `PT_GNU_STACK`'s flags also carry executable-stack permission, deliberately
+   **not** read - W^X is structural here, and an executable stack is refused
+   rather than honoured.
+
+   Proven by the `stackx` fixture in `linuxproc` on all three ISAs (linked
+   `-z stack-size=12582912`, writes through 9280 KiB in 145 recursive frames).
+   Each half was observed failing when reverted alone: with the mapping reverted
+   the run prints **nothing at all**, because the fault eats glibc's buffered
+   stdout - which is exactly why the original defect was hard to attribute.
 2. **262 MiB of eagerly-copied private frames** against a 384 MiB per-cell budget
    and a 512 MiB pool. It fits arithmetically and leaves almost nothing for the
    heap, `ld.so`, `libc.so.6` or 182 MiB of `.bss`. On Linux those pages are

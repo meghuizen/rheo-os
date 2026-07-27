@@ -408,6 +408,16 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   post-claim defence returned a frame forever once claimed, so
   `while let Some(x) = next()` never terminated. Split bounded from unbounded and
   assert the boundedness.
+- **A build tool that ignores an option it does not understand turns a typo into
+  a silent wrong answer.** The `PT_GNU_STACK` proof needs a fixture linked with a
+  larger stack request. GNU `ld` spells that `-z stack-size=N`; `lld` spells it
+  `-z stacksize=N`. Given the wrong spelling, `ld` **warns and links anyway**, so
+  the fixture built cleanly with a `p_memsz` of **0** - and the test then failed
+  against the *fixed* kernel, which is the worst possible direction to be wrong
+  in: it accuses correct code. The general rule is that a proof's *inputs* need
+  the same evidence discipline as its assertions. Assert the property you needed
+  the tool to produce (here: `readelf` the fixture and check `p_memsz`), and be
+  suspicious of any build step whose failure mode is a warning.
 
 ## 12. Never dereference an address the caller chose
 

@@ -945,7 +945,9 @@ fd). The `fcntlx` fixture in `linuxproc` asserts all four, including self-`execv
 check one fd is gone and another survived. (4) **Limits raised for the real target**:
 the frame pool 128 -> **512 MiB**, the per-cell budget 96 -> **384 MiB**, the global
 reserve 8 -> 16 MiB, the Linux stack 1 -> **8 MiB** (with `RLIMIT_STACK` now derived
-from the one constant, since glibc sizes thread stacks from it). QEMU gives 1 GiB and the
+from the one constant, since glibc sizes thread stacks from it - and since then the
+stack is sized from the image's own **`PT_GNU_STACK`** request, 8 MiB being only the
+floor for an image that asks for nothing; docs/LINUX-COMPAT.md). QEMU gives 1 GiB and the
 pool base sits 64 MiB into RAM, so the headroom is deliberate - firmware puts blobs near
 the *top* of RAM (RISC-V `virt`'s DTB at ~`0xBFE0_0000`). This is a **limit raise, not a
 design change**; the proper fix is **demand paging**, a later rung. Found worse than
@@ -1436,7 +1438,10 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               binary - clone/futex/TLS/join), linuxsig (L5: signal delivery -
               async raise, fault->SIGSEGV handler, SIG_DFL terminate),
               linuxproc (L6: fork/execve/wait4/cross-cell pipes - a direct
-              multi-process C fixture + the P11 coreutils-suite shell),
+              multi-process C fixture + the P11 coreutils-suite shell; plus
+              `stackx`, which asks for 12 MiB of stack via PT_GNU_STACK and both
+              reads it back through RLIMIT_STACK and writes 9280 KiB of it
+              through - the loader used to hand every cell a fixed 8 MiB),
               linuxdyn (L7: an unmodified dynamically-linked glibc C hello over
               PT_INTERP + ld-linux + fd-backed mmap), librheoproc (librheo Phase
               F: native spawn/wait + one-shot timer + the lrsh shell + the

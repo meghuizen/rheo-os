@@ -138,7 +138,7 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 | getrandom | full | fills from the cell's DRBG; flags ignored (never blocks) |
 | sched_yield | full | switches to the next ready context of this cell (L4); with no ready sibling it crosses to the next runnable **process** (`proc::yield_cell`, the `SYS_YIELD` hand-off), so a yield is a real preemption point and not a no-op. Returns 0. Only when the caller is the sole runnable process is it picked again |
 | sched_getaffinity | partial | reports a single online CPU (bit 0) so `available_parallelism` reads 1 and thread pools (rayon) stay small/deterministic (L4) |
-| prlimit64 / getrlimit | full | RLIMIT_STACK **8 MiB** (the glibc default, and exactly the stack the loader maps - glibc sizes thread stacks from it, so the two numbers are one constant), RLIMIT_NOFILE 64, else unlimited; not settable |
+| prlimit64 / getrlimit | full | RLIMIT_STACK is **whatever the loader actually mapped** for this cell, read from `LinuxState.stack_pages` - 8 MiB by default, more if the image's `PT_GNU_STACK` asked for more (see the stack section). glibc sizes *thread* stacks from this number, so it must be the mapped size and not a recomputation. RLIMIT_NOFILE 64, else unlimited; not settable |
 | arch_prctl | full | x86-64 only: SET_FS/GET_FS program the FS_BASE MSR (L1); the base is recorded per context and reloaded on a context switch (L4) |
 | prctl | partial | PR_SET_NAME/PR_GET_NAME accepted as a cosmetic no-op (rayon names its workers and treats failure as fatal, L4); every other option -ENOSYS |
 | set_tid_address | full | records the calling context's clear-tid address, returns its tid (L4; enacted by CHILD_CLEARTID on thread exit) |
@@ -184,7 +184,8 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 
 Same windows as native loaded cells (docs/USERLAND.md): image at 4 GiB
 (`ET_EXEC` at its linked address; `ET_DYN` gets load bias 0x1_0000_0000),
-stack top at 8 GiB (8 MiB mapped for Linux cells), anonymous mmap region at
+stack top at 8 GiB (a Linux cell's stack is sized from its own `PT_GNU_STACK`
+`p_memsz`, at least 8 MiB and at most 64 MiB - see below), anonymous mmap region at
 12 GiB, `brk` heap starting at the image end. The initial stack carries the
 System V block **plus the ELF auxiliary vector** (L1): AT_PHDR/PHENT/PHNUM,
 AT_PAGESZ, AT_BASE, AT_FLAGS, AT_ENTRY, AT_UID/EUID/GID/EGID, AT_SECURE,
@@ -204,7 +205,8 @@ it *uses*. Three numbers therefore bound what can run:
 | `frames::POOL_FRAMES` | 131072 = **512 MiB** | all physical memory the kernel hands out |
 | `frames::USER_RESERVE_FRAMES` | 4096 = **16 MiB** | held back from cell-driven allocation, so the kernel's own allocations (page tables, driver rings, a `fork` copy) can never fail |
 | `user::MAX_FRAMES_PER_CELL` | 98304 = **384 MiB** | one cell's fairness cap on the charged mapping paths |
-| `stack::LINUX_STACK_PAGES` | 2048 = **8 MiB** | the mapped initial stack, and the RLIMIT_STACK reported |
+| `stack::LINUX_STACK_PAGES` | 2048 = **8 MiB** | the initial stack an image that asks for nothing gets - a floor, not the size |
+| `stack::LINUX_STACK_MAX_PAGES` | 16384 = **64 MiB** | ceiling on a `PT_GNU_STACK` request; above it the request is clamped and logged |
 
 These were 128 MiB / 8 MiB / 96 MiB / 1 MiB - sized for static-glibc fixtures of a
 few hundred KiB. A ~100 MB binary exhausted them before reaching `main`. QEMU runs
@@ -249,10 +251,18 @@ it is a later rung of work.
     riscv64 glibc dev package ships no `rcrt1.o`; the loader's ET_DYN path
     (bias 0x1_0000_0000) remains for L7 dynamic linking.
   - **uname release "6.6.0-rheo"**, machine per ISA (x86_64/aarch64/riscv64).
-  - **RLIMIT_STACK 8 MiB** - the glibc default, and exactly the stack the
-    loader maps (one constant, `linux::stack::LINUX_STACK_PAGES`: glibc sizes
-    thread stacks from RLIMIT_STACK, so reporting more than is mapped would hand
-    every thread a stack that faults). RLIMIT_NOFILE 64.
+  - **RLIMIT_STACK = the stack the loader actually mapped.** The size comes from
+    the image's own `PT_GNU_STACK` `p_memsz` (`elf::stack_size` ->
+    `LinuxImage.stack_want` -> `stack::stack_pages_for`), floored at
+    `LINUX_STACK_PAGES` = 8 MiB (the glibc default, for an image that asks for
+    nothing) and capped at `LINUX_STACK_MAX_PAGES` = 64 MiB, clamped **and
+    logged** above that - the stack is mapped eagerly and charged to the cell's
+    frame budget, so obeying an arbitrary request would exhaust the pool at load.
+    The reported limit is read from the one `LinuxState.stack_pages` the loader
+    set, not recomputed: glibc sizes *thread* stacks from RLIMIT_STACK, so
+    reporting more than is mapped hands every thread a stack that faults.
+    `PT_GNU_STACK`'s executable-stack flag is deliberately not honoured (W^X is
+    structural). Proven by `stackx` in `linuxproc`. RLIMIT_NOFILE 64.
   - **clock_gettime** is monotonic but coarse: x86 TSC via CPUID 0x16 (else a
     1 GHz assumption), arm CNTFRQ_EL0, riscv a documented 10 MHz timebase
     (`cycle` vs `time` CSR mismatch noted); REALTIME adds a fixed boot epoch.
@@ -405,7 +415,7 @@ it is a later rung of work.
     suite is the real Linux Rust coreutils driven by a shell over the L6
     process primitives.
   - Accommodations, all disclosed: **eager copy, COW deferred** - `fork`
-    copies every committed page (including the 8 MiB Linux stack); `execve`
+    copies every committed page (including the whole Linux stack, >= 8 MiB); `execve`
     frees it immediately, so the transient cost is bounded. **Cross-thread
     SIGCHLD is not queued** - the parent reaps via `wait4` directly (no L6
     fixture installs a SIGCHLD handler). **Close-on-exec is not tracked** -
