@@ -12,7 +12,11 @@ This is *proof of a second core running kernel code plus the foundation for real
 SMP* - **not** preemptive multi-core scheduling. Each secondary does observable
 proof-of-life work and parks; nothing in the kernel is yet safe to run on two cores
 concurrently, and the runtime stays single-CPU cooperative
-(docs/CONCURRENCY.md). Section 9 has the full accounting.
+(docs/CONCURRENCY.md). Section 9 has the full accounting. **Section 10 is the
+docs-first design for phase 2** (task #132: the SMP-safety audit, per-CPU stacks +
+start-all, the preemptive tick, and the EEVDF+BORE per-CPU scheduler with NUMA and
+P/E-core placement) - the phase that turns the parked secondaries into the measured
+answer to Bun's worker starvation (GOAL-BUN).
 
 This doc pairs with CONCURRENCY.md (which describes the *userspace* strand/vcore
 model) - SMP here is the *kernel-level* story: physical cores, per-CPU kernel
@@ -500,3 +504,135 @@ the interrupt vector writes.
 - The **x86-64 NIC RX interrupt** - the last interrupt source any ISA is missing.
   Section 8 records why the old justification no longer holds and what is actually
   left to do.
+
+## 10. Phase 2 design: preemptive multi-core scheduling (task #132)
+
+**Status: design only.** Nothing in this section is implemented. It is written
+docs-first (ARCHITECTURE.md 6 discipline for a change this large) so the work lands
+in reviewable slices against a fixed plan, and so the single-CPU cooperative path
+stays byte-identical until each prerequisite is genuinely safe.
+
+### 10.1 The measured motivation (not a wish)
+
+The cooperative single-CPU scheduler switches to another context **only when the
+current one blocks at a syscall boundary** (kernel/src/nproc.rs, linux/thread.rs).
+That is correct for syscall-driven concurrency - Node.js completes because its main
+thread blocks on `epoll_wait` for an eventfd a worker writes (docs/LINUX-COMPAT.md,
+per-context blocking). It is **not** correct for a program that requires a sibling to
+make progress *before* it ever blocks. The real Bun binary is the measured case
+(GOAL-BUN, the `linuxbun` partial): it spawned a worker via `clone3` and then
+`abort()`ed, and instrumentation showed **all 205 of its syscalls issued from the
+main thread - the worker never got the CPU**. No syscall was missing; the load path
+(streaming, demand paging, dynamic linking, the 128 GiB Gigacage, the event loop) all
+worked. The frontier is that a second runnable context has no core to run on. That is
+this phase, and it is the single largest lever named by the productivity goal:
+multicore throughput, per-core tuning, memory locality, and "high performance
+bun/Claude Code" all sit behind it.
+
+### 10.2 The gate: an SMP-safety audit of shared `static mut` state
+
+The bring-up parks each secondary precisely because the kernel's mutable statics are
+written with no lock and read on the assumption of one CPU. Feeding a secondary
+runnable work before this is done is a data race, not a scheduler. So the **first
+deliverable is an audit, not a scheduler**: enumerate every `static mut` a second core
+could touch, and give each one an explicit discipline - a lock, per-CPU partitioning,
+or a single-owner core. The known set, from this tree:
+
+- **`mm::frames` / `frames_pmem`** - the frame allocator + per-frame refcount (COW).
+  A global `SpinLock` initially; a per-CPU magazine (free-list cache) later for the
+  hot path, refilled/drained under the global lock (the standard slab-magazine shape).
+- **Page tables** - per-cell root, but `AddressSpace` mutation (map/unmap/protect,
+  COW privatisation) races a concurrent fault on the same cell. Per-address-space lock;
+  a remote-TLB shootdown IPI (section 9 names it) for unmap/protect that another core
+  may have cached.
+- **`capability` object/cap tables, `user` cell table** - a per-cell lock, or the
+  seL4 discipline of a big-kernel-lock first and finer locks proven in later.
+- **The Linux personality per-cell state** (`linux::*`: fd table, VMAs, signal
+  dispositions, thread table, futex waiter lists) - all indexed by cell; a per-cell
+  lock makes threads of one cell safe across cores, which is exactly what Bun needs.
+- **`ktimer`** (the single hardware one-shot owner), **`net_rx`**, **`input`** - each
+  becomes **per-CPU**: every core has its own timer arbiter over its own local timer,
+  and RX interrupts are steered to a core. This is the natural home for the per-CPU
+  timer the section-9 IPI note anticipated.
+- **`idle`, `sched` (the admission ledger)** - the run queue and the system-wide
+  reservation ledger; the ledger stays global under a lock, the run queue goes
+  per-CPU (below).
+
+The rule (docs/ENGINEERING.md 3, one owner per shared resource) is the whole design:
+each static gets exactly one owner or one lock, and the single-CPU build compiles the
+locks out (a `SpinLock` on one core is an uncontended flag), so the cooperative path
+is unchanged and stays the proof-of-correctness baseline.
+
+### 10.3 Per-CPU infrastructure
+
+- **Per-CPU stacks**: today each ISA has one dedicated secondary stack (section 9).
+  Start-all needs one kernel stack per core, plus a per-CPU trap/IST stack on x86-64.
+- **A per-CPU register**, replacing the `cpu_index()` id->index search: x86-64
+  `GS_BASE` + `swapgs` at kernel entry, ARM64 `tpidr_el1`, RISC-V a per-hart `sscratch`
+  slot. `this_cpu()` becomes a single register read.
+- **Start-all**: iterate the discovered CPU set - ACPI MADT on x86-64, `PSCI_AFFINITY_INFO`
+  enumeration on ARM64 (section 7 defers exactly this), the device-tree `cpus` node on
+  RISC-V - and bring each up with its own stack via the section 5-7 paths, unchanged.
+
+### 10.4 The preemptive tick
+
+Every core already has a genuinely interrupt-driven one-shot timer (sections 5-8, all
+three ISAs). Preemption is that timer arming a **scheduler tick**: a context that has
+not yielded by the end of its slice is preempted - its `TrapFrame` saved, the next
+runnable context on that core resumed. This is the one mechanism the cooperative model
+lacks (docs/CONCURRENCY.md, task #27's "a spinning thread starves siblings"), and it is
+what lets Bun's worker run: on a second core immediately, or - even on one core - by
+preempting the main thread so the worker is scheduled before main reaches its abort
+check.
+
+### 10.5 The scheduler itself (EEVDF + BORE, integer-only)
+
+The policy is already researched and written down: docs/SCHEDULING.md 11 records the
+CachyOS production stack - **EEVDF** (virtual deadline = eligible time + slice/weight)
+as the base, with **BORE**'s burst-time penalty layered on top, and the load-bearing
+insight that BORE's score is an **integer bit-length/log2** computation with **no
+FPU** - which matters because the kernel is soft-float (CLAUDE.md, the hard/soft-float
+split). So the scheduler math needs no floating point and no new dependency.
+
+- **Per-CPU run queues** with **work-stealing**: an idle core steals from a busy
+  core's queue tail. No global run-queue lock on the hot path.
+- **NUMA locality** (goal: "memory locality"): the machine `Inventory` already carries
+  SRAT/DT NUMA topology (CLAUDE.md, hw discovery). A cell's frames are allocated on a
+  home node; its threads prefer cores on that node; stealing across nodes is a last
+  resort and is charged a documented penalty. This is placement, not new mechanism.
+- **P/E/LP-core awareness** (goal: "tuned to performance/energy/low-power cores"):
+  extend the inventory's per-CPU descriptor with a `CpuClass` (from CPUID leaf 0x1A on
+  x86-64 hybrid parts, the DT `capacity-dmips-mhz` on ARM64). Latency-sensitive strands
+  and reservation-admitted work prefer P-cores; background/batch prefers E/LP-cores; the
+  EEVDF weight and the core class compose (a low-weight task on an E-core is the energy
+  path). Enumeration first (report the classes in `hwinfo`), placement second.
+
+### 10.6 Composition, not extension
+
+This adds **no kernel object and no syscall verb** - like phase 1, it is pure
+mechanism. The run loop generalises the existing cooperative cross-cell switch
+(`user::switch_native_cell`, still the one FP-swapping native switch); the timer
+arbiter becomes per-CPU; the scheduler reuses ktimer, the interrupt-driven timers, and
+the SCHEDULING.md policy. Reservations (object 7) finally gain **runtime enforcement**:
+today admission is real but the guarantee is "admitted, not yet scheduled" (CLAUDE.md,
+Phase C honesty) because there is one cooperative CPU; a preemptive per-CPU scheduler
+is what makes an admitted budget an enforced one.
+
+### 10.7 Ordering and the proof
+
+Land it in slices, each keeping the single-CPU path byte-identical and green:
+
+1. The 10.2 audit + locks (single-CPU: locks compile to uncontended flags; the whole
+   existing suite must stay green - that is the regression gate).
+2. Per-CPU stacks + register + start-all (two cores up, still only the primary fed
+   work - phase-1 proof extended to N cores).
+3. The preemptive tick on the primary (a spinning cooperative thread is now preempted -
+   a direct test: a compute-bound sibling no longer starves a second).
+4. Per-CPU run queues + work-stealing + NUMA/class placement.
+
+The headline proof is an SMP scheduling test where **two cells genuinely run on two
+cores at once** - a shared page incremented from both with an ordering witness that is
+impossible under cooperative single-CPU interleaving - and the honest end-to-end proof
+is **`linuxbun` flipping from the exit-134 partial to `rheo:42` + exit 0**, because the
+worker that "never got the CPU" now has one. Both are the measurable definitions of
+done for this phase; neither is claimed until observed.
