@@ -19,7 +19,7 @@
 use core::ptr::{self, addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::capability::{CapError, CapTable, ObjectTable, READ, WRITE};
+use crate::capability::{CapError, CapTable, ObjectKind, ObjectTable, READ, WRITE};
 
 mod sealed {
     /// Sealed: only types explicitly marked can live in DMA-visible rings.
@@ -338,6 +338,25 @@ fn opcode_right(opcode: u8) -> u32 {
 /// propagates unchanged - observability the system cannot fail to produce
 /// (docs/ARCHITECTURE.md 3, object 10).
 ///
+/// **What the per-entry check does and does not gate** (docs/ARCHITECTURE-DEBT.md
+/// 2.6, stated here because the earlier wording overclaimed it). `entry.cap_id`
+/// is chosen by the *cell*, so the check establishes exactly three things: the
+/// id names a **live** capability in this cell's own table (unforgeability), it
+/// carries the right this opcode needs, and its epoch is current (so a revoke
+/// kills it). It additionally now requires the capability to name a
+/// **`QueuePair`** object - the id is a *queue* reference, and passing, say, a
+/// MemoryGrant id used to satisfy the check because the resolved object was
+/// discarded.
+///
+/// It does **not** gate the resource the opcode reaches. A cell holding a queue
+/// pair can still `OP_NET_TX` an arbitrary Ethernet frame, `OP_NET_RX` any
+/// received one, `OP_GPU_PRESENT`, or `OP_OPEN` any path the registered
+/// `svc::FileOps` will open: those resources have no capability of their own yet.
+/// Closing that needs per-resource object kinds (a socket kind + NIC steering
+/// grants, a file kind for fds) - honestly deferred, docs/NETWORKING.md and
+/// docs/ARCHITECTURE-DEBT.md 2.1/2.6 - and the deferral is stated rather than
+/// papered over by a check that looks like it covers more than it does.
+///
 /// The async I/O opcodes (`OP_OPEN`/`READ`/`WRITE`/`CLOSE`/`FSTAT`,
 /// docs/LIBRHEO.md Phase B) run their file work through the registered
 /// `svc::FileOps`. They take user VAs from the payload, valid here because the
@@ -351,7 +370,12 @@ pub fn kernel_process(qp: &QueuePair, caps: &mut CapTable, objects: &ObjectTable
         let (status, result) =
             match caps.grant_check_low32(objects, entry.cap_id, opcode_right(entry.opcode)) {
                 Err(e) => (cap_status(e), 0),
-                Ok(_object) => run_opcode(&entry),
+                // The resolved object must be the queue itself. Discarding it -
+                // which this used to do - let any live capability the cell held
+                // satisfy the check, so a MemoryGrant id worked as well as the
+                // queue's (docs/ARCHITECTURE-DEBT.md 2.6).
+                Ok(object) if objects.kind(object) != ObjectKind::QueuePair => (STATUS_DENIED, 0),
+                Ok(_) => run_opcode(&entry),
             };
         qp.cq.push(CqEntry {
             flow_id: entry.flow_id,

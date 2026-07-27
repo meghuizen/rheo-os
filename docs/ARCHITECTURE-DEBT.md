@@ -97,7 +97,7 @@ Also still open, and unchanged by this: an admitted reservation is not yet
 **enforced** at runtime - the scheduler is single-CPU cooperative, so admission is
 math that refuses cleanly, not a guarantee anything schedules (task #27).
 
-### 2.6 Ambient authority, and a grant check that gates the wrong thing (A + C)
+### 2.6 Ambient authority, and a grant check that gated less than it claimed (A + C - *partly closed*)
 
 `svc::handle` (`svc.rs:49-169`) is reached for any native syscall the main match
 does not claim and performs **no capability check on any of its 18 verbs** -
@@ -110,8 +110,35 @@ minted `READ|WRITE`. So the per-entry check gates the **ring, not the resource**
 any cell holding a queue pair can transmit arbitrary Ethernet frames, read any
 received frame, present to the display, and `OP_OPEN` any path.
 
-A socket `ObjectKind` and steering grants are honestly deferred **(C)**; what is
+A socket `ObjectKind` and steering grants are honestly deferred **(C)**; what was
 not honest is presenting the per-entry grant check as gating the operation.
+
+**Closed, the dishonest part.** Two things were wrong beyond the deferral, and
+both are fixed:
+
+1. *The check discarded the object it resolved.* `Ok(_object) => run_opcode(..)` -
+   so `entry.cap_id`, which the **cell** chooses, only had to name *some* live
+   capability with the right bit set. A `MemoryGrant` id worked exactly as well as
+   the queue's. It now must name a **`QueuePair`**; a wrong-kind capability
+   completes `STATUS_DENIED`. Proven in `queue_pipeline` from a real cap table,
+   with a control showing the queue's own capability still works - and observed
+   failing with the guard removed (`left: 0, right: 2`, i.e. the grant cap was
+   accepted).
+2. *The claim.* `kernel_process`'s doc now states exactly what the check
+   establishes (a live capability in **this** cell's table, the opcode's right,
+   a current epoch, and the QueuePair kind) and what it does **not** (which
+   resource the opcode reaches - a cell with a queue can still TX an arbitrary
+   frame, present, or `OP_OPEN` any path the registered `FileOps` will open),
+   naming what would close it.
+
+**Still open: the 18 unchecked `svc` verbs**, and it is coupled to §2.1 rather
+than independent - which is why it is not fixed here. Gating `SYS_UPTIME` /
+`SYS_RANDOM` / `SYS_LEASE` / `SYS_MEMINFO` on a capability requires Clock,
+Entropy, Lease and EventStream to *be* capability kinds a cell can hold, and
+`ObjectKind` has none of them. Adding the kinds is admissible (those objects are
+already in ARCHITECTURE.md 3; making them addressable *is* §2.1, not a new
+object), but retrofitting the gate would edit the setup of ~30 pre-existing
+proofs, so it must land **with** §2.1's mint/derive surface, not before it.
 
 ## 3. Structural defects found by the dependency graph
 
