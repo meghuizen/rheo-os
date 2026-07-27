@@ -789,13 +789,32 @@ pub fn trap_init() {
         for (i, entry) in idt.iter_mut().take(VECTOR_COUNT).enumerate() {
             *entry = idt_gate(VECTOR_STUBS[i]);
         }
-        let pointer = IdtPointer {
-            limit: (core::mem::size_of::<IdtEntry>() * IDT_ENTRIES - 1) as u16,
-            base: core::ptr::addr_of!(IDT) as u64,
-        };
-        asm!("lidt [{}]", in(reg) &pointer);
+        load_idt();
     }
     mask_legacy_pic();
+}
+
+/// Point this CPU's IDTR at the (shared) IDT.
+///
+/// # Safety
+/// The IDT must already be filled in - this only loads the register.
+unsafe fn load_idt() {
+    let pointer = IdtPointer {
+        limit: (core::mem::size_of::<IdtEntry>() * IDT_ENTRIES - 1) as u16,
+        base: core::ptr::addr_of!(IDT) as u64,
+    };
+    // SAFETY: a well-formed descriptor over a filled table.
+    unsafe { asm!("lidt [{}]", in(reg) &pointer) };
+}
+
+/// A secondary core adopts the primary's IDT. The *table* is shared - the vectors
+/// are the same code on every core - but IDTR is a per-core register, so a core
+/// that never runs `lidt` has no handlers at all and its first exception is a
+/// triple fault.
+#[cfg(feature = "smp")]
+fn secondary_trap_init() {
+    // SAFETY: the primary filled the IDT in `trap_init` before starting this core.
+    unsafe { load_idt() };
 }
 
 /// Mask every line on the legacy 8259 PIC. Under PVH there is no firmware to
@@ -1229,6 +1248,13 @@ pub fn smp_start_secondary(hw_id: u32) -> Result<(), &'static str> {
 #[cfg(feature = "smp")]
 #[unsafe(no_mangle)]
 extern "C" fn x86_secondary_main() -> ! {
+    // Everything a CPU needs before it can host ring 3 is **per-CPU register
+    // state**, and the AP trampoline set none of it: IDTR, GDTR, TR, the
+    // SYSCALL MSRs, CR0/CR4/XCR0 and GS_BASE all live in the core, not in
+    // memory (docs/SMP.md 10.0). The tables' *contents* are the primary's -
+    // only the descriptor a core loads and the block GS points at are its own.
+    secondary_trap_init();
+    user_init();
     crate::smp::secondary_run(lapic_id());
     loop {
         // SAFETY: kernel context on a parked secondary; interrupts are masked
@@ -1813,15 +1839,51 @@ extern "C" fn x86_user_trap(kind: u64, fault_addr: u64, frame: *mut TrapFrame) -
     crate::user::on_user_trap(k, super::FaultCause::Segv, fault_addr as usize, frame)
 }
 
-// Single CPU: the syscall stub reaches these as plain globals, no GS.
-#[unsafe(no_mangle)]
-static mut KERNEL_RSP: u64 = 0;
-#[unsafe(no_mangle)]
-static mut USER_RSP_SCRATCH: u64 = 0;
-#[unsafe(no_mangle)]
-static mut CUR_FRAME: u64 = 0;
-#[unsafe(no_mangle)]
-static mut KERNEL_CTX: u64 = 0;
+/// How many CPUs can hold ring-3 state at once.
+///
+/// The four words the trap stubs touch, the GDT, the TSS and the syscall kernel
+/// stack are all **per-CPU** - two cores running cells would otherwise scribble on
+/// each other's saved user stack pointer and current-frame pointer, which is not a
+/// fault but a wrong register file (docs/SMP.md 10.0). A power of two, so the slot
+/// is a mask on the CPU's own APIC id and an id outside the range aliases slot 0
+/// rather than running off the array. Matches `KERNEL_CTX_SLOTS` on the other two
+/// ISAs; lifting it is part of the start-all-cores loop, not of this phase.
+const CPU_SLOTS: usize = 8;
+
+/// This CPU's slot, read from its **own** local APIC - no table, no argument, and
+/// nothing to keep live across ring 3. The assembly stubs reach the same slot
+/// through `GS_BASE`, which is why the two must agree; `user_init` is the single
+/// place that programs it.
+fn cpu_slot() -> usize {
+    (lapic_id() as usize) & (CPU_SLOTS - 1)
+}
+
+/// The words the trap stubs reach `GS`-relative. Offsets are fixed by
+/// `kernel/arch/x86_64/user.S` (`CPU_*`), so the order here is load-bearing.
+///
+/// `GS_BASE` points at this CPU's block **in kernel and in user mode alike**, and
+/// there is deliberately no `swapgs`: nothing in this tree ever gives a cell a GS
+/// base (`arch_prctl(ARCH_SET_GS)` is refused `-EINVAL`, and both other ISAs carry
+/// TLS elsewhere), so the register is the kernel's to keep. A cell that did read
+/// `%gs:` would fault on a supervisor-only page - which is what it already did when
+/// the base was 0 and the address was unmapped. Adopting `swapgs` later is a change
+/// to two instructions at each ring boundary and to nothing else here.
+#[repr(C, align(64))]
+struct CpuArea {
+    user_rsp_scratch: u64, // +0
+    kernel_rsp: u64,       // +8
+    cur_frame: u64,        // +16
+    kernel_ctx: u64,       // +24
+}
+
+static mut CPU_AREAS: [CpuArea; CPU_SLOTS] = [const {
+    CpuArea {
+        user_rsp_scratch: 0,
+        kernel_rsp: 0,
+        cur_frame: 0,
+        kernel_ctx: 0,
+    }
+}; CPU_SLOTS];
 
 // ---------------------------------------------------------- GDT/TSS/MSRs
 
@@ -1836,18 +1898,22 @@ struct Tss {
     iomap_base: u16,
 }
 
-static mut TSS: Tss = Tss {
-    reserved0: 0,
-    rsp: [0; 3],
-    reserved1: 0,
-    ist: [0; 7],
-    reserved2: 0,
-    reserved3: 0,
-    iomap_base: 0,
-};
+static mut TSS: [Tss; CPU_SLOTS] = [const {
+    Tss {
+        reserved0: 0,
+        rsp: [0; 3],
+        reserved1: 0,
+        ist: [0; 7],
+        reserved2: 0,
+        reserved3: 0,
+        iomap_base: 0,
+    }
+}; CPU_SLOTS];
 
 // GDT: null, kernel code64, kernel data, user data, user code64, TSS (2).
-static mut GDT: [u64; 7] = [0; 7];
+// Per CPU, because the TSS descriptor in it names that CPU's own TSS - and because
+// `ltr` marks the descriptor busy, so two cores loading one descriptor is a fault.
+static mut GDT: [[u64; 7]; CPU_SLOTS] = [[0; 7]; CPU_SLOTS];
 
 #[repr(C, packed)]
 struct DescPtr {
@@ -1864,26 +1930,33 @@ struct DescPtr {
 // it to an odd offset re-triggered the corruption. Force the alignment.
 #[repr(align(16))]
 struct SyscallKStack([u8; 64 * 1024]);
-static mut SYSCALL_KSTACK: SyscallKStack = SyscallKStack([0; 64 * 1024]);
+static mut SYSCALL_KSTACK: [SyscallKStack; CPU_SLOTS] =
+    [const { SyscallKStack([0; 64 * 1024]) }; CPU_SLOTS];
 
 /// Set up ring 3: a full GDT with user segments and a TSS, then the
 /// SYSCALL/SYSRET MSRs. Called from paging_kernel_init.
 pub(super) fn user_init() {
+    let slot = cpu_slot();
     unsafe {
-        let kstack_top = core::ptr::addr_of!(SYSCALL_KSTACK.0) as u64 + (64 * 1024);
-        *core::ptr::addr_of_mut!(KERNEL_RSP) = kstack_top;
+        // GS_BASE first: every stub below reaches this CPU's block through it, and
+        // nothing between here and the first ring-3 entry may run without it.
+        let area = core::ptr::addr_of_mut!(CPU_AREAS[slot]);
+        paging_wrmsr(0xC000_0101, area as u64);
 
-        let tss = &mut *core::ptr::addr_of_mut!(TSS);
+        let kstack_top = core::ptr::addr_of!(SYSCALL_KSTACK[slot].0) as u64 + (64 * 1024);
+        (*area).kernel_rsp = kstack_top;
+
+        let tss = &mut *core::ptr::addr_of_mut!(TSS[slot]);
         tss.rsp[0] = kstack_top; // ring 3 -> ring 0 fault stack
         tss.iomap_base = core::mem::size_of::<Tss>() as u16;
 
-        let gdt = &mut *core::ptr::addr_of_mut!(GDT);
+        let gdt = &mut *core::ptr::addr_of_mut!(GDT[slot]);
         gdt[0] = 0;
         gdt[1] = 0x00AF_9A00_0000_FFFF; // 0x08 kernel code64
         gdt[2] = 0x00CF_9200_0000_FFFF; // 0x10 kernel data
         gdt[3] = 0x00CF_F200_0000_FFFF; // 0x18 user data (DPL3)
         gdt[4] = 0x00AF_FA00_0000_FFFF; // 0x20 user code64 (DPL3)
-        let tss_base = core::ptr::addr_of!(TSS) as u64;
+        let tss_base = core::ptr::addr_of!(TSS[slot]) as u64;
         let tss_limit = (core::mem::size_of::<Tss>() - 1) as u64;
         gdt[5] = tss_limit
             | ((tss_base & 0xFF_FFFF) << 16)
@@ -1894,7 +1967,7 @@ pub(super) fn user_init() {
 
         let gdt_ptr = DescPtr {
             limit: (core::mem::size_of::<[u64; 7]>() - 1) as u16,
-            base: core::ptr::addr_of!(GDT) as u64,
+            base: core::ptr::addr_of!(GDT[slot]) as u64,
         };
         // Load the GDT, reload CS via a far return, set the data segments,
         // and load the task register.

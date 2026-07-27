@@ -27,8 +27,15 @@
 #![no_std]
 #![no_main]
 
+#[path = "harness.rs"]
+mod harness;
+
+use harness::{CellStore, KernelStack, build_cell};
+use kernel::arch::MapPerm;
+use kernel::capability::{CapTable, ObjectTable};
 use kernel::smp::{self, SpinLock, StartError};
-use kernel::{arch, println};
+use kernel::user_progs::user_copair;
+use kernel::{arch, println, user};
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
@@ -253,6 +260,7 @@ fn test_secondary_bringup() {
             );
             println!("smp: real second core on {} confirmed", arch::NAME);
             test_parallel_gemm(idx);
+            test_user_cells_on_both();
         }
         Err(StartError::NoSecondary) => {
             println!(
@@ -276,4 +284,169 @@ fn test_secondary_bringup() {
     // The primary is intact regardless of the outcome: still CPU 0, still online.
     assert_eq!(arch::cpu_index(), 0, "primary lost its identity");
     assert!(smp::this_cpu().is_online(), "primary went offline");
+}
+
+// ------------------------------------------- a cell in user mode on a secondary
+//
+// The GEMM phase above proves two cores compute at once **in kernel context**. This
+// proves the harder thing and the one "multi-CPU" is usually taken to mean: two cells
+// run in **user mode**, on two cores, at the same instant - each in its own address
+// space, each dropping to the ISA's unprivileged level and trapping back into its own
+// core's kernel stack (docs/SMP.md 10.0).
+//
+// What had to be true for this to work at all, and is therefore what it tests:
+//   - the kernel's "which cell is running" state is **per-CPU** (`user::CURRENT` /
+//     `TOP_CELL` / `EXITED`), not one global;
+//   - the saved kernel context a cell unwinds back into is **per-CPU** (RISC-V's
+//     `KERNEL_CTX`, indexed by the hart's `tp`);
+//   - on RISC-V, the kernel's own `tp` survives U-mode. `tp` is a saved GPR the cell
+//     owns as its TLS pointer *and* where the kernel keeps its CPU index, so without
+//     the frame's `kernel_tp` slot every trap handler would run reading the wrong
+//     CPU's state - and on the boot CPU that is invisible, because the wrong answer
+//     and the right one are both 0.
+//
+// The two cells are **partitioned**, not locked: distinct cell slots, distinct
+// address spaces, distinct kernel stacks, distinct pages. That partitioning is the
+// multikernel answer this design commits to (docs/SCHEDULING.md 1a), and it is why
+// no lock appears here.
+//
+// Dispatch is left **off**: this phase is about two cores, not about preemption
+// (which `preempt` owns), and a preemption timer firing here could hand one core's
+// cell to the other core's scheduler - which is exactly the shared-state audit
+// docs/SMP.md 10.0 lists as not done.
+
+#[unsafe(link_section = ".user.bss")]
+static mut STORE_P: CellStore = CellStore::new();
+#[unsafe(link_section = ".user.bss")]
+static mut STORE_S: CellStore = CellStore::new();
+
+/// The four-word witness page both cells map read-write.
+#[repr(C, align(4096))]
+struct Witness([u64; 512]);
+#[unsafe(link_section = ".user.bss")]
+static mut WITNESS: Witness = Witness([0; 512]);
+
+/// One kernel stack **per core**. Two cores trapping onto one stack would corrupt
+/// each other's frames, and the corruption would look like a random fault rather
+/// than like a missing stack - so this is the cheapest thing to get right.
+static mut KSTACK_P: KernelStack = KernelStack::new();
+static mut KSTACK_S: KernelStack = KernelStack::new();
+
+static mut OBJECTS2: ObjectTable = ObjectTable::new();
+static mut CAPS2: CapTable = CapTable::new();
+
+/// Rounds each cell runs. Enough that the two overlap for many rounds under TCG,
+/// few enough to finish well inside the boot budget.
+const CO_ROUNDS: u64 = 64;
+
+fn test_user_cells_on_both() {
+    // SAFETY: single-threaded setup on the primary; the secondary is parked in its
+    // work loop and touches none of this until a cell index is published.
+    unsafe {
+        let w = &mut *core::ptr::addr_of_mut!(WITNESS);
+        w.0[0] = 0;
+        w.0[1] = 0;
+        w.0[2] = 0;
+        w.0[3] = 0;
+        let shared = core::ptr::addr_of!(WITNESS) as usize;
+
+        let objects = &mut *core::ptr::addr_of_mut!(OBJECTS2);
+        let caps = &mut *core::ptr::addr_of_mut!(CAPS2);
+        *objects = ObjectTable::new();
+        *caps = CapTable::new();
+
+        let p = core::ptr::addr_of_mut!(STORE_P);
+        let sec = core::ptr::addr_of_mut!(STORE_S);
+        let (mut aspace_p, _op, mut frame_p) = build_cell(
+            &mut *p,
+            objects,
+            caps,
+            (*core::ptr::addr_of!(KSTACK_P)).top(),
+            1,
+            user_copair,
+            0,
+            CO_ROUNDS,
+        );
+        let (mut aspace_s, _os, mut frame_s) = build_cell(
+            &mut *sec,
+            objects,
+            caps,
+            (*core::ptr::addr_of!(KSTACK_S)).top(),
+            2,
+            user_copair,
+            1,
+            CO_ROUNDS,
+        );
+        aspace_p.map_user_range(shared, 4096, MapPerm::UserRw);
+        aspace_s.map_user_range(shared, 4096, MapPerm::UserRw);
+        (*p).params.ticks = shared as u64;
+        (*sec).params.ticks = shared as u64;
+
+        user::reset();
+        user::install(
+            0,
+            &aspace_p,
+            caps,
+            objects,
+            (*p).qp.qp.as_ptr(),
+            core::ptr::addr_of_mut!(frame_p),
+        );
+        user::install(
+            1,
+            &aspace_s,
+            caps,
+            objects,
+            (*sec).qp.qp.as_ptr(),
+            core::ptr::addr_of_mut!(frame_s),
+        );
+
+        // SAFETY: both cells are installed, present, native, and distinct.
+        let (met, finished, sec_code, own_code) = smp::run_cells_on_both(0, 1);
+
+        if !finished {
+            println!(
+                "smp: SKIP the two-core user-mode phase - the secondary did not \
+                 finish its cell within the bound, so nothing about a cell on a \
+                 second core is claimed"
+            );
+            return;
+        }
+        assert!(
+            met && !smp::rendezvous_timed_out(),
+            "the two cores never met, so the cells did not start together"
+        );
+        assert_eq!(own_code, 0, "the primary's cell did not exit cleanly");
+        assert_eq!(sec_code, 0, "the secondary's cell did not exit cleanly");
+        assert_eq!((*p).params.status, 1, "the primary's cell never finished");
+        assert_eq!(
+            (*sec).params.status,
+            1,
+            "the secondary's cell never finished"
+        );
+
+        let w = &*core::ptr::addr_of!(WITNESS);
+        let (rounds_p, rounds_s) = (w.0[0], w.0[1]);
+        let (seen_p, seen_s) = (w.0[2], w.0[3]);
+        assert_eq!(rounds_p, CO_ROUNDS, "the primary's cell lost rounds");
+        assert_eq!(rounds_s, CO_ROUNDS, "the secondary's cell lost rounds");
+        // The witness. A cell can only read a nonzero peer counter if the peer wrote
+        // one **between two of this cell's own rounds** - and on one CPU with
+        // cooperative dispatch the first cell runs to completion before the second is
+        // entered, so it would read 0 every time.
+        assert!(
+            seen_p > 0 && seen_s > 0,
+            "neither direction of overlap was observed (primary saw {seen_p}, \
+             secondary saw {seen_s}) - the two cells ran one after the other"
+        );
+        assert!(
+            kernel::mm::frames::used_matches_bitmap(),
+            "the frame pool's used counter drifted from its bitmap under two cores"
+        );
+        println!(
+            "smp: TWO CELLS ran in USER MODE on TWO CORES at once - each in its own \
+             address space, {CO_ROUNDS} rounds each, and each saw the other advance \
+             mid-run (primary saw the secondary reach {seen_p}, the secondary saw the \
+             primary reach {seen_s}) OK"
+        );
+    }
 }

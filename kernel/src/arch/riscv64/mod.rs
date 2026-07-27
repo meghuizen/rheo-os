@@ -764,14 +764,30 @@ pub fn pci_mmio_window() -> (u64, u64) {
 
 /// Saved U-mode register state. Layout matches the offsets in traps.S:
 /// `regs[i]` is xi (regs[0]/x0 unused, regs[2] is the user sp), then sepc,
-/// then the kernel sp to load on trap entry.
+/// then the kernel sp to load on trap entry, then the kernel's own `tp`.
+///
+/// `kernel_tp` exists because `tp` is a *saved GPR* on this ISA - a cell owns it
+/// as its TLS pointer - **and** it is where the kernel keeps its CPU index
+/// (`cpu_index`). Without saving it, the kernel would run every trap handler with
+/// whatever `tp` the cell happened to hold, so on a secondary core it would read
+/// the wrong CPU's per-CPU state (docs/SMP.md 10.0). It is written on the way out
+/// to user mode (in kernel context, on the owning CPU) and reloaded on the way in.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct TrapFrame {
     regs: [u64; 32],
     sepc: u64,
     kernel_sp: u64,
+    kernel_tp: u64,
 }
+
+// traps.S reaches these fields by hand-written byte offsets, so a field added or
+// reordered above must break the build rather than corrupt a frame at runtime.
+const _: () = {
+    assert!(core::mem::offset_of!(TrapFrame, sepc) == 256); // TF_SEPC
+    assert!(core::mem::offset_of!(TrapFrame, kernel_sp) == 264); // TF_KSP
+    assert!(core::mem::offset_of!(TrapFrame, kernel_tp) == 272); // TF_KTP
+};
 
 const REG_SP: usize = 2;
 const REG_TP: usize = 4; // thread pointer (TLS); a saved GPR, so per-context
@@ -789,6 +805,7 @@ pub fn trapframe_new(entry: usize, user_sp: usize, arg: usize, kernel_sp: usize)
         regs,
         sepc: entry as u64,
         kernel_sp: kernel_sp as u64,
+        kernel_tp: 0,
     }
 }
 
@@ -817,6 +834,7 @@ pub const fn trapframe_zeroed() -> TrapFrame {
         regs: [0; 32],
         sepc: 0,
         kernel_sp: 0,
+        kernel_tp: 0,
     }
 }
 

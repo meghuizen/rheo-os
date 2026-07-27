@@ -5,6 +5,10 @@
  * the rest get a dummy 0 so the frame layout is uniform.
  */
 
+/* CpuArea::cur_frame, reached through GS_BASE - see the block comment in
+   user.S. Re-declared here because this is a separate `global_asm!` unit. */
+.equ CPU_CUR_FRAME, 16
+
 .section .text
 
 .macro VECTOR num, has_err
@@ -98,7 +102,7 @@ common_trap:
    rax0 rbx8 rcx16 rdx24 rsi32 rdi40 rbp48 r8_56 r9_64 r10_72 r11_80
    r12_88 r13_96 r14_104 r15_112 rip120 rflags128 rsp136. */
 .Lfault_from_user:
-    mov CUR_FRAME(%rip), %rax     /* rax = &frame */
+    mov %gs:CPU_CUR_FRAME, %rax   /* rax = &frame */
     mov 64(%rsp), %rcx            /* saved rax */
     mov %rcx, 0(%rax)
     mov %rbx, 8(%rax)             /* rbx (never clobbered above) */

@@ -410,20 +410,37 @@ pub fn secondary_run(hw_id: u32) {
 }
 
 #[cfg(feature = "smp")]
-/// The secondary's work loop: meet the primary at the rendezvous, compute its share
-/// of the published GEMM, signal done, park.
+/// The secondary's work loop: meet the primary at the rendezvous, do the published
+/// work (a GEMM share, or a cell to run in user mode), signal done, look for more.
 ///
-/// Bounded rather than infinite. A secondary that spun forever waiting for work would
-/// be correct in a running system and wrong in a boot test, where the primary finishes
-/// and exits QEMU - and worse, it would hold a core against the host for the rest of
-/// the run, which under TCG slows the primary down. One job then park is what this
-/// stage needs; a real dispatch loop belongs with per-CPU scheduling, not here.
+/// **Bounded idling, not bounded work.** The loop serves any number of jobs, but it
+/// gives up after `RV_TIMEOUT_NS` of finding *none*: a secondary that spun forever
+/// would be correct in a running system and wrong in a boot test, where the primary
+/// finishes and exits QEMU - and worse, it would hold a core against the host for the
+/// rest of the run, which under TCG slows the primary down. A real dispatch loop
+/// belongs with per-CPU scheduling, not here.
 fn secondary_work_loop() {
-    let deadline = arch::timer_now_ns().wrapping_add(RV_TIMEOUT_NS);
+    let mut deadline = arch::timer_now_ns().wrapping_add(RV_TIMEOUT_NS);
     loop {
-        // Copied out under the lock; the compute below must not hold it, because the
-        // primary is computing its own rows concurrently and would block on it.
-        let job = *JOB.lock();
+        // A cell to run in **user mode** takes priority: it is the capability this
+        // core exists to demonstrate, and unlike a compute job it changes privilege
+        // level and address space (docs/SMP.md 10.0).
+        let cell = USER_CELL.load(Ordering::Acquire);
+        if cell != usize::MAX {
+            USER_CELL.store(usize::MAX, Ordering::Release);
+            if rendezvous(&RV_SECONDARY, &RV_PRIMARY) {
+                let code = code_of(crate::user::run(cell).1);
+                USER_CELL_CODE.store(code as usize, Ordering::Release);
+            }
+            USER_CELL_DONE.fetch_add(1, Ordering::Release);
+            deadline = arch::timer_now_ns().wrapping_add(RV_TIMEOUT_NS);
+            continue;
+        }
+        // **Taken** out under the lock, not copied: the loop serves more than one job
+        // now, so a job left in place would be drained again the moment this core came
+        // back round. The compute below must not hold the lock, because the primary is
+        // computing its own rows concurrently and would block on it.
+        let job = JOB.lock().take();
         if let Some(job) = job {
             if rendezvous(&RV_SECONDARY, &RV_PRIMARY) {
                 // SAFETY: the primary's `run_gemm_with_secondary` contract - the
@@ -432,7 +449,8 @@ fn secondary_work_loop() {
                 unsafe { drain_blocks(&job) };
             }
             JOBS_DONE.fetch_add(1, Ordering::Release);
-            return;
+            deadline = arch::timer_now_ns().wrapping_add(RV_TIMEOUT_NS);
+            continue;
         }
         if arch::timer_now_ns() >= deadline {
             return; // no work was published; park rather than spin the core forever
@@ -661,6 +679,66 @@ unsafe fn gemm_rows(job: &GemmJob, lo: usize, hi: usize) {
             job.n,
             job.k,
         );
+    }
+}
+
+#[cfg(feature = "smp")]
+/// A cell index published for the secondary to **run in user mode**, or `usize::MAX`
+/// for none (docs/SMP.md 10.0).
+static USER_CELL: AtomicUsize = AtomicUsize::new(usize::MAX);
+#[cfg(feature = "smp")]
+/// The outcome code the secondary's cell exited with, and a done flag.
+static USER_CELL_CODE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp")]
+static USER_CELL_DONE: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "smp")]
+/// Publish cell `idx` for a secondary to run **in user mode**, meet it at the
+/// rendezvous, and run `own` on this core at the same time.
+///
+/// This is the first time a cell executes on a core other than the boot CPU
+/// (docs/SMP.md 10.0). The two cells are **partitioned**: each core owns a distinct
+/// cell slot and a distinct address space, so the only state they share is the cell
+/// table itself - which `run` reads and `finish` writes at *disjoint indices*. That
+/// partitioning, not a lock, is what makes it safe, and it is the multikernel answer
+/// this design commits to rather than a shortcut (docs/SCHEDULING.md 1a).
+///
+/// Returns `(rendezvous_held, secondary_finished, secondary_exit_code, own_outcome)`.
+///
+/// # Safety
+/// Both cells must be installed, present, and **native**; neither may be the other.
+pub unsafe fn run_cells_on_both(own: usize, other: usize) -> (bool, bool, usize, u64) {
+    USER_CELL_DONE.store(0, Ordering::Release);
+    USER_CELL_CODE.store(0, Ordering::Release);
+    RV_PRIMARY.store(0, Ordering::Release);
+    RV_SECONDARY.store(0, Ordering::Release);
+    RV_TIMEOUT.store(0, Ordering::Release);
+    USER_CELL.store(other, Ordering::Release);
+
+    let met = rendezvous(&RV_PRIMARY, &RV_SECONDARY);
+    // SAFETY: the caller's contract; this core touches only its own cell slot.
+    let outcome = crate::user::run(own).1;
+
+    let deadline = arch::timer_now_ns().wrapping_add(RV_TIMEOUT_NS);
+    while USER_CELL_DONE.load(Ordering::Acquire) == 0 {
+        if arch::timer_now_ns() >= deadline {
+            return (met, false, 0, code_of(outcome));
+        }
+        core::hint::spin_loop();
+    }
+    (
+        met,
+        true,
+        USER_CELL_CODE.load(Ordering::Acquire),
+        code_of(outcome),
+    )
+}
+
+#[cfg(feature = "smp")]
+fn code_of(o: crate::user::Outcome) -> u64 {
+    match o {
+        crate::user::Outcome::Exited(c) => c,
+        _ => u64::MAX,
     }
 }
 

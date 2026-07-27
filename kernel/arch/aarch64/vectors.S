@@ -21,6 +21,26 @@
 
 .section .text
 
+// How many per-core saved kernel contexts KERNEL_CTX holds. A power of two, so the
+// index is a mask: an MPIDR affinity outside the range aliases slot 0 rather than
+// scribbling past the array.
+.equ KERNEL_CTX_SLOTS, 8
+
+// KCTX_PTR dst, tmp: point \dst at this core's KERNEL_CTX slot.
+//
+// A cell running at EL0 must unwind back into **its own core's** kernel stack, so
+// the saved kernel context cannot be one global (docs/SMP.md 10.0). The index comes
+// straight from the hardware - MPIDR_EL1 affinity 0, the same value `cpu_index()`
+// reads - so no register has to be kept live across EL0 to carry it. With one core
+// this is affinity 0 and the previous single-slot behaviour exactly.
+.macro KCTX_PTR dst, tmp
+    adrp \dst, KERNEL_CTX
+    add  \dst, \dst, :lo12:KERNEL_CTX
+    mrs  \tmp, mpidr_el1
+    and  \tmp, \tmp, #(KERNEL_CTX_SLOTS - 1)
+    add  \dst, \dst, \tmp, lsl #3
+.endm
+
 .macro FATAL_SLOT idx
 .p2align 7
     mov x0, #\idx
@@ -252,8 +272,7 @@ enter_user_first:
     stp x25, x26, [sp, #48]
     stp x27, x28, [sp, #64]
     stp x29, x30, [sp, #80]
-    adrp x1, KERNEL_CTX
-    add x1, x1, :lo12:KERNEL_CTX
+    KCTX_PTR x1, x3
     mov x2, sp
     str x2, [x1]
     b el0_resume
@@ -261,8 +280,7 @@ enter_user_first:
 // return_to_kernel_asm(): restore enter_user_first's state and return.
 .global return_to_kernel_asm
 return_to_kernel_asm:
-    adrp x1, KERNEL_CTX
-    add x1, x1, :lo12:KERNEL_CTX
+    KCTX_PTR x1, x3
     ldr x2, [x1]
     mov sp, x2
     ldp x19, x20, [sp, #0]
@@ -276,5 +294,6 @@ return_to_kernel_asm:
 
 .section .bss
 .p2align 3
+// One saved kernel context **per core** (see KCTX_PTR above).
 KERNEL_CTX:
-    .space 8
+    .space 8 * KERNEL_CTX_SLOTS

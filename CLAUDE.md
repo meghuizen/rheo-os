@@ -1677,24 +1677,46 @@ after passing, so both passing means both executed inside one interval - which a
 core cannot produce, since there is no kernel-context preemption to interleave them and
 neither side yields. A wall-clock speedup would prove nothing under TCG (it time-slices
 the two vCPUs onto host threads), so simultaneity is the available evidence and it is
-what is asserted. **Honest scope:** the work items are kernel jobs, not cells. A
-secondary drains the queue and parks; **no cell runs in user mode on a secondary**, and
-what would have to be audited first is named in docs/SMP.md 10 - the cell table, the
-capability/object tables, the Linux per-cell state, and the per-CPU-ing of the trap
-entry itself (on x86-64 `CUR_FRAME`/`KERNEL_RSP`/`USER_RSP_SCRATCH` are globals the
-syscall fast path reads, so that is a change *to* the fast path rather than an addition
-beside it - the standard `swapgs`/`IA32_KERNEL_GS_BASE` arrangement, since indexing by
-`cpu_index()` would read the LAPIC ID over MMIO in front of every syscall). **RISC-V and
-ARM64 are nearly free**: RISC-V's `traps.S` already keeps the frame pointer in
-`sscratch` and ARM64's in `TPIDR_EL1`, both per-core registers, so those trap paths are
-per-core in hardware with no software change - only `KERNEL_CTX` and the portable
-`CURRENT`/`TOP_CELL`/`EXITED` need per-CPU-ing. docs/SMP.md 10.0 specifies the slice.
+what is asserted.
+
+**And cells now run in user mode on a secondary core** (docs/SMP.md 10.0, the `smp`
+kernel's fourth phase, **all three ISAs**): two cells execute at the unprivileged level
+on two cores **at the same instant**, each in its own address space, each trapping back
+into its own core's kernel stack. The witness is a shared page in which each cell writes
+only its own round counter and the highest peer counter it ever saw - no lock, nothing
+to lose - and a nonzero "highest peer seen" means the cell read the peer's progress
+*between two of its own rounds*, which one CPU under cooperative dispatch cannot produce
+(the first cell runs to completion before the second is entered, so it could only read
+0). What had to become per-CPU: the saved kernel context `return_to_kernel` unwinds to
+(`KERNEL_CTX`, now one slot per core - indexed by `tp` on RISC-V, MPIDR affinity on
+ARM64, reached through `GS_BASE` on x86-64); the portable `CURRENT`/`TOP_CELL`/`EXITED`
+(now `PerCpu<usize>`, a compile-time slot 0 on the non-`smp` build); **RISC-V's kernel
+`tp`**, which is a saved GPR the cell owns as TLS *and* where the kernel keeps its CPU
+index, so the frame gained a `kernel_tp` slot written on the way out and reloaded on the
+way in - invisible on the boot CPU, where the wrong answer and the right one are both 0,
+which is why it had to be found by reading the trap path; and on x86-64 the four
+trap-stub words plus the GDT, TSS and syscall kernel stack, the words reached
+`GS`-relative with **no `swapgs`** (nothing in this tree ever gives a cell a GS base -
+`arch_prctl(ARCH_SET_GS)` is refused - so `GS_BASE` stays the kernel's in both rings; a
+cell reading `%gs:` faults on a supervisor page exactly as it did when the base was 0),
+plus the per-core registers no memory change substitutes for - IDTR, GDTR, TR, the
+SYSCALL MSRs, CR0/CR4/XCR0 - which the AP trampoline set none of, so a secondary had no
+handlers at all and its first exception was a triple fault. Both RISC-V halves were
+observed **failing** when reverted. Safe by **partitioning, not locking**: distinct cell
+slots, address spaces, kernel stacks and pages, and the cell table read/written at
+disjoint indices - the multikernel answer (docs/SCHEDULING.md 1a), not a shortcut.
+**Honest scope:** two *partitioned* cells, not a scheduler - the primary picks which
+cell the secondary runs and waits; nothing places a runnable cell on whichever core is
+free, nothing migrates, only one secondary is started, and a **Linux** cell on a
+secondary is not attempted (the cell/capability/object tables and the Linux per-cell
+state are still written for one CPU - the audit in docs/SMP.md 10.2 is the gate).
 
 **Still honest about what is not wired:** the fixed VA map is still the map (S2'
 untouched), dispatch is proven for native cells and **off by default** except the
 `linuxnode` boot -
 enabling it for the *Linux* boots is what the `linuxbun` gate needs - `metrics`
-records nothing until a boot enables it, and no second core schedules anything. The
+records nothing until a boot enables it, and no second core *schedules* anything (it
+runs a cell the primary hands it). The
 exit gate is unchanged: `linuxbun` flipping from its accepted partial to `rheo:42`.
 
 **FlashAttention 2 and 3 run** (docs/TILES.md 13): the real exp softmax, filling
@@ -1777,9 +1799,10 @@ MPIDR - and the `smp` test asserts the shared magic through the cross-core spinl
 that the registry slot and the hardware id are **not** the primary's. Everything is
 behind the `kernel/smp` cargo feature; the non-smp library is **byte-identical**
 (verified). Honest: this is bring-up, **not** preemptive multi-core scheduling - each
-secondary does observable proof-of-life work and parks, nothing in the kernel is yet
+secondary runs work the primary hands it and then parks, most of the kernel is not yet
 safe to run on two cores concurrently, the runtime stays single-CPU cooperative, and
-only **one** secondary is started (one dedicated stack per ISA). Still deferred: shared
+only **one** secondary is started (one dedicated stack per ISA). Since then a secondary
+also runs a **cell in user mode** - see above and docs/SMP.md 10.0. Still deferred: shared
 `static mut` state made SMP-safe end to end, per-CPU stacks + a start-all loop, a
 per-CPU register instead of the small id->index table, ARM64 CPU *enumeration* (probing
 `PSCI_AFFINITY_INFO`), cross-CPU IPIs beyond bring-up, and the **x86-64 NIC RX
@@ -1921,7 +1944,10 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               skip-with-reason - docs/MEMORY.md 2.1), smp (per-CPU state + kernel spinlock +
               a real secondary core on all three ISAs: SBI HSM on riscv64,
               INIT-SIPI-SIPI + a real-mode AP trampoline on x86-64, PSCI CPU_ON
-              over the probed HVC conduit on aarch64 - docs/SMP.md), shell-smoke, hwinfo, rng, runtime,
+              over the probed HVC conduit on aarch64; then both cores draining
+              one int8-GEMM work queue; then **two cells in user mode on two
+              cores at once**, each in its own address space, witnessed by each
+              reading the other's progress mid-run - docs/SMP.md 10.0), shell-smoke, hwinfo, rng, runtime,
               posix, blockfs (live virtio-blk disk), elfrun (load a native
               ELF), posixrun (native program over the POSIX syscalls),
               libcrun (a program linked against rheo-libc), jsonrun (a

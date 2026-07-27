@@ -1,8 +1,8 @@
 /*
  * x86-64 U-mode entry via SYSCALL/SYSRET (att syntax).
  *
- * Single CPU, so the "current frame", kernel stack, and a user-rsp scratch
- * are plain globals (no GS/swapgs needed). SYSCALL leaves the user stack
+ * The "current frame", kernel stack, and user-rsp scratch are **per-CPU**, reached
+ * through GS_BASE (see the .equ block below). SYSCALL leaves the user stack
  * live and puts the return RIP in RCX and RFLAGS in R11; the stub saves
  * the full register set into the current cell's TrapFrame, switches to the
  * kernel stack, and calls x86_user_trap, which returns the frame to resume
@@ -13,14 +13,27 @@
  * rflags128 rsp136 kernel_sp144.
  */
 
+/*
+ * The four per-CPU words, reached through GS_BASE (see `CpuArea` in
+ * x86_64/mod.rs, which programs the MSR and owns these offsets). Two cores may
+ * each be running a cell, so a plain `(%rip)` global here would be one core's
+ * saved user stack pointer overwritten by the other's - not a fault, a wrong
+ * register file (docs/SMP.md 10.0). There is no `swapgs`: nothing gives a cell a
+ * GS base, so the register stays the kernel's in both rings.
+ */
+.equ CPU_USER_RSP,  0
+.equ CPU_KERNEL_RSP, 8
+.equ CPU_CUR_FRAME, 16
+.equ CPU_KERNEL_CTX, 24
+
 .section .text
 
 .global syscall_entry
 syscall_entry:
-    mov %rsp, USER_RSP_SCRATCH(%rip)
-    mov KERNEL_RSP(%rip), %rsp
+    mov %rsp, %gs:CPU_USER_RSP
+    mov %gs:CPU_KERNEL_RSP, %rsp
     push %rax                          /* stash syscall number */
-    mov CUR_FRAME(%rip), %rax          /* rax = &frame */
+    mov %gs:CPU_CUR_FRAME, %rax       /* rax = &frame */
     mov %rbx, 8(%rax)
     mov %rdx, 24(%rax)
     mov %rsi, 32(%rax)
@@ -45,7 +58,7 @@ syscall_entry:
        IRET-resumed syscall frame restored whatever stale bytes the slot held. */
     mov %rcx, 16(%rax)                 /* rcx slot = return rip */
     mov %r11, 80(%rax)                 /* r11 slot = rflags */
-    mov USER_RSP_SCRATCH(%rip), %rcx
+    mov %gs:CPU_USER_RSP, %rcx
     mov %rcx, 136(%rax)                /* user rsp */
     pop %rcx                           /* rcx = stashed syscall number */
     mov %rcx, 0(%rax)                  /* rax slot */
@@ -94,7 +107,7 @@ syscall_entry:
 
 .global sysret_resume
 sysret_resume:                         /* rax = &frame */
-    mov %rax, CUR_FRAME(%rip)          /* next syscall saves here */
+    mov %rax, %gs:CPU_CUR_FRAME       /* next syscall saves here */
     mov 120(%rax), %rcx                /* rip -> rcx (sysret target) */
     mov 128(%rax), %r11                /* rflags */
     mov 8(%rax), %rbx
@@ -138,7 +151,7 @@ sysret_resume:                         /* rax = &frame */
  * masked, or the timer and console lines stop reaching the kernel. */
 .global iret_resume
 iret_resume:                           /* rax = &frame */
-    mov %rax, CUR_FRAME(%rip)          /* next syscall saves here */
+    mov %rax, %gs:CPU_CUR_FRAME       /* next syscall saves here */
     mov 128(%rax), %r10                /* rflags */
     or $0x200, %r10                    /* force IF */
     mov 136(%rax), %r9                 /* user rsp */
@@ -176,14 +189,14 @@ enter_user_first:
     push %r13
     push %r14
     push %r15
-    mov %rsp, KERNEL_CTX(%rip)
+    mov %rsp, %gs:CPU_KERNEL_CTX
     mov %rdi, %rax
     jmp sysret_resume
 
 /* return_to_kernel_asm(): restore enter_user_first's state and return. */
 .global return_to_kernel_asm
 return_to_kernel_asm:
-    mov KERNEL_CTX(%rip), %rsp
+    mov %gs:CPU_KERNEL_CTX, %rsp
     pop %r15
     pop %r14
     pop %r13

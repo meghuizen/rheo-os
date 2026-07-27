@@ -13,6 +13,13 @@
 
 .equ TF_SEPC, 256
 .equ TF_KSP,  264
+# The kernel's own tp (its CPU index). tp is a saved GPR the cell owns as TLS, so
+# the kernel must park its own value somewhere across U-mode and take it back on
+# the way in - otherwise every trap handler runs with the cell's tp and reads the
+# wrong CPU's per-CPU state (docs/SMP.md 10.0).
+.equ TF_KTP,  272
+
+.equ KERNEL_CTX_SLOTS, 8
 
 .section .text
 .p2align 2
@@ -65,6 +72,7 @@ trap_vector:
     csrr a0, scause
     csrr a1, stval
     mv a2, sp
+    ld tp, TF_KTP(sp)    # kernel CPU index (the cell's tp stays saved in the frame)
     ld sp, TF_KSP(sp)    # kernel stack
     call riscv_user_trap    # -> TrapFrame* to resume, in a0
 # fall through
@@ -72,6 +80,7 @@ trap_vector:
 .global user_resume
 user_resume:    # a0 = &TrapFrame
     mv t6, a0
+    sd tp, TF_KTP(t6)    # this CPU reclaims its identity on the next trap
     ld t0, TF_SEPC(t6)
     csrw sepc, t0
     csrw sscratch, t6    # next user trap saves into this frame
@@ -174,7 +183,15 @@ enter_user_first:
     sd s9, 80(sp)
     sd s10, 88(sp)
     sd s11, 96(sp)
+    # Per-hart slot: tp holds this CPU's registry index (smp_set_this_cpu), masked
+    # so an uninitialised tp can only alias slot 0 rather than scribble past the
+    # array. Making this per-hart is what lets a *secondary* core run a cell in user
+    # mode and unwind back into its own kernel stack (docs/SMP.md 10.0); with one
+    # CPU, tp is 0 and this is the previous single-slot behaviour exactly.
     la t0, KERNEL_CTX
+    andi t1, tp, (KERNEL_CTX_SLOTS - 1)
+    slli t1, t1, 3
+    add t0, t0, t1
     sd sp, 0(t0)
     li t1, (1 << 8)    # sstatus.SPP: 0 = return to U-mode
     csrc sstatus, t1
@@ -185,6 +202,9 @@ enter_user_first:
 .global return_to_kernel_asm
 return_to_kernel_asm:
     la t0, KERNEL_CTX
+    andi t1, tp, (KERNEL_CTX_SLOTS - 1)
+    slli t1, t1, 3
+    add t0, t0, t1
     ld sp, 0(t0)
     ld ra, 0(sp)
     ld s0, 8(sp)
@@ -204,5 +224,6 @@ return_to_kernel_asm:
 
 .section .bss
 .p2align 3
+# One saved kernel context per hart, indexed by tp (see KERNEL_CTX_SLOTS above).
 KERNEL_CTX:
-    .space 8
+    .space 8 * KERNEL_CTX_SLOTS

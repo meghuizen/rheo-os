@@ -416,6 +416,69 @@ pub extern "C" fn user_spinner(params_va: usize) -> ! {
     loop {}
 }
 
+/// The **co-running pair** cell: the witness that two cells execute *at the same
+/// instant* on two CPUs (docs/SMP.md 10.0).
+///
+/// `workload` is this cell's slot (0 or 1), `iters` the rounds, and `ticks` the VA of
+/// a shared page holding four `u64` words:
+///
+/// | word | meaning |
+/// |---|---|
+/// | 0 | slot 0's round counter |
+/// | 1 | slot 1's round counter |
+/// | 2 | the highest peer counter slot 0 ever saw |
+/// | 3 | the highest peer counter slot 1 ever saw |
+///
+/// Each cell writes **only its own two words** and reads only the peer's counter, so
+/// the page needs no lock and there is no race to lose an update - which matters,
+/// because the two cells really are running on different cores here. (The
+/// `preempt`/`schedidle` kernels share one appended order vector instead; that is
+/// safe there because only one CPU is ever executing.)
+///
+/// The witness: word `2 + slot` is nonzero only if this cell saw the peer make
+/// progress **while this cell was between two of its own rounds**. Under a single
+/// CPU with cooperative dispatch the first cell runs to completion before the second
+/// starts, so it can only ever read a peer counter of 0. Two nonzero observations are
+/// therefore only producible by two cores running at once.
+#[unsafe(link_section = ".user.text")]
+#[unsafe(no_mangle)]
+pub extern "C" fn user_copair(params_va: usize) -> ! {
+    let p = params_va as *mut Params;
+    // SAFETY: the cell's own mapped Params page (its entry argument) and the shared
+    // witness page mapped read-write into it.
+    unsafe {
+        let slot = ((*p).workload & 1) as usize;
+        let rounds = (*p).iters;
+        let base = (*p).ticks as *mut u64;
+        let mine = base.add(slot);
+        let peer = base.add(slot ^ 1);
+        let seen = base.add(2 + slot);
+        let mut i = 0u64;
+        let mut acc = 1u64;
+        while i < rounds {
+            i += 1;
+            mine.write_volatile(i);
+            let q = peer.read_volatile();
+            if q > seen.read_volatile() {
+                seen.write_volatile(q);
+            }
+            // The same constraints as `user_spinner`'s burn loop: `wrapping_*` so
+            // there is no overflow-panic path in kernel `.text`, the result stored so
+            // it is not dead code, and only small immediates so LLVM cannot spill a
+            // constant into kernel `.rodata` a cell has no mapping for.
+            let mut k = 0u64;
+            while k < SPIN_WORK {
+                acc = acc.wrapping_add(k ^ 0x5f).wrapping_mul(3);
+                k += 1;
+            }
+            (*p).ops = acc;
+        }
+        (*p).status = 1;
+        syscall(SYS_EXIT, 0);
+    }
+    loop {}
+}
+
 /// The **scratch-register spinner** (x86-64 only): spin with known sentinels in the
 /// two registers `sysretq` consumes, and report whether they survived.
 ///
@@ -460,7 +523,9 @@ pub extern "C" fn user_scratch_spinner(params_va: usize) -> ! {
 /// a plausible RIP or RFLAGS, and different from each other. Small enough to be
 /// materialised by a 32-bit immediate (a 64-bit constant would need a `.rodata` pool a
 /// cell cannot reach - the defect the plain spinner hit first).
+#[cfg(target_arch = "x86_64")]
 const SCRATCH_RCX: u64 = 0x5EC0_1234;
+#[cfg(target_arch = "x86_64")]
 const SCRATCH_R11: u64 = 0x0BAD_5678;
 
 /// Spin `rounds` times with the sentinels live in RCX and R11; return 0 if both
@@ -508,8 +573,10 @@ unsafe fn spin_scratch(rounds: u64) -> u64 {
         acc = acc.wrapping_add(i ^ 0x5f).wrapping_mul(3);
         i += 1;
     }
-    // Consumed so the loop is not dead code; the result is not a property.
-    if acc == 0 { 0 } else { 0 }
+    // Consumed so the loop is not dead code, but not *reported*: on these ISAs there
+    // is no scratch-register hazard, so the honest answer is "nothing was corrupted".
+    core::hint::black_box(acc);
+    0
 }
 
 /// Arithmetic operations per spin round in [`user_spinner`].

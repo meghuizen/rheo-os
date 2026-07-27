@@ -305,14 +305,31 @@ fn cell_admission(cur: usize) -> &'static mut Admission {
 pub const MAX_CELLS: usize = 16;
 
 static mut CELLS: [RunCell; MAX_CELLS] = [EMPTY; MAX_CELLS];
-static mut CURRENT: usize = 0;
+
+/// The cell each CPU is currently running, the cell each entered `run` with, and the
+/// cell whose exit ended each one's run.
+///
+/// **Per-CPU, because two cores can each be running a cell** (docs/SMP.md 10.0). These
+/// were three `static mut usize`s, which was correct while exactly one core ever
+/// entered user mode and is the single thing that makes "a cell in user mode on a
+/// secondary" produce nonsense rather than a fault: the secondary would overwrite the
+/// primary's notion of which cell is running, and `uaccess` would then resolve the
+/// primary's pointers against the secondary's address space.
+///
+/// On the non-`smp` build `cpu_index()` is a compile-time 0, so every access resolves
+/// to slot 0 with no indexing at run time and the behaviour is exactly what it was.
+static CURRENT: crate::smp::PerCpu<usize> = crate::smp::PerCpu::new(0);
+
+#[inline]
+fn cur_cpu_cell() -> usize {
+    *CURRENT.this()
+}
 
 /// The cell whose trap is being serviced. `crate::uaccess` needs it to know whose
 /// address space a supplied pointer belongs to, and whether that cell's mappings are
 /// lazy at all (a native cell's are not).
 pub fn current_cell() -> usize {
-    // SAFETY: single CPU, synchronous traps.
-    unsafe { *core::ptr::addr_of!(CURRENT) }
+    cur_cpu_cell()
 }
 
 /// The syscall ABI cell `idx` speaks - `uaccess` skips its lazy-mapping work entirely
@@ -320,7 +337,7 @@ pub fn current_cell() -> usize {
 pub fn cell_personality(idx: usize) -> Personality {
     cells()[idx].personality
 }
-static mut EXITED: usize = 0;
+static EXITED: crate::smp::PerCpu<usize> = crate::smp::PerCpu::new(0);
 
 /// A kernel-owned capability table per cell slot, for cells the **kernel**
 /// creates - a native `SYS_SPAWN` child or a Linux `fork` child
@@ -450,7 +467,7 @@ pub fn switch_native_cell(from: usize, to: usize) {
 /// The cell `run` was entered with (docs/LINUX-COMPAT.md L6): the top of the
 /// Linux process tree. Only its exit ends the whole run; a forked child's exit
 /// makes it a zombie and reschedules another cell (`linux::proc`).
-static mut TOP_CELL: usize = 0;
+static TOP_CELL: crate::smp::PerCpu<usize> = crate::smp::PerCpu::new(0);
 
 fn cells() -> &'static mut [RunCell; MAX_CELLS] {
     // SAFETY: single CPU, synchronous traps; no aliasing run concurrently.
@@ -484,7 +501,7 @@ pub fn reset() {
 /// Linux personality keys its per-cell state (fd table, brk, mmap cursor) on
 /// this.
 pub fn current_index() -> usize {
-    unsafe { *core::ptr::addr_of!(CURRENT) }
+    cur_cpu_cell()
 }
 
 /// The installed frame pointer for cell `idx`. The Linux personality's thread
@@ -1493,8 +1510,8 @@ pub fn run(idx: usize) -> (usize, Outcome) {
     let cell = cells()[idx];
     assert!(cell.present, "run of empty cell slot {idx}");
     unsafe {
-        *core::ptr::addr_of_mut!(CURRENT) = idx;
-        *core::ptr::addr_of_mut!(TOP_CELL) = idx;
+        *CURRENT.this_mut() = idx;
+        *TOP_CELL.this_mut() = idx;
         (*cell.aspace).activate();
         // Load this cell's own FP/SIMD image before its first instruction: the
         // clean ABI-default one `fp_area_init` wrote at install for a fresh
@@ -1514,7 +1531,7 @@ pub fn run(idx: usize) -> (usize, Outcome) {
     // Restore the kernel address space so setup code can again reach all
     // of RAM (a cell root only maps that cell's user pages).
     arch::paging_activate_kernel();
-    let exited = unsafe { *core::ptr::addr_of!(EXITED) };
+    let exited = *EXITED.this();
     (
         exited,
         cells()[exited].outcome.expect("no outcome recorded"),
@@ -1543,10 +1560,10 @@ fn linux_ctl(ctl: crate::linux::Ctl, frame: *mut TrapFrame) -> *mut TrapFrame {
 /// Record why the current cell's run ended and signal an unwind by
 /// returning a null frame (the arch trampoline calls return_to_kernel).
 fn finish(outcome: Outcome) -> *mut TrapFrame {
-    let cur = unsafe { *core::ptr::addr_of!(CURRENT) };
+    let cur = cur_cpu_cell();
     cells()[cur].outcome = Some(outcome);
     unsafe {
-        *core::ptr::addr_of_mut!(EXITED) = cur;
+        *EXITED.this_mut() = cur;
     }
     core::ptr::null_mut()
 }
@@ -1564,7 +1581,7 @@ pub fn deadlock_finish() -> *mut TrapFrame {
 /// The cell `run` was entered with - the top of the Linux process tree
 /// (docs/LINUX-COMPAT.md L6). Only its exit unwinds `run`.
 pub fn top_cell() -> usize {
-    unsafe { *core::ptr::addr_of!(TOP_CELL) }
+    *TOP_CELL.this()
 }
 
 /// Whether cell `idx` currently holds a runnable/live cell.
@@ -1693,7 +1710,7 @@ pub fn set_cell_frame(idx: usize, frame: *mut TrapFrame) {
 /// from a native path leaks one cell's vector registers into another.
 pub fn switch_to_cell(idx: usize) {
     unsafe {
-        *core::ptr::addr_of_mut!(CURRENT) = idx;
+        *CURRENT.this_mut() = idx;
         (*cells()[idx].aspace).activate();
     }
 }
@@ -1865,7 +1882,7 @@ pub fn on_user_trap(
     frame: *mut TrapFrame,
 ) -> *mut TrapFrame {
     if kind == TrapKind::Fault {
-        let cur = unsafe { *core::ptr::addr_of!(CURRENT) };
+        let cur = cur_cpu_cell();
         // A Linux cell with an installed, unblocked handler for the fault's
         // signal gets synchronous delivery (SIGSEGV/SIGBUS/SIGILL/SIGFPE) by
         // trap-frame rewrite (docs/LINUX-COMPAT.md L5); otherwise it terminates
@@ -1922,7 +1939,7 @@ pub fn on_user_trap(
 
     let (nr, args) = arch::decode_syscall(unsafe { &*frame });
     let arg = args[0];
-    let cur = unsafe { *core::ptr::addr_of!(CURRENT) };
+    let cur = cur_cpu_cell();
 
     // Linux cells never reach native dispatch: the personality tag decides
     // the syscall table before the number means anything (the ABIs collide).
@@ -2292,7 +2309,7 @@ pub fn cell_count() -> usize {
 
 /// Live capability count in the current cell's table (shell `caps`).
 pub fn current_caps_live() -> usize {
-    let cur = unsafe { *core::ptr::addr_of!(CURRENT) };
+    let cur = cur_cpu_cell();
     let cell = cells()[cur];
     if cell.caps.is_null() {
         0

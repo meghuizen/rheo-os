@@ -186,7 +186,7 @@ pub fn track(cell: usize, context: usize, parent: Option<usize>) -> Option<Vcore
         .and_then(|p| q.find(p as u16, 0))
         .and_then(|pid| q.get(pid))
         .map(|pv| super::bore::Burst::inherit(&pv.burst))
-        .unwrap_or_else(super::bore::Burst::new);
+        .unwrap_or_default();
     q.admit(c, x, Class::Fair, burst, now_ns()).ok()
 }
 

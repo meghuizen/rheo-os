@@ -549,7 +549,7 @@ the interrupt vector writes.
 
 ## 10. Phase 2 design: preemptive multi-core scheduling (task #132)
 
-**Status: partly built.** Two prerequisites have landed and are proven; the
+**Status: partly built.** Three prerequisites have landed and are proven; the
 scheduler itself has not.
 
 - **Timer preemption exists on all three ISAs** (docs/SUBSTRATE.md 15, S3', the
@@ -580,61 +580,81 @@ scheduler itself has not.
   yields. A wall-clock speedup would prove nothing under TCG, which time-slices the two
   vCPUs onto host threads; simultaneity is the available evidence and it is what is
   asserted.
+- **Two cells run in user mode on two cores at once** (the `smp` kernel, all three
+  ISAs) - section 10.0. Not a scheduler: the two cells are partitioned and the primary
+  places them. But a cell now genuinely executes at the unprivileged level on a core
+  that is not the boot CPU, which is the capability every later slice builds on.
 
-### 10.0 The next slice, specified
+### 10.0 Cells run in user mode on a secondary core - built
 
-Running a **cell in user mode on a secondary** is the next capability, and it is
-smaller than "audit everything" once the per-ISA trap state is looked at rather than
-assumed. What follows was established by reading the three entry paths, so the next
-session starts from a list instead of rediscovering it.
+**Done on all three ISAs** (the `smp` kernel's fourth phase). Two cells run **in user
+mode, on two cores, at the same instant** - each in its own address space, each dropping
+to the ISA's unprivileged level and trapping back into its own core's kernel stack. This
+is the capability section 10 was missing: bring-up proves a core executes, the GEMM phase
+proves two cores compute in kernel context, and this proves a *cell* runs on a core that
+is not the boot CPU.
 
-**RISC-V is nearly free.** `traps.S` keeps the current `TrapFrame` pointer in
-**`sscratch`**, and `stvec` is per-hart too - both are CSRs, so the trap path is already
-per-core *in hardware* with no software change at all. The only per-ISA global left is
-`KERNEL_CTX` (the saved kernel context `return_to_kernel` unwinds to), and `tp` already
-holds the CPU index, so indexing it is three instructions in the existing asm.
+**The witness is a page, not a timing.** Each cell owns two words in one shared page: its
+own round counter, and the highest peer counter it has ever seen. It writes only its own
+two words and reads only the peer's counter, so there is no lock and no update to lose -
+which matters here in a way it does not in `preempt` or `schedidle`, where the shared
+order vector is safe precisely because only one CPU is ever executing. A nonzero "highest
+peer seen" means this cell read the peer's progress **between two of its own rounds**. On
+one CPU under cooperative dispatch the first cell runs to completion before the second is
+entered, so it could only ever read 0. Both directions nonzero is therefore not
+producible by one core. Dispatch is deliberately left **off** for the phase: this is
+about two cores, not about preemption (which `preempt` owns), and a slice firing here
+could hand one core's cell to the other core's scheduler.
 
-**ARM64 is nearly free for the same reason**: `VBAR_EL1` is per-core and the frame
-pointer lives in `TPIDR_EL1`, which is a per-core register. A secondary sets its own
-vector base at bring-up and the rest follows.
+**What had to become per-CPU, and what did not.** The trap path is already per-core *in
+hardware* on two ISAs - RISC-V keeps the current frame in `sscratch` and its vectors in
+`stvec`, ARM64 in `TPIDR_EL1` and `VBAR_EL1`, all per-core CSRs/system registers. What
+was global:
 
-**x86-64 is the real work**, and it is a change *to* the syscall fast path rather than
-an addition beside it. `syscall_entry` reads `CUR_FRAME`, `KERNEL_RSP` and
-`USER_RSP_SCRATCH` as RIP-relative globals - a deliberate simplification, stated in
-`user.S`'s header as "single CPU, so ... plain globals (no GS/swapgs needed)". Making
-them per-CPU means the standard `swapgs` + `IA32_KERNEL_GS_BASE` arrangement and
-GS-relative addressing on the hottest path in the kernel. Indexing an array by
-`cpu_index()` is **not** an alternative there: that reads the LAPIC ID over MMIO, which
-is not something to put in front of every syscall.
+- **The saved kernel context** each ISA's `return_to_kernel` unwinds to (`KERNEL_CTX`).
+  Now one slot per core on all three: indexed by `tp` on RISC-V, by MPIDR affinity 0 on
+  ARM64, and reached through `GS_BASE` on x86-64. Reverting RISC-V's to a single slot was
+  observed to make the secondary's cell never finish.
+- **The portable "which cell is running" state** - `user::CURRENT`, `TOP_CELL` and
+  `EXITED` - now `PerCpu<usize>`. With `cpu_index()` a compile-time 0 on the non-`smp`
+  build, that substitution changes nothing there.
+- **RISC-V's kernel `tp`.** `tp` is a *saved GPR* the cell owns as its TLS pointer **and**
+  where the kernel keeps its CPU index, so without saving it the kernel would run every
+  trap handler reading the wrong CPU's per-CPU state. The frame gained a `kernel_tp`
+  slot, written on the way out to U-mode and reloaded on the way in. On the boot CPU this
+  is invisible, because the wrong answer and the right one are both 0 - which is exactly
+  why it had to be found by reading the trap path rather than by testing on one core.
+  Reverting it was observed to make the secondary's cell never finish.
+- **x86-64's four trap-stub words** (`CUR_FRAME`, `KERNEL_RSP`, `USER_RSP_SCRATCH`,
+  `KERNEL_CTX`), plus its **GDT, TSS and syscall kernel stack**. All are per-CPU now. The
+  four words are reached `GS`-relative, and **there is no `swapgs`**: nothing in this tree
+  ever gives a cell a GS base (`arch_prctl(ARCH_SET_GS)` is refused `-EINVAL`, and both
+  other ISAs carry TLS elsewhere), so `GS_BASE` points at the core's own block in kernel
+  and user mode alike. A cell that did read `%gs:` would fault on a supervisor-only page -
+  which is what it already did when the base was 0 and the address was unmapped. This is
+  the cheap half of the arrangement section 10.3 anticipated; adopting `swapgs` later is
+  two instructions at each ring boundary and nothing else here. Indexing by `cpu_index()`
+  was rejected for the reason the earlier plan gave: it reads the LAPIC over MMIO, which
+  does not belong in front of every syscall.
+- **x86-64's per-core registers that no memory change can substitute for**: IDTR, GDTR,
+  TR, the SYSCALL MSRs, CR0/CR4/XCR0 and `GS_BASE`. The AP trampoline set none of them, so
+  a secondary had no interrupt handlers at all and its first exception was a triple fault.
+  The secondary now loads the *primary's* IDT (the table is shared - the vectors are the
+  same code on every core - only the register is its own) and runs `user_init` for itself.
 
-**Portable state that must become per-CPU regardless of ISA:** `user::CURRENT`,
-`TOP_CELL` and `EXITED`. All three are `static mut` scalars and all three have a
-`PerCpu<T>` shape; with `cpu_index()` a compile-time 0 on the non-`smp` build, that
-substitution changes nothing there.
+**Safe by partitioning, not by locking.** The two cells hold distinct cell slots,
+distinct address spaces, distinct kernel stacks and distinct pages; the only structure
+they share is the cell table, which `run` reads and `finish` writes at *disjoint
+indices*. That is the multikernel answer this document commits to (SCHEDULING.md 1a)
+rather than a shortcut, and it is why no lock appears on this path.
 
-**Then the audit**, in blast-radius order: the cell table (`user::CELLS`), the
-capability and object tables, and the Linux personality's per-cell state. The
-partitioning answer is likely to beat the locking one - a cell belongs to a core, and a
-core touches only its own cells - which is the multikernel model this document already
-commits to (SCHEDULING.md 1a) rather than a new idea.
-
-The gate: a native cell running in user mode on a secondary while another runs on the
-primary, with the two-cell interleave witness the `preempt` and `schedidle` kernels
-already use, on the ISAs where it is reached - and skip-with-reason where it is not,
-per the `iommu` precedent.
-
-**What is still design only:** everything below about scheduling *cells* on the second
-core. A secondary drains a queue of kernel work items and parks - which is real
-load-shared parallel execution, but the work items are kernel jobs, not cells. **No cell
-runs in user mode on a secondary**, and the state that would need auditing first is
-named: the cell table, the capability and object tables, the Linux personality's
-per-cell state, and the per-CPU-ing of the trap entry itself (on x86-64 `CUR_FRAME`,
-`KERNEL_RSP` and `USER_RSP_SCRATCH` are globals the syscall fast path reads, which is a
-change to that path rather than an addition beside it; ARM64 and RISC-V already have
-per-core `VBAR_EL1`/`TPIDR_EL1` and `stvec`/`sscratch`). The section stays written docs-first (ARCHITECTURE.md 6
-discipline for a change this large) so the rest lands in reviewable slices against a
-fixed plan, and so the single-CPU cooperative path stays byte-identical until each
-prerequisite is genuinely safe.
+**Honest scope.** This is two *partitioned* cells, not a scheduler: the primary picks
+which cell the secondary runs, publishes it, and waits. Nothing yet places a runnable
+cell on whichever core is free, nothing migrates, and the audit in 10.2 is still the gate
+for that - the cell table, the capability and object tables, and the Linux personality's
+per-cell state are all still written on the assumption of one CPU. A **Linux** cell on a
+secondary is therefore not attempted; the cells here are native. Only one secondary is
+started, so only two cells can be placed.
 
 ### 10.1 The measured motivation (not a wish)
 

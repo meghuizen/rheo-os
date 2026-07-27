@@ -784,7 +784,7 @@ impl VmaList {
                     n += 1;
                 }
             };
-            let mut hex = |v: usize, w: &mut dyn FnMut(u8)| {
+            let hex = |v: usize, w: &mut dyn FnMut(u8)| {
                 // Lowercase, no leading zeros, at least one digit - `%lx`, which is
                 // what the format specifies and what every parser expects.
                 let mut buf = [0u8; 16];

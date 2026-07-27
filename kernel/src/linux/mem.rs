@@ -111,9 +111,9 @@ pub fn reserve_stack(st: &mut LinuxState, base: usize, bytes: usize) {
 ///
 /// Callers must have run [`wx_refused`] first, which is what verifies the calling
 /// cell's authority for the `UserRwx` case. This function only translates bits; it
-/// checks no capability, and a caller that skips the gate would get an RWX mapping
-/// - which is why the gate is a separate, loudly-named function that both call
-/// sites invoke on the line before.
+/// checks no capability, and a caller that skips the gate would get an RWX mapping,
+/// which is why the gate is a separate, loudly-named function that both call sites
+/// invoke on the line before.
 fn perm_from_prot(prot: u64) -> MapPerm {
     if prot & PROT_EXEC != 0 && prot & PROT_WRITE == 0 {
         MapPerm::UserRx
