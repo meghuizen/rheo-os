@@ -99,7 +99,7 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 
 | Syscall | Status | Notes |
 |---|---|---|
-| read / write | full | over the per-cell fd table (console, VFS files, /dev/{null,zero,urandom}) |
+| read / write | full | over the per-cell fd table (console, VFS files, /dev/{null,zero,urandom}). **Console input (stdin) blocks** (docs/ARCHITECTURE-DEBT.md 2.4): it used to answer 0 on an empty console, i.e. *end of input*, which is indistinguishable from a real EOF and so a lie to every reader. A blocking descriptor now parks (`proc::Block::Console`) until a byte is buffered or input genuinely ends; a non-blocking one reports -EAGAIN. Bytes come from the same kernel RX ring the UART interrupt fills, so blocking and non-blocking reads cannot disagree about what has arrived. On a machine with a live serial console and no input, a blocking stdin read waits - as it does on Linux |
 | pread64 | partial | positioned read of a VFS file (lseek+read); ld.so reads ELF headers with it (L7). Non-VFS fds → -EBADF |
 | readv / writev | full | iterate the iovec array over read/write |
 | openat | partial | dirfd is a C `int` (low 32 bits, sign-extended - AT_FDCWD arrives as `0xffffff9c`); AT_FDCWD honored, paths resolved by the VFS; a real (positive) dirfd → -ENOSYS (no suite util needs it). `/dev/{null,zero,urandom,random}` and `/proc/self/auxv` synthesized, else via `FileOps::open` |
@@ -110,13 +110,13 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 | getdents64 | full | VFS directory (path stored per fd), packed as `linux_dirent64` and paged out via a per-fd cursor so a reader looping until 0 (real `ls`) terminates; directory must fit 4 KiB of records |
 | getcwd | full | the per-cell cwd (default `/`) + NUL; -ERANGE if the buffer is too small |
 | chdir | partial | stores the path as the cwd verbatim (absolute in practice); no existence check |
-| pipe2 / pipe | full | `O_CLOEXEC` honored on both ends; `O_NONBLOCK` at creation is the deferral in the `fcntl` row. A **cross-cell** bounded ring buffer (16 global pipes × 64 KiB, `kernel/src/linux/pipe.rs`), the two ends held by different cells after `fork` (L6). Read/write block **cooperatively** with cross-cell wake at syscall boundaries; EOF when all write ends close, SIGPIPE/-EPIPE when all read ends close. `dup`/`fork` refcount the ends. Single-process use (both ends in one cell, no peer to run) falls back to non-blocking -EAGAIN, keeping uu_cat's `splice`-fallback path (L3) working. `pipe` (x86-64 legacy) == `pipe2(...,0)` |
+| pipe2 / pipe | full | `O_CLOEXEC` **and** `O_NONBLOCK` honored on both ends at creation (docs/ARCHITECTURE-DEBT.md 2.4). A **cross-cell** bounded ring buffer (16 global pipes × 64 KiB, `kernel/src/linux/pipe.rs`), the two ends held by different cells after `fork` (L6). Read/write block **cooperatively** with cross-cell wake at syscall boundaries; EOF when all write ends close, SIGPIPE/-EPIPE when all read ends close. `dup`/`fork` refcount the ends. Single-process use (both ends in one cell, no peer to run) falls back to non-blocking -EAGAIN, keeping uu_cat's `splice`-fallback path (L3) working. `pipe` (x86-64 legacy) == `pipe2(...,0)` |
 | splice | ENOSYS | uu_cat's Linux fast path probes `splice` and falls back to read/write on failure (documented fallback) |
 | /proc/self/auxv | full | serves the cell's own auxv byte stream (a read-only synthetic fd); glibc/rustix read it when no PR_GET_AUXV is provided |
 | dup / dup3 | partial | copies the slot; a duplicated VFS fd shares the underlying descriptor (close-once) |
-| fcntl | partial | F_DUPFD/F_DUPFD_CLOEXEC (the CLOEXEC form really sets it), F_GETFD/F_SETFD (**FD_CLOEXEC tracked**, honored by `execve`), F_GETFL (the **real** access mode plus O_NONBLOCK while set), F_SETFL (**O_NONBLOCK honored**: a would-block read/write returns -EAGAIN instead of parking the cell or reporting 0; **O_APPEND and O_ASYNC are refused -EINVAL** - not repositioned on write, no SIGIO), F_GETPIPE_SZ on a pipe (the ring's real capacity). File locking (F_GETLK/F_SETLK/F_SETLKW + the OFD forms) → **-ENOLCK** (no lock manager). **Every other command → -EINVAL** and a console line; it used to `_ => 0`, i.e. report success for anything unimplemented. *Deferral:* `O_NONBLOCK`/`SOCK_NONBLOCK` given at **creation** is accepted and not honored - it cannot be until `poll` waits (see the `poll` row) |
+| fcntl | partial | F_DUPFD/F_DUPFD_CLOEXEC (the CLOEXEC form really sets it), F_GETFD/F_SETFD (**FD_CLOEXEC tracked**, honored by `execve`), F_GETFL (the **real** access mode plus O_NONBLOCK while set), F_SETFL (**O_NONBLOCK honored**: a would-block read/write returns -EAGAIN instead of parking the cell or reporting 0; **O_APPEND and O_ASYNC are refused -EINVAL** - not repositioned on write, no SIGIO), F_GETPIPE_SZ on a pipe (the ring's real capacity). File locking (F_GETLK/F_SETLK/F_SETLKW + the OFD forms) → **-ENOLCK** (no lock manager). **Every other command → -EINVAL** and a console line; it used to `_ => 0`, i.e. report success for anything unimplemented. **Creation-time `O_NONBLOCK`/`SOCK_NONBLOCK` is now honoured too** (`open`/`socket`/`socketpair`/`accept4`/`pipe2`, docs/ARCHITECTURE-DEBT.md 2.4). It could not be while `poll` reported every fd ready: a non-blocking program's poll-then-read loop would be told "ready", read -EAGAIN, and spin. It landed with the waiting `poll` in one slice |
 | ioctl | partial | TIOCGWINSZ on a console fd → 80x24; every other request -ENOTTY |
-| poll / ppoll | partial, **overstated before** | It does not compute readiness at all: **every open fd is reported ready** for whatever events were requested, a closed one POLLNVAL, and the timeout is ignored. That is stronger than "non-blocking readiness" and is worth stating plainly, because two things depend on it: it is what lets glibc's resolver reach its blocking `recvfrom` and resolve names (see L8-INET-REMOTE), and it is the reason creation-time `O_NONBLOCK` cannot be honored yet (a non-blocking program would spin on a false ready and fail). A `poll` that consults `pollin_ready`/`pollout_ready` (which epoll already does) **and waits for its timeout** is the next rung; the two changes must land together |
+| poll / ppoll | full for POLLIN/POLLOUT | **Real readiness, and a real wait** (docs/ARCHITECTURE-DEBT.md 2.4). `revents` is computed per `FdKind` by one shared definition (`linux::poll_revents` over `pollin_ready`/`pollout_ready`): a pipe or local socket from its ring, a **remote** UDP/TCP socket from the `svc::SocketOps` bridge (whose readiness probe pumps the datapath), the console from the RX ring or end of input, a VFS file/`/dev/null`/`/dev/zero` always, an epoll fd from its own watches, a closed fd POLLNVAL. The **timeout is honoured**: 0 is a pure probe, a negative value waits indefinitely, and a positive one is a deadline in the cell's own clock domain. Waiting is a `proc::Block::Poll` registration, so the caller leaves the CPU and the scheduler idles on what the watched descriptors can be woken by. `ppoll`'s `struct timespec` is read (NULL = indefinite). **What it used to be:** readiness was never consulted at all - every open fd was reported ready for whatever was asked and the timeout ignored - and two things depended on that accident, which is why they were fixed in one slice (see the `fcntl` row and L8-INET-REMOTE). *Scope:* POLLERR/POLLHUP/POLLPRI are not reported (a hung-up pipe surfaces as POLLIN readable, which is what a reader acts on); a set larger than 64 descriptors keeps the non-blocking probe, because the request is copied into a fixed kernel array to be judged while another cell's address space is active; a wait whose watched descriptors have **no** wake source answers immediately rather than parking on an impossible condition |
 | faccessat / faccessat2 | full | existence check via the VFS stat handler |
 | access | full | x86-64 legacy; path in arg0, no dirfd. ld.so probes /etc/ld.so.preload etc. (L7); existence check via the VFS |
 | readlinkat | partial | always -ENOENT (no symlinks in the VFS; /proc/self/exe is not read by the L3 suite - uu 0.0.29 gets argv[0] from `std::env::args`, not the auxv/execfn) |
@@ -134,7 +134,7 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 | getuid / geteuid / getgid / getegid | full | 1000 (no root, SECURITY-IDENTITY) |
 | uname | full | sysname "Linux", release "6.6.0-rheo", machine per ISA |
 | clock_gettime | partial | MONOTONIC via `arch::ticks_to_ns`; REALTIME = fixed epoch + monotonic (unsynced, disclosed) |
-| clock_nanosleep / nanosleep | partial | returns immediately (0), no actual sleep |
+| clock_nanosleep / nanosleep | full for the blocking case | **A real sleep** (docs/ARCHITECTURE-DEBT.md 2.4); it used to return 0 immediately. The deadline is computed and compared in the **cell's own clock domain** (`cell_clock_ns` - the domain the program's own `clock_gettime` reports), parked on as a `proc::Block::Timer`, so a sibling process runs while one sleeps. `clock_nanosleep`'s `TIMER_ABSTIME` is honoured; a deadline already in the past returns 0 at once. `rem` is **never written**, because no signal is delivered to a parked process, so the sleep cannot be interrupted - stated rather than implied. Note that glibc routes `nanosleep` through `clock_nanosleep` on every ISA here, so the latter is the number that matters (fixing only the former would be invisible - observed) |
 | getrandom | full | fills from the cell's DRBG; flags ignored (never blocks) |
 | sched_yield | full | switches to the next ready context (L4); returns 0 (no-op if it is the only runnable context) |
 | sched_getaffinity | partial | reports a single online CPU (bit 0) so `available_parallelism` reads 1 and thread pools (rayon) stay small/deterministic (L4) |
@@ -166,7 +166,7 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 | getsockname / getpeername | full | real `sockaddr_in`/`sockaddr_in6`/`sockaddr_un`; a remote socket reports the datapath's own IPv4 and the true peer address |
 | setsockopt / shutdown | recorded | returns 0, stores nothing (SO_REUSEADDR/TCP_NODELAY succeed as no-ops) |
 | getsockopt | partial | zero-filled answer (SO_ERROR reads as 0) |
-| epoll_create1 / epoll_ctl / epoll_wait / epoll_pwait | partial | level-triggered EPOLLIN/EPOLLOUT only, non-blocking; remote UDP readiness is real, a remote TCP socket always reports readable (L8-INET-REMOTE deferral) |
+| epoll_create1 / epoll_ctl / epoll_wait / epoll_pwait | partial | level-triggered EPOLLIN/EPOLLOUT only. `epoll_wait`/`epoll_pwait` now **honour their timeout and genuinely park** (docs/ARCHITECTURE-DEBT.md 2.4) - they used to return 0 at once, which turns every epoll loop into a spin - over the same per-`FdKind` readiness the `poll` row describes, including a real `tcp_pending` probe for a remote TCP socket (it used to always report readable, because `svc::SocketOps` had no way to ask). Still deferred: EPOLLET, EPOLLONESHOT, EPOLLEXCLUSIVE, EPOLLRDHUP/EPOLLPRI, and a nested epoll (an epoll fd watched by another epoll reports no wake source) |
 
 ### Planned identity/constants
 
@@ -630,10 +630,19 @@ it is a later rung of work.
     address is a property of the host's resolver and is therefore **reported, never
     asserted or printed** (one line from a fixed pair: resolved, or cleanly not).
     On this development host it resolves on all three ISAs.
-    Note what this rests on: `poll` currently reports every open fd ready (the
-    `poll` row), which is what lets glibc's resolver proceed to its **blocking**
-    `recvfrom`. That is why creation-time `SOCK_NONBLOCK` is still dropped - the
-    two must be fixed together.
+    **What this used to rest on, and what it rests on now.** It used to work
+    *because of a bug*: `poll` reported every open fd ready without consulting
+    readiness, so glibc's resolver fell through to its `recvfrom` - and that
+    `recvfrom` blocked only because creation-time `SOCK_NONBLOCK` was being
+    dropped. Both were fixed in one slice (docs/ARCHITECTURE-DEBT.md 2.4), because
+    fixing either alone breaks the resolver: a readiness-computing `poll` that does
+    not wait makes it give up, and an honoured `SOCK_NONBLOCK` without a waiting
+    `poll` makes it spin on -EAGAIN. It now works for the right reason: the
+    resolver's `poll` **blocks** until the socket is readable - a remote socket's
+    readiness names `idle::NET`, so the scheduler idles on the NIC, and asking the
+    `svc::SocketOps` bridge for readiness pumps the receive path - and its
+    non-blocking `recvfrom` then succeeds. `linuxnet` is the regression test for
+    exactly this, on all three ISAs.
   - **What works remotely, precisely.** **UDP: fully** - `sendto`/`recvfrom`,
     `connect`+`send`/`recv`, source-address reporting, real ARP next-hop
     resolution (the destination on our own /24, else the gateway), real IPv4 +

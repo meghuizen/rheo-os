@@ -8,6 +8,30 @@ ownership instead of bytes**. Disk, network, GPU, IPC, and timers are the
 same machinery at different endpoints. Blocking does not exist below the
 library level.
 
+**Status of that last sentence.** It is now true of the kernel, and was not
+before (docs/ARCHITECTURE-DEBT.md 2.4). Three verbs - `SYS_ARM_TIMER`,
+`SYS_WAIT_INPUT`, `SYS_WAIT_NET` - used to *wait inside the trap*, in kernel
+context, without ever consulting the scheduler, so one cell's `sleep` idled the
+whole machine while its siblings sat runnable: exactly the hidden blocking
+syscall the model says cannot exist. Each is now a **registration**: the cell
+records what it is waiting for, returns to the scheduler, a sibling runs, and the
+syscall is completed when the scheduler switches back into the waiter
+(`kernel/src/nproc.rs`, and `kernel/src/linux/proc.rs` for the Linux
+personality's `nanosleep`/`poll`/`epoll_wait`/console read). When *nothing* is
+runnable the scheduler idles on the union of the wake sources the blocked cells
+named (`kernel/src/idle.rs`), halting the CPU where an interrupt can wake it.
+
+Two scope statements this does **not** license. First, it is a *cooperative*
+property: a cell yields at a syscall boundary, so a compute-bound cell that never
+traps still holds the CPU until timer preemption exists (task #27,
+docs/CONCURRENCY.md 4). "Blocking does not exist" means no wait consumes the CPU,
+not that any wait is preemptible. Second, where a wait's condition can never
+occur - a receive with no NIC, an *indefinite* receive on a machine with no NIC
+interrupt - the verb keeps its in-trap path deliberately, because that path holds
+the backstops; parking on an impossible condition would be a wedge, not an idle.
+A wait with **no** possible wake source at all is reported as a deadlock, naming
+each blocked cell and what it waits on, rather than hung or panicked.
+
 ## 1. The queue ABI
 
 - A queue pair = submission ring + completion ring in shared memory + a

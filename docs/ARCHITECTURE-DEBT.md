@@ -28,6 +28,9 @@ Recorded so the register stays honest about its own progress.
 | **`SYS_MUNMAP` freed frames it did not own** - no capability check at all; a peer's shared grant, the channel ring and the cell's own queue region were all freeable. Observed pre-fix: a cross-cell use-after-free was *accepted*. | Fixed. Routed through `grant_resolve` like its `COMMIT`/`DECOMMIT`/`SEAL` siblings. |
 | **x86-64 had no working timer interrupt** (the x2APIC MSR block is inert under QEMU-TCG), so `SYS_ARM_TIMER` returned immediately and a "timer-backed idle" was a spin. | Fixed via xAPIC MMIO, selected by probe. Genuinely interrupt-driven on all three ISAs. |
 | **Three "blocked" verdicts** - x86 AP bring-up, ARM64 PSCI, the x86 UART RX interrupt. | All three were **wrong**, from one root cause. A real secondary core now runs kernel code on all three ISAs. |
+| **§2.4 Kernel-blocking waits did not reschedule**, and `reschedule` **panicked** when nothing was runnable - so a process waiting for the outside world could not be expressed. | Fixed. `kernel/src/idle.rs` is a **scheduler idle state** composing `ktimer` + `net_rx` + `input` (no new object, no new verb): `SYS_ARM_TIMER`/`SYS_WAIT_INPUT`/`SYS_WAIT_NET` and the Linux `nanosleep`/`poll`/`epoll_wait`/console read all **register** their condition and return to the run loop, and the scheduler halts only when nothing is runnable. A genuine no-wake-source state prints which cell/pid is blocked on what and ends the run with `DEADLOCK_EXIT`. Proven by `schedidle` (two cells, an unfakeable ordering witness `bSSSSSSSSB`) and `linuxpoll`, on all three ISAs; both observed failing without the fix. |
+| **§2.4 `poll` did not compute readiness at all** - every open fd reported ready, timeout ignored; `epoll_wait` never waited; `nanosleep` returned immediately; blocking stdin answered 0 = EOF; creation-time `O_NONBLOCK` dropped. | Fixed, all in one slice because DNS depended on the combination. `poll`/`ppoll`/`epoll_wait` compute real per-`FdKind` readiness and honour their timeout by parking; `svc::SocketOps` gained the missing `tcp_pending` (its absence *was* the hardcoded "remote TCP is always readable"); `nanosleep` is real in the cell's clock domain; stdin blocks; creation-time `O_NONBLOCK`/`SOCK_NONBLOCK` is honoured. |
+| **§2.5 Admission could not refuse over-commit** - sixteen cells at 90% each all succeeded, and a **second** global controller existed behind the legacy `SYS_RESERVE`, which discarded its `Reservation` and leaked monotonically. | Fixed. One machine-wide ledger (`sched::system()`); a reservation must fit its cell **and** the machine, and a refusal leaves both unchanged. The legacy verb shares that ledger instead of keeping a private one, and its no-release cumulative-probe nature is now documented at the call site rather than being a silent leak. `schedidle` asserts the hand-computed oracle: 900,000 ppm admitted, a second 900,000 refused as over-commit while each *cell's* own controller would have accepted it. |
 
 The lesson is recorded in `ENGINEERING.md` §1: when a capability lie is found,
 every conclusion that touched it is a suspect.
@@ -70,35 +73,23 @@ four cells share one table. What actually isolates memory is the per-cell grant
 array plus the page tables - so in the shipped code the capability table is not
 the isolation boundary the design says it is.
 
-### 2.4 Kernel-blocking waits do not reschedule (A)
+### 2.4 Kernel-blocking waits do not reschedule - **CLOSED** (see §1)
 
-`IO.md:9` and `CONCURRENCY.md:24,38` state that blocking does not exist below the
-library level, and §4.2 says scheduler activations are viable *"because no
-blocking syscall exists"*. But `SYS_ARM_TIMER` (`time.rs:95-114`),
-`SYS_WAIT_NET` (`net_rx.rs:443+`) and `SYS_WAIT_INPUT` all spin or park **in
-kernel context without rescheduling**; only `SYS_WAIT` reschedules. One cell's
-`sleep(1s)` idles the entire machine while siblings sit runnable.
+Was the keystone: simultaneously the enforcement defect and rung 1 of the
+compatibility ladder (§4). `kernel/src/idle.rs` now holds the scheduler idle state
+the entry called for, and `IO.md`/`CONCURRENCY.md`'s "blocking does not exist below
+the library level" is true of the kernel - with the cooperative scope it does *not*
+cover stated in both docs.
 
-Worse, `reschedule` **panics** when nothing is runnable
-(`linux/proc.rs:491`, `nproc.rs:487`) - so a process blocked on the network,
-which is by definition the only runnable thing, **cannot be expressed**.
+### 2.5 Admission cannot refuse over-commit - **CLOSED** (see §1)
 
-This is the keystone: it is simultaneously the enforcement defect and rung 1 of
-the compatibility ladder (§4). The shape needed already exists next to it -
-`linux/proc.rs:476-534` has a `Block` enum, `satisfiable(i)`, `complete_block(n)`
-- so adding `Block::{Epoll,Timer,Console}` is mechanical. What is missing is a
-**scheduler idle state** composing `ktimer` + `net_rx` + `input`.
-
-### 2.5 Admission cannot refuse over-commit (A)
-
-`reserve_admit` tests only `cell_admission(cur)` (`user.rs:753`) against
-`CELL_ADMISSION[MAX_CELLS]`. There is no system-wide ledger, so sixteen cells
-each admitting 90% all succeed - 1440% of one CPU admitted, nothing refused.
-Doctrine 5 ("accepted by math or rejected loudly") is scoped so that it cannot
-reject the only over-commit that matters. Aggravating: a **second** global
-admission controller exists for the same object (`svc.rs:21`, via the ungated
-legacy `SYS_RESERVE`) which **discards its `Reservation`** (`svc.rs:73`), so it
-can never release and its committed utilisation leaks monotonically upward.
+`sched::system()` is the machine-wide ledger; the legacy `SYS_RESERVE`'s second
+controller is gone. What is *not* closed and is now named at the call site: that
+verb still has no release, so it is a cumulative probe rather than a managed
+reservation (`SYS_RESERVE_ADMIT`/`RELEASE` is the real, capability-gated surface).
+Also still open, and unchanged by this: an admitted reservation is not yet
+**enforced** at runtime - the scheduler is single-CPU cooperative, so admission is
+math that refuses cleanly, not a guarantee anything schedules (task #27).
 
 ### 2.6 Ambient authority, and a grant check that gates the wrong thing (A + C)
 
@@ -268,10 +259,11 @@ Three blockers are **design decisions**, not unfinished work:
    nothing detects that a large reservation spans `LINUX_INTERP_BASE` where ld.so
    and libc live. Silent corruption, not an error. The user VA ceiling is
    **256 GiB on every ISA** (`user.rs:62`, Sv39's user half applied uniformly).
-3. **No idle state and no resumable page fault.** §2.4 above; plus
-   `on_user_trap` maps every user fault to a signal or termination, so nothing is
-   demand-paged and nothing grows on fault - against a ~100 MB binary that is
-   **eagerly copied page-by-page into private frames**.
+3. **No resumable page fault.** (The missing *idle state* was the other half of
+   this and is now closed - §2.4.) `on_user_trap` still maps every user fault to a
+   signal or termination, so nothing is demand-paged and nothing grows on fault -
+   against a ~100 MB binary that is **eagerly copied page-by-page into private
+   frames**.
 
 **The stub class is the practical hazard**, because a stub that reports success
 puts the failure far from the cause. The base of the ladder has now been cleared;
@@ -288,22 +280,24 @@ docs/LINUX-COMPAT.md for the semantics and the fixtures):
 | **stdin `read` returns 0 = EOF** on an empty FIFO | still 0 when blocking (no cell may park on the console - documented), but `-EAGAIN` once `O_NONBLOCK` is set, which is the answer a caller can act on |
 | **Limits**: 128 MiB pool / 96 MiB per cell / 1 MiB stack, sized for a few-hundred-KiB fixture | 512 MiB / 384 MiB / 8 MiB, with `RLIMIT_STACK` derived from the one stack constant. A **limit raise, not a design change** - demand paging is still the real answer (blocker 3 above) |
 | `op_tcp_send` never pumped RX, so ACKs never reached the state machine, the send queue filled and `write` returned 0 → EAGAIN forever: **any body larger than the send window deadlocked** | the send path drains the NIC first. **Reasoned + code-reviewed, unproven** - it needs the deterministic TCP peer the data path needs, and none was invented |
+| **`poll` never consulted readiness**, `epoll_wait` never waited, `nanosleep` returned immediately, blocking stdin answered 0 = EOF, creation-time `O_NONBLOCK` was dropped - and the resolver worked *because* of the first and last of those | all fixed together (they cannot be separated - see docs/LINUX-COMPAT.md's `poll` row). `pollx.c` asserts an empty pipe is NOT readable, both timeouts elapse on the program's own clock, an indefinite `poll` is woken by a forked peer, a 40 ms `nanosleep` sleeps, and `pipe2(O_NONBLOCK)` reports EAGAIN; `linuxnet`'s resolver still resolves. Both observed failing without the fix |
+| **`reschedule` panicked** when nothing was runnable, so "waiting for the network" was not an expressible state | a scheduler idle state (`kernel/src/idle.rs`); an unsatisfiable wait is reported, naming the blocked pid and its wait, and ends the run with `DEADLOCK_EXIT`. `polldead.c` reaches that branch deliberately |
 
 **Still open, and now measured rather than suspected:**
 
-- **`poll`/`epoll_wait`** are worse than "ignore fd kind": `poll` does not consult
-  readiness **at all** - every open fd is reported ready for whatever was asked,
-  a closed one `POLLNVAL`, and the timeout is ignored. Two things depend on that
-  accident: it is what lets glibc's resolver fall through to its **blocking**
-  `recvfrom` (so DNS works *because* of the bug), and it is why creation-time
-  `O_NONBLOCK`/`SOCK_NONBLOCK` is still dropped - honouring it would turn every
-  non-blocking program into a spin that fails. A `poll` that computes readiness
-  **and waits for its timeout** plus creation-time `O_NONBLOCK` must land
-  **together**. This is the next rung.
-- `nanosleep` returns immediately; `readlinkat` is hardcoded `-ENOENT`;
-  cross-process `kill` does not exist and `kill(0)`/`kill(-1)` **silently
-  self-target** - which matters because subprocess management is the
-  application's core function.
+- `readlinkat` is hardcoded `-ENOENT`; cross-process `kill` does not exist and
+  `kill(0)`/`kill(-1)` **silently self-target** - which matters because subprocess
+  management is the application's core function. (`poll`/`epoll_wait`/`nanosleep`,
+  blocking stdin and creation-time `O_NONBLOCK` were this rung and are now closed -
+  see §1. The DNS dependency turned out to be exactly as described: the resolver
+  needed a `poll` that *waits*, because honouring `SOCK_NONBLOCK` removes the
+  blocking `recvfrom` it used to rely on.)
+- **`poll`/`epoll` scope that remains:** POLLERR/POLLHUP/POLLPRI are not reported,
+  a poll set larger than 64 descriptors keeps the non-blocking probe, epoll stays
+  level-triggered with no nesting, and a *thread*-level block still parks the whole
+  cell rather than only the calling context (a multi-threaded process whose one
+  thread `poll`s does not run its siblings meanwhile - the futex path does that
+  correctly, this one does not yet).
 
 One hazard learned while bounding the futex timeout, worth recording because it is
 a *new* instance of §12's rule rather than the old one: a cell-supplied argument
@@ -356,10 +350,9 @@ already made.
 
 Chosen by (correctness at risk) first, then (leverage ÷ risk).
 
-**Now - correctness.** §2.4 the scheduler idle state (it is both the enforcement
-defect and the compatibility keystone); §2.1-2.3 the capability surface, complete
-revocation, per-child tables; §2.5 a system-wide admission ledger; §2.6 the
-ambient-authority sweep.
+**Now - correctness.** ~~§2.4 the scheduler idle state~~ and ~~§2.5 a system-wide
+admission ledger~~ are **closed** (§1). Next: §2.1-2.3 the capability surface,
+complete revocation, per-child tables; §2.6 the ambient-authority sweep.
 
 **First week - four Small, near-zero-risk items closing three structural
 defects.** `arch::init -> kernel::boot::init` (5 lines, deletes 3 cycles);

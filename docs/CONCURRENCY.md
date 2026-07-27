@@ -37,6 +37,17 @@ debugging tool.
   async queue, the killer of M:N threading - a hidden blocking syscall
   silently eating a core - cannot happen. This is why scheduler activations
   failed on POSIX and works here (SCHEDULING.md 3).
+
+  **That last claim is now enforced, and was not before**
+  (docs/ARCHITECTURE-DEBT.md 2.4). Three kernel verbs contradicted it -
+  `SYS_ARM_TIMER`, `SYS_WAIT_INPUT`, `SYS_WAIT_NET` waited *in kernel context*
+  without rescheduling, so a cell's `sleep` was precisely the hidden blocking
+  syscall eating the core. Each now registers its condition and returns to the
+  scheduler; a **scheduler idle state** (`kernel/src/idle.rs`) halts the CPU only
+  when no cell is runnable. What remains cooperative is stated plainly: a cell
+  yields at a syscall boundary, so a compute-bound cell that never traps starves
+  its siblings until the preemption doorbell (section 4, task #27). No wait
+  consumes the CPU; not every wait is preemptible.
 - Completions return with a strand ID in the user-data field; the runtime's
   poller unparks exactly that strand. One kernel notification carries a batch
   of completions - one wakeup, N strands resumed.

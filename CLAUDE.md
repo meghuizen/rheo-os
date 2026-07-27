@@ -1206,6 +1206,38 @@ intact; `librheowl` gained the cross-cell half - the compositor's attempt to fre
 the **client's** sealed grant is refused and the zero-copy checksum still matches.
 Each phase was verified to **fail** with its fix reverted.
 
+**The scheduler idle state** (docs/ARCHITECTURE-DEBT.md 2.4, the keystone) makes
+`IO.md`'s and `CONCURRENCY.md`'s "blocking does not exist below the library level"
+**true of the kernel**. It was not: `SYS_ARM_TIMER`, `SYS_WAIT_INPUT` and
+`SYS_WAIT_NET` each waited *inside the trap*, in kernel context, without ever
+consulting the scheduler - so one cell's `sleep` idled the whole machine while its
+siblings sat runnable - and `reschedule` **panicked** when nothing was runnable, so
+"every cell is waiting for the outside world" (a server's normal steady state) was
+not an expressible state at all. Each wait is now a **registration**: the cell
+records its condition, returns to the run loop, a sibling runs, and the syscall is
+completed when the scheduler switches back into the waiter with its own address space
+active. `kernel/src/idle.rs` adds **no kernel object and no verb** - it composes the
+timer arbiter (still the only owner of `arch::timer_*`), the NIC RX line and the UART
+RX line, halting where an interrupt can wake and saying plainly (`idle::spins()`)
+where nothing can. Two waits deliberately keep their in-trap path, because parking on
+them could never end: a receive with no NIC, and an indefinite receive with no NIC
+interrupt (only `wait_frame`'s own `POLL_BUDGET` backstop ends that). A state with
+**no** wake source left prints which cell/pid is blocked on what and ends the run
+with `abi::DEADLOCK_EXIT`. On the Linux side the same machinery makes `poll`/`ppoll`
+compute **real per-`FdKind` readiness** and honour their timeout, `epoll_wait`
+actually wait, `nanosleep` actually sleep (in the cell's own clock domain), and stdin
+block instead of answering 0 = end-of-input; `svc::SocketOps` gained the missing
+`tcp_pending` (its absence *was* the hardcoded "a remote TCP socket is always
+readable"), and creation-time `O_NONBLOCK`/`SOCK_NONBLOCK` is honoured. Those had to
+land in one slice: glibc's resolver worked *because* `poll` lied and the flag was
+dropped, so fixing either alone breaks DNS - it now blocks in `poll` until the socket
+is readable (the scheduler idling on the NIC) and its non-blocking `recvfrom`
+succeeds. Honest scope: this is **cooperative** - a cell yields at a syscall
+boundary, so a compute-bound cell still holds the CPU until timer preemption (#27) -
+and a Linux *thread*-level block still parks the whole cell rather than only the
+calling context. Proven by `schedidle` and `linuxpoll` on all three ISAs, both
+observed failing without the fix.
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
 proofs, and the hardware-lab performance numbers.
@@ -1284,6 +1316,7 @@ Everything routes through the xtask runner (`xtask/src/main.rs`):
 cargo xtask build --arch <x86_64|aarch64|riscv64|all>   # cross-compile all kernels
 cargo xtask run   --arch riscv64 [--bin lsh]            # boot in QEMU, serial on terminal
 cargo xtask test  --arch all                            # boot every test kernel, pass/fail
+cargo xtask test  --arch riscv64 --bin schedidle,netwait # boot only these (iterate)
 cargo xtask bench --arch all                            # icount path lengths (always release)
 cargo fmt --all                                         # format (CI-gated)
 cargo clippy -p xtask -- -D warnings                    # lint host code (CI-gated)
@@ -1310,11 +1343,17 @@ kernel/       the no_std kernel library + boot demo bin
   src/        ISA-independent: capability core, queue ABI, cells, mm
               (frames + frames_pmem real-nvdimm allocator + grants), time (clock), rng (ChaCha20 DRBG +
               hwrng seeding), event streams,
-              sched (reservations), lease, engine, graph, pty, smp
+              sched (reservations + the **system-wide admission ledger**:
+              a reservation must fit its cell AND the machine -
+              docs/ARCHITECTURE-DEBT.md 2.5), lease, engine, graph, pty, smp
               (per-CPU state + a kernel SpinLock + secondary-core bring-up on
               all three ISAs - docs/SMP.md), input
               (kernel RX ring + the SYS_WAIT_INPUT park-until-input primitive -
-              docs/LIBRHEO.md Phase D), ktimer (the kernel **timer arbiter**:
+              docs/LIBRHEO.md Phase D), idle (the **scheduler idle state**: what
+              the kernel does when no cell is runnable but one is blocked on a
+              wake source - composes ktimer + net_rx + input, halts where an
+              interrupt can wake, reports a genuine deadlock instead of
+              panicking - docs/ARCHITECTURE-DEBT.md 2.4), ktimer (the kernel **timer arbiter**:
               the single owner of the per-ISA hardware one-shot - a fixed 5-slot
               deadline registry (RxPoll/RxDeadline/CellSleep/NetTimer/Pacer),
               nearest-deadline arming, and no client's cancel can lose another
@@ -1337,7 +1376,8 @@ kernel/       the no_std kernel library + boot demo bin
               SYS_SPAWN/WAIT + SYS_YIELD round-robin yield + the cooperative
               cross-cell scheduler - docs/LIBRHEO.md Phase F, docs/NETSTACK.md 17),
               linux (the Linux personality:
-              docs/LINUX-COMPAT.md), U-mode programs
+              docs/LINUX-COMPAT.md - incl. the blocking, readiness-computing
+              poll/epoll_wait, a real nanosleep, and blocking stdin), U-mode programs
               (user_progs.rs incl. the lsh shell), abi
   src/arch/   per-ISA Rust modules incl. paging.rs (one dir per ISA)
   arch/       per-ISA assembly (boot, vectors/traps, context switch, user)
@@ -1436,6 +1476,23 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               real DHCP lease reported, NTP/mDNS skip-with-reason) and the
               per-ISA wait-mode assertion - NIC-interrupt park on riscv64/aarch64,
               timer-backed idle on x86-64),
+              schedidle (docs/ARCHITECTURE-DEBT.md 2.4, the keystone: the
+              scheduler idle state - two cells share one page read-write and each
+              appends its own marker to an ordering vector, so the hand-computed
+              oracle `bSSSSSSSSB` proves the peer ran all 8 rounds *while* the
+              other was blocked on a timer and then on the console, with the
+              kernel asserted to have genuinely halted; plus the wedge-free
+              refusal to park a receive that can never be satisfied, the deadlock
+              classifier, and the docs/ARCHITECTURE-DEBT.md 2.5 system-wide
+              admission ledger refusing a second 90%),
+              linuxpoll (the Linux half of 2.4: `pollx` - an unmodified
+              static-glibc binary - asserts an empty pipe is NOT readable, a
+              closed fd is POLLNVAL, both poll and epoll_wait timeouts really
+              elapse on the program's own clock, an indefinite poll is woken by a
+              forked peer, a 40 ms nanosleep sleeps, and pipe2(O_NONBLOCK) reports
+              EAGAIN with no fcntl; `polldead` polls forever on its own empty pipe
+              and the run ends with DEADLOCK_EXIT plus a diagnostic naming the
+              blocked pid, not a kernel panic),
               nettcpcc (rheo-net N2b + N2e: congestion control - the Reno/CUBIC
               integer cwnd trajectories against their oracles, and BBRv3 as the
               default: the scripted Startup/Drain/ProbeBW/ProbeRTT walk, the
