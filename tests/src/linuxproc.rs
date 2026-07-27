@@ -364,6 +364,12 @@ extern "C" fn kernel_main() -> ! {
     let want_stack: &[u8] = b"stack: RLIMIT_STACK covers the PT_GNU_STACK request\n\
         stack: touched 9280 KiB of stack in 145 frames\n\
         stackx OK\n";
+    // The stack is **grow-on-fault** (docs/ARCHITECTURE-DEBT.md 4.0): `setup_stack`
+    // maps only the top page and registers the 12 MiB request as a reservation, so the
+    // load commits one stack page and the 9280 KiB the fixture writes through fault in.
+    // Before this the whole request was mapped up front; the witness is that the stack
+    // pages now appear as demand fills rather than a load-time cost.
+    let fills_before = linux::mem::faults();
     let (code, out) = run_capture(STACKX, &[b"stackx"]);
     assert!(
         out == want_stack,
@@ -372,10 +378,21 @@ extern "C" fn kernel_main() -> ! {
         core::str::from_utf8(want_stack),
     );
     assert!(code == 0, "stackx: exit {code}, expected 0");
+    // 9280 KiB written = 2320 pages, plus the program's own touches, all filled on
+    // fault. An eagerly-mapped stack would show none of these (the pages were already
+    // present at load), so a healthy lower bound proves the stack grows on demand.
+    let stack_fills = linux::mem::faults() - fills_before;
+    assert!(
+        stack_fills > 2000,
+        "stackx: only {stack_fills} demand fills for a run that wrote 9280 KiB of \
+         stack - an eagerly-mapped stack would pre-commit it, so this is not \
+         grow-on-fault"
+    );
     println!(
-        "linuxproc: PT_GNU_STACK OK - an image asking for 12 MiB of stack is \
-         given 12 MiB and told 12 MiB, and 9280 KiB of it is actually written \
-         through - past the old fixed 8 MiB default, which faulted here"
+        "linuxproc: PT_GNU_STACK OK - an image asking for 12 MiB of stack is given 12 \
+         MiB and told 12 MiB; the load commits one page and the 9280 KiB written \
+         through faults in ({stack_fills} demand fills), so the stack grows on demand \
+         rather than costing 12 MiB up front"
     );
 
     // --- the seven syscalls the real Claude Code binary issues that the

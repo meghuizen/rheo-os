@@ -71,6 +71,15 @@ pub fn stack_pages_for(want: usize) -> usize {
     pages
 }
 
+/// The `[base, len)` of a cell's stack reservation, sized from the image's
+/// `PT_GNU_STACK` request. `install_cell` registers this as an anonymous read-write
+/// VMA so the pages below the top one grow on fault (docs/ARCHITECTURE-DEBT.md 4.0),
+/// and a touch below `base` hits no VMA and becomes a SIGSEGV - the guard page.
+pub fn reservation(img: &LinuxImage) -> (usize, usize) {
+    let bytes = stack_pages_for(img.stack_want) * FRAME_SIZE;
+    (USER_STACK_TOP - bytes, bytes)
+}
+
 // ELF auxiliary-vector types (Linux uapi/linux/auxvec.h).
 const AT_NULL: u64 = 0;
 const AT_PHDR: u64 = 3;
@@ -103,19 +112,18 @@ pub fn setup_stack(
     args: &[&[u8]],
     envs: &[&[u8]],
 ) -> usize {
-    // Map every stack page; remember the top page's frame for the write-in.
-    let mut top_pa = 0usize;
-    // Sized from the image's own `PT_GNU_STACK` request, not a fixed constant.
-    let pages = stack_pages_for(img.stack_want);
-    let mut va = USER_STACK_TOP - pages * FRAME_SIZE;
-    while va < USER_STACK_TOP {
-        let pa = frames::alloc().expect("initial process stack (bounded, at load)");
-        aspace.map_user_frame(va, pa, MapPerm::UserRw);
-        if va == USER_STACK_TOP - FRAME_SIZE {
-            top_pa = pa;
-        }
-        va += FRAME_SIZE;
-    }
+    // Map **only the top page** - the one the kernel writes the initial process block
+    // (argv/envp/auxv) into, which is asserted to fit one page below. The rest of the
+    // stack is left to grow on fault: `install_cell` registers the whole span as an
+    // anonymous VMA, so a touch below the top page faults into a fresh zeroed frame
+    // through `linux::mem::fault`, and a touch below the *reservation* hits no VMA and
+    // becomes a SIGSEGV - a guard page for free (docs/ARCHITECTURE-DEBT.md 4.0). The
+    // request used to be mapped whole, so an image asking for a 64 MiB stack paid 64
+    // MiB before `main`; now it pays one page plus what it touches.
+    let sizing_note = stack_pages_for(img.stack_want); // logs a clamp if the image over-asks
+    let _ = sizing_note;
+    let top_pa = frames::alloc().expect("initial process stack top page (bounded, at load)");
+    aspace.map_user_frame(USER_STACK_TOP - FRAME_SIZE, top_pa, MapPerm::UserRw);
 
     // Inject the rt_sigreturn trampoline page for the signal machinery
     // (docs/LINUX-COMPAT.md L5). ARM64/RISC-V have no SA_RESTORER path, so the

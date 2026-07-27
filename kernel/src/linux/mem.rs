@@ -83,6 +83,19 @@ pub const fn mmap_base() -> usize {
     MMAP_BASE
 }
 
+/// Register an anonymous read-write **reservation** the fault handler fills on first
+/// touch - the grow-on-fault stack (docs/ARCHITECTURE-DEBT.md 4.0, blocker 2).
+///
+/// Unlike a `PROT_NONE` reservation this is immediately fillable (a stack page a
+/// program touches must appear); unlike an eager mapping it costs nothing until
+/// touched. Only the top page is mapped eagerly by `stack::setup_stack`; this record
+/// is what lets `fault` fill the rest, and its lower bound is what makes an overflow a
+/// SIGSEGV rather than silent growth into whatever lies below.
+pub fn reserve_stack(st: &mut LinuxState, base: usize, bytes: usize) {
+    st.vmas
+        .insert(base, bytes, PROT_READ | PROT_WRITE, MAP_ANONYMOUS);
+}
+
 /// Map mmap `prot` bits onto a W^X `MapPerm`. PROT_EXEC without PROT_WRITE is
 /// executable-read; PROT_WRITE is read-write; anything else (PROT_READ,
 /// PROT_NONE) is read-only.

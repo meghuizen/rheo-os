@@ -150,6 +150,11 @@ pub fn install_cell(idx: usize, img: &crate::load::LinuxImage) {
     // ...and then the mappings for the segments the loader chose not to copy, which
     // must come *after* the clear that would otherwise throw them away.
     record_image_segments(idx, img);
+    // The stack is a grow-on-fault reservation: `setup_stack` mapped only its top
+    // page, and this record is what lets the pages below it fault in on touch
+    // (docs/ARCHITECTURE-DEBT.md 4.0, blocker 2).
+    let (stack_lo, stack_len) = stack::reservation(img);
+    mem::reserve_stack(st, stack_lo, stack_len);
     // Seed the multi-context thread table with context 0 (docs/LINUX-COMPAT.md
     // L4), reusing the cell's installed frame.
     thread::init_cell(idx);
@@ -275,6 +280,8 @@ pub(crate) fn exec_reinit(cell: usize, img: &crate::load::LinuxImage) {
     // simply has no mapping for the pages the loader recorded, and dies at its entry
     // point - which is why the two call sites are worth reading side by side.
     record_image_segments(cell, img);
+    let (stack_lo, stack_len) = stack::reservation(img);
+    mem::reserve_stack(st, stack_lo, stack_len);
 }
 
 // ------------------------------------------------------------- stdout tap
