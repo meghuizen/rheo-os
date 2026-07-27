@@ -1683,8 +1683,12 @@ what would have to be audited first is named in docs/SMP.md 10 - the cell table,
 capability/object tables, the Linux per-cell state, and the per-CPU-ing of the trap
 entry itself (on x86-64 `CUR_FRAME`/`KERNEL_RSP`/`USER_RSP_SCRATCH` are globals the
 syscall fast path reads, so that is a change *to* the fast path rather than an addition
-beside it; ARM64 and RISC-V already have per-core `VBAR_EL1`/`TPIDR_EL1` and
-`stvec`/`sscratch`).
+beside it - the standard `swapgs`/`IA32_KERNEL_GS_BASE` arrangement, since indexing by
+`cpu_index()` would read the LAPIC ID over MMIO in front of every syscall). **RISC-V and
+ARM64 are nearly free**: RISC-V's `traps.S` already keeps the frame pointer in
+`sscratch` and ARM64's in `TPIDR_EL1`, both per-core registers, so those trap paths are
+per-core in hardware with no software change - only `KERNEL_CTX` and the portable
+`CURRENT`/`TOP_CELL`/`EXITED` need per-CPU-ing. docs/SMP.md 10.0 specifies the slice.
 
 **Still honest about what is not wired:** the fixed VA map is still the map (S2'
 untouched), dispatch is proven for native cells and **off by default** except the

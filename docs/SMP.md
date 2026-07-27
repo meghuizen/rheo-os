@@ -581,6 +581,48 @@ scheduler itself has not.
   vCPUs onto host threads; simultaneity is the available evidence and it is what is
   asserted.
 
+### 10.0 The next slice, specified
+
+Running a **cell in user mode on a secondary** is the next capability, and it is
+smaller than "audit everything" once the per-ISA trap state is looked at rather than
+assumed. What follows was established by reading the three entry paths, so the next
+session starts from a list instead of rediscovering it.
+
+**RISC-V is nearly free.** `traps.S` keeps the current `TrapFrame` pointer in
+**`sscratch`**, and `stvec` is per-hart too - both are CSRs, so the trap path is already
+per-core *in hardware* with no software change at all. The only per-ISA global left is
+`KERNEL_CTX` (the saved kernel context `return_to_kernel` unwinds to), and `tp` already
+holds the CPU index, so indexing it is three instructions in the existing asm.
+
+**ARM64 is nearly free for the same reason**: `VBAR_EL1` is per-core and the frame
+pointer lives in `TPIDR_EL1`, which is a per-core register. A secondary sets its own
+vector base at bring-up and the rest follows.
+
+**x86-64 is the real work**, and it is a change *to* the syscall fast path rather than
+an addition beside it. `syscall_entry` reads `CUR_FRAME`, `KERNEL_RSP` and
+`USER_RSP_SCRATCH` as RIP-relative globals - a deliberate simplification, stated in
+`user.S`'s header as "single CPU, so ... plain globals (no GS/swapgs needed)". Making
+them per-CPU means the standard `swapgs` + `IA32_KERNEL_GS_BASE` arrangement and
+GS-relative addressing on the hottest path in the kernel. Indexing an array by
+`cpu_index()` is **not** an alternative there: that reads the LAPIC ID over MMIO, which
+is not something to put in front of every syscall.
+
+**Portable state that must become per-CPU regardless of ISA:** `user::CURRENT`,
+`TOP_CELL` and `EXITED`. All three are `static mut` scalars and all three have a
+`PerCpu<T>` shape; with `cpu_index()` a compile-time 0 on the non-`smp` build, that
+substitution changes nothing there.
+
+**Then the audit**, in blast-radius order: the cell table (`user::CELLS`), the
+capability and object tables, and the Linux personality's per-cell state. The
+partitioning answer is likely to beat the locking one - a cell belongs to a core, and a
+core touches only its own cells - which is the multikernel model this document already
+commits to (SCHEDULING.md 1a) rather than a new idea.
+
+The gate: a native cell running in user mode on a secondary while another runs on the
+primary, with the two-cell interleave witness the `preempt` and `schedidle` kernels
+already use, on the ISAs where it is reached - and skip-with-reason where it is not,
+per the `iommu` precedent.
+
 **What is still design only:** everything below about scheduling *cells* on the second
 core. A secondary drains a queue of kernel work items and parks - which is real
 load-shared parallel execution, but the work items are kernel jobs, not cells. **No cell
