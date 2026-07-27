@@ -19,6 +19,7 @@ use core::mem::MaybeUninit;
 use core::ptr::addr_of_mut;
 
 use kernel::capability::{CapTable, ObjectTable};
+use kernel::ktimer;
 use kernel::linux::{self, stack as linux_stack};
 use kernel::mm::AddressSpace;
 use kernel::queue::QueuePair;
@@ -54,6 +55,39 @@ macro_rules! rustthreads_bin {
 }
 
 static RUSTTHREADS: &[u8] = rustthreads_bin!();
+
+/// The static-glibc `pthread_cond_timedwait` fixture (built by
+/// `xtask::build_linux_fixtures`), for the futex-timeout phase below.
+macro_rules! fixture {
+    ($name:literal) => {{
+        #[cfg(target_arch = "x86_64")]
+        {
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/linux-fixtures/build/x86_64/",
+                $name
+            ))
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/linux-fixtures/build/aarch64/",
+                $name
+            ))
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/linux-fixtures/build/riscv64/",
+                $name
+            ))
+        }
+    }};
+}
+
+static CONDWAIT: &[u8] = fixture!("condwait");
 
 static mut OBJECTS: ObjectTable = ObjectTable::new();
 static mut CAPS: CapTable = CapTable::new();
@@ -133,6 +167,62 @@ extern "C" fn kernel_main() -> ! {
         }
         Outcome::Faulted(addr) => panic!("rustthreads faulted at {addr:#x}"),
     }
+
+    println!("linuxthreads: OK (clone + futex + TLS + join)");
+
+    // --- the futex **timeout** (docs/LINUX-COMPAT.md L4, the `futex` row).
+    // `pthread_cond_timedwait` on a condvar nobody signals, in a process with no
+    // other thread: the only thing that can end the wait is its own deadline. The
+    // timeout used to be ignored, and with nothing else runnable the kernel
+    // answered 0 ("you were woken"), so glibc looped forever.
+    //
+    // The kernel arms the deadline through the timer arbiter's own slot, so the
+    // wait is a genuine halt where the timer interrupt is wired - enabled here,
+    // opt-in as everywhere else, and reported rather than claimed.
+    ktimer::reset();
+    arch::enable_timer_irq();
+    let parks_before = ktimer::parks();
+    unsafe {
+        STDOUT_LEN = 0;
+    }
+    linux::set_stdout_tap(Some(tap));
+    let outcome = run(CONDWAIT, &[b"condwait"]);
+    linux::set_stdout_tap(None);
+    let want_cond: &[u8] =
+        b"condwait: realtime timedout\ncondwait: monotonic timedout\ncondwait OK\n";
+    match outcome {
+        Outcome::Exited(code) => {
+            let got = captured();
+            assert!(
+                got == want_cond,
+                "condwait stdout mismatch:\n  got:      {:?}\n  expected: {:?}",
+                core::str::from_utf8(got),
+                core::str::from_utf8(want_cond),
+            );
+            assert!(code == 0, "condwait exited {code}, expected 0");
+        }
+        Outcome::Faulted(addr) => panic!("condwait faulted at {addr:#x}"),
+    }
+    // Both waits must have gone through the arbiter's futex slot - evidence the
+    // deadline was a registered deadline, not a spin that happened to end.
+    let regs = ktimer::registrations(ktimer::TimerClient::FutexWait);
+    assert!(
+        regs > 0,
+        "condwait timed out without ever registering a futex deadline with the timer \
+         arbiter - the wait was not honoured the way it claims to be"
+    );
+    let parks = ktimer::parks() - parks_before;
+    println!(
+        "linuxthreads: futex timeout OK - two pthread_cond_timedwait waits on a \
+         never-signalled condvar returned ETIMEDOUT no earlier than their own \
+         deadlines ({regs} arbiter futex deadlines, {parks} genuine CPU halts; \
+         0 halts means this ISA has no wired one-shot and the deadline was honoured \
+         by comparison)"
+    );
+    assert!(
+        kernel::linux::thread::deadlock_waits() == 0,
+        "condwait hit the unsatisfiable-futex path - the timeout was not honoured"
+    );
 
     println!("linuxthreads: PASS");
     arch::exit(arch::ExitCode::Success)

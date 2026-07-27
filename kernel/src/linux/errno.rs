@@ -31,6 +31,13 @@ pub const ERANGE: i64 = 34;
 pub const ENAMETOOLONG: i64 = 36;
 pub const ENOSYS: i64 = 38;
 pub const ENOTEMPTY: i64 = 39;
+/// "No locks available" - what `fcntl` file locking answers here: this
+/// personality has no lock manager, and POSIX reserves this errno for exactly
+/// that (docs/LINUX-COMPAT.md, the `fcntl` row).
+pub const ENOLCK: i64 = 37;
+/// "Timer expired" - a `futex` wait whose caller-supplied timeout elapsed
+/// (docs/LINUX-COMPAT.md L4, the `futex` row).
+pub const ETIMEDOUT: i64 = 110;
 
 // Socket errnos (AF_UNIX, docs/LINUX-COMPAT.md L8). Same asm-generic values on
 // all three ISAs.

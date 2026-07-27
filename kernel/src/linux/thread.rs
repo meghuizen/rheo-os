@@ -25,6 +25,7 @@
 //! reservation-holding threads exist in the test suite.
 
 use crate::arch::{self, TrapFrame};
+use crate::ktimer::{self, TimerClient};
 use crate::linux::Ctl;
 use crate::linux::errno::*;
 use crate::user::{self, MAX_CELLS};
@@ -77,6 +78,14 @@ struct Thread {
     fs_base: u64,
     /// Futex word this context is `Blocked` on (0 when not blocked).
     fut_addr: u64,
+    /// Absolute deadline of this context's futex wait, in the **cell's own clock
+    /// domain** ([`crate::linux::cell_clock_ns`]); 0 means "no timeout".
+    ///
+    /// The cell's domain, not the timer's, because a Linux program computes an
+    /// absolute `FUTEX_WAIT_BITSET` deadline from its own `clock_gettime`, and
+    /// comparing it against a different counter would make the same "50 ms" mean
+    /// something different per ISA (docs/ENGINEERING.md 11).
+    fut_deadline: u64,
     fp: FpArea,
 }
 
@@ -89,6 +98,7 @@ impl Thread {
             clear_child_tid: 0,
             fs_base: 0,
             fut_addr: 0,
+            fut_deadline: 0,
             fp: FpArea::new(),
         }
     }
@@ -152,6 +162,8 @@ pub fn init_cell(cell: usize) {
 
 /// Clear every cell's thread table (called from `linux::reset`).
 pub fn reset() {
+    // SAFETY: single CPU, between runs.
+    unsafe { *addr_of_mut!(DEADLOCK_WAITS) = 0 };
     for cell in 0..MAX_CELLS {
         for th in threads(cell).iter_mut() {
             *th = Thread::new();
@@ -333,6 +345,7 @@ pub fn clone(
         0
     };
     th.fut_addr = 0;
+    th.fut_deadline = 0;
     // Give the child a valid FP image (x86 FXRSTOR needs a well-formed MXCSR);
     // the parent's current FP state is a valid one to seed with.
     // SAFETY: the FP area is 16-aligned and large enough.
@@ -361,34 +374,63 @@ const FUTEX_WAKE: u64 = 1;
 const FUTEX_WAIT_BITSET: u64 = 9;
 const FUTEX_WAKE_BITSET: u64 = 10;
 
-/// futex(uaddr, op, val, ...) - FUTEX_WAIT/WAKE (+ the _BITSET variants treated
-/// as plain WAIT/WAKE; the PRIVATE flag is ignored). WAIT re-checks the word
-/// and parks the caller if it still equals `val`, switching to another ready
+/// futex(uaddr, op, val, timeout, ...) - FUTEX_WAIT/WAKE (+ the _BITSET variants
+/// treated as plain WAIT/WAKE; the PRIVATE flag is ignored). WAIT re-checks the
+/// word and parks the caller if it still equals `val`, switching to another ready
 /// context; WAKE moves up to `val` parked waiters back to ready
-/// (docs/LINUX-COMPAT.md L4). Any timeout is treated as infinite (cooperative
-/// model; documented).
-pub fn futex(cell: usize, uaddr: u64, op: u64, val: u32) -> Ctl {
+/// (docs/LINUX-COMPAT.md L4).
+///
+/// **The timeout is honoured.** It used to be ignored entirely, so
+/// `pthread_cond_timedwait` could wait forever - a hang whose cause was nowhere
+/// near its symptom. `timeout_va` is a `struct timespec`: **relative** for
+/// `FUTEX_WAIT`, **absolute** for `FUTEX_WAIT_BITSET` (in CLOCK_MONOTONIC unless
+/// `FUTEX_CLOCK_REALTIME` is set) - which is the shape glibc's condition variables
+/// actually use. An elapsed deadline returns `-ETIMEDOUT`; when nothing else in the
+/// cell is runnable the CPU **parks** on it through the kernel timer arbiter, never
+/// `arch::timer_*` directly (docs/ENGINEERING.md 3).
+pub fn futex(cell: usize, uaddr: u64, op: u64, val: u32, timeout_va: u64) -> Ctl {
     let cmd = op & 0x7f;
+    // A sibling's deadline may already have elapsed while this context ran.
+    expire_timeouts(cell);
     match cmd {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             // Re-check under the "lock" (single CPU, synchronous): if the word
             // no longer holds the expected value the caller must not block.
-            // SAFETY: `uaddr` is a readable 32-bit word in the active cell.
+            // SAFETY: `uaddr` is a readable 32-bit word in the active cell
+            // (bounded at the dispatch point, docs/ENGINEERING.md 12).
             let cur = unsafe { (uaddr as *const u32).read() };
             if cur != val {
                 return Ctl::Ret((-EAGAIN) as u64);
             }
+            let deadline = match wait_deadline(cmd, op, timeout_va) {
+                Deadline::None => 0,
+                Deadline::At(d) => d,
+                Deadline::Passed => return Ctl::Ret((-ETIMEDOUT) as u64),
+            };
             let ci = cur_thread(cell);
-            match pick_next(cell, ci) {
-                Some(next) => {
-                    threads(cell)[ci].state = TState::Blocked;
-                    threads(cell)[ci].fut_addr = uaddr;
-                    // The caller's return value (0) is written when it is woken.
-                    switch_to(cell, ci, next)
+            threads(cell)[ci].state = TState::Blocked;
+            threads(cell)[ci].fut_addr = uaddr;
+            threads(cell)[ci].fut_deadline = deadline;
+            match next_runnable_or_wait(cell) {
+                Some(next) => switch_to(cell, ci, next),
+                None => {
+                    // Nothing else can run and no deadline can arrive, so this wait
+                    // can never be satisfied from inside the cell: it is a deadlock.
+                    // There is no futex errno for that, and every real caller
+                    // (glibc's low-level locks, Rust's parker) ignores the return
+                    // and re-reads the word - so the survivable answer is still
+                    // "recheck". What changes is that the kernel no longer claims a
+                    // *wakeup* happened (it returned 0, a lie that read as "someone
+                    // woke you"): it reports -EAGAIN, says so once on the console,
+                    // and counts it, so the spin is visible at its cause.
+                    // Remaining work: with timer preemption + a cross-cell futex
+                    // this becomes a real block (docs/CONCURRENCY.md, task #27).
+                    threads(cell)[ci].state = TState::Ready;
+                    threads(cell)[ci].fut_addr = 0;
+                    threads(cell)[ci].fut_deadline = 0;
+                    note_deadlock(uaddr);
+                    Ctl::Ret((-EAGAIN) as u64)
                 }
-                // Nobody else can run: blocking would be a deadlock, so treat
-                // this as a spurious wake (glibc re-checks and loops).
-                None => Ctl::Ret(0),
             }
         }
         FUTEX_WAKE | FUTEX_WAKE_BITSET => Ctl::Ret(wake(cell, uaddr, val) as u64),
@@ -398,6 +440,163 @@ pub fn futex(cell: usize, uaddr: u64, op: u64, val: u32) -> Ctl {
         }
     }
 }
+
+/// What a futex wait's `timeout` argument resolved to.
+enum Deadline {
+    /// No timeout supplied: wait indefinitely.
+    None,
+    /// An absolute deadline in the cell's clock domain.
+    At(u64),
+    /// The supplied deadline is already in the past.
+    Passed,
+}
+
+/// `FUTEX_CLOCK_REALTIME`: the absolute deadline is in CLOCK_REALTIME, not
+/// CLOCK_MONOTONIC (uapi/linux/futex.h).
+const FUTEX_CLOCK_REALTIME: u64 = 256;
+
+/// Resolve a futex wait's `timeout` pointer to an absolute deadline in the cell's
+/// clock domain. `FUTEX_WAIT` takes a **relative** timespec; `FUTEX_WAIT_BITSET`
+/// an **absolute** one, in the clock `FUTEX_CLOCK_REALTIME` selects.
+fn wait_deadline(cmd: u64, op: u64, timeout_va: u64) -> Deadline {
+    if timeout_va == 0 {
+        return Deadline::None;
+    }
+    // SAFETY: a `struct timespec` (two 64-bit words) bounded against the calling
+    // cell's user VA range at the dispatch point (`ptr_args_ok`'s FUTEX row, which
+    // validates arg 3 exactly for the two WAIT commands that reach here - for the
+    // WAKE commands arg 3 is a count and is not treated as a pointer).
+    let (secs, nsecs) = unsafe {
+        let p = timeout_va as *const i64;
+        (p.read(), p.add(1).read())
+    };
+    if secs < 0 || !(0..1_000_000_000).contains(&nsecs) {
+        // An invalid timespec: treat it as no timeout rather than as a deadline in
+        // the past. Linux answers -EINVAL; the dispatcher has no path for that here
+        // and no caller in the suite sends one, so this stays conservative.
+        return Deadline::None;
+    }
+    let ts = (secs as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nsecs as u64);
+    let mono = crate::linux::cell_clock_ns(false);
+    if cmd == FUTEX_WAIT_BITSET {
+        // Absolute, in the caller's chosen clock. Convert to the monotonic domain
+        // the table stores by taking the *remaining* interval.
+        let now = crate::linux::cell_clock_ns(op & FUTEX_CLOCK_REALTIME != 0);
+        if ts <= now {
+            return Deadline::Passed;
+        }
+        Deadline::At(mono.saturating_add(ts - now).max(1))
+    } else {
+        if ts == 0 {
+            return Deadline::Passed;
+        }
+        Deadline::At(mono.saturating_add(ts).max(1))
+    }
+}
+
+/// The nearest outstanding futex deadline among `cell`'s blocked contexts.
+fn nearest_deadline(cell: usize) -> Option<u64> {
+    let t = threads(cell);
+    t.iter()
+        .filter(|th| th.state == TState::Blocked && th.fut_deadline != 0)
+        .map(|th| th.fut_deadline)
+        .min()
+}
+
+/// Move every blocked context whose futex deadline has passed back to ready, with
+/// `-ETIMEDOUT` as its futex return value. Returns how many timed out.
+fn expire_timeouts(cell: usize) -> usize {
+    let now = crate::linux::cell_clock_ns(false);
+    let mut n = 0;
+    for i in 0..MAX_THREADS {
+        let (due, frame) = {
+            let th = &threads(cell)[i];
+            (
+                th.state == TState::Blocked && th.fut_deadline != 0 && now >= th.fut_deadline,
+                th.frame,
+            )
+        };
+        if due {
+            threads(cell)[i].state = TState::Ready;
+            threads(cell)[i].fut_addr = 0;
+            threads(cell)[i].fut_deadline = 0;
+            // SAFETY: `frame` is this context's saved state.
+            arch::set_syscall_ret(unsafe { &mut *frame }, (-ETIMEDOUT) as u64);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Park slice for a futex deadline, in the **timer arbiter's** domain. The
+/// deadline itself lives in the cell's clock domain, and the two are different
+/// counters on RISC-V, so the wait cannot be a single hardware arm: it is a
+/// sequence of bounded parks, each followed by a re-read of the cell clock. 1 ms is
+/// long enough that the halt is worth taking and short enough that the overshoot
+/// past a deadline stays small.
+const FUTEX_PARK_SLICE_NS: u64 = 1_000_000;
+
+/// The next context of `cell` that can run, parking on the nearest futex deadline
+/// while none can. `None` means nothing will ever be runnable again - every
+/// context is blocked on a futex with no deadline.
+fn next_runnable_or_wait(cell: usize) -> Option<usize> {
+    let from = cur_thread(cell);
+    loop {
+        expire_timeouts(cell);
+        if let Some(next) = pick_next(cell, from) {
+            return Some(next);
+        }
+        let deadline = nearest_deadline(cell)?;
+        wait_until(deadline);
+    }
+}
+
+/// Halt until the cell-domain deadline `deadline` passes. The hardware one-shot is
+/// reached only through the kernel timer arbiter's own slot
+/// ([`TimerClient::FutexWait`]), so this can never cancel another subsystem's
+/// deadline (docs/ENGINEERING.md 3, docs/NETSTACK.md 16). Where no timer interrupt
+/// is wired the arbiter refuses to halt and the deadline is honoured by comparison,
+/// which is the honest fallback rather than a claimed park.
+fn wait_until(deadline: u64) {
+    while crate::linux::cell_clock_ns(false) < deadline {
+        ktimer::register(TimerClient::FutexWait, FUTEX_PARK_SLICE_NS);
+        if !ktimer::park(false) {
+            // Nothing to wake a halt (or the slice was below the one-shot's
+            // resolution): spin out this slice rather than halt with no wake source.
+            arch::spin_loop(256);
+        }
+    }
+    ktimer::cancel(TimerClient::FutexWait);
+}
+
+/// Console note + count for a futex wait that can never be satisfied. One line per
+/// cell run, so a spinning program says so once instead of flooding the log.
+fn note_deadlock(uaddr: u64) {
+    // SAFETY: single CPU, synchronous traps.
+    let n = unsafe {
+        let c = &mut *addr_of_mut!(DEADLOCK_WAITS);
+        *c += 1;
+        *c
+    };
+    if n == 1 {
+        crate::println!(
+            "linux: futex WAIT at {uaddr:#x} with no runnable sibling and no timeout - \
+             cannot be satisfied; reporting EAGAIN so the caller re-checks (see \
+             docs/LINUX-COMPAT.md, the futex row)"
+        );
+    }
+}
+
+/// Futex waits that could never be satisfied since the last [`reset`]. Evidence a
+/// test can assert on rather than infer (docs/ENGINEERING.md 1).
+pub fn deadlock_waits() -> u64 {
+    // SAFETY: single CPU.
+    unsafe { *addr_of_mut!(DEADLOCK_WAITS) }
+}
+
+static mut DEADLOCK_WAITS: u64 = 0;
 
 /// Move up to `max` contexts parked on `uaddr` back to ready, setting each one's
 /// futex return value to 0. Returns the number woken.
@@ -417,6 +616,7 @@ fn wake(cell: usize, uaddr: u64, max: u32) -> u32 {
         if blocked {
             threads(cell)[i].state = TState::Ready;
             threads(cell)[i].fut_addr = 0;
+            threads(cell)[i].fut_deadline = 0;
             // SAFETY: `frame` is this context's saved state.
             arch::set_syscall_ret(unsafe { &mut *frame }, 0);
             woken += 1;
@@ -428,6 +628,7 @@ fn wake(cell: usize, uaddr: u64, max: u32) -> u32 {
 /// sched_yield: hand the CPU to the next ready context (if any), leaving the
 /// caller ready. Returns 0.
 pub fn sched_yield(cell: usize) -> Ctl {
+    expire_timeouts(cell);
     let ci = cur_thread(cell);
     match pick_next(cell, ci) {
         Some(next) => {
@@ -454,7 +655,10 @@ pub fn exit_thread(cell: usize, code: u64) -> Ctl {
     }
     threads(cell)[ci].state = TState::Free;
     threads(cell)[ci].fut_addr = 0;
-    match pick_next(cell, ci) {
+    threads(cell)[ci].fut_deadline = 0;
+    // A sibling parked on a futex *with a deadline* is not gone - the process is
+    // over only when nothing can become runnable again.
+    match next_runnable_or_wait(cell) {
         // The exiting context's FP state is gone; just load the successor's.
         Some(next) => resume(cell, next),
         // Last thread of the cell: this is a whole-process exit. Route through

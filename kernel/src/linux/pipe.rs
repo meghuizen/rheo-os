@@ -21,7 +21,9 @@ const PIPE_COUNT: usize = 16;
 /// Per-pipe ring capacity. Large enough that the L6 suite's pipeline payloads
 /// (`seq 1 100 | wc -l`, `ls | sort | head`) never fill it, so a writer rarely
 /// blocks; blocking write is still handled for correctness.
-const PIPE_CAP: usize = 64 * 1024;
+/// Bytes one pipe's ring buffer holds. Reported verbatim by
+/// `fcntl(F_GETPIPE_SZ)` - a real answer, not a guess.
+pub const PIPE_CAP: usize = 64 * 1024;
 
 struct Pipe {
     buf: [u8; PIPE_CAP],

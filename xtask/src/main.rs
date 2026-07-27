@@ -1169,6 +1169,18 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         // DNS round trip to SLIRP's resolver + a real remote TCP connect, the
         // `linuxnet` proof.
         ("inetremote.c", "inetremote"),
+        // Name resolution through glibc's own resolver (docs/NETSTACK.md 18):
+        // `getaddrinfo` over the seeded /etc/{nsswitch.conf,hosts,resolv.conf},
+        // the second `linuxnet` phase.
+        ("resolve.c", "resolve"),
+        // `fcntl`'s honesty (docs/LINUX-COMPAT.md, the `fcntl` row): unimplemented
+        // commands refused, O_NONBLOCK honoured, F_GETFL real, FD_CLOEXEC closed
+        // across execve. Part of the `linuxproc` proof (it execve's itself).
+        ("fcntlx.c", "fcntlx"),
+        // A futex wait that must END BY ITSELF (docs/LINUX-COMPAT.md L4, the
+        // `futex` row): `pthread_cond_timedwait` on a never-signalled condvar.
+        // Part of the `linuxthreads` proof.
+        ("condwait.c", "condwait"),
     ] {
         let mut sc = Command::new(cc);
         sc.arg("-static").arg("-no-pie");

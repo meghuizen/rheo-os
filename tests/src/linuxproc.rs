@@ -71,6 +71,7 @@ macro_rules! fixture {
 static PROCDEMO: &[u8] = fixture!("procdemo");
 static CECHO: &[u8] = fixture!("cecho");
 static RSH: &[u8] = fixture!("rsh");
+static FCNTLX: &[u8] = fixture!("fcntlx");
 static COREUTILS: &[u8] = fixture!("cu/bin/coreutils");
 
 static mut OBJECTS: ObjectTable = ObjectTable::new();
@@ -227,6 +228,37 @@ extern "C" fn kernel_main() -> ! {
     let pct = passed * 100 / total;
     println!("linuxproc: P11 coreutils suite {passed}/{total} = {pct}% (gate >= 80%)");
     assert!(pct >= 80, "P11 gate not met: {passed}/{total} = {pct}%");
+
+    // --- `fcntl` honesty (docs/LINUX-COMPAT.md, the `fcntl` row). This lands
+    // here because its last phase needs `execve`: the fixture marks one
+    // descriptor FD_CLOEXEC, leaves another alone, and execve's ITSELF from the
+    // VFS, so the child observes which descriptors survived. The earlier phases
+    // are pure fd-table semantics (refused commands with distinct errnos,
+    // O_NONBLOCK honoured, F_GETFL real).
+    fs::write("/bin/fcntlx", FCNTLX).expect("seed /bin/fcntlx");
+    let want_fcntl: &[u8] = b"fcntl: setlk ENOLCK\n\
+        fcntl: badcmd EINVAL\n\
+        fcntl: nonblock EAGAIN\n\
+        fcntl: stdin EAGAIN\n\
+        fcntl: getfl ok\n\
+        fcntl: blocking read ok\n\
+        fcntl: exec child\n\
+        fcntl: cloexec closed\n\
+        fcntl: plain survived\n\
+        fcntl OK\n";
+    let (code, out) = run_capture(FCNTLX, &[b"fcntlx"]);
+    assert!(
+        out == want_fcntl,
+        "fcntlx: stdout mismatch\n  got:      {:?}\n  expected: {:?}",
+        core::str::from_utf8(out),
+        core::str::from_utf8(want_fcntl),
+    );
+    assert!(code == 0, "fcntlx: exit {code}, expected 0");
+    println!(
+        "linuxproc: fcntl OK - F_SETLK -> ENOLCK, an unknown cmd -> EINVAL, \
+         F_SETFL(O_NONBLOCK) honoured on a pipe and on stdin, F_GETFL real, \
+         FD_CLOEXEC closed across execve while a plain fd survived"
+    );
 
     println!("linuxproc: PASS");
     arch::exit(arch::ExitCode::Success)

@@ -94,6 +94,7 @@ macro_rules! fixture {
 }
 
 static INETREMOTE: &[u8] = fixture!("inetremote");
+static RESOLVE: &[u8] = fixture!("resolve");
 
 static mut OBJECTS: ObjectTable = ObjectTable::new();
 static mut CAPS: CapTable = CapTable::new();
@@ -232,10 +233,15 @@ extern "C" fn kernel_main() -> ! {
         }
     );
 
-    // A ramfs at / + the VFS personality (glibc startup wants a working VFS
-    // surface; the fixture opens no files).
+    // A ramfs at / + the VFS personality. The `inetremote` fixture opens no
+    // files, but `resolve` does: glibc's name resolver reads
+    // /etc/{nsswitch.conf,hosts,resolv.conf}, so they are seeded here
+    // (docs/NETSTACK.md 18). Without them glibc falls back to its built-in
+    // nameserver 127.0.0.1:53 - a *loopback* address, routed to the in-kernel
+    // datagram queue where nothing listens.
     posix::reset();
     mount::mount("/", Rc::new(RamFs::new()));
+    vfs_personality::seed_resolver_files();
     svc::set_file_ops(vfs_personality::ops());
 
     // The N4b bridge: the remote-INET datapath, over the rheo-net codec + the NIC.
@@ -290,6 +296,72 @@ extern "C" fn kernel_main() -> ! {
         "linuxnet: unmodified static-glibc binary did a REAL remote UDP round trip \
          (DNS to 10.0.2.3:53) + a real remote TCP connect over the NIC"
     );
+
+    // ---------------------------------------------------------------- resolve
+    // Phase 2: name resolution through **glibc's own resolver** rather than a
+    // hand-built packet - `getaddrinfo`, the call every real networked program
+    // makes. The deterministic half is the `files` backend reading the seeded
+    // /etc/hosts (a closed-form answer, asserted exactly); the live half is a real
+    // public name, whose address is a property of the host's resolver and is
+    // therefore reported, never asserted (docs/ENGINEERING.md 4/7).
+    unsafe {
+        STDOUT_LEN = 0;
+    }
+    linux::set_stdout_tap(Some(tap));
+    let outcome = run(RESOLVE, &[b"resolve"]);
+    linux::set_stdout_tap(None);
+    match outcome {
+        Outcome::Exited(code) => {
+            let got = captured();
+            assert!(
+                code == 0,
+                "resolve: exit {code}, expected 0; stdout {:?}",
+                core::str::from_utf8(got)
+            );
+            let hosts: &[u8] = b"resolve: loopback refused\nresolve: hosts 10.9.8.7\n";
+            let Some(rest) = got.strip_prefix(hosts) else {
+                panic!(
+                    "resolve: the loopback refusal and/or the /etc/hosts lookup did not \
+                     produce their expected lines\n  got: {:?}",
+                    core::str::from_utf8(got)
+                );
+            };
+            let live = if let Some(t) = rest.strip_prefix(&b"resolve: dns ok\n"[..]) {
+                assert_eq!(t, b"resolve OK\n", "resolve: unexpected tail");
+                true
+            } else if let Some(t) = rest.strip_prefix(&b"resolve: dns none\n"[..]) {
+                assert_eq!(t, b"resolve OK\n", "resolve: unexpected tail");
+                false
+            } else {
+                panic!(
+                    "resolve: stdout not an accepted transcript\n  got: {:?}",
+                    core::str::from_utf8(got)
+                );
+            };
+            println!(
+                "linuxnet: a loopback UDP send to a port with no listener was REFUSED \
+                 (ECONNREFUSED), not silently reported sent"
+            );
+            println!(
+                "linuxnet: getaddrinfo read the seeded /etc/{{nsswitch.conf,hosts}} and \
+                 resolved rheo.test -> 10.9.8.7 from the file (deterministic, no wire)"
+            );
+            if live {
+                println!(
+                    "linuxnet: getaddrinfo also resolved a real public name over the NIC \
+                     via SLIRP's resolver (reported, not asserted - the address is the \
+                     host's, not this code's)"
+                );
+            } else {
+                println!(
+                    "linuxnet: the live getaddrinfo returned no address - reported, not \
+                     asserted (no outbound DNS behind SLIRP on this host); the \
+                     deterministic /etc/hosts resolution above still holds"
+                );
+            }
+        }
+        Outcome::Faulted(addr) => panic!("resolve: faulted at {addr:#x}"),
+    }
 
     // Kernel-side evidence that the remote receive genuinely parked. The interrupt
     // count can only be incremented from the ISA's interrupt vector, so it cannot

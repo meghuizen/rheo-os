@@ -98,10 +98,17 @@ pub enum TimerClient {
     /// latent. A cell selects it on `SYS_ARM_TIMER` with
     /// [`crate::abi::TIMER_CLIENT_PACER`].
     Pacer = 4,
+    /// A Linux-personality **futex wait's timeout** (docs/LINUX-COMPAT.md L4, the
+    /// `futex` row): `pthread_cond_timedwait`'s deadline, honoured when no other
+    /// context of the cell is runnable. It needs its own slot for the same reason
+    /// the pacer does - a cell can have a futex deadline outstanding while its
+    /// sleep, a receive deadline and the pacer are all also outstanding, and no
+    /// client may cancel another's.
+    FutexWait = 5,
 }
 
 /// Number of deadline slots (one per [`TimerClient`]).
-pub const CLIENTS: usize = 5;
+pub const CLIENTS: usize = 6;
 
 #[derive(Copy, Clone)]
 struct Slot {

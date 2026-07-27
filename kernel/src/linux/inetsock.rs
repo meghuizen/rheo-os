@@ -320,17 +320,32 @@ pub fn close_dgram(ep: u8) {
     }
 }
 
+/// What a loopback datagram send did. The three cases are **not** the same
+/// answer to the caller (docs/ENGINEERING.md 7): a full queue is a drop, which UDP
+/// permits and which a sender may legitimately be told succeeded; **no endpoint at
+/// all** is a delivery that can never happen, and reporting success for it is a
+/// lie that surfaces far from its cause (it is what made glibc's resolver, aimed at
+/// its built-in fallback nameserver `127.0.0.1:53`, fail confusingly).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum DgramSend {
+    /// Queued at the destination endpoint.
+    Delivered,
+    /// A bound endpoint exists but its queue was full: dropped, as UDP permits.
+    Dropped,
+    /// Nothing is bound at `(v6, dst_port)`: no reader exists, now or later.
+    NoEndpoint,
+}
+
 /// Send `bytes` (a datagram) from `src_port` to the endpoint bound at
-/// `(v6, dst_port)`. Best-effort loopback UDP: `true` if a matching endpoint was
-/// found and had queue room, else `false` (dropped, as UDP permits). `bytes` is
-/// truncated to `DGRAM_MAX`.
-pub fn send_dgram(v6: bool, dst_port: u16, src_port: u16, bytes: &[u8]) -> bool {
+/// `(v6, dst_port)`. `bytes` is truncated to `DGRAM_MAX`. See [`DgramSend`] for
+/// why "nothing is bound there" is reported distinctly from "dropped".
+pub fn send_dgram(v6: bool, dst_port: u16, src_port: u16, bytes: &[u8]) -> DgramSend {
     let Some(ep) = dgram_at(v6, dst_port) else {
-        return false;
+        return DgramSend::NoEndpoint;
     };
     let e = &mut dgrams()[ep];
     if e.qlen >= DGRAM_QUEUE {
-        return false;
+        return DgramSend::Dropped;
     }
     let slot = (e.qhead + e.qlen) % DGRAM_QUEUE;
     let n = bytes.len().min(DGRAM_MAX);
@@ -339,7 +354,7 @@ pub fn send_dgram(v6: bool, dst_port: u16, src_port: u16, bytes: &[u8]) -> bool 
     d.len = n as u16;
     d.buf[..n].copy_from_slice(&bytes[..n]);
     e.qlen += 1;
-    true
+    DgramSend::Delivered
 }
 
 /// True if endpoint `ep` has a queued datagram (poll/epoll readiness).

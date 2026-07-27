@@ -134,10 +134,16 @@ pub(crate) fn dup_state(from: usize, to: usize) {
 
 /// Reset cell `cell`'s memory bookkeeping for a fresh `execve` image
 /// (docs/LINUX-COMPAT.md L6): new heap base + mmap cursor + auxv snapshot. The
-/// fd table and cwd are kept (POSIX `execve` semantics); the caller resets the
+/// fd table and cwd are kept (POSIX `execve` semantics) **except** descriptors
+/// marked `FD_CLOEXEC`, which are closed here - that is what close-on-exec means,
+/// and `execve` used to keep every descriptor regardless. The caller resets the
 /// signal dispositions separately.
 pub(crate) fn exec_reinit(cell: usize, image_end: usize) {
     let st = state(cell);
+    let closed = st.fds.close_cloexec();
+    if closed > 0 {
+        crate::println!("linux: execve closed {closed} close-on-exec fd(s)");
+    }
     st.fds.set_auxv(stack::last_auxv());
     let brk =
         (image_end + crate::mm::frames::FRAME_SIZE - 1) & !(crate::mm::frames::FRAME_SIZE - 1);
@@ -285,7 +291,8 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
                 ))
             }
         }
-        nr::FUTEX => thread::futex(cur, args[0], args[1], args[2] as u32),
+        // futex(uaddr, op, val, timeout, ...): arg 3 is the timespec (now honoured).
+        nr::FUTEX => thread::futex(cur, args[0], args[1], args[2] as u32, args[3]),
 
         // -- processes (docs/LINUX-COMPAT.md L6) --
         // `fork`/`vfork` (x86-64 have dedicated numbers; asm-generic routes
@@ -295,7 +302,8 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
         nr::EXECVE => proc::execve(cur, args[0], args[1], args[2], frame),
         nr::WAIT4 => proc::wait4(cur, args[0] as i64, args[1], args[2]),
         // pipe(fd) (x86-64 legacy) == pipe2(fd, 0); pipe2 is the generic form.
-        nr::PIPE | nr::PIPE2 => ret(st.fds.pipe2(args[0])),
+        nr::PIPE => ret(st.fds.pipe2(args[0], 0)),
+        nr::PIPE2 => ret(st.fds.pipe2(args[0], args[1])),
         // dup2(old,new) (x86-64 legacy) == dup3(old,new,0).
         nr::DUP2 => ret(st.fds.dup3(args[0] as i64, args[1] as i64)),
 
@@ -305,8 +313,10 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
         nr::SOCKETPAIR => ret(st.fds.socketpair(args[0], args[1], args[3])),
         nr::BIND => ret(st.fds.bind(args[0] as i64, args[1], args[2])),
         nr::LISTEN => ret(st.fds.listen(args[0] as i64)),
-        // accept4's flags (arg3) are accepted + ignored (SOCK_CLOEXEC/NONBLOCK).
-        nr::ACCEPT | nr::ACCEPT4 => ret(st.fds.accept(args[0] as i64, args[1], args[2])),
+        // accept4's flags (arg3): SOCK_CLOEXEC honoured, SOCK_NONBLOCK deferred
+        // (docs/LINUX-COMPAT.md, the `fcntl` row). Plain `accept` passes 0.
+        nr::ACCEPT => ret(st.fds.accept(args[0] as i64, args[1], args[2], 0)),
+        nr::ACCEPT4 => ret(st.fds.accept(args[0] as i64, args[1], args[2], args[3])),
         nr::CONNECT => ret(st.fds.connect(args[0] as i64, args[1], args[2])),
         nr::GETSOCKNAME => ret(st.fds.getsockname(args[0] as i64, args[1], args[2], false)),
         nr::GETPEERNAME => ret(st.fds.getsockname(args[0] as i64, args[1], args[2], true)),
@@ -332,7 +342,10 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
             }
         }
         // epoll (L8-INET): a minimal level-triggered readiness surface.
-        nr::EPOLL_CREATE | nr::EPOLL_CREATE1 => ret(st.fds.epoll_create()),
+        // epoll_create(size) takes a size *hint*, not flags; only epoll_create1
+        // carries EPOLL_CLOEXEC.
+        nr::EPOLL_CREATE => ret(st.fds.epoll_create(0)),
+        nr::EPOLL_CREATE1 => ret(st.fds.epoll_create(args[0])),
         nr::EPOLL_CTL => ret(st
             .fds
             .epoll_ctl(args[0] as i64, args[1], args[2] as i64, args[3])),
@@ -450,7 +463,21 @@ fn ptr_args_ok(nr_val: u64, args: &[u64; 6]) -> bool {
         nr::GETCWD => wr(0, args[1]),
 
         // -- threads / processes --
-        nr::FUTEX => rd(0, 4),
+        // The futex word, plus - **only for the WAIT commands** - the optional
+        // `struct timespec` timeout in arg 3. This has to be command-aware: for
+        // FUTEX_WAKE and friends arg 3 is a plain *count*, and real callers reach
+        // the syscall with that register simply left dirty (glibc's and Rust's wake
+        // wrappers pass three arguments). Validating it unconditionally as a
+        // pointer refuses a legitimate `FUTEX_WAKE` with -EFAULT, which silently
+        // stops every waiter from being woken - observed as rayon-threaded `sort`
+        // producing no output at all on ARM64 while the other two ISAs passed.
+        nr::FUTEX => {
+            const FUTEX_WAIT: u64 = 0;
+            const FUTEX_WAIT_BITSET: u64 = 9;
+            let cmd = args[1] & 0x7f;
+            let takes_timespec = cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_BITSET;
+            rd(0, 4) && (!takes_timespec || rd_opt(3, 16))
+        }
         nr::CLONE => wr_opt(2, 4), // parent_tid; child_tid is validated on use
         nr::EXECVE => rd(0, 1) && rd(1, 8) && rd_opt(2, 8),
         nr::WAIT4 => wr_opt(1, 4),
@@ -532,6 +559,10 @@ const SIGPIPE: u64 = 13;
 /// buffer parks the caller when a peer can run (the writer), else returns
 /// -EAGAIN (single-process fallback, matching L3).
 fn sys_read(cur: usize, st: &mut LinuxState, fd: i64, buf: u64, count: u64) -> Ctl {
+    // O_NONBLOCK (set through `fcntl(F_SETFL)`) means "never park me": skip the
+    // cooperative block below and let the would-block case report -EAGAIN
+    // (docs/LINUX-COMPAT.md, the `fcntl` row).
+    let nb = st.fds.is_nonblock(fd);
     if let Some((idx, writer)) = st.fds.pipe_end(fd) {
         if writer {
             return err(errno::EBADF); // the write end is not readable
@@ -539,7 +570,7 @@ fn sys_read(cur: usize, st: &mut LinuxState, fd: i64, buf: u64, count: u64) -> C
         return match pipe::read(idx, buf, count) {
             pipe::ReadNb::Done(n) => ret(n),
             pipe::ReadNb::WouldBlock => {
-                if proc::runnable_peer_exists(cur) {
+                if !nb && proc::runnable_peer_exists(cur) {
                     proc::block_pipe_read(cur, buf, count, idx)
                 } else {
                     err(errno::EAGAIN)
@@ -553,7 +584,7 @@ fn sys_read(cur: usize, st: &mut LinuxState, fd: i64, buf: u64, count: u64) -> C
         return match pipe::read(idx, buf, count) {
             pipe::ReadNb::Done(n) => ret(n),
             pipe::ReadNb::WouldBlock => {
-                if proc::runnable_peer_exists(cur) {
+                if !nb && proc::runnable_peer_exists(cur) {
                     proc::block_pipe_read(cur, buf, count, idx)
                 } else {
                     err(errno::EAGAIN)
@@ -576,6 +607,7 @@ fn sys_write(
     count: u64,
     frame: *mut TrapFrame,
 ) -> Ctl {
+    let nb = st.fds.is_nonblock(fd);
     if let Some((idx, writer)) = st.fds.pipe_end(fd) {
         if !writer {
             return err(errno::EBADF); // the read end is not writable
@@ -583,7 +615,7 @@ fn sys_write(
         return match pipe::write(idx, buf, count) {
             pipe::WriteNb::Done(n) => ret(n),
             pipe::WriteNb::WouldBlock => {
-                if proc::runnable_peer_exists(cur) {
+                if !nb && proc::runnable_peer_exists(cur) {
                     proc::block_pipe_write(cur, buf, count, idx)
                 } else {
                     err(errno::EAGAIN)
@@ -605,7 +637,7 @@ fn sys_write(
         return match pipe::write(idx, buf, count) {
             pipe::WriteNb::Done(n) => ret(n),
             pipe::WriteNb::WouldBlock => {
-                if proc::runnable_peer_exists(cur) {
+                if !nb && proc::runnable_peer_exists(cur) {
                     proc::block_pipe_write(cur, buf, count, idx)
                 } else {
                     err(errno::EAGAIN)
@@ -934,20 +966,31 @@ fn sys_uname(buf: u64) -> i64 {
     0
 }
 
+/// The nanosecond reading a Linux cell sees from `clock_gettime` - the **cell's
+/// own clock domain**. MONOTONIC is `arch::ticks_to_ns(time::monotonic())`;
+/// REALTIME is that plus a fixed epoch (2023-11-14T22:13:20Z), because there is no
+/// synced time source (docs/TIME-IDENTITY.md) - disclosed, not hidden.
+///
+/// This is the single definition of that domain, because more than one thing now
+/// depends on it: `clock_gettime` reports it, and a `futex` absolute timeout is
+/// computed by the *program* from it, so the kernel must compare deadlines in the
+/// same domain (docs/ENGINEERING.md 11 - clock domains are not interchangeable;
+/// on RISC-V this is the `cycle` CSR, not the timer's `time` CSR).
+pub(crate) fn cell_clock_ns(realtime: bool) -> u64 {
+    /// The fixed REALTIME epoch, in nanoseconds.
+    const BOOT_EPOCH_NS: u64 = 1_700_000_000 * 1_000_000_000;
+    let ns = crate::arch::ticks_to_ns(crate::time::monotonic());
+    if realtime { ns + BOOT_EPOCH_NS } else { ns }
+}
+
 /// clock_gettime(clk_id, timespec). MONOTONIC uses the cycle counter via
 /// `arch::ticks_to_ns`; REALTIME adds a fixed boot epoch (unsynced - the
 /// value is monotonic but not true wall time, documented).
 fn sys_clock_gettime(clk_id: u64, ts_va: u64) -> i64 {
     const CLOCK_REALTIME: u64 = 0;
-    // A fixed epoch so REALTIME is plausible (2023-11-14T22:13:20Z); there is
-    // no synced time source (docs/TIME-IDENTITY.md), so this is disclosed.
-    const BOOT_EPOCH_SECS: u64 = 1_700_000_000;
-    let ns = crate::arch::ticks_to_ns(crate::time::monotonic());
-    let mut secs = ns / 1_000_000_000;
+    let ns = cell_clock_ns(clk_id == CLOCK_REALTIME);
+    let secs = ns / 1_000_000_000;
     let nsec = ns % 1_000_000_000;
-    if clk_id == CLOCK_REALTIME {
-        secs += BOOT_EPOCH_SECS;
-    }
     // SAFETY: `ts_va` is a writable timespec (two i64) in the cell's memory.
     unsafe {
         let p = ts_va as *mut i64;
@@ -1005,15 +1048,18 @@ struct RLimit {
 const RLIM_INFINITY: u64 = u64::MAX;
 
 /// The limit the personality reports for a resource (docs/LINUX-COMPAT.md 3):
-/// STACK 1 MiB (glibc sizes thread stacks from it), NOFILE = the fd table
-/// size, everything else unlimited.
+/// STACK = the size of the stack actually mapped (glibc sizes thread stacks
+/// from it, so reporting more than is mapped would hand every thread a stack
+/// that faults), NOFILE = the fd table size, everything else unlimited.
 fn rlimit_for(resource: u64) -> RLimit {
     const RLIMIT_STACK: u64 = 3;
     const RLIMIT_NOFILE: u64 = 7;
+    /// The mapped initial-stack size - the one number, not a second guess at it.
+    const STACK_BYTES: u64 = (stack::LINUX_STACK_PAGES * crate::mm::frames::FRAME_SIZE) as u64;
     match resource {
         RLIMIT_STACK => RLimit {
-            cur: 1024 * 1024,
-            max: 1024 * 1024,
+            cur: STACK_BYTES,
+            max: STACK_BYTES,
         },
         RLIMIT_NOFILE => RLimit {
             cur: fd::NFD as u64,

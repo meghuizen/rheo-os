@@ -167,9 +167,59 @@ const REMOTE_CONNECT_TIMEOUT_NS: u64 = 3_000_000_000;
 /// `linux::stack::AUXV_BYTES_MAX`).
 const AUXV_MAX: usize = 20 * 16;
 
+// ---------------------------------------------------------------- open flags
+// The three ISAs agree on every bit used here (x86-64's `asm/fcntl.h` and the
+// asm-generic one define the same values), so these are portable constants and
+// not `arch::linux_abi` entries.
+
+/// `O_ACCMODE`: the access-mode field of a descriptor's status flags.
+const O_ACCMODE: u64 = 0o3;
+/// `O_APPEND` - not honoured by this personality (see [`FdTable::fcntl`]).
+const O_APPEND: u64 = 0o2000;
+/// `O_NONBLOCK` (== `SOCK_NONBLOCK`): honoured when set through
+/// `fcntl(F_SETFL)`.
+const O_NONBLOCK: u64 = 0o4000;
+/// `O_ASYNC`/`FASYNC` - not honoured (no SIGIO is ever delivered).
+const O_ASYNC: u64 = 0o20000;
+/// `O_CLOEXEC` (== `SOCK_CLOEXEC` == `EPOLL_CLOEXEC`).
+pub const O_CLOEXEC: u64 = 0o2000000;
+/// `FD_CLOEXEC`, the single `F_GETFD`/`F_SETFD` bit.
+const FD_CLOEXEC: u64 = 1;
+
+/// The per-descriptor flags the personality **tracks and honours**
+/// (docs/LINUX-COMPAT.md, the `fcntl` row). Kept in a table parallel to `fds`
+/// rather than inside each [`FdKind`] variant, so every kind gets them without
+/// widening an already-large enum.
+#[derive(Copy, Clone)]
+struct FdFlags {
+    /// `FD_CLOEXEC`: this descriptor is closed by `execve`.
+    cloexec: bool,
+    /// `O_NONBLOCK`: a read/write that would block reports `-EAGAIN` instead.
+    nonblock: bool,
+    /// The access mode (`O_RDONLY`/`O_WRONLY`/`O_RDWR`), so `F_GETFL` reports
+    /// what the descriptor was actually opened with rather than a constant.
+    accmode: u8,
+}
+
+impl FdFlags {
+    const fn new(accmode: u8) -> FdFlags {
+        FdFlags {
+            cloexec: false,
+            nonblock: false,
+            accmode,
+        }
+    }
+}
+
+/// `O_RDWR`, the default access mode for a descriptor that is not opened from a
+/// path (pipes get per-end modes; sockets are read-write).
+const ACC_RDWR: u8 = 2;
+
 #[derive(Copy, Clone)]
 pub struct FdTable {
     fds: [FdKind; NFD],
+    /// Per-descriptor flags, indexed exactly like `fds`.
+    flags: [FdFlags; NFD],
     /// The cell's `/proc/self/auxv` bytes, copied in by `install_cell` after
     /// the stack (with its auxv) is built.
     auxv: [u8; AUXV_MAX],
@@ -186,6 +236,7 @@ impl FdTable {
     pub const fn new() -> FdTable {
         FdTable {
             fds: [FdKind::Closed; NFD],
+            flags: [FdFlags::new(ACC_RDWR); NFD],
             auxv: [0; AUXV_MAX],
             auxv_len: 0,
         }
@@ -194,9 +245,35 @@ impl FdTable {
     /// Reset to the initial state: fds 0/1/2 = console, the rest closed.
     pub fn init_console(&mut self) {
         self.fds = [FdKind::Closed; NFD];
+        self.flags = [FdFlags::new(ACC_RDWR); NFD];
         self.fds[0] = FdKind::Console(0);
+        self.flags[0] = FdFlags::new(0); // O_RDONLY
         self.fds[1] = FdKind::Console(1);
+        self.flags[1] = FdFlags::new(1); // O_WRONLY
         self.fds[2] = FdKind::Console(2);
+        self.flags[2] = FdFlags::new(1); // O_WRONLY
+    }
+
+    /// True if `fd` has `O_NONBLOCK` set (through `fcntl(F_SETFL)`). The
+    /// cooperative blocking paths in `linux::mod`/`linux::proc` consult this
+    /// before parking a cell, so a non-blocking descriptor reports `-EAGAIN`
+    /// instead (docs/LINUX-COMPAT.md, the `fcntl` row).
+    pub fn is_nonblock(&self, fd: i64) -> bool {
+        usize_fd(fd).is_some_and(|s| self.flags[s].nonblock)
+    }
+
+    /// Close every descriptor marked `FD_CLOEXEC` - the `execve` step
+    /// (docs/LINUX-COMPAT.md L6). Returns how many were closed, so a test can
+    /// observe that it did something rather than infer it.
+    pub fn close_cloexec(&mut self) -> usize {
+        let mut n = 0;
+        for i in 0..NFD {
+            if self.flags[i].cloexec && !matches!(self.fds[i], FdKind::Closed) {
+                self.close(i as i64);
+                n += 1;
+            }
+        }
+        n
     }
 
     /// Store the cell's serialized auxv for `/proc/self/auxv` reads.
@@ -208,11 +285,11 @@ impl FdTable {
 
     /// pipe2(pipefd[2], flags): allocate a global cross-cell pipe and write the
     /// read and write fds (two `int`s) into `pipefd` (docs/LINUX-COMPAT.md L6).
-    /// Flags (O_CLOEXEC/O_NONBLOCK) are accepted and ignored: the ends block
-    /// cooperatively (the scheduler decides). Close-on-exec is not tracked -
-    /// `execve` keeps all fds open (documented, docs/LINUX-COMPAT.md L6); a
-    /// pipeline child closes its unused ends explicitly, which the shell does.
-    pub fn pipe2(&mut self, pipefd_va: u64) -> i64 {
+    /// `O_CLOEXEC` in `flags` is **honoured** (both ends are closed by `execve`);
+    /// `O_NONBLOCK` at creation is accepted and not honoured - see
+    /// [`FdTable::fcntl`] for why creation-time non-blocking is a separate,
+    /// named deferral from `fcntl(F_SETFL, O_NONBLOCK)`, which is honoured.
+    pub fn pipe2(&mut self, pipefd_va: u64, flags: u64) -> i64 {
         let Some(idx) = pipe::alloc() else {
             return -ENFILE;
         };
@@ -225,6 +302,7 @@ impl FdTable {
             idx: idx as u8,
             writer: false,
         };
+        self.flags[rd] = FdFlags::new(0); // read end: O_RDONLY
         let Some(wr) = self.free_slot(3) else {
             self.fds[rd] = FdKind::Closed;
             pipe::close_end(idx, false);
@@ -235,6 +313,11 @@ impl FdTable {
             idx: idx as u8,
             writer: true,
         };
+        self.flags[wr] = FdFlags::new(1); // write end: O_WRONLY
+        if flags & O_CLOEXEC != 0 {
+            self.flags[rd].cloexec = true;
+            self.flags[wr].cloexec = true;
+        }
         // SAFETY: `pipefd_va` is a writable [i32; 2] in the calling cell.
         unsafe {
             let p = pipefd_va as *mut i32;
@@ -331,6 +414,14 @@ impl FdTable {
                         None => break,
                     }
                 }
+                // With O_NONBLOCK set, an empty FIFO is -EAGAIN, which is what
+                // Linux reports; without it the cell still must not park, so 0 is
+                // returned and the caller reads it as end-of-input (a documented
+                // limitation - the blocking console path is `SYS_WAIT_INPUT`, a
+                // native-cell primitive).
+                if n == 0 && count > 0 && self.flags[slot].nonblock {
+                    return -EAGAIN;
+                }
                 n as i64
             }
             FdKind::Console(_) => -EBADF,
@@ -374,9 +465,20 @@ impl FdTable {
                 }
             }
             // A connected **remote** TCP socket (rheo-net N4b): the byte stream lives
-            // in the registered `svc::SocketOps` datapath, not in a local ring.
+            // in the registered `svc::SocketOps` datapath, not in a local ring. A
+            // non-blocking descriptor passes a zero deadline, so the bridge drains
+            // what has already arrived and reports -EAGAIN rather than parking.
             FdKind::InetTcpRemote { h, .. } => match svc::socket_ops() {
-                Some(o) => (o.tcp_recv)(h as u64, buf_va, count, REMOTE_RECV_TIMEOUT_NS),
+                Some(o) => (o.tcp_recv)(
+                    h as u64,
+                    buf_va,
+                    count,
+                    if self.flags[slot].nonblock {
+                        0
+                    } else {
+                        REMOTE_RECV_TIMEOUT_NS
+                    },
+                ),
                 None => -ENETUNREACH,
             },
             FdKind::SockFresh
@@ -500,6 +602,7 @@ impl FdTable {
         };
         if let Some(kind) = dev {
             self.fds[slot] = kind;
+            self.set_open_flags(slot, flags);
             return slot as i64;
         }
         let Some(o) = svc::file_ops() else {
@@ -518,7 +621,18 @@ impl FdTable {
             path_len: plen as u16,
             dir_off: 0,
         };
+        self.set_open_flags(slot, flags);
         slot as i64
+    }
+
+    /// Record the access mode and `O_CLOEXEC` an `openat` was given. Other status
+    /// bits (`O_APPEND`, `O_NONBLOCK`, ...) are **not** recorded here: they are
+    /// not honoured at open time (see [`FdTable::fcntl`]), and recording a flag
+    /// that changes no behaviour is exactly the shape of claim this personality
+    /// does not make (docs/ENGINEERING.md 7).
+    fn set_open_flags(&mut self, slot: usize, flags: u64) {
+        self.flags[slot] = FdFlags::new((flags & O_ACCMODE) as u8);
+        self.flags[slot].cloexec = flags & O_CLOEXEC != 0;
     }
 
     /// close(fd).
@@ -561,11 +675,13 @@ impl FdTable {
             _ => {}
         }
         self.fds[slot] = FdKind::Closed;
+        self.flags[slot] = FdFlags::new(ACC_RDWR);
         0
     }
 
     /// dup(oldfd) - lowest free slot. Vfs entries share the underlying VFS fd
-    /// (close-once semantics; acceptable for the L2 fixtures).
+    /// (close-once semantics; acceptable for the L2 fixtures). Per POSIX the new
+    /// descriptor does **not** inherit `FD_CLOEXEC`.
     pub fn dup(&mut self, oldfd: i64) -> i64 {
         let Some(old) = usize_fd(oldfd) else {
             return -EBADF;
@@ -577,6 +693,8 @@ impl FdTable {
             return -EMFILE;
         };
         self.fds[slot] = self.fds[old];
+        self.flags[slot] = self.flags[old];
+        self.flags[slot].cloexec = false;
         self.bump_if_pipe(slot);
         slot as i64
     }
@@ -592,6 +710,12 @@ impl FdTable {
         if old != new {
             self.close(newfd);
             self.fds[new] = self.fds[old];
+            // dup2/dup3(flags = 0): the new descriptor is explicitly NOT
+            // close-on-exec, whatever the old one was. A pipeline child dup2s a
+            // pipe end onto fd 0/1 and then `execve`s, so getting this backwards
+            // would close the pipeline.
+            self.flags[new] = self.flags[old];
+            self.flags[new].cloexec = false;
             self.bump_if_pipe(new);
         }
         new as i64
@@ -616,14 +740,50 @@ impl FdTable {
         }
     }
 
-    /// fcntl(fd, cmd, arg) - the minimal subset glibc needs.
+    /// fcntl(fd, cmd, arg).
+    ///
+    /// **What changed and why** (docs/ENGINEERING.md 7): this used to end in
+    /// `_ => 0`, so *every* command it did not implement - `F_SETLK`, `F_SETOWN`,
+    /// `F_GETPIPE_SZ`, `F_ADD_SEALS`, anything a future libc probes - reported
+    /// success while doing nothing. A feature probe that asks "can you lock this
+    /// file?" was told yes. An unimplemented command now **fails**, with a
+    /// distinguishable error per family, so the probe learns the truth:
+    ///
+    /// - file **locking** (`F_GETLK`/`F_SETLK`/`F_SETLKW` and their OFD forms) ->
+    ///   `-ENOLCK`: there is no lock manager in this personality, which is exactly
+    ///   what POSIX's "no locks available" says;
+    /// - everything else unimplemented -> `-EINVAL`, the errno Linux itself uses
+    ///   for an unrecognised `cmd`.
+    ///
+    /// `F_GETFL`/`F_SETFL` are now real: the access mode is the one the descriptor
+    /// was opened with (not a hardcoded `O_RDWR`), and `O_NONBLOCK` is **tracked
+    /// and honoured** - a would-block read/write on a non-blocking descriptor
+    /// returns `-EAGAIN` instead of parking the cell or reporting 0. `O_APPEND` and
+    /// `O_ASYNC` are **refused** (`-EINVAL`) rather than accepted-and-dropped: this
+    /// personality does not reposition on write and delivers no SIGIO.
+    ///
+    /// Named deferral: `O_NONBLOCK`/`SOCK_NONBLOCK` given at **creation**
+    /// (`open`/`socket`/`accept4`/`pipe2`) is still accepted and not honoured. It
+    /// cannot be honoured before `poll` waits: `poll` currently reports every open
+    /// descriptor ready without consulting readiness at all, so a non-blocking
+    /// program's poll-then-read loop would spin and fail instead of blocking once.
+    /// glibc's resolver is exactly such a program (it creates its UDP socket with
+    /// `SOCK_NONBLOCK`), and it works today *because* the flag is dropped. Closing
+    /// this needs a waiting `poll`, which is its own slice of work.
     pub fn fcntl(&mut self, fd: i64, cmd: u64, arg: u64) -> i64 {
         const F_DUPFD: u64 = 0;
         const F_GETFD: u64 = 1;
         const F_SETFD: u64 = 2;
         const F_GETFL: u64 = 3;
         const F_SETFL: u64 = 4;
+        const F_GETLK: u64 = 5;
+        const F_SETLK: u64 = 6;
+        const F_SETLKW: u64 = 7;
+        const F_OFD_GETLK: u64 = 36;
+        const F_OFD_SETLK: u64 = 37;
+        const F_OFD_SETLKW: u64 = 38;
         const F_DUPFD_CLOEXEC: u64 = 1030;
+        const F_GETPIPE_SZ: u64 = 1032;
         let Some(slot) = usize_fd(fd) else {
             return -EBADF;
         };
@@ -637,12 +797,48 @@ impl FdTable {
                     return -EMFILE;
                 };
                 self.fds[dst] = self.fds[slot];
+                self.flags[dst] = self.flags[slot];
+                self.flags[dst].cloexec = cmd == F_DUPFD_CLOEXEC;
                 self.bump_if_pipe(dst);
                 dst as i64
             }
-            F_GETFD | F_SETFD | F_SETFL => 0,
-            F_GETFL => 2, // O_RDWR - the personality does not track open flags
-            _ => 0,
+            F_GETFD => {
+                if self.flags[slot].cloexec {
+                    FD_CLOEXEC as i64
+                } else {
+                    0
+                }
+            }
+            F_SETFD => {
+                self.flags[slot].cloexec = arg & FD_CLOEXEC != 0;
+                0
+            }
+            F_GETFL => {
+                (self.flags[slot].accmode as u64
+                    | if self.flags[slot].nonblock {
+                        O_NONBLOCK
+                    } else {
+                        0
+                    }) as i64
+            }
+            F_SETFL => {
+                // Linux ignores the access mode and the creation flags here, so
+                // only the status bits matter. Refuse the two we cannot honour
+                // rather than drop them silently.
+                if arg & (O_APPEND | O_ASYNC) != 0 {
+                    return -EINVAL;
+                }
+                self.flags[slot].nonblock = arg & O_NONBLOCK != 0;
+                0
+            }
+            // A real answer where there is one: the pipe ring's actual capacity.
+            F_GETPIPE_SZ if matches!(self.fds[slot], FdKind::Pipe { .. }) => pipe::PIPE_CAP as i64,
+            // No lock manager exists - say so, with the errno POSIX reserves for it.
+            F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => -ENOLCK,
+            other => {
+                crate::println!("linux: fcntl cmd {other} unsupported");
+                -EINVAL
+            }
         }
     }
 
@@ -878,8 +1074,9 @@ impl FdTable {
     }
 
     /// socket(domain, type, protocol): an unbound socket. AF_UNIX stream (L8) or
-    /// an AF_INET/AF_INET6 loopback stream/datagram socket (L8-INET). The type's
-    /// high bits (SOCK_CLOEXEC/SOCK_NONBLOCK) are accepted + ignored.
+    /// an AF_INET/AF_INET6 loopback stream/datagram socket (L8-INET).
+    /// `SOCK_CLOEXEC` in the type's high bits is **honoured**; `SOCK_NONBLOCK` is
+    /// accepted and not honoured (the named deferral in [`FdTable::fcntl`]).
     pub fn socket(&mut self, domain: u64, ty: u64) -> i64 {
         match domain {
             AF_UNIX => {
@@ -890,6 +1087,8 @@ impl FdTable {
                     return -EMFILE;
                 };
                 self.fds[slot] = FdKind::SockFresh;
+                self.flags[slot] = FdFlags::new(ACC_RDWR);
+                self.flags[slot].cloexec = ty & O_CLOEXEC != 0;
                 slot as i64
             }
             AF_INET | AF_INET6 => {
@@ -907,15 +1106,17 @@ impl FdTable {
                     },
                     _ => return -EPROTONOSUPPORT,
                 };
+                self.flags[slot] = FdFlags::new(ACC_RDWR);
+                self.flags[slot].cloexec = ty & O_CLOEXEC != 0;
                 slot as i64
             }
             _ => -EAFNOSUPPORT,
         }
     }
 
-    /// epoll_create1(flags): an epoll instance as a new fd (L8-INET). Flags
-    /// (EPOLL_CLOEXEC) are accepted + ignored.
-    pub fn epoll_create(&mut self) -> i64 {
+    /// epoll_create1(flags): an epoll instance as a new fd (L8-INET).
+    /// `EPOLL_CLOEXEC` is honoured.
+    pub fn epoll_create(&mut self, flags: u64) -> i64 {
         let Some(ep) = epoll::create() else {
             return -ENFILE;
         };
@@ -924,6 +1125,8 @@ impl FdTable {
             return -EMFILE;
         };
         self.fds[slot] = FdKind::Epoll { ep };
+        self.flags[slot] = FdFlags::new(ACC_RDWR);
+        self.flags[slot].cloexec = flags & O_CLOEXEC != 0;
         slot as i64
     }
 
@@ -994,6 +1197,7 @@ impl FdTable {
 
     /// socketpair(domain, type, protocol, sv): two connected AF_UNIX sockets
     /// backed by two direction rings (L8). Writes the fd pair into `sv_va`.
+    /// `SOCK_CLOEXEC` is honoured on both ends.
     pub fn socketpair(&mut self, domain: u64, ty: u64, sv_va: u64) -> i64 {
         if let Err(e) = Self::check_stream(domain, ty) {
             return e;
@@ -1014,6 +1218,10 @@ impl FdTable {
             return -EMFILE;
         };
         self.fds[s1] = FdKind::SockConn { rx: b_rx, tx: b_tx };
+        self.flags[s0] = FdFlags::new(ACC_RDWR);
+        self.flags[s1] = FdFlags::new(ACC_RDWR);
+        self.flags[s0].cloexec = ty & O_CLOEXEC != 0;
+        self.flags[s1].cloexec = ty & O_CLOEXEC != 0;
         // SAFETY: `sv_va` is a writable [i32; 2] in the calling cell.
         unsafe {
             let p = sv_va as *mut i32;
@@ -1249,11 +1457,13 @@ impl FdTable {
         }
     }
 
-    /// accept(fd, addr, addrlen): dequeue a pending connection into a new fd.
-    /// Non-blocking: `-EAGAIN` if the backlog is empty (the cooperative
+    /// accept4(fd, addr, addrlen, flags): dequeue a pending connection into a new
+    /// fd. Non-blocking: `-EAGAIN` if the backlog is empty (the cooperative
     /// single-process proof connects before accepting; a blocking cross-cell
     /// accept server is a later refinement, docs/LINUX-COMPAT.md L8).
-    pub fn accept(&mut self, fd: i64, addr_va: u64, addrlen_va: u64) -> i64 {
+    /// `SOCK_CLOEXEC` in `flags` is honoured; `SOCK_NONBLOCK` is the named
+    /// deferral in [`FdTable::fcntl`].
+    pub fn accept(&mut self, fd: i64, addr_va: u64, addrlen_va: u64, flags: u64) -> i64 {
         let Some(slot) = usize_fd(fd) else {
             return -EBADF;
         };
@@ -1273,6 +1483,8 @@ impl FdTable {
                 peer_port: client_port,
                 v6,
             };
+            self.flags[nslot] = FdFlags::new(ACC_RDWR);
+            self.flags[nslot].cloexec = flags & O_CLOEXEC != 0;
             write_inaddr(addr_va, addrlen_va, v6, client_port);
             return nslot as i64;
         }
@@ -1287,6 +1499,8 @@ impl FdTable {
             return -EMFILE;
         };
         self.fds[nslot] = FdKind::SockConn { rx, tx };
+        self.flags[nslot] = FdFlags::new(ACC_RDWR);
+        self.flags[nslot].cloexec = flags & O_CLOEXEC != 0;
         // The connecting peer is unnamed (no bind): report just the family.
         if addr_va != 0 && addrlen_va != 0 {
             // SAFETY: caller-provided sockaddr + socklen_t out-params.
@@ -1476,8 +1690,18 @@ impl FdTable {
         let n = (len as usize).min(inetsock::DGRAM_MAX);
         // SAFETY: `buf` is a readable range of `n` bytes in the active cell.
         let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, n) };
-        inetsock::send_dgram(dv6, dport, src_port, bytes);
-        len as i64
+        match inetsock::send_dgram(dv6, dport, src_port, bytes) {
+            // Nothing is bound at the destination, so no reader exists now or
+            // later: report it (docs/ENGINEERING.md 7). Linux delivers this as an
+            // ICMP port-unreachable, which surfaces as `ECONNREFUSED` on the next
+            // operation of a *connected* socket; there is no ICMP over this
+            // in-kernel loopback queue, so the refusal is reported on the send
+            // itself - earlier than Linux for an unconnected `sendto`, and
+            // documented (docs/LINUX-COMPAT.md, `sendto` row).
+            inetsock::DgramSend::NoEndpoint => -ECONNREFUSED,
+            // A full queue is a genuine UDP drop: the datagram is accounted sent.
+            inetsock::DgramSend::Delivered | inetsock::DgramSend::Dropped => len as i64,
+        }
     }
 
     /// recvfrom(fd, buf, len, src_addr, addrlen): dequeue one UDP datagram over
@@ -1501,7 +1725,12 @@ impl FdTable {
                 len,
                 core::ptr::addr_of_mut!(src_ip) as u64,
                 core::ptr::addr_of_mut!(src_port) as u64,
-                REMOTE_RECV_TIMEOUT_NS,
+                // A zero deadline on a non-blocking descriptor: drain, never park.
+                if self.flags[slot].nonblock {
+                    0
+                } else {
+                    REMOTE_RECV_TIMEOUT_NS
+                },
             );
             if n >= 0 && src_addr != 0 {
                 write_inaddr_v4(src_addr, addrlen_va, src_ip, src_port);
