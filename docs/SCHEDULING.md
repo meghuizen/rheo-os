@@ -298,12 +298,25 @@ model this doc reached working *backward* from the reservation contract.
   a task that requests a **smaller slice gets an earlier deadline**, so a
   latency-sensitive task is served first *without any priority knob* - latency is
   bought by asking for less, not by ranking higher.
-- **BORE** (Burst-Oriented Response Enhancer) - a heuristic *on top of* EEVDF, not
-  a replacement. It accumulates a per-task **burst time** (CPU consumed in a run,
-  decayed on sleep), turns it into a log-scaled **burst score**, and re-weights the
-  task's effective vruntime by it: long-burst CPU hogs are penalised, short-burst
-  interactive tasks are boosted. Pure inference from observed behaviour; no new
-  mechanism.
+- **BORE** (Burst-Oriented Response Enhancer, Masahito Suzuki) - a heuristic *on
+  top of* EEVDF, not a replacement. It tracks each task's **burst time**: the CPU
+  time consumed since the task last *voluntarily relinquished* the CPU (sleep,
+  I/O-wait, or `yield`). It turns that into a **burst score** by taking the
+  **bit-length of the normalized burst time** - a cheap **integer log2** - then
+  applying an offset (`penalty_offset`, default 24 bits subtracted) and a scale
+  (`penalty_scale`, default 1536 = 1.5x in 1/1024 units). The score lands in
+  **0..39, exactly like `nice`**: each step of -1 grants ~**1.25x** more timeslice
+  and more wakeup-preemption aggressiveness. Suzuki frames it as a *radix
+  conversion from binary-log to common-log* - mapping a nanoseconds-to-minutes
+  burst range onto a ~0.01-100x weight, dimensionlessly. So greedy tasks (long
+  runs between yields, usually CPU-bound batch) are weighted down and modest tasks
+  (short runs, usually I/O-bound interactive) are weighted up, reaching an
+  equilibrium. Two refinements matter: a **forked child inherits an ancestor's
+  average child-burst** (a hub/stub topological walk that skips single-child
+  nodes) so a `make` spawning CPU-hungry children cannot swamp interactive tasks;
+  and the score is **EMA-smoothed** against a historical score (`take the larger of
+  latest or history`) to survive burst spikes. Pure inference from observed
+  behaviour, **integer-only**, no new mechanism.
 - **sched_ext (scx)** - `CONFIG_SCHED_CLASS_EXT`: a scheduler *class* whose policy
   is a **BPF program loaded (and swapped) at runtime**, usually with a Rust
   userspace half. CachyOS enables it by default and ships a GUI to switch policies
@@ -356,12 +369,22 @@ ENGINEERING.md's observe-never-infer rule and this doc's own "importance is a
 contract, never a priority number" (position statement), reached independently by
 the interactivity community. Lattice is positioned to do the *honest* version:
 the per-context blocking work (LINUX-COMPAT.md L4, `thread.rs` `pblock`) already
-records exactly the evidence LAVD estimates from - when each context blocks, on
-what, and how often it is woken. A best-effort latency-criticality score can be
-computed from those counters (short inter-block run + frequent wakeups =
-latency-critical → earlier virtual deadline), with no new tracking and no task-
-declared hint to be lied to. This is the concrete input to the §11.3 virtual
-deadline.
+records exactly the evidence BORE and LAVD estimate from - when each context
+blocks (voluntarily relinquishes), on what, and how often it is woken. BORE's
+**burst time is precisely "cycles since this context last blocked"**, which the
+`pblock` machinery already marks; a burst score follows directly as
+`bitlen(burst_cycles >> offset)` scaled to a small integer - and because BORE's
+score is a **bit-length (integer log2)**, not a float, it lands natively in this
+kernel's no-FPU, fixed-point discipline (the `sched.rs` parts-per-million
+precedent), unlike a CFS-style `vruntime` that wants division. That integer burst
+score is the *weight* term of the §11.3 virtual deadline (`eligible +
+slice/weight`): a short-burst, frequently-woken context gets a smaller effective
+denominator → earlier deadline → served first, with **no task-declared hint to be
+lied to** (observe-never-infer). BORE's fork caveat transfers too: a cell that
+spawns many CPU-hungry children (`fork`/`SYS_SPAWN`, a build) must not let those
+children swamp interactive cells, so a spawned cell should **inherit its parent's
+observed burst** as its starting score rather than a neutral default - the
+hub/stub inheritance idea, expressed over the cell tree this OS already has.
 
 ### 11.5 What Lattice deliberately does not take
 
@@ -392,9 +415,11 @@ second core runs but does not yet schedule on it (#27/#132). So:
   `bSSSSSSSSB` oracle, `netservice`'s `order == [0,1,2,...]` interleave witness).
   The payoff arrives with preemption, and so does the change - not before.
 
-Sources: CachyOS sched-ext wiki (`wiki.cachyos.org/configuration/sched-ext`), the
-`sched-ext/scx` scheduler repository, and the EEVDF/BORE/ghOSt background in
-kernel documentation and LWN.
+Sources: the **BORE scheduler** README (`github.com/firelzrd/bore-scheduler`,
+Masahito Suzuki - the algorithm, tunables and defaults in §11.1 are quoted from
+it), the CachyOS sched-ext wiki (`wiki.cachyos.org/configuration/sched-ext`), the
+`sched-ext/scx` scheduler repository, and the EEVDF/ghOSt background in kernel
+documentation and LWN.
 
 ## 12. Honest costs
 
