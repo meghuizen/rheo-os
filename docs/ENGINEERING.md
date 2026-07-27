@@ -439,6 +439,16 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   the inference restored, it fails with the exact original message. That is the
   difference between "reasoned and code-reviewed" (section 7's honest but weaker
   label) and proven.
+- **A correctness fix that works must still be measured before it ships.** Adding
+  "ensure the page is present" to the kernel's user-pointer checks made unmodified
+  static *and* dynamic glibc run with demand-paged images - the functional proof was
+  unambiguous. Then the counters said 11,516 of 11,520 demand fills came from the
+  *kernel* pre-faulting and only 4 from the program's own faults, an amplification of
+  ~2,900x in the hottest path in the kernel. Functionally right, and not shippable.
+  The temptation at that point is to widen the test's bound until it passes, which is
+  the same defect as an oracle that cannot fail - so the honest move was to revert and
+  write down the one measurement that would explain it (which call site asks for pages
+  the program never touches).
 - **Demand paging makes every kernel touch of a user buffer a fault site.** Making
   file mappings demand-paged was safe because a program reads its own mapping before
   passing it anywhere. Extending it to the ELF *image* was not: a program hands a

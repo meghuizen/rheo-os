@@ -492,9 +492,16 @@ so was its claim of 182 MiB of `.bss`, which measurement shows does not exist.
    image lazy, a cell passes a pointer into its own untouched rodata to `write` and
    the *kernel* dereferences an absent user page - a load fault at a kernel PC, which
    is not resumable here. That is why Linux has `copy_from_user` with a fixup table.
-   The fix here needs no new mechanism: the F1 hardening already routes **every**
+   The fix needs no new mechanism: the F1 hardening already routes **every**
    cell-supplied pointer through `user::user_read_ok`/`user_write_ok`/`user_buf`, so
-   those checks gain "ensure present" alongside "in range". It must land first.
+   those checks gain "ensure present" alongside "in range". That was implemented and
+   **functionally proven** - with it, unmodified static *and* dynamic glibc run with
+   their images demand-paged - and then **reverted on a measurement**: 11,516 of
+   11,520 demand fills came from the kernel pre-faulting rather than from the program,
+   a ~2,900x amplification in the hottest path in the kernel. Right answer, wrong
+   cost; the outstanding question is which call site asks for pages the program never
+   touches (a range validated in full versus the bytes actually transferred is the
+   leading candidate). It must land, correctly, first.
 
    **Still open:** the ELF image itself. `load::load_elf_linux` streams every
    `PT_LOAD` page into a frame at load time, and for an `ET_EXEC`-with-`PT_INTERP`
