@@ -156,6 +156,10 @@ name = "linuxnode"
 path = "src/linuxnode.rs"
 
 [[bin]]
+name = "linuxclaude"
+path = "src/linuxclaude.rs"
+
+[[bin]]
 name = "linuxbun"
 path = "src/linuxbun.rs"
 

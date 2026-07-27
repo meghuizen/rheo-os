@@ -503,6 +503,29 @@ Still refused and correctly so: `/etc/localtime` (glibc falls back to UTC, which
 - there is no timezone database and inventing one is worse than the fallback),
 `bunfig.toml`, the `glibc-hwcaps` probes, `trace_marker`, `/proc/self/statm`.
 
+**The real Claude Code binary runs on the OS** (GOAL-CLAUDE, docs/LINUX-COMPAT.md, the
+`linuxclaude` test): `/opt/claude-code/bin/claude`, **275 MB**, the workload
+docs/ARCHITECTURE-DEBT.md 4.0 measured this tree against and named as the target. It is
+a **Bun-compiled single-file executable** - the same JavaScriptCore runtime `linuxbun`
+proves, at nearly three times the size with an entire application bundled in - so it
+needed no new mechanism at all: it streams off a live ext4 disk over virtio-blk-pci
+(~116,000 block-cache fills, none resident whole), demand-pages, links its glibc set
+(`librt` on top of bun's), brings up JSC with its **JIT enabled** (the capability-gated
+W^X exception), runs **under preemption** (2,467 slices taken to sibling contexts), and
+prints exactly `2.1.220 (Claude Code)` with exit 0. Held to the strict gate; asserted on
+an exact transcript.
+
+**Honest scope, because "runs Claude Code" invites a bigger reading than the evidence
+supports.** It runs `claude --version`, which is what can be asserted deterministically:
+it exercises the whole load path, JSC bring-up, the bundled application's startup and its
+argument handling, and needs **no network and no credentials**. Driving a *conversation*
+would need outbound TLS to an API from inside a cell - the N3b/N5a stack wired into a
+cell, which is a networking task rather than anything about running this binary - and is
+not claimed. One real defect found on the way: the runtime disk image was a flat 200 MiB
+sized for `node`, so a 275 MB binary did not fit, and the failure surfaced as `execve`
+refusing at boot with a message that said nothing about disk size; the image is now sized
+from the payload.
+
 **timerfd is done** (docs/LINUX-COMPAT.md L8-TIMERFD, GOAL-TIMERFD):
 `timerfd_create`/`settime`/`gettime` - the **timer source of libuv**, and thus of
 Node.js and the async/JS world. A per-cell fd over a per-personality registry
@@ -1922,6 +1945,11 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               EFD_SEMAPHORE decrements), a real sysinfo, sched_setscheduler
               refusing real-time with EPERM, close_range, and clone3/rseq refused
               deliberately),
+              linuxclaude (GOAL-CLAUDE: the real 275 MB Claude Code binary - a
+              Bun-compiled single-file executable - streamed off a live ext4 disk,
+              JIT enabled, preemptive, printing its exact version string and
+              exiting 0; `--version` only, since a conversation needs outbound
+              TLS from a cell - stated, not implied),
               linuxdyn (L7: an unmodified dynamically-linked glibc C hello over
               PT_INTERP + ld-linux + fd-backed mmap - three ways: loaded direct,
               execve'd from a ramfs VFS, and (GOAL-DISK-2b) execve'd off a real

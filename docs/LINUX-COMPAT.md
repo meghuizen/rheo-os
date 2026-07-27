@@ -1143,6 +1143,40 @@ fixup path.
   `bunfig.toml`, the `glibc-hwcaps` micro-architecture probes, `trace_marker`, and
   `/proc/self/statm`.
 
+- **The real Claude Code binary runs** (GOAL-CLAUDE, the `linuxclaude` test).
+  `/opt/claude-code/bin/claude`, **275 MB** - the workload docs/ARCHITECTURE-DEBT.md 4.0
+  measured this tree against and named as the target. It is a **Bun-compiled single-file
+  executable**, i.e. the same JavaScriptCore runtime `linuxbun` proves at nearly three
+  times the size with an entire application bundled in, and it therefore needed **no new
+  kernel mechanism**: streaming off a live ext4 disk over virtio-blk-pci (~116,000
+  block-cache fills, none resident whole), demand paging, dynamic linking of its glibc
+  set (`librt` on top of bun's), JSC bring-up with its **JIT enabled** through the
+  capability-gated W^X exception (docs/ARCHITECTURE.md 5.1), and **preemptive** dispatch
+  (2,467 slices taken to sibling contexts) were all already there. It prints exactly
+  `2.1.220 (Claude Code)` and exits 0, asserted as an exact transcript. x86-64 only (the
+  binary is an x86-64 ELF; arm64/riscv64 skip-with-reason).
+
+  **What is and is not claimed.** It runs `claude --version`. That choice is the honest
+  limit of what is deterministically assertable here: it exercises the whole load path,
+  JavaScriptCore bring-up, the bundled application's own startup and its argument
+  handling, and it needs **no network and no credentials**. Driving a *conversation*
+  would require outbound TLS to an API from inside a cell - the N3b/N5a stack wired into
+  a cell, which is a networking capability rather than anything about running this binary
+  - and is not claimed. "Claude Code runs on rheo-os" means the binary loads and
+  executes; it does not yet mean the product works end to end.
+
+  It also probes, and is correctly refused: `/sys/kernel/mm/transparent_hugepage/enabled`
+  (no THP), `/sys/fs/cgroup/cpu.max` (no cgroups), `/etc/localtime` and
+  `/usr/share/zoneinfo/` (glibc falls back to UTC, which is right - there is no timezone
+  database and inventing one is worse), `/proc/self/statm`, `trace_marker`, and the
+  `glibc-hwcaps` micro-architecture probes.
+
+  One real defect found on the way: the runtime disk fixture was a flat 200 MiB, sized
+  when the largest payload was the ~124 MB `node`. A 275 MB binary did not fit, and the
+  failure presented as `execve` refusing at boot - "streaming execve of the runtime
+  binary" - which says nothing about an undersized image. The image is now sized from the
+  payload, so the next larger binary cannot reproduce it.
+
 ## 6. Fixture build matrix (reproducibility)
 
 All Linux test binaries are built **from source** by xtask/CI - no binaries

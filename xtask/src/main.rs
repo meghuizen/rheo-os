@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 63] = [
+const TEST_KERNELS: [&str; 64] = [
     "kernel",
     "substrate",
     "cap-invariants",
@@ -56,6 +56,7 @@ const TEST_KERNELS: [&str; 63] = [
     "linuxdyn",
     "linuxnode",
     "linuxbun",
+    "linuxclaude",
     "librheoproc",
     "librheonet",
     "netwait",
@@ -160,6 +161,16 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
         ("linuxbun", Arch::X86_64) => &[
             "-drive",
             "file=tests/linux-fixtures/build/x86_64/bun-disk.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-pci,drive=blk0,disable-legacy=on",
+        ],
+        // linuxclaude (GOAL-CLAUDE): the real Claude Code binary (~275 MB), the
+        // workload docs/ARCHITECTURE-DEBT.md 4.0 measured this tree against. Same
+        // shape as linuxbun - it *is* a Bun-compiled executable - so the same
+        // transport and the same skip-when-absent behaviour.
+        ("linuxclaude", Arch::X86_64) => &[
+            "-drive",
+            "file=tests/linux-fixtures/build/x86_64/claude-disk.img,if=none,id=blk0,format=raw",
             "-device",
             "virtio-blk-pci,drive=blk0,disable-legacy=on",
         ],
@@ -1461,6 +1472,7 @@ fn build_linux_fixtures(arch: Arch) -> bool {
     build_dyn_disk_fixture(arch, &out_dir);
     build_node_disk_fixture(arch, &out_dir);
     build_bun_disk_fixture(arch, &out_dir);
+    build_claude_disk_fixture(arch, &out_dir);
 
     build_coreutils_fixture(arch)
 }
@@ -1611,6 +1623,33 @@ fn build_bun_disk_fixture(arch: Arch, out_dir: &str) {
     );
 }
 
+/// Build the `linuxclaude` fixture (GOAL-CLAUDE): the real **Claude Code** binary
+/// (~275 MB) + its glibc set on an ext4 image, streamed off a live virtio-blk disk by
+/// the `linuxclaude` test.
+///
+/// This is the workload docs/ARCHITECTURE-DEBT.md 4.0 measured the tree against and
+/// named as the target: a Bun-compiled single-file executable, so it is the same
+/// JavaScriptCore runtime `linuxbun` proves, at four times the size and with its
+/// whole application bundled in. It needs `librt` on top of bun's set. Thin caller of
+/// [`build_runtime_disk_fixture`].
+fn build_claude_disk_fixture(arch: Arch, out_dir: &str) {
+    build_runtime_disk_fixture(
+        arch,
+        out_dir,
+        "linuxclaude",
+        "claude-disk.img",
+        "/opt/claude-code/bin/claude",
+        "claude",
+        &[
+            "libc.so.6",
+            "libm.so.6",
+            "libdl.so.2",
+            "libpthread.so.0",
+            "librt.so.1",
+        ],
+    );
+}
+
 /// Build a **disk-streamed language-runtime** ext4 fixture (GOAL-NODE / GOAL-BUN,
 /// docs/LINUX-COMPAT.md): a real ext4 image holding a real x86-64 dynamic binary at
 /// `/bin/<dst>`, its `ld-linux-x86-64.so.2` at the PT_INTERP path, and its host
@@ -1665,8 +1704,21 @@ fn build_runtime_disk_fixture(
         return;
     }
 
-    // A 200 MiB ext4 (same driver-parseable flags as the linuxdisk image, 1 KiB
-    // blocks) holds a ~124 MB binary + ~10 MB of libraries with slack.
+    // Size the ext4 from the payload rather than to a constant (same
+    // driver-parseable flags as the linuxdisk image, 1 KiB blocks).
+    //
+    // It used to be a flat 200 MiB, chosen for a ~124 MB `node` plus ~10 MB of
+    // libraries. The Claude Code binary is ~275 MB, so it did not fit - and the
+    // failure was not a build error but `execve` refusing at boot with
+    // "streaming execve of the runtime binary", which says nothing about the
+    // image being too small. A size derived from the file cannot get this wrong
+    // for the next, larger binary either.
+    let payload_kib = std::fs::metadata(binary)
+        .map(|m| m.len() / 1024)
+        .unwrap_or(0);
+    // Libraries plus ext4 metadata plus slack; 1.25x the binary with a 64 MiB floor
+    // is generous next to the cost of an unexplained boot failure.
+    let count_kib = (payload_kib + payload_kib / 4 + 65_536).max(204_800);
     let _ = std::fs::remove_file(&img);
     let ok = matches!(
         Command::new("dd")
@@ -1674,7 +1726,7 @@ fn build_runtime_disk_fixture(
                 "if=/dev/zero",
                 &format!("of={img}"),
                 "bs=1024",
-                "count=204800"
+                &format!("count={count_kib}"),
             ])
             .output()
             .map(|o| o.status.success()),
