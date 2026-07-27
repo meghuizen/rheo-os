@@ -419,6 +419,22 @@ through the unknown-number log. The `sysx` fixture in `linuxproc` proves it on
 **all three ISAs**, asserting each refusal *as* a refusal, with four narrow
 reverts each observed failing.
 
+**timerfd is done** (docs/LINUX-COMPAT.md L8-TIMERFD, GOAL-TIMERFD):
+`timerfd_create`/`settime`/`gettime` - the **timer source of libuv**, and thus of
+Node.js and the async/JS world. A per-cell fd over a per-personality registry
+(`kernel/src/linux/timerfd.rs`) - **no new kernel object**, the `eventfd`/`epoll`
+precedent - whose expiry is an ordinary **cell-clock deadline**, the same wait
+`nanosleep` (`proc::Block::Timer`) parks on and the same the scheduler already
+halts for through the timer arbiter's `CellSleep` slice, so it composes the
+existing time machinery and touches no deadline arithmetic. A blocking read parks
+on the deadline (no runnable-peer needed - the clock is the wake source, unlike an
+eventfd), and for epoll the timerfd's per-fd source is `idle::TIMER` and its
+readiness is "expired", so the existing poll/epoll timer-slice idle path wakes the
+loop unchanged. One-shot + periodic; `read` returns and consumes the expiration
+count; `write` is `-EINVAL`. The `timerx` fixture in `linuxpoll` proves it on
+**all three ISAs**: a blocking read parks on a 20 ms one-shot (exactly one
+expiration), epoll_wait wakes on a second, and the disarmed timer reads zero.
+
 **librheo** (`librheo/`, docs/LIBRHEO.md) is the greenfield **native userspace
 foundation library** - the role a libc plays, rebuilt for this kernel:
 async-first, capability-native, built ON `runtime/` (not a POSIX threading

@@ -1285,6 +1285,10 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         // A wait that can never end: the scheduler's deadlock diagnostic, the
         // second `linuxpoll` phase.
         ("polldead.c", "polldead", NO_EXTRA),
+        // timerfd - the libuv event-loop timer source (docs/LINUX-COMPAT.md
+        // L8-TIMERFD): a blocking read parks on the deadline, and epoll_wait wakes
+        // on expiry. The third `linuxpoll` phase.
+        ("timerx.c", "timerx", NO_EXTRA),
         // The loader must size the stack from **PT_GNU_STACK**, not a fixed
         // constant (docs/ARCHITECTURE-DEBT.md 4.0, blocker 1). Linked with
         // `-z stacksize` so its own header asks for more than the old 8 MiB

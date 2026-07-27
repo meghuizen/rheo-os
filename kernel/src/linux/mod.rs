@@ -33,6 +33,7 @@ pub mod proc;
 pub mod signal;
 pub mod stack;
 pub mod thread;
+pub mod timerfd;
 pub mod unixsock;
 pub mod vma;
 
@@ -176,6 +177,7 @@ pub fn reset() {
     inetsock::reset();
     epoll::reset();
     eventfd::reset();
+    timerfd::reset();
     filemap::reset();
 }
 
@@ -561,6 +563,12 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
         }
         nr::SYSINFO => ret(sys_sysinfo(args[0])),
         nr::EVENTFD2 => ret(st.fds.eventfd_create(args[0], args[1])),
+        // timerfd (docs/LINUX-COMPAT.md L8-TIMERFD): the libuv event-loop timer
+        // source. A per-cell fd over the timerfd registry; a deadline is an
+        // ordinary cell-clock wait, epoll-pollable.
+        nr::TIMERFD_CREATE => ret(st.fds.timerfd_create(args[0], args[1])),
+        nr::TIMERFD_SETTIME => ret(sys_timerfd_settime(st, args[0], args[1], args[2], args[3])),
+        nr::TIMERFD_GETTIME => ret(sys_timerfd_gettime(st, args[0], args[1])),
         nr::CLOSE_RANGE => ret(st.fds.close_range(args[0], args[1], args[2])),
         // Defined-but-never-dispatched before, so these logged `ENOSYS nr=<n>` as if
         // the number were unknown. They are known, and refusing them is the
@@ -883,6 +891,24 @@ fn sys_read(cur: usize, st: &mut LinuxState, fd: i64, buf: u64, count: u64) -> C
                     proc::block_eventfd_read(cur, buf, count, ev)
                 } else {
                     err(errno::EAGAIN)
+                }
+            }
+            Err(e) => ret(e),
+        };
+    }
+    // A timerfd read returns the expiration count; an unexpired timer parks on its
+    // **deadline** (docs/LINUX-COMPAT.md L8-TIMERFD). Unlike an eventfd, the wake
+    // source is the cell clock, not a peer, so a single-threaded program blocks
+    // correctly with no runnable sibling - the scheduler idles on the timer, exactly
+    // as `nanosleep` does.
+    if let Some(tf) = st.fds.timerfd_of(fd) {
+        return match timerfd::read(tf, buf, count) {
+            Ok(timerfd::ReadNb::Done) => ret(8),
+            Ok(timerfd::ReadNb::WouldBlock) => {
+                if nb {
+                    err(errno::EAGAIN)
+                } else {
+                    proc::block_timerfd_read(cur, buf, count, tf)
                 }
             }
             Err(e) => ret(e),
@@ -1224,6 +1250,67 @@ fn sys_nanosleep(cur: usize, absolute_arg: bool, flags: u64, req_va: u64) -> Ctl
         return Ctl::Ret(0);
     }
     proc::block_timer(cur, deadline)
+}
+
+/// Read a `struct itimerspec` (it_interval then it_value, two `timespec`s = 32
+/// bytes) from cell VA `va`, returning `(interval_ns, value_ns)`; `None` on a bad
+/// timespec or an unreadable buffer. Resolved through `uaccess`, so it is bounds-
+/// and presence-checked (the `_ => true` ptr row applies, like `nanosleep`).
+fn read_itimerspec(va: u64) -> Option<(u64, u64)> {
+    let isec = crate::uaccess::read_unaligned::<i64>(va)?;
+    let insec = crate::uaccess::read_unaligned::<i64>(va + 8)?;
+    let vsec = crate::uaccess::read_unaligned::<i64>(va + 16)?;
+    let vnsec = crate::uaccess::read_unaligned::<i64>(va + 24)?;
+    if isec < 0
+        || !(0..1_000_000_000).contains(&insec)
+        || vsec < 0
+        || !(0..1_000_000_000).contains(&vnsec)
+    {
+        return None;
+    }
+    let interval = (isec as u64).saturating_mul(1_000_000_000) + insec as u64;
+    let value = (vsec as u64).saturating_mul(1_000_000_000) + vnsec as u64;
+    Some((interval, value))
+}
+
+/// Write a `struct itimerspec` to cell VA `va`; false on an unwritable buffer.
+fn write_itimerspec(va: u64, interval_ns: u64, value_ns: u64) -> bool {
+    let split = |ns: u64| ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64);
+    let (isec, insec) = split(interval_ns);
+    let (vsec, vnsec) = split(value_ns);
+    crate::uaccess::write_unaligned::<i64>(va, isec)
+        && crate::uaccess::write_unaligned::<i64>(va + 8, insec)
+        && crate::uaccess::write_unaligned::<i64>(va + 16, vsec)
+        && crate::uaccess::write_unaligned::<i64>(va + 24, vnsec)
+}
+
+/// timerfd_settime(fd, flags, new, old): arm/disarm the timer; `old` (if non-null)
+/// receives the prior setting (docs/LINUX-COMPAT.md L8-TIMERFD).
+fn sys_timerfd_settime(st: &mut LinuxState, fd: u64, flags: u64, new_va: u64, old_va: u64) -> i64 {
+    let Some(tf) = st.fds.timerfd_of(fd as i64) else {
+        return -errno::EINVAL;
+    };
+    let Some((interval_ns, value_ns)) = read_itimerspec(new_va) else {
+        return -errno::EFAULT;
+    };
+    let abstime = flags & timerfd::TFD_TIMER_ABSTIME != 0;
+    let prev = timerfd::settime(tf, abstime, value_ns, interval_ns);
+    if old_va != 0 && !write_itimerspec(old_va, prev.interval_ns, prev.value_ns) {
+        return -errno::EFAULT;
+    }
+    0
+}
+
+/// timerfd_gettime(fd, cur): the time until the next expiry + the period.
+fn sys_timerfd_gettime(st: &mut LinuxState, fd: u64, cur_va: u64) -> i64 {
+    let Some(tf) = st.fds.timerfd_of(fd as i64) else {
+        return -errno::EINVAL;
+    };
+    let it = timerfd::gettime(tf);
+    if !write_itimerspec(cur_va, it.interval_ns, it.value_ns) {
+        return -errno::EFAULT;
+    }
+    0
 }
 
 /// newfstatat(dirfd, path, statbuf, flags). AT_EMPTY_PATH (0x1000) with an

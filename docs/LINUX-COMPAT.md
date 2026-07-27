@@ -154,6 +154,7 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 | rseq / clone3 | ENOSYS | glibc has documented fallbacks (rseq→unregistered, clone3→clone); verified via the ENOSYS logger that glibc/rust fall back to `clone`, so clone3 stays ENOSYS. Both are now **dispatched** to that refusal rather than falling through the unknown-number path, so the log no longer says `ENOSYS nr=435` as if the number were unrecognised (docs/ARCHITECTURE-DEBT.md 4.0) |
 | open (x86-64 legacy) | full | Routed to `openat` with `AT_FDCWD` - the same call. It had been missing, and glibc issues `open` in preference to `openat` on x86-64, so every `open` was refused on **that ISA and nowhere else** (docs/ENGINEERING.md 11, the two-numbers hazard). An unreachable sentinel on the asm-generic tables |
 | eventfd2 | full for the wakeup contract | A 64-bit counter as a per-cell fd over a per-personality registry (`linux::eventfd`), **no kernel object** - the counter lives in the registry, not the descriptor, so `dup`/`fork` share it. Write adds (refusing `u64::MAX` and refusing to overflow), read drains, `EFD_SEMAPHORE` yields 1 and decrements, a zero counter is **not** readable (so poll/epoll report it unready and a blocking read parks under the pipe's runnable-peer rule), sub-8-byte transfers are `-EINVAL`, an unknown flag bit is `-EINVAL` rather than dropped. Scope: a **sibling context** writing it does not wake a context parked on it, which is the L4 cell-level block limitation, not an eventfd one |
+| timerfd_create / settime / gettime | full for the event-loop use | A timer as a per-cell fd over a per-personality registry (`linux::timerfd`), **no kernel object** - the armed deadline is an ordinary cell-clock wait, the same kind `nanosleep` parks on. One-shot and periodic; `TFD_TIMER_ABSTIME`, `CLOCK_MONOTONIC`/`CLOCK_REALTIME`; an all-zero `it_value` disarms. `read` returns the expiration count and consumes it (a periodic timer advances to its next future expiry); a blocking read on a not-yet-expired timer **parks on the deadline** (the scheduler idles on the timer, no runnable-peer needed, unlike an eventfd), a non-blocking one is `-EAGAIN`. `POLLIN` once expired, never `POLLOUT` - so an epoll loop wakes when the timer fires (the libuv timer source). `write` is `-EINVAL`. Scope: the cell-level block limit (L4) and no `TFD_TIMER_CANCEL_ON_SET` (the cell clock does not step) |
 | sysinfo | partial, honestly | `uptime` from the cell's own clock domain, `totalram`/`freeram` from the frame pool, `procs` from the live process count, `mem_unit` 1. `sharedram`/`bufferram`/`totalhigh`/`freehigh`/swap/`loads` are **0 because they are 0** - no page cache, no highmem, no swap, no load average is computed. Bun sizes its heap from these, so a placeholder would be worse than a refusal |
 | sched_setscheduler / getscheduler / get_priority_{max,min} | partial, honestly | One class exists: `SCHED_OTHER`, cooperative round-robin. Setting it at priority 0 succeeds *because it is already in force*; `SCHED_FIFO`/`RR`/`BATCH`/`IDLE` are refused `-EPERM` (the unprivileged-Linux errno every caller handles) rather than accepted and dropped - a real-time guarantee this scheduler cannot keep must not be reported as granted. `getscheduler` reports `SCHED_OTHER`; the priority range is 0..0 |
 | close_range | full | Closes every open descriptor in the inclusive range, skipping already-closed slots as Linux does. `CLOSE_RANGE_CLOEXEC` marks instead of closing; `CLOSE_RANGE_UNSHARE` is refused `-EINVAL` (this personality has no fd table shared separately from the address space) rather than ignored |
@@ -942,6 +943,43 @@ fixup path.
   the same `runnable_peer_exists` rule a pipe read uses, which is the L4
   cell-level block limitation (task #27), not an eventfd-specific one. Within one
   context, and across processes, the semantics are exact.
+
+- **L8-TIMERFD [done]** - **`timerfd_create`/`settime`/`gettime`**, the timer
+  source of libuv, and thus of Node.js and much of the async/JS world
+  (GOAL-TIMERFD). An event loop arms a timerfd for its nearest deadline, adds it
+  to its epoll set, and `epoll_wait` returns when it fires; without timerfd a
+  program loses its timer wakeup, not merely a convenience.
+
+  **No kernel object**, the eventfd pattern exactly: a timerfd is a per-cell fd
+  (`fd::FdKind::TimerFd`) indexing a per-personality registry
+  (`kernel/src/linux/timerfd.rs`), and its expiry is an ordinary **cell-clock
+  deadline** - the same wait `nanosleep` (`proc::Block::Timer`) parks on and the
+  same the scheduler already halts for through the timer arbiter's `CellSleep`
+  slice. So timerfd composes the existing time machinery: it adds no new wake
+  source and does not touch the deadline arithmetic. The armed deadline lives in
+  the **registry**, not the descriptor, so `dup`/`fork` alias one timer (the
+  eventfd reasoning).
+
+  Blocking reuses the sleep machinery: `proc::Block::TimerFdRead`, judged by
+  `satisfiable` from kernel state (the registry + the cell clock), completed by
+  `complete_block` writing the expiration count, classified `idle::TIMER`. Unlike
+  an eventfd read, a blocking timerfd read needs **no runnable peer** - the wake
+  source is the clock, so a single-threaded program parks correctly and the
+  scheduler idles on the timer, exactly as `nanosleep` does. For epoll, the
+  timerfd's per-fd source is `idle::TIMER` and its readiness is "expired", so the
+  existing poll/epoll idle path (timer slices that re-check readiness) wakes the
+  loop with no change to that path.
+
+  A one-shot fires once; a periodic timer's `read` returns the elapsed count and
+  advances its deadline to the next future tick. `write` is `-EINVAL` (a timerfd
+  is not writable). Proven by the `timerx` fixture in `linuxpoll` on all three
+  ISAs: a blocking read parks on a 20 ms one-shot and returns exactly one
+  expiration, then epoll_wait wakes on a second one-shot, and the disarmed timer
+  reads zero.
+
+  *Scope (honest):* the L4 cell-level block limit (a sibling context does not
+  independently wait), and no `TFD_TIMER_CANCEL_ON_SET` - the cell clock does not
+  step, so there is nothing to cancel on.
 
 ## 6. Fixture build matrix (reproducibility)
 

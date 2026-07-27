@@ -127,6 +127,11 @@ pub mod nr {
     pub const EVENTFD2: u64 = 290;
     pub const CLOSE_RANGE: u64 = 436;
 
+    // timerfd (docs/LINUX-COMPAT.md L8-TIMERFD). x86-64 legacy numbers.
+    pub const TIMERFD_CREATE: u64 = 283;
+    pub const TIMERFD_SETTIME: u64 = 286;
+    pub const TIMERFD_GETTIME: u64 = 287;
+
     // epoll (docs/LINUX-COMPAT.md L8-INET). x86-64 legacy numbers.
     pub const EPOLL_CREATE: u64 = 213;
     pub const EPOLL_WAIT: u64 = 232;

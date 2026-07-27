@@ -114,6 +114,11 @@ pub mod nr {
     pub const EVENTFD2: u64 = 19;
     pub const CLOSE_RANGE: u64 = 436;
 
+    // timerfd (docs/LINUX-COMPAT.md L8-TIMERFD). asm-generic numbers.
+    pub const TIMERFD_CREATE: u64 = 85;
+    pub const TIMERFD_SETTIME: u64 = 86;
+    pub const TIMERFD_GETTIME: u64 = 87;
+
     /// Not part of this table: x86-64's legacy `open` (asm-generic ISAs have only
     /// `openat`). Named as unreachable so portable dispatch can list it, like
     /// `ACCESS` and `READLINK`.

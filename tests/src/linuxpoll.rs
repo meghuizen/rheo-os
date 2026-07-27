@@ -93,6 +93,7 @@ macro_rules! fixture {
 
 static POLLX: &[u8] = fixture!("pollx");
 static POLLDEAD: &[u8] = fixture!("polldead");
+static TIMERX: &[u8] = fixture!("timerx");
 
 static mut OBJECTS: ObjectTable = ObjectTable::new();
 static mut CAPS: CapTable = CapTable::new();
@@ -201,6 +202,33 @@ extern "C" fn kernel_main() -> ! {
         "linuxpoll: pollx OK - readiness is real (an empty pipe is NOT ready), both \
          timeouts elapse, an indefinite poll is woken by a forked peer, nanosleep sleeps, \
          and pipe2(O_NONBLOCK) is honoured at creation"
+    );
+
+    // ---- phase 1b: timerfd - the libuv event-loop timer source ----
+    //
+    // A one-shot timer fires exactly once, so both a blocking read and an
+    // epoll_wait report a single expiration, and the disarmed timer reads zero -
+    // deterministic, no wall-clock value asserted (docs/LINUX-COMPAT.md L8-TIMERFD).
+    let (outcome, got) = run_capture(TIMERX, &[b"timerx"]);
+    let want_timer = b"timerx: blocking r=8 exp=1\n\
+                       timerx: epoll n=1 exp=1\n\
+                       timerx: disarmed val=0\n\
+                       timerx OK\n";
+    match outcome {
+        Outcome::Exited(code) => {
+            assert!(
+                got == want_timer,
+                "timerx: stdout mismatch\n  got:      {:?}\n  expected: {:?}",
+                core::str::from_utf8(got),
+                core::str::from_utf8(want_timer),
+            );
+            assert!(code == 0, "timerx: exit {code}, expected 0");
+        }
+        Outcome::Faulted(addr) => panic!("timerx: faulted at {addr:#x}"),
+    }
+    println!(
+        "linuxpoll: timerx OK - timerfd blocking read parks on its deadline and \
+         epoll_wait wakes on expiry (the libuv timer source)"
     );
 
     // ---- phase 2: a wait nothing can ever satisfy ----

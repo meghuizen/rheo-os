@@ -52,6 +52,16 @@ enum Block {
         count: u64,
         ev: u8,
     },
+    /// `read` on a `timerfd` that has not yet expired (docs/LINUX-COMPAT.md
+    /// L8-TIMERFD). Parked until its cell-clock deadline passes - the same wake
+    /// class as `Timer` (`nanosleep`), completed by writing the expiration count.
+    /// `tf` is the registry index (kernel state), so the scheduler judges
+    /// satisfiability without the waiter's address space active.
+    TimerFdRead {
+        buf_va: u64,
+        count: u64,
+        tf: u8,
+    },
     /// `write` on a full pipe whose read ends are still open.
     PipeWrite {
         buf_va: u64,
@@ -620,6 +630,15 @@ pub fn block_eventfd_read(cur: usize, buf_va: u64, count: u64, ev: u8) -> Ctl {
     reschedule(cur)
 }
 
+/// Park `cur` on a not-yet-expired timerfd read; the scheduler completes the read
+/// (writing the expiration count, `cur`'s address space active) once the deadline
+/// passes. The wait is honoured by the scheduler's timer slices, like `nanosleep`.
+pub fn block_timerfd_read(cur: usize, buf_va: u64, count: u64, tf: u8) -> Ctl {
+    procs()[cur].state = PState::Blocked;
+    procs()[cur].block = Block::TimerFdRead { buf_va, count, tf };
+    reschedule(cur)
+}
+
 /// Park `cur` on a full pipe write; completed when space frees or read ends close.
 pub fn block_pipe_write(cur: usize, buf_va: u64, count: u64, idx: usize) -> Ctl {
     procs()[cur].state = PState::Blocked;
@@ -751,7 +770,8 @@ fn sources_of(i: usize) -> crate::idle::Sources {
         | Block::PipeRead { .. }
         | Block::PipeWrite { .. }
         | Block::EventFdRead { .. } => idle::PEER,
-        Block::Timer { .. } => idle::TIMER,
+        // A timerfd read and a nanosleep both wait on a cell-clock deadline.
+        Block::Timer { .. } | Block::TimerFdRead { .. } => idle::TIMER,
         Block::Console { .. } => idle::CONSOLE,
         // Computed when the block was registered, from the descriptors it watches.
         Block::Poll { sources, .. } | Block::Epoll { sources, .. } => sources,
@@ -794,6 +814,7 @@ fn block_name(i: usize) -> &'static str {
         Block::PipeRead { .. } => "read (empty pipe/socket)",
         Block::PipeWrite { .. } => "write (full pipe/socket)",
         Block::EventFdRead { .. } => "read (eventfd counter zero)",
+        Block::TimerFdRead { .. } => "read (timerfd not expired)",
         Block::Timer { .. } => "nanosleep (deadline)",
         Block::Console { .. } => "read (console)",
         Block::Poll { .. } => "poll (fd readiness)",
@@ -808,6 +829,7 @@ fn satisfiable(i: usize) -> bool {
         Block::PipeRead { idx, .. } => pipe::has_data(idx) || pipe::writers(idx) == 0,
         Block::PipeWrite { idx, .. } => pipe::has_space(idx) || pipe::readers(idx) == 0,
         Block::EventFdRead { ev, .. } => super::eventfd::readable(ev),
+        Block::TimerFdRead { tf, .. } => super::timerfd::readable(tf),
         Block::Timer { deadline_ns } => super::cell_clock_ns(false) >= deadline_ns,
         Block::Console { .. } => crate::input::has_data() || crate::input::at_eof(),
         Block::Poll {
@@ -871,6 +893,11 @@ fn complete_block(n: usize) {
                 Err(e) => e,
             }
         }
+        Block::TimerFdRead { buf_va, count, tf } => match super::timerfd::read(tf, buf_va, count) {
+            Ok(super::timerfd::ReadNb::Done) => 8,
+            Ok(super::timerfd::ReadNb::WouldBlock) => -super::errno::EAGAIN,
+            Err(e) => e,
+        },
         Block::PipeWrite { buf_va, count, idx } => match pipe::write(idx, buf_va, count) {
             pipe::WriteNb::Done(n) => n,
             pipe::WriteNb::WouldBlock => 0,
