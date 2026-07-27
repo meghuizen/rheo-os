@@ -61,18 +61,39 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 /// Registry capacity: matches the machine inventory's CPU ceiling.
 pub const MAX_CPUS: usize = crate::hw::MAX_CPUS;
 
-/// Index of the CPU this call runs on.
+/// Index of the CPU this call runs on. **Always a valid registry index.**
 ///
 /// The **one** place the rest of the kernel asks "which core am I?", so that
 /// per-CPU state has a single addressing rule. Without the `smp` feature there
 /// is exactly one CPU and this is a compile-time `0`, which is what makes every
 /// [`PerCpu<T>`] lookup free and every [`SpinLock`] uncontended on the default
 /// build.
+///
+/// ## Totality is a requirement, not a convenience
+///
+/// The returned value indexes every per-CPU structure in the kernel, so an
+/// out-of-range answer is not a wrong number - it is a wild memory access. This
+/// function is therefore **total**: whatever the arch layer reports is bounded
+/// here, and anything out of range resolves to CPU 0.
+///
+/// That guard is load-bearing rather than defensive padding, because the arch
+/// implementations differ in how they answer *before* bring-up has run. x86-64
+/// and ARM64 search a table of hardware ids and fall back to 0, so they are
+/// already safe early. RISC-V reads `tp` directly, which holds whatever the
+/// previous boot stage left there until `smp_set_this_cpu` runs - and the
+/// subsystems re-founded on per-CPU state (the timer arbiter, the metrics
+/// histograms, the DRBG roots, the run queue) all touch it during boot, long
+/// before `smp::init`. That combination panicked the `smp` kernel with an index
+/// of 2147790848. `tp` is now zeroed in the RISC-V boot stub so the value is
+/// genuinely 0 rather than garbage that happens to be masked, and this bound
+/// stays as the structural backstop: a future port that forgets to initialise
+/// its identity register gets CPU 0, not corruption.
 #[inline(always)]
 pub fn cpu_index() -> usize {
     #[cfg(feature = "smp")]
     {
-        arch::cpu_index()
+        let raw = arch::cpu_index();
+        if raw < MAX_CPUS { raw } else { 0 }
     }
     #[cfg(not(feature = "smp"))]
     {

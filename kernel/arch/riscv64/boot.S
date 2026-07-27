@@ -29,6 +29,17 @@
 _start:
 .option push
 .option norelax
+    # `tp` is this hart's **CPU index** in kernel context (arch::cpu_index reads
+    # it, and every per-CPU structure is addressed by it - docs/SUBSTRATE.md
+    # pillar 3). Nothing has set it yet: SBI leaves it holding whatever the
+    # previous stage did, and the boot hart is CPU 0 until `smp::init` says
+    # otherwise. Zero it here, before any Rust runs, so that a read taken during
+    # boot - the timer arbiter, the metrics histograms, the DRBG roots and the run
+    # queue all touch per-CPU state before bring-up - resolves to CPU 0 rather
+    # than to a garbage index. Left uninitialised it faulted the `smp` kernel with
+    # an out-of-bounds per-CPU index.
+    mv   tp, zero
+
     # Build the boot/kernel root in .boot.bss. satp is off, so addresses are
     # physical; the root is identity-reachable at its low PC-relative label.
     la   t0, boot_root
