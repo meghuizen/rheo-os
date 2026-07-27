@@ -2145,7 +2145,15 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               dhello.c + af_unix.c + inet.c + inetremote.c; coreutils via cargo
               install, and the L7 ld.so/libc.so.6
               copied from the toolchain - all gitignored)
-comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md
+comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md; plus
+              linux/ - the tuned-Linux (CachyOS-class) comparison: the axis
+              measurable today is the **scheduler's ordering decision** (both
+              ship EEVDF+BORE), with rheo_sched.rs running the shipped
+              sched/{bore,vcore}.rs unedited over a scripted interactive+hogs
+              trace and sched_latency.rs asking the host Linux the same question
+              in ns - different units, never divided. Every other axis is
+              lab-gated and named; no number in the tree says rheo-os is faster
+              than Linux (docs/SUBSTRATE.md)
 xtask/        build/run/test/bench orchestration (cargo xtask ...)
 idl/          system IDL + codegen        (future, step 6)
 runtime/      strand runtime: heap (alloc), async executor + channel,

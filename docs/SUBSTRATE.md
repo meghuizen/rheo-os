@@ -117,13 +117,26 @@ structurally cannot follow:
 - container isolation without namespace assembly: the cell is the primitive
   (pillar 9).
 
-A **`comparison/linux/`** methodology (the seL4-comparison precedent: same
-hardware, same harness, published method) defines the axes - syscall batch
-throughput, IO tail latency P99.9 under load, container cold-start and
-density, scheduler responsiveness under mixed load (the BORE benchmark
-set). Every "outperforms" claim in this tree must cite a run of it. Until
-lab runs exist, the claim is "designed to, unmeasured" - never "does"
-(TOOLING.md 4).
+**`comparison/linux/` now exists** (the seL4-comparison precedent: same hardware,
+same harness, published method). It defines the axes - syscall batch throughput, IO
+tail latency P99.9 under load, container cold-start and density, scheduler
+responsiveness under mixed load - and says for each whether it is measurable today
+or gated on the lab. One is measurable today and is measured: the **scheduler's
+ordering decision**, because CachyOS's distinguishing feature over mainline is BORE
+on top of EEVDF and pillar 3 deliberately adopts the same frontier, so the
+*decision* is comparable even where the clock is not. `rheo_sched.rs` runs the
+shipped `sched/{bore,vcore}.rs` (unedited, only the frame-funded storage shimmed)
+over a scripted interactive-plus-hogs trace and reports intervening slices, BORE
+weights and eligibility deferrals; `sched_latency.rs` asks the host Linux scheduler
+the same question in nanoseconds. **The units differ and are never divided.**
+
+The rest is gated on rheo-os running on real silicon, and the reason is not a
+scheduling problem: putting a TCG number beside a bare-metal Linux number produces a
+ratio with no physical meaning, and the `-icount` trick that makes the seL4
+comparison fair does not transfer to a full Linux distribution. Every "outperforms"
+claim in this tree must cite a run of a `comparison/` harness. Until the lab runs
+exist, the claim is "designed to, unmeasured" - never "does" (TOOLING.md 4), and
+`comparison/linux/RESULTS.md` says so in its own conclusion.
 
 ---
 
