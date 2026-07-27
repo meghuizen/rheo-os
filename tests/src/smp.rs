@@ -110,9 +110,10 @@ static mut GB: [i8; GK * GN] = [0; GK * GN];
 static mut GC: [i32; GM * GN] = [0; GM * GN];
 static mut GREF: [i32; GM * GN] = [0; GM * GN];
 
-/// Two cores compute one GEMM, and the result is asserted bit-identical to a
-/// single-core reference.
-fn test_parallel_gemm() {
+/// Two cores drain one GEMM work queue; the result is asserted bit-identical to a
+/// single-core reference and both cores are asserted to have taken work. `idx` is the
+/// secondary's registry index, so its share can be read back.
+fn test_parallel_gemm(idx: usize) {
     // SAFETY: single-threaded setup; the secondary is parked in its work loop waiting
     // for a job and touches none of this until one is published.
     unsafe {
@@ -141,7 +142,9 @@ fn test_parallel_gemm() {
         // Split the output rows in half: the primary takes the low half, the secondary
         // the high half. Disjoint in C, so no lock is needed around the compute - which
         // is the point, and why the rendezvous is the only synchronisation.
-        let split = GM / 2;
+        // The whole output range is published as one job; both cores claim blocks
+        // from it. There is no reserved half - which is the point, and why the
+        // per-core counts below are evidence rather than arithmetic.
         let job = smp::GemmJob {
             a: core::ptr::addr_of!(GA) as usize,
             b: core::ptr::addr_of!(GB) as usize,
@@ -149,12 +152,12 @@ fn test_parallel_gemm() {
             as_: GK,
             bs: GN,
             cs: GN,
-            lo: split,
+            lo: 0,
             hi: GM,
             n: GN,
             k: GK,
         };
-        let (met, finished) = smp::run_gemm_with_secondary(job, 0, split);
+        let (met, finished) = smp::run_gemm_with_secondary(job, 0, GM);
 
         if !finished {
             println!(
@@ -171,22 +174,27 @@ fn test_parallel_gemm() {
         );
         let got = &*core::ptr::addr_of!(GC);
         let want = &*core::ptr::addr_of!(GREF);
-        // Bit-exact, both halves. A mismatch confined to one half would say which core
-        // got it wrong, so the halves are checked separately before the whole.
-        for (name, lo, hi) in [("primary", 0, split), ("secondary", split, GM)] {
-            for i in lo..hi {
-                for j in 0..GN {
-                    assert_eq!(
-                        got[i * GN + j],
-                        want[i * GN + j],
-                        "{name} half wrong at ({i},{j})"
-                    );
-                }
-            }
-        }
         assert_eq!(
             got, want,
             "two-core GEMM differs from the single-core oracle"
+        );
+        // **Load sharing**, which a fixed half-and-half split could not show: both
+        // cores must have completed blocks, and the two counts must account for the
+        // whole queue. A run where either is zero did the work on one core and would
+        // still have produced the right answer - which is exactly why this is asserted
+        // rather than inferred from correctness.
+        let (p_blocks, s_blocks) = (smp::blocks_done(0), smp::blocks_done(idx));
+        let total_blocks = GM.div_ceil(smp::GEMM_BLOCK_ROWS);
+        assert_eq!(
+            p_blocks + s_blocks,
+            total_blocks,
+            "blocks completed ({p_blocks} + {s_blocks}) do not account for the whole \
+             queue ({total_blocks}) - a claim was lost or double-counted"
+        );
+        assert!(
+            p_blocks > 0 && s_blocks > 0,
+            "one core did all {total_blocks} blocks (primary {p_blocks}, secondary \
+             {s_blocks}) - the queue was drained serially, not shared"
         );
         // And the frame allocator survived two cores using it (the pool lock,
         // docs/SMP.md 10.2): the incremental used counter still agrees with the bitmap
@@ -196,8 +204,9 @@ fn test_parallel_gemm() {
             "the frame pool's used counter drifted from its bitmap under two cores"
         );
         println!(
-            "smp: TWO CORES computed one {GM}x{GN}x{GK} int8 GEMM at the same time \
-             (rows 0..{split} on CPU 0, {split}..{GM} on the secondary), result \
+            "smp: TWO CORES drained one {total_blocks}-block work queue for a \
+             {GM}x{GN}x{GK} int8 GEMM at the same time (CPU 0 took {p_blocks}, the \
+             secondary {s_blocks} - claimed, not pre-assigned), result \
              bit-identical to the single-core oracle, and the two met at a rendezvous \
              neither could pass alone OK"
         );
@@ -243,7 +252,7 @@ fn test_secondary_bringup() {
                 shared
             );
             println!("smp: real second core on {} confirmed", arch::NAME);
-            test_parallel_gemm();
+            test_parallel_gemm(idx);
         }
         Err(StartError::NoSecondary) => {
             println!(

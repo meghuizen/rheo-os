@@ -427,9 +427,9 @@ fn secondary_work_loop() {
         if let Some(job) = job {
             if rendezvous(&RV_SECONDARY, &RV_PRIMARY) {
                 // SAFETY: the primary's `run_gemm_with_secondary` contract - the
-                // buffers are valid for the exchange and these rows are disjoint from
-                // the primary's.
-                unsafe { gemm_rows(&job, job.lo, job.hi) };
+                // buffers are valid for the exchange, and each block this claims is
+                // its alone.
+                unsafe { drain_blocks(&job) };
             }
             JOBS_DONE.fetch_add(1, Ordering::Release);
             return;
@@ -490,8 +490,65 @@ pub struct GemmJob {
 #[cfg(feature = "smp")]
 static JOB: SpinLock<Option<GemmJob>> = SpinLock::new(None);
 #[cfg(feature = "smp")]
-/// Bumped by a secondary when its rows are done.
+/// Bumped by a secondary when it has finished draining.
 static JOBS_DONE: AtomicUsize = AtomicUsize::new(0);
+
+// ------------------------------------------------------------- the work queue
+//
+// A published job is split into fixed row **blocks**, and both cores claim blocks
+// from a shared cursor until it is exhausted. That is the difference between "the
+// secondary was handed one thing to do" and "the secondary is a core that takes work":
+// with a static half-and-half split the faster core finishes early and idles, and
+// nothing about the division adapts to what the cores actually do. Claiming makes the
+// split a *result* rather than an assumption - which is also what makes the per-core
+// counts below evidence of load sharing rather than of arithmetic.
+//
+// The cursor is a single `fetch_add`, so claiming is wait-free and needs no lock: a
+// core that loses a race simply gets the next block. Blocks are disjoint row ranges of
+// C, so once claimed there is no sharing at all and the compute needs no
+// synchronisation - the reason a GEMM parallelises by output rows in the first place.
+
+#[cfg(feature = "smp")]
+/// Rows per claimable block. Small enough that many blocks exist for two cores to
+/// interleave over, large enough that the claim is negligible next to the work.
+pub const GEMM_BLOCK_ROWS: usize = 4;
+
+#[cfg(feature = "smp")]
+/// Next unclaimed block index.
+static NEXT_BLOCK: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp")]
+/// Blocks completed by each core, indexed by CPU. The load-sharing witness: a run
+/// where one entry is zero did not share anything.
+static BLOCKS_DONE: PerCpu<AtomicUsize> =
+    PerCpu::from_array([const { AtomicUsize::new(0) }; MAX_CPUS]);
+
+#[cfg(feature = "smp")]
+/// Claim and compute blocks until the queue is empty. Runs on **both** cores.
+///
+/// # Safety
+/// As [`run_gemm_with_secondary`]: `job`'s buffers must be valid for the exchange.
+unsafe fn drain_blocks(job: &GemmJob) {
+    let total = job.hi.div_ceil(GEMM_BLOCK_ROWS);
+    loop {
+        let b = NEXT_BLOCK.fetch_add(1, Ordering::AcqRel);
+        if b >= total {
+            return;
+        }
+        let lo = b * GEMM_BLOCK_ROWS;
+        let hi = (lo + GEMM_BLOCK_ROWS).min(job.hi);
+        // SAFETY: the caller's contract, plus the claim above, which makes this row
+        // range this core's alone.
+        unsafe { gemm_rows(job, lo, hi) };
+        BLOCKS_DONE.this().fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "smp")]
+/// Blocks completed by CPU `cpu` in the last run.
+pub fn blocks_done(cpu: usize) -> usize {
+    // SAFETY: a cross-core read of a counter, which is what the aggregate is for.
+    unsafe { BLOCKS_DONE.get(cpu) }.load(Ordering::Acquire)
+}
 
 #[cfg(feature = "smp")]
 /// The two halves of a **rendezvous**: each core announces itself and then waits for
@@ -547,6 +604,11 @@ fn rendezvous(mine: &AtomicUsize, theirs: &AtomicUsize) -> bool {
 /// all, and is the caller's obligation because only the caller knows the split.
 pub unsafe fn run_gemm_with_secondary(job: GemmJob, own_lo: usize, own_hi: usize) -> (bool, bool) {
     JOBS_DONE.store(0, Ordering::Release);
+    NEXT_BLOCK.store(0, Ordering::Release);
+    for cpu in 0..MAX_CPUS {
+        // SAFETY: between runs; no core is draining.
+        unsafe { BLOCKS_DONE.get(cpu) }.store(0, Ordering::Release);
+    }
     RV_PRIMARY.store(0, Ordering::Release);
     RV_SECONDARY.store(0, Ordering::Release);
     RV_TIMEOUT.store(0, Ordering::Release);
@@ -556,9 +618,14 @@ pub unsafe fn run_gemm_with_secondary(job: GemmJob, own_lo: usize, own_hi: usize
     // secondary starting after the primary has finished.
     let met = rendezvous(&RV_PRIMARY, &RV_SECONDARY);
 
-    // SAFETY: the caller's contract - valid buffers, and these rows are disjoint from
-    // the secondary's.
-    unsafe { gemm_rows(&job, own_lo, own_hi) };
+    // Both cores now drain the same queue. The primary takes no reserved share: if
+    // the secondary is faster it does more, and if the secondary never arrives the
+    // primary completes the whole job alone - which is what makes this degrade to
+    // correct-but-serial rather than to a hang.
+    // SAFETY: the caller's contract - valid buffers; the claim in `drain_blocks`
+    // makes each block one core's alone.
+    unsafe { drain_blocks(&job) };
+    let _ = (own_lo, own_hi);
 
     let deadline = arch::timer_now_ns().wrapping_add(RV_TIMEOUT_NS);
     while JOBS_DONE.load(Ordering::Acquire) == 0 {

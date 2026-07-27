@@ -1662,21 +1662,29 @@ the `smp` feature, because locking is a property of the data structure rather th
 build configuration (the lesson that produced the `SYS_YIELD` FP defect: state whose
 safety depends on which features are enabled gets written twice and diverges); an
 uncontended acquire is one atomic exchange, unmeasurable next to zeroing a frame. On
-top of it a secondary core computes half the output rows of an int8 GEMM - the tile
-framework's own `gemm_i8_i32`, shared verbatim - while the primary computes the other
-half, split by output rows so the two write disjoint ranges of C and the compute needs
-no lock at all; the result is asserted **bit-identical** to a single-core oracle, and
-the frame pool's used counter is asserted still to agree with its bitmap (the invariant
-a lost update breaks). The parallelism is proven by a **rendezvous rather than by
+top of it **both cores drain a shared work queue**: an int8 GEMM - the tile framework's
+own `gemm_i8_i32`, shared verbatim - has its output rows split into blocks, and each
+core claims blocks from a single `fetch_add` cursor until exhausted. Split by output
+rows so the two write disjoint ranges of C and the compute needs no lock at all;
+*claimed* rather than pre-assigned so the division is a result, not an assumption - with
+a static half-and-half split the faster core idles and the per-core counts prove nothing
+because they were decided in advance. The result is asserted **bit-identical** to a
+single-core oracle, both counts are asserted nonzero and to sum to the queue (they vary
+run to run - 8/8, 9/7), and the frame pool's used counter is asserted still to agree
+with its bitmap (the invariant a lost update breaks). The parallelism is proven by a **rendezvous rather than by
 timing**: each core publishes a flag and waits for the other's, neither writes its flag
 after passing, so both passing means both executed inside one interval - which a single
 core cannot produce, since there is no kernel-context preemption to interleave them and
 neither side yields. A wall-clock speedup would prove nothing under TCG (it time-slices
 the two vCPUs onto host threads), so simultaneity is the available evidence and it is
-what is asserted. **Honest scope:** a secondary takes one published job and parks -
-there is no per-CPU dispatch, no cell runs in **user mode** on a secondary, and the
-shared state a *cell* touches (the cell table, the capability/object tables, the Linux
-per-cell state) is not yet audited.
+what is asserted. **Honest scope:** the work items are kernel jobs, not cells. A
+secondary drains the queue and parks; **no cell runs in user mode on a secondary**, and
+what would have to be audited first is named in docs/SMP.md 10 - the cell table, the
+capability/object tables, the Linux per-cell state, and the per-CPU-ing of the trap
+entry itself (on x86-64 `CUR_FRAME`/`KERNEL_RSP`/`USER_RSP_SCRATCH` are globals the
+syscall fast path reads, so that is a change *to* the fast path rather than an addition
+beside it; ARM64 and RISC-V already have per-core `VBAR_EL1`/`TPIDR_EL1` and
+`stvec`/`sscratch`).
 
 **Still honest about what is not wired:** the fixed VA map is still the map (S2'
 untouched), dispatch is proven for native cells and **off by default** except the
