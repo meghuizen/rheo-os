@@ -569,10 +569,27 @@ so was its claim of 182 MiB of `.bss`, which measurement shows does not exist.
    keeps the old name, so an unaware caller gets a correct image, and the lazy one is
    named for the obligation it imposes (ENGINEERING.md 11).
 
-   **Still eager, and named:** **COW `fork`** (still an eager copy of every committed
-   page), a **guard-page + grow-on-fault stack** (the initial stack is mapped whole), a
-   segment with a `.bss` tail, and every **native** cell's image. All ride this same
-   handler.
+   **Done: `fork` is copy-on-write.** It shared 2406 pages, copied 0, and cost 12
+   frames of child page tables for a 9.4 MiB process on riscv64 - 200x. A per-frame
+   refcount in `frames` (`free` becomes a decrement, so every pre-COW caller is
+   unchanged), a software PTE bit per ISA (`paging_cow_protect_user`/`_at`/`_clear`),
+   and a fault branch that privates a page on write. The mark lives in the page table,
+   not the VMA list, so it covers the stack and `brk` heap that have no VMA record; the
+   parent is write-protected too, the half that fails silently. Proven by `cowfork`,
+   both halves observed failing when reverted.
+
+   Doing it exposed and fixed an **architectural gap**: the kernel touched cell memory
+   at ~98 sites and 51 dereferenced the raw VA with only a bounds check done elsewhere,
+   so each lazy-mapping feature re-opened a 98-site audit at a new strength. All 51 now
+   route through `kernel/src/uaccess.rs`, the single seam that enforces bounds,
+   presence and COW resolution - a new lazy feature changes one function there. The
+   split between kernel *mechanism* (refcount, share, cow-protect, fault delivery) and
+   COW *policy* (personality code) is kept visible so the policy can move behind a
+   userspace process server later, the seL4 way.
+
+   **Still eager, and named:** a **guard-page + grow-on-fault stack** (the initial
+   stack is mapped whole), a segment with a `.bss` tail, and every **native** cell's
+   image. All ride this same handler.
 
    **What remains before the real target can be attempted**, from measuring it: the
    275 MB binary cannot be `include_bytes!`d (a kernel image that large runs past the

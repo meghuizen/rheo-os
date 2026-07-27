@@ -332,11 +332,56 @@ filled read-only page still SIGSEGV, a page still filling from the file after a 
 sharer exited, and the registry back where it started. Plus `linuxdyn`, where `ld.so`
 maps a real 1.5-2.1 MB `libc` and an unmodified dynamic glibc binary runs.
 
-**Still eager, and named as such:** `fork` (an eager copy of every committed page,
-not COW), the initial stack (mapped whole rather than a guard page that grows on
-fault), a segment with a `.bss` tail, and every **native** cell's image (no VMA list
-to map records with). All ride the same handler and are the next rungs;
+**`fork` is copy-on-write.** It used to copy every committed page, so a process paid
+its whole resident set to fork - more, for a large program, than its image ever cost.
+Now `AddressSpace::fork_from` shares the parent's pages read-only into the child and
+marks both sides copy-on-write; each page is privated on the first write to it, in the
+same `linux::mem::fault` handler. Measured on riscv64: a fork of a 2406-page (9.4 MiB)
+process shares 2406 pages, copies 0, and consumes 12 frames of child page tables -
+200x. Three pieces carry it:
+
+- **A per-frame reference count** in `frames` (`share`/`refs`, and `free` is now a
+  decrement - which is what lets every pre-COW caller stay unchanged). A page that
+  cannot be shared (outside the pool, or at the count ceiling) is copied, so nothing
+  is silently aliased.
+- **A software PTE bit per ISA** (`arch::paging_cow_protect_user`/`_at`/`_clear`: Sv39
+  RSW bit 8, AArch64 bit 55, x86-64 bit 52). The mark lives in the page table, not the
+  VMA list, because a fork shares the stack and the `brk` heap too and neither has a
+  VMA record - a COW test routed through the VMA list would refuse the first stack
+  write after every fork.
+- **The parent is write-protected too**, which is the half that fails silently: without
+  it the parent writes through to memory the child now sees, wrong values with no fault.
+
+Proven by `cowfork` in `linuxproc` on all three ISAs - a 256-page dirty heap forked,
+three isolation properties (the child sees the parent's pre-fork values; neither side's
+writes reach the other), with the kernel's own `mm::fork_pages()`/`fork_frames()` as the
+oracle. Both halves observed failing when reverted.
+
+**Still eager, and named as such:** the initial stack (mapped whole rather than a guard
+page that grows on fault), a segment with a `.bss` tail, and every **native** cell's
+image (no VMA list to map records with). All ride the same handler;
 docs/ARCHITECTURE-DEBT.md 4.0 blocker 2 tracks them.
+
+### Touching a cell's memory: the `uaccess` seam
+
+Every kernel access to a cell's memory goes through one module, `kernel/src/uaccess.rs`.
+This is not decoration: a cell hands the kernel raw virtual addresses, and lazy mapping
+makes *readiness* a moving target - demand paging made a page's presence lazy, COW makes
+its writability lazy on top of that, and a fault taken in kernel mode is not resumable
+here (which is why Linux has `copy_from_user`/`copy_to_user` and a fixup table). Before
+this seam, ~98 sites touched cell memory and 51 dereferenced the raw VA with only a
+bounds check performed elsewhere, so each lazy feature re-opened a 98-site audit and half
+the sites had no guard to extend. The module offers bounds-only predicates
+(`readable`/`writable`, kept separate because folding presence into them cost a measured
+~2,900x amplification), resolve-and-hand-back (`buf`/`slice`/`out_ptr`), and
+resolve-and-perform (`read`/`write`/`copy_in`/`copy_out`/`fill`) - the last so a site
+cannot forget to resolve. A new lazy feature changes one function there and nothing
+else. **Doctrine note:** the frame refcount, `share`, `cow_protect` and fault delivery
+are kernel *mechanism*; the COW *policy* is personality code and, like seL4's
+user-level page-fault handling, can move behind a userspace process server later without
+rewriting the mechanism. It is pre-resolution, not a fixup table - which is sound while
+the kernel is the only thing running, and is where SMP (task #27) will need a real
+fixup path.
 
 ## 5. Milestones
 

@@ -560,6 +560,21 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   why. Three attempts were reverted before the arithmetic was checked. When a proof
   fails after an unrelated change, ask what the number now includes before asking what
   broke.
+- **A run of one-site fixes is a design smell, not progress.** Copy-on-write `fork`
+  produced a string of them: `proc::reap` storing a wait status onto the parent's now-
+  read-only stack, then `signal::build_frame` writing a signal frame onto it, each a
+  kernel-mode store fault at a user address. The fix for the third was not a third
+  patch: it was to *measure* the pattern, which showed the kernel touched cell memory
+  at ~98 sites and 51 dereferenced the raw VA with no guard to extend. When the same
+  shape of bug recurs, stop patching and count the sites - the recurrence is telling
+  you the seam is missing, not that you have one more instance to handle.
+- **Readable is not writable, once a page can be shared.** Demand paging made presence
+  the question a kernel access to user memory had to resolve; COW added a second,
+  because a page can be present and still read-only. The write helpers resolve it and
+  nothing else needs to know - but the general lesson is that each lazy-mapping feature
+  adds a *strength* the accessor must reach, so the accessor has to be one place, or
+  the audit is unbounded. `uaccess::Access::{Read,Write}` is that strength made
+  explicit.
 
 ## 12. Never dereference an address the caller chose
 

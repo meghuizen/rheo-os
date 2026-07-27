@@ -1337,6 +1337,37 @@ the initial stack is mapped whole rather than growing on fault, a segment with a
 tail is copied, and a **native** cell's image is eager (no VMA list to map records
 with) - all ride this same handler.
 
+**Copy-on-write `fork`** (docs/LINUX-COMPAT.md "Demand paging", docs/ARCHITECTURE-DEBT.md
+4.0 blocker 2) makes a fork **share** the parent's pages rather than copy them. It used
+to eager-copy every committed page, so a process paid its whole resident set to fork -
+more, for a large program, than its image ever cost. Now `AddressSpace::fork_from` shares
+read-only into the child and marks both sides copy-on-write; each page privates on first
+write in `linux::mem::fault`. Measured on riscv64: a fork of a 2406-page (9.4 MiB)
+process shares 2406 pages, copies 0, costs 12 frames of child page tables - **200x**.
+Three pieces: a **per-frame refcount** in `frames` (`free` is now a decrement, so every
+pre-COW caller is unchanged; `share` refuses a non-pool page or the ceiling and the caller
+copies), a **software PTE bit per ISA** (`arch::paging_cow_protect_user`/`_at`/`_clear` -
+Sv39 RSW 8, AArch64 55, x86-64 52; the mark lives in the page table not the VMA list, so
+it covers the stack and `brk` heap that have no VMA record), and the **parent
+write-protect** (the half that fails silently - without it the parent writes through to
+memory the child now sees). Proven by `cowfork` in `linuxproc` on all three ISAs with
+`mm::fork_pages()`/`fork_frames()` as the oracle, both halves observed failing when
+reverted.
+
+Every kernel access to a cell's memory now goes through **one seam, `kernel/src/uaccess.rs`**
+(docs/LINUX-COMPAT.md "the uaccess seam"). Lazy mapping makes readiness a moving target -
+demand paging made presence lazy, COW makes writability lazy on top - and a fault in kernel
+mode is not resumable, so each strength must be resolved before the access (the
+`copy_from_user`/fixup-table problem). Before this, ~98 sites touched cell memory and 51
+dereferenced the raw VA with only a bounds check done elsewhere, so each lazy feature
+re-opened a 98-site audit; all 51 now route through `uaccess`, which offers bounds-only
+predicates (kept separate - folding presence in cost a measured ~2,900x amplification),
+resolve-and-hand-back, and resolve-and-perform (`read`/`write`/`copy_in`/`copy_out`/`fill`,
+where a site cannot forget to resolve). Kernel *mechanism* (refcount, share, cow-protect,
+fault delivery) is kept separate from COW *policy* (personality code) so the policy can
+move behind a userspace process server later, the seL4 way; it is pre-resolution, not a
+fixup table, which SMP (task #27) will need.
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
 proofs, and the hardware-lab performance numbers.
@@ -1450,7 +1481,12 @@ kernel/       the no_std kernel library + boot demo bin
   src/        ISA-independent: boot (the portable boot sequencer - arch::init
               does only console/vectors/page tables, so arch names nothing above
               itself), capability core, queue ABI, cells, mm
-              (frames + frames_pmem real-nvdimm allocator + grants), time (clock), rng (ChaCha20 DRBG +
+              (frames + frames_pmem real-nvdimm allocator + grants; frames carries a
+              per-frame refcount so `fork` is copy-on-write - `free` is a decrement,
+              `share`/`refs` the COW primitives), uaccess (**the one seam kernel code
+              touches a cell's memory through**: bounds + presence + copy-on-write
+              resolution, so every lazy-mapping feature is one change here rather than a
+              ~98-site audit - docs/LINUX-COMPAT.md), time (clock), rng (ChaCha20 DRBG +
               hwrng seeding), event streams,
               sched (reservations + the **system-wide admission ledger**:
               a reservation must fit its cell AND the machine -
