@@ -212,8 +212,23 @@ extern "C" fn kernel_main() -> ! {
          FD_CLOEXEC closed across execve while a plain fd survived"
     );
 
-    // --- `/proc/self/exe` (docs/ARCHITECTURE-DEBT.md 4). `readlinkat` was a
-    // hardcoded `-ENOENT` for every path, `/proc/self/exe` included - the one
+    // --- cross-process `kill` + `/proc/self/exe` (docs/ARCHITECTURE-DEBT.md 4).
+    //
+    // `kill` refused any pid but the caller's own with ESRCH, and answered
+    // `kill(0)`/`kill(-1)` by silently delivering to the *caller* - "signal my
+    // children" reported as done and delivered to the wrong process. Subprocess
+    // management is the whole job of the program this personality exists to run.
+    //
+    // Two of the fixture's five kill phases discriminate; the other three passed
+    // with the fix reverted, because the old stub happened to give the same
+    // answers, and that is recorded in the fixture. The two that do: signalling a
+    // live child (the delivery lands on a process that is not running, so it is
+    // recorded pending and delivered by the scheduler when it switches in - the
+    // only moment the target's stack and frame are reachable), and `kill(-1)`
+    // sparing the top of the tree, which stands in for init.
+    //
+    // `readlinkat` was a hardcoded `-ENOENT` for every path, `/proc/self/exe`
+    // included - the one
     // link real programs actually read, to re-exec themselves or to find
     // resources beside their own binary.
     //
@@ -222,7 +237,10 @@ extern "C" fn kernel_main() -> ! {
     // kernel answers `-ENOENT` there rather than inventing a path. So the fixture
     // execve's itself and the re-exec'd process reads the link.
     fs::write("/bin/killx", KILLX).expect("seed /bin/killx");
-    let want_kill: &[u8] = b"exe: /bin/killx\n\
+    let want_kill: &[u8] = b"kill: self probe ok, absent ESRCH, unknown group ESRCH\n\
+        kill: child signalled, handler ran, reaped pid gone\n\
+        kill: -1 spared init, ESRCH with no other process\n\
+        exe: /bin/killx\n\
         exe: non-link EINVAL, absent ENOENT\n\
         killx OK\n";
     let (code, out) = run_capture(KILLX, &[b"killx"]);
@@ -234,8 +252,10 @@ extern "C" fn kernel_main() -> ! {
     );
     assert!(code == 0, "killx: exit {code}, expected 0");
     println!(
-        "linuxproc: /proc/self/exe OK - resolves to the execve'd path, a real \
-         non-link reports EINVAL, an absent path ENOENT"
+        "linuxproc: cross-process kill OK - a live child is probed and signalled, \
+         its handler runs, the reaped pid is gone, and kill(-1) spares the top of \
+         the tree instead of self-targeting; /proc/self/exe resolves to the \
+         execve'd path, a real non-link reports EINVAL, an absent path ENOENT"
     );
 
     // --- the mmap region is bounded (docs/ARCHITECTURE-DEBT.md 4, blocker 2).

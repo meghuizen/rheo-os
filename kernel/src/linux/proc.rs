@@ -195,6 +195,63 @@ pub fn ppid(cell: usize) -> u32 {
     if p < 0 { 0 } else { procs()[p as usize].pid }
 }
 
+/// The cell running process `pid`, if it is **alive** - `Runnable` or `Blocked`,
+/// never a `Zombie` (a zombie has no address space left to deliver into, and
+/// `kill(2)` on one is a no-op in Linux too, not an error the caller can use).
+///
+/// The lookup `kill`/`kill(pid, 0)` needs: before this, signalling anything but
+/// the caller's own pid was `-ESRCH` (docs/ARCHITECTURE-DEBT.md 4).
+pub fn cell_of_pid(pid: u32) -> Option<usize> {
+    (0..MAX_CELLS).find(|&i| {
+        let p = &procs()[i];
+        p.pid == pid && matches!(p.state, PState::Runnable | PState::Blocked)
+    })
+}
+
+/// True if `pid` names any process this table still knows about, **including a
+/// zombie**. `kill(pid, 0)` is an existence probe, and a not-yet-reaped child
+/// still exists as far as its parent is concerned.
+pub fn pid_exists(pid: u32) -> bool {
+    (0..MAX_CELLS).any(|i| procs()[i].pid == pid && procs()[i].state != PState::Free)
+}
+
+/// Run `f` for every **alive** process, in cell order. `skip_top` excludes the
+/// top of the process tree, which is what stands in for init here: Linux's
+/// `kill(-1, sig)` signals every process the caller may signal *except* init,
+/// and this tree has exactly one process with no parent.
+pub fn for_each_live(skip_top: bool, mut f: impl FnMut(usize)) {
+    for i in 0..MAX_CELLS {
+        if skip_top && i == user::top_cell() {
+            continue;
+        }
+        if matches!(procs()[i].state, PState::Runnable | PState::Blocked) {
+            f(i);
+        }
+    }
+}
+
+/// Mark `cell` as terminated by an uncaught fatal signal **without** handing the
+/// CPU anywhere - the remote half of [`exit_signaled`].
+///
+/// `exit_signaled` ends with `reschedule`, which is right when the dying process
+/// is the one that trapped. A `kill` from *another* process must not reschedule
+/// inside the killer's syscall: the killer is still running and has its own
+/// return value to deliver. Returns true if the target was the top cell, whose
+/// death the caller must turn into an unwind rather than a zombie.
+pub fn mark_signaled_remote(cell: usize, signo: u32) -> bool {
+    super::state(cell).fds.close_all();
+    if cell == user::top_cell() {
+        return true;
+    }
+    // SAFETY: `cell`'s address space pointer is valid; it is torn down here and
+    // never reactivated.
+    unsafe { (*user::cell_aspace(cell)).free_user_frames() };
+    procs()[cell].state = PState::Zombie;
+    procs()[cell].wstatus = signo & 0x7f; // WIFSIGNALED
+    procs()[cell].block = Block::None;
+    false
+}
+
 // ------------------------------------------------------------------- fork
 
 // clone(2) flag: a shared address space (thread), vs a new one (fork).
@@ -575,6 +632,26 @@ fn reschedule(leaving: usize) -> Ctl {
             user::switch_to_cell(n);
             thread::restore_current(n);
             complete_block(n);
+            // A signal another process sent while `n` was not running is
+            // delivered *here* and nowhere else: delivery is a rewrite of the
+            // target's own saved frame, pushing a `rt_sigframe` onto the target's
+            // own user stack, so it needs the target's address space active -
+            // which it is, from `switch_to_cell` two lines up. This runs after
+            // `complete_block` so the interrupted syscall's return value is
+            // already in the frame and gets saved into the ucontext, exactly as
+            // a signal interrupting a completed syscall should.
+            match signal::on_resume(n) {
+                signal::Resumed::Ran => {}
+                // An uncaught fatal default: the target dies instead of resuming.
+                // Do it without recursing back into `reschedule` - mark it and go
+                // round the loop for the next runnable process.
+                signal::Resumed::Fatal(signo) => {
+                    if mark_signaled_remote(n, signo) {
+                        return Ctl::Exit(128 + signo as u64);
+                    }
+                    continue;
+                }
+            }
             return Ctl::Switch(thread::current_frame(n));
         }
 

@@ -400,33 +400,42 @@ docs/LINUX-COMPAT.md for the semantics and the fixtures):
   is not a link answers `-EINVAL` and an absent path `-ENOENT`. A cell the test
   kernel loaded directly has no recorded path and gets `-ENOENT` rather than an
   invented one. `killx.c` asserts all three; observed failing reverted.
-- **Cross-process `kill`: written, then reverted unshipped. Still open.** The
-  implementation was straightforward and is worth restating so it is not
-  redesigned from scratch: look the pid up in the process table
-  (`cell_of_pid`), `post` the signal pending on the target's main context, and
-  deliver it from `reschedule` immediately after switching in - a frame rewrite
-  needs the target's own context with its address space active, so that is the
-  only place it can happen. `kill(pid, 0)` becomes a real existence probe;
-  `kill(0)` fans out to every live process (there is no `setpgid`, so every
-  process genuinely *is* in the initial group); `kill(-1)` fans out **excluding
-  the top of the tree**, standing in for init; a negative pid other than -1 names
-  a group that does not exist and is refused rather than redirected to the caller.
+- ~~**Cross-process `kill`: written, then reverted unshipped.**~~ **CLOSED**, and
+  it now passes on **all three ISAs including x86-64**, the one it failed on
+  before.
 
-  It behaved correctly on riscv64 - including the discriminating case,
-  `kill(-1)` sparing init, observed failing as *"kill(-1) self-targeted init"*
-  when reverted - and then **failed on x86-64**, so it was reverted rather than
-  shipped broken on one ISA.
+  `kill` refused any pid but the caller's own with `-ESRCH`, and answered
+  `kill(0, sig)` / `kill(-1, sig)` by **silently delivering to the caller**. Now:
+  a pid is looked up in the process table (`cell_of_pid`); the signal is resolved
+  against the **target's** disposition table and recorded pending on its main
+  context; and it is delivered from `reschedule` immediately after switching in
+  (`signal::on_resume`) - a frame rewrite pushes a `rt_sigframe` onto the
+  *target's* stack, so the target's address space must be active, and that is the
+  only moment it is. `kill(pid, 0)` is a real existence probe; `kill(0)` fans out
+  to every live process (there is no `setpgid`, so every process genuinely *is*
+  in the initial group); `kill(-1)` fans out **excluding the top of the tree**,
+  standing in for init; a negative pid other than -1 names a group that does not
+  exist and is refused rather than redirected to the caller. An uncaught fatal
+  default on a non-running target becomes a zombie its parent reaps, without
+  recursing back into the scheduler.
 
-  The x86-64 cause is now known, because the `readlinkat` half of the same slice
-  failed there the same way and was root-caused: **glibc on x86-64 issues the
-  legacy `readlink` (89), not `readlinkat` (267)**, and the asm-generic table has
-  only `readlinkat` - so the dispatch arm matched on two ISAs and not the third.
-  Fixed with the sentinel pattern the tree already uses for `ACCESS` (a real
-  number on x86-64, an unreachable `u64::MAX - n` on asm-generic), and now proven
-  on all three ISAs. Whether `kill` has a second, independent x86-64 problem or
-  the same class of missing legacy arm is the first thing to check when it is
-  picked up again - `kill` is 62 on x86-64 and 129 on asm-generic, both already
-  dispatched, so it is not that number.
+  Two deliberate details. `on_resume` runs **after** `complete_block`, so the
+  interrupted syscall's return value is already in the frame and gets saved into
+  the ucontext - the reason it does not reuse `check_pending_current`, which
+  clobbers the return register with 0 and would turn a completed read into a
+  spurious end-of-file. And the pre-fix behaviour was reverted **twice**,
+  separately, to check each discriminating phase alone: the child probe
+  (*"probe of a live child failed"*) and the init exclusion (*"-1 with no targets
+  did not report ESRCH"*).
+
+  **Why it failed on x86-64 last time is still not known**, and that is worth
+  stating rather than papering over: this is a rewrite against the same design,
+  not a located-and-fixed bug. The most likely explanation remains the one the
+  `readlinkat` half of that slice was root-caused to - **glibc on x86-64 issues
+  the legacy `readlink` (89), not `readlinkat` (267)** - which would have made the
+  *fixture* fail there for a reason unrelated to `kill`, since the two shared one
+  binary. `kill` is 62 on x86-64 and 129 on asm-generic and both were already
+  dispatched, so it was never that number.
 
   The general hazard, worth its own line: **a syscall that exists under two
   numbers is a portability trap that only one ISA exercises.** x86-64's legacy
@@ -435,15 +444,22 @@ docs/LINUX-COMPAT.md for the semantics and the fixtures):
   asm-generic table passes on aarch64 and riscv64 and silently does nothing on the
   ISA that matters most for this goal.
 
-  Two notes on method, both earned here:
+  Two notes on method, both earned here and both kept in the fixture:
   - The first three `kill` phases written (self probe, absent pid, unknown group)
     all passed **with the fix reverted** - the old stub happened to give the same
     three answers. A proof that does not discriminate is not a proof, and the
     only way to find that out is to revert and re-run. That is what produced the
-    `kill(-1)`-spares-init phase, which does discriminate.
+    child-signal and `kill(-1)`-spares-init phases, which do discriminate.
   - Two mechanisms could let a child wait while the parent signals it, and both
     turned out to be broken - the next two entries. Neither was known before
-    trying to write this proof.
+    trying to write this proof; one of them (`sched_yield`) is now fixed, and it
+    is what the child in this fixture waits on.
+
+  **Scope, honest:** a signal to a target **blocked** in a syscall is recorded
+  pending and delivered when that syscall's own condition is satisfied - it does
+  not interrupt the wait with `EINTR`. A signal cannot currently cut a process
+  out of a blocking `read`. That needs `complete_block` to have an interrupted
+  path and is a separate slice.
 - **A forked child exits instead of waiting - cause NOT yet identified (B).**
   *Retracted claim, kept as a correction.* This entry first asserted that pipe
   reader/writer counts are not refcounted across `fork`, which would make a child
