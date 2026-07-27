@@ -12,6 +12,17 @@ The design lives in `docs/` and is the source of truth. Read
 `docs/ARCHITECTURE.md` first; `docs/BUILD-ORDER.md` says what gets built in
 what order; `docs/DEVELOPMENT.md` covers the day-to-day mechanics.
 
+**`docs/ENGINEERING.md` is the engineering standard** - how a change lands
+here: observe-never-infer (a capability is claimed only from evidence the
+code cannot fake), waits expressed as deadlines not iteration counts, one
+owner per shared resource, deterministic proofs with hand-computed oracles
+and live paths as a bonus that degrades with a printed reason, rejections as
+deliverables, saying exactly what is true (built / proven / partially proven
+/ deferred), and composing before extending so existing proofs stay valid
+unchanged. Every rule there was forced by a real defect in this tree and is
+cited with its scar. Read it before writing code, and follow its section 12
+checklist for each slice of work.
+
 ## Current state
 
 BUILD-ORDER.md steps 0-5 are done, plus slices of 6-10, and a native
@@ -138,9 +149,15 @@ unmeasured with an architectural note rather than a fabricated number.)
 A **POSIX + filesystem stack** (`posix/`, docs/FILESYSTEMS.md,
 POSIX-PERSONALITY.md) sits on a **VFS** translation layer (a `FileSystem`
 trait): a read-write **ramfs** (the working store), a read-only **ext4**
-driver that parses a real ext4 image (superblock, block-group descriptors,
-inodes, the extent tree, linear dirs - host-validated against a `mkfs.ext4`
-image), a mount table + path resolution (the per-session `/`), the **POSIX
+driver - the **`ext4plus`** crate (Google's read-only `ext4-view`), adapted to
+`posix::FileSystem` over a `posix::BlockSource` in the separate **`ext4fs`**
+crate so its deps stay out of the dependency-free `posix` (docs/FILESYSTEMS.md
+names the crate + its transitive deps per the no-deps rule; it **replaced** the
+original hand-rolled bounded parser, which was extent-depth-0 only, so a ~1.7 MB
+glibc `libc.so.6` now reads); driven in `sync` mode at the kernel-resident
+`svc::FileOps` seam, flipping to async when the FS becomes a service cell over
+the queue ABI (where NVMe's queues earn it) - a mount table + path resolution
+(the per-session `/`), the **POSIX
 fd surface** (`open/read/write/close/lseek/stat/getdents/mkdir/unlink` with
 errno), and a **`std::fs`-shaped facade** (`File`, `OpenOptions`,
 `read`/`write`/`read_to_string`, `read_dir`, `metadata`) so standard-library
@@ -160,12 +177,22 @@ to be assigned or mapped - which matters because PVH boot has no firmware to
 program BARs. Since the kernel moved to the high half (docs/MEMORY.md) PA no
 longer equals VA, so the driver hands the device **physical** addresses for
 the virtqueue via `virt_to_phys` (the queue lives in the kernel's own RAM,
-reached through its linear map). The `blockfs` test kernel discovers the device, reads a real ext4
-image off the *live disk* (attached by QEMU with `-drive`), mounts it, and
-reads files through `std::fs` - on **all three ISAs**. At the `BlockDevice`
-seam existing Rust FS drivers (redoxfs, fatfs, a read/write ext4 crate) can
-be dropped in rather than hand-written - gated by the no-deps rule (a doc
-must name any crate).
+reached through its linear map). The `blockfs` test kernel discovers the device,
+mounts a real ext4 image off the *live disk* (attached by QEMU with `-drive`),
+and reads files through `std::fs` - on **all three ISAs** - and it now
+**streams**: the ext4 driver reads through a `posix::BlockSource`
+(byte-addressed `read_at`), and `blockfs` mounts the disk behind a bounded,
+allocation-free LRU `kernel::hw::block::BlockCache` (`CAPACITY = LINE*LINES`)
+rather than slurping the whole disk into RAM. The proof asserts the streaming
+property directly: the 7800-byte multi-block file reads correctly through an
+**8 KiB** cache over a **512 KiB** disk (`CAPACITY < disk`), with
+`block::cache_fills() > 0` proving the bytes came off the device on demand -
+so a filesystem no longer needs the whole image resident (the "binary need not
+reside whole in RAM" rung, docs/ARCHITECTURE-DEBT.md 4.0 blocker 2). An in-RAM
+`&[u8]` is still one `BlockSource` (the `posix` kernel's path, unchanged). At
+the `BlockDevice` seam existing Rust FS drivers (redoxfs, fatfs, a read/write
+ext4 crate) can be dropped in rather than hand-written - gated by the no-deps
+rule (a doc must name any crate).
 
 A **native-userland** path is being built out so real Rust/C/C++ apps
 (eventually the uutils/coreutils) run as cells, recompiled for a rheo-os
@@ -334,12 +361,22 @@ libc's stdio/malloc bss locks keep file garbage and self-deadlock), plus
 gitignored dir (never committed) and seeded into a ramfs `/lib`; a missing
 runtime lib makes that ISA skip-with-reason (static coverage stays). The
 `linuxdyn` test runs a stock **dynamically-linked glibc C hello** (gcc default
-PIE, unmodified) on **all three ISAs**, exact stdout + exit asserted. This closes
+PIE, unmodified) on **all three ISAs**, exact stdout + exit asserted, **three
+ways**: loaded directly (initial-load), `execve`d from a ramfs VFS (the streaming
+`execve` path parses `PT_INTERP` and streams the interpreter demand-paged, sharing
+`stream_elf_at` with the initial-load path - GOAL-DISK-2), and **`execve`d off a
+real ext4 image on a live virtio-blk disk** (GOAL-DISK-2b: mounted via
+`ext4fs`/`ext4plus` + the block cache; the program, its `ld.so` and `libc.so.6`
+all stream off the disk on demand, none resident whole - 447-590 block-cache fills
+per ISA). That is a dynamically-linked glibc binary running unmodified, launched
+straight off ext4 - the shape a shell launching Claude Code needs. This closes
 "unmodified Linux binaries run" for the common dynamic case; the whole
 **L0-L7 Linux personality is complete** - unpatched static and dynamic glibc C,
 unpatched Rust `std`, and the real upstream uutils/coreutils all run as cells,
-kernel-resident like `svc.rs` and adding no kernel object (`execve` of a *dynamic*
-binary and a dynamic Rust/uutils-0.9.x fixture are the documented next steps).
+kernel-resident like `svc.rs` and adding no kernel object (`MAX_MAPPED_FILES` is
+now **64**, headroom for a production binary's dozen-plus shared libraries; a
+dynamic Rust std / uutils-0.9.x fixture exercising many libs is the documented
+next proof).
 **L8 has begun** (docs/LINUX-COMPAT.md L8, docs/NETSTACK.md rheo-net Phase N1d):
 **AF_UNIX (Unix domain) sockets** - `socket`/`socketpair`/`bind`/`listen`/
 `accept`/`connect`/`sendmsg`/`recvmsg` on SOCK_STREAM, sockets as per-cell fds
@@ -349,6 +386,30 @@ no new kernel object, the L6 `pipe2` precedent. The `linuxunix` test runs an
 unmodified static-glibc AF_UNIX C fixture (socketpair+fork + bind/listen/connect/
 accept over an abstract name) on **all three ISAs**. SCM_RIGHTS fd-passing and
 SOCK_DGRAM are documented deferrals.
+
+**The seven measured syscalls are closed** (docs/LINUX-COMPAT.md L8-EVENTFD,
+docs/ARCHITECTURE-DEBT.md 4.0 blocker 3): the set the real Claude Code binary was
+observed issuing in its startup `strace` and the personality did not dispatch. Six
+were advisory; **`eventfd2` was not** - it is the epoll event loop's only wakeup
+path, so refusing it removes the mechanism rather than degrading the program. It
+lands as a per-cell fd over a per-personality registry
+(`kernel/src/linux/eventfd.rs`) - **no new kernel object**, the `epoll`/`pipe`
+precedent - with the counter in the **registry, not the descriptor**, because
+`dup`/`fork` alias one object and a per-descriptor counter would give two counters
+that silently stop waking each other; a zero counter is genuinely not readable, so
+`poll`/`epoll` report it unready and a blocking read parks through the pipe's
+`Block::EventFdRead` machinery. Alongside it: the **legacy x86-64 `open`** (nr 2),
+whose absence refused every `open` on that ISA **and nowhere else** - glibc
+prefers it over `openat` there, the same two-numbers trap as `readlink`;
+**`sysinfo`** with real frame-pool and cell-clock numbers (Bun sizes its heap from
+them, so a zeroed answer is worse than a refusal, and the fields that read 0 are 0
+because they are 0 - no page cache, no swap, no load average);
+**`sched_setscheduler`** accepting the one policy in force and refusing real-time
+`-EPERM` rather than accepting and dropping it; **`close_range`** actually closing
+its range; and **`clone3`/`rseq`** refused *deliberately* instead of falling
+through the unknown-number log. The `sysx` fixture in `linuxproc` proves it on
+**all three ISAs**, asserting each refusal *as* a refusal, with four narrow
+reverts each observed failing.
 
 **librheo** (`librheo/`, docs/LIBRHEO.md) is the greenfield **native userspace
 foundation library** - the role a libc plays, rebuilt for this kernel:
@@ -442,10 +503,13 @@ APLIC in MSI mode -> S-mode IMSIC via the `siselect`/`sireg`/`stopei` CSRs ->
 (GICD + the boot CPU's GICR, CPU interface via `ICC_*_EL1`) and takes it in the
 current-EL-SPx vector slot, draining the byte and EOI'ing via `ICC_EOIR1_EL1`;
 cells run at EL0 with IRQ masked and the kernel unmasks (`daifclr`) only after
-`wfi`. Both are genuine 0%-CPU parks. **x86-64 stays a poll** - under QEMU's TCG +
-`kernel-irqchip=split` the LAPIC ISR/IRR are not modeled and IOAPIC-routed lines do
-not re-deliver reliably, so faking it would be dishonest (its *timer* IS
-interrupt-driven; only the IOAPIC-routed UART is affected). On top of the raw byte
+`wfi`. Both are genuine 0%-CPU parks. **x86-64 was a poll** here - under QEMU's TCG the
+LAPIC ISR/IRR looked unmodelled and IOAPIC-routed lines looked not to re-deliver, so
+faking it would have been dishonest - but **SMP phase 1 disproved that** (every one of
+those observations had been made through the inert x2APIC MSR block, where a missing
+EOI genuinely makes the first interrupt the last): x86-64 now routes COM1's ISA IRQ 4
+through the **IO-APIC** to vector 0x21 and halts at `hlt`, verified end to end at
+bring-up, so UART RX is interrupt-driven on all three ISAs (docs/SMP.md 8). On top of the raw byte
 substrate, librheo gained **`term`** - the
 byte-stream terminal discipline: `input` (a decoder: CSI/SS3 escape sequences ->
 typed `Key`s, UTF-8, control chars, async `next_key().await`), `edit` (a line
@@ -454,14 +518,22 @@ hook), and `render` (a buffered, minimal-diff renderer, batched writes). The
 `librheoterm` test drives a read-eval loop with scripted keystrokes (typing,
 backspace, cursor-left + insert, an arrow-key escape, Up-arrow history) and asserts
 the exact committed lines + exit on **all three ISAs**, plus the idle-park (kernel
-idled at `wfi`) on **RISC-V and ARM64**. Honest: RISC-V and ARM64 are
-interrupt-driven, each with a device-loopback caveat (QEMU's 16550/PL011 loopback
+idled at `wfi`/`hlt`) on **all three**. Honest: RISC-V and ARM64 each carry a
+device-loopback caveat (QEMU's 16550/PL011 loopback
 does not drive the interrupt-controller line, so the deterministic test raises the
 controller line directly - RISC-V the IMSIC MSI, ARM64 `GICD_ISPENDR` for SPI 33 -
 exactly the interrupt the device would raise; the byte is genuinely delivered and a
 genuine interrupt genuinely wakes `wfi`, docs/LIBRHEO.md Phase D). This is "wake on
 input", not preemptive scheduling
-(SMP/#27).
+(SMP/#27). The scripted-byte path also carries a **verified delivery check**:
+`input::pump` used to return "there is data" on the strength of *having halted*, and
+a halt ends on any enabled interrupt - so once the timer one-shot became real on
+every ISA a competing deadline could end it with the UART handler never having run,
+which showed up as an intermittently failing `schedidle` (docs/ENGINEERING.md 11).
+It now checks the ring, recovers the byte from the UART FIFO if the interrupt did
+not deliver it, and pushes it directly with a printed reason if the wire has nothing
+either - with per-tier counters, so a degraded interrupt path is reported rather
+than inferred away (all three ISAs report zero recoveries).
 
 **Phase E** makes librheo the substrate for **services and a Wayland-class
 compositor**: two cells share a **typed cross-cell queue pair** and pass
@@ -548,9 +620,13 @@ and reaps its exit code (a faulted native child is reaped with `FAULT_EXIT`=139 
 native cells have no signals); **`SYS_ARM_TIMER` (47)** is a one-shot deadline,
 now the OS's **second interrupt**, **interrupt-driven on all three ISAs** (the
 kernel arms the per-ISA timer and halts at `wfi`/`hlt` until it fires - a genuine
-0%-CPU park: RISC-V Sstc `stimecmp`, ARM64 CNTV virtual timer via the GICv3, x86-64
-LAPIC LVT one-shot in x2APIC mode; opt-in via `arch::enable_timer_irq`, with a
-cooperative deadline-check fallback where not wired).
+0%-CPU park: RISC-V Sstc `stimecmp`, ARM64 CNTV virtual timer via the GICv3,
+x86-64 the LAPIC one-shot; opt-in via `arch::enable_timer_irq`, with a cooperative
+deadline-check fallback where not wired). x86-64 took the long way: its LAPIC
+one-shot was claimed, rheo-net N2h made bring-up **verify** it and found QEMU 8.2
+TCG reports no x2APIC (leaving that MSR block inert) so it fell back honestly, and
+**SMP phase 1** then fixed the capability by driving the LAPIC over **xAPIC MMIO**
+(docs/SMP.md 5).
 librheo gained **`proc`** (`spawn`/`Child::wait().await`/`args`/`env`/`identity`),
 **`time`** (monotonic `Instant`/`now` + async `sleep`/`timeout`/`interval` over the
 reactor's timer slot), and a **`net`** stub (deferred - networking is a service).
@@ -562,16 +638,15 @@ Phase D console path; **Phase J** wires in the full `term` line editor - see
 below). The `librheoproc` test proves it on **all three ISAs**: an
 orchestrator spawns `/bin/echo` + three `/bin/child` cells (argv fan-out), reduces
 exit codes to 12, and a `time::sleep` wakes on the timer (asserting a genuine
-`wfi`/`hlt` idle-park on all three ISAs); `lrsh` runs a scripted keystroke
+`wfi`/`hlt` idle-park on all three ISAs since SMP phase 1); `lrsh` runs a scripted keystroke
 session through the term editor (committed-command evidence + exit `0x42`); and the spine-only `librheo-embed`
 round-trips. Benchmarks (icount, per TOOLING.md): full async round-trip ~1,433
 (x86-64) / ~2,048 (riscv64) instructions, spawn+wait ~263k (x86-64) / ~539k
 (riscv64) - process create is dominated by ELF stream-load + child crt0, the honest
-price of a new address space. Honest deferrals: the
-**x86-64 UART RX interrupt** (poll fallback - its QEMU TCG split-irqchip
-IOAPIC/LAPIC does not re-deliver reliably; the timer + the riscv/arm UART RX are
-all interrupt-driven), and the `net` stack - docs/LIBRHEO.md has the full A-F
-accounting. **librheo A-F is complete.**
+price of a new address space. Honest deferrals: the `net` stack -
+docs/LIBRHEO.md has the full A-F accounting. (The **x86-64 timer** was a deferral
+here until SMP phase 1 gave it a real LAPIC over xAPIC MMIO; see the SMP section at
+the end for the x86-64 UART RX outcome.) **librheo A-F is complete.**
 
 **Phase G** turns the Phase F `net` stub into the real **NIC data path - raw
 Ethernet frames over a virtio-net driver** (docs/NETWORKING.md, LIBRHEO.md Phase
@@ -626,6 +701,439 @@ attach, set-scanout, transfer, flush). No claim of visible output; the 2D scanou
 command round-trip + compositor present wiring is the deliverable. **librheo A-H
 is complete.**
 
+**rheo-net N2d** (docs/NETSTACK.md 16) makes the network **receive** side as async
+as the send side - the OS's **third interrupt source**. Before it,
+`librheo::net::recv` was a re-poll (`OP_NET_RX` returned "nothing available" and the
+cell submitted it again), and the reactor had no network slot, so a cell waiting for
+a packet **spun a core**. Three pieces: **`SYS_WAIT_NET` (48)** - a park-until-frame
+verb in the shape of `SYS_WAIT_INPUT` (`kernel/src/net_rx.rs`, portable), mechanism
+only, **no new kernel object** (it exposes the same virtio-net driver the `OP_NET_*`
+opcodes bridge to), taking a `timeout_ns` deadline so a transport can wait for "a
+frame **or** the RTO, whichever comes first" (the per-ISA timer gained
+`timer_arm`/`timer_expired`/`timer_disarm`; N2h below took ownership of them);
+a **NIC RX interrupt**, wired from the virtio-mmio slot the driver records
+(`arch::enable_virtio_net_irq`, opt-in like the Phase D UART IRQ, so the other 47
+kernels boot unchanged) - the handler ACKs the device
+(`InterruptStatus`/`InterruptACK`) and counts the arrival, the TX ring now sets
+`VRING_AVAIL_F_NO_INTERRUPT` (transmit stays polled), and on RISC-V
+`riscv_user_trap` now services a device interrupt taken **in U-mode** (S-mode
+interrupts are always enabled there) instead of reading it as a fault; and a
+**reactor network slot** (`net_rx_req` beside console/timer/wait/channel) so
+`net::recv`/`recv_timeout` **park** and wake on the frame, with `net::try_recv`
+keeping the non-blocking drain a batching transport needs. The kernel's RX ring
+*is* the receive virtqueue's 16 pre-posted device-DMA'd buffers (a second ring would
+only add a copy - documented). The `netwait` test proves it on **all three ISAs**: a
+cell parks on `net::recv`, is woken by SLIRP's **ARP reply**, parks again for a **TCP
+reset**, and finally parks with a 20 ms deadline on an empty queue; asserted are one
+reactor wakeup **per** receive (`rt::net_wakeups()` - one park + one wake, never N
+re-polls), a witness strand that ran **while** the receiver was parked, and
+kernel-side `net_rx::irq_count() > 0` + `did_idle()` on the interrupt-driven ISAs.
+Per-ISA honesty (the wait has **three modes**, chosen by portable logic over the
+`arch` predicates - `net_rx::IdleMode`): **riscv64** (APLIC-S source `1+slot` in MSI
+mode -> IMSIC -> `sip.SEIP`) and **aarch64** (GICv3 SPI `16+slot`) are genuinely
+**NIC-interrupt-driven** and halt at `wfi` - a real 0%-CPU park. **x86-64 has no NIC
+RX interrupt** (its NIC is virtio-*pci* driven through the `VIRTIO_PCI_CAP_PCI_CFG`
+tunnel with no BAR assigned to hold an MSI-X table; the other half of the old
+justification - "legacy INTx rides the QEMU-TCG IOAPIC path that does not re-deliver" -
+was **disproved** by SMP phase 1, which drives the UART RX line through exactly that
+path, docs/SMP.md 8); its wait was documented as a **timer-backed
+idle** borrowing the LAPIC (poll, `hlt` for a 500 us slice, re-poll), and **N2h verified
+that claim and it did not hold** - QEMU 8.2 TCG reports no x2APIC, so the LAPIC MSR
+block was inert and x86-64 was honestly `IdleMode::Poll`, a spin; **SMP phase 1** then
+made the LAPIC real over xAPIC MMIO, so x86-64 is back in `TimerIdle` with the halts
+**measured** (21 on a bounded wait, 253 in the escalation phase). `interrupt_driven()` reports
+**false** wherever no NIC line exists, so a timer wake is never dressed up as a NIC
+interrupt. `timeout_ns` is a
+**monotonic deadline in every mode** - `POLL_BUDGET` is only a backstop for an
+indefinite wait on the last-resort poll path and can never truncate a caller's timeout.
+MSI-X through the config tunnel, interrupt coalescing, and zero-copy receive are the
+documented next steps.
+
+**rheo-net N2h** (docs/NETSTACK.md 16, the Phase N2h section) removes a **real
+production defect** in that wait path and replaces its one magic constant, all internal
+mechanism - **no new kernel object, no new verb, no new dependency**. Every ISA has
+exactly **one** hardware one-shot, and two subsystems armed it *directly*:
+`net_rx::wait_frame` (the receive deadline + the poll slices) and `time::arm_timer`
+(`SYS_ARM_TIMER`, every cell's `sleep`/`timeout`). Last-armer-wins, and each
+**disarmed the timer on its way out** - so the inner requester's completion destroyed
+the outer requester's deadline *and* `arch::timer_expired()` then reported that
+deadline elapsed (a lost deadline **and** a false expiry). Latent only because the OS is
+single-CPU cooperative; fatal the moment BBR paces continuously beside a TCP RTO. The
+fix is a **kernel timer arbiter** (`kernel/src/ktimer.rs`, portable, allocation-free): a
+fixed 5-slot table (`RxPoll`, `RxDeadline`, `CellSleep`, `NetTimer`, and `Pacer`
+**reserved for BBR**) with `register`/`cancel`/`expired`/`service`/`park`, which arms
+the hardware for the **nearest** deadline only, marks **every** due client on a firing,
+and re-arms the nearest **remaining** deadline instead of disarming (`preserved()`
+counts exactly the deadlines the old code lost). Deadlines are monotonic ns in the
+timer's **own** domain (a new `arch::timer_now_ns()` - on RISC-V the `time` CSR, not the
+instruction counter), and the arbiter works with no timer at all (pure software
+comparison, which the bounded-poll path needs). The **single-owner invariant** - the
+arbiter is the only kernel caller of `arch::timer_arm`/`expired`/`disarm`/`park` - is
+enforced by construction: the old `arch::timer_wait` arm-wait-disarm helper is **gone**
+from all three ISAs, replaced by `arch::timer_park()` (halt once, no arming). Second,
+the fixed 500 us receive slice becomes an **adaptive NAPI-style escalation**: **hot** (a
+bounded busy-poll after recent activity - a frame, an interrupt, or a **transmit**),
+**warm** (short slices), **cold** (long slices, or an indefinite park where the NIC
+interrupt exists), with per-profile constants mirroring the `net` crate's
+`hft`/`edge`/`warehouse`/`embedded` features (`net_rx::set_profile`, default `Edge`);
+the slice is the single shared `RxPoll` slot, so N waiters can never become N wakeups.
+New counters (`spin_polls`/`timer_slices`/`halts`/`escalations`/`tier`, and the
+arbiter's `arms`/`firings`/`parks`/`preserved`) make the duty cycle **measured, not
+claimed** - and `did_idle()` is now set only when a park genuinely halted, which is what
+exposed the x86-64 LAPIC above (and a `librheo-orch` 4 us sleep that could never reach a
+park - now 2 ms and genuinely parking). The `netwait` test proves it on **all three
+ISAs**: the pre-N2h pattern **reproduced** as a false expiry (skipped-with-reason where
+no verified one-shot exists - which was x86-64 until SMP phase 1, and is now no ISA),
+three concurrent arbiter deadlines each honoured at their
+own time in order with none lost, a 30 ms cell sleep surviving a full 5 ms receive wait,
+and the escalation law asserted both as a pure function and as observed counters (4096
+spin polls then 253-331 genuine timer-slice halts on every ISA) - with the
+riscv/arm NIC-interrupt assertions unchanged.
+
+**rheo-net N4a** (docs/NETSTACK.md 17) is the **network service cell + concurrent
+fan-out** - the keystone every remaining network scenario rides on (app-protocol
+servers, the remote-INET bridge for Linux binaries = **N4b**, onion routing,
+DHCP/zeroconf/NTP). Doctrine puts the stack in userspace, so a long-lived **service
+cell** must serve **many** client cells; Phase E only proved one-to-one. Two hard
+blockers had to go: a cell held **exactly one** channel end (three spawned children
+would all inherit the *same* ring - a race, not a fan-out), and `SYS_SWITCH` is a
+*directed* `cur^1` hand-off (from client cell 2 it reaches cell 3, never the service
+at cell 0 - a livelock). N4a takes the **minimal mechanism extension** of the existing
+spawn/channel path - **no new kernel object**, everything composing Cell (object 1)
+with QueuePair (object 3), exactly the L6-pipe / Phase-J precedents: a **per-cell
+channel table** (`MAX_CELL_CHANNELS` = 4, a fixed static array - the kernel stays
+allocation-free), each slot its own ring region at `channel_slot_va(slot)`, with
+`SYS_CONNECT(out, slot)` gaining the slot argument + a `count`; **`SYS_SPAWN` gaining
+a `chan_spec`** (`SPAWN_CHAN_SLOT | slot << 8` = hand the child the caller's slot
+`slot`, always landing at the child's **own slot 0** so a client binary is
+slot-agnostic; `chan_spec` 0 is the byte-for-byte Phase J default, and
+`AddressSpace::share_rw_into` gained the matching `dst_base`); and **`SYS_YIELD`
+(49)** - hand the CPU to the next runnable native cell, round-robin, the caller
+staying runnable. `SYS_YIELD` is the same cooperative cross-cell scheduler
+`SYS_WAIT`/child-exit already drive (`kernel/src/nproc.rs`) exposed as a plain yield,
+transfers no authority (one capability bundle), and **degenerates to `cur^1`** where
+the caller has no native process tree, so the Phase E/J two-cell path is unchanged;
+the reactor's channel idle path now uses it. On top, `net::service` ships the
+framework: a **`Service`** binding one channel end per client and running **one
+strand per client** (each parked on its own `AsyncReceiver`; the reactor scans slots
+in order, which is what round-robins them), a thin **`Client`** for the spawned cell,
+and a word-wide protocol (`Request { op, client, seq }` packed in the message tag,
+argument/result in its `u32`): `OP_ECHO` (a per-client keyed transform), `OP_RESOLVE`
+(a catalogue name id -> an IPv4, answered from the **network-free** tiers of
+`net::dns` - a `HostsTable` + a TTL `Cache`), `OP_BYE`. librheo gained per-slot
+reactor channels (`attach_channel_slot`, `chan_send_on`/`chan_recv_on`),
+`ipc::Channel::open_slot`, `proc::spawn_on_channel`, and two witnesses -
+`rt::chan_wakeups_on(slot)` + `rt::chan_max_pending()` (over a new **non-destructive**
+`Qp::sq_pending`/`cq_pending` peek). The `netservice` test proves it on **all three
+ISAs**: one service cell serves **three** client cells, each over its **own** channel,
+and exits `0x42` only if every client got its **distinct correct** response (each
+predicts its echo + its own name `10.1.1.1`/`10.2.2.2`/`10.3.3.3` and exits `id+1`,
+codes asserted `1,2,3` - so each was really reaped), `served == [4,3,3]`, the
+**interleave witness** `order == [0,1,2, 0,1,2, 0,1,2, 0]` (strand k reaches round r
+only after strands `0..k` did - no strand monopolised the vcore), the **in-flight
+witness** `max_in_flight == 3` (all three requests queued at the same instant, before
+the first reply), and `wakeups == [4,3,3]` (one genuine reactor park+wake per message,
+never a spin). The core is **deterministic and network-free**; a **bonus live** ARP for
+the SLIRP gateway, performed *inside client 0's serving strand* (parking on the wire
+per N2d while siblings run), resolves on all three ISAs and **degrades honestly** to
+`REPLY_NONE` with no NIC. Honest: **concurrent, not parallel** (one CPU, cooperative -
+a service strand cannot compute while a client computes; SMP is task #27); fan-out is
+**parent-shaped** (the service spawns its clients - a **name-based rendezvous** for
+unrelated cells is the genuinely new capability and a documented follow-on); the
+protocol is word-wide (bigger requests ride a shared sealed grant, the Phase E
+mechanism); and 4 clients is the fixed-array ceiling.
+
+**rheo-net N5a** (docs/NETSTACK.md 19) adds the first **application protocols** -
+**HTTP/1.1 + HTTP/2, client and server** - the gateway most remaining scenarios ride
+on (WAF/DPI inspects HTTP, S3-style storage *is* HTTP, Arrow Flight is gRPC over
+HTTP/2). Both live in the crate's **always-compiled** half (HTTP is parsing plus
+synchronous state machines, so it needs neither librheo nor the NIC and links in
+either posture); **no kernel change, no new object/verb, no new dependency, no
+`cfg(target_arch)`**. **`net::http1`** parses **zero-copy** - method, target, reason
+phrase and every header name/value are `&[u8]` slices *of the caller's buffer* (the
+rheo-json `Cow::Borrowed` discipline; case-insensitivity applied at compare time), so
+a WAF datapath classifies a request without allocating per header; the owned
+`OwnedRequest`/`OwnedResponse` the `Client`/`Server` helpers return are the *only*
+copy. Framing covers `Content-Length` + **chunked** both directions, bodiless
+statuses, and the RFC 9112 persistence rule. **Request smuggling is a parser
+property, not a filter**: `Content-Length` *and* `Transfer-Encoding` (either order),
+duplicate `Content-Length` (even when equal), `5, 5` / `+5` / `0x5`, a non-`chunked`
+final coding, bare LF, `Host : x`, obs-fold, non-token names, control bytes in
+values, oversized/too-many headers, a double space in the request line and a
+non-1.x version are each rejected **with their own error** - 22 shapes asserted,
+plus 4 chunked-framing rejections (a non-empty trailer is refused, not dropped).
+`http1::scan` reuses the `json/src/scan.rs` idiom - scalar oracle + a branchless
+wide path + fuzz equivalence - but the wide path is **SWAR** (`u64` load/compare/
+mask/ctz, 8 bytes per step) rather than SSE2, so it stays portable with no
+`cfg(target_arch)`; a target-specific SIMD kernel is deferred. **`net::http2`** ships
+the frame layer (DATA/HEADERS/SETTINGS/WINDOW_UPDATE/PING/RST_STREAM/GOAWAY/
+CONTINUATION, PRIORITY parsed-and-ignored), the preface, the stream state machine,
+**connection- and stream-level flow control** (a send is bounded by
+`min(conn, stream, max_frame)`, the remainder queued until a WINDOW_UPDATE credits
+it; the *connection* window correctly starts at 65535 and is changed only by
+WINDOW_UPDATE, never by `SETTINGS_INITIAL_WINDOW_SIZE`), and **HPACK** - static
+table, dynamic table with size updates, and the RFC 7541 Appendix B **Huffman code
+generated mechanically from the authoritative RFC text** (blob-hash cross-checked;
+the generator asserted prefix-freedom + canonicality, which is what lets the decoder
+be a per-length canonical lookup rather than a tree), with the padding/EOS rules
+enforced. `conn` has the **same synchronous seam as `net::tcp`** (`on_bytes` /
+`take_out` / `next_event`, no I/O inside), which is what makes h2 provable with no
+live peer and transport-agnostic. For h2 over TLS, N5a added a **minimal RFC 7301
+ALPN** to the N3b handshake (offer in ClientHello, selection echoed in
+EncryptedExtensions, both sides must agree) - with an empty list the ClientHello is
+byte-for-byte N3b's, so the RFC 8448 KAT is untouched; `h2` is therefore
+**negotiated, not assumed**. The `nethttp` test kernel proves it all on **all three
+ISAs** (pure compute, no netdev): the h1 codec with the **zero-copy borrow asserted
+by pointer range**, the 22 smuggling rejections, the **SWAR == scalar** oracle over
+20,000 fuzz buffers, an **h1 client talking to our h1 server over real `net::tcp`**
+across the in-cell `VirtualLink` (POST+body byte-exact, a chunked response
+reassembled exactly, a **second request on the same never-closed connection**, a
+404), **HPACK against RFC 7541 Appendix C** - C.1 integers, C.2.1-C.2.4, and the
+**C.3.1-C.3.3 / C.4.1-C.4.3 sequences** (C.4 Huffman) decoded to the RFC's exact
+header lists *and* re-encoded to the RFC's exact bytes with the dynamic table sizes
+**55/57/110/164** checked (indices 62/63 are only reachable if both tables evolve
+identically), Huffman edge cases, **h2** (preface + SETTINGS acked both ways,
+HEADERS+DATA, a **flow-control-gated body** - 16 of 39 bytes arrive, the remainder
+asserted still queued, the server's WINDOW_UPDATE releases it - a second concurrent
+stream, RST_STREAM/PING-ACK/GOAWAY, and four protocol errors asserted to fail), and
+**HTTPS**: one h1 exchange through the N3b TLS record layer with the plaintext
+asserted absent from the ciphertext, a tampered record still rejected, and ALPN
+negotiating `http/1.1` and `h2`. The **live GET is skipped with a reason** - SLIRP
+has no HTTP server, so there is nothing deterministic to fetch and nothing is faked.
+Deferred: **HTTP/3** (it is HTTP over QUIC = N7), trailers, server push, PRIORITY as
+a scheduler, `CONNECT`/`Upgrade` (incl. `h2c` upgrade), `100-continue`, content
+codings, a resumable chunked decoder (the one-shot re-scan is O(n^2) per body), a
+bound-to-port server *cell* (that composes N4a fan-out with the N6 inbound
+steering), and gRPC / Arrow Flight / Kafka (N5b/N5c) on top of this h2.
+
+**rheo-net N4b** (docs/NETSTACK.md 18, docs/LINUX-COMPAT.md L8-INET-REMOTE) is
+**real remote networking for unmodified Linux binaries** - the biggest functional
+unlock left. L8-INET gave `AF_INET`/`AF_INET6` sockets but **loopback only**: a
+non-loopback destination was refused `-ENETUNREACH`, because a *local* TCP connection
+degenerates to the L6 ring the kernel already has while a *remote* one needs the real
+segment/RTO machinery, and the kernel is **allocation-free**. N4b's key: that is true
+of the `kernel/` **library**, not of a *kernel binary* - a test kernel declares its own
+`#[global_allocator]` and already links alloc crates. So the kernel gains **a bridge,
+not a stack**, and **no kernel object**: `svc::SocketOps` (10 `fn` pointers -
+`local_ip`, `udp_bind`/`close`/`send`/`recv`/`pending`, `tcp_connect`/`send`/`recv`/
+`close` - plus `set_socket_ops`), mirroring `svc::FileOps` line for line (the pattern
+that keeps the kernel **filesystem-free** while serving `open`/`read`/`write`), and
+`kernel/src/linux/fd.rs` forwards every **non-loopback** operation to it via two new
+`FdKind` variants (`InetUdpRemote`/`InetTcpRemote`). **Loopback is byte-for-byte
+unchanged** (`linuxinet` still asserts its transcript), and with no bridge registered
+the answer stays `-ENETUNREACH`, so all 49 pre-existing kernels behave identically.
+The registrant is `tests/src/inet_personality.rs` (the sibling of
+`vfs_personality.rs`), which links **`rheo-net` in a new librheo-free `codec`
+posture** - librheo supplies a *cell's* `_start`/panic handler/global allocator, which
+a kernel binary cannot link, so the crate now has a default `hosted` feature gating
+the async endpoints (`arp::resolve`, `udp::UdpEndpoint`, `icmp`, `dns`, `timer`,
+`local`, `service`) and `--no-default-features` leaves the pure synchronous layers
+(`eth`/`ip`/`arp` packets/`udp` codec/`tcp`/`cc`/`shard`/`wire` framing). Everything on
+the wire is the stack's own code - `eth` framing, `arp` request/reply + a 4-entry cache
+with real next-hop routing, `ip` headers + checksum, `udp` build/parse + pseudo-header
+checksum, and the full RFC 793 `tcp::Connection`, whose **synchronous**
+`poll(now)`/`on_wire_segment(now, bytes)` seam (written for the N2a in-cell link)
+drives straight from a syscall trap. Three small documented driver accessors were added
+(`virtio_net::send_frame_slice`/`recv_frame_slice`/`mac_addr`) plus a
+`net_rx::wait_frame_slice` twin, so a remote receive **parks** on the N2d
+park-until-frame primitive - a genuine WFI idle on riscv64/aarch64, a timer-backed
+`hlt` idle on x86-64 (which has no NIC RX line). The `linuxnet` test proves it on **all three ISAs**: an
+**unmodified static-glibc C binary** (`inetremote.c`) hand-builds a DNS query,
+`sendto`s it to SLIRP's responder `10.0.2.3:53` and `recvfrom`s the reply, asserting
+its **structure** (txid echoed, QR set, sender `10.0.2.3:53` - never a resolved
+address, which SLIRP proxies non-deterministically), then `connect()`s to a closed
+gateway port `10.0.2.2:9` where SLIRP's **real reset** becomes `ECONNREFUSED`; each
+phase prints one line from a small fixed set so the transcript stays exact while
+nothing is fabricated, and the kernel also asserts the receive genuinely parked
+(`net_rx::irq_count() > 0` + `did_idle()`). Honest scope: **UDP remote is complete**;
+**TCP connect is real and proven** (SYN on the wire, RTO retransmit, RST -> refused,
+deadline -> `ETIMEDOUT`) while TCP **data transfer is implemented but unproven** -
+**correcting the earlier wording**, SLIRP *does* proxy outbound TCP (the same proxying
+that makes the live DNS below resolve real names), so the obstacle is not the wire but
+the absence of a **deterministic peer**; arranging one (a host-side sink at
+`10.0.2.2:<port>`, a `guestfwd`ed listener, or an N4a peer cell) is what closes it. One
+real defect on that path **is** fixed: `op_tcp_send` never pumped RX, so the peer's ACKs
+never reached the state machine, `snd_una` never advanced, the send queue filled and
+`write` returned 0 -> EAGAIN forever - any body larger than the send window
+**deadlocked**; the send path now drains the NIC first (reasoned + code-reviewed,
+**not proven**, per docs/ENGINEERING.md 7). Also honest: **IPv6 remote** stays
+`-ENETUNREACH`; no remote **listener** (inbound needs NIC
+steering grants); remote handles are not refcounted across `dup`/`fork`; fixed
+registries (4 UDP / 4 TCP / 4 ARP); one documented 2 s receive + 3 s connect bound (no
+`SO_RCVTIMEO`; a descriptor made non-blocking with `fcntl(F_SETFL, O_NONBLOCK)` passes a
+zero deadline and reports `EAGAIN`); no DHCP (the SLIRP identity 10.0.2.15/gw 10.0.2.2 is
+fixed); and moving the datapath into the **N4a service cell** awaits N4a's deferred
+name-based rendezvous.
+
+**Name resolution + four Linux-personality stubs that reported success** (docs/
+LINUX-COMPAT.md, docs/NETSTACK.md 18). Hand-building a DNS packet proved the datapath
+but not what real programs do, which is call **`getaddrinfo`** - and that failed,
+because nothing in the tree provided `/etc/resolv.conf`, so glibc fell back to its
+built-in nameserver `127.0.0.1:53`, which the personality classifies as **loopback** and
+routed into the in-kernel datagram queue where nothing listens - and **the send reported
+success anyway**. Four fixes, each an `ENGINEERING.md` 7 violation of the same shape (a
+stub reporting success while doing nothing), each with a proof observed to fail without
+it: (1) the `linuxnet`-class kernels seed `/etc/{nsswitch.conf,hosts,resolv.conf}`
+(nameserver `10.0.2.3`, non-loopback) and a loopback datagram to a port with no bound
+endpoint now returns `-ECONNREFUSED` - the `resolve` fixture asserts that refusal, then
+`rheo.test` -> **10.9.8.7** out of the seeded `/etc/hosts` (deterministic, no wire), then
+reports a **live** `getaddrinfo` of a real public name (resolves on all three ISAs here;
+the address is never asserted). (2) **`futex` honours its timeout** - it was ignored
+entirely, so `pthread_cond_timedwait` hung; the timespec in arg 3 is now read
+(relative for `FUTEX_WAIT`, absolute for `FUTEX_WAIT_BITSET`, CLOCK_REALTIME when
+`FUTEX_CLOCK_REALTIME` is set), compared in the **cell's own clock domain**
+(`linux::cell_clock_ns`, the domain the program computed the deadline in), and parked on
+through the timer arbiter's new `FutexWait` slot - never `arch::timer_*` directly. A wait
+with no timeout and no runnable sibling can never be satisfied: it now reports `-EAGAIN`
+plus one console line instead of 0 ("you were woken"). The `condwait` fixture in
+`linuxthreads` times out twice on a never-signalled condvar; without the fix it hangs to
+the 120 s boot-test timeout (observed). Bounding the new pointer argument also caught a
+defect of its own making: validating futex arg 3 unconditionally refused a legitimate
+`FUTEX_WAKE` with `-EFAULT` (real callers leave that register dirty because it is a
+*count* there), which silently stopped every waiter waking - observed as rayon-threaded
+`sort` producing no output on ARM64 while the other two ISAs passed; the check is now
+command-aware. (3) **`fcntl` stops lying**: it ended in
+`_ => 0`, so every unimplemented command reported success - file locking now answers
+`-ENOLCK` (no lock manager) and anything else `-EINVAL`; `F_SETFL(O_NONBLOCK)` is
+**honoured** on every fd kind (a would-block read returns `-EAGAIN`, and an empty
+non-blocking console no longer answers 0 = end-of-input) while `O_APPEND`/`O_ASYNC` are
+**refused** rather than dropped; `F_GETFL` reports the real access mode;
+`FD_CLOEXEC` is tracked and **`execve` closes those descriptors** (it used to keep every
+fd). The `fcntlx` fixture in `linuxproc` asserts all four, including self-`execve`ing to
+check one fd is gone and another survived. (4) **Limits raised for the real target**:
+the frame pool 128 -> **512 MiB**, the per-cell budget 96 -> **384 MiB**, the global
+reserve 8 -> 16 MiB, the Linux stack 1 -> **8 MiB** (with `RLIMIT_STACK` now derived
+from the one constant, since glibc sizes thread stacks from it - and since then the
+stack is sized from the image's own **`PT_GNU_STACK`** request, 8 MiB being only the
+floor for an image that asks for nothing; docs/LINUX-COMPAT.md). QEMU gives 1 GiB and the
+pool base sits 64 MiB into RAM, so the headroom is deliberate - firmware puts blobs near
+the *top* of RAM (RISC-V `virt`'s DTB at ~`0xBFE0_0000`). This is a **limit raise, not a
+design change**; the proper fix is **demand paging**, which has since landed for
+file-backed `mmap` (see the demand-paging paragraph below). Found worse than
+described along the way: **`poll` does not compute readiness at all** - every open fd is
+reported ready and the timeout is ignored - which is simultaneously what lets glibc's
+resolver reach its blocking `recvfrom` and the reason creation-time
+`O_NONBLOCK`/`SOCK_NONBLOCK` still cannot be honoured; a waiting, readiness-computing
+`poll` is the next rung and the two must land together.
+
+**rheo-net N4c** (docs/NETSTACK.md 20) is **host configuration** - the two questions a
+host must answer before anything works, *who am I on this link* and *what time is it*.
+Four pieces, all ordinary userspace over UDP/ARP, **no kernel object, no new verb, no
+new dependency, no `cfg(target_arch)`**: **`net::hostcfg`**, the host-config store
+(address / netmask / gateway / DNS servers / search domains / hostname / source) owning
+the on-link-vs-gateway `next_hop` decision - `HostConfig::slirp()` is now the **one**
+place QEMU's guest/gateway/resolver addresses are named, and
+`udp::UdpEndpoint::from_host_config` / `dns::Config` / `net::service` read the store
+instead of carrying literals (a link-local claim deliberately **clears** the gateway);
+**`net::dhcp`**, a DHCP client (RFC 2131 - the BOOTP codec + magic cookie + TLV
+options, DISCOVER->OFFER->REQUEST->ACK->BOUND, T1/T2 renewal + rebinding + expiry with
+the RFC defaults and a `T1 > T2` clamp, NAK, DECLINE, RELEASE, and the broadcast
+`0.0.0.0 -> 255.255.255.255` **no-ARP** framing that is the whole special case);
+**`net::zeroconf`**, IPv4 link-local (RFC 3927 - the `0.0.0.0`-sender ARP **probe**,
+conflict re-pick, bounded announce, defend-once-then-yield) plus **mDNS** (RFC 6762
+over the **`dns` codec unchanged** - which is why N4c made that codec
+posture-independent: QU bit, cache-flush bit, TTL-0 goodbye, `.local` scoping, the RFC
+1112 `01:00:5e` MAC mapping); and **`net::ntp`**, an SNTP/NTPv4 client whose answer is
+a **bounded interval** (half-width `delay/2` widened by the server's root distance),
+adjusting a *userspace offset* and never a system clock. Codecs + state machines are
+always compiled; only the four async drivers are `hosted`. The `nethostcfg` test proves
+it on **all three ISAs**: a deterministic **network-free** core (a complete DISCOVER
+byte oracle with every uncovered byte asserted zero, the state-machine walk driven by
+OFFER/ACK from our *own* encoder, renewal/rebind/expiry/NAK, seven rejections each with
+its own error, DECLINE/RELEASE, the store read back by `dns::Config` + `UdpEndpoint`,
+the link-local KAT + conflict protocol, mDNS oracles, and the NTP KAT - offset exactly
+**+250 ms**, delay **1.5 s**, half-width **750 ms**/**1.75 s** - plus nine rejections
+and the KoD backoff), then four **bonus live** phases: SLIRP **does** run a DHCP
+server, so a real DISCOVER->OFFER->REQUEST->ACK yields `10.0.2.15/24` on every ISA
+(reported, never asserted - it is a property of the QEMU backend, and nothing ever
+synthesises a lease), while NTP and mDNS skip-with-reason and the link-local probes go
+out and report *absence of evidence*. N4c also **fixed two real defects**: every live
+wait is now bounded by a **duration** rather than a drain count (a drain is an
+interrupt park on one ISA and a poll on another, so a count meant different things per
+ISA and blew the test budget) - `wire::recv_frame_timeout` -> `net::recv_timeout` ->
+`SYS_WAIT_NET`, with counts that remain counting **frames**, which is what forced the
+kernel wait's deadline-not-spin-count semantics and its timer-backed idle above; and
+`LinkLocal::announce` used to serve both the bounded announcement sequence and an
+unbounded post-claim *defence*, so once claimed it returned a frame forever and a
+driver's `while let Some(f) = ll.announce()` never terminated (announcing and
+`defend()` are now separate, and the boundedness is asserted). The test also asserts
+the kernel's **wait mode** per ISA: `NicInterrupt` + `did_idle()` on riscv64/aarch64
+(3-4 genuine device interrupts per run), `TimerIdle` + `did_idle()` +
+`interrupt_driven() == false` on x86-64. Deferred: DHCPv6/SLAAC, DNS-SD, mDNS
+known-answer suppression + name probing + the RFC timing schedule, IGMP/MLD, PTP/NTS
+and any clock discipline, and running the four clients inside the N4a service cell
+(needs N4a's name-based rendezvous).
+
+**rheo-net N2e** (docs/NETSTACK.md 21) makes congestion control **rate-based by
+default**: a from-scratch **BBRv3** (`net/src/bbr.rs`) plus the **pacer** it cannot work
+without (`net/src/pacer.rs`), both in the crate's always-compiled half (synchronous state
+machines, like `tcp`), integer/fixed-point, portable, **no new kernel object, no new
+verb, no new dependency**. Loss-based control is the wrong *default* for the paths this
+stack targets - on a high-BDP path one loss costs seconds of throughput, on lossy
+wireless **loss is not congestion**, and a loss-based controller only backs off once a
+buffer has already overflowed (bufferbloat). BBR replaces the inference with a
+**measurement**: a windowed max delivery rate + a windowed min RTT, sending at that rate
+with ~1 BDP in flight. The `CongestionControl` trait grew its **rate-based half** -
+`RateSample`/`on_rate_sample`, `pacing_rate_bps`, `inflight_cap`, `min_rtt_ns`/`bw_bps`/
+`rounds` - **all default-implemented**, so `FixedWindow`/`Reno`/`Cubic` are
+**byte-for-byte unchanged** (`pacing_rate_bps() == 0` is exactly what keeps them
+unpaced). **BBR's ACK clock is this OS's completion clock**: the delivery-rate sample
+falls out of the send/ack bookkeeping (every first transmission - the `snd_max` test
+Karn's algorithm already uses - records the `delivered` counter + timestamps; the ACK
+computes `delivered_diff / max(ack_elapsed, send_elapsed)`, the `tcp_rate.c` idea), and
+in a hosted cell those ACKs arrive as queue completions carrying the flow id. The state
+machine is Startup (pacing gain **2.77x**, exponential, exiting on a bandwidth plateau
+or an excessive-loss round) -> Drain (**0.75x**, until in-flight is one BDP) -> ProbeBW
+(Down **0.9** / Cruise **0.95** / Refill **1.0** / Up **1.25**) -> ProbeRTT (entered on a
+**10 s** stale min-RTT, in-flight capped at **0.5 BDP**), with the max-bw filter a ring
+of per-round maxima that genuinely **expires** and the min-RTT filter taking any lower
+sample but a higher one only after the window. The **loss response is not a
+multiplicative collapse**: a loss trims `inflight_hi` by 30%, at most once per round and
+**floored at one BDP**, leaving the bandwidth estimate, the pacing rate and the min-RTT
+untouched (there is no `ssthresh` at all) - so random loss on an unqueued path costs
+nothing, while *genuine* congestion still lands as a falling delivery rate that shrinks
+the BDP through the filter. **Pacing is a precondition, not a knob** (unpaced, BBR bursts
+a window into the link and is worse than CUBIC): a token bucket releases data segments at
+the controller's rate with a `max(2*MSS, rate*1ms)` burst, and its deadline goes to the
+**N2h arbiter's reserved `Pacer` slot** - the arbiter's first **continuously re-armed**
+client - via `librheo::time::sleep_pacing` -> `SYS_ARM_TIMER`'s new second argument (a
+slot selector, `0` = the pre-N2e cell-sleep shape: **not a new verb**, the N4a
+`SYS_CONNECT`-slot precedent). N2e also finished N2h's unification: `SYS_ARM_TIMER`'s
+no-hardware-timer path had its own spin loop that bypassed the arbiter, so a deadline on
+an ISA without a verified one-shot was invisible to every other client; there is now one
+path (register/park/cancel) that halts where the interrupt is wired and honours the same
+deadline in software where it is not. On **reservations**: expressing the *byte rate* as
+an object-7 reservation is **honestly rejected** (a reservation admits CPU time against a
+core; the kernel holds no authority over link capacity, and reservations are per-cell
+while a shard owns many flows - it would hand back a guarantee nothing can keep), but the
+**pacer's own CPU cost** is a genuine periodic task, so `pacer::admit_pacing_cpu` asks
+the real admission controller "can this cell afford to pace at this rate?" and gets a
+clean refusal when it cannot. Per-profile tunings mirror N2h's poll tiers (`hft`
+latency-first: 2 s min-RTT window, 50 ms ProbeRTT, 1.5 BDP cap; `warehouse`
+throughput-first: 20-round bandwidth window, 4 s cruise, 2.5 BDP; `edge` the balanced
+default; **`embedded` keeps CUBIC** - BBR's filters plus a per-segment timer buy little
+on a known link). The `nettcpcc` test keeps its eight N2b trajectories **unchanged** and
+adds eleven, on **all three ISAs**: the scripted Startup/Drain/ProbeBW/ProbeRTT walk
+against hand-computed oracles, both filters (a 20 MB/s sample held exactly 10 rounds then
+expiring), the **loss != congestion** headline (12 rounds at a 10 MB/s link rate with a
+random-loss episode every fourth: BBR keeps its 10 MB/s estimate, 95% pacing and 1 BDP
+in flight = **100% of the link rate**, while CUBIC on the identical trace falls to
+187,534 bytes = **37%** - BBR sending **2.6x** faster - and then the converse, BBR halving
+its rate when the *delivery rate* halves), connection-level pacing (2 segments in the
+burst, then every release exactly one segment-time apart), BBR-vs-Reno loss recovery
+(cwnd 20,440 with no ssthresh vs 11,680 after a slow-start restart), the window
+controllers asserted unpaced/uncapped, the CPU-reservation admission (two paces admitted,
+a third `Overcommit`, 100 Gb/s `BadParams`), and **14 live releases parked on real
+arbiter pacer deadlines**. Kernel-side it proves the **continuous-re-arm** property N2h
+could not: 40 back-to-back pacer deadlines while a 20 ms RTO and a 40 ms sleep stay
+outstanding throughout, none lost, then firing in order. Honest deferrals: ECN, SACK
+(so loss is charged per signal, one MSS), randomised ProbeBW cruise, hardware
+timestamps, a delay-shaping `VirtualLink` (a *closed-loop* in-cell model proof - the
+instant loopback yields no rate samples, which is why the model is scripted), two
+concurrent timer waiters in one cell (the reactor still has one timer slot - a pre-N2e
+limit), and byte-rate admission. Wall-clock throughput/jitter remain hardware-lab
+numbers; only integer state and icount are reported here.
+
 A **unified tile framework** (`librheo/src/tile/`, docs/TILES.md) makes
 tile-centric compute (the TileLang/cuTile/Triton direction; SME/AMX; NPU/TPU
 systolic; FPGA) a **library discipline over existing kernel objects** - one
@@ -671,26 +1179,291 @@ per-cell table slot) and an f16-subnormal rounding bug - and the per-cell
 grant table (16->64) and object table (128->512) caps were raised for
 real-workload headroom, both flagged in docs/TILES.md 12.
 
+The **hard-float / FP / SIMD merge** brought the tiles workstream and the
+rheo-net workstream together, and closed the one defect that only existed once
+they were in the same tree. FP/SIMD save-restore across the native cross-cell
+switch was written when there were two switch paths; rheo-net N4a had since
+added a third, **`SYS_YIELD`** - the round-robin yield a service cell's client
+fan-out and the strand reactor's channel idle path both drive. A textual merge
+compiled, passed all 168 pre-existing checks, and **silently corrupted a
+hard-float cell's vector registers on exactly that path** (no fault, no log,
+wrong numbers). The fix makes the invariant structural: `user::switch_native_cell`
+is the *only* native cross-cell switch and swaps the register file *and* the
+address space, so `SYS_SWITCH`, `nproc::reschedule` (`SYS_WAIT` / child exit or
+fault), `SYS_YIELD` and a cell's first entry via `user::run` all carry it; the
+bare `switch_to_cell` is documented as the **Linux** personality's switch, which
+keeps its own per-*context* FP (a Linux cell has up to 8). The proof is a phase
+of `librheoipc`: two hard-float cells pin a per-role pattern in 16 vector
+registers inside a **single** `asm!` block that also contains the `SYS_YIELD`
+(so the compiler cannot spill around the switch), and assert the register file
+returns **bit-identical** - 256 bytes on x86-64/ARM64, 128 on RISC-V, on all
+three ISAs - with the "read back the *peer's* pattern" case reported separately
+because that is what an unswapped switch produces, plus a kernel-side swap
+counter bumped only inside the restore. Verified in both directions: reverting
+`yield_cell` to the bare switch makes 7 of 8 rounds report the peer's pattern
+and panics the kernel. The merge also re-made three choices that had been
+premised on soft-float-only (docs/NETSTACK.md 22): **integer-only CC math** is
+kept and is now a *hard* constraint, not a convenience - `cc`/`bbr`/`pacer`/`tcp`
+link in the librheo-free codec posture *beside a kernel binary* for the N4b
+bridge, and FP in kernel context would falsify the very premise the FP
+save/restore rests on; **forced software crypto backends** stay the default
+after the hardware path was tried and **verified working** (it builds clean on
+the hard-float cell target - the N3a LLVM miscompile does not reproduce there -
+and with `+aes` at baseline emits 477 AES instructions and passes every N3a
+vector on-OS, AES-GCM included), because baseline `+aes` has **no graceful
+fallback** where this tree's own pattern is probe-verify-fall-back, and because
+the throughput win is unmeasurable under QEMU; and **SWAR** stays in the HTTP
+scanner because `http1` must link in the codec posture, which drops librheo
+entirely, so `librheo::tile::simd` is structurally unreachable from it. Both
+follow-ons are named in docs/NETSTACK.md 22 rather than half-done.
+
+A **syscall-surface hardening** pass closed three critical defects an
+architecture audit found - all of them in the seam between a cell's arguments and
+the kernel's own memory, none of them visible to the capability core's own proofs
+(docs/ENGINEERING.md 12, docs/ARCHITECTURE.md 8.2). **(F1)** There was no
+`access_ok` equivalent in the tree: every out-parameter syscall, every queue
+payload VA and every buffer handed to a `svc::FileOps`/`SocketOps` handler was
+dereferenced in kernel mode at a **cell-supplied** address while the cell's root
+was active - and every cell root maps all kernel RAM supervisor-RWX - so
+`SYS_GRANT(out_va = <any kernel VA>)` was a 16-byte arbitrary kernel write with a
+steerable first word. `kernel/src/user.rs` now owns one portable, allocation-free
+check (`user_write_ok`/`user_read_ok` + `user_out`/`user_in`/`user_buf`/
+`user_slice`): null, alignment, overflow-checked add, and a range test against
+`USER_VA_MAX = 2^38` (RISC-V Sv39's user half - the narrowest of the three ISAs,
+with every loader region pinned below it by a `const` assert) plus the shared
+`.user` window, which on riscv64/x86-64 is linked high beside the kernel yet is
+genuinely mapped U into every cell root (writes restricted to its per-cell
+`.user.data`/`.user.bss`). Every named site is routed through it - the five
+`user.rs` out-parameters, `svc.rs`'s EngineInfo/CpuFeatures/ShellIo/DebugWrite/six
+FileOps forwards, `graph_submit` (node array, result array, tile descriptors, and
+each descriptor's own matrix VAs by their exact computed extents), and the whole
+`queue::run_opcode` payload surface (-> `STATUS_DENIED`) - and the Linux
+personality is bounded at its **single dispatch point** (`linux::ptr_args_ok`,
+-EFAULT) rather than at ~60 individual dereferences, which also bounded `readv`'s
+and `poll`'s previously **unbounded** iovcnt/nfds array walks. **(F2)**
+`SYS_MMAP`/`SYS_COMMIT` took `len` from the cell and looped a `frames::alloc` that
+ended in `panic!("frame pool exhausted")`, so `mmap(1 << 40)` took the machine
+down - worse than the OOM killer ARCHITECTURE.md 5 forbids, because it is an OOM
+*panic*. `frames::alloc` is now fallible (`Option`, every caller audited; the
+kernel-internal ones `expect` with the reason they cannot fail), guarded by a
+global reserve (`USER_RESERVE_FRAMES`, 8 MiB) and a per-cell budget
+(`MAX_FRAMES_PER_CELL`, 96 MiB), both checked before a frame is taken, with
+rollback on partial failure, so exhaustion is a clean refusal (`-ENOMEM` on the
+Linux paths). **(F3)** `SYS_MUNMAP` freed whatever the page tables returned, with
+no capability, ownership or bounds check - and three frame sets in a cell's
+address space are not its own (the shared channel ring, a peer's shared sealed
+grant, its own queue-pair region), so it was a cross-cell use-after-free whose
+second free tripped a "double free" assertion: a kernel panic from unprivileged
+code. It now routes through `grant_resolve` exactly like its `SYS_COMMIT`/
+`DECOMMIT`/`SEAL` siblings (a peer's grant is refused for free - the capability
+minted into the peer carries READ, not MAP), plus the cell's own anon/file-mmap
+bump regions; `unmap_range` refuses anything outside the cell's user VA range and
+frees through a new `frames::free_if_pool`. The **`security`** test kernel proves
+all three from a real unprivileged cell on all three ISAs against evidence the
+cell cannot fake (a canary in kernel `.bss` it has no mapping for, the frame-pool
+delta against a hand-computed baseline, a queue ring that still completes an
+`OP_NOP` after the refusal), each with a control phase showing the legitimate path
+intact; `librheowl` gained the cross-cell half - the compositor's attempt to free
+the **client's** sealed grant is refused and the zero-copy checksum still matches.
+Each phase was verified to **fail** with its fix reverted.
+
+**The scheduler idle state** (docs/ARCHITECTURE-DEBT.md 2.4, the keystone) makes
+`IO.md`'s and `CONCURRENCY.md`'s "blocking does not exist below the library level"
+**true of the kernel**. It was not: `SYS_ARM_TIMER`, `SYS_WAIT_INPUT` and
+`SYS_WAIT_NET` each waited *inside the trap*, in kernel context, without ever
+consulting the scheduler - so one cell's `sleep` idled the whole machine while its
+siblings sat runnable - and `reschedule` **panicked** when nothing was runnable, so
+"every cell is waiting for the outside world" (a server's normal steady state) was
+not an expressible state at all. Each wait is now a **registration**: the cell
+records its condition, returns to the run loop, a sibling runs, and the syscall is
+completed when the scheduler switches back into the waiter with its own address space
+active. `kernel/src/idle.rs` adds **no kernel object and no verb** - it composes the
+timer arbiter (still the only owner of `arch::timer_*`), the NIC RX line and the UART
+RX line, halting where an interrupt can wake and saying plainly (`idle::spins()`)
+where nothing can. Two waits deliberately keep their in-trap path, because parking on
+them could never end: a receive with no NIC, and an indefinite receive with no NIC
+interrupt (only `wait_frame`'s own `POLL_BUDGET` backstop ends that). A state with
+**no** wake source left prints which cell/pid is blocked on what and ends the run
+with `abi::DEADLOCK_EXIT`. On the Linux side the same machinery makes `poll`/`ppoll`
+compute **real per-`FdKind` readiness** and honour their timeout, `epoll_wait`
+actually wait, `nanosleep` actually sleep (in the cell's own clock domain), and stdin
+block instead of answering 0 = end-of-input; `svc::SocketOps` gained the missing
+`tcp_pending` (its absence *was* the hardcoded "a remote TCP socket is always
+readable"), and creation-time `O_NONBLOCK`/`SOCK_NONBLOCK` is honoured. Those had to
+land in one slice: glibc's resolver worked *because* `poll` lied and the flag was
+dropped, so fixing either alone breaks DNS - it now blocks in `poll` until the socket
+is readable (the scheduler idling on the NIC) and its non-blocking `recvfrom`
+succeeds. Honest scope: this is **cooperative** - a cell yields at a syscall
+boundary, so a compute-bound cell still holds the CPU until timer preemption (#27) -
+and a Linux *thread*-level block still parks the whole cell rather than only the
+calling context. Proven by `schedidle` and `linuxpoll` on all three ISAs, both
+observed failing without the fix.
+
+**Demand paging** (docs/LINUX-COMPAT.md "Demand paging",
+docs/ARCHITECTURE-DEBT.md 4.0 blocker 2) makes a **file-backed `MAP_PRIVATE` `mmap`
+and the ELF image itself cost what the program touches, not what it reserved**. Both
+used to read every page into a fresh frame before returning - not a size problem to
+answer with a bigger pool, the wrong design at any size. A **resumable user page fault** now fills a page on first
+touch: `on_user_trap` calls `linux::fill_fault` *before* the L5 fault-to-signal branch,
+and `linux::mem::fault` asks three questions in order - is anything mapped here (no
+record = a genuine SIGSEGV), **is the page already present** (then this was a
+*permission* refusal, and since `FaultCause` carries no read/write bit the page tables
+are the source of truth via `AddressSpace::is_mapped`/`arch::paging_mapped` - guessing
+repopulates and re-faults forever, measured at 78,780 fills in the revert probe), and
+does the mapping permit any access (a `PROT_NONE` record is a *reservation* glibc
+commits later with `mprotect`). A mapping owns a VFS handle in **`linux::filemap`**
+rather than the caller's fd, because `ld.so` closes the fd immediately after `mmap` - a
+global, fixed-size, refcounted registry, **no kernel object** (the `pipe`/`epoll`/
+`eventfd` pattern), one reference per live `Vma` record, taken at `fork`
+(`VmaList::inherit_files`, beside `fds::inherit_pipe_ends`) and given back at exit and
+`munmap`. Both halves are load-bearing: without the `fork` addref a child's exit frees
+an entry the **parent** still maps, and the parent's next untouched page reads zeros
+with no fault and no log. Two kernel prerequisites had to land with it - a cell hands
+the kernel pointers into its own memory, so the **kernel** becomes a reader of an
+absent page (a load fault at a kernel PC, not resumable here - this is why Linux has
+`copy_from_user` + a fixup table); the F1 pointer helpers gained "ensure present"
+beside "in range", **on the dereference helpers only**, because putting it on the bare
+range predicates cost a ~2,900x amplification (`unmap_range` bounds a range with them
+and so materialised every page just before freeing it) versus **0** kernel pre-faults
+where it now sits, measured every run. And x86-64's ring-3 fault resume used `sysretq`,
+which *consumes* RCX/R11 - harmless while signal delivery was the only fault resume,
+fatal for the first path that genuinely re-executes; faults now resume via
+`iret_resume`. Proven by `mmapdp` in `linuxproc` on **all three ISAs** (64 file pages
+mapped, exactly **5** filled, each carrying its own per-page byte so the offset
+arithmetic holds at the top of the mapping; 100 rereads free; a write to a *filled*
+read-only page still SIGSEGV; a page still filling from the file after a forked sharer
+exited; the registry back where it started) and by `linuxdyn`, where `ld.so` maps a real
+1.5-2.1 MB `libc`. **The ELF image is demand-paged too**: `load::load_elf_linux`
+**records** the `PT_LOAD`s the fault handler can fill (`load::SegRecorder`) and copies
+only the ones it cannot, printing which segment and why each time - the two conditions
+being `p_filesz == p_memsz` (a `.bss` tail inside one record produced a null
+dereference in a static Rust binary) and `p_offset` congruent to `p_vaddr` mod the page
+size (paging fills whole pages). Because the image is already resident in kernel memory
+rather than in a file, `filemap` carries a second store kind, and because a segment's
+content ends mid-page, `Vma::file_len` says how far a record is backed - past it the
+pages are zeros, not the next segment's bytes. `user::reset` must run **before** the
+load, since it clears the registry the loader registers the image in (the old order
+zeroed every page - an illegal instruction at the entry point; `filemap::alive` now
+says so). Measured on riscv64: `rusthello`'s 201 image pages cost **16** frames at load
+instead of 201, and `linuxrun` asserts that inequality on all three ISAs. **`execve` and
+the ELF interpreter are demand-paged too**: both stream from the VFS, and the obstacle
+was never the streaming but recording against the *caller's* fd, which is closed on
+return - so a mapping opens its own handle over the path (the `mmap` precedent), the
+recorder holds two stores because a dynamically linked program is two files, and
+`exec_reinit` records as `install_cell` does. Witnessed by
+`load::recorded_pages()`/`eager_pages()`, since both paths run inside a syscall where a
+test can measure nothing directly: `linuxdyn` records 1 program + 1 `ld.so` segment (35
+pages recorded, 4 copied), `linuxproc`'s fork+execve phase 221 recorded to 21 copied.
+That slice also introduced and fixed a regression the matrix caught -
+`exec_elf_from_vfs` is shared with the **native** `SYS_SPAWN`, which has no VMA list, so
+a lazy image left its child with an address space full of holes; the eager and lazy loads
+are now separate functions, the eager one keeping the old name so an unaware caller gets
+a correct image. (`fork` is copy-on-write and the stack grows on fault - see the two
+paragraphs below; a segment with a `.bss` tail and a **native** cell's image stay eager,
+both riding this same handler.)
+
+**Copy-on-write `fork`** (docs/LINUX-COMPAT.md "Demand paging", docs/ARCHITECTURE-DEBT.md
+4.0 blocker 2) makes a fork **share** the parent's pages rather than copy them. It used
+to eager-copy every committed page, so a process paid its whole resident set to fork -
+more, for a large program, than its image ever cost. Now `AddressSpace::fork_from` shares
+read-only into the child and marks both sides copy-on-write; each page privates on first
+write in `linux::mem::fault`. Measured on riscv64: a fork of a 2406-page (9.4 MiB)
+process shares 2406 pages, copies 0, costs 12 frames of child page tables - **200x**.
+Three pieces: a **per-frame refcount** in `frames` (`free` is now a decrement, so every
+pre-COW caller is unchanged; `share` refuses a non-pool page or the ceiling and the caller
+copies), a **software PTE bit per ISA** (`arch::paging_cow_protect_user`/`_at`/`_clear` -
+Sv39 RSW 8, AArch64 55, x86-64 52; the mark lives in the page table not the VMA list, so
+it covers the stack and `brk` heap that have no VMA record), and the **parent
+write-protect** (the half that fails silently - without it the parent writes through to
+memory the child now sees). Proven by `cowfork` in `linuxproc` on all three ISAs with
+`mm::fork_pages()`/`fork_frames()` as the oracle, both halves observed failing when
+reverted.
+
+Every kernel access to a cell's memory now goes through **one seam, `kernel/src/uaccess.rs`**
+(docs/LINUX-COMPAT.md "the uaccess seam"). Lazy mapping makes readiness a moving target -
+demand paging made presence lazy, COW makes writability lazy on top - and a fault in kernel
+mode is not resumable, so each strength must be resolved before the access (the
+`copy_from_user`/fixup-table problem). Before this, ~98 sites touched cell memory and 51
+dereferenced the raw VA with only a bounds check done elsewhere, so each lazy feature
+re-opened a 98-site audit; all 51 now route through `uaccess`, which offers bounds-only
+predicates (kept separate - folding presence in cost a measured ~2,900x amplification),
+resolve-and-hand-back, and resolve-and-perform (`read`/`write`/`copy_in`/`copy_out`/`fill`,
+where a site cannot forget to resolve). Kernel *mechanism* (refcount, share, cow-protect,
+fault delivery) is kept separate from COW *policy* (personality code) so the policy can
+move behind a userspace process server later, the seL4 way; it is pre-resolution, not a
+fixup table, which SMP (task #27) will need.
+
+The **stack grows on fault** too (docs/LINUX-COMPAT.md, docs/ARCHITECTURE-DEBT.md 4.0
+blocker 2), which closes the last eager path in the Linux memory model - image, file
+`mmap`, `fork`, and stack are all lazy now. `setup_stack` maps only the top page (argv/
+envp/auxv) and `install_cell`/`exec_reinit` register the rest of the `PT_GNU_STACK`
+request as an anonymous RW reservation (`mem::reserve_stack`); a touch below the top page
+faults in through the same handler, a touch below the reservation is a SIGSEGV (the guard
+page from the bound, not a dedicated page). An image asking for 64 MiB of stack used to
+pay it before `main`; it now pays one page plus what it touches. `stackx` (linuxproc, all
+three ISAs) proves it: a 12 MiB request's 9280 KiB of writes appear as 2380 demand fills,
+59 when the eager mapping is restored. Still eager and named: a `.bss`-tail segment and a
+native cell's image, both riding this handler.
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
-proofs, and the hardware-lab performance numbers. **SMP** (docs/SMP.md,
-task #27) now has its foundation and a real RISC-V secondary: the portable
-**per-CPU state + kernel spinlock** (`kernel/src/smp.rs`: a `SpinLock<T>` +
-a per-CPU registry with `this_cpu()`, zero-impact on the single-CPU path)
-and a **genuine RISC-V secondary hart running kernel code** - brought up via
-SBI HSM `hart_start` onto the shared kernel address space, it claims a
-per-CPU registry slot, marks itself online, and writes a shared counter
-through the cross-core spinlock, which the primary reads back and asserts
-(the `smp` test, riscv64). ARM64 and x86-64 make a genuine, guarded bring-up
-attempt and skip-with-reason: ARM64's PSCI `CPU_ON` (`smc #0`) empirically
-**traps to EL1** (no EL3/EL2 firmware in this QEMU config; the SMC is guarded
-so the trap is observed, not fatal - CPU detection there is likewise
-EL1-limited to the boot CPU), and x86-64 APs need a 16-bit real-mode
-INIT-SIPI-SIPI trampoline below 1 MiB (not implemented; ACPI still enumerates
-the 4 APs). Still deferred: **preemptive multi-core scheduling** (the runtime
-stays single-CPU cooperative - the secondary does proof-of-life work and
-parks, it is not yet fed runnable cells) and making the shared kernel
-`static mut` state SMP-safe end to end.
+proofs, and the hardware-lab performance numbers.
+
+**SMP phase 1** (docs/SMP.md, task #27) closes secondary-core bring-up: **a genuine
+second core runs kernel code on all three ISAs**. The portable foundation
+(`kernel/src/smp.rs`: a `SpinLock<T>` + a per-CPU registry with `this_cpu()`,
+zero-impact on the single-CPU path) is unchanged; what landed is the per-ISA bring-up
+and, first, the **root cause that had blocked x86**. The LAPIC was driven only through
+the **x2APIC MSR block**, which QEMU 8.2 TCG leaves inert - the docs/ENGINEERING.md 1
+case study - and since INIT-SIPI-SIPI is sent through the *interrupt command register*,
+x86 SMP and the x86 timer were the **same** defect. The LAPIC driver now supports both
+access modes and **picks by observation**: request x2APIC, read `IA32_APIC_BASE` back,
+keep it only if `EXTD` latched; otherwise map the **xAPIC MMIO** page uncacheable
+(`paging::apic_map_window`, a third fixed window at PML4[386] whose PDPT is stamped into
+**every cell root**, so a handler reaches EOI whichever root is active) and require the
+register file to answer a write/read-back. Observed under this QEMU: **xAPIC (MMIO)**,
+x2APIC correctly declined.
+
+That unlocked four things. (1) A **genuine one-shot timer on x86-64**: `SYS_ARM_TIMER`
+halts at `hlt` and really sleeps, `netwait`'s pre-N2h regression no longer skips there,
+and the receive wait's `IdleMode::TimerIdle` is a *measured* halt again (21-1771 per run)
+rather than the spin N2h had honestly demoted it to. `ktimer` remains the **only** caller
+of `arch::timer_*` - the single-owner invariant is untouched. (2) **A real x86-64 AP**: a
+position-fixed 16-bit trampoline (`kernel/arch/x86_64/smp.S`) copied to a **verified**
+low page (usable RAM per the firmware map, clear of the PVH `hvm_start_info` and the ACPI
+RSDP), released by INIT-SIPI-SIPI, climbing real -> protected -> long on the primary's own
+`boot_page_tables`. Two triple faults were *observed and fixed* on the way: the AP set
+`EFER.LME` but not `NXE`, and kernel PTEs carry NX (a set bit 63 with NXE clear is a
+reserved-bit fault, so it died on its first LAPIC read); and swapping in the primary's
+`gdt64_ptr` failed because that is the 6-byte 32-bit form while `lgdt` in long mode reads
+2 + 8. The first is fixed *structurally* - the primary publishes its own CR4/EFER/CR0 and
+the AP adopts them verbatim, so the two cores cannot diverge. (3) **A real ARM64
+secondary**: the old verdict "PSCI `CPU_ON`: `smc #0` trapped to EL1" was true of the
+*instruction*, not of PSCI - QEMU's `virt` implements PSCI itself and picks the conduit
+from the machine config (**hvc** for the plain machine, smc only with
+`virtualization=on`), so bring-up now **probes** with `PSCI_VERSION` over each conduit,
+both still guarded by a temporary exception vector, and reports what answered (`hvc #0`,
+version 1.1); `CPU_ON` then enters an MMU-on trampoline that adopts the primary's
+MAIR/TCR/SCTLR verbatim. (4) The **x86-64 UART RX interrupt**, whose poll-only verdict
+had rested on the same inert registers - with a working EOI the IO-APIC path
+demonstrably re-delivers, so GSI 4 -> vector 0x21 is wired, probed by a 16550-loopback
+byte, and `input::interrupt_driven()` is **true on all three ISAs** (x86-64 is now the
+*most* complete of the three here: QEMU's 16550 loopback raises the ISA line itself, so
+nothing has to be poked into the interrupt controller by hand, unlike the riscv/arm
+caveats). No secondary is told its identity - each reads its own hart id / APIC id /
+MPIDR - and the `smp` test asserts the shared magic through the cross-core spinlock plus
+that the registry slot and the hardware id are **not** the primary's. Everything is
+behind the `kernel/smp` cargo feature; the non-smp library is **byte-identical**
+(verified). Honest: this is bring-up, **not** preemptive multi-core scheduling - each
+secondary does observable proof-of-life work and parks, nothing in the kernel is yet
+safe to run on two cores concurrently, the runtime stays single-CPU cooperative, and
+only **one** secondary is started (one dedicated stack per ISA). Still deferred: shared
+`static mut` state made SMP-safe end to end, per-CPU stacks + a start-all loop, a
+per-CPU register instead of the small id->index table, ARM64 CPU *enumeration* (probing
+`PSCI_AFFINITY_INFO`), cross-CPU IPIs beyond bring-up, and the **x86-64 NIC RX
+interrupt** - the last interrupt source any ISA lacks, now known to need ordinary driver
+work (assign the virtio-net BAR, program MSI-X or find the q35 INTx routing) rather than
+the platform limit the old wording implied.
 
 The `.user` linker window holds U-mode code (`.user.text`), shared
 read-only constants (`.user.rodata`), and per-cell data (`.user.bss`) in
@@ -710,6 +1483,7 @@ Everything routes through the xtask runner (`xtask/src/main.rs`):
 cargo xtask build --arch <x86_64|aarch64|riscv64|all>   # cross-compile all kernels
 cargo xtask run   --arch riscv64 [--bin lsh]            # boot in QEMU, serial on terminal
 cargo xtask test  --arch all                            # boot every test kernel, pass/fail
+cargo xtask test  --arch riscv64 --bin schedidle,netwait # boot only these (iterate)
 cargo xtask bench --arch all                            # icount path lengths (always release)
 cargo fmt --all                                         # format (CI-gated)
 cargo clippy -p xtask -- -D warnings                    # lint host code (CI-gated)
@@ -732,35 +1506,83 @@ QEMU 8.x system emulators must be installed to run or test.
 
 ```
 docs/         the design documents (the spec - keep code consistent with it)
+abi/          rheo-abi: the on-wire user/kernel ABI, defined **once** - syscall
+              numbers, queue opcodes/status codes, the ring header + entry
+              layouts, and every repr(C) block a syscall writes into a cell.
+              no_std, zero deps, **no lang items** (the runtime/ model), so it
+              links into a kernel binary and a cell alike; kernel::abi,
+              kernel::queue, librheo::sys and libc::sys all re-export it, which
+              is what makes divergence a compile error instead of a wrong number
+              at runtime (docs/ARCHITECTURE-DEBT.md 3.1)
 kernel/       the no_std kernel library + boot demo bin
-  src/        ISA-independent: capability core, queue ABI, cells, mm
-              (frames + frames_pmem real-nvdimm allocator + grants), time (clock), rng (ChaCha20 DRBG +
+  src/        ISA-independent: boot (the portable boot sequencer - arch::init
+              does only console/vectors/page tables, so arch names nothing above
+              itself), capability core, queue ABI, cells, mm
+              (frames + frames_pmem real-nvdimm allocator + grants; frames carries a
+              per-frame refcount so `fork` is copy-on-write - `free` is a decrement,
+              `share`/`refs` the COW primitives), uaccess (**the one seam kernel code
+              touches a cell's memory through**: bounds + presence + copy-on-write
+              resolution, so every lazy-mapping feature is one change here rather than a
+              ~98-site audit - docs/LINUX-COMPAT.md), time (clock), rng (ChaCha20 DRBG +
               hwrng seeding), event streams,
-              sched (reservations), lease, engine, graph, pty, smp
-              (per-CPU state + a kernel SpinLock + RISC-V SBI-HSM secondary-hart
-              bring-up - docs/SMP.md), input
+              sched (reservations + the **system-wide admission ledger**:
+              a reservation must fit its cell AND the machine -
+              docs/ARCHITECTURE-DEBT.md 2.5), lease, engine, graph, pty, smp
+              (per-CPU state + a kernel SpinLock + secondary-core bring-up on
+              all three ISAs - docs/SMP.md), input
               (kernel RX ring + the SYS_WAIT_INPUT park-until-input primitive -
-              docs/LIBRHEO.md Phase D), svc
-              (shell/resource/POSIX-file syscalls), hw (ACPI/FDT/PCIe
+              docs/LIBRHEO.md Phase D), idle (the **scheduler idle state**: what
+              the kernel does when no cell is runnable but one is blocked on a
+              wake source - composes ktimer + net_rx + input, halts where an
+              interrupt can wake, reports a genuine deadlock instead of
+              panicking - docs/ARCHITECTURE-DEBT.md 2.4), ktimer (the kernel **timer arbiter**:
+              the single owner of the per-ISA hardware one-shot - a fixed 5-slot
+              deadline registry (RxPoll/RxDeadline/CellSleep/NetTimer/Pacer),
+              nearest-deadline arming, and no client's cancel can lose another
+              client's deadline - docs/NETSTACK.md 16 Phase N2h), net_rx (the SYS_WAIT_NET
+              park-until-frame primitive + the NIC RX interrupt sink + the three
+              deadline-honouring wait modes: a NIC-interrupt park, a timer-backed
+              idle where only the timer interrupt exists, else a bounded poll -
+              docs/NETSTACK.md 16), svc
+              (shell/resource syscalls + the **bridge framework**: Bridge<T> +
+              FileOps (POSIX files) / SocketOps (N4b remote INET) / NicOps /
+              DisplayOps - fn-pointer tables whatever owns the real
+              implementation registers at boot, so the kernel stays
+              filesystem-free, network-stack-free and **driver-free**: the queue's
+              opcode dispatch names no device driver, and a driver cell installs
+              into the same slot later - docs/NETSTACK.md 18,
+              docs/ARCHITECTURE-DEBT.md 3.2), hw (ACPI/FDT/PCIe
               discovery + the machine Inventory; block BlockDevice trait +
               virtio_blk driver; virtio_net raw-frame NIC driver -
               docs/NETWORKING.md; virtio_gpu 2D display driver -
               docs/DISPLAY.md), elf + load (ELF loader for native
               programs), user run loop (with per-cell syscall
-              personalities), nproc (native process model: SYS_SPAWN/WAIT +
-              cooperative cross-cell scheduler - docs/LIBRHEO.md Phase F),
+              personalities + the per-cell channel table: one end per client for
+              a service cell, docs/NETSTACK.md 17), nproc (native process model:
+              SYS_SPAWN/WAIT + SYS_YIELD round-robin yield + the cooperative
+              cross-cell scheduler - docs/LIBRHEO.md Phase F, docs/NETSTACK.md 17),
               linux (the Linux personality:
-              docs/LINUX-COMPAT.md), U-mode programs
+              docs/LINUX-COMPAT.md - incl. the blocking, readiness-computing
+              poll/epoll_wait, a real nanosleep, blocking stdin, and eventfd2 as
+              a shared counter registry - eventfd.rs), U-mode programs
               (user_progs.rs incl. the lsh shell), abi
   src/arch/   per-ISA Rust modules incl. paging.rs (one dir per ISA)
   arch/       per-ISA assembly (boot, vectors/traps, context switch, user)
   link/       linker scripts per ISA (incl. the .user text/rodata/data window)
 tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
-              isolation-hw, resources, pmem (Phase J: a MemKind::Pmem grant
+              isolation-hw, security (the syscall-surface hardening audit,
+              docs/ENGINEERING.md 12: an unprivileged U-mode cell attempts an
+              out-parameter into kernel .bss - refused, canary intact - an absurd
+              SYS_MMAP - refused at zero frame cost - and a SYS_MUNMAP of its own
+              queue region / a kernel VA / the .user window / the channel + grant
+              regions - each refused, ring still serving; plus a control per
+              finding so the bound is not a break),
+              resources, pmem (Phase J: a MemKind::Pmem grant
               backed by a real QEMU nvdimm - x86-64 via the ACPI NFIT; arm/riscv
               skip-with-reason - docs/MEMORY.md 2.1), smp (per-CPU state + kernel spinlock +
-              a real RISC-V secondary hart; ARM64/x86-64 skip-with-reason -
-              docs/SMP.md), shell-smoke, hwinfo, rng, runtime,
+              a real secondary core on all three ISAs: SBI HSM on riscv64,
+              INIT-SIPI-SIPI + a real-mode AP trampoline on x86-64, PSCI CPU_ON
+              over the probed HVC conduit on aarch64 - docs/SMP.md), shell-smoke, hwinfo, rng, runtime,
               posix, blockfs (live virtio-blk disk), elfrun (load a native
               ELF), posixrun (native program over the POSIX syscalls),
               libcrun (a program linked against rheo-libc), jsonrun (a
@@ -773,8 +1595,8 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               Phase C: parallel map_reduce + a userspace graph submitted to the
               CPU engine + reservation admission), librheoterm (librheo Phase D:
               the interrupt-driven console wakeup + the term byte-stream
-              discipline - scripted editing/history/escape, idle-park on RISC-V +
-              ARM64; x86-64 poll),
+              discipline - scripted editing/history/escape, idle-park on all three
+              ISAs),
               librheowl (librheo Phase E: the Wayland-class compositor demo -
               two cells share a typed cross-cell queue pair + pass a sealed
               buffer grant zero-copy + a flip completion, checksum-verified),
@@ -787,20 +1609,100 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               binary - clone/futex/TLS/join), linuxsig (L5: signal delivery -
               async raise, fault->SIGSEGV handler, SIG_DFL terminate),
               linuxproc (L6: fork/execve/wait4/cross-cell pipes - a direct
-              multi-process C fixture + the P11 coreutils-suite shell),
+              multi-process C fixture + the P11 coreutils-suite shell; plus
+              `stackx`, which asks for 12 MiB of stack via PT_GNU_STACK and both
+              reads it back through RLIMIT_STACK and writes 9280 KiB of it
+              through - the loader used to hand every cell a fixed 8 MiB - and
+              `sysx`, the seven measured syscalls: eventfd2's full wakeup contract
+              (an empty counter is NOT pollable-readable, a dup shares it,
+              EFD_SEMAPHORE decrements), a real sysinfo, sched_setscheduler
+              refusing real-time with EPERM, close_range, and clone3/rseq refused
+              deliberately),
               linuxdyn (L7: an unmodified dynamically-linked glibc C hello over
-              PT_INTERP + ld-linux + fd-backed mmap), librheoproc (librheo Phase
+              PT_INTERP + ld-linux + fd-backed mmap - three ways: loaded direct,
+              execve'd from a ramfs VFS, and (GOAL-DISK-2b) execve'd off a real
+              ext4 image on a live virtio-blk disk via ext4fs/ext4plus + the block
+              cache, streamed on demand), librheoproc (librheo Phase
               F: native spawn/wait + one-shot timer + the lrsh shell + the
               embedded spine-only cell), librheonet (librheo Phase G: raw-frame
               networking - virtio-net driver + net::send/recv/mac, an ARP round
-              trip via SLIRP), librheogpu (librheo Phase H: a real GPU -
+              trip via SLIRP), netwait (rheo-net N2d: true async receive - the NIC
+              RX interrupt + SYS_WAIT_NET park; a cell parks on net::recv, wakes on
+              SLIRP's ARP reply + a TCP reset, then parks on a deadline, with one
+              reactor wakeup per receive and a genuine kernel idle-park on
+              riscv64/aarch64; plus N2h: the timer-arbiter conflict regression -
+              the pre-N2h lost-deadline pattern reproduced as a false expiry,
+              three concurrent deadlines each honoured in order with none lost, a
+              cell sleep surviving a full receive wait - and the adaptive
+              hot/warm/cold poll escalation, law + observed counters),
+              librheogpu (librheo Phase H: a real GPU -
               virtio-gpu 2D driver + display::Scanout present, the create-2d/
               attach/set-scanout/transfer/flush round trip, headless-honest),
               librheoipc (librheo Phase J: symmetric async IPC - two cells
               ping-pong typed messages over the async Sender/Receiver, each recv
               a genuine reactor park), librheopipe (librheo Phase J: a cross-cell
               stdout pipeline - an orchestrator spawns a producer child that
-              inherits its channel and streams its output back), gpuhw
+              inherits its channel and streams its output back), netservice
+              (rheo-net N4a: the network service cell + concurrent fan-out - one
+              service cell serves 3 client cells, each over its own cross-cell
+              channel, one strand per client; distinct correct responses + the
+              round-robin interleave/in-flight/park-wake witnesses + reaping,
+              deterministic core plus a bonus live ARP), linuxnet (rheo-net N4b:
+              remote INET for unmodified Linux binaries - an unmodified
+              static-glibc C binary does a real DNS round trip to SLIRP's
+              resolver 10.0.2.3:53 and a real remote TCP connect over the NIC,
+              through the svc::SocketOps bridge + inet_personality.rs; plus the
+              `resolve` fixture: glibc's own getaddrinfo over the seeded
+              /etc/{nsswitch.conf,hosts,resolv.conf} - a loopback send with no
+              listener refused, /etc/hosts resolved deterministically, a live
+              public name reported), nethttp
+              (rheo-net N5a: HTTP/1.1 + HTTP/2 - the zero-copy h1 codec with its
+              22 request-smuggling rejections + the SWAR-vs-scalar scan oracle, an
+              h1 client<->server exchange over the in-cell TCP VirtualLink
+              (POST+body, chunked, keep-alive, 404), the RFC 7541 Appendix C HPACK
+              known-answer vectors incl. Huffman, the h2 connection (preface,
+              SETTINGS, concurrent streams, WINDOW_UPDATE-gated body, RST/PING/
+              GOAWAY), and one h1 exchange through the TLS 1.3 record layer with
+              ALPN; pure compute, live GET skipped-with-reason), nethostcfg
+              (rheo-net N4c: host configuration - the DHCP byte oracle + full
+              state-machine walk (renewal/rebind/expiry/NAK/DECLINE/RELEASE +
+              seven rejections), the hostcfg store read back by dns::Config and
+              udp::UdpEndpoint, IPv4 link-local (0.0.0.0 ARP probe, conflict
+              re-pick, bounded announce, defend-once-then-yield), mDNS over the
+              DNS codec, and the NTP offset/delay KAT as a bounded interval;
+              deterministic core plus four duration-bounded live phases (SLIRP's
+              real DHCP lease reported, NTP/mDNS skip-with-reason) and the
+              per-ISA wait-mode assertion - NIC-interrupt park on riscv64/aarch64,
+              timer-backed idle on x86-64),
+              schedidle (docs/ARCHITECTURE-DEBT.md 2.4, the keystone: the
+              scheduler idle state - two cells share one page read-write and each
+              appends its own marker to an ordering vector, so the hand-computed
+              oracle `bSSSSSSSSB` proves the peer ran all 8 rounds *while* the
+              other was blocked on a timer and then on the console, with the
+              kernel asserted to have genuinely halted; plus the wedge-free
+              refusal to park a receive that can never be satisfied, the deadlock
+              classifier, and the docs/ARCHITECTURE-DEBT.md 2.5 system-wide
+              admission ledger refusing a second 90%),
+              linuxpoll (the Linux half of 2.4: `pollx` - an unmodified
+              static-glibc binary - asserts an empty pipe is NOT readable, a
+              closed fd is POLLNVAL, both poll and epoll_wait timeouts really
+              elapse on the program's own clock, an indefinite poll is woken by a
+              forked peer, a 40 ms nanosleep sleeps, and pipe2(O_NONBLOCK) reports
+              EAGAIN with no fcntl; `polldead` polls forever on its own empty pipe
+              and the run ends with DEADLOCK_EXIT plus a diagnostic naming the
+              blocked pid, not a kernel panic),
+              nettcpcc (rheo-net N2b + N2e: congestion control - the Reno/CUBIC
+              integer cwnd trajectories against their oracles, and BBRv3 as the
+              default: the scripted Startup/Drain/ProbeBW/ProbeRTT walk, the
+              max-bw + min-RTT filters incl. expiry, the **loss != congestion**
+              headline (BBR holds 100% of the link rate through random loss where
+              CUBIC falls to 37%), connection-level paced release intervals,
+              BBR-vs-Reno loss recovery, the pacer's CPU-reservation admission and
+              its refusals, 14 live releases parked on kernel timer-arbiter pacer
+              deadlines, and kernel-side the arbiter's continuous-re-arm property -
+              40 pacer deadlines with an RTO + a cell sleep outstanding throughout,
+              none lost; docs/NETSTACK.md 21),
+              gpuhw
               (real-GPU stage 1, docs/GPU-HARDWARE.md 12: PCIe bridge
               recursion + BAR sizing/assignment + capability walk + vendor
               recognition + driving every GPU QEMU models: AMD ati-vga,
@@ -821,13 +1723,28 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               E4M3+E5M2/TF32/int4 round-trips), librheotilebattle (the tile
               battle tier: scaled 7B-class GEMMs, an attention block, paged-KV
               prefix sharing, the columnar reduce, soak + boundary + pipeline
-              stress), bench-core, and
-              the interactive
-              lsh bin (+ harness.rs, vfs_personality.rs); fixtures/ holds the
+              stress),
+              bench-core, and the interactive
+              lsh bin. Shared support, all #[path]-included (docs/
+              ARCHITECTURE-DEBT.md 5): harness.rs (the `.user`-window cell
+              builders **plus** run_elf_cell/run_linux_cell - one native launch
+              and one Linux launch, replacing 22 hand-written copies),
+              fixture.rs (cell!/linux!/linux_cargo! - the per-ISA
+              include_bytes! path, once, which is also what makes the
+              docs/TARGET-ARCHITECTURES.md 4.1 cfg exemption auditable),
+              console_personality.rs (the console-only FileOps: console_only
+              for ENOSYS-everywhere, console_and_empty_fs for the
+              ENOENT/EBADF shape - two variants because collapsing them would
+              change what a cell that *did* make a file call observes),
+              vfs_personality.rs (the real-file FileOps over the POSIX VFS),
+              inet_personality.rs (the N4b remote-INET datapath registered as
+              svc::SocketOps);
+              fixtures/ holds the
               ext4 test image (+ gen-ext4.sh); linux-fixtures/ holds the
               built-from-source glibc test binaries (rusthello/ + rustthreads/
               + hello.c + sig_{raise,segv,dfl}.c + procdemo/cecho/rsh.c +
-              dhello.c; coreutils via cargo install, and the L7 ld.so/libc.so.6
+              dhello.c + af_unix.c + inet.c + inetremote.c; coreutils via cargo
+              install, and the L7 ld.so/libc.so.6
               copied from the toolchain - all gitignored)
 comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md
 xtask/        build/run/test/bench orchestration (cargo xtask ...)
@@ -848,13 +1765,16 @@ librheo/      the native userspace foundation library (docs/LIBRHEO.md):
               GraphBuilder)/sched (Reservation + lattice-rt Priority/PeriodicTask/
               TimingReport)/term (Phase D byte-stream input/edit/render)/ipc
               (Phase E cross-cell Channel + sealed-buffer share + Phase J symmetric
-              async Sender/Receiver on the reactor)/display (Phase E
+              async Sender/Receiver on the reactor + rheo-net N4a multi-slot
+              Channel::open_slot: one end per client for a service cell)/display (Phase E
               Surface/Compositor/InputEvent + Phase H Scanout/Gpu real GPU present
               over OP_GPU_PRESENT - docs/DISPLAY.md)/proc (Phase F spawn/wait/args/
               env + Phase J spawn_piped: a spawned child inherits the parent's
-              channel as its stdout pipe)/time (Phase F clock + async
+              channel as its stdout pipe + rheo-net N4a spawn_on_channel: a service
+              hands each spawned client its own channel slot)/time (Phase F clock + async
               sleep/timeout)/net (Phase G raw-frame
-              send/recv/mac over OP_NET_* - docs/NETWORKING.md) +
+              send/try_recv/mac over OP_NET_* + the N2d parking recv/recv_timeout
+              over SYS_WAIT_NET - docs/NETWORKING.md, docs/NETSTACK.md 16) +
               crt0 (feature-gated: default=full, --no-default-features=embedded
               spine) + the librheo-demo (Phase A), librheo-data (Phase B
               mini-DuckDB scan), librheo-compute (Phase C parallel compute + graph
@@ -862,15 +1782,57 @@ librheo/      the native userspace foundation library (docs/LIBRHEO.md):
               compositor demo), Phase F: librheo-orch (spawn/wait/timer proof),
               lrsh (the librheo-native shell), librheo-echo/librheo-child (native
               coreutils it spawns), librheo-embed (the embedded spine-only cell),
-              librheo-net (Phase G ARP round trip over virtio-net), librheo-gpu
+              librheo-net (Phase G ARP round trip over virtio-net), librheo-netwait
+              (rheo-net N2d parked receive: woken by a real frame, then by a
+              deadline), librheo-gpu
               (Phase H virtio-gpu 2D present round trip), librheo-ipc (Phase J
               two-cell async Sender/Receiver ping-pong), and librheo-pipe/
               librheo-pipesrc (Phase J cross-cell stdout pipeline: a spawned
               producer child streams its output to the parent over the channel)
               programs
+net/          rheo-net: the greenfield network stack as portable userspace
+              (docs/NETSTACK.md, docs/NETWORKING.md) - no_std+alloc, no per-ISA
+              code, built for the bare targets as loaded ELF cells over
+              librheo's raw-frame path: eth/arp/ip (N1a), udp/icmp/wire (N1b),
+              dns caching resolver (N1c), trace (N1e), local fast path (N1d),
+              tcp + timer wheel (N2a), cc Reno/CUBIC (N2b), smoltcp_cell +
+              shard (N2c), crypto (N3a) + tls (N3b, both feature-gated),
+              service (N4a: the service-cell framework - one channel end +
+              one strand per client, so one service cell serves many clients
+              concurrently), hostcfg + dhcp + zeroconf (link-local + mDNS) + ntp
+              (N4c: host configuration - the store the stack reads for its
+              address/netmask/gateway/resolvers/search domains, a DHCP client, RFC
+              3927 link-local, mDNS over the dns codec unchanged, and an SNTP
+              client whose answer is a bounded interval; docs/NETSTACK.md 20),
+              bbr + pacer (N2e: BBRv3 as the default congestion control - the
+              windowed max-bandwidth + min-RTT filters, round-trip counting, the
+              Startup/Drain/ProbeBW/ProbeRTT machine and its gains, a loss response
+              that caps in-flight instead of collapsing the window; plus the send
+              pacer, a token bucket whose release deadline rides the kernel timer
+              arbiter's Pacer slot - pacing is a precondition for BBR, not a knob;
+              docs/NETSTACK.md 21),
+              and http1 + http2 (N5a: HTTP/1.1 - a zero-copy,
+              smuggling-hardened codec + chunked framing + a transport-agnostic
+              Client/Server; HTTP/2 - frames, streams, both flow-control levels,
+              and HPACK with the RFC-generated Appendix B Huffman table - both in
+              the always-compiled half, docs/NETSTACK.md 19). Two postures: `hosted` (default - the
+              librheo-driven async endpoints) and the librheo-free **codec**
+              posture (`--no-default-features`: eth/ip/arp/udp/tcp/cc/shard/wire
+              only), which is what links beside a *kernel* for the N4b
+              SocketOps bridge (docs/NETSTACK.md 18).
+              Plus the netcore/netl4/netdns/nettrace/netlocal/
+              nettcp/nettcpcc/netsmoltcp/netcrypto/nettls/nethttp/nethostcfg
+              demo bins and
+              netsvc-demo + netsvc-client (the N4a service + its clients)
 json/         rheo-json: a dependency-free, zero-copy JSON parser (scalar +
               SSE2 string-scan), no_std, host-tested + benchmarked
               (docs/JSON.md, comparison/json/)
+ext4fs/       the disk ext4 driver: an adapter from the `ext4plus` crate
+              (Google's read-only ext4-view; no_std; `sync` mode) to
+              posix::FileSystem over a posix::BlockSource - kept in its own crate
+              so ext4plus's deps stay out of the dependency-free posix. Replaced
+              the hand-rolled parser (docs/FILESYSTEMS.md names the crate + deps
+              per the no-deps rule). Used by the blockfs/posix test kernels.
 services/     system service cells        (future, phase 5)
 targets/      rheo-os custom target specs + the std port: rheo_os-*.json,
               patch-std.py (rust-src std patch: heap/stdio/args/env/fs arms),
@@ -881,9 +1843,18 @@ targets/      rheo-os custom target specs + the std port: rheo_os-*.json,
 
 ## Rules
 
+- **The engineering standard.** `docs/ENGINEERING.md` governs *how* work
+  lands - evidence, scope language, additivity. Its section 13 checklist
+  applies to every slice.
 - **Docs first.** A change that adds a kernel object or verb must pass the
   admission rule in `docs/ARCHITECTURE.md` section 6 and be reflected there
   before it lands in code.
+- **One native cross-cell switch.** Every path that hands the CPU from one
+  native cell to another goes through `user::switch_native_cell`, which
+  swaps the FP/SIMD register file as well as the address space. Cells are
+  hard-float and the kernel is soft-float, so a bare `switch_to_cell` from a
+  native path silently corrupts vector registers (docs/LIBRHEO.md "FP/SIMD
+  across the native cross-cell switch").
 - **Portability.** Only `kernel/src/arch/` and `kernel/arch/` may differ per
   ISA. A change that needs per-ISA code anywhere else is an architecture bug
   (docs/TARGET-ARCHITECTURES.md 4). Every change must build and boot on all

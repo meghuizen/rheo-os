@@ -60,6 +60,35 @@ pub fn ops() -> FileOps {
     }
 }
 
+/// The IPv4 address `/etc/hosts` maps `rheo.test` to (see
+/// [`seed_resolver_files`]). Deliberately in no real DNS zone, so a program that
+/// resolves the name proves it read the **file**, not the wire.
+pub const HOSTS_TEST_ADDR: &str = "10.9.8.7";
+
+/// Seed the three files glibc's name resolver reads, into the currently mounted
+/// VFS (docs/LINUX-COMPAT.md L8-INET remote, docs/NETSTACK.md 18). Call after
+/// `mount::mount("/", ...)`.
+///
+/// Without them glibc has no configuration to read and falls back to its
+/// built-in nameserver `127.0.0.1:53`, which the personality classifies as
+/// **loopback** and routes to the in-kernel datagram queue - where nothing
+/// listens - so every `getaddrinfo` failed for a reason far from the cause. The
+/// nameserver seeded here is QEMU SLIRP's built-in resolver (`10.0.2.3`), a
+/// **non-loopback** address, so the query rides the proven remote UDP datapath
+/// (rheo-net N4b).
+///
+/// `/etc/hosts` also carries a **deterministic, network-free** name
+/// (`rheo.test` -> [`HOSTS_TEST_ADDR`]) so the `files` backend can be proven
+/// without any wire.
+pub fn seed_resolver_files() {
+    // An already-existing /etc is fine (a caller may have made it).
+    let _ = sys::mkdir("/etc");
+    posix::fs::write("/etc/nsswitch.conf", b"hosts: files dns\n").expect("seed /etc/nsswitch.conf");
+    posix::fs::write("/etc/hosts", b"127.0.0.1\tlocalhost\n10.9.8.7\trheo.test\n")
+        .expect("seed /etc/hosts");
+    posix::fs::write("/etc/resolv.conf", b"nameserver 10.0.2.3\n").expect("seed /etc/resolv.conf");
+}
+
 fn kind_code(k: FileType) -> u64 {
     match k {
         FileType::Regular => 0,

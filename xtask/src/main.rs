@@ -21,11 +21,12 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 49] = [
+const TEST_KERNELS: [&str; 59] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
     "isolation-hw",
+    "security",
     "resources",
     "pmem",
     "smp",
@@ -54,6 +55,9 @@ const TEST_KERNELS: [&str; 49] = [
     "linuxdyn",
     "librheoproc",
     "librheonet",
+    "netwait",
+    "schedidle",
+    "linuxpoll",
     "librheogpu",
     "librheoipc",
     "librheopipe",
@@ -65,8 +69,14 @@ const TEST_KERNELS: [&str; 49] = [
     "nettcp",
     "nettcpcc",
     "netsmoltcp",
+    "netcrypto",
+    "nettls",
     "linuxunix",
     "linuxinet",
+    "linuxnet",
+    "netservice",
+    "nethttp",
+    "nethostcfg",
     "gpuhw",
     "iommu",
     "librheotile",
@@ -92,6 +102,34 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
         ("blockfs", Arch::X86_64) => &[
             "-drive",
             "file=tests/fixtures/ext4.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-pci,drive=blk0,disable-legacy=on",
+        ],
+        // linuxdyn phase 3 (GOAL-DISK-2b): a per-ISA ext4 image built by
+        // `build_dyn_disk_fixture` (gitignored), holding a dynamic glibc binary +
+        // ld.so + libc, mounted off a live virtio-blk disk through ext4fs/ext4plus
+        // and `execve`d. Same two transports as blockfs. If the image is a
+        // placeholder (no e2fsprogs/toolchain), the test detects a non-ext4 disk
+        // and skips phase 3.
+        ("linuxdyn", Arch::Riscv64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-drive",
+            "file=tests/linux-fixtures/build/riscv64/dyn-disk.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-device,drive=blk0",
+        ],
+        ("linuxdyn", Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-drive",
+            "file=tests/linux-fixtures/build/aarch64/dyn-disk.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-device,drive=blk0",
+        ],
+        ("linuxdyn", Arch::X86_64) => &[
+            "-drive",
+            "file=tests/linux-fixtures/build/x86_64/dyn-disk.img,if=none,id=blk0,format=raw",
             "-device",
             "virtio-blk-pci,drive=blk0,disable-legacy=on",
         ],
@@ -127,6 +165,65 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "virtio-net-device,netdev=n0",
         ],
         ("librheonet", Arch::X86_64) => &[
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-pci,netdev=n0,disable-legacy=on",
+        ],
+        // netwait (docs/NETSTACK.md, the async-receive path / rheo-net N2d): the
+        // same SLIRP + virtio-net setup as librheonet - the ARP reply is now the
+        // wake event for a *parked* receive (the cell blocks in SYS_WAIT_NET and,
+        // on riscv/arm, the kernel idles at WFI until the NIC's RX interrupt
+        // fires). Deterministic + network-free. Same two transports.
+        ("netwait", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-device,netdev=n0",
+        ],
+        ("netwait", Arch::X86_64) => &[
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-pci,netdev=n0,disable-legacy=on",
+        ],
+        // netservice (docs/NETSTACK.md the service-cell section, rheo-net Phase N4a):
+        // the service cell's proof is deterministic and network-free, but it also
+        // performs ONE bonus live ARP for a client, so it gets the same SLIRP +
+        // virtio-net setup as librheonet. With no netdev the service reports the live
+        // path skipped and still passes - the netdev only unlocks the bonus.
+        ("netservice", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-device,netdev=n0",
+        ],
+        ("netservice", Arch::X86_64) => &[
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-pci,netdev=n0,disable-legacy=on",
+        ],
+        // linuxnet (docs/NETSTACK.md N4b, docs/LINUX-COMPAT.md L8-INET remote): the
+        // same SLIRP + virtio-net setup as netcore, now driven by an *unmodified
+        // static-glibc Linux binary* through the `svc::SocketOps` bridge - a DNS
+        // query to SLIRP's built-in responder (10.0.2.3:53) and a TCP connect to a
+        // closed gateway port (10.0.2.2:9, answered with a reset). Deterministic +
+        // network-free. Same two transports: virtio-mmio on arm/riscv, virtio-pci
+        // on x86 (disable-legacy=on pins the modern layout the driver expects).
+        ("linuxnet", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-device,netdev=n0",
+        ],
+        ("linuxnet", Arch::X86_64) => &[
             "-netdev",
             "user,id=n0",
             "-device",
@@ -184,6 +281,28 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "virtio-net-device,netdev=n0",
         ],
         ("netdns", Arch::X86_64) => &[
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-pci,netdev=n0,disable-legacy=on",
+        ],
+        // nethostcfg (docs/NETSTACK.md rheo-net Phase N4c): host configuration -
+        // DHCP + zeroconf/mDNS + NTP + the hostcfg store, over the same SLIRP +
+        // virtio-net setup as netdns. The deterministic core (codecs, the DHCP state
+        // machine + its timers, the link-local ARP claim, the mDNS codec, the NTP
+        // offset/delay KAT) is entirely network-free; the netdev is here only so the
+        // four *bonus* live attempts genuinely put frames on the wire - SLIRP runs no
+        // guest-visible DHCP/NTP/mDNS service, so each skips with a printed reason.
+        // Same two transports: virtio-mmio on arm/riscv, virtio-pci on x86.
+        ("nethostcfg", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-netdev",
+            "user,id=n0",
+            "-device",
+            "virtio-net-device,netdev=n0",
+        ],
+        ("nethostcfg", Arch::X86_64) => &[
             "-netdev",
             "user,id=n0",
             "-device",
@@ -527,6 +646,10 @@ fn main() -> ExitCode {
     let mut arches = vec![Arch::X86_64];
     let mut release = false;
     let mut bin = String::from("kernel");
+    // Set only when `--bin` is passed explicitly, so `test` can tell "run just
+    // this kernel" apart from the `run` default (which is also a valid kernel
+    // name). Without this, `test --bin <name>` silently booted all of them.
+    let mut bin_filter: Option<String> = None;
     let mut iter = args[1..].iter();
     while let Some(flag) = iter.next() {
         match flag.as_str() {
@@ -552,6 +675,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 };
                 bin = value.clone();
+                bin_filter = Some(value.clone());
             }
             "--release" => release = true,
             other => {
@@ -575,12 +699,39 @@ fn main() -> ExitCode {
         // calls (debug builds insert pointer-check panics that land in
         // unmapped kernel .text), and optimized path lengths are the
         // system's real numbers anyway.
-        "test" => arches.iter().all(|&a| {
-            build(a, true)
-                && TEST_KERNELS
-                    .iter()
-                    .all(|kernel| boot_expect_pass(a, true, kernel, extra_qemu_args(a, kernel)))
-        }),
+        // `--bin <kernel>[,<kernel>...]` boots only those (fast iteration on the
+        // kernels a change can actually affect); without it the whole matrix
+        // runs. A userspace-only change cannot affect an unrelated kernel, but a
+        // *kernel* change can - `.bss` motion once broke an unrelated kernel
+        // (docs/ENGINEERING.md 11), so kernel changes still owe the full matrix.
+        "test" => {
+            let kernels: Vec<&str> = match &bin_filter {
+                None => TEST_KERNELS.to_vec(),
+                Some(list) => {
+                    let selected: Vec<&str> = list
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if selected.is_empty() {
+                        eprintln!("error: --bin needs at least one kernel name");
+                        return ExitCode::FAILURE;
+                    }
+                    if let Some(bad) = selected.iter().find(|n| !TEST_KERNELS.contains(n)) {
+                        eprintln!("error: unknown test kernel '{bad}'");
+                        eprintln!("known: {}", TEST_KERNELS.join(", "));
+                        return ExitCode::FAILURE;
+                    }
+                    selected
+                }
+            };
+            arches.iter().all(|&a| {
+                build(a, true)
+                    && kernels
+                        .iter()
+                        .all(|kernel| boot_expect_pass(a, true, kernel, extra_qemu_args(a, kernel)))
+            })
+        }
         // Benchmarks always run the release build: instruction path
         // lengths of an unoptimized kernel are not the system's numbers.
         "bench" => arches.iter().all(|&a| build(a, true) && bench(a, true)),
@@ -604,7 +755,7 @@ fn main() -> ExitCode {
 fn print_usage() {
     eprintln!(
         "usage: cargo xtask <build|run|test|bench|std-patch> \
-         [--arch x86_64|aarch64|riscv64|all] [--bin <kernel>] [--release]"
+         [--arch x86_64|aarch64|riscv64|all] [--bin <kernel>[,<kernel>...]] [--release]"
     );
 }
 
@@ -643,6 +794,14 @@ fn build_userland(arch: Arch) -> bool {
         "rheo-libc",
         "-p",
         "rheo-net",
+        // The deterministic-proof support types (`tcp::VirtualLink`) live behind
+        // the non-default `proof` feature so a fault injector cannot reach a
+        // production posture, and above all cannot reach the librheo-free codec
+        // posture that links beside a *kernel* binary
+        // (docs/ARCHITECTURE-DEBT.md 3.5). The demo **cells** are exactly the
+        // proofs that drive it, so they are built with it on.
+        "--features",
+        "proof",
         "--release",
         "--target",
         arch.target(),
@@ -748,13 +907,140 @@ fn build_smoltcp_demo(arch: Arch) -> bool {
         "--bin",
         "netsmoltcp-demo",
         "--features",
-        "smoltcp",
+        "smoltcp,proof",
         "--release",
         "--target",
         arch.target(),
         "-Zbuild-std=core,alloc,compiler_builtins",
         "-Zbuild-std-features=compiler-builtins-mem",
     ]);
+    matches!(cmd.status().map(|s| s.success()), Ok(true))
+}
+
+/// Build the `netcrypto-demo` bin with the `crypto` feature (docs/NETSTACK.md §3,
+/// Phase N3a). Like `build_smoltcp_demo`, `build_userland` (default features)
+/// skips it via `required-features = ["crypto"]`, so this dedicated step builds
+/// just that one bin with the RustCrypto tree, into the same release path the
+/// `netcrypto` test kernel `include_bytes!`s.
+///
+/// The `--cfg *_force_soft` / `curve25519_dalek_backend="serial"` flags force the
+/// **software** AES / GHASH / curve25519 backends: `x86_64-unknown-none`'s default
+/// target features otherwise select intrinsics backends (AES-NI / CLMUL / AVX2)
+/// that miscompile under LLVM ("Do not know how to split the result of this
+/// operator"). The soft backends are the scalar portable path our doctrine wants
+/// anyway (docs/NETSTACK.md §3), applied uniformly on all three ISAs so behaviour
+/// is identical everywhere. Setting env RUSTFLAGS replaces `.cargo/config.toml`'s
+/// `[target]` flags, so x86_64's relocation/code-model are re-supplied here.
+fn build_crypto_demo(arch: Arch) -> bool {
+    println!(
+        "[xtask] building netcrypto-demo (--features crypto, soft backends) for {}",
+        arch.name()
+    );
+    let mut rustflags = String::from(
+        "--cfg aes_force_soft --cfg polyval_force_soft \
+         --cfg curve25519_dalek_backend=\"serial\"",
+    );
+    // x86_64-unknown-none needs its config.toml model flags re-supplied (env
+    // RUSTFLAGS overrides, does not merge with, the [target] config rustflags).
+    if arch == Arch::X86_64 {
+        rustflags.push_str(" -C relocation-model=static -C code-model=small");
+    }
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "build",
+        "-p",
+        "rheo-net",
+        "--bin",
+        "netcrypto-demo",
+        "--features",
+        "crypto",
+        "--release",
+        "--target",
+        arch.target(),
+        "-Zbuild-std=core,alloc,compiler_builtins",
+        "-Zbuild-std-features=compiler-builtins-mem",
+    ]);
+    cmd.env("RUSTFLAGS", rustflags);
+    matches!(cmd.status().map(|s| s.success()), Ok(true))
+}
+
+/// Build the `nettls-demo` bin with the `tls` feature (docs/NETSTACK.md §15,
+/// Phase N3b). The `tls` feature implies `crypto`, so the same force-soft AES /
+/// GHASH / curve25519 backend cfgs as `build_crypto_demo` are needed (the
+/// intrinsics backends miscompile under LLVM on `x86_64-unknown-none`). Like the
+/// crypto demo, `build_userland` (default features) skips it via
+/// `required-features = ["tls"]`, so this dedicated step builds just that bin into
+/// the release path the `nettls` test kernel `include_bytes!`s. Must run after
+/// `build_userland`.
+fn build_tls_demo(arch: Arch) -> bool {
+    println!(
+        "[xtask] building nettls-demo (--features tls, soft backends) for {}",
+        arch.name()
+    );
+    let mut rustflags = String::from(
+        "--cfg aes_force_soft --cfg polyval_force_soft \
+         --cfg curve25519_dalek_backend=\"serial\"",
+    );
+    if arch == Arch::X86_64 {
+        rustflags.push_str(" -C relocation-model=static -C code-model=small");
+    }
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "build",
+        "-p",
+        "rheo-net",
+        "--bin",
+        "nettls-demo",
+        "--features",
+        "tls,proof",
+        "--release",
+        "--target",
+        arch.target(),
+        "-Zbuild-std=core,alloc,compiler_builtins",
+        "-Zbuild-std-features=compiler-builtins-mem",
+    ]);
+    cmd.env("RUSTFLAGS", rustflags);
+    matches!(cmd.status().map(|s| s.success()), Ok(true))
+}
+
+/// Build the `nethttp-demo` bin with the `tls` feature (docs/NETSTACK.md §19,
+/// Phase N5a). The HTTP codec itself needs no feature at all - it is in the
+/// always-compiled half of rheo-net - but the proof cell also runs one HTTP/1.1
+/// exchange **through the TLS 1.3 record layer**, so it is gated on `tls` and needs
+/// the same force-soft AES / GHASH / curve25519 backend cfgs as `build_tls_demo`
+/// (the intrinsics backends miscompile under LLVM on `x86_64-unknown-none`). Like
+/// the crypto/TLS demos, `build_userland` (default features) skips it via
+/// `required-features = ["tls"]`, so this dedicated step builds just that bin into
+/// the release path the `nethttp` test kernel `include_bytes!`s. Must run after
+/// `build_userland`.
+fn build_http_demo(arch: Arch) -> bool {
+    println!(
+        "[xtask] building nethttp-demo (--features tls, soft backends) for {}",
+        arch.name()
+    );
+    let mut rustflags = String::from(
+        "--cfg aes_force_soft --cfg polyval_force_soft \
+         --cfg curve25519_dalek_backend=\"serial\"",
+    );
+    if arch == Arch::X86_64 {
+        rustflags.push_str(" -C relocation-model=static -C code-model=small");
+    }
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "build",
+        "-p",
+        "rheo-net",
+        "--bin",
+        "nethttp-demo",
+        "--features",
+        "tls,proof",
+        "--release",
+        "--target",
+        arch.target(),
+        "-Zbuild-std=core,alloc,compiler_builtins",
+        "-Zbuild-std-features=compiler-builtins-mem",
+    ]);
+    cmd.env("RUSTFLAGS", rustflags);
     matches!(cmd.status().map(|s| s.success()), Ok(true))
 }
 
@@ -823,6 +1109,18 @@ impl Arch {
                 "/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1",
                 "/usr/riscv64-linux-gnu/lib/libc.so.6",
             ),
+        }
+    }
+
+    /// The absolute path a dynamic binary's `PT_INTERP` names for this ISA (the
+    /// `ld-linux-*.so` path, verified with `readelf -p .interp`). Used to place
+    /// the interpreter at the right path inside the `linuxdisk` ext4 image so
+    /// ld.so is found on the mounted disk exactly as on Linux.
+    fn interp_path(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "/lib64/ld-linux-x86-64.so.2",
+            Arch::Aarch64 => "/lib/ld-linux-aarch64.so.1",
+            Arch::Riscv64 => "/lib/ld-linux-riscv64-lp64d.so.1",
         }
     }
 }
@@ -904,19 +1202,70 @@ fn build_linux_fixtures(arch: Arch) -> bool {
     // Signal fixtures (L5) + process fixtures (L6): same static-glibc ET_EXEC
     // recipe as chello. `procdemo` (pipe2+fork+dup2+execve+wait4) and `cecho`
     // (its execve target) are the `linuxproc` proof (docs/LINUX-COMPAT.md L6).
-    for (src, bin) in [
-        ("sig_raise.c", "sig_raise"),
-        ("sig_segv.c", "sig_segv"),
-        ("sig_dfl.c", "sig_dfl"),
-        ("procdemo.c", "procdemo"),
-        ("cecho.c", "cecho"),
-        ("rsh.c", "rsh"),
+    /// Fixtures needing no extra link arguments (most of them).
+    const NO_EXTRA: &[&str] = &[];
+    for (src, bin, extra) in [
+        ("sig_raise.c", "sig_raise", NO_EXTRA),
+        ("sig_segv.c", "sig_segv", NO_EXTRA),
+        ("sig_dfl.c", "sig_dfl", NO_EXTRA),
+        ("procdemo.c", "procdemo", NO_EXTRA),
+        ("cecho.c", "cecho", NO_EXTRA),
+        ("rsh.c", "rsh", NO_EXTRA),
         // AF_UNIX (L8, docs/LINUX-COMPAT.md): socketpair+fork + bind/listen/
         // connect/accept, the `linuxunix` proof.
-        ("af_unix.c", "af_unix"),
+        ("af_unix.c", "af_unix", NO_EXTRA),
         // AF_INET/AF_INET6 loopback (L8-INET, docs/LINUX-COMPAT.md): TCP+UDP+epoll
         // over 127.0.0.1 and TCP over ::1, the `linuxinet` proof.
-        ("inet.c", "inet"),
+        ("inet.c", "inet", NO_EXTRA),
+        // Remote INET over the NIC (rheo-net N4b, docs/NETSTACK.md N4b): a real
+        // DNS round trip to SLIRP's resolver + a real remote TCP connect, the
+        // `linuxnet` proof.
+        ("inetremote.c", "inetremote", NO_EXTRA),
+        // Name resolution through glibc's own resolver (docs/NETSTACK.md 18):
+        // `getaddrinfo` over the seeded /etc/{nsswitch.conf,hosts,resolv.conf},
+        // the second `linuxnet` phase.
+        ("resolve.c", "resolve", NO_EXTRA),
+        // `fcntl`'s honesty (docs/LINUX-COMPAT.md, the `fcntl` row): unimplemented
+        // commands refused, O_NONBLOCK honoured, F_GETFL real, FD_CLOEXEC closed
+        // across execve. Part of the `linuxproc` proof (it execve's itself).
+        ("fcntlx.c", "fcntlx", NO_EXTRA),
+        // Cross-process signalling + `/proc/self/exe` (docs/ARCHITECTURE-DEBT.md 4):
+        // `kill` used to refuse any pid but our own and silently self-target on
+        // pid 0/-1, and `readlinkat` was a hardcoded -ENOENT. Part of the
+        // `linuxproc` proof (it execve's itself for the exe-path phase).
+        ("killx.c", "killx", NO_EXTRA),
+        // The mmap region is bounded and MAP_FIXED cannot replace the kernel's
+        // rings (docs/ARCHITECTURE-DEBT.md 4, blocker 2): the cursor used to run
+        // out of its region, through the queue and into ld.so, silently. Part of
+        // the `linuxproc` proof.
+        ("mmapx.c", "mmapx", NO_EXTRA),
+        // `sched_yield` must cross processes, not only a cell's own contexts
+        // (docs/ARCHITECTURE-DEBT.md 4): a single-threaded yielder had no ready
+        // sibling context, so the call returned immediately and a forked child
+        // could starve its parent. Part of the `linuxproc` proof.
+        ("yieldx.c", "yieldx", NO_EXTRA),
+        // A futex wait that must END BY ITSELF (docs/LINUX-COMPAT.md L4, the
+        // `futex` row): `pthread_cond_timedwait` on a never-signalled condvar.
+        // Part of the `linuxthreads` proof.
+        ("condwait.c", "condwait", NO_EXTRA),
+        // `poll`/`epoll_wait`/`nanosleep` truth + creation-time O_NONBLOCK
+        // (docs/ARCHITECTURE-DEBT.md 2.4): the `linuxpoll` proof.
+        ("pollx.c", "pollx", NO_EXTRA),
+        // A wait that can never end: the scheduler's deadlock diagnostic, the
+        // second `linuxpoll` phase.
+        ("polldead.c", "polldead", NO_EXTRA),
+        // The loader must size the stack from **PT_GNU_STACK**, not a fixed
+        // constant (docs/ARCHITECTURE-DEBT.md 4.0, blocker 1). Linked with
+        // `-z stacksize` so its own header asks for more than the old 8 MiB
+        // default, then it touches that much stack. Part of `linuxproc`.
+        // 12 MiB of PT_GNU_STACK, above the loader's old fixed 8 MiB default.
+        // The spelling matters: GNU ld wants `stack-size`, lld wants `stacksize`,
+        // and ld *ignores* the one it does not know with a warning, not an error -
+        // so the wrong spelling links fine and produces a p_memsz of 0.
+        ("stackx.c", "stackx", &["-Wl,-z,stack-size=12582912"]),
+        ("sysx.c", "sysx", NO_EXTRA),
+        ("mmapdp.c", "mmapdp", NO_EXTRA),
+        ("cowfork.c", "cowfork", NO_EXTRA),
     ] {
         let mut sc = Command::new(cc);
         sc.arg("-static").arg("-no-pie");
@@ -925,6 +1274,11 @@ fn build_linux_fixtures(arch: Arch) -> bool {
             "-o",
             &format!("{out_dir}/{bin}"),
         ]);
+        // Per-fixture link arguments. Most need none; a fixture that has to
+        // *record something in its own ELF headers* (a PT_GNU_STACK size) can
+        // only do it at link time, and a one-off special case here would be the
+        // start of a second fixture-building path.
+        sc.args(extra.iter());
         if !matches!(sc.status().map(|s| s.success()), Ok(true)) {
             eprintln!(
                 "[xtask] signal fixture {bin} build failed for {}",
@@ -937,8 +1291,116 @@ fn build_linux_fixtures(arch: Arch) -> bool {
     if !build_dyn_fixture(arch, cc, &out_dir) {
         return false;
     }
+    build_dyn_disk_fixture(arch, &out_dir);
 
     build_coreutils_fixture(arch)
+}
+
+/// Does an external tool exist on PATH? (xtask has zero deps, so probe by
+/// spawning it - `.output()` errors only when the binary is not found.)
+fn have_tool(name: &str) -> bool {
+    Command::new(name).arg("-V").output().is_ok()
+}
+
+/// Build the `linuxdisk` fixture: a real ext4 image (`mkfs.ext4` + `debugfs`)
+/// holding the dynamic hello at `/bin/dhello`, its interpreter at the ISA's
+/// `PT_INTERP` path, and `/lib/libc.so.6` - so the `linuxdisk` test mounts it off
+/// a live virtio-blk disk (through `ext4fs`/`ext4plus` + the block cache) and
+/// `execve`s a dynamically-linked binary straight from ext4 (GOAL-DISK-2b). The
+/// image is gitignored, like the `.so` fixtures it embeds.
+///
+/// Skipped-with-reason - a small zeroed placeholder image, so QEMU's `-drive`
+/// still has a file and the test detects a non-ext4 disk and skips - when the
+/// runtime libs are placeholders (the toolchain `.so`s were absent) or
+/// `mkfs.ext4`/`debugfs` are not installed. Never fails the build.
+fn build_dyn_disk_fixture(arch: Arch, out_dir: &str) {
+    let img = format!("{out_dir}/dyn-disk.img");
+    let ld = format!("{out_dir}/ld.so");
+    let libc = format!("{out_dir}/libc.so.6");
+    let dhello = format!("{out_dir}/dhello");
+    let placeholder = |img: &str| {
+        let _ = std::fs::write(img, vec![0u8; 64 * 1024]);
+    };
+    let big = |p: &str| {
+        std::fs::metadata(p)
+            .map(|m| m.len() > 4096)
+            .unwrap_or(false)
+    };
+
+    if !(big(&libc) && big(&ld)) {
+        eprintln!(
+            "[xtask] SKIP linuxdisk image for {}: runtime ld.so/libc not available \
+             (linuxdisk will skip this ISA)",
+            arch.name()
+        );
+        placeholder(&img);
+        return;
+    }
+    if !(have_tool("mkfs.ext4") && have_tool("debugfs")) {
+        eprintln!(
+            "[xtask] SKIP linuxdisk image for {}: mkfs.ext4/debugfs not installed \
+             (linuxdisk will skip this ISA)",
+            arch.name()
+        );
+        placeholder(&img);
+        return;
+    }
+
+    // A driver-parseable ext4 (the gen-ext4.sh flags): 1 KiB blocks, no
+    // journal/csum/64bit/htree/resize. 8 MiB holds libc (~2 MB) with slack.
+    let _ = std::fs::remove_file(&img);
+    let ok = matches!(
+        Command::new("dd")
+            .args([
+                "if=/dev/zero",
+                &format!("of={img}"),
+                "bs=1024",
+                "count=8192"
+            ])
+            .output()
+            .map(|o| o.status.success()),
+        Ok(true)
+    ) && matches!(
+        Command::new("mkfs.ext4")
+            .args([
+                "-q",
+                "-b",
+                "1024",
+                "-O",
+                "^has_journal,^metadata_csum,^64bit,^resize_inode,^dir_index,extent",
+                "-F",
+                &img,
+            ])
+            .output()
+            .map(|o| o.status.success()),
+        Ok(true)
+    );
+    if !ok {
+        placeholder(&img);
+        return;
+    }
+
+    // debugfs dest paths are relative to root (no leading slash). The
+    // interpreter goes at its PT_INTERP path (/lib64/... on x86, /lib/... else).
+    let interp_rel = arch.interp_path().trim_start_matches('/');
+    let debugfs = |cmd: &str| {
+        let _ = Command::new("debugfs")
+            .args(["-w", "-R", cmd, &img])
+            .output();
+    };
+    debugfs("mkdir /bin");
+    debugfs("mkdir /lib");
+    if arch.interp_path().starts_with("/lib64/") {
+        debugfs("mkdir /lib64");
+    }
+    debugfs(&format!("write {dhello} bin/dhello"));
+    debugfs(&format!("write {libc} lib/libc.so.6"));
+    debugfs(&format!("write {ld} {interp_rel}"));
+    println!(
+        "[xtask] built linuxdisk ext4 image for {} ({img}; interp {})",
+        arch.name(),
+        arch.interp_path()
+    );
 }
 
 /// Build the L7 **dynamically-linked** glibc fixture (docs/LINUX-COMPAT.md L7):
@@ -1068,6 +1530,24 @@ fn build(arch: Arch, release: bool) -> bool {
     // The N2c smoltcp cell (docs/NETSTACK.md §13): built separately with the
     // `smoltcp` feature (the default `build_userland` skips it via required-features).
     if !build_smoltcp_demo(arch) {
+        return false;
+    }
+    // The N3a crypto cell (docs/NETSTACK.md §3): built separately with the
+    // `crypto` feature + the force-soft backend cfgs (build_userland skips it via
+    // required-features).
+    if !build_crypto_demo(arch) {
+        return false;
+    }
+    // The N3b TLS 1.3 cell (docs/NETSTACK.md §15): built separately with the `tls`
+    // feature (implies `crypto`) + the same force-soft backend cfgs (build_userland
+    // skips it via required-features).
+    if !build_tls_demo(arch) {
+        return false;
+    }
+    // The N5a HTTP cell (docs/NETSTACK.md §19): built separately with the `tls`
+    // feature (its HTTPS composition needs the record layer) + the same
+    // force-soft backend cfgs (build_userland skips it via required-features).
+    if !build_http_demo(arch) {
         return false;
     }
     // The librheodata (Phase B) dataset the test kernel reads off the live disk.

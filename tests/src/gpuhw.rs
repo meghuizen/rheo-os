@@ -21,7 +21,7 @@ use kernel::{arch, println, svc};
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("gpuhw: start on {}", arch::NAME);
 
     hw::print_summary();
@@ -293,7 +293,7 @@ extern "C" fn kernel_main() -> ! {
     let n = svc::engine_count();
     println!("gpuhw: engines registered = {}", n);
     assert!(
-        n >= 1 + inv.ngpu,
+        n > inv.ngpu,
         "engine table should hold the CPU plus every recognised GPU"
     );
 

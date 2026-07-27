@@ -190,8 +190,10 @@ here.
 The complete set. Ten objects, roughly three dozen operations. The governance
 rule in section 6 keeps this list closed.
 
-1. **Cell** - address space + capability set + queues. Cell *groups* add
-   co-placement and a shared lease (the pod replacement), nothing more.
+1. **Cell** - address space + capability set + queues, plus an immutable
+   **principal** the kernel derives at creation (image measurement + parent)
+   and reports but never decides from. Cell *groups* add co-placement and a
+   shared lease (the pod replacement), nothing more.
 2. **Capability** - unforgeable, typed, delegatable, epoch-revocable,
    budget-metered. Becomes a signed cryptographic token when it crosses hosts.
    It is simultaneously the security model, the audit log, and the metering
@@ -224,6 +226,25 @@ establish queue pair; grant/commit/decommit/seal memory; submit graph;
 reserve/release; arm timer/doorbell; checkpoint/restore (DRBG state and sealed
 shared objects excluded from images by rule); attest; plus delivery of
 pressure, revocation, lease-expiry, and completion events.
+
+Cell scheduling on one CPU is part of the **create/destroy cell** verb, not a
+verb of its own: the native cooperative hand-offs (`SYS_SWITCH`, a directed
+`cur^1` switch; `SYS_YIELD`, its round-robin generalisation added for service
+fan-out, docs/NETSTACK.md 17) are pure mechanism over object 1 with policy
+outside - who runs next is a fixed round-robin, and a hand-off transfers no
+authority (the cells share one capability bundle). They pass section 6 on the same
+grounds as the address-space switch they wrap: a cell cannot switch its own page
+tables, and the CPU is shared hardware. Preemptive multi-core scheduling (SMP,
+task #27) is still ahead of the design here.
+
+**Identity is deliberately not an object.** A cell's principal fails §6 test 2 -
+it arbitrates no shared hardware - so it is a field on object 1, and reporting
+it is the existing **`attest`** verb rather than a new one. POSIX users, groups
+and `rwx` are then a userspace projection: the credential is per-cell
+synthesized state in the personality, and mode bits are checked by the file
+server, which is outside the kernel by doctrine 5. The kernel makes no access
+decision from an identity; `grant_check` is untouched. Full model in
+docs/IDENTITY.md.
 
 Everything else in this document is **composition** of these by cells.
 
@@ -514,6 +535,25 @@ revoke-by-epoch, grant check. Properties to machine-check (Verus):
    E passes a grant check.
 4. **Isolation lemma:** two cells with disjoint capability sets cannot affect
    each other's memory or queues through any kernel path.
+
+Property 4 has a **precondition that is not itself about capabilities**, and an
+audit found the implementation missing it: the kernel services a trap in
+S-mode/EL1/ring 0 *with the calling cell's root active*, and every cell root maps
+all of kernel RAM supervisor-RWX through the linear map. So an address a cell puts
+in a syscall argument reaches kernel memory unless the kernel bounds it, and a
+resource a cell names by address is freed out from under another cell unless the
+kernel checks ownership. Neither is visible to a proof about mint/delegate/revoke:
+the capability core can be perfectly sound while an out-parameter write, an
+unbounded allocation length, or an unowned `munmap` walks straight through it.
+
+The isolation lemma therefore reads, in full: **for every kernel entry point, an
+address or length or handle a cell supplies is bounded, budgeted or
+ownership-checked before use** - and only then does "disjoint capability sets"
+imply non-interference. `docs/ENGINEERING.md` 12 is the corresponding engineering
+rule, the `security` test kernel is the runtime evidence from an unprivileged
+cell, and the three findings behind it are recorded there. When the Verus work
+starts, this precondition is part of what layer 1 must state, not an assumption
+underneath it.
 
 Benchmark: seL4 proved this class of property is achievable. Kill criterion:
 if the proof effort exceeds ~2 person-years without closing, shrink the core

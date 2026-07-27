@@ -65,7 +65,12 @@ impl Grant {
             return Err(GrantError::TooLarge);
         }
         for _ in 0..pages {
-            self.frames[self.committed] = alloc_frame(self.kind);
+            // Exhaustion is a refusal, never a panic: the caller decommits what
+            // it already got (docs/ENGINEERING.md 12).
+            let Some(pa) = alloc_frame(self.kind) else {
+                return Err(GrantError::TooLarge);
+            };
+            self.frames[self.committed] = pa;
             self.committed += 1;
         }
         Ok(())
@@ -122,10 +127,10 @@ impl Drop for Grant {
 /// otherwise, and for every other kind, it draws a zeroed DDR frame. The Pmem
 /// fallback is logged once so an emulated-as-DDR pmem grant is never silently
 /// mistaken for a real one.
-fn alloc_frame(kind: MemKind) -> usize {
+fn alloc_frame(kind: MemKind) -> Option<usize> {
     if kind == MemKind::Pmem {
         if let Some(pa) = frames_pmem::alloc() {
-            return pa;
+            return Some(pa);
         }
         note_pmem_ddr_fallback();
     }

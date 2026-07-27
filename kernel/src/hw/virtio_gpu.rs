@@ -235,7 +235,7 @@ impl GpuReport {
 /// Allocate one zeroed frame-pool frame and return its kernel VA (high-half
 /// linear map).
 fn alloc_frame_va() -> usize {
-    arch::phys_to_virt(crate::mm::frames::alloc())
+    arch::phys_to_virt(crate::mm::frames::alloc().expect("virtio-gpu ring (boot, reserve held)"))
 }
 
 unsafe fn r32(base: usize, off: usize) -> u32 {
@@ -820,12 +820,17 @@ impl VirtioGpu {
 
 static mut GPU: Option<VirtioGpu> = None;
 
-/// Install the discovered device as the kernel's GPU (called once at boot).
+/// Install the discovered device as the kernel's GPU (called once at boot), and
+/// register it as the `svc::DisplayOps` bridge `OP_GPU_PRESENT` reaches. Same
+/// reasoning as `virtio_net::install`: registration where the device is known to
+/// exist, so a kernel with no display answers `STATUS_IO` honestly and the
+/// queue's dispatch need not name this module (docs/ARCHITECTURE-DEBT.md 3.2).
 pub fn install(dev: VirtioGpu) {
     // SAFETY: single-threaded boot; set once before any cell runs.
     unsafe {
         *core::ptr::addr_of_mut!(GPU) = Some(dev);
     }
+    crate::svc::set_display_ops(crate::svc::DisplayOps { present });
 }
 
 fn gpu_mut() -> Option<&'static mut VirtioGpu> {
@@ -853,7 +858,8 @@ pub fn present(buf_va: u64, w: u32, h: u32) -> (u32, u32) {
     };
     let len = (w as usize).saturating_mul(h as usize).saturating_mul(4);
     let n = len.min(FB_BYTES);
-    // SAFETY: the cell passes a VA of `len` readable bytes in its own memory.
+    // SAFETY: `buf_va` was range-checked for `len` readable bytes in the calling
+    // cell by `queue::run_opcode`, whose address space is active; `n <= len`.
     if unsafe { dev.present_frame(buf_va, n) } {
         (STATUS_OK, n as u32)
     } else {

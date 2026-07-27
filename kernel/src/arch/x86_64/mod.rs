@@ -7,10 +7,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// Linux personality ABI (x86-64 legacy syscall table; docs/LINUX-COMPAT.md).
 pub mod linux_abi;
 mod paging;
+use paging::apic_map_window;
 pub use paging::{
-    PagingRoot, mmio_map_window, paging_activate, paging_activate_kernel,
-    paging_for_each_user_leaf, paging_kernel_init, paging_map, paging_map_frame, paging_new_root,
-    paging_protect, paging_unmap_frame, pmem_map_window,
+    PagingRoot, mmio_map_window, paging_activate, paging_activate_kernel, paging_cow_at,
+    paging_cow_clear, paging_cow_protect_user, paging_for_each_user_leaf, paging_kernel_init,
+    paging_map, paging_map_frame, paging_mapped, paging_new_root, paging_protect,
+    paging_unmap_frame, pmem_map_window,
 };
 
 /// `uname` machine string for the Linux personality (docs/LINUX-COMPAT.md L2).
@@ -120,152 +122,581 @@ pub fn serial_read_byte() -> Option<u8> {
     }
 }
 
-// ----------------------------------- console input + timer interrupt seam
-// docs/LIBRHEO.md Phase D/F. **Timer: interrupt-driven** (the kernel's second
-// interrupt). q35's per-CPU LAPIC, driven in **x2APIC** mode (MSR access, 0x800+
-// - no MMIO mapping, and EOI works regardless of which page-table root is active
-// during the interrupt), delivers a one-shot **LVT timer** on vector 0x20. Cells
-// run with IF clear (their TrapFrame RFLAGS has no IF); the kernel sets IF only
-// inside the `sti; hlt` idle idiom, so `SYS_ARM_TIMER` is a genuine 0%-CPU park.
+// ---------------------------------------------- the local APIC (LAPIC) driver
+// docs/SMP.md, docs/NETSTACK.md 16. Everything interrupt-driven on this ISA - the
+// one-shot timer, inter-processor interrupts for AP bring-up, and the EOI that any
+// IO-APIC-routed line needs - goes through the per-CPU local APIC. There are two
+// ways to reach its registers and this port supports **both, selected by probe**
+// (docs/ENGINEERING.md 1):
 //
-// **UART RX: poll** (honest). q35 routes COM1's ISA IRQ4 through the emulated
-// IOAPIC, but under QEMU's TCG + `kernel-irqchip=split` the LAPIC's ISR/IRR are
-// not modeled (they read 0) and IPIs are not delivered, so an IOAPIC-routed line
-// delivers the first byte but does not reliably re-trigger, and the self-IPI the
-// RISC-V port uses as its deterministic-test analog does not fire at all. Rather
-// than fake it, x86-64 keeps the poll path (kernel/src/input.rs). The GICv3-style
-// per-source ack the RISC-V AIA gives is what makes RISC-V's UART RX reliable;
-// the honest x86-64 result is timer-only. Opt-in (`enable_timer_irq`, called only
-// by the Phase F test), so no other kernel is affected.
+// - **x2APIC**: the MSR block at 0x800+. Needs no mapping and works whichever
+//   page-table root is active, so it is preferred where it exists. QEMU's TCG does
+//   **not** implement it (`CPUID.01H:ECX[21]` reads 0 with `-cpu max`, because
+//   x2APIC is absent from QEMU's TCG feature word), and QEMU then treats the whole
+//   0x800 MSR block as inert: `EXTD` never latches in `IA32_APIC_BASE`, register
+//   writes are dropped, and `TMCCT` reads **0** - which reads as "the one-shot
+//   already elapsed", so every deadline was satisfied instantly. That defect is the
+//   case study in docs/ENGINEERING.md 1.
+// - **xAPIC MMIO**: the 4 KiB register page at `0xFEE00000`, which QEMU *does*
+//   model under TCG. It needs that page mapped uncacheable into the kernel root
+//   **and every cell root** (an interrupt handler must reach EOI whichever root is
+//   active) - `paging::apic_map_window`.
+//
+// [`lapic_probe`] enables x2APIC, reads `IA32_APIC_BASE` back, and keeps that mode
+// only if `EXTD` actually latched; otherwise it falls back to xAPIC MMIO and
+// verifies the register file responds by writing the spurious-vector register and
+// reading the value back out of the device. The mode that survived is recorded in
+// [`APIC_MODE`], and every accessor below reads the *validated* mode - never CPUID.
 
-/// x2APIC MSRs (Intel SDM vol 3): APIC base, spurious-vector, EOI, and the
-/// LVT-timer trio.
+/// `IA32_APIC_BASE` (Intel SDM vol 3, 11.4.4): bit 11 = global enable (xAPIC),
+/// bit 10 = x2APIC mode (EXTD), bits 12+ = the MMIO page's physical base.
 const MSR_APIC_BASE: u32 = 0x1B;
-const MSR_X2APIC_SVR: u32 = 0x80F;
-const MSR_X2APIC_EOI: u32 = 0x80B;
-const MSR_X2APIC_LVT_TIMER: u32 = 0x832;
-const MSR_X2APIC_TIMER_INIT: u32 = 0x838;
-const MSR_X2APIC_TIMER_CUR: u32 = 0x839;
-const MSR_X2APIC_TIMER_DIV: u32 = 0x83E;
+const APIC_BASE_EN: u64 = 1 << 11;
+const APIC_BASE_EXTD: u64 = 1 << 10;
 
-/// Chosen interrupt vectors: LAPIC timer 0x20, LAPIC spurious 0xFF (above the 32
-/// CPU-exception vectors).
+/// LAPIC register offsets in the xAPIC MMIO page (Intel SDM vol 3, table 11-1).
+/// The x2APIC MSR for the same register is `0x800 + (offset >> 4)`, which is what
+/// makes one set of constants serve both access modes.
+/// (The ICR pair, which only AP bring-up needs, is defined with the `smp`
+/// feature's code below so a non-SMP build carries nothing unused.)
+const LAPIC_ID: usize = 0x020;
+const LAPIC_EOI: usize = 0x0B0;
+const LAPIC_TPR: usize = 0x080;
+const LAPIC_SVR: usize = 0x0F0;
+const LAPIC_LVT_TIMER: usize = 0x320;
+const LAPIC_TMICT: usize = 0x380;
+const LAPIC_TMCCT: usize = 0x390;
+const LAPIC_TDCR: usize = 0x3E0;
+
+/// Offset of the local APIC inside the mapped APIC window (the window starts at
+/// the IO-APIC's `0xFEC00000`; the local APIC is 2 MiB above it).
+const LAPIC_WINDOW_OFFSET: usize = 0xFEE0_0000 - 0xFEC0_0000;
+
+/// How the local APIC is reachable **as observed at bring-up**, not as advertised.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum ApicMode {
+    /// No usable local APIC found: every APIC-driven capability stays off.
+    None,
+    /// The x2APIC MSR block latched (`EXTD` set and read back).
+    X2Apic,
+    /// The legacy xAPIC MMIO page responds to a write/read-back.
+    XApic,
+}
+
+impl ApicMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            ApicMode::None => "none",
+            ApicMode::X2Apic => "x2APIC (MSR)",
+            ApicMode::XApic => "xAPIC (MMIO)",
+        }
+    }
+}
+
+static mut APIC_MODE: ApicMode = ApicMode::None;
+/// Kernel VA of the mapped local APIC register page (xAPIC mode only).
+static mut LAPIC_VA: usize = 0;
+
+/// Chosen interrupt vectors: LAPIC timer 0x20, UART RX 0x21, LAPIC spurious 0xFF
+/// (all above the 32 CPU-exception vectors).
 const VEC_TIMER: usize = 0x20;
+const VEC_UART: usize = 0x21;
 const VEC_SPURIOUS: usize = 0xFF;
 
 static mut TIMER_ENABLED: bool = false;
 
+/// The access mode the bring-up probe validated.
+pub fn apic_mode() -> ApicMode {
+    // SAFETY: single CPU; set once at bring-up before any secondary or cell runs.
+    unsafe { *core::ptr::addr_of!(APIC_MODE) }
+}
+
+/// Read a local APIC register by its xAPIC offset, through whichever access mode
+/// the probe validated. Returns 0 when no APIC is usable.
+fn lapic_read(reg: usize) -> u32 {
+    match apic_mode() {
+        // SAFETY: a validated x2APIC MSR read.
+        ApicMode::X2Apic => unsafe { paging_rdmsr(0x800 + (reg >> 4) as u32) as u32 },
+        // SAFETY: `LAPIC_VA` is the mapped, uncacheable register page; `reg` is one
+        // of the aligned offsets named above, inside its 4 KiB.
+        ApicMode::XApic => unsafe {
+            ((*core::ptr::addr_of!(LAPIC_VA) + reg) as *const u32).read_volatile()
+        },
+        ApicMode::None => 0,
+    }
+}
+
+/// Write a local APIC register by its xAPIC offset, through the validated mode.
+/// A no-op when no APIC is usable, so a fallback path never faults.
+fn lapic_write(reg: usize, value: u32) {
+    match apic_mode() {
+        // SAFETY: a validated x2APIC MSR write.
+        ApicMode::X2Apic => unsafe { paging_wrmsr(0x800 + (reg >> 4) as u32, value as u64) },
+        // SAFETY: as `lapic_read`.
+        ApicMode::XApic => unsafe {
+            ((*core::ptr::addr_of!(LAPIC_VA) + reg) as *mut u32).write_volatile(value);
+        },
+        ApicMode::None => {}
+    }
+}
+
 unsafe extern "C" {
     fn timer_irq_stub();
+    fn uart_irq_stub();
     fn spurious_irq_stub();
 }
 
-/// Whether the UART RX interrupt is wired (false = poll path). x86-64 polls (see
-/// the seam comment: the QEMU TCG IOAPIC/LAPIC does not re-deliver reliably).
+// ------------------------------------------------- UART RX over the IO-APIC
+// docs/SMP.md 8, docs/LIBRHEO.md Phase D. COM1's ISA IRQ 4 is routed by the
+// emulated IO-APIC to a LAPIC vector. This was documented as poll-only on the
+// grounds that "under QEMU TCG + kernel-irqchip=split the LAPIC's ISR/IRR are not
+// modeled (they read 0) and an IO-APIC-routed line does not reliably re-trigger".
+// That diagnosis was made **through the inert x2APIC MSR block** (see the LAPIC
+// section above): with no working EOI the first interrupt would indeed be the last,
+// because the in-service bit is never cleared. With the APIC reached over xAPIC
+// MMIO the whole chain is testable, so bring-up now **probes it end to end** and
+// reports what happened.
+
+/// IO-APIC register window (Intel ICH/82093AA): an index register and a data
+/// window. Offsets are into the mapped APIC window, whose base *is* the IO-APIC.
+const IOAPIC_REGSEL: usize = 0x00;
+const IOAPIC_IOWIN: usize = 0x10;
+/// Redirection-table entry `n` occupies index `0x10 + 2n` (low) and `+1` (high).
+const IOAPIC_REDTBL: u32 = 0x10;
+/// COM1 is ISA IRQ 4, and q35 wires GSI 4 to IO-APIC pin 4 (`gsi_handler` sends
+/// every ISA line to both the i8259 - masked here - and the IO-APIC). The ACPI
+/// MADT's interrupt-source-override table is **not** consulted; the only override
+/// QEMU emits is IRQ 0 -> GSI 2, which does not affect this line. Stated because
+/// it is an assumption, not a discovery.
+const UART_GSI: u32 = 4;
+
+/// Base of the mapped IO-APIC register page, or 0 if the APIC window is not up.
+static mut IOAPIC_VA: usize = 0;
+static mut UART_ENABLED: bool = false;
+/// UART RX interrupts observed, incremented **only** inside the interrupt vector -
+/// the unfakeable evidence the bring-up probe rests on.
+static UART_FIRES: AtomicU64 = AtomicU64::new(0);
+/// While set, the handler drains the UART byte and **discards** it, so the
+/// bring-up probe's own byte never reaches the console ring.
+static mut UART_PROBING: bool = false;
+
+/// SAFETY: `IOAPIC_VA` must be the mapped IO-APIC page.
+unsafe fn ioapic_write(index: u32, value: u32) {
+    unsafe {
+        let base = *core::ptr::addr_of!(IOAPIC_VA);
+        ((base + IOAPIC_REGSEL) as *mut u32).write_volatile(index);
+        ((base + IOAPIC_IOWIN) as *mut u32).write_volatile(value);
+    }
+}
+
+/// Whether the UART RX interrupt is wired **and verified to fire** (false = the
+/// honest poll path). Set by [`enable_uart_rx_irq`] only after the probe below has
+/// seen a real interrupt arrive through the IO-APIC.
 pub fn uart_irq_enabled() -> bool {
+    // SAFETY: single CPU; set once at bring-up.
+    unsafe { *core::ptr::addr_of!(UART_ENABLED) }
+}
+
+/// Bring up the UART RX interrupt (IO-APIC GSI 4 -> LAPIC vector 0x21) **and
+/// verify it end to end**. Called only by the Phase D test, so no other kernel is
+/// affected.
+///
+/// The probe is the point (docs/ENGINEERING.md 1). It puts the 16550 into loopback
+/// and writes a byte, which QEMU's serial model delivers into the receive FIFO and
+/// raises the ISA line for - so a successful probe exercises the *entire* chain the
+/// real path uses: device line -> IO-APIC redirection entry -> LAPIC -> IDT vector
+/// -> handler -> EOI. `UART_ENABLED` is set only if [`UART_FIRES`], which nothing
+/// but the interrupt vector touches, actually moved.
+pub fn enable_uart_rx_irq() {
+    lapic_probe();
+    if apic_mode() == ApicMode::None {
+        crate::println!(
+            "x86-64: no usable local APIC, so no UART RX interrupt - console input polls"
+        );
+        return;
+    }
+    // The APIC window's base is the IO-APIC page; the local APIC sits 2 MiB in.
+    // SAFETY: single CPU at bring-up; `apic_map_window` is idempotent.
+    unsafe { *core::ptr::addr_of_mut!(IOAPIC_VA) = apic_map_window() };
+    set_idt_gate(VEC_UART, uart_irq_stub as *const () as u64);
+
+    // SAFETY: kernel context; IO-APIC MMIO + 16550 port I/O.
+    unsafe {
+        // Redirection entry: vector 0x21, fixed delivery, physical destination,
+        // active-high, edge-triggered, unmasked; destination = this CPU's APIC id.
+        ioapic_write(IOAPIC_REDTBL + 2 * UART_GSI + 1, lapic_id() << 24);
+        ioapic_write(IOAPIC_REDTBL + 2 * UART_GSI, VEC_UART as u32);
+        // 16550: OUT2 gates the IRQ (QEMU's model checks it), ERBFI enables the
+        // received-data-available interrupt.
+        outb(COM1 + 4, 0x08); // MCR: OUT2
+        outb(COM1 + 1, 0x01); // IER: ERBFI
+    }
+
+    // --- the self-test: does a received byte actually raise the interrupt? ---
+    UART_FIRES.store(0, Ordering::Relaxed);
+    // SAFETY: kernel context; the probe byte is discarded by the handler.
+    let usable = unsafe {
+        *core::ptr::addr_of_mut!(UART_PROBING) = true;
+        let t0 = cycles();
+        outb(COM1 + 4, 0x18); // MCR: OUT2 + LOOP
+        outb(COM1, b'\0'); // received into the RX FIFO by loopback
+        outb(COM1 + 4, 0x08); // drop loopback
+        asm!("sti");
+        while UART_FIRES.load(Ordering::Relaxed) == 0
+            && ticks_to_ns(cycles().wrapping_sub(t0)) < PROBE_WINDOW_NS
+        {
+            core::hint::spin_loop();
+        }
+        asm!("cli");
+        *core::ptr::addr_of_mut!(UART_PROBING) = false;
+        UART_FIRES.load(Ordering::Relaxed) > 0
+    };
+    // SAFETY: single CPU; set once before any cell runs.
+    unsafe { *core::ptr::addr_of_mut!(UART_ENABLED) = usable };
+    if usable {
+        crate::println!(
+            "x86-64: UART RX interrupt verified over the IO-APIC (GSI {UART_GSI} -> vector \
+             {VEC_UART:#x}, {} EOI) - a real interrupt arrived",
+            apic_mode().name()
+        );
+    } else {
+        // Leave the line masked so a half-working route cannot surprise a later
+        // `sti` (the timer's idle path enables interrupts).
+        // SAFETY: kernel context; mask the redirection entry again.
+        unsafe {
+            ioapic_write(IOAPIC_REDTBL + 2 * UART_GSI, (1 << 16) | VEC_UART as u32);
+            outb(COM1 + 1, 0x00); // IER: no interrupts
+        }
+        crate::println!(
+            "x86-64: UART RX interrupt did not arrive through the IO-APIC (APIC access: {}) - \
+             console input polls, reported not claimed",
+            apic_mode().name()
+        );
+    }
+}
+
+/// The UART RX interrupt handler (called from `uart_irq_stub`): drain every byte
+/// the 16550 has into the portable RX ring, then EOI. Draining in a loop matters
+/// for an edge-triggered line - a byte that arrived while the vector was being
+/// taken would otherwise sit in the FIFO with no new edge to announce it.
+#[unsafe(no_mangle)]
+extern "C" fn x86_uart_irq() {
+    UART_FIRES.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: single CPU; a plain static read.
+    let probing = unsafe { *core::ptr::addr_of!(UART_PROBING) };
+    while let Some(b) = serial_read_byte() {
+        if !probing {
+            crate::input::rx_push(b);
+        }
+    }
+    lapic_write(LAPIC_EOI, 0);
+}
+
+/// Halt until the UART RX interrupt delivers a byte (only called when
+/// [`uart_irq_enabled`]): the standard enable-halt-disable idle idiom, so this is a
+/// genuine 0%-CPU park.
+pub fn idle_wait() {
+    // SAFETY: kernel context; the standard enable-halt-disable idle idiom.
+    unsafe { asm!("sti; hlt; cli", options(nomem, nostack)) };
+}
+
+/// Deliver a scripted byte through the **real** UART RX interrupt, halting at `hlt`
+/// until it is taken - the same path a live keystroke takes. Used by the
+/// deterministic Phase D test.
+///
+/// The byte goes in by 16550 loopback, which is a genuine receive: QEMU's serial
+/// model puts it in the receive FIFO and raises the ISA line, so the IO-APIC and
+/// the LAPIC do the same work they do for a typed character. (RISC-V and ARM64 have
+/// to raise their interrupt-controller input directly here, because QEMU's
+/// 16550/PL011 loopback does not drive those controllers' lines; on x86 it does,
+/// which is what makes this the more complete of the three.)
+pub fn uart_inject_and_wait(b: u8) {
+    // SAFETY: kernel context; 16550 port I/O + the unmask/halt/mask idiom.
+    unsafe {
+        outb(COM1 + 4, 0x18); // MCR: OUT2 + LOOP
+        outb(COM1, b); // received into the RX FIFO
+        outb(COM1 + 4, 0x08); // drop loopback (the byte stays in the FIFO)
+        asm!("sti; hlt; cli", options(nomem, nostack));
+    }
+}
+
+/// Whether the virtio-net RX interrupt is wired - **false on x86-64** (honest), and
+/// the one interrupt source this ISA still lacks (docs/SMP.md 8).
+///
+/// The NIC here is virtio-*pci* driven entirely through PCI config space (the
+/// `VIRTIO_PCI_CAP_PCI_CFG` tunnel, because PVH boot has no firmware to program
+/// BARs), so **no BAR is assigned** to hold an MSI-X table. That is the whole of the
+/// remaining gap, and it is driver work rather than a platform limit:
+///
+/// - the old second half of this justification - "legacy INTx would ride an IOAPIC
+///   path that does not re-deliver reliably under QEMU TCG" - is **disproved**: the
+///   UART RX line above runs through exactly that path, verified end to end. The
+///   original observation had been made through the inert x2APIC MSR block, where a
+///   missing EOI genuinely makes the first interrupt the last;
+/// - and BAR assignment is not impossible either - `hw::assign_pci_bars` +
+///   `arch::mmio_map_window` already assign and map real BARs for the GPU work
+///   (docs/GPU-HARDWARE.md 12).
+///
+/// What is left is: assign the virtio-net BAR, program its MSI-X table (or discover
+/// the q35 INTx routing), and wire the vector. Not attempted here - a claim about
+/// this line has to be earned by a probe like the UART's, not by inheriting one.
+///
+/// Meanwhile the **timer** interrupt is genuine, so `SYS_WAIT_NET` does not spin: it
+/// takes the timer-backed idle mode (`net_rx::IdleMode::TimerIdle`) - poll the
+/// receive queue, halt at `hlt` for one timer slice, re-poll - a real halt at a low
+/// duty cycle, honoured against the caller's deadline. It is reported as
+/// timer-backed, never as NIC-interrupt-driven (docs/NETSTACK.md 16 has the per-ISA
+/// table).
+pub fn net_irq_enabled() -> bool {
     false
 }
-/// Bring up the UART RX interrupt - x86-64 stays on the poll path (see the seam
-/// comment). Called only by the Phase D test.
-pub fn enable_uart_rx_irq() {}
-/// Halt until the UART RX interrupt (only called when `uart_irq_enabled`, i.e.
-/// never on x86-64).
-pub fn idle_wait() {}
-/// Deliver a scripted byte through the UART RX interrupt (only called when
-/// `uart_irq_enabled`, i.e. never on x86-64).
-pub fn uart_inject_and_wait(_b: u8) {}
 
-/// Whether the LAPIC timer interrupt is wired (false = busy-wait path).
+/// Whether a NIC interrupt is pending - never on x86-64 (no NIC IRQ wired).
+pub fn net_irq_pending() -> bool {
+    false
+}
+
+/// Bring up the virtio-net RX interrupt - not wired on x86-64 (see
+/// [`net_irq_enabled`]). Returns false, so the portable wait picks its next-best
+/// mode (the timer-backed idle) rather than claiming a NIC park.
+pub fn enable_virtio_net_irq(_slot: usize) -> bool {
+    false
+}
+
+/// Whether the LAPIC timer interrupt is wired **and verified to fire** (false =
+/// the honest cooperative/poll path). Set by [`enable_timer_irq`] only after the
+/// bring-up self-test below has seen a real one-shot interrupt arrive.
 pub fn timer_irq_enabled() -> bool {
     // SAFETY: single CPU; set once before any cell runs.
     unsafe { *core::ptr::addr_of!(TIMER_ENABLED) }
 }
 
-/// Enable the LAPIC in x2APIC mode (MSR access) + set the spurious vector. Shared
-/// bring-up for the timer path.
-fn lapic_init() {
-    // SAFETY: kernel context; plain MSR writes.
-    unsafe {
-        // Enable x2APIC: IA32_APIC_BASE |= EN (11) | EXTD (10).
-        let base = paging_rdmsr(MSR_APIC_BASE) | (1 << 11) | (1 << 10);
-        paging_wrmsr(MSR_APIC_BASE, base);
-        // Software-enable the LAPIC + set the spurious vector (SVR bit 8 + 0xFF).
-        paging_wrmsr(MSR_X2APIC_SVR, 0x100 | VEC_SPURIOUS as u64);
-        set_idt_gate(VEC_SPURIOUS, spurious_irq_stub as *const () as u64);
+/// Bring the local APIC up **and establish which access mode actually works**,
+/// once. Idempotent; every APIC user calls it first.
+///
+/// The order matters and each step is verified from the other side
+/// (docs/ENGINEERING.md 1):
+///
+/// 1. Software-enable the APIC (`IA32_APIC_BASE.EN`). The MSR itself is real on
+///    every x86-64 - it is the *0x800 register block* that TCG omits.
+/// 2. If CPUID advertises x2APIC, request `EXTD` and **read the MSR back**. Only
+///    if the bit latched is x2APIC used; a dropped write leaves the bit clear and
+///    the probe moves on rather than driving an inert register file.
+/// 3. Otherwise map the xAPIC MMIO page (uncacheable, into the kernel root and,
+///    via the shared PML4 entry, every cell root) and check the register file
+///    responds: write the spurious-vector register, read it back from the device,
+///    and require the value to match. A dropped MMIO write reads back as 0 or
+///    `0xFFFFFFFF`, so this distinguishes a modelled APIC from an absent one.
+///
+/// After a mode is settled the shared setup runs through the validated accessors:
+/// TPR = 0 (accept every priority), the spurious vector installed and the APIC
+/// software-enabled in the SVR.
+fn lapic_probe() {
+    if apic_mode() != ApicMode::None {
+        return;
+    }
+    // SAFETY: kernel context; `IA32_APIC_BASE` is architectural on every x86-64.
+    let base = unsafe {
+        let base = paging_rdmsr(MSR_APIC_BASE);
+        paging_wrmsr(MSR_APIC_BASE, base | APIC_BASE_EN);
+        base
+    };
+
+    // Step 2: x2APIC, only if the mode bit genuinely latches.
+    let advertises_x2apic = (core::arch::x86_64::__cpuid_count(1, 0).ecx >> 21) & 1 == 1;
+    if advertises_x2apic {
+        // SAFETY: kernel context. The SDM requires xAPIC (EN) before x2APIC
+        // (EN|EXTD); a direct disabled -> x2APIC transition is illegal.
+        let latched = unsafe {
+            paging_wrmsr(MSR_APIC_BASE, base | APIC_BASE_EN | APIC_BASE_EXTD);
+            paging_rdmsr(MSR_APIC_BASE) & APIC_BASE_EXTD != 0
+        };
+        if latched {
+            // SAFETY: single CPU, bring-up.
+            unsafe { *core::ptr::addr_of_mut!(APIC_MODE) = ApicMode::X2Apic };
+        }
+    }
+
+    // Step 3: xAPIC MMIO, verified by a write/read-back through the device.
+    if apic_mode() == ApicMode::None {
+        let va = apic_map_window() + LAPIC_WINDOW_OFFSET;
+        // SAFETY: single CPU, bring-up; the accessors below need the VA first.
+        unsafe {
+            *core::ptr::addr_of_mut!(LAPIC_VA) = va;
+            *core::ptr::addr_of_mut!(APIC_MODE) = ApicMode::XApic;
+        }
+        let probe = 0x100 | VEC_SPURIOUS as u32;
+        lapic_write(LAPIC_SVR, probe);
+        if lapic_read(LAPIC_SVR) != probe {
+            // The page is mapped but nothing behind it answers: retract the claim.
+            // SAFETY: single CPU, bring-up.
+            unsafe { *core::ptr::addr_of_mut!(APIC_MODE) = ApicMode::None };
+            return;
+        }
+    }
+
+    // Shared setup, through whichever accessor won.
+    lapic_write(LAPIC_TPR, 0); // accept interrupts of every priority
+    lapic_write(LAPIC_SVR, 0x100 | VEC_SPURIOUS as u32); // software-enable + vector
+    set_idt_gate(VEC_SPURIOUS, spurious_irq_stub as *const () as u64);
+}
+
+/// LAPIC timer interrupts observed (incremented by the handler). Used by the
+/// bring-up self-test, so the claim "this ISA has a timer interrupt" rests on an
+/// interrupt the kernel actually took.
+static TIMER_FIRES: AtomicU64 = AtomicU64::new(0);
+
+/// Bring up the LAPIC one-shot timer interrupt (vector 0x20), **and verify it**.
+/// Called only by the kernels that arm a deadline.
+///
+/// The verification is the point (docs/ENGINEERING.md 1, rheo-net N2h). The
+/// original port drove the timer through the x2APIC MSR block only, which QEMU's
+/// TCG leaves inert: `TMCCT` read **0**, and 0 means "the one-shot elapsed", so
+/// every deadline on this ISA was reported as already expired - a `SYS_ARM_TIMER`
+/// sleep that did not sleep, while `timer_irq_enabled()` still claimed a hardware
+/// timer. [`lapic_probe`] now reaches the same registers over the **xAPIC MMIO**
+/// page when x2APIC is absent, and this function still refuses to claim the
+/// capability on anything but an interrupt it actually took: arm a one-shot,
+/// briefly unmask, and require [`TIMER_FIRES`] - incremented *only* inside the
+/// interrupt vector - to move. `TIMER_ENABLED` is set only then; otherwise the
+/// portable code falls back honestly (a cooperative deadline check for
+/// `SYS_ARM_TIMER`, a bounded poll for a receive wait) instead of pretending to
+/// park.
+pub fn enable_timer_irq() {
+    lapic_probe();
+    set_idt_gate(VEC_TIMER, timer_irq_stub as *const () as u64);
+    // Divide config = 1 (bits: 0b1011 -> divide by 1).
+    lapic_write(LAPIC_TDCR, 0b1011);
+    // LVT timer: vector 0x20, one-shot (bits 17-18 = 0), unmasked.
+    lapic_write(LAPIC_LVT_TIMER, VEC_TIMER as u32);
+    lapic_write(LAPIC_TMICT, 0); // disarmed until the arbiter arms it
+
+    // --- the self-test: does a one-shot actually fire? ---
+    let usable = if apic_mode() == ApicMode::None {
+        false
+    } else {
+        TIMER_FIRES.store(0, Ordering::Relaxed);
+        let t0 = cycles();
+        lapic_write(LAPIC_TMICT, PROBE_COUNT);
+        // SAFETY: kernel context; the standard unmask/wait/mask idiom. Bounded by
+        // wall time, so a timer that never fires costs one short window at boot.
+        unsafe { asm!("sti") };
+        while TIMER_FIRES.load(Ordering::Relaxed) == 0
+            && ticks_to_ns(cycles().wrapping_sub(t0)) < PROBE_WINDOW_NS
+        {
+            core::hint::spin_loop();
+        }
+        // SAFETY: kernel context; re-mask.
+        unsafe { asm!("cli") };
+        lapic_write(LAPIC_TMICT, 0);
+        TIMER_FIRES.load(Ordering::Relaxed) > 0
+    };
+    // SAFETY: single CPU; set once before any cell runs.
+    unsafe { *core::ptr::addr_of_mut!(TIMER_ENABLED) = usable };
+    if usable {
+        // Calibrate the LAPIC tick rate **now**, not on first use. The
+        // calibration busy-spins a fixed TSC window, and doing that inside the
+        // arbiter's first `timer_arm` burned the whole of a short deadline before
+        // the hardware was even armed - so the first `sleep` on a fresh kernel
+        // never reached a park and reported no idle. One line, but the class of
+        // bug is docs/ENGINEERING.md 1 again: bring-up cost masquerading as an
+        // elapsed deadline. Calibrating at bring-up puts that cost where it
+        // belongs and leaves the arm path free of it.
+        lapic_timer_count(1_000_000);
+        lapic_write(LAPIC_TMICT, 0);
+        crate::println!(
+            "x86-64: LAPIC one-shot timer verified over {} - a real interrupt arrived",
+            apic_mode().name()
+        );
+    } else {
+        crate::println!(
+            "x86-64: LAPIC one-shot timer unavailable (APIC access: {}), no timer interrupt \
+             on this machine - deadlines fall back to the cooperative/poll path",
+            apic_mode().name()
+        );
     }
 }
 
-/// Bring up the LAPIC one-shot timer interrupt (vector 0x20). Called only by the
-/// Phase F timer test.
-pub fn enable_timer_irq() {
-    lapic_init();
-    set_idt_gate(VEC_TIMER, timer_irq_stub as *const () as u64);
-    // SAFETY: kernel context; x2APIC enabled by lapic_init.
-    unsafe {
-        // Divide config = 1 (bits: 0b1011 -> divide by 1).
-        paging_wrmsr(MSR_X2APIC_TIMER_DIV, 0b1011);
-        // LVT timer: vector 0x20, one-shot (bits 17-18 = 0), unmasked.
-        paging_wrmsr(MSR_X2APIC_LVT_TIMER, VEC_TIMER as u64);
-        paging_wrmsr(MSR_X2APIC_TIMER_INIT, 0); // disarmed until timer_wait
-        *core::ptr::addr_of_mut!(TIMER_ENABLED) = true;
-    }
-}
+/// Initial count for the bring-up probe, and the wall-clock window it waits for
+/// the interrupt in. The count is small enough to fire promptly at any plausible
+/// APIC clock; the window is the honest upper bound on boot cost when it never does.
+const PROBE_COUNT: u32 = 1 << 16;
+const PROBE_WINDOW_NS: u64 = 20_000_000; // 20 ms
 
 /// The LAPIC timer interrupt handler (called from `timer_irq_stub`): the
-/// one-shot has fired, so just EOI; the waiter in `timer_wait` observes the
-/// elapsed deadline and returns.
+/// one-shot has fired, so record it (the bring-up self-test reads the count) and
+/// EOI; the arbiter (`ktimer::service`) observes the elapsed deadline and returns.
 #[unsafe(no_mangle)]
 extern "C" fn x86_timer_irq() {
-    // SAFETY: kernel context; x2APIC EOI is a plain MSR write.
-    unsafe { paging_wrmsr(MSR_X2APIC_EOI, 0) };
+    TIMER_FIRES.fetch_add(1, Ordering::Relaxed);
+    lapic_write(LAPIC_EOI, 0);
 }
 
-/// Arm the LAPIC one-shot timer for `deadline_ns` from now and halt at `hlt`
-/// until it fires (a genuine 0%-CPU park). The LAPIC timer counts the APIC bus
-/// clock; we calibrate its rate against the TSC (`cycles()` + `ticks_to_ns`)
-/// once, then convert. Called only when [`timer_irq_enabled`].
-pub fn timer_wait(deadline_ns: u64) {
+/// Monotonic now in nanoseconds **in the timer's own domain** - the TSC, which is
+/// what [`timer_arm`]'s LAPIC count is calibrated against. The timer arbiter
+/// (`kernel/src/ktimer.rs`) compares its deadlines against this.
+pub fn timer_now_ns() -> u64 {
+    ticks_to_ns(cycles())
+}
+
+/// Halt the CPU until an interrupt fires - the LAPIC one-shot the arbiter armed
+/// (the standard enable-halt-disable idle idiom). Called only by
+/// `kernel/src/ktimer.rs`, which owns the hardware one-shot (docs/NETSTACK.md 16);
+/// it halts only with a deadline armed, since on this ISA nothing else is wired to
+/// wake `hlt`.
+pub fn timer_park() {
+    // SAFETY: kernel context; the standard enable-halt-disable idle idiom.
+    unsafe { asm!("sti; hlt; cli", options(nomem, nostack)) };
+}
+
+/// Arm the LAPIC one-shot timer for `deadline_ns` from now, without waiting. The
+/// LAPIC timer counts the APIC bus clock; its rate is calibrated against the TSC
+/// (`cycles()` + `ticks_to_ns`) once, then converted.
+///
+/// **Private mechanism of the timer arbiter** (`kernel/src/ktimer.rs`), the
+/// kernel's single owner of the one-shot: a subsystem that arms this directly
+/// cancels whatever another subsystem armed (docs/NETSTACK.md 16). Register a
+/// deadline with the arbiter instead.
+pub fn timer_arm(deadline_ns: u64) {
     let count = lapic_timer_count(deadline_ns);
-    // SAFETY: kernel context; x2APIC timer MSRs, one-shot, IF via the idle idiom.
-    unsafe {
-        paging_wrmsr(MSR_X2APIC_TIMER_INIT, count as u64); // arm (starts counting down)
-        // The one-shot fires once (current count hits 0); wake hlt and EOI. Loop
-        // guards against an unrelated interrupt waking hlt early.
-        while paging_rdmsr(MSR_X2APIC_TIMER_CUR) != 0 {
-            asm!("sti; hlt; cli", options(nomem, nostack));
-        }
-        paging_wrmsr(MSR_X2APIC_TIMER_INIT, 0); // disarm
-    }
+    lapic_write(LAPIC_TMICT, count);
+}
+
+/// Whether the armed one-shot has fired (its current count reached 0).
+pub fn timer_expired() -> bool {
+    lapic_read(LAPIC_TMCCT) == 0
+}
+
+/// Disarm the LAPIC one-shot timer.
+pub fn timer_disarm() {
+    lapic_write(LAPIC_TMICT, 0);
 }
 
 /// Calibrate the LAPIC timer's tick rate against the TSC and return the initial
 /// count for `deadline_ns`. Done once (the ratio is stable under QEMU), cached.
 fn lapic_timer_count(deadline_ns: u64) -> u32 {
-    static CAL_PPN: AtomicU64 = AtomicU64::new(0); // LAPIC ticks per 1e6 ns, *1024
+    static CAL_PPN: AtomicU64 = AtomicU64::new(0); // LAPIC ticks per ns, << 20
     let mut ppn = CAL_PPN.load(Ordering::Relaxed);
     if ppn == 0 {
         // Run the LAPIC timer for a known TSC span and count its ticks.
-        // SAFETY: kernel context; timer MSRs + TSC.
-        unsafe {
-            paging_wrmsr(MSR_X2APIC_TIMER_INIT, 0xFFFF_FFFF);
-            let tsc0 = cycles();
-            let lc0 = paging_rdmsr(MSR_X2APIC_TIMER_CUR);
-            // Busy-spin a bounded TSC interval (~calibration window).
-            while cycles().wrapping_sub(tsc0) < 2_000_000 {
-                core::hint::spin_loop();
-            }
-            let lc1 = paging_rdmsr(MSR_X2APIC_TIMER_CUR);
-            let tsc1 = cycles();
-            paging_wrmsr(MSR_X2APIC_TIMER_INIT, 0);
-            let lapic_ticks = lc0.wrapping_sub(lc1); // counts down
-            let ns = ticks_to_ns(tsc1.wrapping_sub(tsc0)).max(1);
-            // LAPIC ticks per ns, scaled by 1<<20 for integer precision.
-            ppn = (((lapic_ticks as u128) << 20) / ns as u128) as u64;
-            if ppn == 0 {
-                ppn = 1;
-            }
-            CAL_PPN.store(ppn, Ordering::Relaxed);
+        lapic_write(LAPIC_TMICT, 0xFFFF_FFFF);
+        let tsc0 = cycles();
+        let lc0 = lapic_read(LAPIC_TMCCT);
+        // Busy-spin a bounded TSC interval (~calibration window).
+        while cycles().wrapping_sub(tsc0) < 2_000_000 {
+            core::hint::spin_loop();
         }
+        let lc1 = lapic_read(LAPIC_TMCCT);
+        let tsc1 = cycles();
+        lapic_write(LAPIC_TMICT, 0);
+        let lapic_ticks = lc0.wrapping_sub(lc1) as u64; // counts down
+        let ns = ticks_to_ns(tsc1.wrapping_sub(tsc0)).max(1);
+        // LAPIC ticks per ns, scaled by 1<<20 for integer precision.
+        ppn = (((lapic_ticks as u128) << 20) / ns as u128) as u64;
+        if ppn == 0 {
+            ppn = 1;
+        }
+        CAL_PPN.store(ppn, Ordering::Relaxed);
     }
     let count = ((deadline_ns as u128 * ppn as u128) >> 20).max(1);
     count.min(0xFFFF_FFFF) as u32
@@ -444,38 +875,332 @@ pub fn discover(inv: &mut crate::hw::Inventory) {
 }
 
 // ------------------------------------------------------------------- SMP
-// docs/SMP.md, task #27. x86-64 AP bring-up is **not implemented here** and is
-// honestly reported as blocked: an application processor starts in 16-bit
-// real mode and must be released with an INIT-SIPI-SIPI sequence pointing at a
-// trampoline placed below 1 MiB, which then switches to long mode and joins the
-// kernel. PVH boot hands us no low real-mode memory or firmware to stage that
-// trampoline, and building one cleanly is out of scope for this phase (it must
-// not destabilise the single-core boot every other kernel depends on). CPU
-// *detection* is done - ACPI MADT already counts the APs in the inventory - so
-// the honest deliverable is the count plus a documented blocker. `smp` skips x86
-// with this reason and still passes.
+// docs/SMP.md 6, task #27. **Real AP bring-up.** An application processor leaves
+// reset in 16-bit real mode and is released by an INIT-SIPI-SIPI sequence through
+// the local APIC's interrupt command register, with the SIPI's 8-bit vector
+// naming a page **below 1 MiB** to start executing at. Two things had to exist
+// first: a working ICR (the whole point of the xAPIC MMIO work above - the x2APIC
+// MSR block this port used is inert under QEMU TCG, so a SIPI written there went
+// nowhere), and a real-mode trampoline in low memory, which PVH boot gives no
+// firmware to stage, so the kernel stages it itself
+// (`kernel/arch/x86_64/smp.S`, copied to [`AP_TRAMPOLINE_PA`]).
+//
+// Everything here is `#[cfg(feature = "smp")]`, so the 55 kernels that never opt
+// in link an unchanged library - including the trampoline's assembly.
 
-/// This CPU's index. x86-64 does not bring up secondaries here, so only the boot
-/// processor ever asks - always CPU 0.
+#[cfg(feature = "smp")]
+global_asm!(
+    include_str!("../../../arch/x86_64/smp.S"),
+    options(att_syntax)
+);
+
+/// Physical page the AP trampoline is copied to and started at. Constraints: 4
+/// KiB aligned and **below 1 MiB** (a SIPI vector is 8 bits: the AP starts at
+/// `vector << 12`), in RAM, and clear of anything firmware left in low memory.
+/// 0x8000 sits above the real-mode IVT/BDA and below the PVH start-info and ACPI
+/// staging area; [`smp_start_secondary`] **verifies** all of that at runtime
+/// rather than assuming it.
+#[cfg(feature = "smp")]
+const AP_TRAMPOLINE_PA: usize = 0x8000;
+
+#[cfg(feature = "smp")]
+unsafe extern "C" {
+    /// First byte of the trampoline, in `.boot.text` (VMA == LMA, so its symbol
+    /// address is its physical address).
+    static ap_trampoline: u8;
+    static ap_trampoline_end: u8;
+    /// The base address the trampoline was **assembled for**, published by the
+    /// assembly so Rust can cross-check it against [`AP_TRAMPOLINE_PA`]. The
+    /// trampoline is position-fixed, so a silent disagreement between the two
+    /// constants would jump the AP into nowhere.
+    static AP_TRAMPOLINE_BASE: u64;
+    /// Slots in `.boot.bss` (identity low, so readable by the trampoline's
+    /// 32-bit stage with paging off) where the primary publishes its own control
+    /// registers for the AP to adopt verbatim - see the header of smp.S.
+    static AP_CR4: u64;
+    static AP_EFER: u64;
+    static AP_CR0: u64;
+}
+
+/// Publish this (primary) CPU's `CR4`, `EFER` and `CR0` for the AP trampoline, so
+/// the secondary comes up in **exactly** the primary's mode rather than in a
+/// hand-picked approximation of it.
+///
+/// This is not tidiness. The kernel's page tables carry NX on real entries - the
+/// APIC register window among them - and with `EFER.NXE` clear a set bit 63 is a
+/// **reserved-bit** page fault, so an AP that merely set `LME` triple-faulted on
+/// its first LAPIC read (observed, not theorised). Copying the control registers
+/// makes that whole class of divergence impossible rather than enumerable.
+#[cfg(feature = "smp")]
+fn publish_ap_mode() {
+    // SAFETY: kernel context; reads of this CPU's own control registers.
+    let (cr4, cr0) = unsafe {
+        let cr4: u64;
+        let cr0: u64;
+        asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+        asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack));
+        (cr4, cr0)
+    };
+    // SAFETY: kernel context; EFER is architectural.
+    let efer = unsafe { paging_rdmsr(0xC000_0080) };
+    // The three slots live in `.boot.bss`, whose symbol address is its physical
+    // address; the kernel runs high, so they are written through the linear map.
+    // SAFETY: single CPU at bring-up; three aligned 8-byte writes to kernel BSS.
+    unsafe {
+        let w = |sym: usize, v: u64| {
+            (phys_to_virt(sym) as *mut u64).write(v);
+        };
+        w(core::ptr::addr_of!(AP_CR4) as usize, cr4);
+        w(core::ptr::addr_of!(AP_EFER) as usize, efer);
+        w(core::ptr::addr_of!(AP_CR0) as usize, cr0);
+    }
+}
+
+/// LAPIC registers only AP bring-up needs (see the register table above).
+#[cfg(feature = "smp")]
+const LAPIC_ICR_LOW: usize = 0x300;
+#[cfg(feature = "smp")]
+const LAPIC_ICR_HIGH: usize = 0x310;
+
+/// This CPU's local APIC id, read **from the local APIC** - each CPU's own
+/// register file answers at the same address (QEMU maps the APIC page per-CPU, as
+/// real hardware does), so this is a genuine hardware identity and not something
+/// the primary told the secondary. In xAPIC the id is in bits 24-31.
+fn lapic_id() -> u32 {
+    match apic_mode() {
+        ApicMode::XApic => lapic_read(LAPIC_ID) >> 24,
+        ApicMode::X2Apic => lapic_read(LAPIC_ID),
+        ApicMode::None => 0,
+    }
+}
+
+/// Send an inter-processor interrupt to APIC id `dest`. `icr_low` carries the
+/// vector plus the delivery mode / level / trigger bits.
+///
+/// The ICR is the one register whose two access modes differ in shape: xAPIC has
+/// a 32-bit low/high pair where the **high half must be written first** (writing
+/// the low half is what issues the IPI), while x2APIC has a single 64-bit MSR.
+#[cfg(feature = "smp")]
+fn lapic_send_ipi(dest: u32, icr_low: u32) {
+    match apic_mode() {
+        // SAFETY: a validated x2APIC MSR write; the ICR is MSR 0x830, 64-bit.
+        ApicMode::X2Apic => unsafe {
+            paging_wrmsr(0x830, ((dest as u64) << 32) | icr_low as u64);
+        },
+        ApicMode::XApic => {
+            lapic_write(LAPIC_ICR_HIGH, dest << 24);
+            lapic_write(LAPIC_ICR_LOW, icr_low);
+        }
+        ApicMode::None => {}
+    }
+}
+
+/// Wait (bounded) for a sent IPI to be accepted: the ICR's Delivery Status bit
+/// (12) clears. x2APIC has no delivery-status bit (its MSR write is synchronous),
+/// so this only polls in xAPIC mode. Bounded by wall time, so a wedged APIC costs
+/// one short window instead of hanging the primary.
+#[cfg(feature = "smp")]
+fn lapic_ipi_wait() {
+    if apic_mode() != ApicMode::XApic {
+        return;
+    }
+    let t0 = cycles();
+    while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
+        if ticks_to_ns(cycles().wrapping_sub(t0)) > 10_000_000 {
+            return; // 10 ms; the caller's own bounded wait decides the outcome
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Busy-wait `ns` nanoseconds of TSC time. Used for the two delays the
+/// INIT-SIPI-SIPI sequence architecturally requires. Deliberately **not** the
+/// timer arbiter: bring-up runs before any deadline client exists, and touching
+/// `arch::timer_*` here would break the single-owner invariant
+/// (docs/ENGINEERING.md 3).
+#[cfg(feature = "smp")]
+fn delay_ns(ns: u64) {
+    let t0 = cycles();
+    while ticks_to_ns(cycles().wrapping_sub(t0)) < ns {
+        core::hint::spin_loop();
+    }
+}
+
+/// APIC id -> CPU registry index, filled by each CPU as it establishes its
+/// identity. `u32::MAX` = unused. Indexed by CPU index, so slot 0 is the boot
+/// CPU's APIC id.
+#[cfg(feature = "smp")]
+static mut APIC_ID_OF_CPU: [u32; crate::hw::MAX_CPUS] = [u32::MAX; crate::hw::MAX_CPUS];
+
+/// This CPU's registry index, resolved from its **own** local APIC id against the
+/// table each CPU filled in [`smp_set_this_cpu`].
+///
+/// x86-64 has no free general register to dedicate to a per-CPU pointer the way
+/// RISC-V has `tp`: `FS` carries a Linux cell's TLS base and `GS`/`KERNEL_GS_BASE`
+/// are reserved for the eventual `swapgs` per-CPU block, which is a change to the
+/// syscall entry path and does not belong in a bring-up phase. A search over a
+/// tiny fixed table is honest and costs a LAPIC read; it is on no hot path (the
+/// single-CPU kernels never call it, since `smp::this_cpu` is only reached from
+/// code that opted into SMP). Falls back to 0 - the boot CPU - if this CPU has not
+/// registered, which is exactly the pre-bring-up single-CPU answer.
 #[cfg(feature = "smp")]
 pub fn cpu_index() -> usize {
+    let me = lapic_id();
+    // SAFETY: single writer per slot (each CPU writes only its own), and the
+    // write happens-before the reads that matter (the secondary sets its slot
+    // before marking itself online).
+    let table = unsafe { *core::ptr::addr_of!(APIC_ID_OF_CPU) };
+    for (i, &id) in table.iter().enumerate() {
+        if id == me {
+            return i;
+        }
+    }
     0
 }
 
-/// No-op: no per-CPU identity register is established (single-core path).
+/// Record that the CPU running this call is registry index `index`, by writing
+/// its own APIC id into that slot. Runs on the CPU it describes.
 #[cfg(feature = "smp")]
-pub fn smp_set_this_cpu(_index: usize) {}
+pub fn smp_set_this_cpu(index: usize) {
+    let me = lapic_id();
+    // SAFETY: single CPU writes this slot, and no other CPU reads it before the
+    // secondary signals itself up.
+    unsafe {
+        (*core::ptr::addr_of_mut!(APIC_ID_OF_CPU))[index] = me;
+    }
+}
 
-/// The bootstrap processor's hardware id (APIC id 0 on this QEMU q35 config).
+/// The bootstrap processor's hardware id: its **local APIC id, read from the
+/// hardware** (it is 0 on this QEMU q35 config, but that is an observation, not
+/// an assumption). Requires the APIC to be up, so it brings it up.
 #[cfg(feature = "smp")]
 pub fn boot_cpu_hw_id() -> u32 {
-    0
+    lapic_probe();
+    lapic_id()
 }
 
-/// Report the x86-64 AP-bring-up blocker (docs/SMP.md). No AP is started.
+/// Whether the low page `[AP_TRAMPOLINE_PA, +4 KiB)` is safe to overwrite: RAM
+/// per the firmware memory map, and clear of the two structures firmware left in
+/// low memory that the kernel still reads - the PVH `hvm_start_info` block and
+/// the ACPI RSDP it points at. Returns the reason it is not, or `None`.
+///
+/// This is a check rather than a comment because the page is chosen by the kernel
+/// (PVH gives no low staging area to be handed one), and stamping a trampoline
+/// over firmware data would be a silent memory corruption, not a failed boot.
 #[cfg(feature = "smp")]
-pub fn smp_start_secondary(_hw_id: u32) -> Result<(), &'static str> {
-    Err("needs a 16-bit real-mode AP trampoline (INIT-SIPI-SIPI) below 1 MiB; not implemented")
+fn ap_page_conflict() -> Option<&'static str> {
+    let lo = AP_TRAMPOLINE_PA as u64;
+    let hi = lo + 4096;
+    let inv = crate::hw::inventory();
+    let mut in_ram = false;
+    for i in 0..inv.nmem {
+        let r = inv.mem[i];
+        if r.kind == crate::hw::MemKind::Ram && r.base <= lo && lo + 4096 <= r.base + r.len {
+            in_ram = true;
+        }
+    }
+    if !in_ram {
+        return Some("the chosen low trampoline page is not usable RAM in the firmware memory map");
+    }
+    let info = boot_firmware_ptr() as u64;
+    if info >= lo && info < hi {
+        return Some("the chosen low trampoline page holds the PVH hvm_start_info block");
+    }
+    // The RSDP address is the 5th u32 of hvm_start_info (magic, version, flags,
+    // nr_modules, modlist_paddr(8), cmdline_paddr(8), rsdp_paddr(8)); read it
+    // through the linear map rather than re-parsing ACPI.
+    if info != 0 {
+        // SAFETY: the PVH block QEMU wrote is in low RAM, reached through the
+        // kernel's linear map; `rsdp_paddr` is at offset 32 per the PVH ABI.
+        let rsdp = unsafe { ((phys_to_virt(info as usize) + 32) as *const u64).read() };
+        if rsdp >= lo && rsdp < hi {
+            return Some("the chosen low trampoline page holds the ACPI RSDP");
+        }
+    }
+    None
+}
+
+/// Start the application processor with APIC id `hw_id`: stage the real-mode
+/// trampoline in low memory, then release the AP with INIT-SIPI-SIPI. Returns
+/// `Ok(())` once the SIPI has been sent (the portable `smp::bring_up_one` then
+/// waits, bounded, for the AP to run kernel code and mark itself online), or a
+/// reason a start was not attempted.
+///
+/// Nothing here can hang: both delays and the ICR delivery-status poll are
+/// bounded by wall time, and a non-responsive AP surfaces as the caller's
+/// `StartError::Timeout` rather than a wedged primary.
+#[cfg(feature = "smp")]
+pub fn smp_start_secondary(hw_id: u32) -> Result<(), &'static str> {
+    lapic_probe();
+    if apic_mode() == ApicMode::None {
+        return Err("no usable local APIC (neither x2APIC nor the xAPIC MMIO page responded)");
+    }
+    // The trampoline is position-fixed: it was assembled for one base address,
+    // and jumping an AP at a different one would land it in nowhere. Cross-check
+    // the assembly's own view against ours before touching anything.
+    // SAFETY: a read of a link-time constant in `.rodata`.
+    let assembled_for = unsafe { *core::ptr::addr_of!(AP_TRAMPOLINE_BASE) };
+    if assembled_for != AP_TRAMPOLINE_PA as u64 {
+        return Err("AP trampoline base disagrees between smp.S and mod.rs");
+    }
+    if let Some(reason) = ap_page_conflict() {
+        return Err(reason);
+    }
+    publish_ap_mode();
+
+    // Copy the trampoline from `.boot.text` (identity low, so its symbol address
+    // is its physical address) to the chosen low page. Both ends are touched
+    // through the kernel's linear map, so this works whichever root is active.
+    let src_pa = core::ptr::addr_of!(ap_trampoline) as usize;
+    let end_pa = core::ptr::addr_of!(ap_trampoline_end) as usize;
+    let len = end_pa - src_pa;
+    if len == 0 || len > 4096 {
+        return Err("AP trampoline does not fit in one low page");
+    }
+    // SAFETY: `src` is the trampoline's own bytes and `dst` is the low page
+    // verified above to be RAM the firmware is not using; both are inside the
+    // kernel's linear map of physical 0-2 GiB and the regions do not overlap
+    // (the trampoline is linked at 1 MiB, the destination below it).
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            phys_to_virt(src_pa) as *const u8,
+            phys_to_virt(AP_TRAMPOLINE_PA) as *mut u8,
+            len,
+        );
+    }
+
+    // INIT-SIPI-SIPI (Intel MP spec / SDM 9.4.4). Delivery modes: INIT = 5,
+    // Start-Up = 6; bit 14 = level assert, bit 15 = level triggered.
+    const INIT_ASSERT: u32 = (1 << 15) | (1 << 14) | (5 << 8);
+    const INIT_DEASSERT: u32 = (1 << 15) | (5 << 8);
+    let sipi: u32 = (6 << 8) | (AP_TRAMPOLINE_PA >> 12) as u32;
+
+    lapic_send_ipi(hw_id, INIT_ASSERT);
+    lapic_ipi_wait();
+    delay_ns(10_000_000); // 10 ms, the spec's post-INIT wait
+    lapic_send_ipi(hw_id, INIT_DEASSERT);
+    lapic_ipi_wait();
+    for _ in 0..2 {
+        lapic_send_ipi(hw_id, sipi);
+        lapic_ipi_wait();
+        delay_ns(200_000); // 200 us between the two SIPIs
+    }
+    Ok(())
+}
+
+/// Where the AP trampoline hands control to Rust, on the secondary CPU, in long
+/// mode on the **primary's page tables** with its own stack. It hands the
+/// portable driver this CPU's hardware identity - read from its own local APIC,
+/// not passed in - and parks when that returns.
+#[cfg(feature = "smp")]
+#[unsafe(no_mangle)]
+extern "C" fn x86_secondary_main() -> ! {
+    crate::smp::secondary_run(lapic_id());
+    loop {
+        // SAFETY: kernel context on a parked secondary; interrupts are masked
+        // (the AP has never enabled them), so this halts until an NMI/INIT.
+        unsafe { asm!("cli; hlt", options(nomem, nostack)) };
+    }
 }
 
 /// Feature names; bit i corresponds to index i in CpuReport.features.
@@ -1251,6 +1976,19 @@ pub fn cycles() -> u64 {
 /// 1 GHz assumption. glibc reads this only for coarse timing, so exact TSC
 /// frequency is not load-bearing for the fixtures.
 pub fn ticks_to_ns(ticks: u64) -> u64 {
+    ((ticks as u128 * 1_000_000_000) / tsc_hz() as u128) as u64
+}
+
+/// The TSC frequency in Hz, read once from CPUID leaf 0x16 and cached. Cached
+/// because the timer arbiter converts a TSC reading to nanoseconds on every
+/// deadline check, including inside the receive path's bounded busy-poll tier
+/// (docs/NETSTACK.md 16), and CPUID is a VM exit / serialising instruction.
+fn tsc_hz() -> u64 {
+    static TSC_HZ: AtomicU64 = AtomicU64::new(0);
+    let cached = TSC_HZ.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
     use core::arch::x86_64::__cpuid_count;
     let max_leaf = __cpuid_count(0, 0).eax;
     let mhz = if max_leaf >= 0x16 {
@@ -1263,7 +2001,8 @@ pub fn ticks_to_ns(ticks: u64) -> u64 {
     } else {
         1_000_000_000
     };
-    ((ticks as u128 * 1_000_000_000) / hz as u128) as u64
+    TSC_HZ.store(hz, Ordering::Relaxed);
+    hz
 }
 
 /// Calibration loop with a known instruction count: exactly 2

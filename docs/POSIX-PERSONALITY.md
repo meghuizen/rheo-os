@@ -76,9 +76,28 @@ object store.
 
 ## 4. Login and identity
 
+**Source of truth: docs/IDENTITY.md.** This section used to say "there is no
+root to become"; that was amended. POSIX users, groups and `rwx` are real and
+enforced, as a projection of the native principal model - the numbers are
+aliases for principals, and the checks live in the **file server**, which is
+where a microkernel puts them and where this tree's filesystem code already is.
+
+- A `uid` is a short numeric alias for a principal; a group is a principal that
+  names a set. Both are served by `identityd` through ordinary `/etc/passwd`
+  and `/etc/group`, so `id`, `ls -l` and `getpwuid` work unmodified.
+- The per-process credential (uid/euid/gid/egid/groups) is **per-cell
+  synthesized state**, like pids and fds - no kernel object.
+- **Root exists**, as the principal `rheo://<td>/system/root` aliased to uid 0.
+  Its power is the maximal capability bundle minted to it at boot, not a
+  privileged branch. The file server's permission bypass is an `FsOverride`
+  **capability**: delegatable, attenuable, revocable, audited.
+- Dropping privileges **revokes**, so it cannot be undone; `setuid` is an
+  `Assume(principal)` capability, and a setuid *binary* must have its image
+  measurement entitled to the target principal - SPIFFE workload attestation
+  applied to the oldest escalation surface in Unix.
 - SSH authenticates a *person* (key/certificate); sshd (a cell holding a
   bounded minting grant) creates a **session cell** with that identity's
-  entitled capability set. There is no root to become.
+  entitled capability set.
 - `sudo` is grant escalation to a policy service, possibly gated by approval
   or a second factor, and is itself an audit event (SECURITY-IDENTITY.md 4).
 - The whole login path is ordinary cells and queues: sshd holds a network

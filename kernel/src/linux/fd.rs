@@ -12,6 +12,7 @@ use crate::arch::{self, linux_abi::Stat};
 use crate::linux::dirent;
 use crate::linux::epoll;
 use crate::linux::errno::*;
+use crate::linux::eventfd;
 use crate::linux::inetsock::{self, AF_INET, AF_INET6};
 use crate::linux::pipe;
 use crate::linux::unixsock::{self, AF_UNIX, NAME_MAX, SOCK_DGRAM, SOCK_STREAM, SOCK_TYPE_MASK};
@@ -122,20 +123,112 @@ enum FdKind {
         bound: bool,
         peer_port: u16,
     },
+    /// A UDP socket on the **remote** (NIC-backed) datapath (rheo-net N4b,
+    /// docs/LINUX-COMPAT.md L8-INET remote): `ep` is the opaque handle the
+    /// registered `svc::SocketOps` bridge returned, `port` the local port the
+    /// personality allocated, and `peer_ip`/`peer_port` a `connect`-set default
+    /// destination. A UDP socket becomes remote the first time it names a
+    /// **non-loopback** address; a loopback one keeps `InetDgram` unchanged.
+    InetUdpRemote {
+        ep: u8,
+        port: u16,
+        peer_ip: [u8; 4],
+        peer_port: u16,
+    },
+    /// A connected TCP socket on the **remote** datapath (rheo-net N4b): `h` is the
+    /// `svc::SocketOps` connection handle; `read`/`write` forward to it. Loopback
+    /// TCP keeps `InetConn` (the L6 ring pair) unchanged.
+    InetTcpRemote {
+        h: u8,
+        local_port: u16,
+        peer_ip: [u8; 4],
+        peer_port: u16,
+    },
     /// An epoll instance (docs/LINUX-COMPAT.md L8-INET): `ep` indexes the
     /// per-personality epoll registry (`linux::epoll`).
     Epoll {
         ep: u8,
     },
+    /// An `eventfd2` counter (docs/LINUX-COMPAT.md L8-EVENTFD): `ev` indexes the
+    /// per-personality registry (`linux::eventfd`). The counter deliberately lives
+    /// in the registry, not here - `dup`/`fork` make a second descriptor for the
+    /// *same* object, and a counter copied per descriptor would give two counters
+    /// that silently stop waking each other.
+    EventFd {
+        ev: u8,
+    },
 }
+
+/// How long a **remote** (NIC-backed) blocking receive waits for a frame before
+/// reporting `EAGAIN` (rheo-net N4b). The personality tracks no `O_NONBLOCK` or
+/// `SO_RCVTIMEO`, so one documented bound serves every remote receive: long enough
+/// that a real reply from the network always lands, short enough that a lost packet
+/// cannot wedge a cell. The wait itself is a genuine park (`net_rx::wait_frame`),
+/// not a spin, on the ISAs where the NIC RX interrupt is wired.
+const REMOTE_RECV_TIMEOUT_NS: u64 = 2_000_000_000;
+
+/// The handshake budget for a **remote** TCP `connect` (rheo-net N4b): the SYN is
+/// retransmitted inside this window by the transport's own RTO, and the call
+/// reports `ETIMEDOUT` at the deadline.
+const REMOTE_CONNECT_TIMEOUT_NS: u64 = 3_000_000_000;
 
 /// Room for the serialized auxv served through `/proc/self/auxv` (matches
 /// `linux::stack::AUXV_BYTES_MAX`).
 const AUXV_MAX: usize = 20 * 16;
 
+// ---------------------------------------------------------------- open flags
+// The three ISAs agree on every bit used here (x86-64's `asm/fcntl.h` and the
+// asm-generic one define the same values), so these are portable constants and
+// not `arch::linux_abi` entries.
+
+/// `O_ACCMODE`: the access-mode field of a descriptor's status flags.
+const O_ACCMODE: u64 = 0o3;
+/// `O_APPEND` - not honoured by this personality (see [`FdTable::fcntl`]).
+const O_APPEND: u64 = 0o2000;
+/// `O_NONBLOCK` (== `SOCK_NONBLOCK`): honoured when set through
+/// `fcntl(F_SETFL)`.
+const O_NONBLOCK: u64 = 0o4000;
+/// `O_ASYNC`/`FASYNC` - not honoured (no SIGIO is ever delivered).
+const O_ASYNC: u64 = 0o20000;
+/// `O_CLOEXEC` (== `SOCK_CLOEXEC` == `EPOLL_CLOEXEC`).
+pub const O_CLOEXEC: u64 = 0o2000000;
+/// `FD_CLOEXEC`, the single `F_GETFD`/`F_SETFD` bit.
+const FD_CLOEXEC: u64 = 1;
+
+/// The per-descriptor flags the personality **tracks and honours**
+/// (docs/LINUX-COMPAT.md, the `fcntl` row). Kept in a table parallel to `fds`
+/// rather than inside each [`FdKind`] variant, so every kind gets them without
+/// widening an already-large enum.
+#[derive(Copy, Clone)]
+struct FdFlags {
+    /// `FD_CLOEXEC`: this descriptor is closed by `execve`.
+    cloexec: bool,
+    /// `O_NONBLOCK`: a read/write that would block reports `-EAGAIN` instead.
+    nonblock: bool,
+    /// The access mode (`O_RDONLY`/`O_WRONLY`/`O_RDWR`), so `F_GETFL` reports
+    /// what the descriptor was actually opened with rather than a constant.
+    accmode: u8,
+}
+
+impl FdFlags {
+    const fn new(accmode: u8) -> FdFlags {
+        FdFlags {
+            cloexec: false,
+            nonblock: false,
+            accmode,
+        }
+    }
+}
+
+/// `O_RDWR`, the default access mode for a descriptor that is not opened from a
+/// path (pipes get per-end modes; sockets are read-write).
+const ACC_RDWR: u8 = 2;
+
 #[derive(Copy, Clone)]
 pub struct FdTable {
     fds: [FdKind; NFD],
+    /// Per-descriptor flags, indexed exactly like `fds`.
+    flags: [FdFlags; NFD],
     /// The cell's `/proc/self/auxv` bytes, copied in by `install_cell` after
     /// the stack (with its auxv) is built.
     auxv: [u8; AUXV_MAX],
@@ -152,6 +245,7 @@ impl FdTable {
     pub const fn new() -> FdTable {
         FdTable {
             fds: [FdKind::Closed; NFD],
+            flags: [FdFlags::new(ACC_RDWR); NFD],
             auxv: [0; AUXV_MAX],
             auxv_len: 0,
         }
@@ -160,9 +254,35 @@ impl FdTable {
     /// Reset to the initial state: fds 0/1/2 = console, the rest closed.
     pub fn init_console(&mut self) {
         self.fds = [FdKind::Closed; NFD];
+        self.flags = [FdFlags::new(ACC_RDWR); NFD];
         self.fds[0] = FdKind::Console(0);
+        self.flags[0] = FdFlags::new(0); // O_RDONLY
         self.fds[1] = FdKind::Console(1);
+        self.flags[1] = FdFlags::new(1); // O_WRONLY
         self.fds[2] = FdKind::Console(2);
+        self.flags[2] = FdFlags::new(1); // O_WRONLY
+    }
+
+    /// True if `fd` has `O_NONBLOCK` set (through `fcntl(F_SETFL)`). The
+    /// cooperative blocking paths in `linux::mod`/`linux::proc` consult this
+    /// before parking a cell, so a non-blocking descriptor reports `-EAGAIN`
+    /// instead (docs/LINUX-COMPAT.md, the `fcntl` row).
+    pub fn is_nonblock(&self, fd: i64) -> bool {
+        usize_fd(fd).is_some_and(|s| self.flags[s].nonblock)
+    }
+
+    /// Close every descriptor marked `FD_CLOEXEC` - the `execve` step
+    /// (docs/LINUX-COMPAT.md L6). Returns how many were closed, so a test can
+    /// observe that it did something rather than infer it.
+    pub fn close_cloexec(&mut self) -> usize {
+        let mut n = 0;
+        for i in 0..NFD {
+            if self.flags[i].cloexec && !matches!(self.fds[i], FdKind::Closed) {
+                self.close(i as i64);
+                n += 1;
+            }
+        }
+        n
     }
 
     /// Store the cell's serialized auxv for `/proc/self/auxv` reads.
@@ -174,11 +294,10 @@ impl FdTable {
 
     /// pipe2(pipefd[2], flags): allocate a global cross-cell pipe and write the
     /// read and write fds (two `int`s) into `pipefd` (docs/LINUX-COMPAT.md L6).
-    /// Flags (O_CLOEXEC/O_NONBLOCK) are accepted and ignored: the ends block
-    /// cooperatively (the scheduler decides). Close-on-exec is not tracked -
-    /// `execve` keeps all fds open (documented, docs/LINUX-COMPAT.md L6); a
-    /// pipeline child closes its unused ends explicitly, which the shell does.
-    pub fn pipe2(&mut self, pipefd_va: u64) -> i64 {
+    /// `O_CLOEXEC` and `O_NONBLOCK` in `flags` are both **honoured** on both ends
+    /// (docs/ARCHITECTURE-DEBT.md 2.4 - creation-time non-blocking used to be a named
+    /// deferral, blocked on `poll` computing real readiness).
+    pub fn pipe2(&mut self, pipefd_va: u64, flags: u64) -> i64 {
         let Some(idx) = pipe::alloc() else {
             return -ENFILE;
         };
@@ -191,6 +310,7 @@ impl FdTable {
             idx: idx as u8,
             writer: false,
         };
+        self.flags[rd] = FdFlags::new(0); // read end: O_RDONLY
         let Some(wr) = self.free_slot(3) else {
             self.fds[rd] = FdKind::Closed;
             pipe::close_end(idx, false);
@@ -201,11 +321,22 @@ impl FdTable {
             idx: idx as u8,
             writer: true,
         };
-        // SAFETY: `pipefd_va` is a writable [i32; 2] in the calling cell.
-        unsafe {
-            let p = pipefd_va as *mut i32;
-            p.write(rd as i32);
-            p.add(1).write(wr as i32);
+        self.flags[wr] = FdFlags::new(1); // write end: O_WRONLY
+        if flags & O_CLOEXEC != 0 {
+            self.flags[rd].cloexec = true;
+            self.flags[wr].cloexec = true;
+        }
+        // Creation-time O_NONBLOCK, honoured on both ends (see `set_open_flags`).
+        if flags & O_NONBLOCK != 0 {
+            self.flags[rd].nonblock = true;
+            self.flags[wr].nonblock = true;
+        }
+        // Through `uaccess`: bounded, present, and copy-on-write resolved before the
+        // store (a fresh pipe's fd pair often lands on a stack shared by a fork).
+        if !crate::uaccess::write::<i32>(pipefd_va, rd as i32)
+            || !crate::uaccess::write::<i32>(pipefd_va + 4, wr as i32)
+        {
+            return -EFAULT;
         }
         0
     }
@@ -238,6 +369,7 @@ impl FdTable {
                     ep, bound: true, ..
                 } => inetsock::addref_dgram(ep),
                 FdKind::Epoll { ep } => epoll::addref(ep),
+                FdKind::EventFd { ev } => eventfd::addref(ev),
                 _ => {}
             }
         }
@@ -264,6 +396,12 @@ impl FdTable {
         usize_fd(fd).is_some_and(|s| matches!(self.fds[s], FdKind::Console(_)))
     }
 
+    /// True if `fd` is the **console input** descriptor - the one read that can
+    /// block on console input (docs/ARCHITECTURE-DEBT.md 2.4).
+    pub fn is_console_in(&self, fd: i64) -> bool {
+        usize_fd(fd).is_some_and(|s| matches!(self.fds[s], FdKind::Console(0)))
+    }
+
     /// True if `fd` refers to an open descriptor (used by `poll` to distinguish
     /// a valid fd from a closed one).
     pub fn is_open(&self, fd: i64) -> bool {
@@ -271,46 +409,64 @@ impl FdTable {
     }
 
     /// read(fd, buf, count).
+    ///
+    /// `buf_va` is bound to the calling cell's user VA range here rather than
+    /// only at the syscall entry, because `readv`/`writev` reach this with a
+    /// **per-iovec** base the entry check never saw (docs/ENGINEERING.md 12).
     pub fn read(&mut self, fd: i64, buf_va: u64, count: u64) -> i64 {
         let Some(slot) = usize_fd(fd) else {
             return -EBADF;
         };
+        if crate::user::user_buf_mut(buf_va, count as usize).is_none() {
+            return -EFAULT;
+        }
         match self.fds[slot] {
+            // stdin. Bytes come from the kernel's console **RX ring**
+            // (`crate::input`), which is the same buffer the UART RX interrupt fills
+            // and the same one the scheduler drains when a parked reader wakes - so a
+            // blocking and a non-blocking read cannot disagree about what has
+            // arrived. `sys_read` decides *whether* to park before reaching here
+            // (docs/ARCHITECTURE-DEBT.md 2.4); this is the non-blocking drain.
+            //
+            // Before that, this read went straight to the UART FIFO and answered 0 on
+            // an empty console - "end of input", which was a lie to every reader.
             FdKind::Console(0) => {
-                // Non-blocking stdin: drain the serial RX FIFO (0 if empty).
-                let buf =
-                    unsafe { core::slice::from_raw_parts_mut(buf_va as *mut u8, count as usize) };
-                let mut n = 0;
-                while n < buf.len() {
-                    match arch::serial_read_byte() {
-                        Some(b) => {
-                            buf[n] = b;
-                            n += 1;
-                        }
-                        None => break,
+                // SAFETY: `[buf_va, buf_va+count)` was range-checked above and the
+                // calling cell's address space is active.
+                let n = unsafe { crate::input::drain(buf_va, count as usize) };
+                if n == 0 && count > 0 {
+                    if self.flags[slot].nonblock {
+                        return -EAGAIN;
                     }
+                    // Reached only when the caller was allowed to see end of input
+                    // (`sys_read` parks otherwise).
+                    return 0;
                 }
                 n as i64
             }
             FdKind::Console(_) => -EBADF,
             FdKind::Null => 0,
             FdKind::Zero => {
-                let buf =
-                    unsafe { core::slice::from_raw_parts_mut(buf_va as *mut u8, count as usize) };
-                buf.fill(0);
+                if !crate::uaccess::fill(buf_va, 0, count as usize) {
+                    return -EFAULT;
+                }
                 count as i64
             }
             FdKind::Urandom => {
-                let buf =
-                    unsafe { core::slice::from_raw_parts_mut(buf_va as *mut u8, count as usize) };
+                // SAFETY: `uaccess::slice` bounds, faults in and un-shares the range;
+                // we are servicing this cell's synchronous trap.
+                let Some(buf) = (unsafe { crate::uaccess::slice(buf_va, count as usize) }) else {
+                    return -EFAULT;
+                };
                 crate::rng::derive_cell_drbg().fill_bytes(buf);
                 count as i64
             }
             FdKind::ProcAuxv { pos } => {
                 let end = self.auxv_len;
                 let n = (end - pos.min(end)).min(count as usize);
-                let buf = unsafe { core::slice::from_raw_parts_mut(buf_va as *mut u8, n) };
-                buf.copy_from_slice(&self.auxv[pos..pos + n]);
+                if !crate::uaccess::copy_out(buf_va, &self.auxv[pos..pos + n]) {
+                    return -EFAULT;
+                }
                 self.fds[slot] = FdKind::ProcAuxv { pos: pos + n };
                 n as i64
             }
@@ -332,12 +488,38 @@ impl FdTable {
                     pipe::ReadNb::WouldBlock => -EAGAIN,
                 }
             }
+            // A connected **remote** TCP socket (rheo-net N4b): the byte stream lives
+            // in the registered `svc::SocketOps` datapath, not in a local ring. A
+            // non-blocking descriptor passes a zero deadline, so the bridge drains
+            // what has already arrived and reports -EAGAIN rather than parking.
+            FdKind::InetTcpRemote { h, .. } => match svc::socket_ops() {
+                Some(o) => (o.tcp_recv)(
+                    h as u64,
+                    buf_va,
+                    count,
+                    if self.flags[slot].nonblock {
+                        0
+                    } else {
+                        REMOTE_RECV_TIMEOUT_NS
+                    },
+                ),
+                None => -ENETUNREACH,
+            },
             FdKind::SockFresh
             | FdKind::SockListen { .. }
             | FdKind::InetStreamFresh { .. }
             | FdKind::InetListen { .. }
-            | FdKind::InetDgram { .. } => -ENOTCONN,
+            | FdKind::InetDgram { .. }
+            | FdKind::InetUdpRemote { .. } => -ENOTCONN,
             FdKind::Epoll { .. } => -EINVAL,
+            // An eventfd read drains the counter. Non-blocking here, like a pipe:
+            // the parking path is `mod::sys_read`, which intercepts eventfd fds
+            // before reaching this table (readv falls through to this behaviour).
+            FdKind::EventFd { ev } => match eventfd::read(ev, buf_va, count) {
+                Ok(eventfd::ReadNb::Done) => 8,
+                Ok(eventfd::ReadNb::WouldBlock) => -EAGAIN,
+                Err(e) => e,
+            },
             FdKind::Vfs { vfs_fd, .. } => match svc::file_ops() {
                 Some(o) => (o.read)(vfs_fd as u64, buf_va, count),
                 None => -EBADF,
@@ -346,14 +528,22 @@ impl FdTable {
         }
     }
 
-    /// write(fd, buf, count).
+    /// write(fd, buf, count). `buf_va` is bound to the calling cell's user VA
+    /// range (see [`Fds::read`] for why the check is here, not only at entry).
     pub fn write(&mut self, fd: i64, buf_va: u64, count: u64) -> i64 {
         let Some(slot) = usize_fd(fd) else {
             return -EBADF;
         };
+        if crate::user::user_buf(buf_va, count as usize).is_none() {
+            return -EFAULT;
+        }
         match self.fds[slot] {
             FdKind::Console(0) => -EBADF,
             FdKind::Console(_) => {
+                if crate::uaccess::buf(buf_va, count as usize).is_none() {
+                    return -EFAULT;
+                }
+                // SAFETY: `uaccess::buf` validated the range readable in the active cell.
                 let buf =
                     unsafe { core::slice::from_raw_parts(buf_va as *const u8, count as usize) };
                 for &b in buf {
@@ -380,12 +570,19 @@ impl FdTable {
                     pipe::WriteNb::Epipe => -EPIPE,
                 }
             }
+            // A connected **remote** TCP socket (rheo-net N4b).
+            FdKind::InetTcpRemote { h, .. } => match svc::socket_ops() {
+                Some(o) => (o.tcp_send)(h as u64, buf_va, count),
+                None => -ENETUNREACH,
+            },
             FdKind::SockFresh
             | FdKind::SockListen { .. }
             | FdKind::InetStreamFresh { .. }
             | FdKind::InetListen { .. }
-            | FdKind::InetDgram { .. } => -ENOTCONN,
+            | FdKind::InetDgram { .. }
+            | FdKind::InetUdpRemote { .. } => -ENOTCONN,
             FdKind::Epoll { .. } => -EINVAL,
+            FdKind::EventFd { ev } => eventfd::write(ev, buf_va, count),
             FdKind::Vfs { vfs_fd, .. } => match svc::file_ops() {
                 Some(o) => (o.write)(vfs_fd as u64, buf_va, count),
                 None => -EBADF,
@@ -402,6 +599,26 @@ impl FdTable {
     /// readable this way; other fd kinds return -EBADF (ld.so maps regular
     /// files only). A short read leaves the tail of `dst` untouched (mmap
     /// pre-zeroes its frames).
+    /// The VFS path behind `fd`, copied into `out`, returning its length - the
+    /// hook a **file-backed mapping** needs so it can open the file *again* and own
+    /// its own handle (`linux::filemap`). `ld.so` closes the fd right after `mmap`,
+    /// so a mapping that kept the caller's descriptor would reference a closed and
+    /// soon-reused one.
+    ///
+    /// `None` for anything that is not a VFS file: a mapping can only be backed by
+    /// something the VFS can re-open.
+    pub fn vfs_path(&self, fd: i64, out: &mut [u8]) -> Option<usize> {
+        let slot = usize_fd(fd)?;
+        match self.fds[slot] {
+            FdKind::Vfs { path, path_len, .. } => {
+                let n = (path_len as usize).min(out.len());
+                out[..n].copy_from_slice(&path[..n]);
+                Some(n)
+            }
+            _ => None,
+        }
+    }
+
     pub fn pread(&self, fd: i64, dst: u64, len: u64, offset: i64) -> i64 {
         let Some(slot) = usize_fd(fd) else {
             return -EBADF;
@@ -427,6 +644,11 @@ impl FdTable {
             // Relative-to-a-dirfd resolution is L3 (docs/LINUX-COMPAT.md).
             return -ENOSYS;
         }
+        if crate::uaccess::buf(path_va, path_len).is_none() {
+            return -EFAULT;
+        }
+        // SAFETY: `uaccess::buf` bounded and faulted in `[path_va, path_va+path_len)`
+        // in the active cell.
         let bytes = unsafe { core::slice::from_raw_parts(path_va as *const u8, path_len) };
         let name = &bytes[..bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len())];
 
@@ -442,6 +664,7 @@ impl FdTable {
         };
         if let Some(kind) = dev {
             self.fds[slot] = kind;
+            self.set_open_flags(slot, flags);
             return slot as i64;
         }
         let Some(o) = svc::file_ops() else {
@@ -460,7 +683,27 @@ impl FdTable {
             path_len: plen as u16,
             dir_off: 0,
         };
+        self.set_open_flags(slot, flags);
         slot as i64
+    }
+
+    /// Record the access mode, `O_CLOEXEC` and `O_NONBLOCK` an `openat` was given.
+    ///
+    /// **Creation-time `O_NONBLOCK` is now honoured** (docs/ARCHITECTURE-DEBT.md
+    /// 2.4). It could not be before, and the reason is worth recording because it was
+    /// not laziness: `poll` reported every descriptor ready for whatever was asked,
+    /// so a program that opened a descriptor non-blocking, polled it, and then read it
+    /// would have been told "ready", read `-EAGAIN`, and spun forever. Honouring the
+    /// flag was only safe once `poll` computed real readiness - which is why the two
+    /// landed in the same slice.
+    ///
+    /// `O_APPEND`/`O_ASYNC` are still **refused** by `fcntl` rather than silently
+    /// accepted here (docs/ENGINEERING.md 7); a `VFS` open with them is a no-op
+    /// because the VFS has no append mode, which the honesty table states.
+    fn set_open_flags(&mut self, slot: usize, flags: u64) {
+        self.flags[slot] = FdFlags::new((flags & O_ACCMODE) as u8);
+        self.flags[slot].cloexec = flags & O_CLOEXEC != 0;
+        self.flags[slot].nonblock = flags & O_NONBLOCK != 0;
     }
 
     /// close(fd).
@@ -485,15 +728,32 @@ impl FdTable {
             FdKind::InetDgram {
                 ep, bound: true, ..
             } => inetsock::close_dgram(ep),
+            // Remote (NIC-backed) sockets: release the bridge's handle. These are
+            // NOT reference-counted across `dup`/`fork` - a duplicated remote
+            // socket aliases one handle and the first close releases it (a
+            // documented N4b deferral, docs/LINUX-COMPAT.md L8-INET remote).
+            FdKind::InetUdpRemote { ep, .. } => {
+                if let Some(o) = svc::socket_ops() {
+                    (o.udp_close)(ep as u64);
+                }
+            }
+            FdKind::InetTcpRemote { h, .. } => {
+                if let Some(o) = svc::socket_ops() {
+                    (o.tcp_close)(h as u64);
+                }
+            }
             FdKind::Epoll { ep } => epoll::close(ep),
+            FdKind::EventFd { ev } => eventfd::close(ev),
             _ => {}
         }
         self.fds[slot] = FdKind::Closed;
+        self.flags[slot] = FdFlags::new(ACC_RDWR);
         0
     }
 
     /// dup(oldfd) - lowest free slot. Vfs entries share the underlying VFS fd
-    /// (close-once semantics; acceptable for the L2 fixtures).
+    /// (close-once semantics; acceptable for the L2 fixtures). Per POSIX the new
+    /// descriptor does **not** inherit `FD_CLOEXEC`.
     pub fn dup(&mut self, oldfd: i64) -> i64 {
         let Some(old) = usize_fd(oldfd) else {
             return -EBADF;
@@ -505,6 +765,8 @@ impl FdTable {
             return -EMFILE;
         };
         self.fds[slot] = self.fds[old];
+        self.flags[slot] = self.flags[old];
+        self.flags[slot].cloexec = false;
         self.bump_if_pipe(slot);
         slot as i64
     }
@@ -520,6 +782,12 @@ impl FdTable {
         if old != new {
             self.close(newfd);
             self.fds[new] = self.fds[old];
+            // dup2/dup3(flags = 0): the new descriptor is explicitly NOT
+            // close-on-exec, whatever the old one was. A pipeline child dup2s a
+            // pipe end onto fd 0/1 and then `execve`s, so getting this backwards
+            // would close the pipeline.
+            self.flags[new] = self.flags[old];
+            self.flags[new].cloexec = false;
             self.bump_if_pipe(new);
         }
         new as i64
@@ -540,18 +808,58 @@ impl FdTable {
                 ep, bound: true, ..
             } => inetsock::addref_dgram(ep),
             FdKind::Epoll { ep } => epoll::addref(ep),
+            FdKind::EventFd { ev } => eventfd::addref(ev),
             _ => {}
         }
     }
 
-    /// fcntl(fd, cmd, arg) - the minimal subset glibc needs.
+    /// fcntl(fd, cmd, arg).
+    ///
+    /// **What changed and why** (docs/ENGINEERING.md 7): this used to end in
+    /// `_ => 0`, so *every* command it did not implement - `F_SETLK`, `F_SETOWN`,
+    /// `F_GETPIPE_SZ`, `F_ADD_SEALS`, anything a future libc probes - reported
+    /// success while doing nothing. A feature probe that asks "can you lock this
+    /// file?" was told yes. An unimplemented command now **fails**, with a
+    /// distinguishable error per family, so the probe learns the truth:
+    ///
+    /// - file **locking** (`F_GETLK`/`F_SETLK`/`F_SETLKW` and their OFD forms) ->
+    ///   `-ENOLCK`: there is no lock manager in this personality, which is exactly
+    ///   what POSIX's "no locks available" says;
+    /// - everything else unimplemented -> `-EINVAL`, the errno Linux itself uses
+    ///   for an unrecognised `cmd`.
+    ///
+    /// `F_GETFL`/`F_SETFL` are now real: the access mode is the one the descriptor
+    /// was opened with (not a hardcoded `O_RDWR`), and `O_NONBLOCK` is **tracked
+    /// and honoured** - a would-block read/write on a non-blocking descriptor
+    /// returns `-EAGAIN` instead of parking the cell or reporting 0. `O_APPEND` and
+    /// `O_ASYNC` are **refused** (`-EINVAL`) rather than accepted-and-dropped: this
+    /// personality does not reposition on write and delivers no SIGIO.
+    ///
+    /// **Creation-time** `O_NONBLOCK`/`SOCK_NONBLOCK` (`open`/`socket`/`socketpair`/
+    /// `accept4`/`pipe2`) is now honoured too (docs/ARCHITECTURE-DEBT.md 2.4). It
+    /// could not be before, and the reason is the interesting part: `poll` reported
+    /// every open descriptor ready without consulting readiness at all, so a
+    /// non-blocking program's poll-then-read loop would be told "ready", read
+    /// `-EAGAIN`, and spin. glibc's resolver is exactly such a program - it creates
+    /// its UDP socket with `SOCK_NONBLOCK` - and DNS worked *because* the flag was
+    /// dropped and its `recvfrom` therefore blocked. Honouring the flag is only
+    /// correct alongside a `poll` that computes real readiness **and waits** for it,
+    /// which is why both landed in one slice: the resolver now blocks in `poll` until
+    /// the reply is on the socket, then its non-blocking `recvfrom` succeeds.
     pub fn fcntl(&mut self, fd: i64, cmd: u64, arg: u64) -> i64 {
         const F_DUPFD: u64 = 0;
         const F_GETFD: u64 = 1;
         const F_SETFD: u64 = 2;
         const F_GETFL: u64 = 3;
         const F_SETFL: u64 = 4;
+        const F_GETLK: u64 = 5;
+        const F_SETLK: u64 = 6;
+        const F_SETLKW: u64 = 7;
+        const F_OFD_GETLK: u64 = 36;
+        const F_OFD_SETLK: u64 = 37;
+        const F_OFD_SETLKW: u64 = 38;
         const F_DUPFD_CLOEXEC: u64 = 1030;
+        const F_GETPIPE_SZ: u64 = 1032;
         let Some(slot) = usize_fd(fd) else {
             return -EBADF;
         };
@@ -565,12 +873,48 @@ impl FdTable {
                     return -EMFILE;
                 };
                 self.fds[dst] = self.fds[slot];
+                self.flags[dst] = self.flags[slot];
+                self.flags[dst].cloexec = cmd == F_DUPFD_CLOEXEC;
                 self.bump_if_pipe(dst);
                 dst as i64
             }
-            F_GETFD | F_SETFD | F_SETFL => 0,
-            F_GETFL => 2, // O_RDWR - the personality does not track open flags
-            _ => 0,
+            F_GETFD => {
+                if self.flags[slot].cloexec {
+                    FD_CLOEXEC as i64
+                } else {
+                    0
+                }
+            }
+            F_SETFD => {
+                self.flags[slot].cloexec = arg & FD_CLOEXEC != 0;
+                0
+            }
+            F_GETFL => {
+                (self.flags[slot].accmode as u64
+                    | if self.flags[slot].nonblock {
+                        O_NONBLOCK
+                    } else {
+                        0
+                    }) as i64
+            }
+            F_SETFL => {
+                // Linux ignores the access mode and the creation flags here, so
+                // only the status bits matter. Refuse the two we cannot honour
+                // rather than drop them silently.
+                if arg & (O_APPEND | O_ASYNC) != 0 {
+                    return -EINVAL;
+                }
+                self.flags[slot].nonblock = arg & O_NONBLOCK != 0;
+                0
+            }
+            // A real answer where there is one: the pipe ring's actual capacity.
+            F_GETPIPE_SZ if matches!(self.fds[slot], FdKind::Pipe { .. }) => pipe::PIPE_CAP as i64,
+            // No lock manager exists - say so, with the errno POSIX reserves for it.
+            F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => -ENOLCK,
+            other => {
+                crate::println!("linux: fcntl cmd {other} unsupported");
+                -EINVAL
+            }
         }
     }
 
@@ -593,7 +937,10 @@ impl FdTable {
             | FdKind::InetListen { .. }
             | FdKind::InetConn { .. }
             | FdKind::InetDgram { .. }
-            | FdKind::Epoll { .. } => -ESPIPE,
+            | FdKind::InetUdpRemote { .. }
+            | FdKind::InetTcpRemote { .. }
+            | FdKind::Epoll { .. }
+            | FdKind::EventFd { .. } => -ESPIPE,
             FdKind::Closed => -EBADF,
         }
     }
@@ -635,8 +982,16 @@ impl FdTable {
             | FdKind::InetListen { .. }
             | FdKind::InetConn { .. }
             | FdKind::InetDgram { .. }
+            | FdKind::InetUdpRemote { .. }
+            | FdKind::InetTcpRemote { .. }
             | FdKind::Epoll { .. } => {
                 Stat::new(S_IFSOCK | 0o600, 0, 1, 1, 1000, 1000, 0, 4096, 0, 0)
+            }
+            // An eventfd is an anonymous inode, which Linux reports as a regular
+            // file of size 0 - not a socket. glibc's `fstat` on it must not look
+            // like something you can `recv` from.
+            FdKind::EventFd { .. } => {
+                Stat::new(dirent::S_IFREG | 0o600, 0, 1, 1, 1000, 1000, 0, 4096, 0, 0)
             }
             FdKind::Vfs { vfs_fd, .. } => {
                 let Some(o) = svc::file_ops() else {
@@ -654,8 +1009,12 @@ impl FdTable {
                 Stat::new(mode, native.size, 1, 1, 1000, 1000, 0, 4096, blocks, 0)
             }
         };
-        // SAFETY: `statbuf_va` is a writable VA in the calling cell.
-        unsafe { (statbuf_va as *mut Stat).write(st) };
+        let Some(out) = crate::user::user_out::<Stat>(statbuf_va) else {
+            return -EFAULT;
+        };
+        // SAFETY: `out` was validated non-null, `Stat`-aligned and inside the
+        // calling cell's user VA range; its address space is active.
+        unsafe { out.write(st) };
         0
     }
 
@@ -680,7 +1039,10 @@ impl FdTable {
             | FdKind::InetListen { .. }
             | FdKind::InetConn { .. }
             | FdKind::InetDgram { .. }
+            | FdKind::InetUdpRemote { .. }
+            | FdKind::InetTcpRemote { .. }
             | FdKind::Epoll { .. } => Ok((S_IFSOCK | 0o600, 0)),
+            FdKind::EventFd { .. } => Ok((dirent::S_IFREG | 0o600, 0)),
             FdKind::Vfs { vfs_fd, .. } => {
                 let Some(o) = svc::file_ops() else {
                     return Err(-EBADF);
@@ -756,7 +1118,11 @@ impl FdTable {
             return 0; // end of directory
         }
         // Copy whole records from dir_off while they fit the caller's buffer.
-        let out = unsafe { core::slice::from_raw_parts_mut(buf_va as *mut u8, len as usize) };
+        // SAFETY: `uaccess::slice` bounds it, faults it in and un-shares it; we are
+        // servicing this cell's synchronous trap.
+        let Some(out) = (unsafe { crate::uaccess::slice(buf_va, len as usize) }) else {
+            return -EFAULT;
+        };
         let mut cur = dir_off;
         let mut oi = 0usize;
         while cur < total {
@@ -796,8 +1162,9 @@ impl FdTable {
     }
 
     /// socket(domain, type, protocol): an unbound socket. AF_UNIX stream (L8) or
-    /// an AF_INET/AF_INET6 loopback stream/datagram socket (L8-INET). The type's
-    /// high bits (SOCK_CLOEXEC/SOCK_NONBLOCK) are accepted + ignored.
+    /// an AF_INET/AF_INET6 loopback stream/datagram socket (L8-INET).
+    /// `SOCK_CLOEXEC` and `SOCK_NONBLOCK` (== `O_NONBLOCK`) in the type's high bits
+    /// are both **honoured** (docs/ARCHITECTURE-DEBT.md 2.4).
     pub fn socket(&mut self, domain: u64, ty: u64) -> i64 {
         match domain {
             AF_UNIX => {
@@ -808,6 +1175,9 @@ impl FdTable {
                     return -EMFILE;
                 };
                 self.fds[slot] = FdKind::SockFresh;
+                self.flags[slot] = FdFlags::new(ACC_RDWR);
+                self.flags[slot].cloexec = ty & O_CLOEXEC != 0;
+                self.flags[slot].nonblock = ty & O_NONBLOCK != 0;
                 slot as i64
             }
             AF_INET | AF_INET6 => {
@@ -825,15 +1195,18 @@ impl FdTable {
                     },
                     _ => return -EPROTONOSUPPORT,
                 };
+                self.flags[slot] = FdFlags::new(ACC_RDWR);
+                self.flags[slot].cloexec = ty & O_CLOEXEC != 0;
+                self.flags[slot].nonblock = ty & O_NONBLOCK != 0;
                 slot as i64
             }
             _ => -EAFNOSUPPORT,
         }
     }
 
-    /// epoll_create1(flags): an epoll instance as a new fd (L8-INET). Flags
-    /// (EPOLL_CLOEXEC) are accepted + ignored.
-    pub fn epoll_create(&mut self) -> i64 {
+    /// epoll_create1(flags): an epoll instance as a new fd (L8-INET).
+    /// `EPOLL_CLOEXEC` is honoured.
+    pub fn epoll_create(&mut self, flags: u64) -> i64 {
         let Some(ep) = epoll::create() else {
             return -ENFILE;
         };
@@ -842,7 +1215,82 @@ impl FdTable {
             return -EMFILE;
         };
         self.fds[slot] = FdKind::Epoll { ep };
+        self.flags[slot] = FdFlags::new(ACC_RDWR);
+        self.flags[slot].cloexec = flags & O_CLOEXEC != 0;
         slot as i64
+    }
+
+    /// `eventfd2(initval, flags)`: a counter as a new fd
+    /// (docs/LINUX-COMPAT.md L8-EVENTFD). `EFD_CLOEXEC` and `EFD_NONBLOCK` are
+    /// honoured on the descriptor (the flags the descriptor owns); `EFD_SEMAPHORE`
+    /// belongs to the object and is passed to the registry. Any other flag bit is
+    /// `-EINVAL` rather than ignored - a dropped flag is a silent wrong answer.
+    pub fn eventfd_create(&mut self, initval: u64, flags: u64) -> i64 {
+        use eventfd::{EFD_CLOEXEC, EFD_NONBLOCK, EFD_SEMAPHORE};
+        if flags & !(EFD_CLOEXEC | EFD_NONBLOCK | EFD_SEMAPHORE) != 0 {
+            return -EINVAL;
+        }
+        let Some(ev) = eventfd::create(initval, flags & EFD_SEMAPHORE != 0) else {
+            return -ENFILE;
+        };
+        let Some(slot) = self.free_slot(3) else {
+            eventfd::close(ev);
+            return -EMFILE;
+        };
+        self.fds[slot] = FdKind::EventFd { ev };
+        self.flags[slot] = FdFlags::new(ACC_RDWR);
+        self.flags[slot].cloexec = flags & EFD_CLOEXEC != 0;
+        self.flags[slot].nonblock = flags & EFD_NONBLOCK != 0;
+        slot as i64
+    }
+
+    /// `close_range(first, last, flags)`: close every open descriptor in the
+    /// inclusive range (docs/ARCHITECTURE-DEBT.md 4.0, blocker 3).
+    ///
+    /// glibc falls back to a `close` loop on `-ENOSYS`, so this is a *performance*
+    /// call rather than a functional one - but a loop over 64 descriptors is 64
+    /// syscalls, and the call is trivial to serve correctly. Closed slots in the
+    /// range are skipped, not an error, exactly as Linux does. `CLOSE_RANGE_CLOEXEC`
+    /// (mark rather than close) is honoured; `CLOSE_RANGE_UNSHARE` needs an fd table
+    /// this personality does not share separately from the address space, so it is
+    /// refused `-EINVAL` rather than silently ignored.
+    pub fn close_range(&mut self, first: u64, last: u64, flags: u64) -> i64 {
+        const CLOSE_RANGE_UNSHARE: u64 = 1 << 1;
+        const CLOSE_RANGE_CLOEXEC: u64 = 1 << 2;
+        if flags & !CLOSE_RANGE_CLOEXEC != 0 {
+            // Includes CLOSE_RANGE_UNSHARE, deliberately.
+            let _ = CLOSE_RANGE_UNSHARE;
+            return -EINVAL;
+        }
+        if first > last {
+            return -EINVAL;
+        }
+        let lo = first as usize;
+        // `last` is commonly `UINT_MAX` ("everything above"), so clamp rather than
+        // iterate to it.
+        let hi = (last as usize).min(NFD - 1);
+        for slot in lo..=hi.max(lo) {
+            if slot >= NFD || matches!(self.fds[slot], FdKind::Closed) {
+                continue;
+            }
+            if flags & CLOSE_RANGE_CLOEXEC != 0 {
+                self.flags[slot].cloexec = true;
+            } else {
+                self.close(slot as i64);
+            }
+        }
+        0
+    }
+
+    /// The registry index behind `fd` if it is an eventfd - the hook `sys_read`
+    /// uses to intercept a blocking read before the non-blocking table path, the
+    /// same shape as [`Self::pipe_end`].
+    pub fn eventfd_of(&self, fd: i64) -> Option<u8> {
+        let slot = usize_fd(fd)?;
+        match self.fds[slot] {
+            FdKind::EventFd { ev } => Some(ev),
+            _ => None,
+        }
     }
 
     /// epoll_ctl(epfd, op, fd, event): register/modify/remove a watched fd. Reads
@@ -856,13 +1304,16 @@ impl FdTable {
             return -EINVAL;
         };
         let (events, data) = if event_va != 0 {
-            // SAFETY: `event_va` is a caller-provided `struct epoll_event`.
-            unsafe {
-                let ev = (event_va as *const u32).read_unaligned();
-                let d = ((event_va + arch::linux_abi::EPOLL_EVENT_DATA_OFFSET as u64)
-                    as *const u64)
-                    .read_unaligned();
-                (ev, d)
+            // `data` sits at a per-ISA offset the ABI does not promise to align, so
+            // both fields are read unaligned - through `uaccess`, which bounds and
+            // faults in the `struct epoll_event` first.
+            let doff = arch::linux_abi::EPOLL_EVENT_DATA_OFFSET as u64;
+            match (
+                crate::uaccess::read_unaligned::<u32>(event_va),
+                crate::uaccess::read_unaligned::<u64>(event_va + doff),
+            ) {
+                (Some(ev), Some(d)) => (ev, d),
+                _ => return -EFAULT,
             }
         } else {
             (0, 0)
@@ -898,11 +1349,10 @@ impl FdTable {
             }
             if re != 0 {
                 let base = events_va + out as u64 * size;
-                // SAFETY: `events_va` is a caller-provided array of `maxevents`
-                // `struct epoll_event`; `out < maxevents`.
-                unsafe {
-                    (base as *mut u32).write_unaligned(re);
-                    ((base + doff) as *mut u64).write_unaligned(data);
+                if !crate::uaccess::write_unaligned::<u32>(base, re)
+                    || !crate::uaccess::write_unaligned::<u64>(base + doff, data)
+                {
+                    return -EFAULT;
                 }
                 out += 1;
             }
@@ -910,8 +1360,84 @@ impl FdTable {
         out as i64
     }
 
+    /// How many of instance `epfd`'s watched fds are ready right now. The
+    /// satisfiability test for a **blocking** `epoll_wait`
+    /// (docs/ARCHITECTURE-DEBT.md 2.4): computed from kernel state only, so the
+    /// scheduler can ask it while another cell's address space is active.
+    pub fn epoll_ready(&self, epfd: i64) -> usize {
+        let Some(slot) = usize_fd(epfd) else {
+            return 0;
+        };
+        let FdKind::Epoll { ep } = self.fds[slot] else {
+            return 0;
+        };
+        let mut snap = [(0i32, 0u32, 0u64); epoll::MAX_WATCH];
+        let n = epoll::snapshot(ep, &mut snap);
+        snap[..n]
+            .iter()
+            .filter(|&&(wfd, wevents, _)| {
+                (wevents & epoll::EPOLLIN != 0 && self.pollin_ready(wfd as i64))
+                    || (wevents & epoll::EPOLLOUT != 0 && self.pollout_ready(wfd as i64))
+            })
+            .count()
+    }
+
+    /// The union of wake sources instance `epfd`'s watched fds can be woken by, so
+    /// the scheduler knows what to idle on (docs/ARCHITECTURE-DEBT.md 2.4). Empty
+    /// means nothing could ever make this set ready, and `epoll_wait` must not park.
+    pub fn epoll_sources(&self, epfd: i64) -> crate::idle::Sources {
+        let Some(slot) = usize_fd(epfd) else {
+            return 0;
+        };
+        let FdKind::Epoll { ep } = self.fds[slot] else {
+            return 0;
+        };
+        let mut snap = [(0i32, 0u32, 0u64); epoll::MAX_WATCH];
+        let n = epoll::snapshot(ep, &mut snap);
+        snap[..n]
+            .iter()
+            .fold(0, |acc, &(wfd, _, _)| acc | self.fd_sources(wfd as i64))
+    }
+
+    /// What can make descriptor `fd` change readiness (docs/ARCHITECTURE-DEBT.md
+    /// 2.4). This is the per-`FdKind` answer to "if a cell blocks on this, what wakes
+    /// it?", and it is what keeps a blocking `poll`/`epoll_wait` from parking on a
+    /// condition nothing can produce.
+    ///
+    /// A **remote** (NIC-backed) socket is woken by the network; a pipe or a
+    /// loopback socket by another *process*; the console by console input. Everything
+    /// whose readiness is constant (a regular file, `/dev/null`, a closed fd) has no
+    /// source at all - it is either already ready or never will be, and in both cases
+    /// parking is wrong.
+    pub fn fd_sources(&self, fd: i64) -> crate::idle::Sources {
+        use crate::idle;
+        let Some(slot) = usize_fd(fd) else {
+            return 0;
+        };
+        match self.fds[slot] {
+            FdKind::Pipe { .. }
+            | FdKind::SockConn { .. }
+            | FdKind::InetConn { .. }
+            | FdKind::SockListen { .. }
+            | FdKind::InetListen { .. }
+            | FdKind::InetDgram { .. }
+            // An eventfd's counter only ever changes because another *cell* wrote
+            // it (a sibling context writing it does not park the cell at all), so
+            // the wake source is a peer, exactly as for a pipe.
+            | FdKind::EventFd { .. } => idle::PEER,
+            FdKind::InetUdpRemote { .. } | FdKind::InetTcpRemote { .. } => idle::NET,
+            FdKind::Console(0) => idle::CONSOLE,
+            // An epoll fd's own readiness is the union of what it watches; asking
+            // recursively would need a depth bound, and nesting epolls is outside
+            // this personality's scope (docs/LINUX-COMPAT.md L8-INET).
+            FdKind::Epoll { .. } => 0,
+            _ => 0,
+        }
+    }
+
     /// socketpair(domain, type, protocol, sv): two connected AF_UNIX sockets
     /// backed by two direction rings (L8). Writes the fd pair into `sv_va`.
+    /// `SOCK_CLOEXEC` is honoured on both ends.
     pub fn socketpair(&mut self, domain: u64, ty: u64, sv_va: u64) -> i64 {
         if let Err(e) = Self::check_stream(domain, ty) {
             return e;
@@ -932,11 +1458,16 @@ impl FdTable {
             return -EMFILE;
         };
         self.fds[s1] = FdKind::SockConn { rx: b_rx, tx: b_tx };
-        // SAFETY: `sv_va` is a writable [i32; 2] in the calling cell.
-        unsafe {
-            let p = sv_va as *mut i32;
-            p.write(s0 as i32);
-            p.add(1).write(s1 as i32);
+        self.flags[s0] = FdFlags::new(ACC_RDWR);
+        self.flags[s1] = FdFlags::new(ACC_RDWR);
+        self.flags[s0].cloexec = ty & O_CLOEXEC != 0;
+        self.flags[s1].cloexec = ty & O_CLOEXEC != 0;
+        self.flags[s0].nonblock = ty & O_NONBLOCK != 0;
+        self.flags[s1].nonblock = ty & O_NONBLOCK != 0;
+        if !crate::uaccess::write::<i32>(sv_va, s0 as i32)
+            || !crate::uaccess::write::<i32>(sv_va + 4, s1 as i32)
+        {
+            return -EFAULT;
         }
         0
     }
@@ -963,7 +1494,7 @@ impl FdTable {
             }
             // AF_INET stream: record the local port; `listen` registers it.
             FdKind::InetStreamFresh { v6, .. } => {
-                let Some((av6, port, _)) = read_inaddr(addr_va, addrlen) else {
+                let Some((av6, port, _, _)) = read_inaddr(addr_va, addrlen) else {
                     return -EINVAL;
                 };
                 if av6 != v6 {
@@ -979,7 +1510,7 @@ impl FdTable {
             FdKind::InetDgram {
                 v6, bound: false, ..
             } => {
-                let Some((av6, port, _)) = read_inaddr(addr_va, addrlen) else {
+                let Some((av6, port, _, _)) = read_inaddr(addr_va, addrlen) else {
                     return -EINVAL;
                 };
                 if av6 != v6 {
@@ -1038,20 +1569,69 @@ impl FdTable {
             return -EBADF;
         };
         match self.fds[slot] {
-            FdKind::SockConn { .. } | FdKind::InetConn { .. } => return -EISCONN,
-            FdKind::SockFresh | FdKind::InetStreamFresh { .. } | FdKind::InetDgram { .. } => {}
+            FdKind::SockConn { .. } | FdKind::InetConn { .. } | FdKind::InetTcpRemote { .. } => {
+                return -EISCONN;
+            }
+            FdKind::SockFresh
+            | FdKind::InetStreamFresh { .. }
+            | FdKind::InetDgram { .. }
+            | FdKind::InetUdpRemote { .. } => {}
             _ => return -EINVAL,
+        }
+        // A UDP socket already on the remote datapath: just re-point its default
+        // destination (a `connect` on a datagram socket sets no state on the wire).
+        if let FdKind::InetUdpRemote { ep, port, .. } = self.fds[slot] {
+            let Some((_, dport, dst, loop_ok)) = read_inaddr(addr_va, addrlen) else {
+                return -EINVAL;
+            };
+            if loop_ok {
+                return -EINVAL; // cannot fall back to loopback once remote
+            }
+            self.fds[slot] = FdKind::InetUdpRemote {
+                ep,
+                port,
+                peer_ip: dst,
+                peer_port: dport,
+            };
+            return 0;
         }
         // AF_INET stream: look up the loopback listener, allocate the ring pair.
         if let FdKind::InetStreamFresh { v6, local_port } = self.fds[slot] {
-            let Some((av6, port, loop_ok)) = read_inaddr(addr_va, addrlen) else {
+            let Some((av6, port, dst, loop_ok)) = read_inaddr(addr_va, addrlen) else {
                 return -EINVAL;
             };
             if av6 != v6 {
                 return -EAFNOSUPPORT;
             }
             if !loop_ok {
-                return -ENETUNREACH; // NIC-backed remote INET is a later phase
+                // A **remote** destination (rheo-net N4b): hand the active open to
+                // the registered datapath. The kernel runs no TCP state machine -
+                // the bridge does the handshake over the NIC and reports the
+                // outcome; without a bridge the answer stays ENETUNREACH, exactly
+                // as before N4b. IPv6 remote is a documented deferral (the N4b
+                // datapath is IPv4).
+                if v6 {
+                    return -ENETUNREACH;
+                }
+                let Some(o) = svc::socket_ops() else {
+                    return -ENETUNREACH;
+                };
+                let src_port = if local_port != 0 {
+                    local_port
+                } else {
+                    inetsock::ephemeral_port()
+                };
+                let h = (o.tcp_connect)(dst, port, src_port, REMOTE_CONNECT_TIMEOUT_NS);
+                if h < 0 {
+                    return h;
+                }
+                self.fds[slot] = FdKind::InetTcpRemote {
+                    h: h as u8,
+                    local_port: src_port,
+                    peer_ip: dst,
+                    peer_port: port,
+                };
+                return 0;
             }
             let client_port = if local_port != 0 {
                 local_port
@@ -1076,14 +1656,16 @@ impl FdTable {
         }
         // AF_INET datagram: record a default peer (and ephemeral-bind if needed).
         if let FdKind::InetDgram { v6, ep, bound, .. } = self.fds[slot] {
-            let Some((av6, port, loop_ok)) = read_inaddr(addr_va, addrlen) else {
+            let Some((av6, port, dst, loop_ok)) = read_inaddr(addr_va, addrlen) else {
                 return -EINVAL;
             };
             if av6 != v6 {
                 return -EAFNOSUPPORT;
             }
             if !loop_ok {
-                return -ENETUNREACH;
+                // Remote UDP (rheo-net N4b): move the socket onto the registered
+                // datapath, recording the default destination.
+                return self.go_remote_udp(slot, v6, ep, bound, dst, port);
             }
             let (ep, bound) = if bound {
                 (ep, true)
@@ -1116,11 +1698,13 @@ impl FdTable {
         }
     }
 
-    /// accept(fd, addr, addrlen): dequeue a pending connection into a new fd.
-    /// Non-blocking: `-EAGAIN` if the backlog is empty (the cooperative
+    /// accept4(fd, addr, addrlen, flags): dequeue a pending connection into a new
+    /// fd. Non-blocking: `-EAGAIN` if the backlog is empty (the cooperative
     /// single-process proof connects before accepting; a blocking cross-cell
     /// accept server is a later refinement, docs/LINUX-COMPAT.md L8).
-    pub fn accept(&mut self, fd: i64, addr_va: u64, addrlen_va: u64) -> i64 {
+    /// `SOCK_CLOEXEC` and `SOCK_NONBLOCK` in `flags` are both honoured
+    /// (docs/ARCHITECTURE-DEBT.md 2.4).
+    pub fn accept(&mut self, fd: i64, addr_va: u64, addrlen_va: u64, flags: u64) -> i64 {
         let Some(slot) = usize_fd(fd) else {
             return -EBADF;
         };
@@ -1140,6 +1724,9 @@ impl FdTable {
                 peer_port: client_port,
                 v6,
             };
+            self.flags[nslot] = FdFlags::new(ACC_RDWR);
+            self.flags[nslot].cloexec = flags & O_CLOEXEC != 0;
+            self.flags[nslot].nonblock = flags & O_NONBLOCK != 0;
             write_inaddr(addr_va, addrlen_va, v6, client_port);
             return nslot as i64;
         }
@@ -1154,6 +1741,9 @@ impl FdTable {
             return -EMFILE;
         };
         self.fds[nslot] = FdKind::SockConn { rx, tx };
+        self.flags[nslot] = FdFlags::new(ACC_RDWR);
+        self.flags[nslot].cloexec = flags & O_CLOEXEC != 0;
+        self.flags[nslot].nonblock = flags & O_NONBLOCK != 0;
         // The connecting peer is unnamed (no bind): report just the family.
         if addr_va != 0 && addrlen_va != 0 {
             // SAFETY: caller-provided sockaddr + socklen_t out-params.
@@ -1206,6 +1796,36 @@ impl FdTable {
                 write_inaddr(addr_va, addrlen_va, v6, if peer { peer_port } else { port });
                 return 0;
             }
+            // Remote sockets report the datapath's own IPv4 address, not loopback
+            // (rheo-net N4b): the bridge owns the local identity.
+            FdKind::InetUdpRemote {
+                port,
+                peer_ip,
+                peer_port,
+                ..
+            } => {
+                let (ip, p) = if peer {
+                    (peer_ip, peer_port)
+                } else {
+                    (local_ipv4(), port)
+                };
+                write_inaddr_v4(addr_va, addrlen_va, ip, p);
+                return 0;
+            }
+            FdKind::InetTcpRemote {
+                local_port,
+                peer_ip,
+                peer_port,
+                ..
+            } => {
+                let (ip, p) = if peer {
+                    (peer_ip, peer_port)
+                } else {
+                    (local_ipv4(), local_port)
+                };
+                write_inaddr_v4(addr_va, addrlen_va, ip, p);
+                return 0;
+            }
             _ => {}
         }
         // AF_UNIX.
@@ -1238,6 +1858,32 @@ impl FdTable {
         let Some(slot) = usize_fd(fd) else {
             return -EBADF;
         };
+        // Already on the remote datapath (rheo-net N4b): send straight over it.
+        if let FdKind::InetUdpRemote {
+            ep,
+            peer_ip,
+            peer_port,
+            ..
+        } = self.fds[slot]
+        {
+            let Some(o) = svc::socket_ops() else {
+                return -ENETUNREACH;
+            };
+            let (dst, dport) = if dest_addr != 0 {
+                let Some((_, port, ip, loop_ok)) = read_inaddr(dest_addr, addrlen) else {
+                    return -EINVAL;
+                };
+                if loop_ok {
+                    return -ENETUNREACH; // a remote socket cannot address loopback
+                }
+                (ip, port)
+            } else if peer_port != 0 {
+                (peer_ip, peer_port)
+            } else {
+                return -EINVAL;
+            };
+            return (o.udp_send)(ep as u64, dst, dport, buf, len);
+        }
         let FdKind::InetDgram {
             v6,
             ep,
@@ -1265,11 +1911,17 @@ impl FdTable {
             }
         };
         let (dv6, dport) = if dest_addr != 0 {
-            let Some((av6, port, loop_ok)) = read_inaddr(dest_addr, addrlen) else {
+            let Some((av6, port, dst, loop_ok)) = read_inaddr(dest_addr, addrlen) else {
                 return -EINVAL;
             };
             if !loop_ok {
-                return -ENETUNREACH;
+                // First non-loopback destination: promote the socket onto the
+                // registered remote datapath, then send there (rheo-net N4b).
+                let r = self.go_remote_udp(slot, v6, ep, true, dst, port);
+                if r < 0 {
+                    return r;
+                }
+                return self.sendto(fd, buf, len, dest_addr, addrlen);
             }
             (av6, port)
         } else if peer_port != 0 {
@@ -1279,10 +1931,23 @@ impl FdTable {
         };
         let (_, src_port) = inetsock::dgram_addr(ep);
         let n = (len as usize).min(inetsock::DGRAM_MAX);
-        // SAFETY: `buf` is a readable range of `n` bytes in the active cell.
+        if crate::uaccess::buf(buf, n).is_none() {
+            return -EFAULT;
+        }
+        // SAFETY: `uaccess::buf` validated the range readable in the active cell.
         let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, n) };
-        inetsock::send_dgram(dv6, dport, src_port, bytes);
-        len as i64
+        match inetsock::send_dgram(dv6, dport, src_port, bytes) {
+            // Nothing is bound at the destination, so no reader exists now or
+            // later: report it (docs/ENGINEERING.md 7). Linux delivers this as an
+            // ICMP port-unreachable, which surfaces as `ECONNREFUSED` on the next
+            // operation of a *connected* socket; there is no ICMP over this
+            // in-kernel loopback queue, so the refusal is reported on the send
+            // itself - earlier than Linux for an unconnected `sendto`, and
+            // documented (docs/LINUX-COMPAT.md, `sendto` row).
+            inetsock::DgramSend::NoEndpoint => -ECONNREFUSED,
+            // A full queue is a genuine UDP drop: the datagram is accounted sent.
+            inetsock::DgramSend::Delivered | inetsock::DgramSend::Dropped => len as i64,
+        }
     }
 
     /// recvfrom(fd, buf, len, src_addr, addrlen): dequeue one UDP datagram over
@@ -1292,14 +1957,43 @@ impl FdTable {
         let Some(slot) = usize_fd(fd) else {
             return -EBADF;
         };
+        // The remote datapath (rheo-net N4b): the bridge blocks on the wire (a
+        // genuine `net_rx` park, not a spin) and fills in the sender's address.
+        if let FdKind::InetUdpRemote { ep, .. } = self.fds[slot] {
+            let Some(o) = svc::socket_ops() else {
+                return -ENETUNREACH;
+            };
+            let mut src_ip = [0u8; 4];
+            let mut src_port: u16 = 0;
+            let n = (o.udp_recv)(
+                ep as u64,
+                buf,
+                len,
+                core::ptr::addr_of_mut!(src_ip) as u64,
+                core::ptr::addr_of_mut!(src_port) as u64,
+                // A zero deadline on a non-blocking descriptor: drain, never park.
+                if self.flags[slot].nonblock {
+                    0
+                } else {
+                    REMOTE_RECV_TIMEOUT_NS
+                },
+            );
+            if n >= 0 && src_addr != 0 {
+                write_inaddr_v4(src_addr, addrlen_va, src_ip, src_port);
+            }
+            return n;
+        }
         let FdKind::InetDgram { v6, ep, bound, .. } = self.fds[slot] else {
             return -ENOTSOCK;
         };
         if !bound {
             return -EAGAIN; // never bound: nothing can have arrived
         }
-        // SAFETY: `buf` is a writable range of `len` bytes in the active cell.
-        let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
+        // SAFETY: as the other `uaccess::slice` sites - bounded, present, un-shared,
+        // and we are inside this cell's synchronous trap.
+        let Some(out) = (unsafe { crate::uaccess::slice(buf, len as usize) }) else {
+            return -EFAULT;
+        };
         match inetsock::recv_dgram(ep, out) {
             Some((src_port, n)) => {
                 if src_addr != 0 {
@@ -1331,7 +2025,56 @@ impl FdTable {
     /// True if `fd` is a datagram (UDP) socket - `sendto`/`recvfrom` route to the
     /// datagram path (`linux::inetsock`) rather than the stream write/read path.
     pub fn is_dgram(&self, fd: i64) -> bool {
-        usize_fd(fd).is_some_and(|s| matches!(self.fds[s], FdKind::InetDgram { .. }))
+        usize_fd(fd).is_some_and(|s| {
+            matches!(
+                self.fds[s],
+                FdKind::InetDgram { .. } | FdKind::InetUdpRemote { .. }
+            )
+        })
+    }
+
+    /// Move a UDP socket from the loopback registry onto the **remote**
+    /// (NIC-backed) datapath (rheo-net N4b), recording `peer_ip:peer_port` as its
+    /// default destination. The local port carries over when the socket was already
+    /// bound, so a `bind`-then-`sendto` program keeps its chosen source port; an
+    /// unbound socket gets an ephemeral one. Returns 0 or `-errno`.
+    fn go_remote_udp(
+        &mut self,
+        slot: usize,
+        v6: bool,
+        ep: u8,
+        bound: bool,
+        peer_ip: [u8; 4],
+        peer_port: u16,
+    ) -> i64 {
+        // The N4b datapath is IPv4; a v6 remote destination stays ENETUNREACH.
+        if v6 {
+            return -ENETUNREACH;
+        }
+        let Some(o) = svc::socket_ops() else {
+            return -ENETUNREACH;
+        };
+        let port = if bound {
+            let (_, p) = inetsock::dgram_addr(ep);
+            p
+        } else {
+            inetsock::ephemeral_port()
+        };
+        let h = (o.udp_bind)(port);
+        if h < 0 {
+            return h;
+        }
+        // Release the loopback endpoint - this socket now lives on the wire.
+        if bound {
+            inetsock::close_dgram(ep);
+        }
+        self.fds[slot] = FdKind::InetUdpRemote {
+            ep: h as u8,
+            port,
+            peer_ip,
+            peer_port,
+        };
+        0
     }
 
     /// POLLIN readiness for `fd` (used by epoll, level-triggered). A socket is
@@ -1352,12 +2095,32 @@ impl FdTable {
             FdKind::InetDgram {
                 ep, bound: true, ..
             } => inetsock::dgram_has_data(ep),
-            FdKind::Console(0)
-            | FdKind::Vfs { .. }
+            // Remote sockets (rheo-net N4b): readiness is a question for the bridge,
+            // and both answers **pump the datapath** first - which is what makes a
+            // blocking `poll` on a DNS socket become ready when the reply lands
+            // (docs/ARCHITECTURE-DEBT.md 2.4). `tcp_pending` used to be missing from
+            // `svc::SocketOps` entirely, and a hardcoded `true` here *was* that
+            // absence: a poll on a remote TCP socket always claimed readable.
+            FdKind::InetUdpRemote { ep, .. } => {
+                svc::socket_ops().is_some_and(|o| (o.udp_pending)(ep as u64))
+            }
+            FdKind::InetTcpRemote { h, .. } => {
+                svc::socket_ops().is_some_and(|o| (o.tcp_pending)(h as u64))
+            }
+            // Console input is readable when a byte is buffered, or at end of input
+            // (EOF is a readable condition - a reader must be able to see it).
+            FdKind::Console(0) => crate::input::has_data() || crate::input::at_eof(),
+            FdKind::Vfs { .. }
             | FdKind::Null
             | FdKind::Zero
             | FdKind::Urandom
             | FdKind::ProcAuxv { .. } => true,
+            // An epoll fd is readable when one of its watches is - which is what
+            // makes `poll`ing an epoll fd work at all.
+            FdKind::Epoll { .. } => self.epoll_ready(fd) > 0,
+            // The whole point of an eventfd: readable exactly when the counter is
+            // non-zero, which is what an epoll loop parks on to be woken.
+            FdKind::EventFd { ev } => eventfd::readable(ev),
             _ => false,
         }
     }
@@ -1380,9 +2143,21 @@ impl FdTable {
             | FdKind::Vfs { .. }
             | FdKind::Null
             | FdKind::Zero
-            | FdKind::InetDgram { bound: true, .. } => true,
+            | FdKind::InetDgram { bound: true, .. }
+            | FdKind::InetUdpRemote { .. }
+            | FdKind::InetTcpRemote { .. } => true,
+            FdKind::EventFd { ev } => eventfd::writable(ev),
             _ => false,
         }
+    }
+}
+
+/// The remote datapath's local IPv4 address (rheo-net N4b), or `0.0.0.0` with no
+/// bridge installed.
+fn local_ipv4() -> [u8; 4] {
+    match svc::socket_ops() {
+        Some(o) => (o.local_ip)(),
+        None => [0; 4],
     }
 }
 
@@ -1427,7 +2202,10 @@ fn read_sun_key(addr_va: u64, addrlen: u64, out: &mut [u8; NAME_MAX]) -> Option<
 ///
 /// Layout: `sin_family` u16 @0, `sin_port` big-endian u16 @2, then the address
 /// (v4: 4 bytes @4; v6: 16 bytes @8 after a 4-byte flowinfo).
-fn read_inaddr(addr_va: u64, addrlen: u64) -> Option<(bool, u16, bool)> {
+///
+/// The third tuple element is the **IPv4 octets** (all zero for a v6 address) -
+/// what the rheo-net N4b remote datapath needs to address the peer.
+fn read_inaddr(addr_va: u64, addrlen: u64) -> Option<(bool, u16, [u8; 4], bool)> {
     let len = addrlen as usize;
     if addr_va == 0 || len < 4 {
         return None;
@@ -1445,7 +2223,7 @@ fn read_inaddr(addr_va: u64, addrlen: u64) -> Option<(bool, u16, bool)> {
             let a = unsafe { core::slice::from_raw_parts((addr_va + 4) as *const u8, 4) };
             let oct = [a[0], a[1], a[2], a[3]];
             let is_local = inetsock::is_loopback_v4(oct) || oct == [0, 0, 0, 0];
-            Some((false, port, is_local))
+            Some((false, port, oct, is_local))
         }
         AF_INET6 => {
             if len < 24 {
@@ -1456,7 +2234,7 @@ fn read_inaddr(addr_va: u64, addrlen: u64) -> Option<(bool, u16, bool)> {
             let mut oct = [0u8; 16];
             oct.copy_from_slice(a);
             let is_local = inetsock::is_loopback_v6(oct) || oct == [0u8; 16];
-            Some((true, port, is_local))
+            Some((true, port, [0; 4], is_local))
         }
         _ => None,
     }
@@ -1492,6 +2270,26 @@ fn write_inaddr(addr_va: u64, addrlen_va: u64, v6: bool, port: u16) {
             if addrlen_va != 0 {
                 (addrlen_va as *mut u32).write(16);
             }
+        }
+    }
+}
+
+/// Write a `sockaddr_in` for a **real** IPv4 address + port (rheo-net N4b): the
+/// remote datapath's peers are not loopback, so `getsockname`/`getpeername`/
+/// `recvfrom` on a remote socket report the genuine address rather than 127.0.0.1.
+fn write_inaddr_v4(addr_va: u64, addrlen_va: u64, ip: [u8; 4], port: u16) {
+    if addr_va == 0 {
+        return;
+    }
+    let pbe = port.to_be();
+    // SAFETY: caller-provided sockaddr buffer (>= 16 bytes) + socklen_t out-param.
+    unsafe {
+        core::ptr::write_bytes(addr_va as *mut u8, 0, 16);
+        (addr_va as *mut u16).write_unaligned(inetsock::AF_INET as u16);
+        ((addr_va + 2) as *mut u16).write_unaligned(pbe);
+        core::ptr::copy_nonoverlapping(ip.as_ptr(), (addr_va + 4) as *mut u8, 4);
+        if addrlen_va != 0 {
+            (addrlen_va as *mut u32).write(16);
         }
     }
 }

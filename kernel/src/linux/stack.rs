@@ -20,8 +20,65 @@ use crate::mm::frames::{self, FRAME_SIZE};
 /// Top of the initial user stack (matches load::USER_STACK_TOP): 8 GiB.
 const USER_STACK_TOP: usize = 0x2_0000_0000;
 /// Linux stacks are larger than the native 32 KiB - glibc probes and uses a
-/// meaningful stack early. 1 MiB (matches the RLIMIT_STACK we report).
-const LINUX_STACK_PAGES: usize = 256;
+/// meaningful stack early. **8 MiB**, the glibc/Linux default `RLIMIT_STACK`,
+/// and it must match the `RLIMIT_STACK` the personality reports
+/// (`linux::rlimit_for`) because glibc sizes *thread* stacks from that number.
+///
+/// It was 1 MiB, which real programs overrun (deep recursion, big stack frames
+/// in a JIT). The whole stack is mapped **eagerly** at load, so this costs
+/// 8 MiB of frames per Linux cell up front; a guard-page + demand-grow stack is
+/// the proper fix and rides with demand paging (docs/LINUX-COMPAT.md).
+///
+/// This is the **default**, used when the image asks for nothing. An image that
+/// records a larger `PT_GNU_STACK` `p_memsz` gets that instead, up to
+/// [`LINUX_STACK_MAX_PAGES`] - see [`stack_pages_for`].
+pub const LINUX_STACK_PAGES: usize = 2048;
+
+/// Ceiling on an image's `PT_GNU_STACK` request: **64 MiB**.
+///
+/// A bound rather than blind obedience, because the stack is mapped eagerly and
+/// charged to the cell's frame budget: an image asking for 2 GiB would exhaust
+/// the pool at load with no diagnostic near the cause. 64 MiB is 8x the default
+/// and 5x the largest real request measured (the Claude Code binary's 12.8 MiB,
+/// docs/ARCHITECTURE-DEBT.md 4.0); a request above it is clamped **and logged**,
+/// so a program that genuinely needs more fails with the reason on the console
+/// rather than mysteriously.
+pub const LINUX_STACK_MAX_PAGES: usize = 16384;
+
+/// How many stack pages to map for an image that asked for `want` bytes via
+/// `PT_GNU_STACK` (0 = asked for nothing).
+///
+/// The loader used to ignore `PT_GNU_STACK` entirely and hand every Linux cell
+/// [`LINUX_STACK_PAGES`], so an image asking for more silently got less and
+/// overran - the failure landing far from its cause, in whatever function
+/// happened to be deep enough (docs/ARCHITECTURE-DEBT.md 4.0). Reading the
+/// header is the difference between a number that happens to fit today's
+/// binaries and a mechanism that fits tomorrow's.
+pub fn stack_pages_for(want: usize) -> usize {
+    if want == 0 {
+        return LINUX_STACK_PAGES;
+    }
+    let pages = want.div_ceil(FRAME_SIZE).max(LINUX_STACK_PAGES);
+    if pages > LINUX_STACK_MAX_PAGES {
+        crate::println!(
+            "linux: PT_GNU_STACK asks {} KiB, clamped to the {} KiB ceiling \
+             (stack is mapped eagerly and charged to the cell)",
+            want / 1024,
+            LINUX_STACK_MAX_PAGES * FRAME_SIZE / 1024
+        );
+        return LINUX_STACK_MAX_PAGES;
+    }
+    pages
+}
+
+/// The `[base, len)` of a cell's stack reservation, sized from the image's
+/// `PT_GNU_STACK` request. `install_cell` registers this as an anonymous read-write
+/// VMA so the pages below the top one grow on fault (docs/ARCHITECTURE-DEBT.md 4.0),
+/// and a touch below `base` hits no VMA and becomes a SIGSEGV - the guard page.
+pub fn reservation(img: &LinuxImage) -> (usize, usize) {
+    let bytes = stack_pages_for(img.stack_want) * FRAME_SIZE;
+    (USER_STACK_TOP - bytes, bytes)
+}
 
 // ELF auxiliary-vector types (Linux uapi/linux/auxvec.h).
 const AT_NULL: u64 = 0;
@@ -55,17 +112,18 @@ pub fn setup_stack(
     args: &[&[u8]],
     envs: &[&[u8]],
 ) -> usize {
-    // Map every stack page; remember the top page's frame for the write-in.
-    let mut top_pa = 0usize;
-    let mut va = USER_STACK_TOP - LINUX_STACK_PAGES * FRAME_SIZE;
-    while va < USER_STACK_TOP {
-        let pa = frames::alloc();
-        aspace.map_user_frame(va, pa, MapPerm::UserRw);
-        if va == USER_STACK_TOP - FRAME_SIZE {
-            top_pa = pa;
-        }
-        va += FRAME_SIZE;
-    }
+    // Map **only the top page** - the one the kernel writes the initial process block
+    // (argv/envp/auxv) into, which is asserted to fit one page below. The rest of the
+    // stack is left to grow on fault: `install_cell` registers the whole span as an
+    // anonymous VMA, so a touch below the top page faults into a fresh zeroed frame
+    // through `linux::mem::fault`, and a touch below the *reservation* hits no VMA and
+    // becomes a SIGSEGV - a guard page for free (docs/ARCHITECTURE-DEBT.md 4.0). The
+    // request used to be mapped whole, so an image asking for a 64 MiB stack paid 64
+    // MiB before `main`; now it pays one page plus what it touches.
+    let sizing_note = stack_pages_for(img.stack_want); // logs a clamp if the image over-asks
+    let _ = sizing_note;
+    let top_pa = frames::alloc().expect("initial process stack top page (bounded, at load)");
+    aspace.map_user_frame(USER_STACK_TOP - FRAME_SIZE, top_pa, MapPerm::UserRw);
 
     // Inject the rt_sigreturn trampoline page for the signal machinery
     // (docs/LINUX-COMPAT.md L5). ARM64/RISC-V have no SA_RESTORER path, so the
@@ -73,7 +131,7 @@ pub fn setup_stack(
     // sa_restorer and returns an empty code slice, so nothing is mapped.
     let tramp = arch::sig_tramp_code();
     if !tramp.is_empty() {
-        let pa = frames::alloc();
+        let pa = frames::alloc().expect("initial process stack (bounded, at load)");
         aspace.map_user_frame(arch::SIGTRAMP_VA, pa, MapPerm::UserRx);
         // SAFETY: freshly allocated frame; written through the kernel linear map
         // within `tramp.len()` bytes (« FRAME_SIZE).

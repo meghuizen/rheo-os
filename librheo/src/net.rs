@@ -9,7 +9,12 @@
 //! cell** (docs/NETWORKING.md 2), not part of this foundation, and stays
 //! deferred: [`connect`]/[`listen`] remain [`Unsupported`] stubs pending a
 //! socket object + the blessed transport cell. What is real here is `send`,
-//! `recv`, and `mac` bridged to the kernel's virtio-net driver.
+//! `recv`/`try_recv`, and `mac` bridged to the kernel's virtio-net driver.
+//!
+//! Receive is **symmetric with send**: [`recv`] parks the strand until a frame
+//! arrives (the kernel idles at WFI on the NIC's RX interrupt where it is wired -
+//! docs/NETSTACK.md, the async-receive path / rheo-net N2d), and [`try_recv`] is
+//! the non-blocking drain a transport uses to batch a burst.
 
 use crate::rt;
 use crate::sys;
@@ -66,11 +71,37 @@ pub async fn send(frame: &[u8]) -> Result<usize, NetError> {
     }
 }
 
-/// Poll for one raw Ethernet frame into `buf` (`OP_NET_RX`). Returns the frame
-/// length, or `0` if no packet is available (the reactor's polled RX path - the
-/// caller re-`recv`s to wait; a device-IRQ wake is a later refinement). Above
-/// this a service layers a real socket wait (docs/NETWORKING.md).
+/// Receive one raw Ethernet frame into `buf`, **parking** until one arrives
+/// (docs/NETSTACK.md, the async-receive path / rheo-net N2d). This is the true
+/// async receive: the strand parks on the reactor's network slot, the vcore runs
+/// the cell's other strands, and only when they have all parked does the reactor
+/// block in the kernel (`SYS_WAIT_NET`) - which idles the CPU at WFI until the
+/// NIC's RX interrupt fires, where that interrupt is wired (RISC-V and ARM64
+/// today; x86-64 falls back to a bounded kernel poll - docs/NETSTACK.md has the
+/// per-ISA table). **One park and one wake per frame**, not a re-poll spin.
+///
+/// Returns the frame length, or `0` only if the kernel's wait gave up (no NIC
+/// installed, or the poll fallback's budget expired). Use [`try_recv`] for a
+/// non-blocking drain (batching a burst, or a caller that must not block).
 pub async fn recv(buf: &mut [u8]) -> Result<usize, NetError> {
+    Ok(rt::recv_frame(buf.as_mut_ptr(), buf.len(), 0).await)
+}
+
+/// Like [`recv`], but bounded: park for a frame, giving up after `timeout_ns`
+/// nanoseconds and returning `0`. This is the primitive a transport needs for a
+/// retransmission timeout - "a frame, or the RTO, whichever comes first". Where
+/// both the NIC and the timer interrupt are wired the kernel arms the deadline and
+/// halts once, waking on either source, so the wait is still a 0%-CPU park.
+pub async fn recv_timeout(buf: &mut [u8], timeout_ns: u64) -> Result<usize, NetError> {
+    Ok(rt::recv_frame(buf.as_mut_ptr(), buf.len(), timeout_ns).await)
+}
+
+/// Non-blocking drain: try to take one raw Ethernet frame into `buf`
+/// (`OP_NET_RX`). Returns the frame length, or `0` if no packet is available -
+/// the caller decides whether to retry, batch, or park with [`recv`]. This is the
+/// batching primitive (a transport draining a burst of frames per poll must not
+/// block on the last one).
+pub async fn try_recv(buf: &mut [u8]) -> Result<usize, NetError> {
     let mut a = [0u8; 24];
     put_u64(&mut a, 0, buf.as_mut_ptr() as u64);
     put_u32(&mut a, 8, buf.len() as u32);

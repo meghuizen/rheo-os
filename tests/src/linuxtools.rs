@@ -19,18 +19,18 @@
 extern crate alloc;
 
 use alloc::rc::Rc;
-use core::mem::MaybeUninit;
 use core::ptr::addr_of_mut;
 
-use kernel::capability::{CapTable, ObjectTable};
-use kernel::linux::{self, stack as linux_stack};
-use kernel::mm::AddressSpace;
-use kernel::queue::QueuePair;
+use kernel::linux::{self};
 use kernel::svc;
-use kernel::user::{self, Outcome, Personality};
-use kernel::{arch, load, println};
+use kernel::user::Outcome;
+use kernel::{arch, println};
 use posix::{RamFs, fs, mount, sys};
 
+#[path = "fixture.rs"]
+mod fixture;
+#[path = "harness.rs"]
+mod harness;
 #[path = "vfs_personality.rs"]
 mod vfs_personality;
 
@@ -40,46 +40,12 @@ static mut HEAP_MEM: [u8; 4 * 1024 * 1024] = [0; 4 * 1024 * 1024];
 
 /// The static-glibc coreutils multicall binary, per ISA (built by
 /// `xtask::build_coreutils_fixture` into the gitignored fixture build dir).
-macro_rules! coreutils_bin {
-    () => {{
-        #[cfg(target_arch = "x86_64")]
-        {
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/linux-fixtures/build/x86_64/cu/bin/coreutils"
-            ))
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/linux-fixtures/build/aarch64/cu/bin/coreutils"
-            ))
-        }
-        #[cfg(target_arch = "riscv64")]
-        {
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/linux-fixtures/build/riscv64/cu/bin/coreutils"
-            ))
-        }
-    }};
-}
-
-static COREUTILS: &[u8] = coreutils_bin!();
+static COREUTILS: &[u8] = fixture::linux!("cu/bin/coreutils");
 
 // Seeded ramfs contents. `multi.txt` is deliberately unsorted so `sort` has
 // visible work and `head`/`wc` have a known shape.
 const DATA: &[u8] = b"coreutils on rheo-os\n";
 const MULTI: &[u8] = b"banana\napple\ncherry\n";
-
-static mut OBJECTS: ObjectTable = ObjectTable::new();
-static mut CAPS: CapTable = CapTable::new();
-static mut QP: MaybeUninit<QueuePair> = MaybeUninit::uninit();
-
-#[repr(align(16))]
-struct KStack([u8; 64 * 1024]);
-static mut KSTACK: KStack = KStack([0; 64 * 1024]);
 
 // -- stdout capture, wired to the Linux personality's stdout tap --
 const CAP_MAX: usize = 16 * 1024;
@@ -105,23 +71,8 @@ fn captured() -> &'static [u8] {
 /// Load the coreutils image into a fresh Linux cell with `argv`, run it, return
 /// the outcome. A fresh address space per call so the program starts clean.
 fn run_util(argv: &[&[u8]]) -> Outcome {
-    let mut aspace = AddressSpace::new(1);
-    let img = load::load_elf_linux(COREUTILS, &mut aspace).expect("load coreutils ELF");
-    let sp = linux_stack::setup_stack(&mut aspace, &img, argv, &[]);
-
-    // SAFETY: single-threaded; the statics outlive the synchronous run.
-    unsafe {
-        let kernel_sp = core::ptr::addr_of!(KSTACK.0) as usize + 64 * 1024;
-        let mut frame = arch::trapframe_new(img.entry, sp, 0, kernel_sp);
-        let objects = &mut *addr_of_mut!(OBJECTS);
-        let caps = &mut *addr_of_mut!(CAPS);
-        let qp = core::ptr::addr_of!(QP) as *const QueuePair;
-        user::reset();
-        user::install(0, &aspace, caps, objects, qp, addr_of_mut!(frame));
-        user::set_personality(0, Personality::Linux);
-        linux::install_cell(0, img.image_end);
-        user::run(0).1
-    }
+    // SAFETY: single-threaded init; the harness's statics outlive the run.
+    unsafe { harness::run_linux_cell(COREUTILS, argv) }
 }
 
 /// Run one utility and assert its exit code and exact stdout.
@@ -154,7 +105,7 @@ fn check(argv: &[&[u8]], want_code: u64, want_out: &[u8]) {
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("linuxtools: start on {}", arch::NAME);
 
     // SAFETY: once, before any allocation.
@@ -216,6 +167,14 @@ extern "C" fn kernel_main() -> ! {
     );
     check(&[b"coreutils", b"pwd"], 0, b"/\n");
 
+    // Scale evidence for demand paging, free: this kernel loads the unpatched upstream
+    // coreutils multicall - a ~4-4.7 MB binary - once per utility. An eager loader paid
+    // for its whole image every time (docs/ARCHITECTURE-DEBT.md 4.0, blocker 2).
+    println!(
+        "linuxtools: {} image page(s) left to demand paging across this run, {} copied",
+        kernel::load::recorded_pages(),
+        kernel::load::eager_pages()
+    );
     println!("linuxtools: PASS");
     arch::exit(arch::ExitCode::Success)
 }

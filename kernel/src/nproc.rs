@@ -6,20 +6,23 @@
 //! Linux personality's `linux::proc` (docs/LINUX-COMPAT.md L6), which this
 //! mirrors for `Personality::Native` cells.
 //!
-//! A spawned child is a fresh native cell with its **own** address space and
-//! mapped queue pair (so it can run librheo's reactor), **sharing** the parent's
-//! capability bundle (like `fork`). Spawning is gated by a **cell-spawn
-//! capability** (an `ObjectKind::Cell` cap carrying WRITE): a cell without it
-//! cannot create cells (no ambient authority). Scheduling generalizes the native
+//! A spawned child is a fresh native cell with its **own** address space, its own
+//! mapped queue pair (so it can run librheo's reactor), and **its own capability
+//! table**: it does not share the parent's (docs/ARCHITECTURE-DEBT.md 2.3), so it
+//! holds only what the spawn path explicitly mints into it. Spawning is gated by
+//! a **cell-spawn capability** (an `ObjectKind::Cell` cap carrying WRITE): a cell
+//! without it cannot create cells (no ambient authority). Scheduling generalizes the native
 //! cross-cell `SYS_SWITCH`: the parent that `SYS_WAIT`s blocks and hands the CPU
 //! to a runnable child; the child's exit makes it a zombie and reschedules,
 //! waking the parent whose wait is now satisfiable. Cooperative, single CPU: a
 //! cell yields only at a syscall boundary. The pre-existing native `run` /
 //! `SYS_SWITCH` path is untouched - a cell that never spawns has no entry here.
 
-use crate::abi::FAULT_EXIT;
+use crate::abi::{FAULT_EXIT, SPAWN_CHAN_SLOT};
 use crate::arch::{self, TrapFrame};
-use crate::capability::{BUDGET_UNLIMITED, ObjectKind, ObjectTable, READ, WRITE};
+use crate::capability::{ObjectKind, READ, WRITE};
+use crate::idle;
+use crate::ktimer::{self, TimerClient};
 use crate::load;
 use crate::mm::AddressSpace;
 use crate::queue::QueuePair;
@@ -38,10 +41,52 @@ pub enum Sched {
 enum PState {
     Free,
     Runnable,
-    /// Parked in `SYS_WAIT` for the child cell in `wait_for`.
+    /// Parked on the condition in `Proc::block`.
     Blocked,
     /// Exited, holding its exit code, awaiting a parent `SYS_WAIT`.
     Zombie,
+}
+
+/// What a parked native cell is waiting for (docs/ARCHITECTURE-DEBT.md 2.4).
+///
+/// Before this existed, the only native block was `SYS_WAIT` (recorded in
+/// `Proc::wait_for`) and the other three waiting verbs - `SYS_ARM_TIMER`,
+/// `SYS_WAIT_INPUT`, `SYS_WAIT_NET` - waited **inside the trap** without ever
+/// reaching the scheduler, so one cell's `sleep` idled the machine while its
+/// siblings were runnable. They are now registrations: the cell records its
+/// condition here, the CPU goes to a sibling, and [`complete_block`] finishes the
+/// syscall with the blocked cell's own address space active.
+///
+/// The cell-visible semantics are unchanged: a `sleep` still sleeps for its full
+/// duration, a `SYS_WAIT_INPUT` still returns the bytes it drained, a
+/// `SYS_WAIT_NET` still returns the frame length or 0 at its deadline.
+#[derive(Copy, Clone)]
+enum Block {
+    None,
+    /// `SYS_WAIT` for the child cell `child`.
+    Wait {
+        child: usize,
+    },
+    /// `SYS_ARM_TIMER`: parked until `deadline_ns` (absolute, timer domain). The
+    /// arbiter slot the deadline lives in is kept so re-registration after another
+    /// client fires goes to the caller's own slot (a pacer's and a sleep's deadlines
+    /// are different clients, docs/NETSTACK.md 21).
+    Timer {
+        deadline_ns: u64,
+        client: TimerClient,
+    },
+    /// `SYS_WAIT_INPUT`: parked until a console byte is buffered, or input ends.
+    Console {
+        buf_va: u64,
+        len: usize,
+    },
+    /// `SYS_WAIT_NET`: parked until a frame arrives, or `deadline_ns` (absolute,
+    /// timer domain; 0 = indefinite) passes.
+    Net {
+        buf_va: u64,
+        len: usize,
+        deadline_ns: u64,
+    },
 }
 
 #[derive(Copy, Clone)]
@@ -50,7 +95,11 @@ struct Proc {
     /// Parent cell index, or -1 for the top of the tree (the first spawner).
     parent: i32,
     /// The child cell this proc is blocked in `SYS_WAIT` for (when `Blocked`).
+    /// Kept alongside `block` because `complete_block` reaps an awaited zombie on
+    /// **every** switch-in, including a plain `SYS_YIELD` (pre-existing behaviour).
     wait_for: usize,
+    /// What this proc is parked on (when `Blocked`).
+    block: Block,
     /// Exit code while `Zombie` (0..=255, or `FAULT_EXIT` for a faulted child).
     code: u64,
 }
@@ -61,6 +110,7 @@ impl Proc {
             state: PState::Free,
             parent: -1,
             wait_for: 0,
+            block: Block::None,
             code: 0,
         }
     }
@@ -103,6 +153,7 @@ fn ensure_top(cell: usize) {
             state: PState::Runnable,
             parent: -1,
             wait_for: 0,
+            block: Block::None,
             code: 0,
         };
     }
@@ -110,21 +161,28 @@ fn ensure_top(cell: usize) {
 
 // -------------------------------------------------------------------- spawn
 
-/// `SYS_SPAWN(path_va, path_len, argv_va, envp_va)`: load the ELF at `path` from
-/// the VFS into a new native cell, build its initial stack from the caller's
-/// argv/envp, map it a queue pair + mint a queue capability into the shared
-/// bundle, and record the caller as parent. Returns the child's handle (its cell
-/// index) or `u64::MAX` on failure. Gated by the cell-spawn capability.
+/// `SYS_SPAWN(path_va, path_len, argv_va, envp_va, chan_spec)`: load the ELF at
+/// `path` from the VFS into a new native cell, build its initial stack from the
+/// caller's argv/envp, map it a queue pair + mint a queue capability into the
+/// **child's own** capability table, and record the caller as parent. Returns the child's handle (its
+/// cell index) or `u64::MAX` on failure. Gated by the cell-spawn capability.
+///
+/// `chan_spec` picks which of the caller's channel ends the child inherits: 0 =
+/// the Phase J default (slot 0 if wired), else `SPAWN_CHAN_SLOT | slot << 8`
+/// (docs/NETSTACK.md the service-cell section, rheo-net N4a) - a **service cell**
+/// spawns client k with its own slot k, so each client gets a private ring.
 ///
 /// Reading the caller's `frame` (for its kernel SP, shared by the cooperative
 /// child) is the point of the call.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     cur: usize,
     path_va: u64,
     path_len: u64,
     argv_va: u64,
     envp_va: u64,
+    chan_spec: u64,
     frame: *mut TrapFrame,
 ) -> u64 {
     // Cell-spawn authority: the caller must hold an ObjectKind::Cell capability
@@ -169,10 +227,19 @@ pub fn spawn(
     // load; librheo binaries are ET_EXEC so bias 0). The path is a kernel VA.
     let path_kva = addr_of_mut!(SPAWN_PATH) as u64;
     let mut child_aspace = AddressSpace::new((child as u16) + 64);
+    // The **eager** loader, deliberately: a native cell has no VMA list, so there is
+    // nothing here to turn a recorded segment into a mapping. Demand paging is a Linux
+    // personality feature (`load::exec_elf_from_vfs_demand`), and a native child given
+    // a lazy image gets an address space full of holes with no diagnostic - which is
+    // what happened when the two shared one function (docs/ENGINEERING.md 11).
     let Some(img) = load::exec_elf_from_vfs(ops, path_kva, path_len as u64, &mut child_aspace)
     else {
         return u64::MAX;
     };
+    debug_assert!(
+        img.nsegs == 0,
+        "native spawn cannot map demand-paged segments"
+    );
     let entry = img.entry;
 
     // Build the native SysV initial stack (argc/argv/envp). Its SP points at
@@ -181,59 +248,48 @@ pub fn spawn(
     // walking the raw SP).
     let sp = load::setup_stack(&mut child_aspace, &argv[..argc], &envp[..envc]);
 
-    // Map the child a queue-pair region + mint its queue capability into the
-    // shared bundle (so the child's ring is grant-checked at doorbell time).
+    // Map the child a queue-pair region. Its queue capability is minted **into
+    // the child's own table** after `install_spawned` publishes that table - a
+    // spawned cell no longer shares the parent's (docs/ARCHITECTURE-DEBT.md
+    // 2.3), so the mint has to happen where the child can reach it.
     let qp = load::map_queue(&mut child_aspace);
-    // SAFETY: single CPU; the shared object/cap tables are uniquely owned for the
-    // trap. `objects` is installed `*const` but owned mutably by the test kernel;
-    // recovered here to create the child's queue object.
-    let qp_cap_id = unsafe {
-        let objects = &mut *(objs_ptr as *mut ObjectTable);
-        let caps = &mut *caps_ptr;
-        let Ok(obj) = objects.create(ObjectKind::QueuePair) else {
-            return u64::MAX;
-        };
-        match caps.mint(objects, obj, READ | WRITE, BUDGET_UNLIMITED) {
-            Ok(h) => h.raw_low32(),
-            Err(_) => return u64::MAX,
-        }
-    };
 
-    // Inherit the parent's cross-cell channel, if it has one (docs/LIBRHEO.md
-    // Phase J): map the same channel frames into the child RW and mint a channel
-    // capability into the shared bundle, so a spawned child streams its output to
-    // the parent over the Phase E channel (a spawned pipeline stage). The child
-    // gets the **opposite** role (parent consumer <-> child producer). Only a
-    // parent that holds a channel triggers this - an ordinary spawn is unchanged.
-    let (p_chan_va, p_role) = user::cell_chan(cur);
+    // Inherit one of the parent's cross-cell channels (docs/LIBRHEO.md Phase J;
+    // the slot selector is docs/NETSTACK.md rheo-net N4a): map the same channel
+    // frames into the child RW and mint a channel capability into the shared
+    // bundle, so a spawned child streams over the Phase E channel (a spawned
+    // pipeline stage, or a service's client). The child gets the **opposite** role
+    // (parent consumer <-> child producer) at its own **slot 0**, so a client
+    // binary is slot-agnostic. Only a parent that holds that channel triggers
+    // this - an ordinary spawn (`chan_spec` 0, no slot-0 channel) is unchanged.
+    let want_slot = if chan_spec & SPAWN_CHAN_SLOT != 0 {
+        ((chan_spec >> 8) & 0xff) as usize
+    } else {
+        0
+    };
+    let (p_chan_va, p_role) = user::cell_chan_slot(cur, want_slot);
+    if chan_spec & SPAWN_CHAN_SLOT != 0 && p_chan_va == 0 {
+        return u64::MAX; // an explicit slot request must name a wired channel
+    }
     let child_chan = if p_chan_va != 0 {
         // SAFETY: single CPU; the parent's address space is read (a page-table
         // walk) and the child's is edited (published when the child is switched
         // to). Both are uniquely owned for the trap.
+        let child_chan_va = load::channel_slot_va(0) as u64;
         let n = unsafe {
             (*user::cell_aspace(cur)).share_rw_into(
                 &mut child_aspace,
                 p_chan_va as usize,
                 QueuePair::REGION_SIZE,
+                child_chan_va as usize,
             )
         };
         if n == 0 {
             None
         } else {
-            // SAFETY: as the qp-cap mint above - the shared tables are uniquely
-            // owned for the trap.
-            let cap = unsafe {
-                let objects = &mut *(objs_ptr as *mut ObjectTable);
-                let caps = &mut *caps_ptr;
-                let Ok(obj) = objects.create(ObjectKind::QueuePair) else {
-                    return u64::MAX;
-                };
-                match caps.mint(objects, obj, READ | WRITE, BUDGET_UNLIMITED) {
-                    Ok(h) => h.raw_low32(),
-                    Err(_) => return u64::MAX,
-                }
-            };
-            Some((p_chan_va, cap, p_role ^ 1))
+            // The capability itself is minted into the child's table below,
+            // for the same reason as the queue's.
+            Some((child_chan_va, p_role ^ 1))
         }
     } else {
         None
@@ -255,6 +311,9 @@ pub fn spawn(
         )
     };
 
+    // Install first (with an empty capability table and no queue cap yet), then
+    // mint into the child's *own* table. Ordering matters now that the tables
+    // are separate: `mint_into` reaches the table through the installed cell.
     // SAFETY: pointers are kernel-owned statics that outlive the child's run.
     unsafe {
         user::install_spawned(
@@ -264,17 +323,31 @@ pub fn spawn(
             frame_ptr,
             cur,
             load::USER_QUEUE_VA as u64,
-            qp_cap_id,
+            0,
         );
     }
+    // The child's queue capability. Without it the child's very first doorbell
+    // fails its grant check, so a failure here has to unwind the whole spawn
+    // rather than hand back a cell that cannot use its ring.
+    let Some(qp_cap_id) = user::mint_into(child, ObjectKind::QueuePair, READ | WRITE) else {
+        user::free_cell(child);
+        return u64::MAX;
+    };
+    user::set_queue_info(child, load::USER_QUEUE_VA as u64, qp_cap_id);
+
     // Record the inherited channel so the child's `SYS_CONNECT` reports its end.
-    if let Some((va, cap, role)) = child_chan {
+    if let Some((va, role)) = child_chan {
+        let Some(cap) = user::mint_into(child, ObjectKind::QueuePair, READ | WRITE) else {
+            user::free_cell(child);
+            return u64::MAX;
+        };
         user::set_channel_info(child, va, cap, role);
     }
     procs()[child] = Proc {
         state: PState::Runnable,
         parent: cur as i32,
         wait_for: 0,
+        block: Block::None,
         code: 0,
     };
     child as u64
@@ -358,7 +431,178 @@ pub fn wait(cur: usize, handle: u64, _frame: *mut TrapFrame) -> Sched {
     // Block the caller and hand the CPU to a runnable cell (the child).
     procs()[cur].state = PState::Blocked;
     procs()[cur].wait_for = child;
+    procs()[cur].block = Block::Wait { child };
     Sched::Switch(reschedule(cur))
+}
+
+// ------------------------------------------------- the three converted waits
+//
+// docs/ARCHITECTURE-DEBT.md 2.4. Each of these used to wait in kernel context
+// inside its own syscall; each now registers its condition and hands the CPU to a
+// sibling. Each returns `None` when the caller is the **only** schedulable cell, in
+// which case the syscall keeps its pre-existing in-trap wait byte for byte - there
+// is nothing to reschedule to, and the in-trap wait *is* the idle. That is what
+// makes this change additive for every single-cell kernel in the tree
+// (docs/ENGINEERING.md 8).
+
+/// `SYS_ARM_TIMER`: register the deadline and reschedule, or `None` to wait in
+/// place. `deadline_ns` is the caller's **relative** duration.
+pub fn block_timer(cur: usize, deadline_ns: u64, client: TimerClient) -> Option<*mut TrapFrame> {
+    if deadline_ns == 0 || !can_reschedule(cur) {
+        return None;
+    }
+    ensure_tracked(cur);
+    ktimer::register(client, deadline_ns);
+    let deadline = ktimer::now_ns().wrapping_add(deadline_ns.max(1));
+    park(
+        cur,
+        Block::Timer {
+            deadline_ns: deadline,
+            client,
+        },
+    )
+}
+
+/// `SYS_WAIT_INPUT`: register the console wait and reschedule, or `None` to wait in
+/// place. A buffer already holding data is completed here rather than parked, so a
+/// cell reading available input never leaves the CPU.
+///
+/// # Safety
+/// `buf_va` must be a writable `len`-byte buffer in the caller's address space; the
+/// caller (the syscall dispatch) has range-checked it (docs/ENGINEERING.md 12).
+pub unsafe fn block_console(cur: usize, buf_va: u64, len: usize) -> Option<*mut TrapFrame> {
+    if len == 0 || !can_reschedule(cur) {
+        return None;
+    }
+    // Bytes are already buffered: let `wait_input` return them directly rather than
+    // parking. Deliberately a *peek* (`has_data`) and not a drain - draining here and
+    // then letting `wait_input` drain again would write the first bytes to the
+    // caller's buffer and immediately overwrite them with the next ones.
+    if crate::input::has_data() {
+        return None;
+    }
+    ensure_tracked(cur);
+    park(cur, Block::Console { buf_va, len })
+}
+
+/// `SYS_WAIT_NET`: register the frame wait (with its deadline) and reschedule, or
+/// `None` to wait in place.
+///
+/// # Safety
+/// As [`block_console`]: `buf_va` is a range-checked writable buffer in the caller.
+pub unsafe fn block_net(
+    cur: usize,
+    buf_va: u64,
+    len: usize,
+    timeout_ns: u64,
+) -> Option<*mut TrapFrame> {
+    if len == 0 || !can_reschedule(cur) || crate::net_rx::frame_pending() {
+        return None;
+    }
+    // Two cases that must keep the in-trap wait, because parking on them could
+    // never end (docs/ENGINEERING.md 11 - a wait whose condition cannot occur is a
+    // wedge, and the in-trap path has the backstops):
+    //  * no NIC installed at all - `wait_frame` answers 0 immediately;
+    //  * an *indefinite* wait with no NIC RX interrupt - only `wait_frame`'s bounded
+    //    poll (its `POLL_BUDGET` backstop) can end that, and a backstop the
+    //    scheduler idle does not have must not be bypassed.
+    if !crate::net_rx::nic_present() || (timeout_ns == 0 && !crate::arch::net_irq_enabled()) {
+        return None;
+    }
+    ensure_tracked(cur);
+    let deadline_ns = if timeout_ns == 0 {
+        0
+    } else {
+        ktimer::register(TimerClient::RxDeadline, timeout_ns);
+        ktimer::now_ns().wrapping_add(timeout_ns.max(1))
+    };
+    park(
+        cur,
+        Block::Net {
+            buf_va,
+            len,
+            deadline_ns,
+        },
+    )
+}
+
+/// Mark `cur` blocked on `block` and hand the CPU on.
+fn park(cur: usize, block: Block) -> Option<*mut TrapFrame> {
+    procs()[cur].state = PState::Blocked;
+    procs()[cur].block = block;
+    Some(reschedule(cur))
+}
+
+/// Whether blocking `cur` can hand the CPU to some **other** cell - either one that
+/// is runnable now, or one that is itself parked on a wake source the scheduler idle
+/// state can wait for (that cell will run again, so parking `cur` is progress).
+/// False only in the genuinely single-cell case, where the syscall keeps its in-trap
+/// wait unchanged and that wait *is* the idle.
+fn can_reschedule(cur: usize) -> bool {
+    (0..MAX_CELLS).any(|i| {
+        i != cur
+            && (schedulable(i)
+                || (user::cell_present(i)
+                    && procs()[i].state == PState::Blocked
+                    && sources_of(i) & idle::WAITABLE != 0))
+    })
+}
+
+/// Give every present native cell a process entry before parking `cell`, so
+/// `reschedule`'s round-robin (which looks for `Runnable`) can reach them.
+///
+/// A test kernel may install two native cells that never spawn (the Phase E/J
+/// shape), which leaves both `Proc` slots `Free`. `SYS_YIELD`'s `schedulable`
+/// already treats `Free` as runnable, but `reschedule` deliberately keeps its
+/// pre-existing `Runnable` predicate (it must not start scheduling cells the Phase F
+/// proofs never gave it), so the entries are materialised here instead. Idempotent.
+fn ensure_tracked(cell: usize) {
+    ensure_top(cell);
+    for i in 0..MAX_CELLS {
+        if i != cell && user::cell_present(i) && user::cell_is_native(i) {
+            ensure_top(i);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------- yield
+
+/// `SYS_YIELD()`: hand the CPU to the **next runnable native cell** in
+/// round-robin order; the caller stays runnable (docs/NETSTACK.md the service-cell
+/// section, rheo-net N4a). This is the N-cell generalisation of `SYS_SWITCH`'s
+/// directed `cur^1` hand-off, which cannot reach client 3 from client 2 and so
+/// livelocks a service serving N>1 clients. It adds **no kernel object**: it is the
+/// same cooperative cross-cell scheduler `SYS_WAIT`/child-exit already drive
+/// (`reschedule` above), exposed as a plain yield, and transfers no authority -
+/// the cells involved share one capability bundle.
+///
+/// Where the caller has no native process tree (two cells a test kernel wired but
+/// never spawned - Phase E/J), the round-robin degenerates to the `cur^1` peer and
+/// behaviour is unchanged. Returns `Sched::Ret(0)` when the caller is the only
+/// schedulable cell (yield to nobody = resume).
+pub fn yield_cell(cur: usize) -> Sched {
+    let Some(next) = (1..MAX_CELLS)
+        .map(|k| (cur + k) % MAX_CELLS)
+        .find(|&i| schedulable(i))
+    else {
+        return Sched::Ret(0);
+    };
+    // The native cross-cell switch, FP/SIMD register file included: this is a
+    // hard-float cell's hand-off point (docs/LIBRHEO.md, docs/ENGINEERING.md 3),
+    // and a service cell reaches it on every client round.
+    user::switch_native_cell(cur, next);
+    complete_block(next);
+    Sched::Switch(user::cell_frame(next))
+}
+
+/// Whether cell `i` can be resumed by a yield: present, native, and either a
+/// runnable member of a native process tree or a cell with no tree state at all
+/// (an installed Phase E/J peer, whose `Proc` slot is `Free`). A `Blocked` waiter
+/// or a `Zombie` is skipped - `reschedule` owns waking those.
+fn schedulable(i: usize) -> bool {
+    user::cell_present(i)
+        && user::cell_is_native(i)
+        && matches!(procs()[i].state, PState::Free | PState::Runnable)
 }
 
 /// Reap zombie child `z`: free its cell slot and kernel-owned storage, and
@@ -407,42 +651,207 @@ fn process_exit(cell: usize, code: u64) -> *mut TrapFrame {
 // ----------------------------------------------------------------- scheduler
 
 /// Hand the CPU to the next runnable native cell after `leaving` blocks or exits.
-/// Wakes any parent whose awaited child is now a zombie, round-robins to a
-/// runnable cell, and completes its pending `SYS_WAIT`. Panics only on a true
-/// deadlock (a scheduling bug, surfaced loudly).
+/// Wakes any blocked cell whose condition now holds, round-robins to a runnable
+/// cell, and completes its pending block.
+///
+/// When nothing is runnable but at least one cell is parked on a **wake source**,
+/// this **idles** ([`crate::idle`]) until a source can have fired and looks again -
+/// which is the state that used to `panic!("no runnable cell")`
+/// (docs/ARCHITECTURE-DEBT.md 2.4). "Every cell is waiting for the outside world" is
+/// the normal steady state of a server, not a scheduling bug. Only when nothing is
+/// runnable *and* no blocked cell has any source left is it a genuine deadlock, and
+/// that is reported (see [`report_deadlock`]) rather than panicked.
 fn reschedule(leaving: usize) -> *mut TrapFrame {
-    // Save the outgoing cell's live FP/SIMD state (harmless if it is exiting);
-    // the incoming cell's is restored after the address-space switch below. The
-    // native analogue of the Linux `thread::save_current_fp` in `linux::proc`.
-    user::save_native_fp(leaving);
+    loop {
+        wake_satisfiable();
 
-    // Wake blocked parents whose awaited child is now a zombie.
-    for i in 0..MAX_CELLS {
-        if procs()[i].state == PState::Blocked {
-            let w = procs()[i].wait_for;
-            if procs()[w].state == PState::Zombie {
-                procs()[i].state = PState::Runnable;
+        let next = (1..=MAX_CELLS)
+            .map(|k| (leaving + k) % MAX_CELLS)
+            .find(|&i| user::cell_present(i) && procs()[i].state == PState::Runnable);
+        if let Some(n) = next {
+            if n != leaving {
+                // Save the outgoing cell's live FP/SIMD state (harmless if it is
+                // exiting) and load the incoming cell's - the native analogue of the
+                // Linux personality's `thread::save_current_fp`/`restore_current`.
+                user::switch_native_cell(leaving, n);
             }
+            complete_block(n);
+            return user::cell_frame(n);
         }
+
+        // Nothing runnable. Idle on whatever the blocked cells are waiting for.
+        let src = blocked_sources();
+        if src & idle::WAITABLE == 0 {
+            return report_deadlock(leaving, src);
+        }
+        refresh_deadlines();
+        idle::wait(src);
     }
-
-    let next = (1..=MAX_CELLS)
-        .map(|k| (leaving + k) % MAX_CELLS)
-        .find(|&i| user::cell_present(i) && procs()[i].state == PState::Runnable);
-    let Some(n) = next else {
-        panic!("nproc: no runnable cell (native process scheduler deadlock)");
-    };
-
-    user::switch_to_cell(n);
-    user::restore_native_fp(n);
-    complete_block(n);
-    user::cell_frame(n)
 }
 
-/// If cell `n` is a woken waiter (Runnable, `wait_for` pointing at a now-zombie
-/// child), complete its `SYS_WAIT`: reap the child and set its return value (its
-/// address space is now active). A freshly-scheduled child running for the first
-/// time has `wait_for == 0` / no matching zombie, so nothing is completed.
+/// Promote every blocked cell whose condition now holds to `Runnable`.
+fn wake_satisfiable() {
+    for i in 0..MAX_CELLS {
+        if procs()[i].state == PState::Blocked && satisfiable(i) {
+            procs()[i].state = PState::Runnable;
+        }
+    }
+}
+
+/// Whether blocked cell `i`'s condition now holds.
+fn satisfiable(i: usize) -> bool {
+    match procs()[i].block {
+        Block::None => false,
+        // Pre-existing behaviour, now expressed through `Block`: a `SYS_WAIT`er wakes
+        // when its awaited child is a zombie.
+        Block::Wait { child } => child < MAX_CELLS && procs()[child].state == PState::Zombie,
+        Block::Timer { deadline_ns, .. } => reached(deadline_ns),
+        Block::Console { .. } => crate::input::has_data() || crate::input::at_eof(),
+        Block::Net { deadline_ns, .. } => {
+            crate::net_rx::frame_pending() || (deadline_ns != 0 && reached(deadline_ns))
+        }
+    }
+}
+
+/// Re-register the **nearest** outstanding deadline in each arbiter slot before the
+/// scheduler idles.
+///
+/// The arbiter has one slot per *client kind*, not per cell (docs/NETSTACK.md 16 -
+/// the client set is closed so the kernel stays allocation-free). Two cells sleeping
+/// at once therefore share `CellSleep`, and whichever registered last would be the
+/// only deadline the hardware is armed for - so the other cell would wake late, by
+/// however much the two deadlines differ. The scheduler multiplexes them: each
+/// blocked cell's deadline is held in its own `Block` (absolute, timer domain), and
+/// the nearest of them is what the slot gets before every idle. Satisfiability is
+/// judged from the `Block`, never from the slot, so a cell can never be woken by
+/// another cell's deadline either.
+fn refresh_deadlines() {
+    let now = ktimer::now_ns();
+    let mut nearest = [u64::MAX; ktimer::CLIENTS];
+    let mut net_nearest = u64::MAX;
+    for i in 0..MAX_CELLS {
+        if procs()[i].state != PState::Blocked {
+            continue;
+        }
+        match procs()[i].block {
+            Block::Timer {
+                deadline_ns,
+                client,
+            } => {
+                let s = &mut nearest[client as usize];
+                if deadline_ns < *s {
+                    *s = deadline_ns;
+                }
+            }
+            Block::Net { deadline_ns, .. } if deadline_ns != 0 && deadline_ns < net_nearest => {
+                net_nearest = deadline_ns;
+            }
+            _ => {}
+        }
+    }
+    for (slot, &deadline) in nearest.iter().enumerate() {
+        if deadline != u64::MAX {
+            ktimer::register(client_of(slot), deadline.wrapping_sub(now).max(1));
+        }
+    }
+    if net_nearest != u64::MAX {
+        ktimer::register(
+            TimerClient::RxDeadline,
+            net_nearest.wrapping_sub(now).max(1),
+        );
+    }
+}
+
+/// The [`TimerClient`] for arbiter slot index `slot`. The enum is `#[repr]`-free, so
+/// the mapping is written out rather than transmuted.
+fn client_of(slot: usize) -> TimerClient {
+    match slot {
+        0 => TimerClient::RxPoll,
+        1 => TimerClient::RxDeadline,
+        2 => TimerClient::CellSleep,
+        3 => TimerClient::NetTimer,
+        4 => TimerClient::Pacer,
+        _ => TimerClient::FutexWait,
+    }
+}
+
+/// Whether the absolute timer-domain deadline `deadline_ns` has passed. Compared in
+/// the **timer's own** domain (`ktimer::now_ns`), never the instruction counter -
+/// they are different counters on RISC-V (docs/ENGINEERING.md 11).
+fn reached(deadline_ns: u64) -> bool {
+    ktimer::now_ns().wrapping_sub(deadline_ns) < (1 << 63)
+}
+
+/// The union of the wake sources every blocked cell is waiting on
+/// ([`crate::idle`]). Zero means nothing is blocked; a value with no
+/// [`idle::WAITABLE`] bit means every blocked cell is waiting on another cell, which
+/// with nothing runnable is a deadlock.
+fn blocked_sources() -> idle::Sources {
+    let mut src = 0;
+    for i in 0..MAX_CELLS {
+        if procs()[i].state == PState::Blocked {
+            src |= sources_of(i);
+        }
+    }
+    src
+}
+
+/// The wake sources cell `i`'s current block can be satisfied by.
+fn sources_of(i: usize) -> idle::Sources {
+    match procs()[i].block {
+        Block::None => 0,
+        Block::Wait { .. } => idle::PEER,
+        Block::Timer { .. } => idle::TIMER,
+        Block::Console { .. } => idle::CONSOLE,
+        // A bounded receive also waits on its deadline.
+        Block::Net { deadline_ns, .. } => {
+            idle::NET | if deadline_ns != 0 { idle::TIMER } else { 0 }
+        }
+    }
+}
+
+/// The union of wake sources the native scheduler is currently blocked on - the
+/// classifier the run loop's idle/deadlock decision is made from, exposed so a test
+/// can assert it directly (docs/ENGINEERING.md 1: assert the decision, not the
+/// consequence).
+pub fn wake_sources() -> idle::Sources {
+    blocked_sources()
+}
+
+/// No cell is runnable and no blocked cell has a wake source left: a genuine
+/// deadlock. Print what each blocked cell is waiting for and end the run with
+/// [`crate::abi::DEADLOCK_EXIT`], rather than `panic!`ing with a kernel stack trace
+/// that says nothing about the cells (docs/ARCHITECTURE-DEBT.md 2.4).
+fn report_deadlock(leaving: usize, src: idle::Sources) -> *mut TrapFrame {
+    crate::println!(
+        "nproc: DEADLOCK - no runnable native cell, no wake source (leaving={leaving}, waiting on {})",
+        idle::describe(src)
+    );
+    for i in 0..MAX_CELLS {
+        if procs()[i].state == PState::Blocked {
+            crate::println!("nproc:   cell {i} blocked on {}", block_name(i));
+        }
+    }
+    user::deadlock_finish()
+}
+
+/// The name of cell `i`'s block, for the deadlock diagnostic.
+fn block_name(i: usize) -> &'static str {
+    match procs()[i].block {
+        Block::None => "nothing",
+        Block::Wait { .. } => "SYS_WAIT (child exit)",
+        Block::Timer { .. } => "SYS_ARM_TIMER (deadline)",
+        Block::Console { .. } => "SYS_WAIT_INPUT (console)",
+        Block::Net { .. } => "SYS_WAIT_NET (frame)",
+    }
+}
+
+/// Apply woken cell `n`'s pending syscall - its address space is now active - and
+/// set its return value, then clear the block.
+///
+/// `SYS_WAIT` keeps its pre-existing shape exactly: a zombie the cell was waiting
+/// for is reaped on **every** switch-in (including a plain `SYS_YIELD`), keyed on
+/// `wait_for`, because that is what the Phase F/N4a proofs observe.
 fn complete_block(n: usize) {
     let child = procs()[n].wait_for;
     if child < MAX_CELLS
@@ -451,8 +860,37 @@ fn complete_block(n: usize) {
     {
         let code = reap(child);
         procs()[n].wait_for = 0;
+        procs()[n].block = Block::None;
         let frame = user::cell_frame(n);
         // SAFETY: `frame` is `n`'s saved trap frame.
         unsafe { arch::set_syscall_ret(&mut *frame, code) };
+        return;
     }
+    let block = procs()[n].block;
+    procs()[n].block = Block::None;
+    let r: u64 = match block {
+        Block::None | Block::Wait { .. } => return,
+        Block::Timer { client, .. } => {
+            ktimer::cancel(client);
+            0
+        }
+        // SAFETY: `buf_va`/`len` were range-checked against **this** cell's user VA
+        // range when the block was registered, and `n`'s address space is active
+        // again here (`switch_native_cell` above, or `n == leaving`).
+        Block::Console { buf_va, len } => unsafe { crate::input::drain(buf_va, len) as u64 },
+        Block::Net {
+            buf_va,
+            len,
+            deadline_ns,
+        } => {
+            if deadline_ns != 0 {
+                ktimer::cancel(TimerClient::RxDeadline);
+            }
+            // SAFETY: as `Block::Console` above.
+            unsafe { crate::net_rx::complete_wait(buf_va, len) as u64 }
+        }
+    };
+    let frame = user::cell_frame(n);
+    // SAFETY: `frame` is `n`'s saved trap frame.
+    unsafe { arch::set_syscall_ret(&mut *frame, r) };
 }

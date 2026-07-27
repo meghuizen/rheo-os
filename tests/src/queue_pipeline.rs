@@ -12,7 +12,7 @@
 use kernel::capability::{BUDGET_UNLIMITED, ObjectKind, ObjectTable, READ, WRITE};
 use kernel::cell::Cell;
 use kernel::queue::{
-    self, OP_ECHO, QueuePair, STATUS_BAD_HANDLE, STATUS_OK, STATUS_REVOKED, SqEntry,
+    self, OP_ECHO, QueuePair, STATUS_BAD_HANDLE, STATUS_DENIED, STATUS_OK, STATUS_REVOKED, SqEntry,
 };
 use kernel::{arch, println};
 
@@ -25,7 +25,7 @@ const BATCH: usize = 16;
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("queue-pipeline: start on {}", arch::NAME);
 
     let mut objects = ObjectTable::new();
@@ -76,6 +76,35 @@ extern "C" fn kernel_main() -> ! {
     queue::kernel_process(&qp, &mut producer.caps, &objects);
     assert_eq!(qp.cq.pop().unwrap().status, STATUS_BAD_HANDLE);
     println!("queue-pipeline: forged capability denied on data path OK");
+
+    // A capability of the **wrong kind** is denied, even though it is live, held
+    // by this very cell, and carries the required right
+    // (docs/ARCHITECTURE-DEBT.md 2.6). `entry.cap_id` is chosen by the cell, and
+    // the per-entry check used to discard the object it resolved - so any live
+    // capability satisfied it and a MemoryGrant id worked exactly as well as the
+    // queue's. The id is a *queue* reference; it must name a QueuePair.
+    let grant_object = objects.create(ObjectKind::MemoryGrant).unwrap();
+    let grant_cap = producer
+        .caps
+        .mint(&objects, grant_object, READ | WRITE, BUDGET_UNLIMITED)
+        .unwrap();
+    qp.sq.push(SqEntry::new(OP_ECHO, grant_cap, 0x99, 0x99));
+    queue::kernel_process(&qp, &mut producer.caps, &objects);
+    let wrong_kind = qp.cq.pop().unwrap();
+    assert_eq!(
+        wrong_kind.status, STATUS_DENIED,
+        "a MemoryGrant capability was accepted on the queue data path"
+    );
+    assert_eq!(
+        wrong_kind.flow_id, 0x99,
+        "flow context lost on the deny path"
+    );
+    // Control: the queue's own capability still works, so the check above is a
+    // bound and not a break.
+    qp.sq.push(SqEntry::new(OP_ECHO, cap, 0x9A, 0x9A));
+    queue::kernel_process(&qp, &mut producer.caps, &objects);
+    assert_eq!(qp.cq.pop().unwrap().status, STATUS_OK);
+    println!("queue-pipeline: wrong-kind capability denied, queue cap still OK");
 
     // Revoke mid-stream: the same capability that just worked goes dark, now
     // reporting the distinct `STATUS_REVOKED`.

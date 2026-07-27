@@ -21,17 +21,21 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::rc::Rc;
 use core::ptr::addr_of_mut;
 
+use ext4fs::Ext4Fs;
 use kernel::capability::{CapTable, ObjectTable};
+use kernel::hw::block::{self, BlockCache};
+use kernel::hw::virtio_blk::{self, VirtioBlk};
 use kernel::linux::{self, stack as linux_stack};
 use kernel::mm::AddressSpace;
 use kernel::queue::QueuePair;
 use kernel::svc;
 use kernel::user::{self, Outcome, Personality};
 use kernel::{arch, load, println};
-use posix::{RamFs, fs, mount, sys};
+use posix::{BlockSource, Errno, RamFs, fs, mount, sys};
 
 #[path = "vfs_personality.rs"]
 mod vfs_personality;
@@ -113,10 +117,66 @@ fn captured() -> &'static [u8] {
 }
 
 /// Run `image` (a dynamically-linked binary) with `argv`/`envp` under a fresh
-/// Linux cell, capturing stdout; returns (outcome, captured bytes).
+/// Linux cell, capturing stdout; the **initial-load** path (`load_elf_linux`, whole
+/// image in a kernel buffer). Returns the outcome.
 fn run(image: &[u8], argv: &[&[u8]], envp: &[&[u8]]) -> Outcome {
+    // Reset **before** loading: `user::reset` clears the mapped-file registry the
+    // loader registers the image in, so resetting afterwards leaves the cell's records
+    // naming a released entry and the whole image faults in as zeros
+    // (docs/ENGINEERING.md 11).
+    user::reset();
     let mut aspace = AddressSpace::new(1);
     let img = load::load_elf_linux(image, &mut aspace).expect("load dynamic Linux ELF");
+    run_image(img, aspace, argv, envp)
+}
+
+/// Run a dynamically-linked binary via the **streaming `execve`** path
+/// (`exec_elf_from_vfs_demand`): the program and its `PT_INTERP` interpreter are
+/// both streamed from the VFS and demand-paged, exactly as a shell `execve`ing a
+/// dynamic program does. Proves the streaming loader handles `PT_INTERP`
+/// (docs/LINUX-COMPAT.md L7, docs/ARCHITECTURE-DEBT.md 4.0 blocker 2).
+fn run_execve(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Outcome {
+    user::reset();
+    let mut aspace = AddressSpace::new(1);
+    let ops = svc::file_ops().expect("file ops registered");
+    // `path` is a `'static` &str (kernel .rodata), which is where
+    // `exec_elf_from_vfs_demand` requires the path to live.
+    let img =
+        load::exec_elf_from_vfs_demand(ops, path.as_ptr() as u64, path.len() as u64, &mut aspace)
+            .expect("streaming execve of a dynamic Linux ELF");
+    run_image(img, aspace, argv, envp)
+}
+
+/// Shared tail: assert both files are demand-paged, lay out the stack, install the
+/// Linux cell and run it.
+fn run_image(
+    img: load::LinuxImage,
+    mut aspace: AddressSpace,
+    argv: &[&[u8]],
+    envp: &[&[u8]],
+) -> Outcome {
+    // Both files must be demand-paged, not just the program. A dynamically linked
+    // binary is the program plus its **interpreter**, and the interpreter comes from
+    // the VFS rather than from a kernel buffer - a different loader path, so it needs
+    // its own evidence. The oracle is the address: `ld.so` is loaded at
+    // `LINUX_INTERP_BASE`, which nothing else occupies.
+    let interp_segs = img
+        .recorded()
+        .iter()
+        .filter(|s| s.base >= load::LINUX_INTERP_BASE)
+        .count();
+    let prog_segs = img.nsegs - interp_segs;
+    assert!(
+        prog_segs > 0 && interp_segs > 0,
+        "linuxdyn: {prog_segs} program + {interp_segs} interpreter segment(s) recorded \
+         - both files must be demand-paged"
+    );
+    println!(
+        "linuxdyn: {prog_segs} program + {interp_segs} ld.so segment(s) left to demand \
+         paging ({} image pages recorded, {} copied since boot)",
+        load::recorded_pages(),
+        load::eager_pages()
+    );
     let sp = linux_stack::setup_stack(&mut aspace, &img, argv, envp);
     // SAFETY: single-threaded init; the statics outlive the synchronous run.
     unsafe {
@@ -125,17 +185,16 @@ fn run(image: &[u8], argv: &[&[u8]], envp: &[&[u8]]) -> Outcome {
         let objects = &mut *addr_of_mut!(OBJECTS);
         let caps = &mut *addr_of_mut!(CAPS);
         let qp = core::ptr::addr_of!(QP) as *const QueuePair;
-        user::reset();
         user::install(0, &aspace, caps, objects, qp, addr_of_mut!(frame));
         user::set_personality(0, Personality::Linux);
-        linux::install_cell(0, img.image_end);
+        linux::install_cell(0, &img);
         user::run(0).1
     }
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("linuxdyn: start on {}", arch::NAME);
 
     // SAFETY: once, before any allocation.
@@ -166,6 +225,10 @@ extern "C" fn kernel_main() -> ! {
     }
     fs::write(INTERP_PATH, LD_SO).expect("seed ld.so");
     fs::write("/lib/libc.so.6", LIBC).expect("seed libc.so.6");
+    // The dynamic program on the VFS at /bin/dhello, so it can be `execve`d
+    // (streamed) as well as loaded directly.
+    sys::mkdir("/bin").expect("mkdir /bin");
+    fs::write("/bin/dhello", DHELLO).expect("seed /bin/dhello");
     svc::set_file_ops(vfs_personality::ops());
 
     println!(
@@ -204,6 +267,117 @@ extern "C" fn kernel_main() -> ! {
     }
     println!("linuxdyn: dhello OK (PT_INTERP + ld.so + fd-backed mmap)");
 
+    // Phase 2: the same dynamic binary via the **streaming `execve`** path -
+    // program + interpreter both streamed from the VFS and demand-paged, the way a
+    // shell launching a dynamic program does. Proves the streaming loader handles
+    // PT_INTERP (docs/ARCHITECTURE-DEBT.md 4.0 blocker 2, task GOAL-DISK-2).
+    unsafe {
+        STDOUT_LEN = 0;
+    }
+    linux::set_stdout_tap(Some(tap));
+    let outcome = run_execve(
+        "/bin/dhello",
+        &[b"dhello"],
+        &[b"LD_LIBRARY_PATH=/lib", b"PATH=/bin"],
+    );
+    linux::set_stdout_tap(None);
+    match outcome {
+        Outcome::Exited(code) => {
+            let got = captured();
+            assert!(
+                got == want_out,
+                "dhello (execve): stdout mismatch\n  got:      {:?}\n  expected: {:?}",
+                core::str::from_utf8(got),
+                core::str::from_utf8(want_out),
+            );
+            assert!(code == 12, "dhello (execve): exit {code}, expected 12");
+        }
+        Outcome::Faulted(addr) => panic!("dhello (execve): faulted at {addr:#x}"),
+    }
+    println!("linuxdyn: dhello via streaming execve OK (PT_INTERP streamed from the VFS)");
+
+    // Phase 3 (GOAL-DISK-2b): the same dynamic binary `execve`d from a real ext4
+    // image on a **live virtio-blk disk**, mounted through ext4fs/ext4plus + the
+    // bounded block cache. This composes the two proven capabilities - the
+    // streaming PT_INTERP loader (phase 2) and block-cached ext4 (#167) - end to
+    // end: the program, its interpreter and libc all stream off the disk on
+    // demand, none resident whole. If no ext4 disk is attached (a placeholder
+    // image: no e2fsprogs or toolchain libs at build time), skip-with-reason.
+    disk_phase(want_out);
+
     println!("linuxdyn: PASS");
     arch::exit(arch::ExitCode::Success)
+}
+
+/// The kernel cache-line bridge to `posix::BlockSource` (the orphan-rule newtype,
+/// as in `blockfs`).
+struct Cached(BlockCache<VirtioBlk>);
+impl BlockSource for Cached {
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<(), Errno> {
+        self.0.read_at(off, buf).map_err(|_| Errno::Io)
+    }
+}
+
+fn disk_phase(want_out: &[u8]) {
+    let dev = match virtio_blk::probe() {
+        Some(d) => d,
+        None => {
+            println!(
+                "linuxdyn: SKIP disk phase on {} - no virtio-blk disk attached",
+                arch::NAME
+            );
+            return;
+        }
+    };
+    let cache = BlockCache::new(dev);
+    let disk = match Ext4Fs::new(Box::new(Cached(cache))) {
+        Ok(fs) => fs,
+        Err(_) => {
+            println!(
+                "linuxdyn: SKIP disk phase on {} - the virtio-blk disk holds no ext4 \
+                 image (placeholder; no e2fsprogs/toolchain at build time)",
+                arch::NAME
+            );
+            return;
+        }
+    };
+
+    // Mount the live ext4 disk as the cell's `/`, then stream-`execve` from it.
+    posix::reset();
+    mount::mount("/", Rc::new(disk));
+    let fills_before = block::cache_fills();
+    unsafe {
+        STDOUT_LEN = 0;
+    }
+    linux::set_stdout_tap(Some(tap));
+    let outcome = run_execve(
+        "/bin/dhello",
+        &[b"dhello"],
+        &[b"LD_LIBRARY_PATH=/lib", b"PATH=/bin"],
+    );
+    linux::set_stdout_tap(None);
+    match outcome {
+        Outcome::Exited(code) => {
+            let got = captured();
+            assert!(
+                got == want_out,
+                "dhello (disk): stdout mismatch\n  got:      {:?}\n  expected: {:?}",
+                core::str::from_utf8(got),
+                core::str::from_utf8(want_out),
+            );
+            assert!(code == 12, "dhello (disk): exit {code}, expected 12");
+        }
+        Outcome::Faulted(addr) => panic!("dhello (disk): faulted at {addr:#x}"),
+    }
+    // Streaming witness: the program + ld.so + libc came off the device on
+    // demand through the bounded cache, not a whole-image preload.
+    let fills = block::cache_fills() - fills_before;
+    assert!(
+        fills > 0,
+        "no device reads - the binary was not streamed off disk"
+    );
+    println!(
+        "linuxdyn: dhello via streaming execve OFF A LIVE ext4 DISK OK \
+         ({fills} block-cache fills through ext4plus)"
+    );
 }

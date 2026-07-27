@@ -48,7 +48,7 @@ static mut QP: MaybeUninit<QueuePair> = MaybeUninit::uninit();
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("elfrun: start on {}", arch::NAME);
 
     let mut aspace = AddressSpace::new(1);

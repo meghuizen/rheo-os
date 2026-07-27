@@ -195,7 +195,16 @@ impl Compositor {
     /// surface into the scanout), and send the flip completion carrying the
     /// framebuffer checksum. Returns the `(frame_id, checksum)`. The caller then
     /// [`switch_to_peer`](Channel::switch_to_peer)s to deliver the completion.
-    pub fn present(&mut self, ch: &Channel) -> (u32, u32) {
+    /// Re-checksum the composited framebuffer - used to prove it is unchanged
+    /// after a refused teardown attempt.
+    pub fn rechecksum(&self) -> u32 {
+        checksum(self.framebuffer())
+    }
+
+    /// Returns `(frame_id, checksum, peer_va)` - the last being the VA the
+    /// client's sealed buffer was mapped at in *this* cell, so a caller can
+    /// inspect (or, in the `librheowl` security phase, attempt to free) it.
+    pub fn present(&mut self, ch: &Channel) -> (u32, u32, u64) {
         let msg = ch.recv();
         let frame = Self::decode(&msg.payload);
         let n = (frame.w as usize * frame.h as usize).min(self.w as usize * self.h as usize);
@@ -209,7 +218,7 @@ impl Compositor {
         // The flip/present completion (the frame callback): status ok, checksum
         // in `result`, frame id echoed in `user_data`.
         ch.complete(frame.frame_id as u64, crate::sys::STATUS_OK, sum);
-        (frame.frame_id, sum)
+        (frame.frame_id, sum, frame.peer_va)
     }
 }
 

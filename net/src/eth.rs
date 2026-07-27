@@ -5,9 +5,20 @@
 //! into a caller-provided buffer.
 //!
 //! The MAC type is `librheo::net::Mac`, re-exported so the whole stack (and the
-//! raw-frame path underneath) share one address type.
+//! raw-frame path underneath) share one address type. In the librheo-free
+//! **codec** posture (`--no-default-features`, docs/NETSTACK.md N4b) the same
+//! newtype is declared locally - six bytes, bit-identical, so the codec compiles
+//! where librheo cannot link.
 
+#[cfg(feature = "hosted")]
 pub use librheo::net::Mac;
+
+/// A 48-bit Ethernet (MAC) address. The codec-posture twin of
+/// `librheo::net::Mac`: the same `repr`-transparent six bytes, declared here so
+/// the stack's parsers/builders compile without librheo (docs/NETSTACK.md N4b).
+#[cfg(not(feature = "hosted"))]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Mac(pub [u8; 6]);
 
 /// The broadcast MAC (`ff:ff:ff:ff:ff:ff`).
 pub const BROADCAST: Mac = Mac([0xff; 6]);

@@ -14,10 +14,15 @@
 //! `user::on_user_trap` when a Linux cell has an installed, unblocked handler;
 //! otherwise the default disposition terminates the cell reporting 128+signo.
 //!
-//! Scope (L5): delivery is to self (`raise`/`kill`/`tgkill`/`tkill` of the
-//! current process/tid) and to synchronous faults. Cross-thread signal
-//! targeting of a *non-running* context is recorded as pending but not
-//! force-delivered (no L5 fixture needs it; documented in LINUX-COMPAT.md).
+//! Scope: delivery is to self (`raise`/`tgkill`/`tkill`), to synchronous
+//! faults, and - since docs/ARCHITECTURE-DEBT.md 4 - to **another process** via
+//! `kill`. A cross-process signal cannot be delivered where it is sent: the
+//! rewrite needs the *target's* saved frame and the target's user stack, so the
+//! target's address space must be active. It is therefore recorded pending and
+//! delivered by [`on_resume`], which the process scheduler calls at the one
+//! moment those conditions hold - just after it switches into the target.
+//! Cross-*thread* targeting of a non-running context is still recorded pending
+//! only (no fixture needs it; documented in LINUX-COMPAT.md).
 
 use crate::arch::{self, SigFrameSpec, TrapFrame};
 use crate::linux::errno::*;
@@ -335,15 +340,162 @@ fn cause_signo(cause: arch::FaultCause) -> u32 {
     }
 }
 
-/// kill(pid, sig): deliver to self. Only self-targeting is supported (pid ==
-/// our own pid, the whole group 0, or -1); any other pid is -ESRCH. The pid is
-/// per-cell now that processes exist (docs/LINUX-COMPAT.md L6).
+/// kill(pid, sig): signal a process (docs/ARCHITECTURE-DEBT.md 4).
+///
+/// This used to refuse any pid but the caller's own with `-ESRCH`, and to answer
+/// `kill(0, sig)` / `kill(-1, sig)` by **silently delivering to the caller** -
+/// the "signal my children" a supervisor is actually asking for, reported as
+/// done and delivered to the wrong process. Four target forms now:
+///
+/// - `pid > 0` - that process. Itself is delivered inline (the frame is right
+///   here); another is posted and delivered on its next resume ([`on_resume`]).
+/// - `pid == 0` - the caller's process group. There is no `setpgid` here, so
+///   every live process genuinely *is* in the initial group, the caller
+///   included.
+/// - `pid == -1` - every process the caller may signal **except init**, per
+///   `kill(2)`. The top of the process tree is the only process with no parent,
+///   so that is what stands in for init.
+/// - any other negative - a process group that does not exist here. Refused
+///   `-ESRCH` rather than quietly redirected to the caller.
+///
+/// `sig == 0` is an existence probe in every form: no delivery, but a real
+/// answer (`0` or `-ESRCH`), which is how `kill(pid, 0)` is used to tell a live
+/// child from a reaped one.
 pub fn kill(cell: usize, pid: i64, sig: u64, frame: *mut TrapFrame) -> Ctl {
-    let mypid = crate::linux::proc::pid(cell) as i64;
-    if pid != mypid && pid != 0 && pid != -1 {
+    use crate::linux::proc;
+    if sig as usize > NSIG {
+        return err(EINVAL);
+    }
+    let mypid = proc::pid(cell) as i64;
+
+    // A single named process.
+    if pid > 0 {
+        if pid == mypid {
+            return deliver_or_signal(cell, thread::current_context(cell), sig, frame, 0, 0);
+        }
+        if sig == 0 {
+            return if proc::pid_exists(pid as u32) {
+                ret(0)
+            } else {
+                err(ESRCH)
+            };
+        }
+        let Some(target) = proc::cell_of_pid(pid as u32) else {
+            return err(ESRCH);
+        };
+        return post_remote(target, sig as u32);
+    }
+
+    // A negative pid other than -1 names a process group. Groups do not exist
+    // here (no `setpgid`), so there is nothing to signal - and answering the
+    // caller's own process instead, as this used to, is the worst possible lie.
+    if pid < -1 {
         return err(ESRCH);
     }
-    deliver_or_signal(cell, thread::current_context(cell), sig, frame, 0, 0)
+
+    // 0 = the caller's group (every live process, caller included);
+    // -1 = every live process except init (the top of the tree).
+    let skip_top = pid == -1;
+    let mut targets = 0usize;
+    let mut self_targeted = false;
+    proc::for_each_live(skip_top, |i| {
+        targets += 1;
+        if i == cell {
+            self_targeted = true;
+        } else if sig != 0 {
+            // Ignore the per-target status: a fan-out reports the *set*, and a
+            // single unsignalable member is not the caller's error.
+            let _ = post_remote(i, sig as u32);
+        }
+    });
+    if targets == 0 {
+        return err(ESRCH);
+    }
+    if self_targeted && sig != 0 {
+        return deliver_or_signal(cell, thread::current_context(cell), sig, frame, 0, 0);
+    }
+    ret(0)
+}
+
+/// Post `signo` to another live process, resolving the disposition against
+/// **that process's** table (dispositions are per-cell), and return the `kill`
+/// result.
+///
+/// Delivery itself cannot happen here - the target's address space is not
+/// active, so its stack cannot be written and its frame must not be rewritten
+/// against the wrong page tables. What happens here is the decision; the frame
+/// rewrite happens in [`on_resume`].
+fn post_remote(target: usize, signo: u32) -> Ctl {
+    let act = actions(target)[signo as usize];
+    // Ignored outright: nothing is recorded, and that is a success.
+    if act.handler == SIG_IGN || (act.handler == SIG_DFL && !default_terminates(signo)) {
+        return ret(0);
+    }
+    // A fatal default kills the target now. It is not running, so there is no
+    // frame to rewrite and nothing to reschedule - the process simply becomes a
+    // zombie its parent can reap. A dead *top* cell cannot be a zombie; that is
+    // reported and the run ends when the scheduler next reaches it.
+    if act.handler == SIG_DFL {
+        if crate::linux::proc::mark_signaled_remote(target, signo) {
+            crate::println!("linux: kill: signal {signo} terminated the top process");
+        }
+        return ret(0);
+    }
+    // A real handler: record it and let the scheduler deliver it. Context 0 is
+    // the process's main context - the one a cross-*process* signal targets.
+    ctx(target, 0).pending |= bit(signo);
+    ret(0)
+}
+
+/// What [`on_resume`] did.
+pub enum Resumed {
+    /// Nothing pending, or a handler frame was built - resume the frame.
+    Ran,
+    /// A pending signal whose disposition is a fatal default: the process must
+    /// terminate with this signal instead of resuming.
+    Fatal(u32),
+}
+
+/// Deliver a signal that arrived while `cell` was not running, called by the
+/// process scheduler immediately after it switches into `cell`
+/// (docs/ARCHITECTURE-DEBT.md 4).
+///
+/// This is the only place a cross-process signal *can* be delivered: building a
+/// `rt_sigframe` writes the target's user stack and rewrites the target's saved
+/// frame, both of which need the target's address space active.
+///
+/// Unlike [`check_pending_current`] this does **not** overwrite the syscall
+/// return register. The caller has just completed the interrupted syscall's
+/// block, so the frame already carries the value the program must see when
+/// `rt_sigreturn` restores it; clobbering it with 0 would turn a completed read
+/// into a spurious end-of-file.
+pub fn on_resume(cell: usize) -> Resumed {
+    let idx = thread::current_context(cell);
+    let deliverable = ctx(cell, idx).pending & !ctx(cell, idx).blocked;
+    if deliverable == 0 {
+        return Resumed::Ran;
+    }
+    for s in 1..=NSIG as u32 {
+        if deliverable & bit(s) == 0 {
+            continue;
+        }
+        let act = actions(cell)[s as usize];
+        if act.handler == SIG_IGN || (act.handler == SIG_DFL && !default_terminates(s)) {
+            ctx(cell, idx).pending &= !bit(s);
+            continue;
+        }
+        if act.handler == SIG_DFL {
+            ctx(cell, idx).pending &= !bit(s);
+            return Resumed::Fatal(s);
+        }
+        let frame = thread::frame_ptr(cell, idx);
+        // SAFETY: `frame` is `cell`'s current-context saved state and `cell`'s
+        // address space is active (the scheduler just switched into it), so the
+        // user stack `build_frame` writes is mapped.
+        unsafe { build_frame(cell, idx, s, &act, &mut *frame, 0, 0) };
+        return Resumed::Ran;
+    }
+    Resumed::Ran
 }
 
 /// tgkill(tgid, tid, sig): deliver to a thread of this process (self only).
@@ -488,6 +640,14 @@ fn deliver_or_signal(
 /// # Safety
 /// `frame` is the target context's saved state and the cell root is active, so
 /// the user stack it selects is writable.
+/// Stack bytes to make writable below the chosen SP before building a signal frame.
+///
+/// A bound rather than an exact size on purpose: the frame's layout is per-ISA
+/// (`arch::setup_rt_frame`), x86-64's is the largest (siginfo + ucontext + a 512-byte
+/// FP area), and 8 KiB covers every ISA with room. Over-resolving costs at most one
+/// extra copy-on-write break on the very stack the handler is about to run on.
+const SIGFRAME_SPAN: u64 = 8192;
+
 unsafe fn build_frame(
     cell: usize,
     idx: usize,
@@ -516,6 +676,19 @@ unsafe fn build_frame(
     } else {
         arch::user_sp(frame)
     };
+
+    // `arch::setup_rt_frame` writes the `rt_sigframe` straight onto the user stack, so
+    // that span has to be **writable** before it does - and after a copy-on-write
+    // `fork` a present stack page can still be read-only, which makes the kernel's
+    // store an unresumable fault at a kernel PC. Resolving it here keeps the per-ISA
+    // frame builders free of mapping concerns (docs/ENGINEERING.md 11).
+    let lo = stack_top.saturating_sub(SIGFRAME_SPAN);
+    if crate::uaccess::buf_mut(lo, SIGFRAME_SPAN as usize).is_none() {
+        crate::println!(
+            "linux: no writable stack at {lo:#x} for a signal {signo} frame - not delivering"
+        );
+        return;
+    }
 
     let spec = SigFrameSpec {
         signo,

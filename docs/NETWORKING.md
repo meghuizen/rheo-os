@@ -21,12 +21,15 @@ requires - the kernel owns the queue plumbing, not the protocols.
   (`VIRTIO_F_VERSION_1` + `VIRTIO_NET_F_MAC`; no mergeable-rx-buffers or
   checksum/GSO offload), an RX and a TX **split virtqueue**, and the 12-byte v1
   `virtio_net_hdr`. DMA uses **physical** addresses (`virt_to_phys`) since the
-  kernel moved to the higher half. Polled (no device IRQ yet - a later refinement,
-  like virtio-blk).
+  kernel moved to the higher half. Transmit is polled; **receive is now
+  interrupt-driven on riscv/arm** (rheo-net N2d, docs/NETSTACK.md §16 - x86-64's
+  virtio-pci NIC has no usable interrupt line here and keeps a kernel-side poll).
 - librheo's **`net`** is now a real async surface: `mac()`, `send(frame)`,
-  `recv(buf)` over three queue opcodes (`OP_NET_TX`/`OP_NET_RX`/`OP_NET_MAC`)
+  `try_recv(buf)` over three queue opcodes (`OP_NET_TX`/`OP_NET_RX`/`OP_NET_MAC`)
   bridged to the driver in `kernel_process`, completing with the strand token -
-  the same async model as the Phase B `io` opcodes. `connect`/`listen` stay
+  the same async model as the Phase B `io` opcodes - plus `recv`/`recv_timeout`,
+  which **park** on the reactor's network slot and are woken by the NIC's receive
+  interrupt through `SYS_WAIT_NET` (rheo-net N2d, docs/NETSTACK.md §16). `connect`/`listen` stay
   `Unsupported` stubs: a socket/IP/TCP layer is a **service** (section 2).
 - Proof: the `librheonet` test kernel (all three ISAs) - a librheo cell asks the
   NIC for its MAC, sends a **broadcast ARP request** for the SLIRP gateway
@@ -35,10 +38,36 @@ requires - the kernel owns the queue plumbing, not the protocols.
   + opcode + sender IP and exiting `0x42`.
 - Deferred (documented): the full transport stack (IP/ARP-cache/TCP/QUIC/TLS as a
   library in a cell, section 2), a first-class socket `ObjectKind` + steering-table
-  grants (section 1), header/payload split (section 1), a device RX interrupt, and
-  everything in sections 4-7 (eBPF dataplane, DDoS staging, DPU offload).
+  grants (section 1), header/payload split (section 1), and everything in sections
+  4-7 (eBPF dataplane, DDoS staging, DPU offload). The **device RX interrupt** is
+  **done** for riscv/arm (rheo-net N2d, docs/NETSTACK.md §16); x86-64 MSI-X through
+  the PCI config tunnel, interrupt coalescing, and zero-copy receive remain.
 
-## 0a. What is built (rheo-net Phase N1a-N1e + N2a/N2b): the L2/L3/L4 core + caching DNS + traceroute + native TCP + congestion control
+> **Service-cell update (N4a, docs/NETSTACK.md §17):** the doctrine of this
+> document - the stack is a **userspace service cell**, the kernel owns only queue
+> plumbing and grant checks (§§1, 5-9) - now has its serving substrate. A service
+> cell holds **one cross-cell channel end per client** and runs **one strand per
+> client**, so a single network service cell serves many client cells concurrently
+> (proven with 3, all three ISAs). It adds **no kernel object**: a per-cell channel
+> *table* (`MAX_CELL_CHANNELS = 4`), a channel-slot selector on `SYS_SPAWN`, and
+> `SYS_YIELD` (a round-robin generalisation of `SYS_SWITCH`'s `cur^1` hand-off,
+> needed because an XOR cannot reach client 3 from client 2) - all mechanism over the
+> existing Cell + QueuePair objects, all documented in NETSTACK.md §17. Honest:
+> **concurrent, not parallel** (one CPU, cooperative - SMP is task #27), fan-out is
+> parent-shaped (the service spawns its clients; a name-based rendezvous for
+> unrelated cells is a documented follow-on), and the wire protocol is word-wide
+> today (bigger requests ride a shared sealed grant). This is what N4b (the
+> remote-INET bridge for unmodified Linux binaries) and N5 (app protocols) build on.
+
+> **Security transports update (N3a/N3b, docs/NETSTACK.md §14-15):** the crypto
+> primitive layer (N3a - ChaCha20-Poly1305 + RustCrypto SHA-2/HKDF/X25519/
+> Ed25519/AES-GCM) and a from-scratch **TLS 1.3** handshake + record layer +
+> minimal X.509 (N3b) are built and proven byte-for-byte against the RFC 8448
+> known-answer trace. Both are userspace-only, feature-gated, and add no kernel
+> object - consistent with §9 (TLS lives in userspace; keys are non-extractable
+> handles, the seam for the per-queue inline-crypto offload of §9).
+
+## 0a. What is built (rheo-net Phase N1a-N1e + N2a/N2b + N4b): the L2/L3/L4 core + caching DNS + traceroute + native TCP + congestion control + remote INET for Linux binaries
 
 The **greenfield network stack** begins here as **portable userspace** - a new
 `net/` workspace crate (`no_std` + alloc, no per-ISA code) built for the three
@@ -120,6 +149,30 @@ the in-cell virtual link, exiting `0x42`. A **live** TCP handshake is again
 **skipped with reason**. The smoltcp cell + the sharded transport + a live handshake
 are **N2c**; SACK/window-scaling/ECN, NewReno partial-ACK recovery, CUBIC
 HyStart/fast-convergence, and BBR are deferred (docs/NETSTACK.md 11-12).
+
+**rheo-net N4b** makes the stack reachable by **unmodified Linux binaries over the
+real NIC** (docs/NETSTACK.md §18, docs/LINUX-COMPAT.md L8-INET-REMOTE). The kernel
+gains **a bridge, not a stack**: `svc::SocketOps`, a table of function pointers a
+service registers - the exact `svc::FileOps` pattern that keeps the kernel
+**filesystem-free** while still serving `open`/`read`/`write`. The Linux
+personality's INET sockets keep their in-kernel **loopback** fast path (a local byte
+stream is just the L6 ring) and forward every **non-loopback** operation to that
+table; with no table registered the answer stays `-ENETUNREACH`, so nothing else
+changes. **No kernel object** is added and the kernel stays **allocation-free and
+network-stack-free** - the datapath is `rheo-net` linked in a new **codec** posture
+(`--no-default-features`, no librheo, so it links beside a kernel) driving
+`hw::virtio_net`; the frame path is the stack's own `eth`/`arp`/`ip`/`udp` code and
+the full RFC 793 `tcp::Connection`, whose synchronous
+`poll`/`on_wire_segment` seam drives straight from a syscall trap. A remote receive
+**parks** on the N2d `SYS_WAIT_NET` primitive (a genuine WFI idle on riscv64/aarch64,
+the documented timer-backed `hlt` idle on x86-64, which has no NIC RX line - docs/SMP.md 8). Proof: the `linuxnet` test kernel - an
+**unmodified static-glibc C binary** does a real DNS round trip to SLIRP's resolver
+`10.0.2.3:53` and a real remote TCP connect to a closed gateway port (SLIRP's reset
+becomes `ECONNREFUSED`), on all three ISAs. Honest scope: **UDP remote is complete**;
+**TCP connect is real and proven** while TCP *data transfer* is implemented but
+unproven under QEMU (SLIRP has no TCP responder); IPv6 remote, a remote listener
+(which needs the §1 steering grants), and moving the datapath into the N4a **service
+cell** are the documented next steps.
 
 ## 1. NIC queues are the primitive
 
@@ -248,3 +301,16 @@ pretends the hardware feature matrix is uniform.
 - NIC offload heterogeneity is real; the feature matrix differs per hardware
   generation and the grant layer surfaces it honestly (typed-hardware
   doctrine, again).
+
+## 9. Application protocols on the NIC path (rheo-net N5a)
+
+The raw-frame NIC path (Phase G) carries IP/TCP (N2), TLS 1.3 (N3), and now
+**HTTP/1.1 + HTTP/2** (N5a, docs/NETSTACK.md §19). Both HTTP versions are pure
+userspace codec plus a synchronous state machine - the same shape as `net::tcp`,
+so they are provable in-cell with no live peer and they add **no kernel object and
+no per-ISA code**. HTTP/1.1 parses zero-copy (header names and values borrow the
+receive buffer, which is what the WAF/DPI dataplane of section 8 needs) and rejects
+every request-smuggling shape in the parser itself. HTTP/2 carries the frame layer,
+the stream state machine, connection- and stream-level flow control, and HPACK with
+the RFC 7541 Appendix B Huffman code. `h2` over TLS is negotiated by a minimal
+RFC 7301 ALPN added to the N3b handshake, not assumed. HTTP/3 waits on QUIC (N7).

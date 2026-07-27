@@ -14,13 +14,15 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::rc::Rc;
 use core::ptr::addr_of_mut;
 
-use kernel::hw::block::BlockDevice;
-use kernel::hw::virtio_blk;
+use ext4fs::Ext4Fs;
+use kernel::hw::block::{self, BlockCache};
+use kernel::hw::virtio_blk::{self, VirtioBlk};
 use kernel::{arch, println};
-use posix::{Ext4, fs, mount};
+use posix::{BlockSource, Errno, fs, mount};
 
 #[global_allocator]
 static HEAP: runtime::Heap = runtime::Heap::empty();
@@ -28,7 +30,7 @@ static mut HEAP_MEM: [u8; 2 * 1024 * 1024] = [0; 2 * 1024 * 1024];
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("blockfs: start on {}", arch::NAME);
 
     // SAFETY: once, before any allocation; HEAP_MEM is a unique static.
@@ -45,24 +47,46 @@ extern "C" fn kernel_main() -> ! {
         }
     };
 
-    let sectors = dev.capacity_sectors();
+    // Wrap the device in a bounded block cache so ext4 STREAMS off the disk
+    // rather than reading the whole image into RAM (the old path, and the
+    // reason a binary could not exceed the pool). The cache holds at most
+    // CAPACITY bytes resident; we assert that is strictly less than the disk,
+    // so a correct multi-block read below cannot be the whole disk sitting in
+    // memory (docs/ARCHITECTURE-DEBT.md 4.0 blocker 2).
+    let cache = BlockCache::new(dev);
+    let disk_bytes = cache.capacity_sectors() as usize * 512;
     println!(
-        "blockfs: virtio-blk found, {} sectors ({} KiB)",
-        sectors,
-        sectors / 2
+        "blockfs: virtio-blk found, {} sectors ({} KiB); cache resident bound {} KiB",
+        cache.capacity_sectors(),
+        disk_bytes / 1024,
+        BlockCache::<VirtioBlk>::CAPACITY / 1024
+    );
+    assert!(
+        BlockCache::<VirtioBlk>::CAPACITY < disk_bytes,
+        "cache ({}) must be smaller than the disk ({}) for streaming to mean anything",
+        BlockCache::<VirtioBlk>::CAPACITY,
+        disk_bytes
     );
 
-    // Read the whole disk into RAM, then hand it to the ext4 parser. (A
-    // production FS would stream through a block cache; reading a small test
-    // image whole proves the transport + parser end to end.)
-    let bytes = sectors as usize * 512;
-    let mut disk = alloc::vec![0u8; bytes];
-    dev.read(0, &mut disk).expect("read disk");
-    let img: &'static [u8] = alloc::vec::Vec::leak(disk);
+    // The one bridge from the kernel cache to the posix `BlockSource` trait -
+    // a local newtype (the orphan rule; posix and kernel do not know each
+    // other). This is the composition site, like the FileOps registration.
+    struct Cached(BlockCache<VirtioBlk>);
+    impl BlockSource for Cached {
+        fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<(), Errno> {
+            self.0.read_at(off, buf).map_err(|_| Errno::Io)
+        }
+    }
 
-    // Full stack: block device -> ext4 -> VFS -> std::fs facade.
+    let fills_before = block::cache_fills();
+
+    // Full stack: block device -> block cache -> ext4plus (ext4fs) -> VFS ->
+    // std::fs facade.
     posix::reset();
-    mount::mount("/", Rc::new(Ext4::new(img).expect("parse ext4 from disk")));
+    mount::mount(
+        "/",
+        Rc::new(Ext4Fs::new(Box::new(Cached(cache))).expect("mount ext4 from disk")),
+    );
 
     let hello = fs::read_to_string("/hello.txt").expect("read hello");
     assert!(hello == "hello from ext4\n", "hello wrong: {hello:?}");
@@ -78,7 +102,17 @@ extern "C" fn kernel_main() -> ! {
         "big last line"
     );
 
-    println!("blockfs: ext4 read off live virtio-blk disk (hello.txt + multi-block big.txt) OK");
+    // Streaming witness: the multi-block file (7800 bytes) read correctly
+    // through a cache that cannot hold the whole disk, and the bytes really
+    // came from the device on demand (fills happened during the reads).
+    let fills = block::cache_fills() - fills_before;
+    assert!(fills > 0, "no device reads - data was not streamed");
+    println!(
+        "blockfs: ext4 read off live virtio-blk disk (hello.txt + multi-block big.txt) OK; \
+         {fills} line fills through a {}-KiB cache over a {}-KiB disk",
+        BlockCache::<VirtioBlk>::CAPACITY / 1024,
+        disk_bytes / 1024
+    );
     println!("blockfs: PASS");
     arch::exit(arch::ExitCode::Success)
 }

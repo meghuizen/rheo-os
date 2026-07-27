@@ -45,22 +45,57 @@ pub struct Channel {
     cap_id: u32,
     role: u64,
     chan_va: u64,
+    slot: usize,
+    count: usize,
 }
 
 impl Channel {
-    /// Discover and attach this cell's end of the shared channel. `None` if no
-    /// channel is wired for this cell.
+    /// Base VA of this end's shared ring region (the frames the two cells drive
+    /// directly). Not this cell's to free - they are shared.
+    pub fn base(&self) -> usize {
+        self.chan_va as usize
+    }
+
+    /// Discover and attach this cell's end of the shared channel (slot 0). `None`
+    /// if no channel is wired for this cell.
     pub fn open() -> Option<Channel> {
-        let info = sys::connect()?;
+        Channel::open_slot(0)
+    }
+
+    /// Discover and attach this cell's channel end at `slot` (docs/NETSTACK.md the
+    /// service-cell section, rheo-net N4a). Slot 0 is the Phase E/J channel; a
+    /// **service cell** holds one end per client (slots `0..count()`), each a
+    /// separate shared ring region with one client cell. `None` if that slot holds
+    /// no channel.
+    pub fn open_slot(slot: usize) -> Option<Channel> {
+        let info = sys::connect_slot(slot)?;
         // SAFETY: `chan_va` is this cell's mapped, kernel-initialised shared ring
-        // region (the peer maps the same frames at the same VA).
+        // region for this slot (the peer maps the same frames).
         let qp = unsafe { Qp::attach(info.chan_va as *mut u8) };
         Some(Channel {
             qp,
             cap_id: info.cap_id as u32,
             role: info.role,
             chan_va: info.chan_va,
+            slot,
+            count: info.count as usize,
         })
+    }
+
+    /// How many channel ends this cell holds in total (1 for a Phase E/J cell, N
+    /// for a service cell serving N clients). 0 if none are wired.
+    pub fn count() -> usize {
+        sys::connect_slot(0).map_or(0, |i| i.count as usize)
+    }
+
+    /// This end's channel slot.
+    pub fn slot(&self) -> usize {
+        self.slot
+    }
+
+    /// How many channel ends this cell holds, as reported when this end was opened.
+    pub fn peer_count(&self) -> usize {
+        self.count
     }
 
     /// Split into a symmetric async [`AsyncSender`] + [`AsyncReceiver`] that
@@ -73,8 +108,11 @@ impl Channel {
     /// cell-boundary hand-off stays a cooperative switch under the single-CPU
     /// model. Consumes the channel (the async halves own it from here).
     pub fn split(self) -> (AsyncSender, AsyncReceiver) {
-        rt::attach_channel(self.chan_va, self.role, self.cap_id);
-        (AsyncSender { _priv: () }, AsyncReceiver { _priv: () })
+        rt::attach_channel_slot(self.slot, self.chan_va, self.role, self.cap_id);
+        (
+            AsyncSender { slot: self.slot },
+            AsyncReceiver { slot: self.slot },
+        )
     }
 
     /// This end's role (`ROLE_CLIENT` / `ROLE_SERVER`).
@@ -200,7 +238,7 @@ pub struct Message {
 /// enqueues on this end's producer ring and parks on the reactor only if the
 /// ring is momentarily full - never a busy switch.
 pub struct AsyncSender {
-    _priv: (),
+    slot: usize,
 }
 
 impl AsyncSender {
@@ -208,7 +246,12 @@ impl AsyncSender {
     /// strands) only if the ring is full; the reactor completes it when the peer
     /// drains space.
     pub async fn send(&self, msg: Message) {
-        rt::chan_send(msg.tag, msg.val).await
+        rt::chan_send_on(self.slot, msg.tag, msg.val).await
+    }
+
+    /// The channel slot this half drives.
+    pub fn slot(&self) -> usize {
+        self.slot
     }
 }
 
@@ -216,15 +259,20 @@ impl AsyncSender {
 /// always parks on the reactor and is woken by the reactor's channel service -
 /// an idle receiver costs no spin, and the wakeup is genuinely reactor-driven.
 pub struct AsyncReceiver {
-    _priv: (),
+    slot: usize,
 }
 
 impl AsyncReceiver {
     /// Receive one [`Message`] from the peer cell, parking on the reactor until
     /// it arrives. While parked the vcore runs the cell's other strands.
     pub async fn recv(&self) -> Message {
-        let (tag, val) = rt::chan_recv().await;
+        let (tag, val) = rt::chan_recv_on(self.slot).await;
         Message { tag, val }
+    }
+
+    /// The channel slot this half drives.
+    pub fn slot(&self) -> usize {
+        self.slot
     }
 }
 

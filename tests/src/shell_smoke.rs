@@ -46,7 +46,7 @@ exit\n";
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("shell-smoke: start on {}", arch::NAME);
     pty::install_script(SCRIPT);
 

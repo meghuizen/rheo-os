@@ -19,7 +19,7 @@
 use core::ptr::{self, addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::capability::{CapError, CapTable, Handle, ObjectTable, READ, WRITE};
+use crate::capability::{CapError, CapTable, ObjectKind, ObjectTable, READ, WRITE};
 
 mod sealed {
     /// Sealed: only types explicitly marked can live in DMA-visible rings.
@@ -34,91 +34,33 @@ mod sealed {
 }
 pub use sealed::DmaSafe;
 
-/// Submission opcodes understood by the current kernel side.
-pub const OP_NOP: u8 = 0;
-/// Echo `payload[0..4]` back through the completion's `result` field - the
-/// null round trip with a data touch, used by the librheo async proof.
-pub const OP_ECHO: u8 = 1;
-// ---- async I/O opcodes (docs/LIBRHEO.md Phase B, docs/IO.md 1) ----
-// Each reads its arguments from the `SqEntry.payload` (24 bytes) and completes
-// through the CQ carrying the submission's `user_data` (the strand token). File
-// work is performed via the registered `svc::FileOps` (the same VFS the POSIX
-// personality uses), so the kernel stays filesystem-free. During a cell's
-// `SYS_DOORBELL` trap its address space is active, so a `buf_va` in the payload
-// is the cell's own mapped memory: the read/write lands there directly (no
-// kernel bounce), which is the IO.md zero-copy-by-reference path.
-/// `open(path_va, path_len, flags)`: payload `[path_va u64@0][path_len u32@8]
-/// [flags u32@12]`; `result` = fd (or an I/O error status).
-pub const OP_OPEN: u8 = 2;
-/// `read(fd, buf_va, len, offset)`: payload `[buf_va u64@0][offset u64@8]
-/// [len u32@16][fd u32@20]`; `result` = bytes read.
-pub const OP_READ: u8 = 3;
-/// `write(fd, buf_va, len, offset)`: same layout as `OP_READ`. With
-/// [`FLAG_INLINE`] and `len <= INLINE_MAX`, the bytes ride in the payload
-/// instead of a `buf_va` (the IO.md sub-threshold inline path): payload
-/// `[fd u32@0][len u32@4][data @8..8+len]`. `result` = bytes written.
-pub const OP_WRITE: u8 = 4;
-/// `close(fd)`: payload `[fd u32@0]`.
-pub const OP_CLOSE: u8 = 5;
-/// `fstat(fd, statbuf_va)`: payload `[statbuf_va u64@0][fd u32@8]`.
-pub const OP_FSTAT: u8 = 6;
-/// Submit a userspace-built dependency graph to the CPU engine (docs/LIBRHEO.md
-/// Phase C, docs/ARCHITECTURE.md 3 objects 4/6). Payload `[nodes_va u64@0]
-/// [count u32@8][results_va u64@12]`: `count` `abi::GraphNode`s live at
-/// `nodes_va`; the kernel validates the edges, runs the graph on the CPU
-/// engine, writes each node's `u64` result to `results_va`, and completes with
-/// `result` = the node count. Both VAs are the cell's own mapped memory (its
-/// address space is active during the `SYS_DOORBELL` trap), so no bounce.
-pub const OP_GRAPH_SUBMIT: u8 = 7;
-// ---- raw-frame networking opcodes (docs/NETWORKING.md, LIBRHEO.md Phase G) ----
-// A cell's async `net::send`/`recv`/`mac` (over the strand reactor) bridged to
-// the kernel's virtio-net driver during the `SYS_DOORBELL` trap. The buffer VAs
-// are the cell's own mapped memory (its address space is active during the
-// drain), so TX reads and RX writes land there directly - no kernel bounce.
-// Networking above raw frames (IP/TCP/QUIC) is a **service**, not a kernel
-// object (docs/NETWORKING.md 1-2); the kernel owns only the queue plumbing.
-/// `net_tx(buf_va, len)`: payload `[buf_va u64@0][len u32@8]`; `result` = bytes
-/// sent. Sends the `len` bytes at `buf_va` as one Ethernet frame.
-pub const OP_NET_TX: u8 = 8;
-/// `net_rx(buf_va, len)`: payload `[buf_va u64@0][len u32@8]`; `result` = the
-/// received frame length (0 = no packet available - the cell re-submits to poll).
-pub const OP_NET_RX: u8 = 9;
-/// `net_mac(buf_va)`: payload `[buf_va u64@0]`; writes the 6-byte MAC at `buf_va`,
-/// `result` = 6.
-pub const OP_NET_MAC: u8 = 10;
-// ---- GPU present opcode (docs/LIBRHEO.md Phase H, docs/DISPLAY.md) ----
-/// `gpu_present(buf_va, w, h)`: payload `[buf_va u64@0][w u32@8][h u32@12]`. The
-/// compositor's `w x h` RGBA framebuffer at `buf_va` (the cell's own mapped
-/// memory) is copied into the virtio-gpu resource, transferred to the host, and
-/// flushed to scanout 0. `result` = bytes presented. Writes to the device, so it
-/// needs WRITE (the `opcode_right` default). Extends the queue object (object 3)
-/// with a mechanism - no new kernel object (ARCHITECTURE.md 6).
-pub const OP_GPU_PRESENT: u8 = 11;
+// ---- the on-wire layout: one definition, re-exported ----
+//
+// Opcodes, status codes, flags, the entry layouts and the ring header are the
+// **cross-crate** contract, so they live in `rheo-abi` and are re-exported here
+// unchanged (docs/ARCHITECTURE-DEBT.md 3.1). They used to be restated in
+// `librheo/src/sys.rs` by hand; a field-meaning change on one side produced
+// wrong numbers with no fault. `pub use` keeps every existing path
+// (`queue::SqEntry`, `queue::OP_NOP`, ...) working.
+pub use rheo_abi::{
+    CqEntry, FLAG_DUR_FLUSH, FLAG_DUR_FUA, FLAG_INLINE, INLINE_MAX, OP_CHAN_MSG, OP_CLOSE, OP_ECHO,
+    OP_FSTAT, OP_GPU_PRESENT, OP_GRAPH_SUBMIT, OP_NET_MAC, OP_NET_RX, OP_NET_TX, OP_NOP, OP_OPEN,
+    OP_READ, OP_WRITE, QUEUE_ABI_VERSION, QueueHeader, RING_DEPTH, STATUS_BAD_HANDLE,
+    STATUS_BAD_OPCODE, STATUS_DENIED, STATUS_EXHAUSTED, STATUS_IO, STATUS_OK, STATUS_REVOKED,
+    SqEntry,
+};
 
-/// `SqEntry.flags` bit: the op's data rides inline in the payload rather than
-/// by reference at `buf_va` (docs/IO.md 1 - the inline-vs-by-reference
-/// threshold). librheo sets it for writes at or below [`INLINE_MAX`] bytes.
-pub const FLAG_INLINE: u8 = 1 << 0;
-/// Largest inline write payload: what fits after the `[fd u32][len u32]` header
-/// in the 24-byte payload. Above this, an op is by-reference (zero-copy).
-pub const INLINE_MAX: usize = 16;
-
-/// Completion status codes.
-pub const STATUS_OK: u32 = 0;
-pub const STATUS_BAD_OPCODE: u32 = 1;
-pub const STATUS_DENIED: u32 = 2;
-/// The capability's object epoch was revoked (docs/SECURITY-IDENTITY.md 3).
-pub const STATUS_REVOKED: u32 = 3;
-/// The capability's metered budget is exhausted.
-pub const STATUS_EXHAUSTED: u32 = 4;
-/// The submission's `cap_id` names no live capability in the cell's table.
-pub const STATUS_BAD_HANDLE: u32 = 5;
-/// The file op failed (no personality handler, or the handler returned -errno).
-pub const STATUS_IO: u32 = 6;
+// `DmaSafe` is this crate's trait, so implementing it for the ABI's entry types
+// is allowed and stays where the DMA rule is enforced.
+// SAFETY: both are `repr(C)` plain data - no pointers, valid for every bit
+// pattern a device could write.
+unsafe impl DmaSafe for SqEntry {}
+// SAFETY: as above.
+unsafe impl DmaSafe for CqEntry {}
 
 /// Distinct completion status for each capability-check failure, so a cell can
 /// tell revoked from exhausted from denied (docs/LIBRHEO.md Phase B) rather
-/// than collapsing every `CapError` to `STATUS_DENIED`.
+/// than collapsing every `CapError` to [`STATUS_DENIED`].
 fn cap_status(e: CapError) -> u32 {
     match e {
         CapError::BadHandle => STATUS_BAD_HANDLE,
@@ -127,106 +69,6 @@ fn cap_status(e: CapError) -> u32 {
         _ => STATUS_DENIED,
     }
 }
-
-/// On-wire ABI version carried in the ring header (docs/IO.md 1). A cell
-/// binding the region checks this before trusting the layout.
-pub const QUEUE_ABI_VERSION: u32 = 1;
-
-/// A submission queue entry - exactly 64 bytes, one cache line, so
-/// producer and consumer never false-share (docs/KERNEL-RUST.md 3).
-#[repr(C, align(64))]
-#[derive(Copy, Clone)]
-pub struct SqEntry {
-    pub opcode: u8,
-    pub flags: u8,
-    pub engine_id: u16,
-    pub cap_id: u32,
-    pub flow_id: u128,  // 16 bytes - the distributed trace handle
-    pub user_data: u64, // returned in CqEntry unchanged
-    // 24, not 32: header (8) + flow_id at its 16-alignment (16..32) +
-    // user_data (8) leaves exactly 24 bytes in a 64-byte line.
-    pub payload: [u8; 24], // opcode-specific
-}
-const _: () = assert!(core::mem::size_of::<SqEntry>() == 64);
-unsafe impl DmaSafe for SqEntry {}
-
-/// A completion queue entry - 32 bytes.
-#[repr(C, align(32))]
-#[derive(Copy, Clone)]
-pub struct CqEntry {
-    pub flow_id: u128,
-    pub user_data: u64,
-    pub status: u32,
-    pub result: u32,
-}
-const _: () = assert!(core::mem::size_of::<CqEntry>() == 32);
-unsafe impl DmaSafe for CqEntry {}
-
-impl CqEntry {
-    /// All-zero entry, for static ring storage.
-    pub const ZERO: CqEntry = CqEntry {
-        flow_id: 0,
-        user_data: 0,
-        status: 0,
-        result: 0,
-    };
-}
-
-impl SqEntry {
-    /// All-zero entry, for static ring storage.
-    pub const ZERO: SqEntry = SqEntry {
-        opcode: 0,
-        flags: 0,
-        engine_id: 0,
-        cap_id: 0,
-        flow_id: 0,
-        user_data: 0,
-        payload: [0; 24],
-    };
-
-    pub fn new(opcode: u8, cap: Handle, flow_id: u128, user_data: u64) -> SqEntry {
-        SqEntry {
-            opcode,
-            flags: 0,
-            engine_id: 0,
-            cap_id: cap_index(cap),
-            flow_id,
-            user_data,
-            payload: [0; 24],
-        }
-    }
-}
-
-// The 64-byte ABI entry carries a 32-bit capability reference. The full
-// IDL-generated ABI (BUILD-ORDER.md step 6) will define this packing; for
-// now the low 16 bits are the slot and the next 16 the generation's low
-// bits, reconstructed against the table at check time.
-fn cap_index(handle: Handle) -> u32 {
-    handle.raw_low32()
-}
-
-/// The shared ring header (docs/IO.md 1): version + geometry + the four ring
-/// indices, at fixed `repr(C)` offsets so an independently-compiled cell
-/// binds to the same words the kernel does. Exactly one cache line (64 B).
-#[repr(C)]
-pub struct QueueHeader {
-    /// ABI version ([`QUEUE_ABI_VERSION`]).
-    pub version: u32,
-    /// Ring depth (entries per ring); [`RING_DEPTH`].
-    pub depth: u32,
-    /// Byte offset of the SQ entry array from the region base.
-    pub sq_off: u32,
-    /// Byte offset of the CQ entry array from the region base.
-    pub cq_off: u32,
-    pub sq_head: AtomicU32,
-    pub sq_tail: AtomicU32,
-    pub cq_head: AtomicU32,
-    pub cq_tail: AtomicU32,
-    _reserved: [u32; 8],
-}
-const _: () = assert!(core::mem::size_of::<QueueHeader>() == 64);
-
-pub const RING_DEPTH: usize = 64;
 
 const HEADER_SIZE: usize = 64;
 const SQ_OFF: usize = HEADER_SIZE;
@@ -337,7 +179,7 @@ impl QueuePair {
             addr_of_mut!((*h).sq_tail).write(AtomicU32::new(0));
             addr_of_mut!((*h).cq_head).write(AtomicU32::new(0));
             addr_of_mut!((*h).cq_tail).write(AtomicU32::new(0));
-            addr_of_mut!((*h)._reserved).write([0; 8]);
+            addr_of_mut!((*h).reserved).write([0; 8]);
         }
     }
 
@@ -496,6 +338,25 @@ fn opcode_right(opcode: u8) -> u32 {
 /// propagates unchanged - observability the system cannot fail to produce
 /// (docs/ARCHITECTURE.md 3, object 10).
 ///
+/// **What the per-entry check does and does not gate** (docs/ARCHITECTURE-DEBT.md
+/// 2.6, stated here because the earlier wording overclaimed it). `entry.cap_id`
+/// is chosen by the *cell*, so the check establishes exactly three things: the
+/// id names a **live** capability in this cell's own table (unforgeability), it
+/// carries the right this opcode needs, and its epoch is current (so a revoke
+/// kills it). It additionally now requires the capability to name a
+/// **`QueuePair`** object - the id is a *queue* reference, and passing, say, a
+/// MemoryGrant id used to satisfy the check because the resolved object was
+/// discarded.
+///
+/// It does **not** gate the resource the opcode reaches. A cell holding a queue
+/// pair can still `OP_NET_TX` an arbitrary Ethernet frame, `OP_NET_RX` any
+/// received one, `OP_GPU_PRESENT`, or `OP_OPEN` any path the registered
+/// `svc::FileOps` will open: those resources have no capability of their own yet.
+/// Closing that needs per-resource object kinds (a socket kind + NIC steering
+/// grants, a file kind for fds) - honestly deferred, docs/NETWORKING.md and
+/// docs/ARCHITECTURE-DEBT.md 2.1/2.6 - and the deferral is stated rather than
+/// papered over by a check that looks like it covers more than it does.
+///
 /// The async I/O opcodes (`OP_OPEN`/`READ`/`WRITE`/`CLOSE`/`FSTAT`,
 /// docs/LIBRHEO.md Phase B) run their file work through the registered
 /// `svc::FileOps`. They take user VAs from the payload, valid here because the
@@ -509,7 +370,12 @@ pub fn kernel_process(qp: &QueuePair, caps: &mut CapTable, objects: &ObjectTable
         let (status, result) =
             match caps.grant_check_low32(objects, entry.cap_id, opcode_right(entry.opcode)) {
                 Err(e) => (cap_status(e), 0),
-                Ok(_object) => run_opcode(&entry),
+                // The resolved object must be the queue itself. Discarding it -
+                // which this used to do - let any live capability the cell held
+                // satisfy the check, so a MemoryGrant id worked as well as the
+                // queue's (docs/ARCHITECTURE-DEBT.md 2.6).
+                Ok(object) if objects.kind(object) != ObjectKind::QueuePair => (STATUS_DENIED, 0),
+                Ok(_) => run_opcode(&entry),
             };
         qp.cq.push(CqEntry {
             flow_id: entry.flow_id,
@@ -544,8 +410,24 @@ fn rd_u64(p: &[u8; 24], o: usize) -> u64 {
 }
 
 /// Execute one grant-checked submission and return `(status, result)`.
+///
+/// A submission's payload carries **cell-supplied addresses** (buffers, paths,
+/// descriptors), and the cell's address space is active while the kernel drains
+/// the ring - so each one is bound to that cell's user VA range before it is
+/// handed to a `svc::FileOps` handler or a device driver. A rejected address
+/// completes `STATUS_DENIED`: no dereference, no fault, no panic
+/// (docs/ENGINEERING.md 12).
 fn run_opcode(entry: &SqEntry) -> (u32, u32) {
     let p = &entry.payload;
+    // Validated cell buffer, or an early `STATUS_DENIED` completion.
+    macro_rules! ck {
+        ($e:expr) => {
+            match $e {
+                Some(v) => v,
+                None => return (STATUS_DENIED, 0),
+            }
+        };
+    }
     match entry.opcode {
         OP_NOP => (STATUS_OK, 0),
         OP_ECHO => (STATUS_OK, rd_u32(p, 0)),
@@ -553,6 +435,7 @@ fn run_opcode(entry: &SqEntry) -> (u32, u32) {
             let path_va = rd_u64(p, 0);
             let path_len = rd_u32(p, 8) as u64;
             let flags = rd_u32(p, 12) as u64;
+            ck!(crate::user::user_buf(path_va, path_len as usize));
             io_result(crate::svc::file_ops().map(|o| (o.open)(path_va, path_len, flags)))
         }
         OP_READ => {
@@ -560,6 +443,7 @@ fn run_opcode(entry: &SqEntry) -> (u32, u32) {
             let offset = rd_u64(p, 8);
             let len = rd_u32(p, 16) as u64;
             let fd = rd_u32(p, 20) as u64;
+            ck!(crate::user::user_buf_mut(buf_va, len as usize));
             io_result(crate::svc::file_ops().map(|o| {
                 (o.lseek)(fd, offset as i64, 0); // SEEK_SET (positional)
                 (o.read)(fd, buf_va, len)
@@ -579,6 +463,7 @@ fn run_opcode(entry: &SqEntry) -> (u32, u32) {
                 let offset = rd_u64(p, 8);
                 let len = rd_u32(p, 16) as u64;
                 let fd = rd_u32(p, 20) as u64;
+                ck!(crate::user::user_buf(buf_va, len as usize));
                 crate::svc::file_ops().map(|o| {
                     (o.lseek)(fd, offset as i64, 0);
                     (o.write)(fd, buf_va, len)
@@ -593,42 +478,67 @@ fn run_opcode(entry: &SqEntry) -> (u32, u32) {
         OP_FSTAT => {
             let statbuf_va = rd_u64(p, 0);
             let fd = rd_u32(p, 8) as u64;
+            ck!(crate::user::user_out::<crate::abi::Stat>(statbuf_va));
             io_result(crate::svc::file_ops().map(|o| (o.fstat)(fd, statbuf_va)))
         }
         OP_GRAPH_SUBMIT => {
             let nodes_va = rd_u64(p, 0);
             let count = rd_u32(p, 8);
             let results_va = rd_u64(p, 12);
-            // SAFETY: both VAs are the submitting cell's own mapped memory,
-            // reachable because its address space is active during the drain.
+            // `graph_submit` validates both arrays (and every descriptor VA
+            // inside them) against the submitting cell's user VA range itself,
+            // because only it knows each extent.
+            // SAFETY: the submitting cell's address space is active during the
+            // drain, which is this function's contract.
             crate::svc::graph_submit(nodes_va, count, results_va)
         }
-        // Raw-frame networking (docs/NETWORKING.md, LIBRHEO.md Phase G): bridge
-        // to the virtio-net driver. The VAs are the cell's own mapped memory.
+        // Raw-frame networking (docs/NETWORKING.md, LIBRHEO.md Phase G). Reached
+        // through the `svc::NicOps` **bridge**, not by naming a driver: device
+        // drivers live permanently outside the kernel (ARCHITECTURE.md 5), so
+        // this arm must not know that the NIC is virtio-net any more than
+        // `OP_OPEN` above knows the filesystem is ext4
+        // (docs/ARCHITECTURE-DEBT.md 3.2). The datapath **DMA-reads** the
+        // transmit buffer, so an unvalidated VA here would hand kernel memory to
+        // a device - the range check stays on this side of the bridge, where the
+        // submitting cell's address space is known.
         OP_NET_TX => {
             let buf_va = rd_u64(p, 0);
             let len = rd_u32(p, 8) as u64;
-            crate::hw::virtio_net::tx(buf_va, len)
+            ck!(crate::user::user_buf(buf_va, len as usize));
+            bridged(crate::svc::nic_ops().map(|o| (o.tx)(buf_va, len)))
         }
         OP_NET_RX => {
             let buf_va = rd_u64(p, 0);
             let len = rd_u32(p, 8) as u64;
-            crate::hw::virtio_net::rx(buf_va, len)
+            ck!(crate::user::user_buf_mut(buf_va, len as usize));
+            bridged(crate::svc::nic_ops().map(|o| (o.rx)(buf_va, len)))
         }
         OP_NET_MAC => {
             let buf_va = rd_u64(p, 0);
-            crate::hw::virtio_net::mac(buf_va)
+            ck!(crate::user::user_buf_mut(buf_va, 6));
+            bridged(crate::svc::nic_ops().map(|o| (o.mac)(buf_va)))
         }
-        // GPU 2D present (docs/LIBRHEO.md Phase H): bridge to the virtio-gpu
-        // driver. The VA is the cell's own mapped framebuffer.
+        // GPU 2D present (docs/LIBRHEO.md Phase H): through the `svc::DisplayOps`
+        // bridge, for the same reason. The datapath copies `w*h*4` bytes out of
+        // the cell's framebuffer, so the extent is checked here.
         OP_GPU_PRESENT => {
             let buf_va = rd_u64(p, 0);
             let w = rd_u32(p, 8);
             let h = rd_u32(p, 12);
-            crate::hw::virtio_gpu::present(buf_va, w, h)
+            let fb_len = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+            ck!(crate::user::user_buf(buf_va, fb_len));
+            bridged(crate::svc::display_ops().map(|o| (o.present)(buf_va, w, h)))
         }
         _ => (STATUS_BAD_OPCODE, 0),
     }
+}
+
+/// A device bridge's result, or [`STATUS_IO`] when no bridge is registered. The
+/// sibling of [`io_result`] for the device tables: a kernel built with no netdev
+/// or no display genuinely cannot serve the opcode, and saying so is the honest
+/// answer (docs/ENGINEERING.md 7) - never a silent success.
+fn bridged(r: Option<(u32, u32)>) -> (u32, u32) {
+    r.unwrap_or((STATUS_IO, 0))
 }
 
 /// Map a file op's `Option<i64>` (None = no personality handler) into a

@@ -63,8 +63,30 @@ extern "C" fn main() -> i32 {
         AGG.store(sum, Ordering::Relaxed);
 
         // 3. the one-shot timer: the clock advances across a sleep.
+        //
+        // The deadline is tens of milliseconds, not microseconds, on purpose. The
+        // kernel can only *halt* on a deadline that is still in the future when the
+        // scheduler reaches the park; an already-elapsed deadline is completed
+        // immediately and nothing idles. rheo-net N2h made that observable rather
+        // than assumed (`time::timer_did_idle()` is set only from inside a park that
+        // genuinely stopped the CPU), which is why the first raise happened: a 4 us
+        // sleep was always already elapsed and the "WFI park" was a fiction.
+        //
+        // 2 ms then held for a while and still failed intermittently on x86-64, and
+        // the reason is not the kernel. The boot test runs **without** `-icount`, so
+        // the guest's monotonic clock is host wall-clock: a host scheduling hiccup
+        // between arming the deadline and reaching the park consumes guest time the
+        // guest never spent, and a millisecond-scale deadline can expire before the
+        // run loop gets there. Raising it to 50 ms puts the deadline far outside any
+        // plausible host hiccup, so the halt is deterministic. The **assertion is
+        // unchanged and no weaker** - it still demands a genuine halt; only the
+        // stimulus is now large enough that the emulator's timing noise cannot
+        // decide the outcome (docs/ENGINEERING.md 10: make the proof deterministic,
+        // never tune the claim down to match the emulator). Costs 50 ms of wall
+        // clock, once, in one boot test; `cargo xtask bench` boots only
+        // `bench_core`, so no icount path pays for it.
         let start = time::now();
-        time::sleep(Duration::from_micros(4)).await;
+        time::sleep(Duration::from_millis(50)).await;
         if start.elapsed_ticks() > 0 {
             SLEPT.store(1, Ordering::Relaxed);
         }

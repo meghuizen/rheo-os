@@ -27,7 +27,7 @@ static mut CAPS: CapTable = CapTable::new();
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
 
     // SAFETY: single CPU, one shell cell; statics are used only here.
     unsafe {

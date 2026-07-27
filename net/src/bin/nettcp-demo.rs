@@ -241,11 +241,11 @@ fn socket_api() -> Result<(), i32> {
     let sip = Ipv4Addr::new(10, 0, 0, 2);
     let (cport, sport) = (40001u16, 80u16);
 
-    let mut s: TcpStream = TcpStream::connect(cip, cport, sip, sport, 0x0000_2000);
+    let mut s: TcpStream<FixedWindow> = TcpStream::connect(cip, cport, sip, sport, 0x0000_2000);
     if s.state() != State::SynSent || s.is_established() {
         return Err(70);
     }
-    let mut l: TcpListener = TcpListener::bind(sip, sport, cip, cport, 0x0000_3000);
+    let mut l: TcpListener<FixedWindow> = TcpListener::bind(sip, sport, cip, cport, 0x0000_3000);
     if l.state() != State::Listen {
         return Err(71);
     }

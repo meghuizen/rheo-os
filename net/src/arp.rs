@@ -8,9 +8,12 @@
 //! all big-endian. [`resolve`] sends a broadcast request over `librheo::net` and
 //! waits (bounded retries) for the reply, populating an [`ArpCache`].
 
+#[cfg(feature = "hosted")]
 use alloc::collections::BTreeMap;
 
+#[cfg(feature = "hosted")]
 use librheo::net;
+#[cfg(feature = "hosted")]
 use librheo::time::Instant;
 
 use crate::eth::{self, Mac};
@@ -117,6 +120,7 @@ pub fn build_request(
 }
 
 /// One cache entry: the resolved MAC and the tick it was learned at.
+#[cfg(feature = "hosted")]
 #[derive(Copy, Clone)]
 struct Entry {
     mac: Mac,
@@ -127,11 +131,13 @@ struct Entry {
 /// address. TTL/eviction are minimal for N1a: [`ArpCache::lookup`] optionally
 /// treats an entry older than a caller-supplied age as stale. A full aging /
 /// probe / eviction policy is an N1b refinement.
+#[cfg(feature = "hosted")]
 #[derive(Default)]
 pub struct ArpCache {
     map: BTreeMap<[u8; 4], Entry>,
 }
 
+#[cfg(feature = "hosted")]
 impl ArpCache {
     /// An empty cache.
     pub fn new() -> ArpCache {
@@ -178,14 +184,16 @@ impl ArpCache {
     }
 }
 
-/// The retry budget for [`resolve`]'s RX poll. Each `net::recv` is a doorbell (a
+/// The retry budget for [`resolve`]'s RX poll. Each `net::try_recv` is a doorbell (a
 /// VM exit that lets QEMU's SLIRP backend run), so a reply lands within a handful
 /// of iterations; the cap only guards a wholly non-delivering backend. Bounded
 /// retries keep the proof deterministic under QEMU; a wall-clock timeout via
 /// `librheo::time::timeout` is available for a real deployment.
+#[cfg(feature = "hosted")]
 pub const RESOLVE_RETRIES: u32 = 200_000;
 
 /// The error [`resolve`] returns.
+#[cfg(feature = "hosted")]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ResolveError {
     /// The raw-frame TX/RX path failed.
@@ -196,9 +204,10 @@ pub enum ResolveError {
 
 /// Resolve `target_ip` to a MAC on the local link (docs/NETSTACK.md L2). Returns
 /// a cached entry immediately; otherwise broadcasts an ARP request through
-/// [`build_request`] + `librheo::net::send`, polls `net::recv` for the reply
+/// [`build_request`] + `librheo::net::send`, polls `net::try_recv` for the reply
 /// (parsing via [`eth::Frame`] + [`ArpPacket::parse`]), inserts it into `cache`,
 /// and returns the MAC. Bounded by [`RESOLVE_RETRIES`].
+#[cfg(feature = "hosted")]
 pub async fn resolve(
     cache: &mut ArpCache,
     src_mac: Mac,
@@ -214,7 +223,9 @@ pub async fn resolve(
 
     let mut buf = [0u8; 1600];
     for _ in 0..RESOLVE_RETRIES {
-        let n = net::recv(&mut buf).await.map_err(|_| ResolveError::Net)?;
+        let n = net::try_recv(&mut buf)
+            .await
+            .map_err(|_| ResolveError::Net)?;
         if n == 0 {
             continue; // nothing yet - poll again
         }

@@ -140,7 +140,11 @@ common_trap:
     call x86_fault_trap          /* -> frame* to resume in rax, or null */
     test %rax, %rax
     jz return_to_kernel_asm
-    jmp sysret_resume            /* rax = frame; resume (handler or resumed pc) */
+    /* A fault resumes through IRET, never SYSRET: the interrupted instruction may
+       re-execute (demand paging) and SYSRET consumes RCX and R11. See iret_resume
+       in user.S for the full argument - this was a real defect, latent while
+       signal delivery was the only ring-3 fault resume. */
+    jmp iret_resume              /* rax = frame */
 
 /* Hardware-interrupt stubs (docs/LIBRHEO.md Phase F). These fire in ring 0
  * (the kernel's sti;hlt idle idiom), so there is no privilege/stack switch -
@@ -174,6 +178,7 @@ common_trap:
 .endm
 
 IRQ_STUB timer_irq_stub, x86_timer_irq
+IRQ_STUB uart_irq_stub, x86_uart_irq
 
 /* The LAPIC spurious vector requires no EOI and does no work: just return. */
 .global spurious_irq_stub

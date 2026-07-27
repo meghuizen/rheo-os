@@ -27,11 +27,15 @@ use kernel::hw::iommu::Vtd as Iommu;
 #[cfg(target_arch = "aarch64")]
 use kernel::hw::smmuv3::Smmu as Iommu;
 
+/// DMA landing buffer for the mediated virtio-blk read. Only the ISAs with a
+/// QEMU IOMMU model (x86-64 VT-d, ARM64 SMMUv3) reach the DMA phase; riscv
+/// skips with a reason, so there the static is unreferenced.
+#[allow(dead_code)]
 static mut BUF: [u8; 512] = [0; 512];
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("iommu: start on {}", arch::NAME);
 
     let iommu_base = hw::inventory().iommu_base;

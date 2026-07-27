@@ -47,6 +47,33 @@ pub struct SpawnError;
 /// or [`SpawnError`] (no spawn capability, ELF not found, or the cell table is
 /// full). The child does not run until it is `wait`ed (or the parent exits).
 pub fn spawn(path: &str, argv: &[&str], env: &[&str]) -> Result<Child, SpawnError> {
+    spawn_inner(path, argv, env, 0)
+}
+
+/// Spawn `path` as a new native cell that **inherits this cell's channel end
+/// `slot`** as its own slot 0, with the opposite role (docs/NETSTACK.md the
+/// service-cell section, rheo-net N4a). This is how a **service cell** gives every
+/// client its own private ring: the service holds N ends (slots `0..N`, wired at
+/// connect time) and spawns client k on slot k. The child is slot-agnostic - it
+/// always finds its end with `ipc::Channel::open()`.
+///
+/// [`spawn`] is this with the Phase J default (slot 0 if wired). Fails with
+/// [`SpawnError`] if `slot` holds no channel, or for the usual spawn reasons.
+pub fn spawn_on_channel(
+    path: &str,
+    argv: &[&str],
+    env: &[&str],
+    slot: usize,
+) -> Result<Child, SpawnError> {
+    spawn_inner(path, argv, env, sys::spawn_chan_spec(slot))
+}
+
+fn spawn_inner(
+    path: &str,
+    argv: &[&str],
+    env: &[&str],
+    chan_spec: u64,
+) -> Result<Child, SpawnError> {
     // Build NUL-terminated C strings + NULL-terminated pointer arrays in this
     // cell's memory; the kernel reads them out before building the child stack.
     let mut argv_c: Vec<Vec<u8>> = Vec::with_capacity(argv.len());
@@ -68,11 +95,12 @@ pub fn spawn(path: &str, argv: &[&str], env: &[&str]) -> Result<Child, SpawnErro
     let mut env_ptrs: Vec<u64> = env_c.iter().map(|s| s.as_ptr() as u64).collect();
     env_ptrs.push(0);
 
-    let handle = sys::spawn(
+    let handle = sys::spawn_chan(
         path.as_ptr() as u64,
         path.len() as u64,
         argv_ptrs.as_ptr() as u64,
         env_ptrs.as_ptr() as u64,
+        chan_spec,
     );
     if handle == u64::MAX {
         Err(SpawnError)

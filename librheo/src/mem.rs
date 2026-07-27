@@ -99,10 +99,24 @@ pub(crate) unsafe fn init_heap() {
 
 use crate::sys;
 
-/// The typed kind of memory a grant is backed by (docs/MEMORY.md). Mirrors the
-/// kernel's `mm::grant::MemKind`. Only `Ddr` is real in QEMU; `Hbm`/`Cxl`/
-/// `Pmem`/`Remote` are backed by DDR frames (emulated, honest); `DeviceBar` has
-/// no backing and is refused by the kernel.
+/// The typed kind of memory a grant is backed by (docs/MEMORY.md 2.1). Mirrors
+/// the kernel's `mm::grant::MemKind`.
+///
+/// What each kind actually gets, on this machine:
+/// - `Ddr` - the DDR frame pool. Always real.
+/// - `Pmem` - **real persistent memory** where the platform exposes an nvdimm
+///   (x86-64 q35 via the ACPI NFIT): the kernel commits from a separate pmem
+///   allocator, physically distinct from the DDR pool. Where no nvdimm exists
+///   (arm/riscv `virt`) it falls back to DDR and the kernel **prints the
+///   reason** - it is not silently aliased.
+/// - `Hbm`/`Cxl`/`Remote` - emulated as DDR; QEMU models no such memory. Also
+///   reported once, for the same reason.
+/// - `DeviceBar` - no backing; refused by the kernel.
+///
+/// This doc used to say `Pmem` was DDR-backed like the others. That was true of
+/// the `SYS_GRANT` path and false of the design, because the kind was recorded
+/// and then ignored at commit time (docs/ARCHITECTURE-DEBT.md 3.6). The kind now
+/// reaches the allocator.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[repr(u64)]
 pub enum MemKind {

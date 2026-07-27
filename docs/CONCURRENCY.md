@@ -37,6 +37,17 @@ debugging tool.
   async queue, the killer of M:N threading - a hidden blocking syscall
   silently eating a core - cannot happen. This is why scheduler activations
   failed on POSIX and works here (SCHEDULING.md 3).
+
+  **That last claim is now enforced, and was not before**
+  (docs/ARCHITECTURE-DEBT.md 2.4). Three kernel verbs contradicted it -
+  `SYS_ARM_TIMER`, `SYS_WAIT_INPUT`, `SYS_WAIT_NET` waited *in kernel context*
+  without rescheduling, so a cell's `sleep` was precisely the hidden blocking
+  syscall eating the core. Each now registers its condition and returns to the
+  scheduler; a **scheduler idle state** (`kernel/src/idle.rs`) halts the CPU only
+  when no cell is runnable. What remains cooperative is stated plainly: a cell
+  yields at a syscall boundary, so a compute-bound cell that never traps starves
+  its siblings until the preemption doorbell (section 4, task #27). No wait
+  consumes the CPU; not every wait is preemptible.
 - Completions return with a strand ID in the user-data field; the runtime's
   poller unparks exactly that strand. One kernel notification carries a batch
   of completions - one wakeup, N strands resumed.
@@ -59,19 +70,34 @@ RT-reservation mutexes in the L4 suite), and multiple *vcores* (real SMP
 parallelism) still awaits secondary-core bring-up. The native strand runtime
 (sections 1-3) remains the single-vcore userspace scheduler.
 
+**Native cells get the same guarantee, per cell rather than per context.** A
+native cell is single-context, and cells build **hard-float** while the kernel
+stays soft-float (docs/TILES.md 4), so at a cross-cell hand-off the physical
+vector register file still holds the outgoing cell's values. `user::switch_native_cell`
+is the one native switch and swaps that register file along with the address
+space - `SYS_SWITCH`, the `nproc` scheduler (`SYS_WAIT` / child exit) and the
+round-robin `SYS_YIELD` all route through it, so a strand that yields the vcore
+across a cell boundary keeps its FP state. The Linux path above keeps its own
+per-*context* swap, because one Linux cell time-shares the registers between up
+to 8 contexts. Both mechanisms and the proof are in docs/LIBRHEO.md ("FP/SIMD
+across the native cross-cell switch").
+
 **The first real wakeups (docs/LIBRHEO.md Phase D/F).** Until Phase D, "park on a
 token" was closed only by a synchronous doorbell drain - a reactor with nothing
 ready could only spin, because the kernel had **no interrupts on any ISA**. Phase
 D adds the OS's **first block-and-wake**: a librheo `term` cell whose strand parks
 on console input drives the reactor to block in `SYS_WAIT_INPUT`, and the kernel
 **idles until the UART RX interrupt delivers a byte** (RISC-V S-mode external via
-the AIA IMSIC; ARM64 PL011 SPI via the GICv3) instead of spinning - a genuine
-0%-CPU park. Phase F adds the **second interrupt**, the **timer**: a strand
+the AIA IMSIC; ARM64 PL011 SPI via the GICv3; x86-64 ISA IRQ 4 via the IO-APIC,
+added in docs/SMP.md 8 once a working LAPIC EOI existed) instead of spinning - a
+genuine 0%-CPU park on all three ISAs. Phase F adds the **second interrupt**, the **timer**: a strand
 parking on a deadline (`time::sleep`/`SYS_ARM_TIMER`) idles until the per-ISA timer
-interrupt fires - **interrupt-driven on all three ISAs** (RISC-V Sstc `stimecmp`;
-ARM64 CNTV virtual timer via the GICv3; x86-64 LAPIC LVT one-shot). x86-64's UART
-RX still polls (its QEMU TCG split-irqchip IOAPIC/LAPIC does not re-deliver
-reliably, documented). The general completion-queue IRQ and the preemption
+interrupt fires - **interrupt-driven on all three ISAs**: RISC-V Sstc `stimecmp`,
+ARM64 CNTV via the GICv3, and (since docs/SMP.md phase 1) the x86-64 LAPIC one-shot
+driven over the **xAPIC MMIO** page. x86-64 had claimed this over the x2APIC MSR
+block, which QEMU TCG leaves inert - rheo-net N2h made bring-up *verify* it, the claim
+did not hold, and phase 1 fixed the capability rather than the wording
+(docs/ENGINEERING.md 1). The general completion-queue IRQ and the preemption
 doorbell (section 4) remain future work.
 
 ## 2. Both stack disciplines

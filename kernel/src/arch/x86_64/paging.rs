@@ -32,7 +32,14 @@ const RW: u64 = 1 << 1; // writable
 const US: u64 = 1 << 2; // user-accessible
 const PS: u64 = 1 << 7; // page size (2 MiB leaf at PD level)
 const G: u64 = 1 << 8; // global
+const PWT: u64 = 1 << 3; // page write-through
+const PCD: u64 = 1 << 4; // page cache disable (with PWT: PAT entry 3 = UC)
 const NX: u64 = 1 << 63; // no-execute
+/// x86-64 leaves bits 52-58 available to software. Bit 52 marks a
+/// **copy-on-write** page: it was writable, `fork` cleared RW, and the next write
+/// must private it rather than fault the process (docs/ARCHITECTURE-DEBT.md 4.0,
+/// blocker 2). The hardware ignores it.
+const COW: u64 = 1 << 52;
 
 const PAGE_SIZE: usize = 4096;
 const MIB2: usize = 2 << 20;
@@ -93,7 +100,7 @@ fn fill_high_pd(pd: &mut [u64; 512], phys_base: usize, carve: bool) {
     for (i, entry) in pd.iter_mut().enumerate() {
         let pa = phys_base + i * MIB2;
         if carve && pa == user_slot_pa {
-            let pt_pa = frames::alloc();
+            let pt_pa = frames::alloc().expect("page table (boot, reserve held)");
             *entry = addr_bits(pt_pa) | P | RW | US; // empty PT, filled by paging_map
         } else {
             // Supervisor 2 MiB page, executable (kernel code lives here).
@@ -108,10 +115,10 @@ fn fill_high_pd(pd: &mut [u64; 512], phys_base: usize, carve: bool) {
 /// the one `.user` slot delegated to a 4 KiB page table whose leaves carry the
 /// US bit.
 pub fn paging_new_root() -> PagingRoot {
-    let pml4_pa = frames::alloc();
-    let pdpt_pa = frames::alloc();
-    let pd_lo_pa = frames::alloc();
-    let pd_hi_pa = frames::alloc();
+    let pml4_pa = frames::alloc().expect("PML4 (boot, reserve held)");
+    let pdpt_pa = frames::alloc().expect("PDPT (boot, reserve held)");
+    let pd_lo_pa = frames::alloc().expect("low PD (boot, reserve held)");
+    let pd_hi_pa = frames::alloc().expect("high PD (boot, reserve held)");
     let pml4 = table_mut(pml4_pa);
     let pdpt = table_mut(pdpt_pa);
     // US on the upper tables lets the one carved `.user` leaf be user-
@@ -121,6 +128,15 @@ pub fn paging_new_root() -> PagingRoot {
     pdpt[pdpt_index(KVA) + 1] = addr_bits(pd_hi_pa) | P | RW | US; // phys 1-2 GiB
     fill_high_pd(table_mut(pd_lo_pa), 0, true);
     fill_high_pd(table_mut(pd_hi_pa), 1 << 30, false);
+    // The APIC register window, when a kernel has brought it up: one shared PML4
+    // entry (see `apic_map_window`), so an interrupt taken with this root active
+    // can reach the local APIC's EOI register. Zero - and thus skipped entirely -
+    // in every kernel that never enables an APIC-driven interrupt.
+    // SAFETY: single CPU; a plain read of a bring-up-time static.
+    let apic_pml4e = unsafe { *core::ptr::addr_of!(APIC_PML4E) };
+    if apic_pml4e != 0 {
+        pml4[pml4_index(APIC_WINDOW_VA)] = apic_pml4e;
+    }
     PagingRoot { pml4_pa }
 }
 
@@ -152,7 +168,7 @@ pub fn paging_map(root: &mut PagingRoot, va: usize, perm: MapPerm) {
 /// writable, user-accessible so the walk can descend) if the slot is empty.
 fn ensure_table(parent: &mut [u64; 512], idx: usize) -> usize {
     if parent[idx] & P == 0 {
-        let t = frames::alloc(); // zeroed
+        let t = frames::alloc().expect("page table (user reserve held)"); // zeroed
         parent[idx] = addr_bits(t) | P | RW | US;
     }
     next_table(parent[idx])
@@ -195,6 +211,74 @@ fn leaf(root: &PagingRoot, va: usize) -> Option<(usize, usize)> {
         return None; // unmapped, or a 2 MiB supervisor block (never user)
     }
     Some((next_table(e), pt_index(va)))
+}
+
+/// Clear RW on every **writable** user leaf and mark it copy-on-write, returning how
+/// many were changed - the `fork` half of COW (docs/ARCHITECTURE-DEBT.md 4.0, blocker
+/// 2). See the riscv64 twin for why this is per-ISA rather than a loop over
+/// `paging_protect` in portable code.
+pub fn paging_cow_protect_user(root: &mut PagingRoot) -> usize {
+    let mut n = 0usize;
+    for_each_user_leaf_slot(root, &mut |e: &mut u64| {
+        if *e & RW != 0 {
+            *e = (*e & !RW) | COW;
+            n += 1;
+        }
+    });
+    n
+}
+
+/// The frame behind `va` if its leaf is marked copy-on-write, else `None`.
+pub fn paging_cow_at(root: &PagingRoot, va: usize) -> Option<usize> {
+    let (pt_pa, idx) = leaf(root, va)?;
+    let e = table_mut(pt_pa)[idx];
+    if e & P == 0 || e & COW == 0 {
+        return None;
+    }
+    Some((e & 0x000F_FFFF_FFFF_F000) as usize)
+}
+
+/// Resolve a copy-on-write page: clear the mark, restore RW, and repoint the leaf at
+/// `new_pa` when the page had to be copied. The caller re-activates the root to flush.
+pub fn paging_cow_clear(root: &mut PagingRoot, va: usize, new_pa: Option<usize>) {
+    let Some((pt_pa, idx)) = leaf(root, va) else {
+        return;
+    };
+    let pt = table_mut(pt_pa);
+    let e = pt[idx];
+    let pa = new_pa.unwrap_or((e & 0x000F_FFFF_FFFF_F000) as usize);
+    // Keep the flag bits, drop COW, restore RW. A writable page is never executable
+    // here (W^X), so NX stays as `paging_protect`'s `UserRw` arm sets it.
+    let flags = (e & !0x000F_FFFF_FFFF_F000 & !COW) | RW | NX;
+    pt[idx] = (pa as u64) | flags;
+}
+
+/// Invoke `f` on every mapped 4 KiB user leaf entry of `root`, by mutable reference so
+/// the callback may rewrite it in place. Private for the same reason as the riscv64
+/// twin: a raw PTE is paging-internal.
+fn for_each_user_leaf_slot(root: &mut PagingRoot, f: &mut dyn FnMut(&mut u64)) {
+    let kva_i = pml4_index(KVA);
+    for (i4, &e4) in table_mut(root.pml4_pa).iter().enumerate() {
+        if i4 == kva_i || e4 & P == 0 {
+            continue;
+        }
+        for &e3 in table_mut(next_table(e4)).iter() {
+            if e3 & P == 0 {
+                continue;
+            }
+            for &e2 in table_mut(next_table(e3)).iter() {
+                if e2 & P == 0 || e2 & PS != 0 {
+                    continue;
+                }
+                for e1 in table_mut(next_table(e2)).iter_mut() {
+                    if *e1 & P == 0 || *e1 & US == 0 {
+                        continue;
+                    }
+                    f(e1);
+                }
+            }
+        }
+    }
 }
 
 /// Invoke `f(va, pa, perm)` for every mapped 4 KiB **user** leaf (US bit set) in
@@ -255,6 +339,15 @@ pub fn paging_unmap_frame(root: &mut PagingRoot, va: usize) -> Option<usize> {
 
 /// Rewrite the leaf permission bits at `va`, keeping the mapped frame. A no-op
 /// if `va` is unmapped. The caller flushes the TLB by re-activating the root.
+/// Whether `va` has a **live 4 KiB leaf** in `root` - see the riscv64 twin for why
+/// a demand-paging fault handler needs this before anything else.
+pub fn paging_mapped(root: &PagingRoot, va: usize) -> bool {
+    match leaf(root, va) {
+        Some((pt_pa, idx)) => table_mut(pt_pa)[idx] & P != 0,
+        None => false,
+    }
+}
+
 pub fn paging_protect(root: &mut PagingRoot, va: usize, perm: MapPerm) {
     if let Some((pt_pa, idx)) = leaf(root, va) {
         let pt = table_mut(pt_pa);
@@ -361,6 +454,60 @@ pub fn mmio_map_window(base_pa: usize, len: usize) -> usize {
     }
     paging_activate_kernel(); // flush the TLB (reload CR3)
     MMIO_WINDOW_VA + offset
+}
+
+/// Kernel VA of the **APIC register window** (docs/SMP.md). The x86 APIC
+/// registers live at a fixed physical region just under 4 GiB - the IO-APIC at
+/// `0xFEC00000` and each CPU's local APIC at `0xFEE00000` - which is above the
+/// kernel's top-2 GiB linear map, so like the nvdimm and the PCI BAR it needs its
+/// own window. A third fixed PML4 slot (386) keeps it disjoint from pmem (384)
+/// and MMIO (385).
+///
+/// Unlike those two, this window must be reachable from **every** page-table root,
+/// not just the kernel's: an interrupt can land while a cell root is active, and
+/// its handler has to write the local APIC's EOI register. So the window's PDPT is
+/// allocated once and its PML4 entry is recorded in [`APIC_PML4E`], which
+/// [`paging_new_root`] stamps into each cell root - one shared entry, no extra
+/// frame per cell. Kernels that never call [`apic_map_window`] leave PML4[386]
+/// empty and are byte-for-byte unchanged.
+const APIC_WINDOW_VA: usize = 0xFFFF_C100_0000_0000;
+/// Physical base of the APIC window: 2 MiB aligned, and 4 MiB covers both the
+/// IO-APIC (`0xFEC00000`) and the local APIC (`0xFEE00000`).
+const APIC_WINDOW_PA: usize = 0xFEC0_0000;
+const APIC_WINDOW_LEN: usize = 0x40_0000;
+
+/// The PML4 entry for the APIC window once mapped, else 0. Shared by every root.
+static mut APIC_PML4E: u64 = 0;
+
+/// Map the APIC register window into the kernel root (idempotent) and return its
+/// kernel VA. Physical `APIC_WINDOW_PA` lands at the returned VA, so the local
+/// APIC is at `va + (0xFEE00000 - 0xFEC00000)`.
+///
+/// The pages are **strongly uncacheable**: `PCD|PWT` with the default PAT selects
+/// entry 3 = UC, which is what a register file needs (a cached APIC register would
+/// be a correctness bug on real hardware; QEMU TCG models no caches, so it is
+/// invisible here - stated so the attribute is not mistaken for decoration).
+pub fn apic_map_window() -> usize {
+    // SAFETY: single CPU, called at bring-up before any secondary exists.
+    if unsafe { *core::ptr::addr_of!(APIC_PML4E) } != 0 {
+        return APIC_WINDOW_VA;
+    }
+    let pml4_pa = core::ptr::addr_of!(boot_page_tables) as usize;
+    for p in 0..APIC_WINDOW_LEN / MIB2 {
+        let va = APIC_WINDOW_VA + p * MIB2;
+        let pa = APIC_WINDOW_PA + p * MIB2;
+        let pml4 = table_mut(pml4_pa);
+        let pdpt = table_mut(ensure_table(pml4, pml4_index(va)));
+        let pd = table_mut(ensure_table(pdpt, pdpt_index(va)));
+        // 2 MiB supervisor page: present, writable, size, global, NX, uncacheable.
+        pd[pd_index(va)] = addr_bits(pa) | P | RW | PS | G | NX | PCD | PWT;
+    }
+    // SAFETY: single CPU; publish the shared PML4 entry for cell roots.
+    unsafe {
+        *core::ptr::addr_of_mut!(APIC_PML4E) = table_mut(pml4_pa)[pml4_index(APIC_WINDOW_VA)];
+    }
+    paging_activate_kernel(); // flush the TLB (reload CR3)
+    APIC_WINDOW_VA
 }
 
 /// Finish paging bring-up. The MMU and the kernel working root are already

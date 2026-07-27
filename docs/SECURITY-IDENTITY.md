@@ -5,8 +5,13 @@ subsystem 4.8.
 
 The model in one sentence: **who you are is proven by attestation, and what
 you may do is exactly the set of capabilities minted to that identity** -
-there are no users, no root, no ambient permissions, and network policy is a
-consequence of identity, not of IP addresses.
+there are no ambient permissions, and network policy is a consequence of
+identity, not of IP addresses.
+
+This document covers the **cross-host, cryptographic** half. The single-host
+model - principals, POSIX users/groups/`rwx`, root, and boot modes - is
+**docs/IDENTITY.md**, which is the source of truth where the two overlap.
+Section 4 below was amended by it.
 
 ## 1. The identity tree (SPIFFE, made native)
 
@@ -54,17 +59,36 @@ does not pretend:
 - The stated contract everywhere: revocation is **eventual within a bounded
   window**, and the window is a queryable number, not folklore.
 
-## 4. No users, no root
+## 4. No ambient authority - but users and root do exist
 
-- UID 0 does not exist. Human access is an identity like any other: an SSH
-  login authenticates a person, and a session cell is minted with that
-  identity's entitled capability set (POSIX-PERSONALITY.md).
+**Amended.** This section used to read *"No users, no root - UID 0 does not
+exist"*. That was right about the mechanism and wrong about the world; the full
+reasoning and the replacement model are in **docs/IDENTITY.md** (which is the
+source of truth for identity). The short version:
+
+- **A name is not authority.** That was, and remains, the load-bearing rule.
+  Nothing is permitted because of a number in a process structure.
+- **Users and root exist as names.** An OS that runs unmodified Linux software
+  meets `getuid`, `chown`, `chmod` and a shell prompt on day one; answering
+  those with a hardcoded constant is a stub reporting success
+  (ENGINEERING.md 7), not a security property. uid 0 is an alias for the
+  principal `rheo://<td>/system/root`.
+- **Root's power is a capability bundle**, minted to it at boot, not a
+  privileged branch. The one thing that looks like a `uid == 0` test - the file
+  server's permission bypass - is an `FsOverride` **capability**, so it is
+  delegatable, attenuable, revocable and audited. Dropping privileges revokes
+  capabilities, so it cannot be undone.
+- Human access is still an identity like any other: an SSH login authenticates
+  a person, and a session cell is minted with that identity's entitled
+  capability set (POSIX-PERSONALITY.md).
 - "sudo" becomes **grant escalation**: a request to a policy service that may
   require approval or a second factor, minting additional short-lived
   capabilities. The escalation is itself an audit event.
 - Operator break-glass exists as a pre-provisioned, heavily audited identity
   class with wide but still enumerated grants - wide is allowed; ambient is
-  not.
+  not. Single-user boot is the local form of this, and is **measured** into the
+  initial cell's principal so it is visible rather than silent
+  (IDENTITY.md 8).
 
 ## 5. Secrets
 

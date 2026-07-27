@@ -104,6 +104,21 @@ pub mod nr {
     pub const CLONE3: u64 = 435;
     pub const FACCESSAT2: u64 = 439;
 
+    // Measured from the real Claude Code startup trace
+    // (docs/ARCHITECTURE-DEBT.md 4.0, blocker 3).
+    pub const SYSINFO: u64 = 179;
+    pub const SCHED_SETSCHEDULER: u64 = 119;
+    pub const SCHED_GETSCHEDULER: u64 = 120;
+    pub const SCHED_GET_PRIORITY_MAX: u64 = 125;
+    pub const SCHED_GET_PRIORITY_MIN: u64 = 126;
+    pub const EVENTFD2: u64 = 19;
+    pub const CLOSE_RANGE: u64 = 436;
+
+    /// Not part of this table: x86-64's legacy `open` (asm-generic ISAs have only
+    /// `openat`). Named as unreachable so portable dispatch can list it, like
+    /// `ACCESS` and `READLINK`.
+    pub const OPEN: u64 = u64::MAX - 10;
+
     // epoll (docs/LINUX-COMPAT.md L8-INET). asm-generic has create1/ctl/pwait
     // only (no legacy create/wait; those are named as unreachable sentinels
     // below so portable dispatch can list them).
@@ -141,6 +156,10 @@ pub mod nr {
     /// `faccessat`). Named as unreachable so portable dispatch can list it;
     /// no program can issue this number here (docs/LINUX-COMPAT.md L7).
     pub const ACCESS: u64 = u64::MAX - 6;
+    /// No legacy `readlink` in the asm-generic table (only `readlinkat`), so this
+    /// is an unreachable sentinel - the dispatch arm compiles on every ISA and
+    /// matches only where the number is real.
+    pub const READLINK: u64 = u64::MAX - 9;
 }
 
 /// The asm-generic `struct epoll_event` is naturally aligned (16 bytes; the
@@ -223,3 +242,36 @@ impl Stat {
         }
     }
 }
+
+/// Every x86-64-only verb is represented here by an **unreachable sentinel** so
+/// one portable `match` compiles on all three ISAs. The scheme has a sharp edge:
+/// two sentinels with the same value make the *second* arm dead code, silently.
+/// That happened - `READLINK` was added as `MAX - 7`, colliding with
+/// `EPOLL_CREATE`, which made `epoll_create` unreachable on this table. Clippy
+/// reports it as an unreachable pattern, but only if clippy runs after the
+/// constant is added, and the boot tests did not exercise the shadowed arm.
+///
+/// So the invariant is now checked at compile time instead of by review.
+const _: () = {
+    let all = [
+        nr::POLL,
+        nr::FORK,
+        nr::VFORK,
+        nr::PIPE,
+        nr::DUP2,
+        nr::ACCESS,
+        nr::READLINK,
+        nr::EPOLL_CREATE,
+        nr::EPOLL_WAIT,
+        nr::OPEN,
+    ];
+    let mut i = 0;
+    while i < all.len() {
+        let mut j = i + 1;
+        while j < all.len() {
+            assert!(all[i] != all[j], "duplicate asm-generic syscall sentinel");
+            j += 1;
+        }
+        i += 1;
+    }
+};

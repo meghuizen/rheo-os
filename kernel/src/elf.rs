@@ -14,6 +14,10 @@ const PT_LOAD: u32 = 1;
 /// A `PT_INTERP` segment names the ELF interpreter (`ld-linux-*.so`) that must
 /// load and relocate a dynamically-linked binary (docs/LINUX-COMPAT.md L7).
 const PT_INTERP: u32 = 3;
+/// `PT_GNU_STACK` - the toolchain's record of how much stack the image wants
+/// (`p_memsz`) and whether it wants it executable (`p_flags`, deliberately
+/// ignored: W^X is structural here). Set by `ld -z stacksize=N`.
+const PT_GNU_STACK: u32 = 0x6474_e551;
 
 /// ELF `e_type` values the loader distinguishes.
 pub const ET_EXEC: u16 = 2;
@@ -132,6 +136,32 @@ impl<'a> Elf<'a> {
             }
         }
         found
+    }
+
+    /// The stack size the image asks for, from `PT_GNU_STACK`'s `p_memsz`, or
+    /// `None` if the segment is absent or asks for nothing.
+    ///
+    /// The loader used to ignore this header entirely and give every Linux cell
+    /// one fixed size, so a binary that asked for more silently got less and
+    /// overran (docs/ARCHITECTURE-DEBT.md 4.0). The measured case that forced
+    /// this: the real Claude Code binary's `PT_GNU_STACK` `p_memsz` is
+    /// `0xc35000` = 12.8 MiB against a fixed 8 MiB. Bumping the constant would
+    /// have fixed that one binary and left the next one to fail the same way,
+    /// which is the difference between a number and a mechanism.
+    ///
+    /// `PT_GNU_STACK`'s flags also carry executable-stack permission; that is
+    /// deliberately **not** read, because W^X is structural here and an
+    /// executable stack is refused rather than honoured (`linux::mem`).
+    pub fn stack_size(&self) -> Option<usize> {
+        for i in 0..self.phnum {
+            let base = self.phoff + i * self.phentsize;
+            if rd_u32(self.image, base)? != PT_GNU_STACK {
+                continue;
+            }
+            let memsz = rd_u64(self.image, base + 40)? as usize;
+            return (memsz != 0).then_some(memsz);
+        }
+        None
     }
 
     /// The file offset and length of the `PT_INTERP` segment - the NUL-

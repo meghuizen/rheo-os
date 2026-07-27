@@ -14,6 +14,9 @@ edition = "2024"
 
 [dependencies]
 runtime = { path = "../runtime" }
+# The on-wire ABI, defined once (docs/ARCHITECTURE-DEBT.md 3.1) - the same crate
+# the kernel re-exports, so `librheo::sys` cannot drift from `kernel::abi`.
+rheo-abi = { path = "../abi" }
 
 # Feature gating (docs/LIBRHEO.md): `full` (the default) pulls every extended
 # module; an **embedded** cell builds `--no-default-features` to link only the
@@ -81,10 +84,24 @@ path = "src/bin/lrsh.rs"
 name = "librheo-net"
 path = "src/bin/librheo-net.rs"
 
+# rheo-net N2d (docs/NETSTACK.md, the async-receive path): true async receive -
+# the receiving strand parks on the reactor's network slot and the kernel idles at
+# WFI until the NIC's RX interrupt delivers a real frame.
+[[bin]]
+name = "librheo-netwait"
+path = "src/bin/librheo-netwait.rs"
+
 # Phase H: a real GPU scanout over a virtio-gpu 2D driver (present round trip).
 [[bin]]
 name = "librheo-gpu"
 path = "src/bin/librheo-gpu.rs"
+
+# The typed-grant proof (docs/ARCHITECTURE-DEBT.md 3.6): a cell asks SYS_GRANT
+# for MemKind::Pmem and commits it, so the `pmem` test kernel can assert on the
+# other side of the trap that the frames came from the nvdimm pool.
+[[bin]]
+name = "librheo-pmem"
+path = "src/bin/librheo-pmem.rs"
 
 # Phase J: symmetric async IPC - two cells ping-pong typed messages over the
 # async Sender/Receiver, parking on the reactor (no busy switch).

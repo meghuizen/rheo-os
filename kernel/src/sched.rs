@@ -100,3 +100,40 @@ impl Default for Admission {
         Self::new()
     }
 }
+
+// ------------------------------------------------------- the system-wide ledger
+
+/// The **system-wide** admission ledger (docs/ARCHITECTURE-DEBT.md 2.5,
+/// docs/SCHEDULING.md 4).
+///
+/// The defect this closes: admission was tested **only** against the *calling
+/// cell's* controller, so sixteen cells each admitting 90% all succeeded - 1440% of
+/// one CPU admitted, nothing refused. Doctrine 5 ("accepted by math or rejected
+/// loudly") was scoped so that it could not reject the only over-commit that
+/// matters. Aggravating it, a **second** global controller existed for the same
+/// object, behind the legacy `SYS_RESERVE` verb.
+///
+/// So there is now exactly one ledger for the machine, and it is this. A
+/// reservation must fit **both** its cell's controller and this one; the per-cell
+/// controller stays because it is what makes a *cell's* own set schedulable
+/// (docs/SCHEDULING.md 4) and what `SYS_RESERVE_QUERY` reports.
+///
+/// Single CPU today (task #27). Under SMP a reservation is admitted against a
+/// *core*, so this becomes one ledger per core plus a placement decision; the shape
+/// - admit against the resource, not against the requester - is what matters here.
+static mut SYSTEM: Admission = Admission::new();
+
+/// The machine-wide admission ledger. Every reservation is charged here as well as
+/// to its own cell.
+pub fn system() -> &'static mut Admission {
+    // SAFETY: single CPU, synchronous traps; no concurrent access.
+    unsafe { &mut *core::ptr::addr_of_mut!(SYSTEM) }
+}
+
+/// Clear the system-wide ledger (called from `user::reset`, between runs).
+pub fn reset_system() {
+    // SAFETY: single CPU, between runs.
+    unsafe {
+        *core::ptr::addr_of_mut!(SYSTEM) = Admission::new();
+    }
+}

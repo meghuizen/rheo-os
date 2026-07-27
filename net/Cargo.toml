@@ -15,7 +15,18 @@ edition = "2024"
 # The raw-frame NIC path, the async reactor, the heap, and the one-shot timer -
 # rheo-net is a layer over librheo, not a peer of it. `full` (librheo default)
 # provides `net`/`time`/`mem`/`rt`.
-librheo = { path = "../librheo" }
+#
+# **Optional**, behind the `hosted` feature (on by default). librheo supplies a
+# cell's `_start`, `#[panic_handler]` and `#[global_allocator]`, so a *kernel*
+# binary cannot link it (duplicate lang items). rheo-net N4b needs the stack's
+# pure codec + state machines available kernel-side (the `svc::SocketOps` bridge,
+# docs/NETSTACK.md N4b), so `--no-default-features` drops librheo and compiles the
+# **codec** posture: eth/ip/arp-packet/udp-codec/tcp/cc/shard/wire-framing, with
+# every async librheo-driven endpoint gated out. `qemu-tests` depends on rheo-net
+# that way. NOTE: never build `-p qemu-tests` and `-p rheo-net` in ONE cargo
+# invocation - feature unification would turn `hosted` back on and the test kernel
+# would fail to link. xtask keeps them in separate invocations.
+librheo = { path = "../librheo", optional = true }
 
 # The blessed pure-Rust `no_std` transport (docs/NETSTACK.md 3, §13, Phase N2c) -
 # Redox's stack, correctness-first, single-poll. Pinned. `default-features = false`
@@ -33,13 +44,45 @@ smoltcp = { version = "=0.13.1", default-features = false, features = [
     "alloc",
 ], optional = true }
 
+# rheo-net N3a crypto primitives (docs/NETSTACK.md §3, the hybrid crypto posture).
+# The ChaCha20-Poly1305 AEAD is from-scratch (ChaCha20 is already ours, Poly1305 is
+# small); these audited RustCrypto crates supply SHA-2 / HKDF / X25519 / Ed25519 /
+# AES-GCM. Each is doc-named in NETSTACK.md §3 per the no-deps rule, pinned,
+# `default-features = false` so they build `no_std` for the three bare soft-float
+# targets (no `getrandom`/`std` pulled), and all are behind the `crypto` feature so
+# the base stack + every existing test are unaffected when it is off (the default).
+sha2 = { version = "=0.10.8", default-features = false, optional = true }
+hkdf = { version = "=0.12.4", default-features = false, optional = true }
+aes-gcm = { version = "=0.10.3", default-features = false, features = [
+    "aes",
+    "alloc",
+], optional = true }
+x25519-dalek = { version = "=2.0.1", default-features = false, features = [
+    "static_secrets",
+], optional = true }
+ed25519-dalek = { version = "=2.1.1", default-features = false, optional = true }
+
 # Profile feature gates (docs/NETSTACK.md): a deployment links only the layers
 # its profile needs. For N1a every profile pulls the same L2/L3 core (the
 # modules are always compiled); the gates are declared now so later phases
 # (UDP/TCP/TLS/app protocols) can be attached per profile without a churn of the
 # public surface. `default = ["edge"]` is the general-purpose profile.
 [features]
-default = ["edge"]
+default = ["edge", "hosted"]
+# The librheo-**hosted** posture: the async endpoints/services that drive the NIC
+# and the reactor through librheo (`arp::resolve`, `udp::UdpEndpoint`, `icmp`,
+# `dns`, `timer`, `local`, `service`). On by default - every cell build wants it.
+# Turning it OFF (`--no-default-features`) yields the **codec** posture, which
+# links into a kernel binary (docs/NETSTACK.md N4b).
+hosted = ["dep:librheo"]
+# The **deterministic-proof** support types (docs/ARCHITECTURE-DEBT.md 3.5):
+# `tcp::VirtualLink`, the in-cell loopback that carries a segment to a peer
+# `Connection` and can be armed to **drop** one, which is what makes RTO recovery
+# provable with no live peer. It is fault injection, so it must not ship in a
+# production posture - and it especially must not ship in the librheo-free codec
+# posture, which links into *kernel* binaries for the N4b bridge. Off by default;
+# xtask enables it for the demo cells whose proofs drive it.
+proof = []
 # A tiny subset: raw frames + minimal UDP (future). Smallest datapath.
 embedded = []
 # General host / firewall / WAF: the full L2-L4 core (future TCP/TLS).
@@ -50,10 +93,44 @@ hft = []
 warehouse = []
 # N2c: the smoltcp blessed transport cell (docs/NETSTACK.md 13). Off by default
 # so the from-scratch stack + every existing test are unaffected.
-smoltcp = ["dep:smoltcp"]
+smoltcp = ["dep:smoltcp", "hosted"]
+# N3a: the crypto primitive layer (docs/NETSTACK.md §3). ChaCha20-Poly1305 is
+# from-scratch; the audited RustCrypto crates supply the rest. Off by default so
+# the base stack + every existing test are unaffected; built separately by xtask.
+crypto = [
+    "hosted",
+    "dep:sha2",
+    "dep:hkdf",
+    "dep:aes-gcm",
+    "dep:x25519-dalek",
+    "dep:ed25519-dalek",
+]
+# N3b: the TLS 1.3 stack (docs/NETSTACK.md §15) - from-scratch over the N3a
+# primitives, so it just implies `crypto` (no new dependency). Off by default;
+# built separately by xtask with the same force-soft backend cfgs as the crypto
+# demo. The key schedule / record layer / handshake / minimal X.509 are pure Rust.
+tls = ["crypto"]
 
 [lib]
 name = "rheo_net"
+
+# The crypto build (docs/NETSTACK.md §3, N3a) is compiled on x86_64 with
+# `RUSTFLAGS=--cfg aes_force_soft --cfg polyval_force_soft
+# --cfg curve25519_dalek_backend="serial"` (xtask's `build_crypto_demo`) to route
+# aes / aes-gcm's polyval-GHASH / curve25519-dalek onto their **portable software**
+# backends - the `x86_64-unknown-none` default target features otherwise select
+# intrinsics backends (AES-NI / CLMUL / AVX2 SIMD) that miscompile under LLVM
+# ("Do not know how to split the result of this operator"). Soft backends are the
+# scalar fallback our doctrine wants anyway (docs/NETSTACK.md §3). Those RUSTFLAGS
+# reach this crate too, so declare the custom cfgs as known - otherwise
+# `unexpected_cfgs` would fire on rheo-net under clippy `-D warnings`. rheo-net
+# never reads them.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(aes_force_soft)',
+    'cfg(polyval_force_soft)',
+    'cfg(curve25519_dalek_backend, values("serial", "simd", "fiat"))',
+] }
 
 # The N1a proof cell: reads the NIC MAC, resolves the SLIRP gateway via net::arp
 # (a real ARP round trip through the stack), and round-trips IPv4/IPv6 headers +
@@ -123,3 +200,63 @@ path = "src/bin/nettcpcc-demo.rs"
 name = "netsmoltcp-demo"
 path = "src/bin/netsmoltcp-demo.rs"
 required-features = ["smoltcp"]
+
+# The N3a crypto proof cell: runs every crypto primitive against its RFC/NIST test
+# vector (ChaCha20-Poly1305, SHA-256/384, HKDF, X25519, Ed25519, AES-GCM) + the
+# round-trip / tamper-reject checks + the two-randomness-class + nonce-safe API.
+# Pure compute (no netdev). Requires the `crypto` feature (built separately by
+# xtask with the force-soft cfgs); loaded by the `netcrypto` test kernel.
+[[bin]]
+name = "netcrypto-demo"
+path = "src/bin/netcrypto-demo.rs"
+required-features = ["crypto"]
+
+# The N3b TLS 1.3 proof cell (docs/NETSTACK.md §15): the RFC 8448 §3 known-answer
+# key-schedule check (early/handshake/master secrets, traffic secrets, write
+# keys+IVs, Finished MACs - byte-for-byte), an in-cell full 1-RTT handshake with
+# an app-data round trip + tamper-reject, and the minimal-X.509 verify/reject.
+# Pure compute (no netdev). Requires the `tls` feature (built separately by xtask
+# with the force-soft cfgs); loaded by the `nettls` test kernel.
+[[bin]]
+name = "nettls-demo"
+path = "src/bin/nettls-demo.rs"
+required-features = ["tls"]
+
+# The N4a proof cells (docs/NETSTACK.md the service-cell section): the **network
+# service cell** and its clients. `netsvc-demo` is the service - it binds one
+# cross-cell channel end per client, spawns three `netsvc-client` cells (each
+# inheriting its own end), and serves them concurrently with one strand per client.
+# Loaded by the `netservice` test kernel.
+[[bin]]
+name = "netsvc-demo"
+path = "src/bin/netsvc-demo.rs"
+
+[[bin]]
+name = "netsvc-client"
+path = "src/bin/netsvc-client.rs"
+
+# The N5a proof cell (docs/NETSTACK.md §19): HTTP/1.1 + HTTP/2. The h1 codec +
+# zero-copy borrow proof, 18 request-smuggling rejections, the SWAR-vs-scalar scan
+# oracle, an h1 client<->server exchange over the in-cell TCP VirtualLink
+# (POST+body, chunked, keep-alive, 404), the RFC 7541 Appendix C HPACK known-answer
+# vectors (C.1/C.2/C.3/C.4 incl. Huffman), the h2 connection (preface, SETTINGS,
+# concurrent streams, WINDOW_UPDATE-gated body, RST/PING/GOAWAY), and one HTTP/1.1
+# exchange through the N3b TLS record layer with ALPN. Pure compute (no netdev).
+# Requires the `tls` feature (built separately by xtask with the force-soft
+# backends); loaded by the `nethttp` test kernel.
+[[bin]]
+name = "nethttp-demo"
+path = "src/bin/nethttp-demo.rs"
+required-features = ["tls"]
+
+# The N4c proof cell (docs/NETSTACK.md §20): host configuration - DHCP (codec byte
+# oracle + the DISCOVER->OFFER->REQUEST->ACK walk + T1/T2 renewal/rebind/expiry +
+# DECLINE/RELEASE + six rejections), the hostcfg store read back by dns::Config and
+# udp::UdpEndpoint, IPv4 link-local (ARP probe + conflict re-pick + announce +
+# defend), mDNS over the DNS codec, and the NTP offset/delay known-answer test with
+# the result as a bounded interval. Deterministic and network-free; the live DHCP /
+# NTP / mDNS / link-local attempts are bonus and skip-with-reason. Loaded by the
+# `nethostcfg` test kernel.
+[[bin]]
+name = "nethostcfg-demo"
+path = "src/bin/nethostcfg-demo.rs"

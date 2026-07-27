@@ -12,25 +12,18 @@
 //! Ctrl-C/Ctrl-D, and returns one line at a time. Raw mode (per-keystroke)
 //! and the resize/signal control queue (docs/SHELL.md) are future work.
 
-use crate::arch;
+use crate::{arch, input};
 
-/// Where the line discipline reads keystrokes from.
-enum Source {
-    /// Live serial console (interactive `cargo xtask run --bin lsh`).
-    Serial,
-    /// A fixed script consumed byte by byte (headless tests). The usize is
-    /// the read cursor.
-    Script(&'static [u8], usize),
-}
-
-static mut SOURCE: Source = Source::Serial;
-
-/// Install a scripted input source (for deterministic headless tests).
-/// The script is played as if typed; end of script is end of input.
+/// Install a scripted input source (for deterministic headless tests). The
+/// script is played as if typed; end of script is end of input.
+///
+/// Forwards to [`input::install_script`]: this module used to hold a second,
+/// byte-identical `Source` enum with its own `static mut` and its own cursor
+/// (docs/ARCHITECTURE-DEBT.md 3.6). There is one scripted-input source in the
+/// kernel now. The **live** paths stay separate on purpose - see the note on
+/// `input::Source`.
 pub fn install_script(script: &'static [u8]) {
-    unsafe {
-        *core::ptr::addr_of_mut!(SOURCE) = Source::Script(script, 0);
-    }
+    input::install_script(script);
 }
 
 /// Write one byte to the console.
@@ -52,25 +45,17 @@ fn echo_str(s: &str) {
 /// Fetch the next raw input byte. Blocks (polls) on the serial source;
 /// returns None at end of a script source.
 fn next_byte() -> Option<u8> {
-    // SAFETY: single CPU, synchronous; SOURCE is only touched here and in
-    // install_script (before any cell runs).
-    let src = unsafe { &mut *core::ptr::addr_of_mut!(SOURCE) };
-    match src {
-        Source::Serial => loop {
-            if let Some(b) = arch::serial_read_byte() {
-                return Some(b);
-            }
-            core::hint::spin_loop();
-        },
-        Source::Script(data, pos) => {
-            if *pos >= data.len() {
-                None
-            } else {
-                let b = data[*pos];
-                *pos += 1;
-                Some(b)
-            }
+    // Scripted input comes from the one shared cursor; the live path is this
+    // module's own (a blocking poll inside the cooked read, which is not what
+    // `input`'s interrupt-fed ring does).
+    if input::scripted() {
+        return input::script_next_byte();
+    }
+    loop {
+        if let Some(b) = arch::serial_read_byte() {
+            return Some(b);
         }
+        core::hint::spin_loop();
     }
 }
 

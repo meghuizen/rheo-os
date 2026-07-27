@@ -38,6 +38,11 @@ const PTE_U: u64 = 1 << 4;
 const PTE_G: u64 = 1 << 5;
 const PTE_A: u64 = 1 << 6;
 const PTE_D: u64 = 1 << 7;
+/// Sv39 reserves bits 8-9 (`RSW`) for software. Bit 8 marks a page a
+/// **copy-on-write** page: it was writable, `fork` cleared the write bit, and the
+/// next write must private it rather than fault the process
+/// (docs/ARCHITECTURE-DEBT.md 4.0, blocker 2). The hardware ignores it.
+const PTE_COW: u64 = 1 << 8;
 
 const PAGE_SIZE: usize = 4096;
 const GIB: usize = 1 << 30;
@@ -88,7 +93,7 @@ fn table_mut(pa: usize) -> &'static mut [u64; 512] {
 /// superpages with the one `.user` slot delegated to a level-0 table where user
 /// pages carry the U bit.
 pub fn paging_new_root() -> PagingRoot {
-    let l2_pa = frames::alloc();
+    let l2_pa = frames::alloc().expect("root page table (boot, reserve held)");
     let l2 = table_mut(l2_pa);
 
     // High MMIO gigapage (0..1 GiB), supervisor R|W.
@@ -97,7 +102,7 @@ pub fn paging_new_root() -> PagingRoot {
 
     // High kernel RAM (2..3 GiB): level-1 table of 2 MiB supervisor superpages,
     // with the `.user` slot delegated to a per-cell level-0 table.
-    let l1_pa = frames::alloc();
+    let l1_pa = frames::alloc().expect("page table (boot, reserve held)");
     let l1 = table_mut(l1_pa);
     let user_slot_va = user_window_base() & !(MIB2 - 1);
     for (i, entry) in l1.iter_mut().enumerate() {
@@ -106,7 +111,7 @@ pub fn paging_new_root() -> PagingRoot {
         if va == user_slot_va {
             // Delegate this 2 MiB slot to a per-cell level-0 table; user pages
             // are added later by paging_map. Empty for now.
-            let l0_pa = frames::alloc();
+            let l0_pa = frames::alloc().expect("page table (boot, reserve held)");
             *entry = table_to_pte(l0_pa, PTE_V); // pointer PTE (no R/W/X)
         } else {
             *entry = table_to_pte(pa, PTE_V | PTE_R | PTE_W | PTE_X | PTE_G | PTE_A | PTE_D);
@@ -150,7 +155,7 @@ pub fn paging_map(root: &mut PagingRoot, va: usize, perm: MapPerm) {
 /// (a pointer PTE, no R/W/X) if the slot is not yet valid.
 fn ensure_table(parent: &mut [u64; 512], idx: usize) -> usize {
     if parent[idx] & PTE_V == 0 {
-        let t = frames::alloc(); // zeroed
+        let t = frames::alloc().expect("page table (user reserve held)"); // zeroed
         parent[idx] = table_to_pte(t, PTE_V);
     }
     pte_to_table(parent[idx])
@@ -190,6 +195,74 @@ fn leaf(root: &PagingRoot, va: usize) -> Option<(usize, usize)> {
         return None;
     }
     Some((pte_to_table(e), (va >> 12) & 0x1FF))
+}
+
+/// Clear the write bit on every **writable** user leaf and mark it copy-on-write,
+/// returning how many were changed - the `fork` half of COW
+/// (docs/ARCHITECTURE-DEBT.md 4.0, blocker 2). The caller re-activates the root to
+/// flush, and [`paging_cow_at`] recognises the pages afterwards.
+///
+/// Written here rather than as a loop over `paging_protect` in portable code because
+/// it rewrites the very leaf entries a walk would be iterating over, and because a
+/// software PTE bit is not something `MapPerm` can express.
+pub fn paging_cow_protect_user(root: &mut PagingRoot) -> usize {
+    let mut n = 0usize;
+    for_each_user_leaf_slot(root, &mut |e: &mut u64| {
+        if *e & PTE_W != 0 {
+            *e = (*e & !PTE_W) | PTE_COW;
+            n += 1;
+        }
+    });
+    n
+}
+
+/// The frame behind `va` if its leaf is marked copy-on-write, else `None` - asked by
+/// the page-fault handler to tell "this write must private a shared page" from "this
+/// write is genuinely refused".
+pub fn paging_cow_at(root: &PagingRoot, va: usize) -> Option<usize> {
+    let (l0_pa, idx) = leaf(root, va)?;
+    let e = table_mut(l0_pa)[idx];
+    if e & PTE_V == 0 || e & PTE_COW == 0 {
+        return None;
+    }
+    Some(pte_to_table(e))
+}
+
+/// Resolve a copy-on-write page: clear the COW mark, restore write access, and
+/// repoint the leaf at `new_pa` when the page had to be copied (`None` keeps the
+/// frame - the case where this mapping turned out to be the only holder). The caller
+/// re-activates the root to flush the stale read-only entry.
+pub fn paging_cow_clear(root: &mut PagingRoot, va: usize, new_pa: Option<usize>) {
+    let Some((l0_pa, idx)) = leaf(root, va) else {
+        return;
+    };
+    let l0 = table_mut(l0_pa);
+    let e = l0[idx];
+    let pa = new_pa.unwrap_or_else(|| pte_to_table(e));
+    l0[idx] = table_to_pte(pa, (e & 0x3FF & !PTE_COW) | PTE_W);
+}
+
+/// Invoke `f` on every mapped 4 KiB **user** leaf entry of `root`, by mutable
+/// reference so the callback may rewrite it in place. Kept private: handing out a
+/// raw PTE is a paging-internal thing, and the portable callers want
+/// [`paging_for_each_user_leaf`]'s decoded `(va, pa, perm)` instead.
+fn for_each_user_leaf_slot(root: &mut PagingRoot, f: &mut dyn FnMut(&mut u64)) {
+    for &e2 in table_mut(root.l2_pa).iter() {
+        if e2 & PTE_V == 0 || e2 & (PTE_R | PTE_W | PTE_X) != 0 {
+            continue;
+        }
+        for &e1 in table_mut(pte_to_table(e2)).iter() {
+            if e1 & PTE_V == 0 || e1 & (PTE_R | PTE_W | PTE_X) != 0 {
+                continue;
+            }
+            for e0 in table_mut(pte_to_table(e1)).iter_mut() {
+                if *e0 & PTE_V == 0 || *e0 & PTE_U == 0 {
+                    continue;
+                }
+                f(e0);
+            }
+        }
+    }
 }
 
 /// Invoke `f(va, pa, perm)` for every mapped 4 KiB **user** leaf (U bit set) in
@@ -245,6 +318,20 @@ pub fn paging_unmap_frame(root: &mut PagingRoot, va: usize) -> Option<usize> {
 
 /// Rewrite the leaf permission bits at `va`, keeping the mapped frame. A no-op
 /// if `va` is unmapped. The caller flushes the TLB by re-activating the root.
+/// Whether `va` has a **live 4 KiB leaf** in `root` - the question a demand-paging
+/// fault handler has to answer before anything else: is this "the page is not
+/// there" (populate it and retry) or "the page is there and the access was
+/// refused" (a genuine SIGSEGV)? Without it a permission fault on a populated
+/// page would be re-populated and re-faulted forever.
+///
+/// Portable callers reach this through `mm::AddressSpace::is_mapped`.
+pub fn paging_mapped(root: &PagingRoot, va: usize) -> bool {
+    match leaf(root, va) {
+        Some((l0_pa, idx)) => table_mut(l0_pa)[idx] & PTE_V != 0,
+        None => false,
+    }
+}
+
 pub fn paging_protect(root: &mut PagingRoot, va: usize, perm: MapPerm) {
     if let Some((l0_pa, idx)) = leaf(root, va) {
         let l0 = table_mut(l0_pa);

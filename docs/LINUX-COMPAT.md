@@ -99,7 +99,7 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 
 | Syscall | Status | Notes |
 |---|---|---|
-| read / write | full | over the per-cell fd table (console, VFS files, /dev/{null,zero,urandom}) |
+| read / write | full | over the per-cell fd table (console, VFS files, /dev/{null,zero,urandom}). **Console input (stdin) blocks** (docs/ARCHITECTURE-DEBT.md 2.4): it used to answer 0 on an empty console, i.e. *end of input*, which is indistinguishable from a real EOF and so a lie to every reader. A blocking descriptor now parks (`proc::Block::Console`) until a byte is buffered or input genuinely ends; a non-blocking one reports -EAGAIN. Bytes come from the same kernel RX ring the UART interrupt fills, so blocking and non-blocking reads cannot disagree about what has arrived. On a machine with a live serial console and no input, a blocking stdin read waits - as it does on Linux |
 | pread64 | partial | positioned read of a VFS file (lseek+read); ld.so reads ELF headers with it (L7). Non-VFS fds → -EBADF |
 | readv / writev | full | iterate the iovec array over read/write |
 | openat | partial | dirfd is a C `int` (low 32 bits, sign-extended - AT_FDCWD arrives as `0xffffff9c`); AT_FDCWD honored, paths resolved by the VFS; a real (positive) dirfd → -ENOSYS (no suite util needs it). `/dev/{null,zero,urandom,random}` and `/proc/self/auxv` synthesized, else via `FileOps::open` |
@@ -110,13 +110,13 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 | getdents64 | full | VFS directory (path stored per fd), packed as `linux_dirent64` and paged out via a per-fd cursor so a reader looping until 0 (real `ls`) terminates; directory must fit 4 KiB of records |
 | getcwd | full | the per-cell cwd (default `/`) + NUL; -ERANGE if the buffer is too small |
 | chdir | partial | stores the path as the cwd verbatim (absolute in practice); no existence check |
-| pipe2 / pipe | full | a **cross-cell** bounded ring buffer (16 global pipes × 64 KiB, `kernel/src/linux/pipe.rs`), the two ends held by different cells after `fork` (L6). Read/write block **cooperatively** with cross-cell wake at syscall boundaries; EOF when all write ends close, SIGPIPE/-EPIPE when all read ends close. `dup`/`fork` refcount the ends. Single-process use (both ends in one cell, no peer to run) falls back to non-blocking -EAGAIN, keeping uu_cat's `splice`-fallback path (L3) working. `pipe` (x86-64 legacy) == `pipe2(...,0)` |
+| pipe2 / pipe | full | `O_CLOEXEC` **and** `O_NONBLOCK` honored on both ends at creation (docs/ARCHITECTURE-DEBT.md 2.4). A **cross-cell** bounded ring buffer (16 global pipes × 64 KiB, `kernel/src/linux/pipe.rs`), the two ends held by different cells after `fork` (L6). Read/write block **cooperatively** with cross-cell wake at syscall boundaries; EOF when all write ends close, SIGPIPE/-EPIPE when all read ends close. `dup`/`fork` refcount the ends. Single-process use (both ends in one cell, no peer to run) falls back to non-blocking -EAGAIN, keeping uu_cat's `splice`-fallback path (L3) working. `pipe` (x86-64 legacy) == `pipe2(...,0)` |
 | splice | ENOSYS | uu_cat's Linux fast path probes `splice` and falls back to read/write on failure (documented fallback) |
 | /proc/self/auxv | full | serves the cell's own auxv byte stream (a read-only synthetic fd); glibc/rustix read it when no PR_GET_AUXV is provided |
 | dup / dup3 | partial | copies the slot; a duplicated VFS fd shares the underlying descriptor (close-once) |
-| fcntl | partial | F_DUPFD/F_DUPFD_CLOEXEC/F_GETFD/F_SETFD/F_GETFL(→O_RDWR)/F_SETFL only |
+| fcntl | partial | F_DUPFD/F_DUPFD_CLOEXEC (the CLOEXEC form really sets it), F_GETFD/F_SETFD (**FD_CLOEXEC tracked**, honored by `execve`), F_GETFL (the **real** access mode plus O_NONBLOCK while set), F_SETFL (**O_NONBLOCK honored**: a would-block read/write returns -EAGAIN instead of parking the cell or reporting 0; **O_APPEND and O_ASYNC are refused -EINVAL** - not repositioned on write, no SIGIO), F_GETPIPE_SZ on a pipe (the ring's real capacity). File locking (F_GETLK/F_SETLK/F_SETLKW + the OFD forms) → **-ENOLCK** (no lock manager). **Every other command → -EINVAL** and a console line; it used to `_ => 0`, i.e. report success for anything unimplemented. **Creation-time `O_NONBLOCK`/`SOCK_NONBLOCK` is now honoured too** (`open`/`socket`/`socketpair`/`accept4`/`pipe2`, docs/ARCHITECTURE-DEBT.md 2.4). It could not be while `poll` reported every fd ready: a non-blocking program's poll-then-read loop would be told "ready", read -EAGAIN, and spin. It landed with the waiting `poll` in one slice |
 | ioctl | partial | TIOCGWINSZ on a console fd → 80x24; every other request -ENOTTY |
-| poll / ppoll | partial | non-blocking readiness only (never waits); answers glibc/Rust fd sanitization at startup |
+| poll / ppoll | full for POLLIN/POLLOUT | **Real readiness, and a real wait** (docs/ARCHITECTURE-DEBT.md 2.4). `revents` is computed per `FdKind` by one shared definition (`linux::poll_revents` over `pollin_ready`/`pollout_ready`): a pipe or local socket from its ring, a **remote** UDP/TCP socket from the `svc::SocketOps` bridge (whose readiness probe pumps the datapath), the console from the RX ring or end of input, a VFS file/`/dev/null`/`/dev/zero` always, an epoll fd from its own watches, a closed fd POLLNVAL. The **timeout is honoured**: 0 is a pure probe, a negative value waits indefinitely, and a positive one is a deadline in the cell's own clock domain. Waiting is a `proc::Block::Poll` registration, so the caller leaves the CPU and the scheduler idles on what the watched descriptors can be woken by. `ppoll`'s `struct timespec` is read (NULL = indefinite). **What it used to be:** readiness was never consulted at all - every open fd was reported ready for whatever was asked and the timeout ignored - and two things depended on that accident, which is why they were fixed in one slice (see the `fcntl` row and L8-INET-REMOTE). *Scope:* POLLERR/POLLHUP/POLLPRI are not reported (a hung-up pipe surfaces as POLLIN readable, which is what a reader acts on); a set larger than 64 descriptors keeps the non-blocking probe, because the request is copied into a fixed kernel array to be judged while another cell's address space is active; a wait whose watched descriptors have **no** wake source answers immediately rather than parking on an impossible condition |
 | faccessat / faccessat2 | full | existence check via the VFS stat handler |
 | access | full | x86-64 legacy; path in arg0, no dirfd. ld.so probes /etc/ld.so.preload etc. (L7); existence check via the VFS |
 | readlinkat | partial | always -ENOENT (no symlinks in the VFS; /proc/self/exe is not read by the L3 suite - uu 0.0.29 gets argv[0] from `std::env::args`, not the auxv/execfn) |
@@ -129,16 +129,16 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 | getpid | full | synthesized pid/tgid: 1000 for the top process, 1001+ per forked child (L6) |
 | gettid | full | per-context tid (L4): the main thread is 1000, clone children 1001+ |
 | clone | partial | the pthread-create flag set (CLONE_VM/FS/FILES/SIGHAND/THREAD/SETTLS/PARENT_SETTID/CHILD_CLEARTID): a new context in the same address space with its own stack/TLS, returns 0 in the child / tid in the parent (L4). Not `fork` (L6); >`MAX_CONTEXTS` (8) per cell → -EAGAIN. Arg order is arch ABI (`CLONE_BACKWARDS` on ARM64/RISC-V) |
-| futex | partial | FUTEX_WAIT/WAKE (+ WAIT_BITSET/WAKE_BITSET as plain WAIT/WAKE; PRIVATE ignored); WAIT re-checks the word and parks the caller, WAKE moves up to `val` waiters to ready (L4). Any timeout treated as infinite; **priority inheritance is a documented TODO** (FIFO wake; no RT-reservation mutexes in the suite) |
+| futex | partial | FUTEX_WAIT/WAKE (+ WAIT_BITSET/WAKE_BITSET as plain WAIT/WAKE; PRIVATE ignored); WAIT re-checks the word and parks the caller, WAKE moves up to `val` waiters to ready (L4). **The timeout is honored** (it used to be treated as infinite, so `pthread_cond_timedwait` hung): a `struct timespec` is read from arg 3 - **relative** for FUTEX_WAIT, **absolute** for FUTEX_WAIT_BITSET, in CLOCK_MONOTONIC or (with FUTEX_CLOCK_REALTIME) CLOCK_REALTIME - and an elapsed deadline returns **-ETIMEDOUT**. Deadlines are compared in the **cell's own clock domain** (`linux::cell_clock_ns`, what its `clock_gettime` reports), because that is the domain the program computed the deadline in; the CPU parks on them through the kernel timer arbiter's `FutexWait` slot, never `arch::timer_*` directly. A WAIT with **no timeout and no runnable sibling** can never be satisfied: it returns **-EAGAIN** (so the caller re-checks, which is what every real caller does) and logs one console line, instead of returning 0 - "you were woken" - which was a lie about a wakeup that never happened. **Priority inheritance is still a TODO** (FIFO wake) |
 | getppid | full | the parent's pid (0 for the top of the process tree) |
 | getuid / geteuid / getgid / getegid | full | 1000 (no root, SECURITY-IDENTITY) |
 | uname | full | sysname "Linux", release "6.6.0-rheo", machine per ISA |
 | clock_gettime | partial | MONOTONIC via `arch::ticks_to_ns`; REALTIME = fixed epoch + monotonic (unsynced, disclosed) |
-| clock_nanosleep / nanosleep | partial | returns immediately (0), no actual sleep |
+| clock_nanosleep / nanosleep | full for the blocking case | **A real sleep** (docs/ARCHITECTURE-DEBT.md 2.4); it used to return 0 immediately. The deadline is computed and compared in the **cell's own clock domain** (`cell_clock_ns` - the domain the program's own `clock_gettime` reports), parked on as a `proc::Block::Timer`, so a sibling process runs while one sleeps. `clock_nanosleep`'s `TIMER_ABSTIME` is honoured; a deadline already in the past returns 0 at once. `rem` is **never written**, because no signal is delivered to a parked process, so the sleep cannot be interrupted - stated rather than implied. Note that glibc routes `nanosleep` through `clock_nanosleep` on every ISA here, so the latter is the number that matters (fixing only the former would be invisible - observed) |
 | getrandom | full | fills from the cell's DRBG; flags ignored (never blocks) |
-| sched_yield | full | switches to the next ready context (L4); returns 0 (no-op if it is the only runnable context) |
+| sched_yield | full | switches to the next ready context of this cell (L4); with no ready sibling it crosses to the next runnable **process** (`proc::yield_cell`, the `SYS_YIELD` hand-off), so a yield is a real preemption point and not a no-op. Returns 0. Only when the caller is the sole runnable process is it picked again |
 | sched_getaffinity | partial | reports a single online CPU (bit 0) so `available_parallelism` reads 1 and thread pools (rayon) stay small/deterministic (L4) |
-| prlimit64 / getrlimit | full | RLIMIT_STACK 1 MiB, RLIMIT_NOFILE 64, else unlimited; not settable |
+| prlimit64 / getrlimit | full | RLIMIT_STACK is **whatever the loader actually mapped** for this cell, read from `LinuxState.stack_pages` - 8 MiB by default, more if the image's `PT_GNU_STACK` asked for more (see the stack section). glibc sizes *thread* stacks from this number, so it must be the mapped size and not a recomputation. RLIMIT_NOFILE 64, else unlimited; not settable |
 | arch_prctl | full | x86-64 only: SET_FS/GET_FS program the FS_BASE MSR (L1); the base is recorded per context and reloaded on a context switch (L4) |
 | prctl | partial | PR_SET_NAME/PR_GET_NAME accepted as a cosmetic no-op (rayon names its workers and treats failure as fatal, L4); every other option -ENOSYS |
 | set_tid_address | full | records the calling context's clear-tid address, returns its tid (L4; enacted by CHILD_CLEARTID on thread exit) |
@@ -147,16 +147,32 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 | rt_sigprocmask | full | per-context blocked mask (BLOCK/UNBLOCK/SETMASK); SIGKILL/SIGSTOP never blockable; a now-unblocked pending signal is delivered before return (L5) |
 | sigaltstack | full | per-context alternate signal stack; honored for SA_ONSTACK handlers; -EPERM while executing on it (L5) |
 | rt_sigreturn | full | restores the interrupted `TrapFrame` + signal mask from the signal frame on the user stack; resumes where the signal interrupted (L5) |
-| kill / tgkill / tkill / rt_sigqueueinfo | partial | self-targeting only (own pid 1000 / own tids): `raise`/`abort` paths. Delivery is by trap-frame rewrite; a signal to a *non-running* sibling context is recorded pending (not force-delivered) - no L5 fixture needs it, documented. Non-self pid/tgid -ESRCH (L5) |
+| kill | full for live processes | Any live pid, the caller's group (`0`), or every process except the top of the tree (`-1`, standing in for init); any other negative pid is `-ESRCH` (no `setpgid`, so no groups exist). `sig == 0` is a real existence probe. A signal to **another** process is resolved against *its* disposition table and recorded pending, then delivered when the scheduler switches into it (`signal::on_resume`) - a frame rewrite needs the target's own stack and address space, and that is the only moment they are live. An uncaught fatal default makes a non-running target a zombie its parent reaps. **Does not interrupt a blocked syscall**: a target parked in `read`/`poll` gets the signal when that wait completes, not with `EINTR` - documented, and a separate slice |
+| tgkill / tkill / rt_sigqueueinfo | partial | self-targeting only (own pid 1000 / own tids): `raise`/`abort` paths. A signal to a *non-running* sibling **context** is recorded pending, not force-delivered - no fixture needs it. Non-self tgid `-ESRCH` |
 | rt_sigtimedwait | partial | never blocks; returns -EAGAIN so callers loop/bail rather than hang (no fixture waits in it) (L5) |
 | mremap | full | shrink unmaps the tail in place; grow requires MREMAP_MAYMOVE (map a fresh region, copy, free the old); else -ENOMEM. glibc's large-block `realloc` needs it (the malloc-copy-free fallback otherwise leaks frames) |
-| rseq / clone3 | ENOSYS | glibc has documented fallbacks (rseq→unregistered, clone3→clone); verified via the ENOSYS logger that glibc/rust fall back to `clone`, so clone3 stays ENOSYS |
+| rseq / clone3 | ENOSYS | glibc has documented fallbacks (rseq→unregistered, clone3→clone); verified via the ENOSYS logger that glibc/rust fall back to `clone`, so clone3 stays ENOSYS. Both are now **dispatched** to that refusal rather than falling through the unknown-number path, so the log no longer says `ENOSYS nr=435` as if the number were unrecognised (docs/ARCHITECTURE-DEBT.md 4.0) |
+| open (x86-64 legacy) | full | Routed to `openat` with `AT_FDCWD` - the same call. It had been missing, and glibc issues `open` in preference to `openat` on x86-64, so every `open` was refused on **that ISA and nowhere else** (docs/ENGINEERING.md 11, the two-numbers hazard). An unreachable sentinel on the asm-generic tables |
+| eventfd2 | full for the wakeup contract | A 64-bit counter as a per-cell fd over a per-personality registry (`linux::eventfd`), **no kernel object** - the counter lives in the registry, not the descriptor, so `dup`/`fork` share it. Write adds (refusing `u64::MAX` and refusing to overflow), read drains, `EFD_SEMAPHORE` yields 1 and decrements, a zero counter is **not** readable (so poll/epoll report it unready and a blocking read parks under the pipe's runnable-peer rule), sub-8-byte transfers are `-EINVAL`, an unknown flag bit is `-EINVAL` rather than dropped. Scope: a **sibling context** writing it does not wake a context parked on it, which is the L4 cell-level block limitation, not an eventfd one |
+| sysinfo | partial, honestly | `uptime` from the cell's own clock domain, `totalram`/`freeram` from the frame pool, `procs` from the live process count, `mem_unit` 1. `sharedram`/`bufferram`/`totalhigh`/`freehigh`/swap/`loads` are **0 because they are 0** - no page cache, no highmem, no swap, no load average is computed. Bun sizes its heap from these, so a placeholder would be worse than a refusal |
+| sched_setscheduler / getscheduler / get_priority_{max,min} | partial, honestly | One class exists: `SCHED_OTHER`, cooperative round-robin. Setting it at priority 0 succeeds *because it is already in force*; `SCHED_FIFO`/`RR`/`BATCH`/`IDLE` are refused `-EPERM` (the unprivileged-Linux errno every caller handles) rather than accepted and dropped - a real-time guarantee this scheduler cannot keep must not be reported as granted. `getscheduler` reports `SCHED_OTHER`; the priority range is 0..0 |
+| close_range | full | Closes every open descriptor in the inclusive range, skipping already-closed slots as Linux does. `CLOSE_RANGE_CLOEXEC` marks instead of closing; `CLOSE_RANGE_UNSHARE` is refused `-EINVAL` (this personality has no fd table shared separately from the address space) rather than ignored |
 | fork / vfork | full | clone-cell-within-capability-bundle (docs/POSIX-PERSONALITY.md 2): a new `user` cell in the parent's bundle, the parent's committed pages **eager-copied** (COW deferred + documented), `LinuxState`/fd table/cwd/signal dispositions deep-copied, a child pid synthesized; child returns 0, parent returns the pid. Only the calling thread is duplicated (POSIX). Reached via `clone` without `CLONE_VM` on every ISA (glibc's `fork`), or the x86-64 `fork`/`vfork` numbers. Over the `MAX_CELLS` (16) cap → -EAGAIN. `vfork` is treated as `fork` (eager copy, no COW share - safe, just less lazy) (`kernel/src/linux/proc.rs`) |
-| execve | full | replaces the calling cell's image with one **streamed** from the VFS (`load::exec_elf_from_vfs`: only the ELF header + phdrs are buffered; each `PT_LOAD` segment is read page-by-page straight into its destination frame, so the kernel holds no whole-image buffer). Keeps the same cell/pid, fd table (close-on-exec is not tracked - documented), and cwd; resets signal handlers to default and starts single-threaded. ET_EXEC + static-PIE ET_DYN, stock base |
+| execve | full | replaces the calling cell's image with one **streamed** from the VFS (`load::exec_elf_from_vfs`: only the ELF header + phdrs are buffered; each `PT_LOAD` segment is read page-by-page straight into its destination frame, so the kernel holds no whole-image buffer). Keeps the same cell/pid, cwd, and fd table **except descriptors marked FD_CLOEXEC, which are closed** (it used to keep every fd regardless); resets signal handlers to default and starts single-threaded. ET_EXEC + static-PIE ET_DYN, stock base |
 | wait4 / waitpid | full | the parent blocks cooperatively (switching to a runnable child) until a child exits, then reaps: WIFEXITED/WEXITSTATUS for a normal exit, WIFSIGNALED for a signal-killed child; frees the child cell + its frames. `pid > 0` waits for that child, `pid <= 0` for any; WNOHANG honored; -ECHILD with no children. SIGCHLD is not queued to a handler (the parent reaps directly; documented) |
 | dup2 | full | (x86-64 legacy) == `dup3(old, new, 0)`; a pipe end is refcounted |
 | setpgid / setsid | recorded | returns 0 (single-session model, no job control); the shell queries process groups but does not depend on the effect |
 | getpgid / getsid | partial | returns the caller's pid (one group/session per process) |
+| socket / socketpair | partial | AF_UNIX (L8) and AF_INET/AF_INET6 (L8-INET), SOCK_STREAM + SOCK_DGRAM (AF_UNIX SOCK_DGRAM deferred); other families -EAFNOSUPPORT. `SOCK_CLOEXEC` honored; `SOCK_NONBLOCK` is the deferral in the `fcntl` row |
+| bind / listen / accept / accept4 | partial | per-cell synthesized registries; **local only** - a remote listener needs NIC flow-steering grants (L8-INET-REMOTE deferral). `accept` is non-blocking (-EAGAIN on an empty backlog) |
+| connect | partial | AF_UNIX + **loopback** INET over the L6 ring pair; a **non-loopback IPv4** destination is handed to the registered `svc::SocketOps` bridge - a real remote TCP handshake over the NIC, reporting 0 / -ECONNREFUSED / -ETIMEDOUT (L8-INET-REMOTE). Non-loopback **IPv6** → -ENETUNREACH. With no bridge registered, every non-loopback address → -ENETUNREACH |
+| sendto / recvfrom | partial | datagram sockets: **loopback** over the in-kernel queue, **non-loopback IPv4** over the `svc::SocketOps` bridge (real UDP on the wire: ARP next hop, IPv4+UDP checksums, source-address reporting; the receive **parks** on `net_rx::wait_frame`, or drains without parking when the fd is O_NONBLOCK). A loopback datagram sent to a port where **nothing is bound** now returns **-ECONNREFUSED** rather than reporting the datagram sent - Linux reports that as an ICMP port-unreachable on a later operation of a connected socket, and there is no ICMP over this in-kernel queue, so it is reported on the send itself (earlier than Linux for an unconnected `sendto`, and deliberately so: the silent success made glibc's resolver - which falls back to 127.0.0.1:53 with no /etc/resolv.conf - fail for a reason nothing pointed at). A full destination queue is still a normal UDP **drop** and is reported sent. A stream socket ignores the address and routes to read/write. No `MSG_*` flags |
+| send / recv / read / write on a socket | partial | loopback/AF_UNIX over the L6 rings; a connected **remote** TCP socket forwards to `SocketOps::tcp_send`/`tcp_recv` - implemented but **unproven in QEMU** (SLIRP has no TCP responder), see L8-INET-REMOTE |
+| sendmsg / recvmsg | partial | gather/scatter over `msg_iov`, non-blocking; **no SCM_RIGHTS** ancillary data (L8 deferral) |
+| getsockname / getpeername | full | real `sockaddr_in`/`sockaddr_in6`/`sockaddr_un`; a remote socket reports the datapath's own IPv4 and the true peer address |
+| setsockopt / shutdown | recorded | returns 0, stores nothing (SO_REUSEADDR/TCP_NODELAY succeed as no-ops) |
+| getsockopt | partial | zero-filled answer (SO_ERROR reads as 0) |
+| epoll_create1 / epoll_ctl / epoll_wait / epoll_pwait | partial | level-triggered EPOLLIN/EPOLLOUT only. `epoll_wait`/`epoll_pwait` now **honour their timeout and genuinely park** (docs/ARCHITECTURE-DEBT.md 2.4) - they used to return 0 at once, which turns every epoll loop into a spin - over the same per-`FdKind` readiness the `poll` row describes, including a real `tcp_pending` probe for a remote TCP socket (it used to always report readable, because `svc::SocketOps` had no way to ask). Still deferred: EPOLLET, EPOLLONESHOT, EPOLLEXCLUSIVE, EPOLLRDHUP/EPOLLPRI, and a nested epoll (an epoll fd watched by another epoll reports no wake source) |
 
 ### Planned identity/constants
 
@@ -173,13 +189,211 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 
 Same windows as native loaded cells (docs/USERLAND.md): image at 4 GiB
 (`ET_EXEC` at its linked address; `ET_DYN` gets load bias 0x1_0000_0000),
-stack top at 8 GiB (1 MiB mapped for Linux cells), anonymous mmap region at
+stack top at 8 GiB (a Linux cell's stack is sized from its own `PT_GNU_STACK`
+`p_memsz`, at least 8 MiB and at most 64 MiB - see below), anonymous mmap region at
 12 GiB, `brk` heap starting at the image end. The initial stack carries the
 System V block **plus the ELF auxiliary vector** (L1): AT_PHDR/PHENT/PHNUM,
 AT_PAGESZ, AT_BASE, AT_FLAGS, AT_ENTRY, AT_UID/EUID/GID/EGID, AT_SECURE,
 AT_RANDOM (16 DRBG bytes), AT_HWCAP, AT_CLKTCK, AT_PLATFORM, AT_EXECFN,
 AT_NULL. No vDSO (`AT_SYSINFO_EHDR` absent - glibc falls back to real
 syscalls).
+
+### Limits (and why demand paging is the real answer)
+
+Most of what a Linux cell maps is still committed **eagerly** - the whole image, the
+whole initial stack, every anonymous `mmap` - so a program costs frames in proportion
+to its *size*, not to what it *uses*. **File-backed `mmap` is the exception and is
+now demand-paged** (see "Demand paging" below), which is what lets `ld.so` map a real
+`libc` without paying for it. Three numbers therefore still bound what can run:
+
+| Constant | Value | What it bounds |
+|---|---|---|
+| `frames::POOL_FRAMES` | 131072 = **512 MiB** | all physical memory the kernel hands out |
+| `frames::USER_RESERVE_FRAMES` | 4096 = **16 MiB** | held back from cell-driven allocation, so the kernel's own allocations (page tables, driver rings, a `fork` copy) can never fail |
+| `user::MAX_FRAMES_PER_CELL` | 98304 = **384 MiB** | one cell's fairness cap on the charged mapping paths |
+| `stack::LINUX_STACK_PAGES` | 2048 = **8 MiB** | the initial stack an image that asks for nothing gets - a floor, not the size |
+| `stack::LINUX_STACK_MAX_PAGES` | 16384 = **64 MiB** | ceiling on a `PT_GNU_STACK` request; above it the request is clamped and logged |
+
+These were 128 MiB / 8 MiB / 96 MiB / 1 MiB - sized for static-glibc fixtures of a
+few hundred KiB. A ~100 MB binary exhausted them before reaching `main`. QEMU runs
+`-m 1G` on every ISA and the pool base sits 64 MiB into RAM, so ~960 MiB is
+available; the pool deliberately does **not** take it all, because firmware places
+blobs near the top of RAM (QEMU's RISC-V `virt` puts the device tree the kernel
+parses at ~`0xBFE0_0000` with `-m 1G`) and a pool that reached one would overwrite
+it. Raising further means checking that first.
+
+**This is a limit raise, not a design change**, and it does not remove the
+underlying constraint - it moves it. The proper fix is demand paging, below.
+
+### Demand paging
+
+A **resumable user page fault** commits a page on first touch. `on_user_trap` calls
+`linux::fill_fault` *before* the L5 fault-to-signal branch: if the personality can
+fill the page it returns the same frame and the faulting instruction re-executes;
+otherwise the fault becomes SIGSEGV exactly as before. The handler
+(`linux::mem::fault`) asks three questions in order, and the order is the whole
+correctness argument:
+
+1. **Is anything mapped here?** No VMA record means a genuine SIGSEGV - the
+   commonest one being a null dereference.
+2. **Is the page already present?** Then this fault was a *permission* refusal, not a
+   missing page. `FaultCause` carries no read/write bit, so the page tables are the
+   source of truth (`AddressSpace::is_mapped` over `arch::paging_mapped`). Guessing
+   here repopulates and re-faults forever, with no diagnostic - measured at 78,780
+   fills in the revert probe.
+3. **Does the mapping permit any access?** A `PROT_NONE` record is a *reservation*
+   (glibc reserves large arenas that way and commits sub-ranges with `mprotect`);
+   populating one hands out memory the program deliberately made inaccessible.
+
+**What is demand-paged today: file-backed `MAP_PRIVATE` `mmap`, and the ELF image
+itself.** The mapping owns a
+VFS handle in `linux::filemap` rather than remembering the caller's fd, because
+`ld.so` closes the fd immediately after `mmap` - on Linux a mapping references the
+*file*. That registry is global, fixed-size and refcounted (the `pipe`/`epoll`/
+`eventfd` pattern, **no kernel object**), with one reference per live `Vma` record:
+taken at `fork` (`VmaList::inherit_files` beside `fds::inherit_pipe_ends`) and given
+back at exit and at `munmap`. Both halves matter - without the `fork` addref a
+child's exit frees an entry the *parent* still maps, and the parent's next untouched
+page reads zeros with no fault and no log.
+
+**The image.** `load::load_elf_linux` used to copy every `PT_LOAD` page into a fresh
+frame, so a program cost frames in proportion to its size - and since the image is
+already resident in kernel memory, that was a *second* copy of the whole program.
+For an `ET_EXEC` binary with a `PT_INTERP` the kernel loads the main program itself,
+so this path (not `mmap`) is where a large image's memory lands. It now **records**
+the segments it can leave to the fault handler, in a `load::SegRecorder`, and copies
+only the ones it cannot. Two conditions must hold, and each was found by a segment
+that broke without it:
+
+- **`p_filesz == p_memsz`.** A segment with a `.bss` tail is part file and part zero
+  inside one record, and getting that boundary wrong produced a null dereference in
+  a static Rust binary. The honest scope is: whole-file segments are demand-paged,
+  the rest copied. Static glibc has exactly one such segment, tens of KiB.
+- **`p_offset` congruent to `p_vaddr` mod the page size.** Paging fills whole pages,
+  so the page holding a VA must line up with a page-aligned file offset. Every real
+  toolchain emits this; a hand-built ELF that does not is copied.
+
+Each refusal prints which segment and why, so "loaded eagerly" is never silent.
+Because the bytes come from kernel memory rather than a file, `filemap` gained a
+second store kind (`Store::Mem`), and because a segment's content ends mid-page,
+`Vma::file_len` says how far a record is backed - past it the pages are zero, not
+"whatever is next in the file".
+
+**`user::reset` must run before the load, not after.** It clears the registry the
+loader registers the image in, so the old order left the records naming a released
+entry and every page came back zeroed - which on RISC-V is an illegal instruction at
+the entry point and nothing more informative. `filemap::alive` now makes a
+recurrence say so rather than hand out blank memory.
+
+**`execve` and the interpreter are demand-paged too.** Both stream from the VFS, and
+the obstacle was never the streaming - it was that recording against the *caller's*
+fd would name a file closed on return. So a mapping opens its **own** handle over the
+path, which is what `mmap` already does and for the same reason. `SegRecorder` holds up
+to two stores, because a dynamically linked program is two files (the program and
+`ld.so`); a third file is something `ld.so` maps itself through `mmap`, already lazy.
+`exec_reinit` records, as `install_cell` does - it was the only caller, so an
+`execve`d image used to record nothing.
+
+One trap is worth naming, because it was hit: `exec_elf_from_vfs` is shared with the
+**native** `SYS_SPAWN`, and a native cell has no VMA list, so a lazy image left its
+child with an address space full of holes and no diagnostic. The eager and lazy loads
+are now separate functions - the eager one keeps the old name so an unaware caller
+gets a correct image, and `exec_elf_from_vfs_demand` says in its name that the caller
+must map what it returns.
+
+Measured: `linuxdyn` records 1 program + 1 `ld.so` segment (35 pages recorded, 4
+copied), and `linuxproc`'s fork+execve phase records 221 pages and copies 21. Both
+paths run inside a syscall where a test can measure nothing directly, so
+`load::recorded_pages()`/`eager_pages()` are the witnesses.
+
+Measured on riscv64: `rusthello`'s 201 image pages cost **16 frames** at load
+(the one eager zero-tail segment plus page tables) instead of 201. `linuxrun`
+asserts that inequality on all three ISAs, so "the recorded pages were not
+committed" is checked rather than believed.
+
+**Two things the kernel had to gain for this to be safe.** A cell hands the kernel
+pointers into its own memory, and with presence lazy the *kernel* becomes a reader of
+a page nothing has faulted in - a load fault at a kernel PC, which is not resumable
+here (this is why Linux has `copy_from_user` and a fixup table). The F1 hardening
+already routes every cell-supplied pointer through one set of helpers, so those gained
+"ensure present" beside "in range": asked once at the seam, not at ~60 dereferences.
+Placement was the whole problem - in the bare range predicates it cost a ~2,900x
+amplification, because `unmap_range` uses them only to *bound* a range and so
+materialised every page immediately before freeing it; on the dereference helpers it
+costs 0 kernel pre-faults, measured every run. Second, x86-64's ring-3 fault resume
+used `sysretq`, which *consumes* RCX and R11 - fine while signal delivery was the only
+fault resume (a handler entry does not re-execute anything), fatal for the first path
+that genuinely re-executes. Faults now resume through `iret_resume`.
+
+Proof: `mmapdp` in `linuxproc` on all three ISAs - 64 file pages mapped, exactly 5
+filled, each carrying its own per-page file byte (so the offset arithmetic holds at
+the top of the mapping), 100 rereads of a filled page costing nothing, a write to a
+filled read-only page still SIGSEGV, a page still filling from the file after a forked
+sharer exited, and the registry back where it started. Plus `linuxdyn`, where `ld.so`
+maps a real 1.5-2.1 MB `libc` and an unmodified dynamic glibc binary runs.
+
+**`fork` is copy-on-write.** It used to copy every committed page, so a process paid
+its whole resident set to fork - more, for a large program, than its image ever cost.
+Now `AddressSpace::fork_from` shares the parent's pages read-only into the child and
+marks both sides copy-on-write; each page is privated on the first write to it, in the
+same `linux::mem::fault` handler. Measured on riscv64: a fork of a 2406-page (9.4 MiB)
+process shares 2406 pages, copies 0, and consumes 12 frames of child page tables -
+200x. Three pieces carry it:
+
+- **A per-frame reference count** in `frames` (`share`/`refs`, and `free` is now a
+  decrement - which is what lets every pre-COW caller stay unchanged). A page that
+  cannot be shared (outside the pool, or at the count ceiling) is copied, so nothing
+  is silently aliased.
+- **A software PTE bit per ISA** (`arch::paging_cow_protect_user`/`_at`/`_clear`: Sv39
+  RSW bit 8, AArch64 bit 55, x86-64 bit 52). The mark lives in the page table, not the
+  VMA list, because a fork shares the stack and the `brk` heap too and neither has a
+  VMA record - a COW test routed through the VMA list would refuse the first stack
+  write after every fork.
+- **The parent is write-protected too**, which is the half that fails silently: without
+  it the parent writes through to memory the child now sees, wrong values with no fault.
+
+Proven by `cowfork` in `linuxproc` on all three ISAs - a 256-page dirty heap forked,
+three isolation properties (the child sees the parent's pre-fork values; neither side's
+writes reach the other), with the kernel's own `mm::fork_pages()`/`fork_frames()` as the
+oracle. Both halves observed failing when reverted.
+
+**The stack grows on fault.** `setup_stack` maps only its top page - the one the kernel
+writes argv/envp/auxv into - and `install_cell`/`exec_reinit` register the rest of the
+`PT_GNU_STACK` request as an anonymous read-write reservation (`mem::reserve_stack`). A
+touch below the top page faults a fresh zeroed frame in through the same handler; a touch
+below the *reservation* hits no VMA and is a SIGSEGV, so the guard page falls out of the
+bound rather than needing its own page. An image asking for a 64 MiB stack used to pay 64
+MiB before `main`; it now pays one page plus what it touches. Proven by `stackx`
+(linuxproc, all three ISAs): a 12 MiB request whose 9280 KiB of writes appear as 2380
+demand fills where an eager stack shows none (observed failing at 59 when the eager
+mapping is restored), with the RLIMIT_STACK and touch-through assertions unchanged.
+
+That closes the last eager path in the memory model: image, file `mmap`, `fork`, and the
+stack are all lazy. **Still eager, and named:** a segment with a `.bss` tail (copied
+whole because its file/zero boundary sits inside one record), and every **native** cell's
+image (no VMA list to map records with). Both ride the same handler;
+docs/ARCHITECTURE-DEBT.md 4.0 blocker 2 tracks them.
+
+### Touching a cell's memory: the `uaccess` seam
+
+Every kernel access to a cell's memory goes through one module, `kernel/src/uaccess.rs`.
+This is not decoration: a cell hands the kernel raw virtual addresses, and lazy mapping
+makes *readiness* a moving target - demand paging made a page's presence lazy, COW makes
+its writability lazy on top of that, and a fault taken in kernel mode is not resumable
+here (which is why Linux has `copy_from_user`/`copy_to_user` and a fixup table). Before
+this seam, ~98 sites touched cell memory and 51 dereferenced the raw VA with only a
+bounds check performed elsewhere, so each lazy feature re-opened a 98-site audit and half
+the sites had no guard to extend. The module offers bounds-only predicates
+(`readable`/`writable`, kept separate because folding presence into them cost a measured
+~2,900x amplification), resolve-and-hand-back (`buf`/`slice`/`out_ptr`), and
+resolve-and-perform (`read`/`write`/`copy_in`/`copy_out`/`fill`) - the last so a site
+cannot forget to resolve. A new lazy feature changes one function there and nothing
+else. **Doctrine note:** the frame refcount, `share`, `cow_protect` and fault delivery
+are kernel *mechanism*; the COW *policy* is personality code and, like seL4's
+user-level page-fault handling, can move behind a userspace process server later without
+rewriting the mechanism. It is pre-resolution, not a fixup table - which is sound while
+the kernel is the only thing running, and is where SMP (task #27) will need a real
+fixup path.
 
 ## 5. Milestones
 
@@ -208,7 +422,18 @@ syscalls).
     riscv64 glibc dev package ships no `rcrt1.o`; the loader's ET_DYN path
     (bias 0x1_0000_0000) remains for L7 dynamic linking.
   - **uname release "6.6.0-rheo"**, machine per ISA (x86_64/aarch64/riscv64).
-  - **RLIMIT_STACK 1 MiB** (matches the mapped Linux stack); RLIMIT_NOFILE 64.
+  - **RLIMIT_STACK = the stack the loader actually mapped.** The size comes from
+    the image's own `PT_GNU_STACK` `p_memsz` (`elf::stack_size` ->
+    `LinuxImage.stack_want` -> `stack::stack_pages_for`), floored at
+    `LINUX_STACK_PAGES` = 8 MiB (the glibc default, for an image that asks for
+    nothing) and capped at `LINUX_STACK_MAX_PAGES` = 64 MiB, clamped **and
+    logged** above that - the stack is mapped eagerly and charged to the cell's
+    frame budget, so obeying an arbitrary request would exhaust the pool at load.
+    The reported limit is read from the one `LinuxState.stack_pages` the loader
+    set, not recomputed: glibc sizes *thread* stacks from RLIMIT_STACK, so
+    reporting more than is mapped hands every thread a stack that faults.
+    `PT_GNU_STACK`'s executable-stack flag is deliberately not honoured (W^X is
+    structural). Proven by `stackx` in `linuxproc`. RLIMIT_NOFILE 64.
   - **clock_gettime** is monotonic but coarse: x86 TSC via CPUID 0x16 (else a
     1 GHz assumption), arm CNTFRQ_EL0, riscv a documented 10 MHz timebase
     (`cycle` vs `time` CSR mismatch noted); REALTIME adds a fixed boot epoch.
@@ -277,8 +502,18 @@ syscalls).
     in the suite, so this is deferred with a code TODO.
   - **`clone3` stays ENOSYS**: verified via the logger that glibc/rust fall back
     to `clone`.
-  - **Frame pool** stays 32768 frames (128 MiB); demand-commit keeps N thread
-    stacks + arenas within it (`linuxthreads` runs 5 contexts comfortably).
+  - **Futex timeouts are honored** (they were not at L4, which is what made
+    `pthread_cond_timedwait` hang) - see the `futex` row in the status table for
+    the clock domains and the deadline path. Proof: `condwait.c` in the
+    `linuxthreads` test does two `pthread_cond_timedwait`s on a never-signalled
+    condvar (one CLOCK_REALTIME, one CLOCK_MONOTONIC), each of which must return
+    ETIMEDOUT no earlier than its own deadline, with the kernel asserting the
+    deadlines really went through the timer arbiter's `FutexWait` slot. Without
+    the fix the fixture hangs until the boot test's 120 s timeout - observed.
+  - **Frame pool** is 131072 frames (512 MiB) with a 384 MiB per-cell budget;
+    demand-commit keeps N thread stacks + arenas within it (`linuxthreads` runs
+    5 contexts comfortably). See "Limits" below for why the numbers are what they
+    are.
 - **L5 [done]** - signals: **synthesized POSIX signal delivery, no kernel
   object** (docs/POSIX-PERSONALITY.md: signals are event delivery, not a
   primitive). Dispositions are a per-cell table (SIG_DFL/SIG_IGN honored);
@@ -351,7 +586,7 @@ syscalls).
     suite is the real Linux Rust coreutils driven by a shell over the L6
     process primitives.
   - Accommodations, all disclosed: **eager copy, COW deferred** - `fork`
-    copies every committed page (including the 1 MiB Linux stack); `execve`
+    copies every committed page (including the whole Linux stack, >= 8 MiB); `execve`
     frees it immediately, so the transient cost is bounded. **Cross-thread
     SIGCHLD is not queued** - the parent reaps via `wait4` directly (no L6
     fixture installs a SIGCHLD handler). **Close-on-exec is not tracked** -
@@ -407,11 +642,27 @@ syscalls).
     access, openat/pread64/fstat on /lib, mmap fd-backed + MAP_FIXED, mprotect
     for RELRO, arch_prctl/set_tid_address/set_robust_list, rseq→ENOSYS,
     prlimit64) then main's write + exit_group.
-  - Accommodations, disclosed: **`execve` of a dynamic binary is not wired** -
-    the streaming `execve` path stays static/static-PIE only; the `linuxdyn`
-    proof loads the dynamic binary directly. A dynamic **Rust** `std` hello is
-    not built (it additionally needs `libgcc_s.so.1`/`libm.so.6` seeded); the C
-    hello is the L7 proof. **MAP_SHARED of a file** stays unmodeled (ld.so uses
+  - **`execve` of a dynamic binary is now wired** (GOAL-DISK-2): the streaming
+    `execve` path (`load::exec_elf_from_vfs_demand` → `exec_elf_inner`) parses
+    `PT_INTERP`, reads the interpreter path from the program's fd at the segment
+    offset (the streaming path holds only the header buffer, not the whole
+    image), and streams the interpreter at `LINUX_INTERP_BASE` demand-paged - the
+    same handling `load_elf_linux` gives the initial-load path, factored so the
+    two share `stream_elf_at`. `linuxdyn` now proves **both**: phase 1 loads
+    `dhello` directly (initial-load), phase 2 `execve`s `/bin/dhello` from the VFS
+    (streaming), each asserting exact stdout + exit 12 on all three ISAs, with the
+    recorded-page witness confirming program + interpreter are both demand-paged.
+  - **`execve` off a live ext4 disk is done** (GOAL-DISK-2b): `linuxdyn` phase 3
+    mounts a real ext4 image on a virtio-blk disk through `ext4fs`/`ext4plus` + the
+    block cache and `execve`s `/bin/dhello` from it - the program, `ld.so` and
+    `libc.so.6` all stream off the disk on demand (447-590 block-cache fills per
+    ISA, exact stdout + exit 12, all three ISAs), none resident whole. That is the
+    shell-launches-a-dynamic-binary-off-disk shape the real target needs.
+  - Accommodations, disclosed: a dynamic **Rust** `std` hello is not built (it
+    additionally needs `libgcc_s.so.1`/`libm.so.6` seeded); the C hello is the L7
+    proof. `MAX_MAPPED_FILES` is now **64** (raised from 8), headroom for a
+    production binary's dozen-plus shared libraries - a documented limit-raise,
+    not a design change. **MAP_SHARED of a file** stays unmodeled (ld.so uses
     PRIVATE).
 
 - **L8 [done]** - **AF_UNIX (Unix domain) sockets** - the first slice of the
@@ -464,17 +715,17 @@ syscalls).
   family is handled inside); epoll adds a few numbers to the two `arch/*/linux_abi`
   tables (x86-64 legacy `epoll_create1`=291.. / asm-generic `epoll_create1`=20..;
   per-ISA ABI).
-  - **Loopback-only scope (the load-bearing honesty).** The kernel is
-    **allocation-free**; the native transports (`net::tcp`/`net::udp`) are
-    `no_std`+**alloc** userspace crates and **cannot** be linked kernel-resident.
-    For **loopback** a TCP connection between two local endpoints reduces to a
-    **reliable, in-order byte stream** - exactly the L6 ring pair that already
-    backs AF_UNIX SOCK_STREAM - and UDP to an in-order **datagram queue**. So INET
-    sockets run over loopback deterministically and network-free, keying the
-    address namespace by `(is_v6, port)`. This proves the socket **ABI**; it is
-    **not** internet networking. **NIC-backed remote INET** (driving the full
-    `net::tcp` segment/RTO/congestion state machine over virtio-net) is a **named
-    later phase** - a non-loopback destination is refused `-ENETUNREACH`.
+  - **Loopback scope at L8-INET (superseded for remote by L8-INET-REMOTE, below).**
+    The kernel is **allocation-free**; the native transports (`net::tcp`/`net::udp`)
+    are `no_std`+**alloc** userspace crates and **cannot** be linked into the
+    `kernel/` library. For **loopback** a TCP connection between two local endpoints
+    reduces to a **reliable, in-order byte stream** - exactly the L6 ring pair that
+    already backs AF_UNIX SOCK_STREAM - and UDP to an in-order **datagram queue**.
+    So INET sockets run over loopback deterministically and network-free, keying the
+    address namespace by `(is_v6, port)`. This proves the socket **ABI**. At L8-INET
+    a non-loopback destination was refused `-ENETUNREACH`; **L8-INET-REMOTE** lifts
+    that over a bridge, and the loopback path below is **unchanged byte-for-byte**
+    (`linuxinet` still asserts the same transcript).
   - **Syscalls**: `socket(AF_INET|AF_INET6, SOCK_STREAM|SOCK_DGRAM)`, `bind`,
     `listen`, `accept`/`accept4`, `connect`, `send`/`recv`/`read`/`write` on a
     connected stream (via the same cross-cell block + SIGPIPE path as pipes),
@@ -505,6 +756,167 @@ syscalls).
     namespaces (no IPV4_MAPPED). UDP is best-effort (a datagram to an unbound
     port is dropped, `sendto` still reports success). Stream `accept` is
     non-blocking (as in AF_UNIX).
+
+- **L8-INET-REMOTE [done]** - **real remote networking: an unmodified Linux binary
+  reaches the network over the NIC** (rheo-net **N4b**, docs/NETSTACK.md N4b). This
+  lifts the L8-INET `-ENETUNREACH` refusal for non-loopback addresses, and again
+  adds **no kernel object** and **no new syscall**: the socket numbers, the fd
+  table and the per-cell synthesized state are all as before.
+  - **The mechanism: a bridge, not a stack (`svc::SocketOps`).** Doctrine
+    (docs/ARCHITECTURE.md 6, docs/NETWORKING.md) puts IP/UDP/TCP in **userspace**,
+    and `kernel/` is allocation-free, so the kernel can hold **no network stack** -
+    exactly the constraint that keeps it holding no filesystem. The answer is the
+    same one `svc::FileOps` already uses: a table of **function pointers a service
+    registers**, with all policy outside. `kernel/src/svc.rs` gains
+    **`SocketOps`** + `set_socket_ops`/`socket_ops` (10 entries: `local_ip`,
+    `udp_bind`/`udp_close`/`udp_send`/`udp_recv`/`udp_pending`,
+    `tcp_connect`/`tcp_send`/`tcp_recv`/`tcp_close`), and
+    `kernel/src/linux/fd.rs` forwards **non-loopback** operations to it. Two new
+    `FdKind` variants carry the bridge handles (`InetUdpRemote`,
+    `InetTcpRemote`); **loopback keeps `InetDgram`/`InetConn` and the L6 ring
+    fast path untouched**. With no bridge registered the answer is still
+    `-ENETUNREACH`, so every other Linux kernel behaves exactly as before.
+  - **Who registers it.** Today `tests/src/inet_personality.rs` (the sibling of
+    `vfs_personality.rs`, the same pattern): it links **`rheo-net`** in its
+    librheo-free **codec posture** (`--no-default-features`) and drives
+    `hw::virtio_net` directly. The protocol work is entirely the stack's -
+    `eth` framing, `arp` request/reply, `ip` headers + checksum, `udp`
+    build/parse + pseudo-header checksum, and the full RFC 793
+    `tcp::Connection` state machine (its synchronous
+    `poll(now)`/`on_wire_segment(now, bytes)` seam drives cleanly from kernel
+    context). The documented end state is a network **service cell** reached
+    over a queue pair (rheo-net N4a); the table is shaped to accept that
+    substitution.
+  - **Blocking.** A remote receive **parks**: the bridge blocks in
+    `net_rx::wait_frame_slice` - the N2d park-until-frame primitive - so on
+    riscv64/aarch64 the kernel genuinely halts at WFI until the NIC's RX
+    interrupt fires, and on x86-64 it falls back to the same documented bounded
+    kernel poll (no MSI-X through the virtio-pci config tunnel). Never a
+    re-submit spin.
+  - **Proof (`linuxnet`, all three ISAs, exact stdout + exit 0)**: an unmodified
+    static-glibc C fixture (`inetremote.c`, built from source by xtask, never
+    committed) (1) hand-builds a **DNS query** and `sendto`s it to QEMU SLIRP's
+    built-in responder at **10.0.2.3:53**, then `recvfrom`s the reply and checks
+    its **structure** - our transaction id echoed, the QR bit set, the sender
+    being 10.0.2.3:53 (never a specific resolved address: SLIRP proxies to the
+    host resolver, so an A record's value is not deterministic); and (2)
+    `connect()`s to a **closed port on the gateway** (10.0.2.2:9) - a real
+    three-way handshake goes out and SLIRP's **reset** comes back, which
+    `tcp::Connection` turns into `ECONNREFUSED`. The kernel additionally asserts
+    the receive really parked (`net_rx::irq_count() > 0` + `did_idle()` on the
+    interrupt-driven ISAs). With no netdev attached the kernel
+    skips-with-reason.
+  - **Name resolution through glibc's own resolver** (`resolve.c`, the second
+    `linuxnet` fixture). Hand-building a DNS packet proves the datapath but not
+    the thing every real program actually does, which is call `getaddrinfo`. That
+    did not work, and the reason was **missing configuration, reported as
+    success**: there was no `/etc/resolv.conf` anywhere in the tree, so glibc fell
+    back to its built-in nameserver `127.0.0.1:53`; that address is **loopback**,
+    so the query went to the in-kernel datagram queue where nothing listens - and
+    the send **reported the datagram sent anyway**. `getaddrinfo` then failed with
+    no signal pointing at any of it.
+    Two changes fix it: the `linuxnet`-class kernels seed
+    `/etc/{nsswitch.conf,hosts,resolv.conf}` into the ramfs
+    (`vfs_personality::seed_resolver_files`, nameserver `10.0.2.3` - SLIRP's
+    resolver, a **non-loopback** address, so the query rides the proven remote UDP
+    path), and a loopback datagram to a port with **no bound endpoint** now
+    returns `-ECONNREFUSED` (the `sendto` row above). The fixture asserts, in
+    order: that refusal (deterministic, network-free); `rheo.test` resolving to
+    **10.9.8.7** from the seeded `/etc/hosts` - a closed-form answer, asserted
+    exactly, proving the `files` backend read the seeded configuration with no
+    wire involved; and then a **live** `getaddrinfo` of a real public name, whose
+    address is a property of the host's resolver and is therefore **reported, never
+    asserted or printed** (one line from a fixed pair: resolved, or cleanly not).
+    On this development host it resolves on all three ISAs.
+    **What this used to rest on, and what it rests on now.** It used to work
+    *because of a bug*: `poll` reported every open fd ready without consulting
+    readiness, so glibc's resolver fell through to its `recvfrom` - and that
+    `recvfrom` blocked only because creation-time `SOCK_NONBLOCK` was being
+    dropped. Both were fixed in one slice (docs/ARCHITECTURE-DEBT.md 2.4), because
+    fixing either alone breaks the resolver: a readiness-computing `poll` that does
+    not wait makes it give up, and an honoured `SOCK_NONBLOCK` without a waiting
+    `poll` makes it spin on -EAGAIN. It now works for the right reason: the
+    resolver's `poll` **blocks** until the socket is readable - a remote socket's
+    readiness names `idle::NET`, so the scheduler idles on the NIC, and asking the
+    `svc::SocketOps` bridge for readiness pumps the receive path - and its
+    non-blocking `recvfrom` then succeeds. `linuxnet` is the regression test for
+    exactly this, on all three ISAs.
+  - **What works remotely, precisely.** **UDP: fully** - `sendto`/`recvfrom`,
+    `connect`+`send`/`recv`, source-address reporting, real ARP next-hop
+    resolution (the destination on our own /24, else the gateway), real IPv4 +
+    UDP checksums, a blocking receive that parks. **TCP: connect is real and
+    proven** (SYN on the wire, RTO retransmit inside the budget, a real reset
+    turned into `ECONNREFUSED`, `ETIMEDOUT` at the deadline). TCP **data
+    transfer is implemented** (`tcp_send`/`tcp_recv` over the same
+    `tcp::Connection`, `read`/`write` on the fd) but **not proven**. Be precise
+    about why, because the old wording ("SLIRP has no TCP responder")
+    **overstated** it: SLIRP *does* proxy **outbound** TCP - the same proxying
+    that makes the live DNS above work for UDP - so a real remote TCP data
+    exchange is reachable in principle. What SLIRP does not offer is a
+    **deterministic** peer: there is no built-in TCP service to talk to, and
+    anything reachable through the proxy is a property of the host, not of this
+    code. So the gap is "no deterministic peer is arranged", not "the wire cannot
+    carry it". Closing it means arranging one: a host-side sink started by xtask
+    and reached at `10.0.2.2:<port>`, a `guestfwd`ed listener, or the N4a service
+    cell talking to a peer cell - each a live phase that must degrade
+    with a printed reason.
+    One real defect on that path **has** been fixed: `op_tcp_send` never
+    processed inbound segments, so the peer's ACKs never reached the state
+    machine, `snd_una` never advanced, the send queue filled and `write` returned
+    0 → `EAGAIN` **forever** - any body larger than the send queue deadlocked. The
+    send path now drains the NIC before accepting data. That fix is **reasoned and
+    code-reviewed, not proven**: it needs the same peer the data path needs.
+  - **Deferred, disclosed**: **IPv6 remote** (`AF_INET6` to a non-loopback
+    address is still `-ENETUNREACH` - the N4b datapath is IPv4); no remote
+    **listener**/`accept` (an inbound connection needs NIC flow-steering
+    grants, docs/NETWORKING.md); remote handles are **not reference-counted**
+    across `dup`/`fork` (the first close releases them); one datapath instance
+    for the whole machine, with fixed-size registries (4 UDP endpoints, 4 TCP
+    connections, a 4-entry ARP cache); no `SO_RCVTIMEO` - one documented receive
+    bound (2 s) and connect bound (3 s) apply, except that a descriptor made
+    non-blocking with `fcntl(F_SETFL, O_NONBLOCK)` passes a **zero** deadline, so
+    it drains without parking and reports `-EAGAIN`; no DHCP
+    (the SLIRP identity 10.0.2.15/gateway 10.0.2.2 is fixed - DHCP as a
+    userspace service is a later phase); `epoll` on a remote TCP socket reports
+    "always readable" (the N4b datapath has no non-blocking readiness probe),
+    while remote UDP readiness is real.
+
+- **L8-EVENTFD [done]** - **`eventfd2`, plus the six other syscalls the real
+  Claude Code binary was measured issuing** (docs/ARCHITECTURE-DEBT.md 4.0,
+  blocker 3). The seven were taken from that binary's startup `strace`, not
+  guessed. Six are advisory - a program keeps going without them, or glibc has a
+  documented fallback. `eventfd2` is not: it is the epoll event loop's only
+  wakeup path, so refusing it does not degrade the program, it removes the
+  mechanism.
+
+  **No kernel object.** An eventfd is a per-cell fd (`fd::FdKind::EventFd`)
+  indexing a per-personality registry (`kernel/src/linux/eventfd.rs`), exactly as
+  an epoll instance and a pipe are. The counter lives in the **registry**, not in
+  the descriptor: `dup` and `fork` produce a second descriptor for the *same*
+  object, and a counter copied per descriptor gives two counters that silently
+  stop waking each other (docs/ENGINEERING.md 11). Sharing is the whole point of
+  the object, so the shared state *is* the object.
+
+  Blocking is the pipe's machinery, reused: `proc::Block::EventFdRead`, judged by
+  `satisfiable` from kernel state (the waiter's address space is not active
+  there), completed by `complete_block` once it is, classified as an `idle::PEER`
+  wake source, and named in the deadlock diagnostic.
+
+  The other six are in the syscall table above (legacy `open`, `sysinfo`,
+  `sched_setscheduler` + `getscheduler` + `get_priority_{max,min}`,
+  `close_range`, `clone3`, `rseq`). Two are worth repeating here because they are
+  *honesty* fixes rather than features: `sched_setscheduler` accepts the policy
+  already in force and refuses real-time with `-EPERM` instead of accepting and
+  dropping it, and `sysinfo` reports the real frame pool rather than zeros.
+
+  Proven by the `sysx` fixture in `linuxproc` on all three ISAs, asserting each
+  refusal **as** a refusal. Four narrow reverts were each observed failing.
+
+  *Scope (honest):* a **sibling context** writing an eventfd does not wake a
+  context parked on it - a blocking eventfd read parks the whole **cell** under
+  the same `runnable_peer_exists` rule a pipe read uses, which is the L4
+  cell-level block limitation (task #27), not an eventfd-specific one. Within one
+  context, and across processes, the semantics are exact.
 
 ## 6. Fixture build matrix (reproducibility)
 

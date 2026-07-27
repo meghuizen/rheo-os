@@ -12,10 +12,17 @@
 //! what the L6 ring pair already provides (as it does for AF_UNIX SOCK_STREAM) -
 //! and UDP to an in-order **datagram queue**. So this module implements INET
 //! sockets over loopback deterministically and network-free, keying the address
-//! namespace by `(is_v6, port)`. **NIC-backed remote INET sockets** (driving the
-//! full `net::tcp` segment/RTO/congestion state machine over virtio-net) are a
-//! **later phase**, not this one; a non-loopback destination is refused
-//! (`ENETUNREACH`).
+//! namespace by `(is_v6, port)`.
+//!
+//! **This module is still loopback-only, but the personality is not.** The
+//! sentence that used to sit here - "a non-loopback destination is refused
+//! `ENETUNREACH`" - was true when it was written and stopped being true at
+//! rheo-net N4b: `linux::fd` now forwards every non-loopback operation to the
+//! registered `svc::SocketOps` bridge, which drives the full `net::tcp` /
+//! `net::udp` machinery over virtio-net from *outside* the kernel
+//! (docs/NETSTACK.md 18). `ENETUNREACH` is what remains when **no** bridge is
+//! registered, or for a non-loopback **IPv6** destination (the N4b datapath is
+//! IPv4). Nothing here changed; the routing decision moved one level up.
 //!
 //! ## What lives here
 //! Two per-personality synthesized registries (fixed statics, like the pipe /
@@ -320,17 +327,32 @@ pub fn close_dgram(ep: u8) {
     }
 }
 
+/// What a loopback datagram send did. The three cases are **not** the same
+/// answer to the caller (docs/ENGINEERING.md 7): a full queue is a drop, which UDP
+/// permits and which a sender may legitimately be told succeeded; **no endpoint at
+/// all** is a delivery that can never happen, and reporting success for it is a
+/// lie that surfaces far from its cause (it is what made glibc's resolver, aimed at
+/// its built-in fallback nameserver `127.0.0.1:53`, fail confusingly).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum DgramSend {
+    /// Queued at the destination endpoint.
+    Delivered,
+    /// A bound endpoint exists but its queue was full: dropped, as UDP permits.
+    Dropped,
+    /// Nothing is bound at `(v6, dst_port)`: no reader exists, now or later.
+    NoEndpoint,
+}
+
 /// Send `bytes` (a datagram) from `src_port` to the endpoint bound at
-/// `(v6, dst_port)`. Best-effort loopback UDP: `true` if a matching endpoint was
-/// found and had queue room, else `false` (dropped, as UDP permits). `bytes` is
-/// truncated to `DGRAM_MAX`.
-pub fn send_dgram(v6: bool, dst_port: u16, src_port: u16, bytes: &[u8]) -> bool {
+/// `(v6, dst_port)`. `bytes` is truncated to `DGRAM_MAX`. See [`DgramSend`] for
+/// why "nothing is bound there" is reported distinctly from "dropped".
+pub fn send_dgram(v6: bool, dst_port: u16, src_port: u16, bytes: &[u8]) -> DgramSend {
     let Some(ep) = dgram_at(v6, dst_port) else {
-        return false;
+        return DgramSend::NoEndpoint;
     };
     let e = &mut dgrams()[ep];
     if e.qlen >= DGRAM_QUEUE {
-        return false;
+        return DgramSend::Dropped;
     }
     let slot = (e.qhead + e.qlen) % DGRAM_QUEUE;
     let n = bytes.len().min(DGRAM_MAX);
@@ -339,7 +361,7 @@ pub fn send_dgram(v6: bool, dst_port: u16, src_port: u16, bytes: &[u8]) -> bool 
     d.len = n as u16;
     d.buf[..n].copy_from_slice(&bytes[..n]);
     e.qlen += 1;
-    true
+    DgramSend::Delivered
 }
 
 /// True if endpoint `ep` has a queued datagram (poll/epoll readiness).

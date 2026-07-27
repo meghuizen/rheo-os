@@ -4,9 +4,11 @@
 //! resolution, and the **IPv4 TTL hook** (settable per send, the seam a later
 //! traceroute increments) live in exactly one place - no per-protocol copy.
 
+#[cfg(feature = "hosted")]
 use crate::arp::{self, ArpCache, ResolveError};
 use crate::eth::{self, Mac};
 use crate::ip::{self, Ipv4Addr, Ipv4Header};
+#[cfg(feature = "hosted")]
 use librheo::net;
 
 /// The default IPv4 TTL for a locally-originated packet (RFC 1122 suggests 64).
@@ -34,6 +36,7 @@ pub enum WireError {
     TooBig,
 }
 
+#[cfg(feature = "hosted")]
 impl From<ResolveError> for WireError {
     fn from(e: ResolveError) -> WireError {
         match e {
@@ -48,6 +51,7 @@ impl From<ResolveError> for WireError {
 /// directly (the reply carries SLIRP's gateway MAC either way). A real deployment
 /// would ARP the gateway for an off-link destination; that routing decision is an
 /// N1c refinement (host config + a routing table), documented in docs/NETSTACK.md.
+#[cfg(feature = "hosted")]
 pub async fn resolve_next_hop(
     cache: &mut ArpCache,
     src_mac: Mac,
@@ -135,6 +139,7 @@ pub fn parse_ipv4(frame: &[u8]) -> Option<Ipv4Frame> {
 }
 
 /// Send one already-framed raw Ethernet frame over `librheo::net`.
+#[cfg(feature = "hosted")]
 pub async fn send_frame(frame: &[u8]) -> Result<(), WireError> {
     net::send(frame)
         .await
@@ -142,8 +147,28 @@ pub async fn send_frame(frame: &[u8]) -> Result<(), WireError> {
         .map_err(|_| WireError::Net)
 }
 
-/// Poll for one raw Ethernet frame into `buf` (a single `net::recv`). Returns the
-/// frame length (`0` if nothing is ready - the caller re-polls).
+/// Poll for one raw Ethernet frame into `buf` (a single non-blocking
+/// `net::try_recv`). Returns the frame length (`0` if nothing is ready - the
+/// caller re-polls). The parking receive is `librheo::net::recv` (docs/NETSTACK.md,
+/// the async-receive path); this stays the non-blocking drain the poll loops and
+/// batching transports above it expect.
+#[cfg(feature = "hosted")]
 pub async fn recv_frame(buf: &mut [u8]) -> Result<usize, WireError> {
-    net::recv(buf).await.map_err(|_| WireError::Net)
+    net::try_recv(buf).await.map_err(|_| WireError::Net)
+}
+
+/// Wait up to `timeout_ns` for one raw Ethernet frame into `buf`, **parking** rather
+/// than polling (`librheo::net::recv_timeout` -> `SYS_WAIT_NET`). Returns the frame
+/// length, or `0` if the deadline elapsed with nothing received.
+///
+/// This is the receive a protocol driver should reach for: the wait is expressed as a
+/// **duration**, so it means the same thing on every ISA, and the kernel spends it
+/// halted rather than spinning wherever an interrupt can wake it (the NIC's RX
+/// interrupt on riscv64/aarch64, a short timer slice on x86-64 - docs/NETSTACK.md
+/// 16). [`recv_frame`] stays the non-blocking drain that a batching transport wants.
+#[cfg(feature = "hosted")]
+pub async fn recv_frame_timeout(buf: &mut [u8], timeout_ns: u64) -> Result<usize, WireError> {
+    net::recv_timeout(buf, timeout_ns)
+        .await
+        .map_err(|_| WireError::Net)
 }

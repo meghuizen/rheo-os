@@ -24,6 +24,11 @@ const AF: u64 = 1 << 10;
 const NG: u64 = 1 << 11; // ASID-tagged (per-cell) entry
 const PXN: u64 = 1 << 53;
 const UXN: u64 = 1 << 54;
+/// AArch64 stage-1 reserves bits 55-58 for software. Bit 55 marks a
+/// **copy-on-write** page: it was writable, `fork` made it read-only, and the next
+/// write must private it rather than fault the process
+/// (docs/ARCHITECTURE-DEBT.md 4.0, blocker 2). The hardware ignores it.
+const COW: u64 = 1 << 55;
 
 const PAGE_SIZE: usize = 4096;
 const MIB2: usize = 2 << 20;
@@ -77,7 +82,7 @@ fn l3_index(va: usize) -> usize {
 /// 2 MiB slot is pre-built as a level-3 table; the loader adds program/stack
 /// pages on demand via `paging_map_frame`.
 pub fn paging_new_root() -> PagingRoot {
-    let l0_pa = frames::alloc();
+    let l0_pa = frames::alloc().expect("root page table (boot, reserve held)");
     let l0 = table_mut(l0_pa);
     let slot = user_window_base() & !(MIB2 - 1);
     let l1 = table_mut(ensure_table(l0, l0_index(slot)));
@@ -112,7 +117,7 @@ pub fn paging_map(root: &mut PagingRoot, va: usize, perm: MapPerm) {
 /// (a table descriptor) if the slot is not yet valid.
 fn ensure_table(parent: &mut [u64; 512], idx: usize) -> usize {
     if parent[idx] & VALID == 0 {
-        let t = frames::alloc(); // zeroed
+        let t = frames::alloc().expect("page table (user reserve held)"); // zeroed
         parent[idx] = addr_bits(t) | TABLE | VALID;
     }
     next_table(parent[idx])
@@ -158,6 +163,74 @@ fn leaf(root: &PagingRoot, va: usize) -> Option<(usize, usize)> {
         return None;
     }
     Some((next_table(e), l3_index(va)))
+}
+
+/// Clear write access on every **writable** user leaf and mark it copy-on-write,
+/// returning how many were changed - the `fork` half of COW
+/// (docs/ARCHITECTURE-DEBT.md 4.0, blocker 2). See the riscv64 twin for why this is
+/// per-ISA rather than a loop over `paging_protect` in portable code.
+pub fn paging_cow_protect_user(root: &mut PagingRoot) -> usize {
+    let mut n = 0usize;
+    for_each_user_leaf_slot(root, &mut |e: &mut u64| {
+        if *e & (0b11 << 6) == AP_RW_ALL {
+            *e = (*e & !(0b11u64 << 6)) | AP_RO_ALL | COW;
+            n += 1;
+        }
+    });
+    n
+}
+
+/// The frame behind `va` if its leaf is marked copy-on-write, else `None`.
+pub fn paging_cow_at(root: &PagingRoot, va: usize) -> Option<usize> {
+    let (l3_pa, idx) = leaf(root, va)?;
+    let e = table_mut(l3_pa)[idx];
+    if e & VALID == 0 || e & COW == 0 {
+        return None;
+    }
+    Some((e & 0x0000_FFFF_FFFF_F000) as usize)
+}
+
+/// Resolve a copy-on-write page: clear the mark, restore write access, and repoint
+/// the leaf at `new_pa` when the page had to be copied. The caller re-activates the
+/// root to flush.
+pub fn paging_cow_clear(root: &mut PagingRoot, va: usize, new_pa: Option<usize>) {
+    let Some((l3_pa, idx)) = leaf(root, va) else {
+        return;
+    };
+    let l3 = table_mut(l3_pa);
+    let e = l3[idx];
+    let pa = new_pa.unwrap_or((e & 0x0000_FFFF_FFFF_F000) as usize);
+    // A writable page is never executable here (W^X), so the XN bits are the
+    // read-write pair, matching `paging_protect`'s `MapPerm::UserRw` arm.
+    l3[idx] =
+        addr_bits(pa) | ATTR_NORMAL | SH_INNER | AP_RW_ALL | AF | NG | UXN | PXN | TABLE | VALID;
+}
+
+/// Invoke `f` on every mapped 4 KiB user leaf entry of `root`, by mutable reference
+/// so the callback may rewrite it in place. Private for the same reason as the
+/// riscv64 twin: a raw PTE is paging-internal.
+fn for_each_user_leaf_slot(root: &mut PagingRoot, f: &mut dyn FnMut(&mut u64)) {
+    for &e0 in table_mut(root.l0_pa).iter() {
+        if e0 & VALID == 0 || e0 & TABLE == 0 {
+            continue;
+        }
+        for &e1 in table_mut(next_table(e0)).iter() {
+            if e1 & VALID == 0 || e1 & TABLE == 0 {
+                continue;
+            }
+            for &e2 in table_mut(next_table(e1)).iter() {
+                if e2 & VALID == 0 || e2 & TABLE == 0 {
+                    continue;
+                }
+                for e3 in table_mut(next_table(e2)).iter_mut() {
+                    if *e3 & VALID == 0 {
+                        continue;
+                    }
+                    f(e3);
+                }
+            }
+        }
+    }
 }
 
 /// Invoke `f(va, pa, perm)` for every mapped 4 KiB user leaf in `root` - the
@@ -217,6 +290,15 @@ pub fn paging_unmap_frame(root: &mut PagingRoot, va: usize) -> Option<usize> {
 
 /// Rewrite the leaf permission bits at `va`, keeping the mapped frame. A no-op
 /// if `va` is unmapped. The caller flushes the TLB by re-activating the root.
+/// Whether `va` has a **live 4 KiB leaf** in `root` - see the riscv64 twin for why
+/// a demand-paging fault handler needs this before anything else.
+pub fn paging_mapped(root: &PagingRoot, va: usize) -> bool {
+    match leaf(root, va) {
+        Some((l3_pa, idx)) => table_mut(l3_pa)[idx] & VALID != 0,
+        None => false,
+    }
+}
+
 pub fn paging_protect(root: &mut PagingRoot, va: usize, perm: MapPerm) {
     if let Some((l3_pa, idx)) = leaf(root, va) {
         let l3 = table_mut(l3_pa);

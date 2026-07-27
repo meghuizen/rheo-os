@@ -290,7 +290,9 @@ is not re-litigated later.
 
 ACCELERATORS.md 1-2 asserts the vendor blob is contained, not trusted.
 This section is the concrete interface: what the cell can touch, what the
-kernel keeps, and why the blob's worst day is bounded.
+kernel keeps, and why the blob's worst day is bounded. (DRIVERS.md 4
+generalizes this interface to every device class - block, NIC, HID, LKL
+cells hosting Linux driver code - so it is written once, here.)
 
 **BAR windows are capabilities.** A `MemKind::DeviceBar` grant is a window
 into a `BarAssignment` range (section 3), MMIO-mapped into the driver cell

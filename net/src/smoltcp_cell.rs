@@ -15,7 +15,7 @@
 //! are *async* over the strand reactor. [`QueueDevice`] bridges the two the way
 //! every async-over-smoltcp integration does: it buffers frames in two
 //! `VecDeque`s. The async driver ([`poll`]) pulls frames off the NIC with
-//! `net::recv` into the device's RX queue, runs smoltcp's synchronous poll, then
+//! `net::try_recv` into the device's RX queue, runs smoltcp's synchronous poll, then
 //! ships the device's TX queue out with `net::send`. So the `RxToken`/`TxToken`
 //! consume/produce the frames that `net::recv`/`net::send` carry - smoltcp drives
 //! the real virtio-net driver end to end, one hop removed by the queue buffer.
@@ -164,7 +164,7 @@ impl Clock {
 
 /// One async poll step of a smoltcp interface over the raw-frame NIC:
 ///
-/// 1. drain up to [`RX_BATCH`] frames off the NIC (`net::recv`) into the device;
+/// 1. drain up to [`RX_BATCH`] frames off the NIC (`net::try_recv`) into the device;
 /// 2. sleep [`POLL_MS`] on the reactor and advance the smoltcp `clock` by it (so
 ///    smoltcp's timers advance in real milliseconds while the vcore runs other
 ///    strands);
@@ -177,7 +177,7 @@ pub async fn pump(device: &mut QueueDevice, clock: &mut Clock) -> usize {
     let mut got = 0;
     let mut buf = [0u8; MTU + 64];
     for _ in 0..RX_BATCH {
-        match net::recv(&mut buf).await {
+        match net::try_recv(&mut buf).await {
             Ok(0) => break, // nothing ready
             Ok(n) => {
                 device.push_rx(buf[..n].to_vec());

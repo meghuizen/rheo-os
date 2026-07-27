@@ -12,6 +12,9 @@
 // Shared across several test bins via #[path]; each uses only a subset.
 #![allow(dead_code)]
 
+use core::mem::MaybeUninit;
+use core::ptr::addr_of_mut;
+
 use kernel::abi::{Params, ShellIo};
 use kernel::arch::{self, MapPerm, TrapFrame};
 use kernel::capability::{
@@ -19,6 +22,8 @@ use kernel::capability::{
 };
 use kernel::mm::AddressSpace;
 use kernel::queue::QueuePair;
+use kernel::user::Outcome;
+use kernel::{linux, load, user};
 
 /// Per-cell user page size budgets (each a whole number of 4 KiB pages).
 const STACK_BYTES: usize = 32 * 1024;
@@ -218,4 +223,101 @@ pub unsafe fn build_cell(
     let stack_top = stack_addr + STACK_BYTES;
     let frame = arch::trapframe_new(entry as usize, stack_top, params_addr, kernel_sp);
     (aspace, object, frame)
+}
+
+// ===========================================================================
+// Loading and running a cell from an ELF image
+// ===========================================================================
+//
+// Fifteen kernels had written the same native launch by hand and seven more the
+// same Linux launch - byte-identical once comments and the image's variable name
+// are normalised away, thirty-five lines each
+// (docs/ARCHITECTURE-DEBT.md 5). Both are here once.
+//
+// The kernel state a launch needs (`ObjectTable`, `CapTable`, the `QueuePair`
+// overlay, the trap-handler stack) lives here too, because every one of those
+// twenty-two kernels touched it *only* inside the block being replaced - checked,
+// not assumed: each referenced these names exactly thirteen times and all
+// thirteen were in the launch. A kernel that needs the tables afterwards (to
+// assert on capability state, say) keeps its own and does not use these
+// entry points.
+
+static mut OBJECTS: ObjectTable = ObjectTable::new();
+static mut CAPS: CapTable = CapTable::new();
+static mut QP: MaybeUninit<QueuePair> = MaybeUninit::uninit();
+static mut KSTACK: KernelStack = KernelStack::new();
+
+/// Load `image` into a fresh native cell with its own address space, stack and
+/// mapped queue pair, run it to completion, and return its [`Outcome`].
+///
+/// The cell gets what librheo's `_start` expects to find: a queue-pair region
+/// mapped at `load::USER_QUEUE_VA` with a minted `QueuePair` capability
+/// (READ|WRITE, unmetered), reported through `SYS_QUEUE_INFO`. `what` names the
+/// program in the load-failure panic.
+///
+/// # Safety
+/// Single-threaded init only: this installs into cell slot 0 after
+/// `user::reset()`, so it must not run while another cell is live. The statics it
+/// uses outlive the synchronous run.
+pub unsafe fn run_elf_cell(image: &[u8], what: &str) -> Outcome {
+    let mut aspace = AddressSpace::new(1);
+    let entry = load::load_elf(image, &mut aspace).unwrap_or_else(|| panic!("load {what} ELF"));
+    let stack_top = load::map_stack(&mut aspace);
+    let qp = load::map_queue(&mut aspace);
+
+    // SAFETY: the caller guarantees single-threaded init; every pointer below
+    // refers to a static or to a local that outlives the `user::run` call.
+    unsafe {
+        let objects = &mut *addr_of_mut!(OBJECTS);
+        let caps = &mut *addr_of_mut!(CAPS);
+        let object = objects.create(ObjectKind::QueuePair).unwrap();
+        let cap = caps
+            .mint(objects, object, READ | WRITE, BUDGET_UNLIMITED)
+            .unwrap();
+        let cap_id = cap.raw_low32();
+
+        (*addr_of_mut!(QP)).write(qp);
+        let qp_ptr = (*addr_of_mut!(QP)).as_ptr();
+
+        let kernel_sp = (*addr_of_mut!(KSTACK)).top();
+        let mut frame = arch::trapframe_new(entry, stack_top, 0, kernel_sp);
+        user::reset();
+        user::install(0, &aspace, caps, objects, qp_ptr, addr_of_mut!(frame));
+        user::set_queue_info(0, load::USER_QUEUE_VA as u64, cap_id);
+        user::run(0).1
+    }
+}
+
+/// Load `image` as a `Personality::Linux` cell with a System V initial stack
+/// built from `argv`, run it, and return its [`Outcome`].
+///
+/// No queue pair is mapped: a Linux binary reaches the kernel through the Linux
+/// syscall ABI, not the queue (docs/LINUX-COMPAT.md). The `QueuePair` pointer is
+/// still installed because `user::install` takes one; nothing dereferences it on
+/// this path.
+///
+/// # Safety
+/// As [`run_elf_cell`].
+pub unsafe fn run_linux_cell(image: &[u8], argv: &[&[u8]]) -> Outcome {
+    // Reset **before** loading, not after. `user::reset` clears the personality's
+    // mapped-file registry, and the loader registers the image in it - so resetting
+    // afterwards would leave the cell's records naming a released entry and every page
+    // of the image would fault in as zeros (docs/ENGINEERING.md 11).
+    user::reset();
+    let mut aspace = AddressSpace::new(1);
+    let img = load::load_elf_linux(image, &mut aspace).expect("load Linux ELF");
+    let sp = linux::stack::setup_stack(&mut aspace, &img, argv, &[]);
+
+    // SAFETY: as above.
+    unsafe {
+        let kernel_sp = (*addr_of_mut!(KSTACK)).top();
+        let mut frame = arch::trapframe_new(img.entry, sp, 0, kernel_sp);
+        let objects = &mut *addr_of_mut!(OBJECTS);
+        let caps = &mut *addr_of_mut!(CAPS);
+        let qp = core::ptr::addr_of!(QP) as *const QueuePair;
+        user::install(0, &aspace, caps, objects, qp, addr_of_mut!(frame));
+        user::set_personality(0, user::Personality::Linux);
+        linux::install_cell(0, &img);
+        user::run(0).1
+    }
 }

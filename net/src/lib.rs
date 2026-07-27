@@ -76,31 +76,152 @@
 //!   of N shards, connections hashed to shards by their [`shard::FourTuple`],
 //!   shared-nothing (structural on the single CPU, not parallel - SMP is #27).
 //!
-//! Still deferred (per docs/NETSTACK.md): TLS 1.3 (N3); full NewReno partial-ACK
-//! recovery, CUBIC HyStart / fast-convergence, and BBR; negative caching; and the
-//! *live* ICMPv6 path (the v6 codec is unit-proven; SLIRP cannot generate v6
-//! errors).
+//! **Phase N3a** adds the crypto primitive layer (feature `crypto`, off by
+//! default):
+//! - [`crypto`]: from-scratch ChaCha20-Poly1305 (RFC 8439) + doc-named RustCrypto
+//!   SHA-2 / HKDF / X25519 / Ed25519 / AES-GCM, each proven against its RFC/NIST
+//!   test vector; the two-randomness-class API ([`crypto::rand`] vs
+//!   [`crypto::kdf`]) and the nonce-reuse guard ([`crypto::aead::SealingKey`]).
+//!   The TLS 1.3 handshake over these primitives is N3b.
+//!
+//! **Phase N4a** adds the service-cell model - the keystone every later service
+//! rides on:
+//! - [`service`]: a [`service::Service`] holding **one cross-cell channel end per
+//!   client** and running **one strand per client**, so a single network service
+//!   cell serves many client cells concurrently (cooperative, single-CPU - SMP is
+//!   task #27), plus the thin [`service::Client`] a spawned cell uses. Fan-out
+//!   composes over librheo Phase J spawn/channel inheritance.
+//!
+//! **Phase N5a** adds the first **application protocols** over that transport
+//! (docs/NETSTACK.md §19) - the gateway every remaining scenario (WAF/DPI,
+//! S3-style storage, Arrow Flight, Kafka) rides on:
+//! - [`http1`]: HTTP/1.1 - a **zero-copy** request/response codec (header names and
+//!   values borrow the input buffer), `Content-Length` + **chunked** framing both
+//!   directions, keep-alive, and a **smuggling-hardened** parser (both
+//!   `Content-Length` and `Transfer-Encoding`, duplicate `Content-Length`, bare LF,
+//!   whitespace before the colon, obs-fold, non-token names and oversized header
+//!   blocks are each rejected with their own error), plus a transport-agnostic
+//!   [`http1::Client`]/[`http1::Server`] pair driven over the synchronous
+//!   [`tcp::Connection`] seam - or over the TLS record layer, which is how HTTPS
+//!   composes.
+//! - [`http2`]: HTTP/2 - the frame layer, the connection preface, the stream state
+//!   machine, **connection- and stream-level flow control**, and **HPACK** (static
+//!   table, dynamic table with size updates, and the RFC 7541 Appendix B Huffman
+//!   code generated from the RFC text), proven against the RFC 7541 Appendix C
+//!   known-answer vectors.
+//!
+//! Both live in the **always-compiled** (posture-independent) half of the crate:
+//! HTTP is parsing and state machines, so it needs neither librheo nor the NIC.
+//!
+//! **Phase N4c** adds **host configuration** - the four services that answer "who am
+//! I on this link, and what time is it?" (docs/NETSTACK.md §20). All four are UDP or
+//! ARP based and all four are naturally userspace, which is where the doctrine wants
+//! them:
+//! - [`hostcfg`]: the **host-configuration store** - address / netmask / gateway /
+//!   DNS servers / search domains / hostname, plus the on-link-vs-gateway
+//!   [`hostcfg::HostConfig::next_hop`] routing decision. DHCP, static config and
+//!   zeroconf all write it; [`udp::UdpEndpoint::from_host_config`], [`dns`] and
+//!   [`service`] read it, so the stack no longer carries hardcoded addresses.
+//! - [`dhcp`]: a **DHCP client** (RFC 2131) - the BOOTP-shaped codec with the magic
+//!   cookie and TLV options, the DISCOVER -> OFFER -> REQUEST -> ACK state machine,
+//!   the T1/T2 renewal and rebinding timers, expiry, DECLINE and RELEASE.
+//! - [`zeroconf`]: **IPv4 link-local** autoconfiguration (RFC 3927 - candidate
+//!   selection, ARP probe, conflict re-pick, announce, single defence) and **mDNS**
+//!   (RFC 6762 - `.local` query/response over `224.0.0.251:5353`, the QU and
+//!   cache-flush bits, goodbye TTLs) **reusing the [`dns`] codec unchanged**.
+//! - [`ntp`]: an **SNTP/NTPv4 client** (RFC 5905 client subset) - the 48-byte codec,
+//!   the four-timestamp offset and round-trip delay, poll backoff, and the result as
+//!   a **bounded interval** ([`ntp::Estimate`]) in the shape of
+//!   `kernel::time::Interval`, never a false instant. It adjusts a **userspace
+//!   offset**, never a system clock; PTP and NTS stay deferred.
+//!
+//! N4c is what made the [`dns`] codec posture-independent: mDNS is DNS messages with
+//! a different transport, so it reuses the same parser rather than getting a second
+//! one. Only [`dns::Resolver`]/[`dns::Config`] stayed behind `hosted`.
+//!
+//! **Phase N2e** makes congestion control **rate-based by default**
+//! (docs/NETSTACK.md §21) - loss-based control is the wrong default for high-BDP,
+//! lossy and bufferbloated paths, where **loss is not congestion**:
+//! - [`bbr`]: **BBRv3** - a max-bandwidth filter over windowed delivery-rate samples,
+//!   a windowed min-RTT filter, round-trip counting, the Startup -> Drain -> ProbeBW
+//!   (down/cruise/refill/up) -> ProbeRTT state machine with its pacing/cwnd gains, and
+//!   a loss response that caps in-flight instead of collapsing the window. Integer /
+//!   fixed-point, and now [`tcp::DefaultCc`] - `Reno`/`Cubic` stay selectable.
+//! - [`pacer`]: the **send pacer** - a token bucket that releases bytes at the
+//!   controller's pacing rate, whose deadline is registered with the **kernel timer
+//!   arbiter's pacer slot** (`librheo::time::sleep_pacing`), making it the arbiter's
+//!   first continuously re-armed client. **Pacing is a precondition for BBR, not a
+//!   tuning knob**: unpaced, BBR bursts a window into the link and performs worse than
+//!   CUBIC.
+//! - [`tcp::CongestionControl`] grew the rate-based half of the interface
+//!   ([`tcp::RateSample`], `on_rate_sample`/`pacing_rate_bps`/`inflight_cap`/
+//!   `min_rtt_ns`/`bw_bps`/`rounds`), all default-implemented, so `FixedWindow`,
+//!   [`cc::Reno`] and [`cc::Cubic`] behave **byte-for-byte** as before.
+//!
+//! Still deferred (per docs/NETSTACK.md): full NewReno partial-ACK recovery, CUBIC
+//! HyStart / fast-convergence, SACK, ECN (BBR's other congestion signal), negative
+//! DNS caching, and the *live* ICMPv6 path (the v6 codec is unit-proven; SLIRP cannot
+//! generate v6 errors).
 
 #![no_std]
 
 extern crate alloc;
 
 pub mod arp;
+pub mod bbr;
 pub mod cc;
+pub mod dhcp;
 pub mod dns;
 pub mod eth;
-pub mod icmp;
+pub mod hostcfg;
+pub mod http1;
+pub mod http2;
 pub mod ip;
-pub mod local;
+pub mod ntp;
+pub mod pacer;
 pub mod shard;
 pub mod tcp;
-pub mod timer;
-pub mod trace;
 pub mod udp;
 pub mod wire;
+pub mod zeroconf;
+
+// The **librheo-hosted** modules (feature `hosted`, on by default): every layer
+// that reaches the NIC or the clock through librheo's async surface. Gating them
+// out (`--no-default-features`) leaves the **codec posture** - pure parsing,
+// framing, checksums and synchronous state machines - which is what makes the
+// stack linkable into a *kernel* binary for the rheo-net N4b `svc::SocketOps`
+// bridge (docs/NETSTACK.md N4b). librheo supplies a cell's `_start`, panic
+// handler and global allocator, so a kernel cannot link it; the codec posture
+// carries none of that. Nothing here is duplicated - the same `eth`/`ip`/`udp`/
+// `tcp` code serves both postures.
+#[cfg(feature = "hosted")]
+pub mod icmp;
+#[cfg(feature = "hosted")]
+pub mod local;
+#[cfg(feature = "hosted")]
+pub mod service;
+#[cfg(feature = "hosted")]
+pub mod timer;
+#[cfg(feature = "hosted")]
+pub mod trace;
 
 /// The smoltcp blessed transport cell (docs/NETSTACK.md §13, N2c). Gated behind
 /// the `smoltcp` feature so the from-scratch stack + every existing test are
 /// unaffected when it is off (the default). Present only when a cell opts in.
 #[cfg(feature = "smoltcp")]
 pub mod smoltcp_cell;
+
+/// The N3a crypto primitive layer (docs/NETSTACK.md §3). Gated behind the
+/// `crypto` feature so the base stack + every existing test are unaffected when
+/// it is off (the default). Present only when a cell opts in.
+#[cfg(feature = "crypto")]
+pub mod crypto;
+
+/// The N3b TLS 1.3 stack (docs/NETSTACK.md §15): the HKDF key schedule, the AEAD
+/// record layer, the handshake state machine, and a minimal X.509 - all
+/// from-scratch on the N3a `crypto` primitives. Gated behind the `tls` feature
+/// (which implies `crypto`) so the base stack + every existing test are
+/// unaffected when it is off (the default). Proven byte-for-byte against the RFC
+/// 8448 known-answer trace.
+#[cfg(feature = "tls")]
+pub mod tls;

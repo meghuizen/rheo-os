@@ -12,3 +12,7 @@ edition = "2024"
 smp = []
 
 [dependencies]
+# The on-wire ABI, defined once (docs/ARCHITECTURE-DEBT.md 3.1). Zero deps, no
+# lang items - the `runtime/` model, so it links into a kernel binary and a cell
+# alike.
+rheo-abi = { path = "../abi" }

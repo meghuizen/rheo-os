@@ -12,13 +12,11 @@ use crate::event::{self, EventStream};
 use crate::graph::{Graph, Input};
 use crate::lease::Lease;
 use crate::rng::{self, Drbg};
-use crate::sched::Admission;
 use crate::time;
 use crate::{mm, pty, user};
 
 static mut DRBG: Drbg = Drbg::ZERO;
 static mut EVENTS: EventStream = EventStream::new();
-static mut ADMISSION: Admission = Admission::new();
 static mut ENGINE: Engine = Engine::cpu();
 static mut READY: bool = false;
 
@@ -66,10 +64,22 @@ pub fn handle(nr: u64, args: &[u64; 6]) -> Option<u64> {
         }
         SYS_EVENT_COUNT => Some(((events().buffered() as u64) << 32) | events().total()),
         SYS_GRAPH => Some(run_demo_graph(arg)),
+        // The **legacy** reserve verb (the `lsh` `reserve` builtin). It admits
+        // against the machine-wide ledger (docs/ARCHITECTURE-DEBT.md 2.5) - it used
+        // to keep a *second, private* global controller for the same object, so the
+        // two disagreed about how much of the CPU was committed.
+        //
+        // Honest scope, because it matters: this verb has **no release**. It
+        // discards its `Reservation` handle, so its utilisation is charged for the
+        // life of the boot and only ever grows. That is exactly why `lsh`'s second
+        // `reserve 8 10` is refused after `reserve 3 10` succeeded - the demo relies
+        // on the accumulation. It is a cumulative *probe*, not a managed
+        // reservation; `SYS_RESERVE_ADMIT`/`RELEASE` (object 7) is the real surface
+        // and is capability-gated and releasable.
         SYS_RESERVE => {
             let budget = arg >> 32;
             let period = arg & 0xFFFF_FFFF;
-            let admission = unsafe { &mut *core::ptr::addr_of_mut!(ADMISSION) };
+            let admission = crate::sched::system();
             match admission.admit(budget, period, period) {
                 Ok(_) => Some(admission.committed_ppm()),
                 Err(_) => Some(u64::MAX),
@@ -114,15 +124,19 @@ pub fn handle(nr: u64, args: &[u64; 6]) -> Option<u64> {
             } else {
                 None
             };
-            if let Some(info) = info {
-                // SAFETY: `arg` is a user VA in the running cell's active
-                // address space, sized for an `EngineInfo` (the cell passes
-                // its own slot).
-                unsafe {
-                    (arg as *mut EngineInfo).write(info);
+            match (info, user::user_out::<EngineInfo>(arg)) {
+                // SAFETY: `out` was validated (non-null, aligned, inside the
+                // calling cell's user VA range); its address space is active.
+                (Some(info), Some(out)) => {
+                    unsafe { out.write(info) };
+                    Some(n as u64)
                 }
+                // A rejected out-parameter reports **zero** engines, so a cell
+                // that gates on `index < count` (librheo `Engine::info_at`)
+                // reads nothing (docs/ENGINEERING.md 12).
+                (_, None) => Some(0),
+                (None, _) => Some(n as u64), // index out of range: nothing written
             }
-            Some(n as u64)
         }
         SYS_CPUINFO => {
             // out_va == 0: print for the shell. out_va != 0: write a
@@ -131,17 +145,20 @@ pub fn handle(nr: u64, args: &[u64; 6]) -> Option<u64> {
             // report + the FP widths the kernel validated at boot.
             if arg == 0 {
                 print_cpuinfo();
-            } else {
-                let inv = crate::hw::inventory();
-                let feats = crate::abi::CpuFeatures {
-                    features: inv.cpu.features,
-                    simd: crate::arch::fp_simd_tiers(),
-                    vendor: inv.cpu.vendor,
-                };
-                // SAFETY: `arg` is a writable VA in the calling cell; the cell
-                // provides a buffer of at least size_of::<CpuFeatures>().
-                unsafe { (arg as *mut crate::abi::CpuFeatures).write(feats) };
+                return Some(0);
             }
+            let Some(out) = user::user_out::<crate::abi::CpuFeatures>(arg) else {
+                return Some(u64::MAX); // refused, nothing written
+            };
+            let inv = crate::hw::inventory();
+            let feats = crate::abi::CpuFeatures {
+                features: inv.cpu.features,
+                simd: crate::arch::fp_simd_tiers(),
+                vendor: inv.cpu.vendor,
+            };
+            // SAFETY: `out` was validated (non-null, aligned, inside the calling
+            // cell's user VA range); its address space is active for the trap.
+            unsafe { out.write(feats) };
             Some(0)
         }
         SYS_LSPCI => {
@@ -157,15 +174,124 @@ pub fn handle(nr: u64, args: &[u64; 6]) -> Option<u64> {
         // registered personality handler. The handler runs in kernel context
         // with user-memory access enabled, so it takes raw user VAs. Returns
         // None (faults the cell) if no personality is installed.
-        SYS_OPEN => file_ops().map(|o| (o.open)(args[0], args[1], args[2]) as u64),
+        //
+        // Every buffer/path VA below is cell-supplied and is dereferenced
+        // inside the handler, which cannot itself tell a user VA from the
+        // kernel VAs the *kernel* legitimately passes it (`load::stream_segment`
+        // hands it `phys_to_virt(frame)`). So the check belongs here, at the
+        // syscall boundary: a rejected address is `-EFAULT`, never a
+        // dereference (docs/ENGINEERING.md 12).
+        SYS_OPEN => file_ops().map(|o| match path_ok(args[0], args[1]) {
+            Some(()) => (o.open)(args[0], args[1], args[2]) as u64,
+            None => EFAULT_RET,
+        }),
         SYS_CLOSE => file_ops().map(|o| (o.close)(args[0]) as u64),
-        SYS_READ => file_ops().map(|o| (o.read)(args[0], args[1], args[2]) as u64),
-        SYS_WRITE_FD => file_ops().map(|o| (o.write)(args[0], args[1], args[2]) as u64),
+        SYS_READ => file_ops().map(|o| match user::user_buf_mut(args[1], args[2] as usize) {
+            Some(_) => (o.read)(args[0], args[1], args[2]) as u64,
+            None => EFAULT_RET,
+        }),
+        SYS_WRITE_FD => file_ops().map(|o| match user::user_buf(args[1], args[2] as usize) {
+            Some(_) => (o.write)(args[0], args[1], args[2]) as u64,
+            None => EFAULT_RET,
+        }),
         SYS_LSEEK => file_ops().map(|o| (o.lseek)(args[0], args[1] as i64, args[2]) as u64),
-        SYS_STAT => file_ops().map(|o| (o.stat)(args[0], args[1], args[2]) as u64),
-        SYS_FSTAT => file_ops().map(|o| (o.fstat)(args[0], args[1]) as u64),
-        SYS_GETDENTS => file_ops().map(|o| (o.getdents)(args[0], args[1], args[2], args[3]) as u64),
+        SYS_STAT => file_ops().map(|o| {
+            let ok =
+                path_ok(args[0], args[1]).is_some() && user::user_out::<Stat>(args[2]).is_some();
+            if ok {
+                (o.stat)(args[0], args[1], args[2]) as u64
+            } else {
+                EFAULT_RET
+            }
+        }),
+        SYS_FSTAT => file_ops().map(|o| match user::user_out::<Stat>(args[1]) {
+            Some(_) => (o.fstat)(args[0], args[1]) as u64,
+            None => EFAULT_RET,
+        }),
+        SYS_GETDENTS => file_ops().map(|o| {
+            let ok = path_ok(args[0], args[1]).is_some()
+                && user::user_buf_mut(args[2], args[3] as usize).is_some();
+            if ok {
+                (o.getdents)(args[0], args[1], args[2], args[3]) as u64
+            } else {
+                EFAULT_RET
+            }
+        }),
         _ => None,
+    }
+}
+
+/// `-EFAULT` in the native syscall convention (a negative `i64` returned as a
+/// `u64`), for a rejected cell-supplied address.
+const EFAULT_RET: u64 = (-14i64) as u64;
+
+/// Validate a cell-supplied path `(va, len)`: a readable buffer, and a length
+/// no larger than the longest path the VFS accepts (so a bogus length cannot
+/// pass merely because the address is in range).
+fn path_ok(va: u64, len: u64) -> Option<()> {
+    if len > 4096 {
+        return None;
+    }
+    user::user_buf(va, len as usize).map(|_| ())
+}
+
+// ============================================================================
+// The bridge framework
+// ============================================================================
+//
+// `ARCHITECTURE.md` 5 puts filesystems, network stacks and device drivers
+// permanently **outside** the kernel, and the kernel is allocation-free, so it
+// can hold none of them. What it holds instead is a **bridge**: a table of `fn`
+// pointers that whatever owns the real implementation registers at boot. The
+// kernel serves the verb; the policy lives outside. `FileOps` established the
+// pattern (which is what keeps the kernel filesystem-free while still answering
+// `open`/`read`/`write`), `SocketOps` repeated it for the network - and by the
+// third and fourth table the static/setter/getter triple had been hand-written
+// often enough to earn a type (docs/ARCHITECTURE-DEBT.md 5).
+//
+// Adds **no kernel object** (ARCHITECTURE.md 6): a bridge is not addressable, is
+// not delegable, and carries no authority of its own - it is where a verb the
+// kernel already serves gets its implementation. Registration is a boot-time
+// act by the binary that owns the device or the service.
+
+/// A registration slot for one bridge table.
+///
+/// Installed once at boot and read-only afterwards, which is what makes the
+/// `unsafe` inside sound on the single-CPU path; when a secondary core can run
+/// cell code (SMP-2, task #27) this becomes the one place that has to change,
+/// instead of the four hand-rolled copies it replaces.
+pub struct Bridge<T: Copy + 'static> {
+    slot: Option<T>,
+}
+
+impl<T: Copy + 'static> Bridge<T> {
+    pub const fn empty() -> Bridge<T> {
+        Bridge { slot: None }
+    }
+
+    /// Install the table. Called once, at boot, by the owner of the
+    /// implementation; a second call replaces the first.
+    ///
+    /// # Safety
+    /// Must run before any cell does, and never concurrently with [`get`](Self::get).
+    pub unsafe fn install(this: *mut Bridge<T>, ops: T) {
+        // SAFETY: the caller guarantees boot-time exclusivity.
+        unsafe { (*this).slot = Some(ops) }
+    }
+
+    /// The installed table, or `None` if nothing registered one - which every
+    /// caller must handle, because "no bridge" is the honest answer for a kernel
+    /// built without that service (docs/ENGINEERING.md 7), not a reason to
+    /// pretend the operation succeeded.
+    ///
+    /// # Safety
+    /// Must not run concurrently with [`install`](Self::install). The safe
+    /// accessors below (`file_ops`, `socket_ops`, `nic_ops`, `display_ops`) are
+    /// the intended entry points: each names the boot-time-only-install
+    /// invariant that discharges this.
+    pub unsafe fn get(this: *const Bridge<T>) -> Option<&'static T> {
+        // SAFETY: the caller guarantees no concurrent install.
+        unsafe { (*this).slot.as_ref() }
     }
 }
 
@@ -187,22 +313,181 @@ pub struct FileOps {
     pub getdents: fn(path_va: u64, path_len: u64, buf_va: u64, buf_len: u64) -> i64,
 }
 
-static mut FILE_OPS: Option<FileOps> = None;
+static mut FILE_OPS: Bridge<FileOps> = Bridge::empty();
 
 /// Install the POSIX personality handler (called once at boot by the cell
 /// that provides the filesystem view).
 pub fn set_file_ops(ops: FileOps) {
-    unsafe {
-        *core::ptr::addr_of_mut!(FILE_OPS) = Some(ops);
-    }
+    // SAFETY: boot-time, before any cell runs.
+    unsafe { Bridge::install(core::ptr::addr_of_mut!(FILE_OPS), ops) }
 }
 
 /// The installed POSIX personality handler, if any. Public so the Linux
 /// personality's fd table can forward file I/O through the same VFS
 /// (docs/LINUX-COMPAT.md L2).
 pub fn file_ops() -> Option<&'static FileOps> {
-    // SAFETY: set once at boot, read-only afterwards.
-    unsafe { (*core::ptr::addr_of!(FILE_OPS)).as_ref() }
+    // SAFETY: installed once at boot, read-only afterwards.
+    unsafe { Bridge::get(core::ptr::addr_of!(FILE_OPS)) }
+}
+
+// ----------------------------------------------------- the remote-INET bridge
+//
+// rheo-net **N4b** (docs/NETSTACK.md N4b, docs/LINUX-COMPAT.md L8-INET remote).
+// `FileOps` above keeps the kernel **filesystem-free** while still serving the
+// POSIX file syscalls: a service registers function pointers, policy lives
+// outside. `SocketOps` is that pattern applied to the network, and for exactly the
+// same reason: doctrine (docs/ARCHITECTURE.md 6, docs/NETWORKING.md) puts IP/UDP/
+// TCP in **userspace**, and the kernel is allocation-free, so it can hold no
+// network stack. The Linux personality's INET sockets therefore keep their
+// loopback fast path in-kernel (a reliable local byte stream is just the L6 ring,
+// `linux::inetsock`) and forward every **non-loopback** operation to whatever
+// registered this table.
+//
+// Adds **no kernel object**: a socket is still a per-cell synthesized fd, and the
+// bridge is a table of `fn` pointers - the same mechanism-only shape as `FileOps`.
+// Today the registrant is a test kernel (`tests/src/inet_personality.rs`) that
+// links the `rheo-net` **codec** posture and drives `hw::virtio_net`; the
+// documented end state is a network **service cell** reached over a queue pair
+// (rheo-net N4a), which this table is deliberately shaped to accept.
+
+/// The remote (NIC-backed) INET datapath's operations. Every handler runs in
+/// kernel context during the calling cell's trap, so buffer arguments are raw VAs
+/// in the active address space - the `FileOps` convention. A negative return is
+/// `-errno`. `timeout_ns` of 0 means "do not block".
+#[derive(Copy, Clone)]
+pub struct SocketOps {
+    /// The local IPv4 address the datapath sends from (for `getsockname`).
+    pub local_ip: fn() -> [u8; 4],
+    /// Bind a remote UDP endpoint on local `port` (never 0 - the personality
+    /// allocates an ephemeral port first). Returns an opaque handle or `-errno`.
+    pub udp_bind: fn(port: u16) -> i64,
+    /// Release a UDP endpoint handle.
+    pub udp_close: fn(ep: u64),
+    /// Send `len` bytes at `buf_va` to `dst_ip:dst_port`. Returns bytes or `-errno`.
+    pub udp_send: fn(ep: u64, dst_ip: [u8; 4], dst_port: u16, buf_va: u64, len: u64) -> i64,
+    /// Receive one datagram into `buf_va` (up to `len`), blocking up to
+    /// `timeout_ns`. Writes the sender's IPv4 to `src_ip_va` (4 bytes) and its port
+    /// to `src_port_va` (a `u16`), when non-zero. Returns bytes or `-errno`
+    /// (`-EAGAIN` when nothing arrived).
+    pub udp_recv: fn(
+        ep: u64,
+        buf_va: u64,
+        len: u64,
+        src_ip_va: u64,
+        src_port_va: u64,
+        timeout_ns: u64,
+    ) -> i64,
+    /// Whether a datagram is already queued for `ep` (poll/epoll readiness).
+    pub udp_pending: fn(ep: u64) -> bool,
+    /// Active-open a TCP connection to `dst_ip:dst_port` from `src_port`, waiting
+    /// up to `timeout_ns` for the handshake. Returns an opaque handle, or
+    /// `-ECONNREFUSED` / `-ETIMEDOUT` / another `-errno`.
+    pub tcp_connect: fn(dst_ip: [u8; 4], dst_port: u16, src_port: u16, timeout_ns: u64) -> i64,
+    /// Send `len` bytes at `buf_va` on a connected handle. Returns bytes or `-errno`.
+    pub tcp_send: fn(h: u64, buf_va: u64, len: u64) -> i64,
+    /// Receive up to `len` bytes into `buf_va`, blocking up to `timeout_ns`.
+    /// Returns bytes (0 = peer closed) or `-errno`.
+    pub tcp_recv: fn(h: u64, buf_va: u64, len: u64, timeout_ns: u64) -> i64,
+    /// Whether bytes are already queued for `h`, or the peer has closed - the
+    /// `poll`/`epoll` readiness probe (docs/ARCHITECTURE-DEBT.md 2.4). Its absence
+    /// **was** the Linux personality's hardcoded `pollin_ready => true` for a remote
+    /// TCP socket: with no way to ask, the only answer that let a poll-then-read
+    /// caller reach the blocking `tcp_recv` was to claim readable always. Like
+    /// [`SocketOps::udp_pending`] this pumps the receive path first, so it reports
+    /// what has actually arrived.
+    pub tcp_pending: fn(h: u64) -> bool,
+    /// Close a connected handle (sends a FIN, releases the slot).
+    pub tcp_close: fn(h: u64),
+}
+
+static mut SOCKET_OPS: Bridge<SocketOps> = Bridge::empty();
+
+/// Install the remote-INET datapath (called once at boot by the cell/test kernel
+/// that owns the network stack). Without it, a non-loopback destination keeps
+/// returning `ENETUNREACH` exactly as before N4b.
+pub fn set_socket_ops(ops: SocketOps) {
+    // SAFETY: boot-time, before any cell runs.
+    unsafe { Bridge::install(core::ptr::addr_of_mut!(SOCKET_OPS), ops) }
+}
+
+/// The installed remote-INET datapath, if any. Read by the Linux personality's
+/// socket calls (`linux::fd`) for non-loopback addresses.
+pub fn socket_ops() -> Option<&'static SocketOps> {
+    // SAFETY: installed once at boot, read-only afterwards.
+    unsafe { Bridge::get(core::ptr::addr_of!(SOCKET_OPS)) }
+}
+
+// ------------------------------------------------- the NIC / display bridges
+//
+// `ARCHITECTURE.md` 5 keeps device drivers "beyond queue/IOMMU/reset plumbing"
+// permanently outside the kernel. The queue's opcode dispatch nevertheless named
+// `hw::virtio_net::tx` and `hw::virtio_gpu::present` **directly** - twenty lines
+// below the `file_ops()` bridge that gets it right - so the object layer knew
+// two concrete drivers by name (docs/ARCHITECTURE-DEBT.md 3.2). These two tables
+// close that: the opcodes now reach a device the same way they reach a
+// filesystem, and the kernel binary that owns the device registers it.
+//
+// This is a *seam*, not a rewrite: the virtio drivers still live in `hw/` and are
+// still what a kernel binary installs here. What changes is that `queue` no
+// longer names them, so a driver **cell** (the documented end state) can be
+// installed in exactly the same slot with no change above it. The registration is
+// `hw::register_device_bridges()`, called from boot, so nothing else moves.
+
+/// The NIC datapath the `OP_NET_*` opcodes bridge to (docs/NETWORKING.md,
+/// docs/LIBRHEO.md Phase G). Each handler runs in kernel context during the
+/// submitting cell's `SYS_DOORBELL` trap, so buffer arguments are raw VAs in the
+/// active address space - **already range-checked by the dispatcher** before the
+/// call. Each returns the opcode's `(status, result)` pair.
+#[derive(Copy, Clone)]
+pub struct NicOps {
+    /// Send the `len` bytes at `buf_va` as one Ethernet frame; `result` = bytes sent.
+    pub tx: fn(buf_va: u64, len: u64) -> (u32, u32),
+    /// Copy one received frame into `buf_va` (up to `len`); `result` = frame
+    /// length, 0 when nothing has arrived (a cell that wants to *wait* uses
+    /// `SYS_WAIT_NET`).
+    pub rx: fn(buf_va: u64, len: u64) -> (u32, u32),
+    /// Write the 6-byte MAC at `buf_va`; `result` = 6.
+    pub mac: fn(buf_va: u64) -> (u32, u32),
+}
+
+static mut NIC_OPS: Bridge<NicOps> = Bridge::empty();
+
+/// Install the NIC datapath (once, at boot, by the binary that discovered it).
+pub fn set_nic_ops(ops: NicOps) {
+    // SAFETY: boot-time, before any cell runs.
+    unsafe { Bridge::install(core::ptr::addr_of_mut!(NIC_OPS), ops) }
+}
+
+/// The installed NIC datapath, if any. `None` means this kernel has no NIC
+/// bridge, and the `OP_NET_*` opcodes complete `STATUS_IO` - the honest answer,
+/// which is also exactly what the 40-odd kernels with no netdev want.
+pub fn nic_ops() -> Option<&'static NicOps> {
+    // SAFETY: installed once at boot, read-only afterwards.
+    unsafe { Bridge::get(core::ptr::addr_of!(NIC_OPS)) }
+}
+
+/// The display datapath `OP_GPU_PRESENT` bridges to (docs/LIBRHEO.md Phase H,
+/// docs/DISPLAY.md). Same convention as [`NicOps`].
+#[derive(Copy, Clone)]
+pub struct DisplayOps {
+    /// Present the `w x h` RGBA framebuffer at `buf_va` to scanout 0;
+    /// `result` = bytes presented.
+    pub present: fn(buf_va: u64, w: u32, h: u32) -> (u32, u32),
+}
+
+static mut DISPLAY_OPS: Bridge<DisplayOps> = Bridge::empty();
+
+/// Install the display datapath (once, at boot).
+pub fn set_display_ops(ops: DisplayOps) {
+    // SAFETY: boot-time, before any cell runs.
+    unsafe { Bridge::install(core::ptr::addr_of_mut!(DISPLAY_OPS), ops) }
+}
+
+/// The installed display datapath, if any. `None` -> `OP_GPU_PRESENT` completes
+/// `STATUS_IO`.
+pub fn display_ops() -> Option<&'static DisplayOps> {
+    // SAFETY: installed once at boot, read-only afterwards.
+    unsafe { Bridge::get(core::ptr::addr_of!(DISPLAY_OPS)) }
 }
 
 /// Copy `len` bytes from a loaded program's buffer to the console
@@ -210,17 +495,26 @@ pub fn file_ops() -> Option<&'static FileOps> {
 /// the trap with supervisor access to user pages enabled, so the user VAs are
 /// directly readable. `len` is capped so a bad request cannot run away.
 fn debug_write(req_va: u64) -> u64 {
-    // SAFETY: the program passes the VA of a `DebugWrite` in its own mapped
-    // pages; we read the descriptor, then `len` bytes from `ptr`.
+    // Both the descriptor and the bytes it points at are cell-supplied
+    // addresses (docs/ENGINEERING.md 12): validate the descriptor, then its
+    // payload range, before either is read.
+    let Some(req_ptr) = user::user_in::<DebugWrite>(req_va) else {
+        return 0;
+    };
+    // SAFETY: `req_ptr` was validated (non-null, aligned, inside the calling
+    // cell's readable user VA range); its address space is active for the trap.
+    let req = unsafe { req_ptr.read() };
+    let len = (req.len as usize).min(4096);
+    let Some(src) = user::user_buf(req.ptr, len) else {
+        return 0;
+    };
+    // SAFETY: `[src, src+len)` was validated readable in the calling cell.
     unsafe {
-        let req = (req_va as *const DebugWrite).read();
-        let len = (req.len as usize).min(4096);
-        let src = req.ptr as *const u8;
         for i in 0..len {
-            crate::arch::serial_write_byte(src.add(i).read());
+            crate::arch::serial_write_byte((src as *const u8).add(i).read());
         }
-        len as u64
     }
+    len as u64
 }
 
 // -- console helpers for the hardware builtins --
@@ -350,9 +644,13 @@ fn print_numa() {
 
 /// Read one PTY line into ShellIo.in_buf. Returns 1 for a line, 0 at EOF.
 fn read_line(io_va: u64) -> u64 {
-    let io = io_va as *mut ShellIo;
-    // SAFETY: the shell passes the VA of its own ShellIo (mapped RW, and
-    // reachable by the kernel through its identity map).
+    // The shell passes the VA of its own `ShellIo`; validated because it is
+    // still a cell-supplied address (docs/ENGINEERING.md 12).
+    let Some(io) = user::user_out::<ShellIo>(io_va) else {
+        return 0;
+    };
+    // SAFETY: `io` was validated writable, `ShellIo`-aligned and inside the
+    // calling cell's user VA range; its address space is active for the trap.
     unsafe {
         let buf = core::ptr::addr_of_mut!((*io).in_buf) as *mut u8;
         match pty::read_line(buf, SHELL_BUF) {
@@ -370,8 +668,11 @@ fn read_line(io_va: u64) -> u64 {
 
 /// Write ShellIo.out_buf[..out_len] to the PTY.
 fn write(io_va: u64) -> u64 {
-    let io = io_va as *const ShellIo;
-    // SAFETY: as above; out_len is clamped to the buffer.
+    let Some(io) = user::user_in::<ShellIo>(io_va) else {
+        return 0;
+    };
+    // SAFETY: `io` was validated readable, aligned and inside the calling
+    // cell's user VA range; out_len is clamped to the buffer.
     unsafe {
         let len = ((*io).out_len as usize).min(SHELL_BUF);
         let base = core::ptr::addr_of!((*io).out_buf) as *const u8;
@@ -390,19 +691,35 @@ fn write(io_va: u64) -> u64 {
 /// result written back to `results_va`. Returns `(status, count)` on success or
 /// a `(STATUS_*, 0)` failure - the queue completion the reactor delivers.
 ///
+/// Every cell-supplied address reaching this function - the node array, the
+/// result array, each tile descriptor and each matrix/buffer VA inside a
+/// descriptor - is validated against the calling cell's user VA range before it
+/// is dereferenced (docs/ENGINEERING.md 12); a rejected address completes
+/// `STATUS_DENIED`, never a fault and never a kernel access.
+///
 /// # Safety
-/// `nodes_va`/`results_va` are trusted to be the calling cell's mapped buffers;
-/// the caller (`queue::run_opcode`) invokes this only during that cell's trap.
+/// The caller (`queue::run_opcode`) must invoke this only during the submitting
+/// cell's trap, so its address space is active.
 pub fn graph_submit(nodes_va: u64, count: u32, results_va: u64) -> (u32, u32) {
     use crate::queue::{STATUS_BAD_OPCODE, STATUS_DENIED, STATUS_OK};
     let count = count as usize;
     if count == 0 || count > crate::graph::MAX_NODES {
         return (STATUS_BAD_OPCODE, 0);
     }
+    // Both arrays are cell-supplied addresses: validate the whole extent up
+    // front (`count` is already capped at MAX_NODES, so neither product can
+    // overflow) - docs/ENGINEERING.md 12. No alignment is required because the
+    // accesses below are deliberately unaligned.
+    if user::user_buf(nodes_va, count * core::mem::size_of::<GraphNode>()).is_none()
+        || user::user_buf_mut(results_va, count * 8).is_none()
+    {
+        return (STATUS_DENIED, 0);
+    }
     let mut g = Graph::new();
     for i in 0..count {
-        // SAFETY: `nodes_va` is the cell's mapped buffer; each 32-byte node is
-        // read unaligned to tolerate any buffer alignment.
+        // SAFETY: `[nodes_va, nodes_va + count*32)` was validated readable in
+        // the calling cell above; each 32-byte node is read unaligned to
+        // tolerate any buffer alignment.
         let node = unsafe { (nodes_va as *const GraphNode).add(i).read_unaligned() };
         let op = match node.op {
             0 => Op::Const(node.a),
@@ -414,34 +731,61 @@ pub fn graph_submit(nodes_va: u64, count: u32, results_va: u64) -> (u32, u32) {
             // as `nodes_va` itself - validated here with hard caps; any
             // violation completes STATUS_DENIED, never a fault.
             4 => {
-                if node.a_is_node != 0 || node.a == 0 {
+                if node.a_is_node != 0
+                    || user::user_buf(node.a, core::mem::size_of::<BufReduceDesc>()).is_none()
+                {
                     return (STATUS_DENIED, 0);
                 }
-                // SAFETY: `node.a` is the cell's mapped descriptor buffer.
+                // SAFETY: `node.a` was validated as a readable descriptor-sized
+                // range in the calling cell (docs/ENGINEERING.md 12).
                 let d = unsafe { (node.a as *const BufReduceDesc).read_unaligned() };
-                if d.va == 0 || d.elems == 0 || d.elems > (1 << 20) || d.dtype > 2 {
+                if d.elems == 0 || d.elems > (1 << 20) || d.dtype > 2 {
+                    return (STATUS_DENIED, 0);
+                }
+                // The descriptor's *own* buffer VA is cell-supplied too, and the
+                // engine dereferences it: bound it by the exact extent the
+                // reduction reads (dtype 0=I8, 1=U8 -> 1 byte, 2=I32 -> 4).
+                let esz = if d.dtype == 2 { 4 } else { 1 };
+                if user::user_buf(d.va, d.elems as usize * esz).is_none() {
                     return (STATUS_DENIED, 0);
                 }
                 Op::BufReduce(d)
             }
             5 => {
-                if node.a_is_node != 0 || node.a == 0 {
+                if node.a_is_node != 0
+                    || user::user_buf(node.a, core::mem::size_of::<TileGemmDesc>()).is_none()
+                {
                     return (STATUS_DENIED, 0);
                 }
-                // SAFETY: `node.a` is the cell's mapped descriptor buffer.
+                // SAFETY: `node.a` was validated as a readable descriptor-sized
+                // range in the calling cell.
                 let d = unsafe { (node.a as *const TileGemmDesc).read_unaligned() };
                 let dims_ok = (1..=256).contains(&d.m)
                     && (1..=256).contains(&d.n)
                     && (1..=256).contains(&d.k);
                 let strides_ok = d.a_stride >= d.k && d.b_stride >= d.n && d.c_stride >= d.n;
-                if d.a_va == 0
-                    || d.b_va == 0
-                    || d.c_va == 0
-                    || !dims_ok
+                if !dims_ok
                     || !strides_ok
                     || d.dtype_in != 0 // I8 in ...
                     || d.dtype_acc != 2
                 // ... i32 accumulate, exactly
+                {
+                    return (STATUS_DENIED, 0);
+                }
+                // The three matrix VAs are cell-supplied and the engine walks
+                // them, so bound each by the exact extent the kernel touches
+                // (docs/ENGINEERING.md 12): row `i` of A starts at
+                // `i*a_stride`, so A spans `(m-1)*a_stride + k` i8 elements; B
+                // spans `(k-1)*b_stride + n` i8; C spans `(m-1)*c_stride + n`
+                // i32. Dims and strides are already capped at 256 above, so no
+                // product can overflow.
+                let (m, n, k) = (d.m as usize, d.n as usize, d.k as usize);
+                let a_ext = (m - 1) * d.a_stride as usize + k;
+                let b_ext = (k - 1) * d.b_stride as usize + n;
+                let c_ext = ((m - 1) * d.c_stride as usize + n) * 4;
+                if user::user_buf(d.a_va, a_ext).is_none()
+                    || user::user_buf(d.b_va, b_ext).is_none()
+                    || user::user_buf_mut(d.c_va, c_ext).is_none()
                 {
                     return (STATUS_DENIED, 0);
                 }
@@ -460,7 +804,8 @@ pub fn graph_submit(nodes_va: u64, count: u32, results_va: u64) -> (u32, u32) {
     let engine = unsafe { &*core::ptr::addr_of!(ENGINE) };
     g.run(engine, &mut results);
     for (i, &r) in results.iter().take(count).enumerate() {
-        // SAFETY: `results_va` is the cell's mapped buffer, `count` u64s wide.
+        // SAFETY: `[results_va, results_va + count*8)` was validated writable
+        // in the calling cell at entry.
         unsafe {
             (results_va as *mut u64).add(i).write_unaligned(r);
         }

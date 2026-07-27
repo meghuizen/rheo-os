@@ -59,7 +59,46 @@ Hardware root of trust (TPM 2.0 or DICE)
    and can never be granted away (ARCHITECTURE.md 4.2).
 5. Engine enumeration: devices discovered, IOMMU domains created, firmware
    measured. Engines are *not yet* schedulable.
-6. PID 1 starts: the host reconciler, holding the initial capability set.
+6. PID 1 starts: the host reconciler, holding the initial capability set -
+   which set depends on the boot mode (section 3.1).
+
+## 3.1 Boot flags and boot modes
+
+**PLANNED** (docs/IDENTITY.md 8, phases ID1 and ID6). Nothing here is
+implemented yet.
+
+The kernel parses a boot command line once, at init, and keeps it immutable for
+the life of the boot.
+
+- **The source is per-ISA; everything above it is portable**
+  (TARGET-ARCHITECTURES.md 4). One `arch::boot_cmdline()` reads x86-64's PVH
+  `hvm_start_info` cmdline pointer and `/chosen/bootargs` from the flattened
+  device tree on ARM64 and RISC-V. The firmware plumbing for all three already
+  exists in `kernel/src/hw/`. Above it there is one portable `BootConfig` and no
+  `cfg(target_arch)`.
+- **Readable in user mode, never writable.** `SYS_BOOTINFO` for native cells,
+  `/proc/cmdline` for the Linux personality - the file real programs read. A
+  cell cannot modify it and cannot forge it.
+- **Measured.** The command line's hash is an input to the initial cell's
+  principal derivation, so *how the machine was booted* is part of what the host
+  attests. This is what makes a privileged boot mode defensible: it cannot be
+  hidden from a remote verifier.
+
+| `rheo.boot=` | Effect |
+|---|---|
+| `normal` (default) | `identityd` starts first; the initial cell gets a **narrowed** bundle; a login is required for a user session |
+| `single` | No `identityd`, no login, console only, networking not started. The initial cell **is** the root principal with the full bundle |
+| `recovery` | `single`, plus the root filesystem read-only, for repair |
+
+The modes differ **only in which capabilities the first cell is minted**. There
+is no "am I in single-user mode?" branch in any check anywhere, so single-user
+mode is not a hole in the security model - it is the same model started from a
+different initial capability set.
+
+Stated plainly: a single-user boot is a **full-authority boot**. What protects
+it is control of the console and the boot path, exactly as on any other OS, plus
+the one thing this design adds - it is measured, so it is visible rather than
+silent.
 
 ## 4. Entropy at boot
 

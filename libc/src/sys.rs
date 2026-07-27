@@ -1,17 +1,17 @@
-//! Raw syscalls and typed wrappers (docs/USERLAND.md M2 ABI). The numbers
-//! match `kernel/src/abi.rs`; arguments go in the ISA's argument registers
-//! (riscv a0.., arm x0.., x86 rdi/rsi/rdx), the number in the syscall-number
-//! register, the result back in the first argument register.
+//! Raw syscalls and typed wrappers (docs/USERLAND.md M2 ABI). Arguments go in
+//! the ISA's argument registers (riscv a0.., arm x0.., x86 rdi/rsi/rdx), the
+//! number in the syscall-number register, the result back in the first argument
+//! register.
+//!
+//! The numbers themselves come from the `rheo-abi` crate - the same definition
+//! the kernel re-exports - rather than being restated here (they used to be, in
+//! a third hand-kept copy; docs/ARCHITECTURE-DEBT.md 3.1).
 
 use core::arch::asm;
 
-pub const SYS_MMAP: u64 = 21;
-pub const SYS_EXIT_GROUP: u64 = 22;
-pub const SYS_OPEN: u64 = 23;
-pub const SYS_CLOSE: u64 = 24;
-pub const SYS_READ: u64 = 25;
-pub const SYS_WRITE_FD: u64 = 26;
-pub const SYS_LSEEK: u64 = 27;
+pub use rheo_abi::{
+    SYS_CLOSE, SYS_EXIT_GROUP, SYS_LSEEK, SYS_MMAP, SYS_OPEN, SYS_READ, SYS_WRITE_FD,
+};
 
 #[cfg(target_arch = "riscv64")]
 #[inline(always)]

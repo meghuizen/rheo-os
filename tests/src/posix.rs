@@ -10,15 +10,17 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::ptr::addr_of_mut;
 
+use ext4fs::Ext4Fs;
 use kernel::{arch, println};
 use posix::sys::Whence;
 use posix::vfs::FileType;
-use posix::{Errno, Ext4, RamFs, fs, mount};
+use posix::{Errno, RamFs, fs, mount};
 
 #[global_allocator]
 static HEAP: runtime::Heap = runtime::Heap::empty();
@@ -30,7 +32,7 @@ static EXT4_IMG: &[u8] = include_bytes!("../fixtures/ext4.img");
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("posix: start on {}", arch::NAME);
 
     // SAFETY: once, before any allocation; HEAP_MEM is a unique static.
@@ -42,7 +44,7 @@ extern "C" fn kernel_main() -> ! {
     mount::mount("/", Rc::new(RamFs::new()));
     mount::mount(
         "/mnt",
-        Rc::new(Ext4::new(EXT4_IMG).expect("parse ext4 image")),
+        Rc::new(Ext4Fs::new(Box::new(EXT4_IMG)).expect("mount ext4 image")),
     );
 
     test_ramfs_rw();

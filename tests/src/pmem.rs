@@ -24,11 +24,28 @@
 
 use kernel::mm::frames_pmem;
 use kernel::mm::grant::{Grant, MemKind};
+use kernel::svc;
+use kernel::user::Outcome;
 use kernel::{arch, println};
+
+#[path = "console_personality.rs"]
+mod console_personality;
+#[path = "fixture.rs"]
+mod fixture;
+#[path = "harness.rs"]
+mod harness;
+
+/// The cell that asks `SYS_GRANT` for `MemKind::Pmem` - the path a real program
+/// takes, as opposed to the kernel-internal `Grant` type tested above.
+static PMEM_CELL: &[u8] = fixture::cell!("librheo-pmem");
+
+/// What `librheo-pmem` exits with on success, and how many pages it commits.
+const CELL_OK: u64 = 0x42;
+const CELL_PAGES: usize = 4;
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init(); // runs hw::detect -> frames_pmem::init_from_inventory
+    kernel::boot::init(); // runs hw::detect -> frames_pmem::init_from_inventory
     println!("pmem: start on {}", arch::NAME);
 
     match frames_pmem::region() {
@@ -53,6 +70,12 @@ extern "C" fn kernel_main() -> ! {
     // Regardless of nvdimm presence, a DDR grant must still work and draw from
     // the DDR pool (never the pmem region) - the DDR path is unaffected.
     test_ddr_unaffected();
+
+    // The half above exercises the kernel-internal `Grant` type. The half below
+    // exercises the path a **cell** takes, which is where object 5 was
+    // implemented a second time and the typed kind was dropped on the floor
+    // (docs/ARCHITECTURE-DEBT.md 3.6).
+    test_cell_grant_reaches_the_pmem_pool();
 
     println!("pmem: PASS");
     arch::exit(arch::ExitCode::Success)
@@ -161,4 +184,61 @@ fn test_ddr_unaffected() {
     let (free_after, _) = kernel::mm::frames::stats();
     assert_eq!(free_after, free_before, "DDR grant leaked frames on drop");
     println!("pmem: DDR path unaffected OK");
+}
+
+/// A **cell** asking `SYS_GRANT` for `MemKind::Pmem` must land on the pmem pool.
+///
+/// This is the assertion the cell cannot make and cannot fake: the kernel reads
+/// its own pmem allocator's free count before and after, and the count must fall
+/// by exactly the pages the cell committed. Before the fix the delta was **0** -
+/// `grant_commit` recorded the kind and then called `frames::alloc`, so a `Pmem`
+/// grant was DDR with nothing printed.
+///
+/// Where the machine exposes no nvdimm (arm/riscv `virt`) the cell still
+/// succeeds, because the commit falls back to DDR, but the kernel must have
+/// **said so** - the other half of the honesty requirement
+/// (docs/ENGINEERING.md 7). That path is asserted as "the DDR pool paid
+/// instead", with the printed reason visible in the log.
+fn test_cell_grant_reaches_the_pmem_pool() {
+    let have_nvdimm = frames_pmem::region().is_some();
+    let (free_pmem_before, _) = frames_pmem::stats();
+    let (free_ddr_before, _) = kernel::mm::frames::stats();
+
+    svc::set_file_ops(console_personality::console_only());
+
+    // SAFETY: single-threaded init; the harness's statics outlive the run.
+    let outcome = unsafe { harness::run_elf_cell(PMEM_CELL, "librheo-pmem") };
+    match outcome {
+        Outcome::Exited(code) => assert!(
+            code == CELL_OK,
+            "librheo-pmem exited {code:#x}, expected {CELL_OK:#x}"
+        ),
+        Outcome::Faulted(addr) => panic!("librheo-pmem faulted at {addr:#x}"),
+    }
+
+    let (free_pmem_after, _) = frames_pmem::stats();
+    let (free_ddr_after, _) = kernel::mm::frames::stats();
+    let pmem_used = free_pmem_before - free_pmem_after;
+    let ddr_used = free_ddr_before.saturating_sub(free_ddr_after);
+
+    if have_nvdimm {
+        assert!(
+            pmem_used >= CELL_PAGES,
+            "SYS_GRANT(Pmem) drew {pmem_used} pmem frames, expected at least \
+             {CELL_PAGES} - the typed kind never reached the allocator"
+        );
+        println!(
+            "pmem: SYS_GRANT(Pmem) from a cell drew {pmem_used} frames from the \
+             nvdimm pool (DDR paid {ddr_used} for the cell's own image/stack)"
+        );
+    } else {
+        assert!(
+            pmem_used == 0,
+            "no nvdimm region, yet {pmem_used} pmem frames were consumed"
+        );
+        println!(
+            "pmem: SYS_GRANT(Pmem) from a cell fell back to DDR with a printed \
+             reason (no nvdimm on this machine); {ddr_used} DDR frames used"
+        );
+    }
 }

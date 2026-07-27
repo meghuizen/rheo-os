@@ -2,13 +2,39 @@
 
 **Status:** Draft v0.1. Expands ARCHITECTURE.md 4.6.
 
-**Implemented (`posix/` crate):** a VFS translation layer (`FileSystem`
-trait), a read-write **ramfs**, and a read-only **ext4** driver (Tier 1)
-that parses a real ext4 image - superblock, block-group descriptors, inodes,
-the extent tree, linear directories. It is host-validated against a
-`mkfs.ext4` image. A mount table gives the per-session `/` (section 3), and
-the POSIX fd surface + a `std::fs` facade sit on top (POSIX-PERSONALITY.md).
-Proven on all three ISAs by the `posix` test kernel.
+**Implemented (`posix/` crate + `ext4fs/`):** a VFS translation layer
+(`FileSystem` trait), a read-write **ramfs**, the `BlockSource` seam
+(`posix::block` - byte-addressed random access), and a read-only **ext4**
+driver (Tier 1). A mount table gives the per-session `/` (section 3), and the
+POSIX fd surface + a `std::fs` facade sit on top (POSIX-PERSONALITY.md). Proven
+on all three ISAs by the `posix` test kernel.
+
+The ext4 driver is the **`ext4plus`** crate (`ext4fs/` adapts it to
+`posix::FileSystem` over a `BlockSource`), **not** a hand-rolled parser. This is
+the "drop an existing Rust FS driver in behind the `BlockDevice`/`BlockSource`
+seam" route below, taken for real: `ext4plus` is Google's read-only
+`ext4-view`, so it handles the full on-disk format (arbitrary extent-tree depth,
+htree dirs, checksums, ext2/3/4) that the original bounded hand-rolled parser
+did not - a ~1.7 MB glibc `libc.so.6`, a depth-1 extent tree, reads correctly,
+which the depth-0-only hand-rolled driver rejected. `ext4fs` lives in its own
+crate so its dependencies stay **out of the deliberately dependency-free
+`posix`** crate. Per the no-dependencies rule, the crate and its transitive
+dependencies are named here: **`ext4plus` 0.1.0-rc.2**, pulling `async-trait`,
+`async-lock` (+ `event-listener`), `maybe-async`, `crc`, `bitflags`, and `spin`
+(the last two via the `sync` feature that drives `ext4plus` synchronously). It
+is driven in **`sync`** mode because the driver is kernel-resident behind
+`svc::FileOps`, whose call site is a synchronous syscall trap over a blocking
+virtio-blk read - `maybe-async` strips the futures, so async here would be
+poll-to-completion over blocking I/O with no overlap. The **async** posture is
+correct when the filesystem moves into a **service cell** over the queue ABI
+(the FUSE-over-queues end state, section 3; DRIVERS.md 3.1 designs the FUSE
+wire-protocol translation that realizes it), where a read parks a strand on an
+`OP_READ` completion - and where **NVMe's** submission/completion queues realize
+real queue-depth parallelism; the same crate flips to its default async mode
+there, and the `BlockSource`/`BlockDevice` seam plus `maybe-async`'s design are
+exactly what keep that reversible. `ext4plus` parses untrusted on-disk data, so
+it is a supply-chain surface (mitigated by its read-only scope and Google
+provenance); vendoring/audit is the standing follow-on.
 
 **Live disk (implemented, all three ISAs):** a **virtio-blk driver**
 (`kernel/src/hw/virtio_blk.rs`) exposes a **`BlockDevice`** trait
@@ -23,13 +49,16 @@ virtqueue (PA=VA). The `blockfs` test kernel discovers the device, reads a
 real ext4 image off the *live disk* (attached by QEMU with `-drive`), mounts
 it, and reads files through `std::fs` - on all three ISAs.
 
-**Route to more formats:** at the `BlockDevice` seam, existing Rust
-filesystem drivers - `redoxfs` (Redox OS), `fatfs`, a read/write ext4 crate -
-can be *dropped in* rather than hand-written, so we do not reimplement every
-on-disk format. The constraint is this repo's no-dependencies rule: any such
-crate must be named in a doc and ideally vendored/audited, since a filesystem
-driver parses untrusted on-disk data. Write support for ext4 (journaling,
-allocation) is deferred behind that work.
+**Route to more formats:** at the `BlockDevice`/`BlockSource` seam, existing
+Rust filesystem drivers are *dropped in* rather than hand-written, so we do not
+reimplement every on-disk format. ext4 already takes this route (`ext4plus`,
+above); the same pattern serves `redoxfs` (Redox OS), `fatfs`, or a read/write
+ext4 crate when a format is needed. The constraint is this repo's
+no-dependencies rule: any such crate must be named in a doc and ideally
+vendored/audited, since a filesystem driver parses untrusted on-disk data.
+**Write** support for ext4 (journaling, allocation) is deferred - `ext4plus` is
+read-only; a read/write crate slots in behind the same seam when writes to a
+legacy format are actually needed.
 
 Position: there is no global filesystem tree in the native model - storage is
 a **capability-scoped object store**, and "filesystems" are either views over

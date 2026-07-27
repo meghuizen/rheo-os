@@ -43,12 +43,74 @@ enum Block {
         count: u64,
         idx: usize,
     },
+    /// `read` on an `eventfd` whose counter is zero (docs/LINUX-COMPAT.md
+    /// L8-EVENTFD). Parked until some other cell writes it; `ev` is the registry
+    /// index, which is kernel state, so the scheduler can judge satisfiability
+    /// without the waiter's address space active.
+    EventFdRead {
+        buf_va: u64,
+        count: u64,
+        ev: u8,
+    },
     /// `write` on a full pipe whose read ends are still open.
     PipeWrite {
         buf_va: u64,
         count: u64,
         idx: usize,
     },
+    /// `nanosleep`/`clock_nanosleep`: parked until `deadline_ns` in the **cell's own
+    /// clock domain** (`linux::cell_clock_ns`) - the domain the program's own
+    /// `clock_gettime` reports, so a sleep of N ns is N ns *as the program measures
+    /// it* (docs/ENGINEERING.md 11: clock domains are not interchangeable).
+    Timer {
+        deadline_ns: u64,
+    },
+    /// `read` on an empty console (stdin). Parked until a byte is buffered or input
+    /// ends (docs/ARCHITECTURE-DEBT.md 2.4 - it used to answer 0, i.e. "end of
+    /// input", which is a lie to every reader).
+    Console {
+        buf_va: u64,
+        count: u64,
+    },
+    /// `poll`/`ppoll`: parked until one of the descriptors in the cell's copied poll
+    /// set is ready, or `deadline_ns` (cell clock domain; 0 = indefinite) passes.
+    Poll {
+        fds_va: u64,
+        nfds: usize,
+        deadline_ns: u64,
+        sources: crate::idle::Sources,
+    },
+    /// `epoll_wait`/`epoll_pwait`: as `Poll`, over the epoll instance's own watch
+    /// list (which already lives in kernel state, so nothing is copied).
+    Epoll {
+        epfd: i64,
+        events_va: u64,
+        maxevents: usize,
+        deadline_ns: u64,
+        sources: crate::idle::Sources,
+    },
+}
+
+/// Descriptors a single `poll` call may block on. A larger set keeps the
+/// pre-existing non-blocking probe (documented): the array lives in the **cell's**
+/// address space, which is not active while the scheduler judges satisfiability, so
+/// the request has to be copied into kernel state - and the kernel is
+/// allocation-free, so that copy is a fixed array.
+pub const POLL_MAX: usize = 64;
+
+/// One copied `pollfd` request (the `revents` field is recomputed at completion).
+#[derive(Copy, Clone)]
+struct PollReq {
+    fd: i32,
+    events: i16,
+}
+
+static mut POLLSET: [[PollReq; POLL_MAX]; MAX_CELLS] =
+    [[PollReq { fd: -1, events: 0 }; POLL_MAX]; MAX_CELLS];
+
+fn pollset(cell: usize) -> &'static mut [PollReq; POLL_MAX] {
+    // SAFETY: single CPU, synchronous traps; one cell runs at a time.
+    unsafe { &mut (*addr_of_mut!(POLLSET))[cell] }
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -142,6 +204,72 @@ pub fn ppid(cell: usize) -> u32 {
     if p < 0 { 0 } else { procs()[p as usize].pid }
 }
 
+/// The cell running process `pid`, if it is **alive** - `Runnable` or `Blocked`,
+/// never a `Zombie` (a zombie has no address space left to deliver into, and
+/// `kill(2)` on one is a no-op in Linux too, not an error the caller can use).
+///
+/// The lookup `kill`/`kill(pid, 0)` needs: before this, signalling anything but
+/// the caller's own pid was `-ESRCH` (docs/ARCHITECTURE-DEBT.md 4).
+pub fn cell_of_pid(pid: u32) -> Option<usize> {
+    (0..MAX_CELLS).find(|&i| {
+        let p = &procs()[i];
+        p.pid == pid && matches!(p.state, PState::Runnable | PState::Blocked)
+    })
+}
+
+/// True if `pid` names any process this table still knows about, **including a
+/// zombie**. `kill(pid, 0)` is an existence probe, and a not-yet-reaped child
+/// still exists as far as its parent is concerned.
+pub fn pid_exists(pid: u32) -> bool {
+    (0..MAX_CELLS).any(|i| procs()[i].pid == pid && procs()[i].state != PState::Free)
+}
+
+/// Run `f` for every **alive** process, in cell order. `skip_top` excludes the
+/// top of the process tree, which is what stands in for init here: Linux's
+/// `kill(-1, sig)` signals every process the caller may signal *except* init,
+/// and this tree has exactly one process with no parent.
+pub fn for_each_live(skip_top: bool, mut f: impl FnMut(usize)) {
+    for i in 0..MAX_CELLS {
+        if skip_top && i == user::top_cell() {
+            continue;
+        }
+        if matches!(procs()[i].state, PState::Runnable | PState::Blocked) {
+            f(i);
+        }
+    }
+}
+
+/// How many Linux processes are alive right now - the `procs` field `sysinfo`
+/// reports. Counts runnable and blocked, not zombies: a zombie is not a process
+/// any more, it is a status waiting to be read.
+pub fn live_count() -> usize {
+    let mut n = 0;
+    for_each_live(false, |_| n += 1);
+    n
+}
+
+/// Mark `cell` as terminated by an uncaught fatal signal **without** handing the
+/// CPU anywhere - the remote half of [`exit_signaled`].
+///
+/// `exit_signaled` ends with `reschedule`, which is right when the dying process
+/// is the one that trapped. A `kill` from *another* process must not reschedule
+/// inside the killer's syscall: the killer is still running and has its own
+/// return value to deliver. Returns true if the target was the top cell, whose
+/// death the caller must turn into an unwind rather than a zombie.
+pub fn mark_signaled_remote(cell: usize, signo: u32) -> bool {
+    super::state(cell).fds.close_all();
+    if cell == user::top_cell() {
+        return true;
+    }
+    // SAFETY: `cell`'s address space pointer is valid; it is torn down here and
+    // never reactivated.
+    unsafe { (*user::cell_aspace(cell)).free_user_frames() };
+    procs()[cell].state = PState::Zombie;
+    procs()[cell].wstatus = signo & 0x7f; // WIFSIGNALED
+    procs()[cell].block = Block::None;
+    false
+}
+
 // ------------------------------------------------------------------- fork
 
 // clone(2) flag: a shared address space (thread), vs a new one (fork).
@@ -168,9 +296,13 @@ pub fn fork(cur: usize, parent_frame: *mut TrapFrame) -> i64 {
         return -EAGAIN;
     };
 
-    // Eager-copy the parent's committed pages into a fresh address space.
-    // SAFETY: the parent is the running cell; its address space pointer is valid.
-    let parent_aspace = unsafe { &*user::cell_aspace(cur) };
+    // Share the parent's committed pages copy-on-write into a fresh address space, so
+    // a fork costs page tables and not the resident set (docs/ARCHITECTURE-DEBT.md 4.0,
+    // blocker 2). `&mut` because the *parent* is write-protected too - the half that
+    // produces wrong values rather than a fault when it is missing.
+    // SAFETY: the parent is the running cell; its address space pointer is valid, and
+    // it is the active address space, which is what lets `fork_from` flush its TLB.
+    let parent_aspace = unsafe { &mut *user::cell_aspace_mut(cur) };
     let child_aspace = parent_aspace.fork_from((child as u16) + 32);
     // SAFETY: single CPU; ASPACE[child] is free (the slot was Free).
     unsafe { (*addr_of_mut!(ASPACE))[child].write(child_aspace) };
@@ -250,9 +382,16 @@ pub fn execve(cur: usize, path_va: u64, argv_va: u64, envp_va: u64, frame: *mut 
     // `open` works regardless of which address space is active.
     let path_kva = addr_of_mut!(EXEC_PATH) as u64;
     let mut new_aspace = AddressSpace::new((cur as u16) + 48);
-    let Some(img) = load::exec_elf_from_vfs(ops, path_kva, path_len as u64, &mut new_aspace) else {
+    let Some(img) = load::exec_elf_from_vfs_demand(ops, path_kva, path_len as u64, &mut new_aspace)
+    else {
         return err(ENOENT);
     };
+    // Record what this cell is now running, so `readlinkat("/proc/self/exe")` has
+    // a truthful answer instead of a hardcoded `-ENOENT`
+    // (docs/ARCHITECTURE-DEBT.md 4). SAFETY: EXEC_PATH holds `path_len` bytes.
+    crate::linux::set_exe_path(cur, unsafe {
+        core::slice::from_raw_parts(addr_of_mut!(EXEC_PATH) as *const u8, path_len)
+    });
 
     // Build the new initial stack (argv/envp/auxv) - written through the kernel
     // linear map, so the new space need not be active yet.
@@ -260,7 +399,7 @@ pub fn execve(cur: usize, path_va: u64, argv_va: u64, envp_va: u64, frame: *mut 
 
     // Reset the cell's personality state for the new image: keep fds + cwd, new
     // heap/mmap/auxv, default signal handlers, single thread.
-    super::exec_reinit(cur, img.image_end);
+    super::exec_reinit(cur, &img);
     signal::exec_reset(cur);
 
     // Tear down the old image, install the new one, and resume at its entry.
@@ -312,19 +451,35 @@ fn copy_str_array(arr_va: u64, out: &mut [&'static [u8]; EXEC_PTR_MAX], off: &mu
     if arr_va == 0 {
         return 0;
     }
+    // Both the pointer array and every string it names are cell-supplied
+    // addresses (docs/ENGINEERING.md 12): the array is bounded to the fixed
+    // `EXEC_PTR_MAX` slots and range-checked, and each string's terminator scan
+    // is bounded by how much of the cell's readable range remains at that
+    // pointer. An out-of-range array or pointer stops the copy rather than
+    // reading kernel memory.
+    if crate::user::user_buf(arr_va, EXEC_PTR_MAX * 8).is_none() {
+        return 0;
+    }
     let mut count = 0usize;
-    // SAFETY: `arr_va` is a NULL-terminated pointer array in the active cell.
+    // SAFETY: `[arr_va, arr_va + EXEC_PTR_MAX*8)` was range-checked readable in
+    // the active cell above, and each `src` span is checked below.
     unsafe {
         let base = addr_of_mut!(EXEC_STR) as *mut u8;
         for (i, slot) in out.iter_mut().enumerate() {
-            let p = (arr_va as *const u64).add(i).read();
+            let Some(p) = crate::uaccess::read::<u64>(arr_va + (i as u64) * 8) else {
+                break;
+            };
             if p == 0 {
+                break;
+            }
+            let span = crate::user::user_read_span(p, EXEC_STR_MAX);
+            if span == 0 {
                 break;
             }
             let start = *off;
             let src = p as *const u8;
             let mut n = 0usize;
-            while *off < EXEC_STR_MAX - 1 {
+            while *off < EXEC_STR_MAX - 1 && n < span {
                 let b = src.add(n).read();
                 *base.add(*off) = b;
                 *off += 1;
@@ -368,8 +523,13 @@ pub fn wait4(cur: usize, upid: i64, wstatus_va: u64, options: u64) -> Ctl {
 fn reap(z: usize, wstatus_va: u64) -> u32 {
     let pid = procs()[z].pid;
     if wstatus_va != 0 {
-        // SAFETY: `wstatus_va` is a writable `int` in the active cell.
-        unsafe { (wstatus_va as *mut i32).write(procs()[z].wstatus as i32) };
+        // Through `uaccess`, not a raw store: the parent's stack is copy-on-write
+        // after a fork, so a present page here can still be read-only and a kernel
+        // store to it faults at a kernel PC (docs/ENGINEERING.md 11). A refusal loses
+        // the status rather than the machine, and `wait4` still reaps.
+        if !crate::uaccess::write(wstatus_va, procs()[z].wstatus as i32) {
+            crate::println!("linux: wait4 could not store the status at {wstatus_va:#x}");
+        }
     }
     procs()[z] = Proc::free();
     user::free_cell(z);
@@ -420,6 +580,13 @@ fn process_exit(cell: usize, status: u32, top_code: u64) -> Ctl {
     // SAFETY: `cell`'s address space pointer is valid; it is torn down here and
     // never reactivated.
     unsafe { (*user::cell_aspace(cell)).free_user_frames() };
+    // Its *records* are resources too: a file-backed mapping holds a reference to a
+    // `filemap` backing store, and dropping the frames without dropping the records
+    // leaks that reference until the slot happens to be reused - and `dup_state`
+    // overwrites a reused slot wholesale, so "happens to be reused" never releases it
+    // at all. Clearing here is what makes the reference lifetime symmetric with
+    // `vmas.inherit_files()` in `dup_state`: taken at fork, given back at exit.
+    super::state(cell).vmas.clear();
     procs()[cell].state = PState::Zombie;
     procs()[cell].wstatus = status;
     procs()[cell].block = Block::None;
@@ -445,6 +612,14 @@ pub fn block_pipe_read(cur: usize, buf_va: u64, count: u64, idx: usize) -> Ctl {
     reschedule(cur)
 }
 
+/// Park `cur` on an eventfd read whose counter is zero; the scheduler completes
+/// the read (with `cur`'s address space active) once a peer writes the counter.
+pub fn block_eventfd_read(cur: usize, buf_va: u64, count: u64, ev: u8) -> Ctl {
+    procs()[cur].state = PState::Blocked;
+    procs()[cur].block = Block::EventFdRead { buf_va, count, ev };
+    reschedule(cur)
+}
+
 /// Park `cur` on a full pipe write; completed when space frees or read ends close.
 pub fn block_pipe_write(cur: usize, buf_va: u64, count: u64, idx: usize) -> Ctl {
     procs()[cur].state = PState::Blocked;
@@ -453,6 +628,30 @@ pub fn block_pipe_write(cur: usize, buf_va: u64, count: u64, idx: usize) -> Ctl 
 }
 
 // ----------------------------------------------------------------- scheduler
+
+/// `sched_yield` across **processes**: leave `cur` runnable and hand the CPU to
+/// the next runnable cell, round-robin (docs/ARCHITECTURE-DEBT.md 4).
+///
+/// [`thread::sched_yield`] only ever rescheduled among a cell's own L4 contexts,
+/// so a forked child looping `sched_yield()` ran to completion before its parent
+/// was scheduled at all: this scheduler is cooperative, a yield is one of its few
+/// preemption points, and there the yield did nothing. Every other cross-cell
+/// hand-off here goes through [`reschedule`]; this is that hand-off with the
+/// caller left **runnable** instead of blocked - what the native `SYS_YIELD` does
+/// for native cells (docs/NETSTACK.md 17).
+///
+/// `reschedule`'s round-robin visits `cur` last, so a process that is the only
+/// runnable one is simply picked again: a yield is never a block, and never a
+/// deadlock.
+pub fn yield_cell(cur: usize) -> Ctl {
+    // Set the return value into the saved frame *before* the switch, so `cur`'s
+    // frame already carries the 0 it resumes with whichever cell runs next.
+    // `complete_block` cannot do it - a yield registers no block.
+    let frame = thread::current_frame(cur);
+    // SAFETY: `frame` is `cur`'s current-context saved state, in kernel memory.
+    unsafe { arch::set_syscall_ret(&mut *frame, 0) };
+    reschedule(cur)
+}
 
 /// Hand the CPU to the next runnable cell after `leaving` blocks or exits. Wakes
 /// any blocked cell whose condition is now satisfiable, then round-robins to a
@@ -463,24 +662,143 @@ fn reschedule(leaving: usize) -> Ctl {
     // Save the outgoing cell's live FP state (harmless if it is exiting).
     thread::save_current_fp(user::current_index());
 
-    // Wake blocked cells whose condition now holds.
-    for i in 0..MAX_CELLS {
-        if procs()[i].state == PState::Blocked && satisfiable(i) {
-            procs()[i].state = PState::Runnable;
+    loop {
+        // Wake blocked cells whose condition now holds.
+        for i in 0..MAX_CELLS {
+            if procs()[i].state == PState::Blocked && satisfiable(i) {
+                procs()[i].state = PState::Runnable;
+            }
+        }
+
+        let next = (1..=MAX_CELLS)
+            .map(|k| (leaving + k) % MAX_CELLS)
+            .find(|&i| user::cell_present(i) && procs()[i].state == PState::Runnable);
+        if let Some(n) = next {
+            user::switch_to_cell(n);
+            thread::restore_current(n);
+            complete_block(n);
+            // A signal another process sent while `n` was not running is
+            // delivered *here* and nowhere else: delivery is a rewrite of the
+            // target's own saved frame, pushing a `rt_sigframe` onto the target's
+            // own user stack, so it needs the target's address space active -
+            // which it is, from `switch_to_cell` two lines up. This runs after
+            // `complete_block` so the interrupted syscall's return value is
+            // already in the frame and gets saved into the ucontext, exactly as
+            // a signal interrupting a completed syscall should.
+            match signal::on_resume(n) {
+                signal::Resumed::Ran => {}
+                // An uncaught fatal default: the target dies instead of resuming.
+                // Do it without recursing back into `reschedule` - mark it and go
+                // round the loop for the next runnable process.
+                signal::Resumed::Fatal(signo) => {
+                    if mark_signaled_remote(n, signo) {
+                        return Ctl::Exit(128 + signo as u64);
+                    }
+                    continue;
+                }
+            }
+            return Ctl::Switch(thread::current_frame(n));
+        }
+
+        // Nothing runnable. Idle on whatever the blocked cells are waiting for
+        // instead of panicking (docs/ARCHITECTURE-DEBT.md 2.4): "every process is
+        // waiting for the outside world" is a server's normal steady state, and
+        // before this it was not an expressible one - which is what made a process
+        // blocked awaiting a network reply, by definition the only runnable thing,
+        // impossible.
+        let src = blocked_sources();
+        if src & crate::idle::WAITABLE == 0 {
+            return report_deadlock(src);
+        }
+        // A cell-clock deadline cannot be armed on the hardware one-shot directly -
+        // they are different counters on RISC-V - so an outstanding one is honoured
+        // by bounded slices, each followed by a re-read of the cell clock. Exactly
+        // the futex-timeout pattern (docs/LINUX-COMPAT.md, the `futex` row).
+        if src & crate::idle::TIMER != 0 {
+            crate::ktimer::register(crate::ktimer::TimerClient::CellSleep, SLEEP_SLICE_NS);
+        }
+        crate::idle::wait(src);
+        if src & crate::idle::TIMER != 0 {
+            crate::ktimer::cancel(crate::ktimer::TimerClient::CellSleep);
         }
     }
+}
 
-    let next = (1..=MAX_CELLS)
-        .map(|k| (leaving + k) % MAX_CELLS)
-        .find(|&i| user::cell_present(i) && procs()[i].state == PState::Runnable);
-    let Some(n) = next else {
-        panic!("linux: no runnable cell (process scheduler deadlock)");
-    };
+/// How long the scheduler halts before re-reading the cell clock for an outstanding
+/// `nanosleep`/`poll` deadline. 1 ms: long enough that the halt is worth taking,
+/// short enough that the overshoot past a deadline stays small. Same constant and
+/// same reasoning as the futex timeout's park slice.
+const SLEEP_SLICE_NS: u64 = 1_000_000;
 
-    user::switch_to_cell(n);
-    thread::restore_current(n);
-    complete_block(n);
-    Ctl::Switch(thread::current_frame(n))
+/// The union of wake sources every blocked cell is waiting on ([`crate::idle`]).
+fn blocked_sources() -> crate::idle::Sources {
+    let mut src = 0;
+    for i in 0..MAX_CELLS {
+        if procs()[i].state == PState::Blocked {
+            src |= sources_of(i);
+        }
+    }
+    src
+}
+
+/// The wake sources cell `i`'s current block can be satisfied by.
+fn sources_of(i: usize) -> crate::idle::Sources {
+    use crate::idle;
+    match procs()[i].block {
+        Block::None => 0,
+        // A pipe/socket ring or a child exit is another *process*'s doing.
+        Block::Wait { .. }
+        | Block::PipeRead { .. }
+        | Block::PipeWrite { .. }
+        | Block::EventFdRead { .. } => idle::PEER,
+        Block::Timer { .. } => idle::TIMER,
+        Block::Console { .. } => idle::CONSOLE,
+        // Computed when the block was registered, from the descriptors it watches.
+        Block::Poll { sources, .. } | Block::Epoll { sources, .. } => sources,
+    }
+}
+
+/// The union of wake sources the Linux process scheduler is blocked on - the
+/// classifier its idle/deadlock decision is made from, exposed so a test can assert
+/// it directly (docs/ENGINEERING.md 1).
+pub fn wake_sources() -> crate::idle::Sources {
+    blocked_sources()
+}
+
+/// Nothing runnable and no blocked process has a wake source left: a genuine
+/// deadlock. Name each blocked process and what it waits on, then end the run with
+/// [`crate::abi::DEADLOCK_EXIT`] - a diagnostic instead of a kernel stack trace that
+/// mentions no process (docs/ARCHITECTURE-DEBT.md 2.4).
+fn report_deadlock(src: crate::idle::Sources) -> Ctl {
+    crate::println!(
+        "linux: DEADLOCK - no runnable process, no wake source (waiting on {})",
+        crate::idle::describe(src)
+    );
+    for i in 0..MAX_CELLS {
+        if procs()[i].state == PState::Blocked {
+            crate::println!(
+                "linux:   pid {} (cell {i}) blocked on {}",
+                procs()[i].pid,
+                block_name(i)
+            );
+        }
+    }
+    Ctl::Exit(crate::abi::DEADLOCK_EXIT)
+}
+
+/// The name of cell `i`'s block, for the deadlock diagnostic.
+fn block_name(i: usize) -> &'static str {
+    match procs()[i].block {
+        Block::None => "nothing",
+        Block::Wait { .. } => "wait4 (child exit)",
+        Block::PipeRead { .. } => "read (empty pipe/socket)",
+        Block::PipeWrite { .. } => "write (full pipe/socket)",
+        Block::EventFdRead { .. } => "read (eventfd counter zero)",
+        Block::Timer { .. } => "nanosleep (deadline)",
+        Block::Console { .. } => "read (console)",
+        Block::Poll { .. } => "poll (fd readiness)",
+        Block::Epoll { .. } => "epoll_wait (fd readiness)",
+    }
 }
 
 /// Whether blocked cell `i`'s wait condition is now satisfiable.
@@ -489,8 +807,43 @@ fn satisfiable(i: usize) -> bool {
         Block::Wait { want, .. } => find_zombie_child(i, want).is_some() || !has_child(i, want),
         Block::PipeRead { idx, .. } => pipe::has_data(idx) || pipe::writers(idx) == 0,
         Block::PipeWrite { idx, .. } => pipe::has_space(idx) || pipe::readers(idx) == 0,
+        Block::EventFdRead { ev, .. } => super::eventfd::readable(ev),
+        Block::Timer { deadline_ns } => super::cell_clock_ns(false) >= deadline_ns,
+        Block::Console { .. } => crate::input::has_data() || crate::input::at_eof(),
+        Block::Poll {
+            nfds, deadline_ns, ..
+        } => {
+            poll_ready_count(i, nfds) > 0
+                || (deadline_ns != 0 && super::cell_clock_ns(false) >= deadline_ns)
+        }
+        Block::Epoll {
+            epfd, deadline_ns, ..
+        } => {
+            super::state(i).fds.epoll_ready(epfd) > 0
+                || (deadline_ns != 0 && super::cell_clock_ns(false) >= deadline_ns)
+        }
         Block::None => false,
     }
+}
+
+/// How many of cell `i`'s copied poll requests are ready right now. Computed
+/// entirely from **kernel** state - the copied request array plus the cell's own fd
+/// table - because the cell's address space is not active while the scheduler judges
+/// this. Readiness for a remote (NIC-backed) socket pumps the datapath, which is
+/// what lets a `poll` on a DNS socket become ready when the reply lands.
+fn poll_ready_count(i: usize, nfds: usize) -> usize {
+    let set = pollset(i);
+    let st = super::state(i);
+    let mut ready = 0;
+    for r in set.iter().take(nfds.min(POLL_MAX)) {
+        if r.fd < 0 {
+            continue;
+        }
+        if super::poll_revents(&st.fds, r.fd as i64, r.events) != 0 {
+            ready += 1;
+        }
+    }
+    ready
 }
 
 /// Apply a woken cell's pending syscall (its address space is now active) and
@@ -509,12 +862,163 @@ fn complete_block(n: usize) {
             pipe::ReadNb::Done(n) => n,
             pipe::ReadNb::WouldBlock => 0, // woken only when satisfiable; treat as EOF
         },
+        Block::EventFdRead { buf_va, count, ev } => {
+            match super::eventfd::read(ev, buf_va, count) {
+                Ok(super::eventfd::ReadNb::Done) => 8,
+                // Woken only when readable, so this cannot normally happen; report
+                // -EAGAIN rather than a fabricated byte count if it ever does.
+                Ok(super::eventfd::ReadNb::WouldBlock) => -super::errno::EAGAIN,
+                Err(e) => e,
+            }
+        }
         Block::PipeWrite { buf_va, count, idx } => match pipe::write(idx, buf_va, count) {
             pipe::WriteNb::Done(n) => n,
             pipe::WriteNb::WouldBlock => 0,
             pipe::WriteNb::Epipe => -EPIPE,
         },
+        // A completed sleep returns 0 (the `rem` out-parameter is only written on an
+        // interruption, and no signal can interrupt a sleep here - documented).
+        Block::Timer { .. } => 0,
+        // SAFETY: `buf_va`/`count` were bounded against **this** cell's user VA
+        // range when the block was registered, and `n`'s address space is active
+        // again here (`switch_to_cell` above).
+        Block::Console { buf_va, count } => unsafe {
+            crate::input::drain(buf_va, count as usize) as i64
+        },
+        Block::Poll { fds_va, nfds, .. } => write_poll_result(n, fds_va, nfds),
+        Block::Epoll {
+            epfd,
+            events_va,
+            maxevents,
+            ..
+        } => super::state(n).fds.epoll_wait(epfd, events_va, maxevents),
     };
     // SAFETY: `frame` is `n`'s current-context saved state.
     unsafe { arch::set_syscall_ret(&mut *frame, r as u64) };
+}
+
+/// Recompute `revents` for cell `n`'s copied poll set and write it back into the
+/// caller's `pollfd` array (its address space is active), returning the ready count.
+/// A timeout that expired with nothing ready writes all-zero `revents` and returns
+/// 0, exactly as `poll(2)` specifies.
+fn write_poll_result(n: usize, fds_va: u64, nfds: usize) -> i64 {
+    let set = *pollset(n);
+    let st = super::state(n);
+    let mut ready = 0i64;
+    for (k, r) in set.iter().take(nfds.min(POLL_MAX)).enumerate() {
+        let revents = if r.fd < 0 {
+            0
+        } else {
+            super::poll_revents(&st.fds, r.fd as i64, r.events)
+        };
+        // `revents` sits at an odd 2-byte offset in the caller's `pollfd`, so the
+        // write is unaligned by the ABI's own layout - and it goes through `uaccess`,
+        // which resolves the page's writability (the array may be COW after a fork).
+        crate::uaccess::write_unaligned::<i16>(fds_va + (k as u64) * 8 + 6, revents);
+        if revents != 0 {
+            ready += 1;
+        }
+    }
+    ready
+}
+
+// ------------------------------------------------- the four Linux blocking waits
+//
+// docs/ARCHITECTURE-DEBT.md 2.4. Each registers its condition and hands the CPU on;
+// `complete_block` finishes the syscall with the caller's address space active.
+// `None` means "do not park" - the caller keeps its pre-existing behaviour, which is
+// what makes each of these additive.
+
+/// Park `cur` until `deadline_ns` (cell clock domain) - `nanosleep`.
+pub fn block_timer(cur: usize, deadline_ns: u64) -> Ctl {
+    procs()[cur].state = PState::Blocked;
+    procs()[cur].block = Block::Timer { deadline_ns };
+    reschedule(cur)
+}
+
+/// Park `cur` on an empty console read - blocking `stdin`.
+pub fn block_console(cur: usize, buf_va: u64, count: u64) -> Ctl {
+    procs()[cur].state = PState::Blocked;
+    procs()[cur].block = Block::Console { buf_va, count };
+    reschedule(cur)
+}
+
+/// Copy `cur`'s `poll` request set into kernel state and park on it. `None` if the
+/// set is larger than [`POLL_MAX`] (the caller then keeps the non-blocking probe) or
+/// if no watched descriptor has any wake source at all - parking on that could never
+/// end, so the caller answers immediately instead (a wedge refused, not created).
+///
+/// # Safety
+/// `[fds_va, fds_va + nfds*8)` must be a `pollfd` array bounded to `cur`'s user VA
+/// range (the Linux dispatch does that for every `poll`, docs/ENGINEERING.md 12).
+pub unsafe fn block_poll(cur: usize, fds_va: u64, nfds: usize, deadline_ns: u64) -> Option<Ctl> {
+    if nfds > POLL_MAX {
+        return None;
+    }
+    let set = pollset(cur);
+    for (k, slot) in set.iter_mut().enumerate().take(nfds) {
+        let base = fds_va + (k as u64) * 8;
+        *slot = PollReq {
+            fd: crate::uaccess::read_unaligned::<i32>(base).unwrap_or(-1),
+            events: crate::uaccess::read_unaligned::<i16>(base + 4).unwrap_or(0),
+        };
+    }
+    let sources = poll_sources(cur, nfds, deadline_ns);
+    if sources & (crate::idle::WAITABLE | crate::idle::PEER) == 0 {
+        return None;
+    }
+    procs()[cur].state = PState::Blocked;
+    procs()[cur].block = Block::Poll {
+        fds_va,
+        nfds,
+        deadline_ns,
+        sources,
+    };
+    Some(reschedule(cur))
+}
+
+/// Park `cur` on an epoll instance. `None` when no watched descriptor has a wake
+/// source (as [`block_poll`]).
+pub fn block_epoll(
+    cur: usize,
+    epfd: i64,
+    events_va: u64,
+    maxevents: usize,
+    deadline_ns: u64,
+) -> Option<Ctl> {
+    let sources = super::state(cur).fds.epoll_sources(epfd)
+        | if deadline_ns != 0 {
+            crate::idle::TIMER
+        } else {
+            0
+        };
+    if sources & (crate::idle::WAITABLE | crate::idle::PEER) == 0 {
+        return None;
+    }
+    procs()[cur].state = PState::Blocked;
+    procs()[cur].block = Block::Epoll {
+        epfd,
+        events_va,
+        maxevents,
+        deadline_ns,
+        sources,
+    };
+    Some(reschedule(cur))
+}
+
+/// The wake sources cell `cur`'s copied poll set can be woken by.
+fn poll_sources(cur: usize, nfds: usize, deadline_ns: u64) -> crate::idle::Sources {
+    let set = pollset(cur);
+    let st = super::state(cur);
+    let mut src = if deadline_ns != 0 {
+        crate::idle::TIMER
+    } else {
+        0
+    };
+    for r in set.iter().take(nfds.min(POLL_MAX)) {
+        if r.fd >= 0 {
+            src |= st.fds.fd_sources(r.fd as i64);
+        }
+    }
+    src
 }

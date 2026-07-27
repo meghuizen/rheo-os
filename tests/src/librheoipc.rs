@@ -46,6 +46,14 @@ static DEMO: &[u8] = include_bytes!(concat!(
 
 /// The consumer returns this on full success (see librheo-ipc.rs).
 const EXPECTED_EXIT: u64 = 0x42;
+/// A cell returns this when its FP/SIMD register file did not survive a
+/// cross-cell `SYS_YIELD` (librheo-ipc.rs `FP_FAIL`).
+const FP_FAIL: u64 = 0x1F;
+/// FP rounds each cell runs (librheo-ipc.rs `FP_ROUNDS`).
+const FP_ROUNDS: u64 = 4;
+/// Minimum FP/SIMD register-file swaps the kernel must have performed: one per
+/// cross-cell yield, from both cells.
+const MIN_FP_SWAPS: u64 = 2 * FP_ROUNDS;
 
 fn c_write(fd: u64, buf_va: u64, len: u64) -> i64 {
     if fd == 1 || fd == 2 {
@@ -105,7 +113,7 @@ unsafe fn mint_queue_cap(objects: &mut ObjectTable, caps: &mut CapTable) -> u32 
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("librheoipc: start on {}", arch::NAME);
 
     svc::init();
@@ -180,11 +188,31 @@ extern "C" fn kernel_main() -> ! {
         user::run(0).1
     };
 
+    // Kernel-side witness for the FP/SIMD phase: `fp_swaps` is bumped *only*
+    // inside `user::restore_native_fp`, so it cannot be manufactured by the cells.
+    // Each cell ran FP_ROUNDS (4) yields with live vector state, so at least
+    // 2 * 4 switches carried an FP swap, plus the initial load per `run`.
+    let swaps = user::fp_swaps();
+
     match outcome {
         Outcome::Exited(code) => {
             assert!(
+                code != FP_FAIL,
+                "librheo-ipc: a cell's FP/SIMD register file did NOT survive a cross-cell \
+                 SYS_YIELD (exit {code:#x}) - the native switch is not swapping FP state"
+            );
+            assert!(
                 code == EXPECTED_EXIT,
                 "librheo-ipc consumer exited {code:#x}, expected {EXPECTED_EXIT:#x}"
+            );
+            assert!(
+                swaps >= MIN_FP_SWAPS,
+                "librheo-ipc: only {swaps} FP/SIMD register-file swaps, expected at least \
+                 {MIN_FP_SWAPS} (2 cells x {FP_ROUNDS} yields)"
+            );
+            println!(
+                "librheoipc: FP/SIMD register file preserved bit-identically across every \
+                 cross-cell SYS_YIELD ({swaps} kernel-side swaps, >= {MIN_FP_SWAPS}) OK"
             );
             println!(
                 "librheoipc: symmetric async IPC ran (shared queue pair + N typed \

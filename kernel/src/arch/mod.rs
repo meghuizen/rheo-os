@@ -118,15 +118,17 @@ pub use imp::{
     SIGACTION_HAS_RESTORER, SIGTRAMP_VA, TrapFrame, VIRTIO_MMIO_BASE, VIRTIO_MMIO_COUNT,
     VIRTIO_MMIO_STRIDE, clone_child_frame, context_init, context_switch, cpu_feature_names,
     cpu_report, cycles, decode_syscall, discover, doorbell_count, doorbell_trap, enable_timer_irq,
-    enable_uart_rx_irq, enter_user_first, exit, fp_area_init, fp_simd_tiers, has_hwrng, hwrng_name,
-    hwrng_u64, idle_wait, mmio_map_window, paging_activate, paging_activate_kernel,
-    paging_for_each_user_leaf, paging_kernel_init, paging_map, paging_map_frame, paging_new_root,
-    paging_protect, paging_unmap_frame, pci_cfg_read32, pci_cfg_write32, pci_mmio_window,
-    phys_to_virt, pmem_map_window, restore_rt_frame, restore_user_fp, return_to_kernel,
-    save_user_fp, serial_init, serial_read_byte, serial_write_byte, set_syscall_ret,
-    set_user_fs_base, setup_rt_frame, sig_tramp_code, spin_loop, ticks_to_ns, timer_irq_enabled,
-    timer_wait, trap_init, trapframe_kernel_sp, trapframe_new, trapframe_zeroed,
-    uart_inject_and_wait, uart_irq_enabled, user_fs_base, user_sp, virt_to_phys,
+    enable_uart_rx_irq, enable_virtio_net_irq, enter_user_first, exit, fp_area_init, fp_simd_tiers,
+    has_hwrng, hwrng_name, hwrng_u64, idle_wait, mmio_map_window, net_irq_enabled, net_irq_pending,
+    paging_activate, paging_activate_kernel, paging_cow_at, paging_cow_clear,
+    paging_cow_protect_user, paging_for_each_user_leaf, paging_kernel_init, paging_map,
+    paging_map_frame, paging_mapped, paging_new_root, paging_protect, paging_unmap_frame,
+    pci_cfg_read32, pci_cfg_write32, pci_mmio_window, phys_to_virt, pmem_map_window,
+    restore_rt_frame, restore_user_fp, return_to_kernel, save_user_fp, serial_init,
+    serial_read_byte, serial_write_byte, set_syscall_ret, set_user_fs_base, setup_rt_frame,
+    sig_tramp_code, spin_loop, ticks_to_ns, timer_arm, timer_disarm, timer_expired,
+    timer_irq_enabled, timer_now_ns, timer_park, trap_init, trapframe_kernel_sp, trapframe_new,
+    trapframe_zeroed, uart_inject_and_wait, uart_irq_enabled, user_fs_base, user_sp, virt_to_phys,
 };
 
 /// SMP surface (docs/SMP.md, task #27), exported only under the `smp` feature so
@@ -134,14 +136,17 @@ pub use imp::{
 #[cfg(feature = "smp")]
 pub use imp::{boot_cpu_hw_id, cpu_index, smp_set_this_cpu, smp_start_secondary};
 
-/// Full arch bring-up for a kernel binary: console, exception vectors,
-/// then the frame allocator and the kernel address space (MMU on).
+/// The **arch's own** bring-up: serial console, exception vectors, then the
+/// kernel address space with the MMU on.
+///
+/// It deliberately stops there. The portable subsystems that must also start
+/// before a cell runs (clock, hardware discovery, DRBG, `svc`) are sequenced by
+/// [`crate::boot::init`], which is what every kernel binary calls. Starting them
+/// from here made `arch` reference four modules that depend on `arch` - three
+/// module cycles from three lines, none of them per-ISA
+/// (docs/ARCHITECTURE-DEBT.md 3.6). Nothing above `arch` is named here now.
 pub fn init() {
     serial_init();
     trap_init();
     paging_kernel_init();
-    crate::time::init();
-    crate::hw::detect();
-    crate::rng::init();
-    crate::svc::init();
 }

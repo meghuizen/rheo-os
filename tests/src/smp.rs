@@ -5,12 +5,21 @@
 //! spinlock + the per-CPU registry, which must work single-core with zero fuss),
 //! then asks the arch layer to start one secondary core. The honest per-ISA
 //! outcome (docs/SMP.md):
-//!   - RISC-V: a genuine second hart runs kernel code (SBI HSM hart_start); the
-//!     test asserts the secondary marked itself online and wrote the shared
-//!     counter through the cross-core spinlock.
-//!   - ARM64 / x86-64: secondary bring-up is blocked in this QEMU config; the
-//!     test makes a genuine attempt, prints skip-with-reason, and still PASSES
+//!   - RISC-V: a genuine second hart runs kernel code (SBI HSM `hart_start`).
+//!   - x86-64: a genuine second core runs kernel code (a real-mode AP trampoline
+//!     staged in low memory, released by INIT-SIPI-SIPI through the local APIC's
+//!     interrupt command register - docs/SMP.md 6).
+//!   - ARM64: bring-up is blocked in this QEMU config (PSCI `CPU_ON` needs EL3
+//!     firmware that `virt` without `secure=on` does not have); the test makes a
+//!     genuine, guarded attempt, prints skip-with-reason, and still PASSES
 //!     (mirroring how librheonet/librheogpu skip when a device is absent).
+//!
+//! Where a secondary does come up, the assertions are chosen to be unfakeable by
+//! the primary (docs/ENGINEERING.md 1): the shared counter carries a fixed magic
+//! written only from `smp::secondary_run`, the registry slot is one the primary
+//! never claims, and the secondary's recorded hardware id must **differ** from the
+//! boot CPU's - a primary looping back through the same code could satisfy none of
+//! the three.
 //!
 //! Either way the primary never hangs (the bring-up wait is bounded) and never
 //! faults - a blocked ISA keeps single-core boot intact.
@@ -23,7 +32,7 @@ use kernel::{arch, println};
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("smp: start on {}", arch::NAME);
 
     test_spinlock();
@@ -90,6 +99,16 @@ fn test_secondary_bringup() {
                 shared,
                 smp::SECONDARY_MARK,
                 "secondary's cross-core spinlock write missing (got {shared:#x})"
+            );
+            // A *different* core, not the primary re-entering: the registry slot
+            // is not the boot CPU's, and the hardware id the secondary recorded
+            // (which it read from its own hardware - its hart id / APIC id) is not
+            // the boot CPU's either.
+            assert_ne!(idx, 0, "secondary claimed the boot CPU's registry slot");
+            assert_ne!(
+                smp::cpu(idx).hw_id(),
+                arch::boot_cpu_hw_id(),
+                "secondary recorded the boot CPU's hardware id"
             );
             println!(
                 "smp: secondary CPU {idx} (hw id {}) ran kernel code - online={}, shared={:#x} OK",

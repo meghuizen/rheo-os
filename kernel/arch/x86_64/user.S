@@ -69,6 +69,59 @@ sysret_resume:                         /* rax = &frame */
     mov 0(%rax), %rax                  /* rax last */
     sysretq
 
+/* iret_resume(rax = &frame): resume a *faulting* instruction.
+ *
+ * A fault resume MUST NOT use SYSRET. `sysretq` takes its RIP from RCX and its
+ * RFLAGS from R11 - it *consumes* those two registers. That is exactly right for a
+ * syscall return, because the SYSCALL instruction is defined to clobber RCX and R11
+ * and no caller may rely on them across it. It is wrong for a fault, where the
+ * interrupted instruction is about to re-execute and must see the register file it
+ * had: RCX is the count for every `rep` string op and R11 is an ordinary scratch
+ * register, so resuming through SYSRET silently corrupts them.
+ *
+ * That was invisible while the only ring-3 fault resume was *signal delivery*,
+ * which does not re-execute anything - it enters a handler at a fresh function
+ * boundary, where RCX/R11 are caller-saved and glibc restores them from the
+ * ucontext on `rt_sigreturn`. Demand paging (docs/ARCHITECTURE-DEBT.md 4.0,
+ * blocker 2) is the first path that re-executes, and it failed immediately:
+ * unmodified dynamically-linked glibc derailed inside ld.so's relocation loop with
+ * a dereference of a register that had been overwritten with RFLAGS.
+ *
+ * So: build the long-mode interrupt frame (SS, RSP, RFLAGS, CS, RIP) from the
+ * TrapFrame, restore *every* GPR including RCX and R11, and `iretq`. Selectors come
+ * from the STAR layout in x86_64/mod.rs (SYSRET base 0x10 -> user SS 0x18, CS
+ * 0x20), with RPL 3. IF is forced on: a cell must never resume with interrupts
+ * masked, or the timer and console lines stop reaching the kernel. */
+.global iret_resume
+iret_resume:                           /* rax = &frame */
+    mov %rax, CUR_FRAME(%rip)          /* next syscall saves here */
+    mov 128(%rax), %r10                /* rflags */
+    or $0x200, %r10                    /* force IF */
+    mov 136(%rax), %r9                 /* user rsp */
+    mov 120(%rax), %r8                 /* rip */
+    pushq $0x1b                        /* SS  = user data | RPL 3 */
+    pushq %r9
+    pushq %r10                         /* RFLAGS */
+    pushq $0x23                        /* CS  = user code | RPL 3 */
+    pushq %r8                          /* RIP */
+    /* Every register, scratch ones included - this is the whole point. */
+    mov 8(%rax), %rbx
+    mov 16(%rax), %rcx
+    mov 24(%rax), %rdx
+    mov 32(%rax), %rsi
+    mov 40(%rax), %rdi
+    mov 48(%rax), %rbp
+    mov 56(%rax), %r8
+    mov 64(%rax), %r9
+    mov 72(%rax), %r10
+    mov 80(%rax), %r11
+    mov 88(%rax), %r12
+    mov 96(%rax), %r13
+    mov 104(%rax), %r14
+    mov 112(%rax), %r15
+    mov 0(%rax), %rax                  /* rax last; the iret frame is on the stack */
+    iretq
+
 /* enter_user_first(rdi = &frame): save callee-saved state so
    return_to_kernel can unwind here, then drop to ring 3 via sysret. */
 .global enter_user_first

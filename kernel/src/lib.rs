@@ -15,6 +15,9 @@
 
 pub mod abi;
 pub mod arch;
+/// The boot sequencer (see the module docs): portable, so `arch` need not
+/// reach up into the subsystems that depend on it.
+pub mod boot;
 pub mod capability;
 pub mod cell;
 #[macro_use]
@@ -24,11 +27,14 @@ pub mod engine;
 pub mod event;
 pub mod graph;
 pub mod hw;
+pub mod idle;
 pub mod input;
+pub mod ktimer;
 pub mod lease;
 pub mod linux;
 pub mod load;
 pub mod mm;
+pub mod net_rx;
 pub mod nproc;
 mod panic;
 pub mod pty;
@@ -39,5 +45,6 @@ pub mod sched;
 pub mod smp;
 pub mod svc;
 pub mod time;
+pub mod uaccess;
 pub mod user;
 pub mod user_progs;

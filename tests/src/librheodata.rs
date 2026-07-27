@@ -17,34 +17,21 @@
 
 extern crate alloc;
 
-use core::mem::MaybeUninit;
 use core::ptr::addr_of_mut;
 
 use kernel::abi::Stat;
-use kernel::capability::{BUDGET_UNLIMITED, CapTable, ObjectKind, ObjectTable, READ, WRITE};
 use kernel::hw::block::BlockDevice;
 use kernel::hw::virtio_blk;
-use kernel::mm::AddressSpace;
-use kernel::queue::QueuePair;
 use kernel::svc::{self, FileOps};
-use kernel::user::{self, Outcome};
-use kernel::{arch, load, println};
+use kernel::user::Outcome;
+use kernel::{arch, println};
 
-#[cfg(target_arch = "x86_64")]
-static DEMO: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../target/x86_64-unknown-none/release/librheo-data"
-));
-#[cfg(target_arch = "aarch64")]
-static DEMO: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../target/aarch64-unknown-none-softfloat/release/librheo-data"
-));
-#[cfg(target_arch = "riscv64")]
-static DEMO: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../target/riscv64gc-unknown-none-elf/release/librheo-data"
-));
+#[path = "fixture.rs"]
+mod fixture;
+#[path = "harness.rs"]
+mod harness;
+
+static DEMO: &[u8] = fixture::cell!("librheo-data");
 
 const EXPECTED_EXIT: u64 = 0x42;
 
@@ -132,21 +119,13 @@ fn bf_getdents(_p: u64, _l: u64, _b: u64, _bl: u64) -> i64 {
     -38
 }
 
-static mut OBJECTS: ObjectTable = ObjectTable::new();
-static mut CAPS: CapTable = CapTable::new();
-static mut QP: MaybeUninit<QueuePair> = MaybeUninit::uninit();
-
-#[repr(align(16))]
-struct KStack([u8; 64 * 1024]);
-static mut KSTACK: KStack = KStack([0; 64 * 1024]);
-
 fn rd_u32(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("librheodata: start on {}", arch::NAME);
 
     // SAFETY: once, before any allocation; HEAP_MEM is a unique static.
@@ -196,31 +175,8 @@ extern "C" fn kernel_main() -> ! {
         getdents: bf_getdents,
     });
 
-    let mut aspace = AddressSpace::new(1);
-    let entry = load::load_elf(DEMO, &mut aspace).expect("load librheo-data ELF");
-    let stack_top = load::map_stack(&mut aspace);
-    let qp = load::map_queue(&mut aspace);
-
-    // SAFETY: single-threaded init; the statics outlive the run.
-    let outcome = unsafe {
-        let objects = &mut *addr_of_mut!(OBJECTS);
-        let caps = &mut *addr_of_mut!(CAPS);
-        let object = objects.create(ObjectKind::QueuePair).unwrap();
-        let cap = caps
-            .mint(objects, object, READ | WRITE, BUDGET_UNLIMITED)
-            .unwrap();
-        let cap_id = cap.raw_low32();
-
-        (*addr_of_mut!(QP)).write(qp);
-        let qp_ptr = (*addr_of_mut!(QP)).as_ptr();
-
-        let kernel_sp = core::ptr::addr_of!(KSTACK.0) as usize + 64 * 1024;
-        let mut frame = arch::trapframe_new(entry, stack_top, 0, kernel_sp);
-        user::reset();
-        user::install(0, &aspace, caps, objects, qp_ptr, addr_of_mut!(frame));
-        user::set_queue_info(0, load::USER_QUEUE_VA as u64, cap_id);
-        user::run(0).1
-    };
+    // SAFETY: single-threaded init; the harness's statics outlive the run.
+    let outcome = unsafe { harness::run_elf_cell(DEMO, "librheo-data") };
 
     match outcome {
         Outcome::Exited(code) => {

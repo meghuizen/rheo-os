@@ -408,7 +408,8 @@ committed line is exact - on all three ISAs.
   until at least one console input byte is available, copies up to `len` bytes
   into the cell buffer, and returns the count (0 = end of input). The first
   block-and-wake: the kernel idles here (WFI where the UART RX interrupt is wired,
-  a poll otherwise). This is **mechanism** (the arm-doorbell / completion-delivery
+  a poll where none is - which is now no ISA in this tree). This is **mechanism**
+  (the arm-doorbell / completion-delivery
   the plan names), not a new kernel object - it passes the docs/ARCHITECTURE.md 6
   admission rule.
 - **a kernel-side RX ring** (`kernel/src/input.rs`, portable) - received bytes are
@@ -430,9 +431,9 @@ finally closed by a real wakeup.
 This is the kernel's first hardware interrupt, and it is boot-critical, so it was
 brought up one ISA at a time behind an explicit, opt-in enable
 (`arch::enable_uart_rx_irq`, called only by the Phase D test) - the other test
-kernels never touch it and run exactly as before. **UART RX is now
-interrupt-driven on RISC-V and ARM64**; x86-64 stays on the poll fallback (its
-QEMU TCG interrupt controller does not re-deliver reliably - see below).
+kernels never touch it and run exactly as before. **UART RX is interrupt-driven on
+all three ISAs** - RISC-V and ARM64 from this phase, x86-64 since docs/SMP.md 8
+retired the diagnosis that had made it poll-only (see below).
 
 - **RISC-V 64 - interrupt-driven.** QEMU `virt` with `aia=aplic-imsic` routes the
   16550 UART's IRQ (source 10) through the **AIA**: the S-mode APLIC
@@ -471,15 +472,26 @@ QEMU TCG interrupt controller does not re-deliver reliably - see below).
   interrupt the PL011 would raise on receive - and the handler pushes the carried
   byte to the ring. The GIC delivery, the `wfi` idle, and the wakeup are all
   genuine; a live keystroke takes the full PL011->GIC path.
-- **x86-64 - poll (honest).** q35 routes COM1's ISA IRQ4 through the emulated
-  IOAPIC, but under QEMU's TCG + `kernel-irqchip=split` the LAPIC's ISR/IRR are
-  not modeled (they read 0) and IPIs are not delivered, so an IOAPIC-routed line
-  delivers the first byte but does not reliably re-trigger, and the self-IPI the
-  RISC-V/ARM ports use as their deterministic-test analog does not fire at all.
-  Rather than fake it, `SYS_WAIT_INPUT` polls COM1 (the CPU spins - honest, not
-  0%-idle). `input::interrupt_driven()` reports false. (The x86-64 **timer** IS
-  interrupt-driven - the LAPIC LVT timer, a CPU-local source, works fine; only the
-  IOAPIC-routed UART line is affected.)
+- **x86-64 - interrupt-driven** (since docs/SMP.md 8; it was poll-only here, and the
+  reason turned out to be wrong). q35 routes COM1's ISA IRQ 4 through the emulated
+  IO-APIC to a LAPIC vector. This was documented as poll-only because "under QEMU's
+  TCG + `kernel-irqchip=split` the LAPIC's ISR/IRR are not modeled (they read 0) and
+  an IO-APIC-routed line delivers the first byte but does not reliably re-trigger".
+  Every one of those observations was made **through the inert x2APIC MSR block**
+  (docs/ENGINEERING.md 1) - and with no working EOI the first interrupt genuinely is
+  the last, because the in-service bit is never cleared. Once the LAPIC is reached
+  over its **xAPIC MMIO** page the whole chain works: the kernel programs the
+  IO-APIC redirection entry for GSI 4 (vector 0x21, physical destination = the boot
+  CPU's APIC id, edge-triggered), enables the 16550's OUT2 gate and ERBFI, and
+  drains the FIFO in the handler before EOI'ing the LAPIC. `SYS_WAIT_INPUT` is a
+  **genuine 0%-CPU park** at `hlt`, and `librheoterm` asserts the idle-park on this
+  ISA too.
+  *No QEMU caveat here, unlike the other two:* QEMU's 16550 loopback both delivers
+  the byte into the receive FIFO **and** raises the ISA line, so the deterministic
+  test exercises the full device -> IO-APIC -> LAPIC -> vector path rather than
+  poking the interrupt controller directly. Bring-up **probes** exactly that
+  (loopback a byte, briefly unmask, require a handler-only counter to move) and
+  leaves the line masked and the poll path in place if it does not arrive.
 
 `input::interrupt_driven()` reports which mode an ISA is in; the test asserts the
 idle-park only where it is interrupt-driven, and prints the mode either way.
@@ -667,14 +679,27 @@ mirroring the Linux personality's `linux::proc` (docs/LINUX-COMPAT.md L6) for
   the Linux personality's job, L5); a native fault is terminal for the child.
 - **`SYS_ARM_TIMER` (47)** - `arm_timer(deadline_ns)`. Blocks until `deadline_ns`
   of monotonic time elapse. The "arm timer" verb, a one-shot deadline - now the
-  OS's **second interrupt**, **interrupt-driven on all three ISAs** (the kernel
-  arms the per-ISA timer and halts at `wfi`/`hlt` until it fires - a **genuine
-  0%-CPU park**): **riscv** the Sstc `stimecmp` CSR (S timer interrupt,
-  `scause` = int | 5); **aarch64** the CNTV virtual timer (`CNTV_CVAL_EL0` /
-  `CNTV_CTL_EL0`, PPI 27 through the GICv3 redistributor); **x86-64** the LAPIC
-  one-shot LVT timer (vector 0x20, rate calibrated once against the TSC), driven in
-  x2APIC mode. Where the timer IRQ is not wired it falls back to a cooperative
+  OS's **second interrupt**, and a **genuine 0%-CPU park on all three ISAs**
+  (the kernel arms the per-ISA timer and halts at `wfi`/`hlt` until it fires):
+  **riscv** the Sstc `stimecmp` CSR (S timer interrupt, `scause` = int | 5);
+  **aarch64** the CNTV virtual timer (`CNTV_CVAL_EL0` / `CNTV_CTL_EL0`, PPI 27 through
+  the GICv3 redistributor); **x86-64** the LAPIC one-shot LVT timer (vector 0x20).
+  x86-64 took the long way there, and the history is the tree's canonical
+  observe-never-infer case (docs/ENGINEERING.md 1): the LVT timer was driven over the
+  **x2APIC MSR block** and documented as working, until rheo-net N2h made bring-up
+  *verify* it and found QEMU 8.2 TCG `-cpu max` reports **no x2APIC**
+  (CPUID.01H:ECX[21] = 0), which leaves the whole MSR block inert - the one-shot never
+  fires and its count reads 0 ("already expired"), so `SYS_ARM_TIMER` returned
+  **immediately**. N2h made the fallback honest; **docs/SMP.md phase 1** fixed the
+  capability, driving the same LAPIC over its **xAPIC MMIO** page (which QEMU does
+  model) with the access mode chosen by probe - x2APIC requested, `EXTD` read back,
+  and declined when it does not latch. `enable_timer_irq()` still refuses to claim the
+  timer on anything but an interrupt it actually took.
+  Where the timer IRQ is not wired it falls back to a cooperative
   deadline check against the monotonic counter (deterministic under QEMU `-icount`).
+  All deadlines are registered with the kernel **timer arbiter**
+  (`kernel/src/ktimer.rs`), the single owner of the hardware one-shot - before N2h a
+  cell's sleep and a network deadline cancelled each other (docs/NETSTACK.md 16).
   Opt-in (`arch::enable_timer_irq`, called only by the Phase F test). Honors
   docs/POWER.md: the kernel arms the timer only when a real deadline was requested
   (librheo arms a timer only for an actual `sleep`/`timeout`). The `librheoproc`
@@ -790,8 +815,11 @@ its queue; a transport library layers on top.
   `VIRTIO_NET_F_MAC`; no mergeable-rx-buffers, no checksum/GSO offload), an **RX**
   and a **TX** split virtqueue, the 12-byte v1 `virtio_net_hdr`, and the MAC read
   from device config. DMA uses **physical** addresses (`virt_to_phys`) - the rings
-  and buffers live in kernel RAM reached through the linear map. Polled (a device
-  RX interrupt is a later refinement, like virtio-blk).
+  and buffers live in kernel RAM reached through the linear map. Polled at Phase G;
+  the **device RX interrupt landed later** in rheo-net N2d (docs/NETSTACK.md §16) -
+  receive is interrupt-driven on riscv/arm; on x86-64 there is still no NIC RX line,
+  so the wait is a timer-backed `hlt` idle between polls (docs/SMP.md 8 records what
+  re-examining that found).
 - Three **queue opcodes** (`OP_NET_TX`/`OP_NET_RX`/`OP_NET_MAC`, no new kernel
   object) bridge a cell's async submissions to the driver in `kernel_process`,
   completing with the strand token - the same async model as the Phase B `io`
@@ -801,9 +829,13 @@ its queue; a transport library layers on top.
 
 ### librheo module (Phase G)
 
-`net` is now a real async surface: `mac()`, `send(frame)`, `recv(buf) -> len`
-(len 0 = no packet, the polled RX path - a device-IRQ wake is the refinement).
+`net` is now a real async surface: `mac()`, `send(frame)`, `try_recv(buf) -> len`
+(len 0 = no packet - the non-blocking drain a batching transport uses).
 `connect`/`listen` stay `Unsupported` stubs - a socket/IP/TCP layer is a service.
+Phase G's receive was a re-poll; **rheo-net N2d** (docs/NETSTACK.md §16) added the
+NIC RX interrupt, the `SYS_WAIT_NET` park verb and a reactor network slot, so
+`recv`/`recv_timeout` now **park** and are woken by the frame (or a deadline) -
+the receive side is as async as the send side.
 
 ### Proof + honesty (Phase G)
 
@@ -813,8 +845,10 @@ MAC, sends a **broadcast ARP request** for the SLIRP gateway `10.0.2.2`, and
 QEMU `-netdev user` - asserting the reply's ethertype + opcode + sender IP and
 exiting `0x42`. Honest deferrals: the **full transport stack** (IP/ARP-cache/TCP/
 QUIC/TLS as a library in a cell), a first-class **socket** `ObjectKind` + steering
-grants, **header/payload split**, and the **device RX interrupt** - all documented
-in docs/NETWORKING.md. The mechanism (a NIC driver + typed async raw-frame queue
+grants and **header/payload split** - documented in docs/NETWORKING.md. (The
+**device RX interrupt**, deferred here, was built in rheo-net N2d, §16 of
+docs/NETSTACK.md: NIC-interrupt-driven on riscv/arm; on x86-64 a timer-backed idle,
+since that ISA has no NIC RX line - docs/SMP.md 8.) The mechanism (a NIC driver + typed async raw-frame queue
 opcodes) is the deliverable; the stack rides on it.
 
 ## Phase H - a real GPU: virtio-gpu 2D driver + compositor scanout
@@ -1006,33 +1040,46 @@ What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
   console block-and-wake (**a genuine 0%-CPU WFI park on riscv64**), `Child::wait`
   and `time::sleep` as reactor-serviced parks (the parent's other strands run
   until quiescent, then the cell blocks), and the Phase G `net` **raw-frame
-  send/recv** (`OP_NET_*` completions over a real virtio-net NIC; RX is polled).
-- **Sync-translated / cooperative** (single-CPU, honest): the **timer is now
-  interrupt-driven on all three ISAs** (riscv Sstc, aarch64 CNTV, x86-64 LAPIC LVT
-  - a genuine 0%-CPU park); the cross-cell IPC channel now has a **fully symmetric
+  send/recv** (`OP_NET_*` completions over a real virtio-net NIC) - whose
+  **receive now parks too** (rheo-net N2d: the NIC RX interrupt + `SYS_WAIT_NET` +
+  a reactor network slot; a genuine WFI park on riscv64/aarch64, a timer-backed
+  `hlt` idle between polls on x86-64, which has no NIC RX line - docs/NETSTACK.md §16).
+- **Sync-translated / cooperative** (single-CPU, honest): the **timer is
+  interrupt-driven on all three ISAs** - riscv64 (Sstc), aarch64 (CNTV) and, since
+  docs/SMP.md phase 1, x86-64 (the LAPIC one-shot over xAPIC MMIO) - a genuine 0%-CPU
+  park, verified at bring-up on each; the cross-cell IPC channel now has a **fully symmetric
   async `Sender`/`Receiver`** (Phase J: it parks on the reactor - the in-cell wait
   is a genuine park, only the cell-boundary hand-off stays a cooperative
   `SYS_SWITCH`); parallel `compute` strands **interleave** on one CPU
   rather than run on separate cores; reservations are **admitted** (the EDF math is
   real and refuses over-commit) but not yet **scheduled** (run-queue enforcement is
-  SMP work); the **console UART RX is interrupt-driven on riscv64 (AIA) and aarch64
-  (GICv3)** - a genuine `wfi` park - and stays a **poll on x86-64** (its QEMU TCG +
-  split-irqchip IOAPIC/LAPIC does not re-deliver reliably; documented, honest).
+  SMP work); the **console UART RX is interrupt-driven on all three ISAs** -
+  riscv64 (AIA), aarch64 (GICv3) and, since docs/SMP.md 8, x86-64 (IO-APIC GSI 4 ->
+  LAPIC vector, verified end to end at bring-up) - a genuine `wfi`/`hlt` park; the
+  **NIC receive line** (rheo-net N2d) is the third interrupt source and is the one that
+  still splits - interrupt-driven on riscv64 (APLIC->IMSIC) and aarch64 (GICv3 SPI),
+  **not wired** on x86-64, whose receive wait therefore takes
+  `net_rx::IdleMode::TimerIdle` (a real `hlt` on a timer slice between receive-queue
+  polls, measured: 21-1771 halts per run). That mode was once claimed on an inert
+  LAPIC and correctly demoted by N2h to `IdleMode::Poll`; docs/SMP.md 5 made the LAPIC
+  real, so it is a measured halt again. `interrupt_driven()` still reports **false**
+  there, because that predicate is about the NIC line and nothing else
+  (docs/NETSTACK.md 16, Phase N2h).
 - **Deferred (documented)**: **real VIRGL/3D + the full display pipeline** (Phase
   H lands the virtio-gpu 2D scanout round-trip - create-2d/attach/set-scanout/
   transfer/flush + `display::Scanout` present; the cursor plane, multi-scanout,
   EDID/mode negotiation, vsync-interrupt -> typed event, and a visible framebuffer
   stay future work), the **full network stack** (Phase G lands the NIC
   data path - a virtio-net driver + raw-frame `net::send`/`recv`/`mac`; IP/TCP/QUIC
-  stays a service/transport-library in a cell, plus a socket object + a device RX
-  interrupt), **SMP** secondary-core bring-up +
-  work-stealing + reservation enforcement + **priority-inheritance** locks (task
-  #27), real **HBM/CXL** (emulated on DDR; PMEM is now real nvdimm-backed on
+  stays a service/transport-library in a cell, plus a socket object + an **x86-64**
+  device RX interrupt - riscv64/aarch64 have theirs), **SMP** work-stealing +
+  reservation enforcement + **priority-inheritance** locks (task #27; secondary-core
+  bring-up itself is now done on all three ISAs, docs/SMP.md), real **HBM/CXL** (emulated on DDR; PMEM is now real nvdimm-backed on
   x86-64 - Phase J, docs/MEMORY.md 2.1)
   and NUMA (single-node), durability/latency **contracts** (advisory - no durable/
   RT backend in QEMU), a **first-class file/socket capability** (fds are `FileOps`
-  handles today), the **timer IRQ** and the **x86/arm UART RX IRQ**. These are
-  engineering, not redesign: every one has its seam
+  handles today), and the **x86-64 NIC RX interrupt** (the timer and UART RX IRQs
+  are done on all three ISAs). These are engineering, not redesign: every one has its seam
   in place (the queue object, the grant object, the `ipc` channel, the interrupt
   path, the cooperative scheduler).
 
@@ -1042,3 +1089,93 @@ librheo A-J is proven by **ten in-QEMU test kernels on all three ISAs**
 asserting exact behaviour, kept green alongside the whole suite (34 kernels x 3
 ISAs). Phase J's third refinement - the full `term` editor - is proven inside the
 `librheoproc` shell scenario, not a separate kernel.
+
+### Later extension: multi-slot channels (rheo-net N4a)
+
+Phases E and J gave a cell **one** cross-cell channel end - reported by
+`SYS_CONNECT`, inherited into a spawned child by `SYS_SPAWN`. rheo-net **N4a**
+(docs/NETSTACK.md 17) generalises that to a small **per-cell channel table**
+(`MAX_CELL_CHANNELS = 4`), because a *service* cell needs one end per client: three
+children inheriting the *same* ring would be three producers on one SPSC ring, not a
+fan-out. Slot 0 stays the Phase E/J channel, so every Phase E/J behaviour is
+unchanged byte-for-byte:
+
+- `SYS_CONNECT(out, slot)` gained the slot argument (existing callers pass 0) and
+  now also reports how many ends the cell holds; `ipc::Channel::open_slot`,
+  `rt::attach_channel_slot`, and `rt::chan_send_on`/`chan_recv_on` are the librheo
+  surface.
+- `SYS_SPAWN` gained a `chan_spec` argument selecting which of the caller's ends the
+  child inherits; the child always receives it at **its own slot 0** with the
+  opposite role, so a client binary is slot-agnostic. `proc::spawn_on_channel` wraps
+  it. `chan_spec = 0` is the Phase J default (`proc::spawn`/`spawn_piped`).
+- The reactor's channel idle path now hands the CPU on with **`SYS_YIELD`** (a
+  round-robin yield to the next runnable native cell) rather than `SYS_SWITCH`'s
+  directed `cur^1` - an XOR cannot reach client 3 from client 2. With a single peer
+  `SYS_YIELD` *is* that switch, which is why `librheoipc`/`librheopipe`/`librheowl`
+  are untouched.
+
+No new kernel object: it composes Cell (object 1) with QueuePair (object 3), the
+same way the L6 pipe and Phase J channel inheritance already do. Honest scope stays
+what Phase J stated - the in-cell wait is a genuine reactor park; the cell-boundary
+hand-off is cooperative, single-CPU (SMP is task #27).
+
+## FP/SIMD across the native cross-cell switch
+
+Cells build **hard-float** (docs/TILES.md 4: SSE2 / NEON / F+D baseline, with
+AVX/AVX-512 enabled for U-mode where CPUID reports it), while the kernel stays
+soft-float. That combination is what makes the switch a correctness problem: at a
+cross-cell hand-off the physical FP/SIMD register file still holds the **outgoing**
+cell's values, because nothing in the kernel has overwritten them. A cell that
+hands the CPU on with live values in its vector registers therefore reads back its
+*peer's* values when it resumes - no fault, no log, wrong numbers.
+
+**The invariant.** `user::switch_native_cell(from, to)` is the *only* native
+cross-cell switch: it activates `to`'s address space **and** swaps the register
+file (save `from`'s live registers into `from`'s kernel-side area, load `to`'s
+image). Every native path goes through it:
+
+| path | driver |
+|---|---|
+| `SYS_SWITCH` | the directed `cur ^ 1` hand-off (Phase E/J) |
+| `nproc::reschedule` | `SYS_WAIT`, and a child's exit or fault (Phase F) |
+| `nproc::yield_cell` | `SYS_YIELD` - the round-robin yield (rheo-net N4a: a service cell's client fan-out, and the strand reactor's channel idle path) |
+| `user::run` | a cell's *first* entry loads its image (the clean ABI-default one `arch::fp_area_init` wrote at install) |
+
+The swap lives **inside** that one function rather than being repeated at each call
+site, per docs/ENGINEERING.md 3 (one owner, enforced by construction). The bare
+`user::switch_to_cell` does the address space only and is documented as the
+**Linux** personality's switch: a Linux cell holds up to 8 contexts with an FP area
+each, so `linux::proc` brackets it with `linux::thread::save_current_fp` /
+`restore_current` instead.
+
+**Why this needed finding rather than assuming.** `SYS_YIELD` and the FP
+save/restore were developed independently, on separate branches. `SYS_YIELD` is a
+*third* switch path that did not exist when the FP work was written, so merging the
+two produced a tree that compiled, passed all 168 existing checks, and silently
+corrupted vector registers on exactly the path a service cell uses most. Nothing
+detected it because no cell held live FP state across a yield - the defect was
+latent, not absent.
+
+**The proof** (docs/ENGINEERING.md 1 - evidence the code cannot fake) is a phase of
+the `librheoipc` kernel. Both hard-float cells run a **single** `asm!` block that
+
+1. loads 16 vector registers from a per-role pattern that differs from the peer's
+   in **every byte** (256 bytes of register file on x86-64/ARM64 via `xmm0`-`xmm15`
+   / `q0`-`q15`, 128 on RISC-V via `f0`-`f15`),
+2. executes `SYS_YIELD` - so the peer runs and loads *its* pattern into those same
+   physical registers,
+3. stores the register file back out.
+
+One block means the compiler cannot spill or reload around the switch: what comes
+out came out of the registers. Four rounds per cell, and the verdict distinguishes
+**"read back the peer's pattern"** from ordinary corruption, because the former is
+precisely what an unswapped switch produces. Kernel-side, `user::fp_swaps()` counts
+swaps *only* inside `restore_native_fp`, and the test asserts it is at least one per
+yield. Verified in both directions: with the swap wired the register file is
+bit-identical on all three ISAs; with `yield_cell` reverted to the bare
+`switch_to_cell`, 7 of 8 rounds report the peer's pattern and the kernel panics.
+
+Scope: single-context native cells (a Linux cell's per-context FP is `linux::thread`
+above). The two schedulers are disjoint - `nproc` only ever selects native cells -
+so a switch never crosses a personality. SVE / RVV state is not enabled, so the
+areas are sized for NEON / the D extension / an XSAVE image (docs/TILES.md 4).

@@ -5,9 +5,12 @@
 //! - `vfs`: the translation-layer core - a `FileSystem` trait every backend
 //!   plugs into.
 //! - `ramfs`: a read-write in-memory filesystem (the working store).
-//! - `ext4`: a read-only driver for a real ext4 image (Tier-1 legacy disk
-//!   interchange, FILESYSTEMS.md 1). No block driver yet, so the image is a
-//!   RAM buffer (`include_bytes!` in the OS); the parsing is the real work.
+//! - `block`: the `BlockSource` seam (byte-addressed random access) a
+//!   filesystem reads through - an in-RAM `&[u8]`, or a bounded block cache over
+//!   a live device so an image far larger than RAM streams rather than residing
+//!   whole in memory. The disk **ext4** driver itself lives in the separate
+//!   `ext4fs` crate (the `ext4plus` adapter), so `posix` stays dependency-free
+//!   (docs/FILESYSTEMS.md; the hand-rolled parser it replaced was retired).
 //! - `mount`: the per-session `/` - a mount table + path resolution.
 //! - `sys`: the POSIX file syscall surface (fd table, open/read/write/...).
 //! - `fs`: a `std::fs`-shaped facade, so standard-library file code runs here.
@@ -21,14 +24,14 @@
 
 extern crate alloc;
 
-pub mod ext4;
+pub mod block;
 pub mod fs;
 pub mod mount;
 pub mod ramfs;
 pub mod sys;
 pub mod vfs;
 
-pub use ext4::Ext4;
+pub use block::BlockSource;
 pub use ramfs::RamFs;
 pub use vfs::{DirEntry, Errno, FileSystem, FileType, Metadata, NodeId};
 

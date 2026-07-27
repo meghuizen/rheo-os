@@ -11,6 +11,22 @@ edition = "2024"
 kernel = { path = "../kernel" }
 runtime = { path = "../runtime" }
 posix = { path = "../posix" }
+# The disk ext4 driver (docs/FILESYSTEMS.md): the `ext4plus` adapter, used by
+# the `blockfs`/`linuxdisk` kernels to mount a real ext4 image off a live disk
+# through the block cache. Its transitive deps are named in the doc (no-deps
+# rule).
+ext4fs = { path = "../ext4fs" }
+
+# rheo-net in its librheo-free **codec** posture (docs/NETSTACK.md N4b): the
+# `linuxnet` kernel registers a `svc::SocketOps` bridge whose datapath is the
+# stack's own eth/arp/ip/udp/tcp code, so a Linux cell can reach real remote
+# addresses while the kernel itself stays network-stack-free and allocation-free.
+# `default-features = false` drops librheo - it supplies a *cell's* `_start`,
+# panic handler and global allocator, which a kernel binary cannot link.
+# NOTE: never build `-p qemu-tests` together with `-p rheo-net` in one cargo
+# invocation; feature unification would re-enable `hosted` and the link would
+# fail. xtask keeps them in separate invocations.
+rheo-net = { path = "../net", default-features = false }
 
 [features]
 # The `smp` test kernel needs kernel/smp (docs/SMP.md). Kept out of the default
@@ -34,6 +50,10 @@ path = "src/bench_core.rs"
 [[bin]]
 name = "isolation-hw"
 path = "src/isolation_hw.rs"
+
+[[bin]]
+name = "security"
+path = "src/security.rs"
 
 [[bin]]
 name = "resources"
@@ -140,6 +160,18 @@ name = "librheonet"
 path = "src/librheonet.rs"
 
 [[bin]]
+name = "netwait"
+path = "src/netwait.rs"
+
+[[bin]]
+name = "schedidle"
+path = "src/schedidle.rs"
+
+[[bin]]
+name = "linuxpoll"
+path = "src/linuxpoll.rs"
+
+[[bin]]
 name = "librheogpu"
 path = "src/librheogpu.rs"
 
@@ -214,6 +246,33 @@ path = "src/nettcpcc.rs"
 name = "netsmoltcp"
 path = "src/netsmoltcp.rs"
 
+# rheo-net Phase N3a (docs/NETSTACK.md §3): the crypto primitive layer - every
+# primitive proven against its RFC/NIST test vector (ChaCha20-Poly1305, SHA-2,
+# HKDF, X25519, Ed25519, AES-GCM) + round-trip/tamper checks + the
+# two-randomness-class + nonce-safe API. Pure compute - needs no netdev.
+[[bin]]
+name = "netcrypto"
+path = "src/netcrypto.rs"
+
+# rheo-net N3b (docs/NETSTACK.md §15): TLS 1.3 - the RFC 8448 §3 known-answer key
+# schedule (byte-for-byte), an in-cell full 1-RTT handshake (both suites) with an
+# app-data round trip + tamper-reject, and a minimal-X.509 verify/reject. Pure
+# compute - needs no netdev.
+[[bin]]
+name = "nettls"
+path = "src/nettls.rs"
+
+# rheo-net N5a (docs/NETSTACK.md §19): HTTP/1.1 + HTTP/2 - the zero-copy h1 codec
+# with its request-smuggling rejections, an h1 client<->server exchange over the
+# in-cell TCP VirtualLink (POST+body, chunked, keep-alive, 404), the RFC 7541
+# Appendix C HPACK known-answer vectors (incl. Huffman), the h2 connection
+# (preface, SETTINGS, concurrent streams, WINDOW_UPDATE-gated body, RST/PING/
+# GOAWAY), and one h1 exchange through the TLS 1.3 record layer with ALPN. Pure
+# compute - needs no netdev.
+[[bin]]
+name = "nethttp"
+path = "src/nethttp.rs"
+
 # Linux-personality L8 (docs/LINUX-COMPAT.md L8): AF_UNIX sockets - an unmodified
 # static-glibc C fixture doing socketpair+fork and bind/listen/connect/accept.
 [[bin]]
@@ -226,6 +285,34 @@ path = "src/linuxunix.rs"
 [[bin]]
 name = "linuxinet"
 path = "src/linuxinet.rs"
+
+# rheo-net Phase N4b (docs/NETSTACK.md N4b, docs/LINUX-COMPAT.md L8-INET remote):
+# **real remote networking for unmodified Linux binaries** - a static-glibc C
+# fixture does a live DNS round trip to SLIRP's resolver and a real remote TCP
+# connect, over a `svc::SocketOps` bridge backed by rheo-net + virtio-net.
+[[bin]]
+name = "linuxnet"
+path = "src/linuxnet.rs"
+
+# rheo-net Phase N4a (docs/NETSTACK.md the service-cell section): the network
+# service cell + concurrent client fan-out - one service cell serves three client
+# cells concurrently, each over its own cross-cell channel (one strand per client).
+# Deterministic core (network-free) plus one bonus live ARP the service performs for
+# a client, reported and never asserted.
+[[bin]]
+name = "netservice"
+path = "src/netservice.rs"
+
+# rheo-net Phase N4c (docs/NETSTACK.md §20): **host configuration** - a DHCP client
+# (byte oracle + the DISCOVER->OFFER->REQUEST->ACK walk + T1/T2 renewal/rebind/
+# expiry + DECLINE/RELEASE + six rejections), the hostcfg store read back by
+# dns::Config and udp::UdpEndpoint, IPv4 link-local (ARP probe + conflict re-pick +
+# announce + defend), mDNS over the DNS codec, and the NTP offset/delay known-answer
+# test with the result as a bounded interval. Deterministic and network-free; four
+# bonus live attempts (DHCP/NTP/mDNS/link-local) skip with a reason.
+[[bin]]
+name = "nethostcfg"
+path = "src/nethostcfg.rs"
 
 # Real-GPU hardware plumbing (docs/GPU-HARDWARE.md 3, 12 stage 1): PCIe
 # bridge recursion + BAR sizing/assignment + capability walk + vendor

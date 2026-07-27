@@ -34,6 +34,10 @@ impl<const A: u32, const B: u32> SubsetOf<Rights<B>> for Rights<A> where
 pub type ReadOnly<T> = Capability<T, Rights<{ super::READ }>>;
 pub type ReadWrite<T> = Capability<T, Rights<{ super::READ | super::WRITE }>>;
 pub type Delegatable<T> = Capability<T, Rights<{ super::READ | super::DELEGATE }>>;
+/// Every **access** right. Deliberately not [`super::REVOKE`]: revocation
+/// invalidates the object for every other holder too, so it is not something a
+/// convenience alias should hand out. Ask for it by name (see
+/// [`rheo_abi::RIGHT_ALL`] for the genuinely complete set).
 pub type Full<T> = Capability<
     T,
     Rights<{ super::READ | super::WRITE | super::EXECUTE | super::DELEGATE | super::MAP }>,

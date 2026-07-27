@@ -172,6 +172,54 @@ architecture.
 Boot, exception vectors, and the context-switch inner loop are the only
 assembly, a few files per ISA.
 
+### 4.1 The two exemptions
+
+"Nothing outside these modules may conditionally compile on architecture" is
+enforced by review, and two places in the tree genuinely need an exemption. Both
+are written down here so that a `cfg(target_arch)` outside `kernel/src/arch/` is
+either one of these or a bug - there is no third category, and no unstated
+tolerance (docs/ENGINEERING.md 7).
+
+**U-mode programs (`kernel/src/user_progs.rs`, 9 sites).** These functions
+execute in a cell, not in the kernel, and a cell's page tables map neither kernel
+`.text` nor kernel `.rodata`. So they *cannot call into* `arch/` - not "should
+not": an out-of-line call would fault. What they need per-ISA is exactly two
+things, and both **are** the ISA rather than an abstraction over it: the syscall
+instruction (`ecall` / `svc` / `syscall`) and the cycle-counter read. Writing them
+inline with `cfg(target_arch)` is the only way to place those instructions in a
+cell's own text. The exemption is bounded: it covers *inline assembly for the
+syscall instruction and the counter read in code that runs in U-mode*, nothing
+else. Anything a U-mode program needs beyond that belongs in librheo, which is
+compiled for the cell and reaches the kernel through the queue-pair ABI.
+
+**The test kernels (`tests/src/`), two kinds and no others.** Counted, so the
+claim is checkable: **138 of the 146** `cfg` sites select a **per-target file
+path** - the cell image a kernel embeds with `include_bytes!`
+(`x86_64-unknown-none` vs `aarch64-unknown-none-softfloat` vs
+`riscv64gc-unknown-none-elf`), and `linuxdyn`'s `INTERP_PATH`, the target's own
+`ld-linux-*.so` name. Those are build-tree and target-triple facts; no
+instruction, register or layout is chosen by them.
+
+Of the remaining eight, three are **per-ISA expectations about what QEMU
+models** - the skip-with-reason discipline, not a portability escape: `gpuhw`
+asserts six driven GPU vendors on x86-64 and four elsewhere because the VMware
+and QXL device models are x86-only. A test may assert what the *emulator*
+provides per machine; it may not branch on the ISA to change what the *kernel*
+does.
+
+The last five are all in `iommu.rs` and are a **known defect, not an exemption**:
+it selects `hw::iommu::Vtd` vs `hw::smmuv3::Smmu` and gates the whole DMA phase
+per ISA, which means the per-ISA IOMMU choice is made by the consumer instead of
+behind the trait seam this very section lists IOMMU under. Recorded in
+docs/ARCHITECTURE-DEBT.md 3.6 and still open; when it closes, `tests/src` holds
+path selection and QEMU-capability assertions only.
+
+Neither exemption reaches the kernel library's own logic. Every portable
+subsystem that looks per-ISA - `net_rx`'s three wait modes, `ktimer`'s arming,
+`idle`'s halt decision, `smp`'s registry - is portable code branching on
+**`arch` predicates it queries at runtime**, which is the pattern to copy when a
+new subsystem needs to behave differently per machine.
+
 ---
 
 ## 5. Engines (accelerators and devices)
