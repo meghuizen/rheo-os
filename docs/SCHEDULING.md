@@ -279,7 +279,124 @@ over running on a static server budget. For the RT paths where this matters
 the cost is worth the guarantee; for bulk best-effort work the service can
 opt to run on its own Residual budget instead (§4.1) and skip the lookup.
 
-## 11. Honest costs
+## 11. Learnings from production Linux schedulers (CachyOS)
+
+CachyOS is the performance-tuned Linux distribution whose whole identity is the
+CPU scheduler, so it is the best available evidence for what the choices in this
+doc cost and buy in practice. Its stack is three layers, and each one maps
+directly onto a decision already made above - which is the point of recording it:
+the mainstream performance community arrived, working *forward* from CFS, at the
+model this doc reached working *backward* from the reservation contract.
+
+### 11.1 What CachyOS actually ships
+
+- **EEVDF** (Earliest Eligible Virtual Deadline First) - the mainline default
+  since Linux 6.6 and CachyOS's base. Each task is given a **virtual deadline** =
+  its eligible time + `slice/weight`, and an **eligibility** gate: a task may run
+  only once its *lag* (fair share received minus consumed) is non-negative. Among
+  eligible tasks, the earliest virtual deadline wins. The load-bearing property:
+  a task that requests a **smaller slice gets an earlier deadline**, so a
+  latency-sensitive task is served first *without any priority knob* - latency is
+  bought by asking for less, not by ranking higher.
+- **BORE** (Burst-Oriented Response Enhancer) - a heuristic *on top of* EEVDF, not
+  a replacement. It accumulates a per-task **burst time** (CPU consumed in a run,
+  decayed on sleep), turns it into a log-scaled **burst score**, and re-weights the
+  task's effective vruntime by it: long-burst CPU hogs are penalised, short-burst
+  interactive tasks are boosted. Pure inference from observed behaviour; no new
+  mechanism.
+- **sched_ext (scx)** - `CONFIG_SCHED_CLASS_EXT`: a scheduler *class* whose policy
+  is a **BPF program loaded (and swapped) at runtime**, usually with a Rust
+  userspace half. CachyOS enables it by default and ships a GUI to switch policies
+  live. The notable ones: **scx_lavd** (Latency-criticality Aware Virtual Deadline
+  - estimates each task's latency-criticality from its wakeup/run behaviour and
+  scales its virtual deadline by it; the default on CachyOS's handheld/gaming
+  build), **scx_flash** (an EDF/deadline scheduler balancing latency and
+  fairness), **scx_rusty** (per-LLC multi-domain load balancing, most logic in
+  Rust), **scx_bpfland** (prioritises tasks that yield the CPU voluntarily).
+
+### 11.2 sched_ext is the two-level bet, validated - and it supersedes ghOSt
+
+§3 justified two-level scheduling and scheduler activations by pointing at
+Google's ghOSt as evidence "the demand is real." sched_ext is that demand landed
+in the mainline kernel: scheduling **policy in userspace, mechanism in the
+kernel**, swappable at runtime without reboot - exactly the mechanism/policy split
+this whole design rests on (ARCHITECTURE.md 4.7). The lesson is not "add BPF"; it
+is that the shared-pool **dispatch policy must be a single swappable seam**, not a
+hardcoded scheduler baked into the kernel. Lattice already puts fast dispatch in
+the userspace runtime (§3); the kernel-side placement policy for the shared pool
+should be equally pluggable - one `Policy` seam the boot path selects, the same
+way the `net` crate selects `hft`/`edge`/`warehouse`/`embedded` (NETSTACK.md).
+CachyOS proves the payoff is real: LAVD for interactive/handheld, flash for
+latency+fairness, rusty for throughput servers - **one workload, one policy**, not
+one scheduler pretending to fit all.
+
+### 11.3 EEVDF's virtual deadline unifies with our reservations - one ready order
+
+The keystone takeaway. This doc already schedules **reserved** work by EDF
+(§4: `SCHED_DEADLINE` promoted to the primary interface) and has the deadline
+substrate for it - the kernel timer arbiter (NETSTACK.md 16, the single owner of
+the per-ISA one-shot) plus the reservation admission math (`kernel/src/sched.rs`).
+EEVDF shows that **best-effort work belongs in the same deadline-ordered
+structure**: give each non-reserved task a *virtual* deadline (`eligible +
+slice/weight`) and the shared pool becomes one ready queue ordered by deadline,
+with reserved cells carrying *hard* deadlines and best-effort cells carrying
+*virtual* ones. That is "compose before extending" (ENGINEERING.md): no second
+scheduler, no priority axis - Residual work (§4.1) is simply the tail of the same
+order (a virtual deadline at +infinity, run only on slack). It also means Lattice
+should **not** port CFS-style fair timesharing as a separate thing; it is already
+closer to scx_lavd/scx_flash (deadline schedulers) than to CFS, because it started
+from deadlines. Build the shared-pool scheduler as *virtual-deadline EEVDF over
+the existing arbiter*, not as a fairness engine bolted beside the reservation one.
+
+### 11.4 BORE and LAVD are observe-never-infer, applied to time
+
+Both infer a task's urgency from **measured behaviour** - burst length, wakeup
+frequency, how often it yields - never from a number the task declares. That is
+ENGINEERING.md's observe-never-infer rule and this doc's own "importance is a
+contract, never a priority number" (position statement), reached independently by
+the interactivity community. Lattice is positioned to do the *honest* version:
+the per-context blocking work (LINUX-COMPAT.md L4, `thread.rs` `pblock`) already
+records exactly the evidence LAVD estimates from - when each context blocks, on
+what, and how often it is woken. A best-effort latency-criticality score can be
+computed from those counters (short inter-block run + frequent wakeups =
+latency-critical → earlier virtual deadline), with no new tracking and no task-
+declared hint to be lied to. This is the concrete input to the §11.3 virtual
+deadline.
+
+### 11.5 What Lattice deliberately does not take
+
+- **Cross-LLC load balancing / work-stealing schedulers** (scx_rusty's core
+  competency). The multikernel model (§1a) *partitions* cores rather than
+  balancing across a shared runqueue, and NUMA work-stealing is already
+  topology-bounded (§6). A global balancer is the shared mutable scheduler state
+  §1a exists to avoid; CachyOS needs it only because Linux is one SMP kernel.
+- **A periodic-tick fair scheduler as the default.** EEVDF/BORE still run under a
+  timeslice tick; §1 removes the global tick, so the shared-pool EEVDF here is
+  driven by the deadline arbiter's one-shots, not HZ.
+
+### 11.6 Honest gate - none of this is implementable yet
+
+Every technique above is **preemptive and multi-core**. Lattice today is
+**cooperative and single-CPU**: a context yields only at a syscall boundary
+(CONCURRENCY.md, LINUX-COMPAT.md L4), and SMP bring-up (docs/SMP.md) proves a
+second core runs but does not yet schedule on it (#27/#132). So:
+
+- The virtual-deadline shared pool (§11.3), the behaviour-inferred criticality
+  score (§11.4), and the pluggable `Policy` seam (§11.2) are **design targets
+  gated on preemption + SMP**, recorded here so the scheduler is built toward them
+  rather than retrofitted.
+- The cooperative pick order is **deliberately left round-robin for now**. Making
+  it latency-aware would change nothing measurable under a single CPU with no
+  preemption (a compute-bound context still holds the CPU until it yields) and
+  would break the deterministic ordering the proofs assert (`schedidle`'s
+  `bSSSSSSSSB` oracle, `netservice`'s `order == [0,1,2,...]` interleave witness).
+  The payoff arrives with preemption, and so does the change - not before.
+
+Sources: CachyOS sched-ext wiki (`wiki.cachyos.org/configuration/sched-ext`), the
+`sched-ext/scx` scheduler repository, and the EEVDF/BORE/ghOSt background in
+kernel documentation and LWN.
+
+## 12. Honest costs
 
 - Partitioning wastes cores at low utilization; fair timesharing is *better*
   for a laptop. This design assumes a server whose workload mix is known and
