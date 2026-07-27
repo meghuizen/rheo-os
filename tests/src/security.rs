@@ -121,6 +121,13 @@ fn attack(entry: extern "C" fn(usize) -> !, target: u64) -> Report {
 
         let (_idx, outcome) = user::run(0);
         let charged = user::cell_frames_charged(0);
+        // The O(1) free count is only trustworthy if it still agrees with the
+        // bitmap it summarises; every phase below reads it, so check the
+        // invariant here rather than trusting it (docs/ENGINEERING.md 1).
+        assert!(
+            frames::used_matches_bitmap(),
+            "the frame allocator's used counter diverged from its bitmap"
+        );
         let (free_after, _) = frames::stats();
         let p = (*store_ptr).params;
         Report {

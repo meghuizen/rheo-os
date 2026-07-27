@@ -17,6 +17,12 @@ pub const POOL_FRAMES: usize = 32768;
 static mut BITMAP: [u64; POOL_FRAMES / 64] = [0; POOL_FRAMES / 64];
 static mut NEXT_HINT: usize = 0;
 static mut INITIALIZED: bool = false;
+/// Frames currently allocated. Kept incrementally so [`stats`] - and therefore
+/// [`user_available`], which every cell-driven allocation consults - is O(1)
+/// rather than a 512-word popcount of the bitmap. The bitmap stays the source of
+/// truth for *which* frames; this counts them, and `debug_used_matches_bitmap`
+/// checks the two agree.
+static mut USED: usize = 0;
 
 unsafe extern "C" {
     static __kernel_end: u8;
@@ -49,7 +55,8 @@ pub const USER_RESERVE_FRAMES: usize = 2048;
 
 /// How many frames a **cell** may still be given: the free pool less the
 /// kernel's reserve. The number a user-driven allocation must check against
-/// before it allocates anything.
+/// before it allocates anything. O(1) - it is consulted per allocating syscall,
+/// and per *page* on the Linux file-mmap path.
 pub fn user_available() -> usize {
     stats().0.saturating_sub(USER_RESERVE_FRAMES)
 }
@@ -76,6 +83,7 @@ pub fn alloc() -> Option<usize> {
             let (word, bit) = (frame / 64, frame % 64);
             if bitmap[word] & (1 << bit) == 0 {
                 bitmap[word] |= 1 << bit;
+                *core::ptr::addr_of_mut!(USED) += 1;
                 *core::ptr::addr_of_mut!(NEXT_HINT) = frame + 1;
                 let pa = arch::FRAME_POOL_BASE + frame * FRAME_SIZE;
                 // Zero through the kernel's linear map (identity on x86/riscv;
@@ -88,12 +96,24 @@ pub fn alloc() -> Option<usize> {
     }
 }
 
-/// (free frames, total frames) - used by the shell's `meminfo` builtin.
+/// (free frames, total frames) - the shell's `meminfo` builtin, the reservation
+/// memory floor, and the cell-allocation guard above.
 pub fn stats() -> (usize, usize) {
+    // SAFETY: single CPU, synchronous traps.
+    let used = unsafe { *core::ptr::addr_of!(USED) };
+    (POOL_FRAMES - used, POOL_FRAMES)
+}
+
+/// Whether the incremental [`stats`] counter still agrees with the bitmap it
+/// summarises - the cheap invariant that keeps the O(1) count honest. Asserted by
+/// the `security` test kernel after every allocation and free it drives
+/// (docs/ENGINEERING.md 1: observe, do not infer).
+pub fn used_matches_bitmap() -> bool {
+    // SAFETY: single CPU, synchronous traps.
     unsafe {
         let bitmap = &*core::ptr::addr_of!(BITMAP);
-        let used: usize = bitmap.iter().map(|w| w.count_ones() as usize).sum();
-        (POOL_FRAMES - used, POOL_FRAMES)
+        let counted: usize = bitmap.iter().map(|w| w.count_ones() as usize).sum();
+        counted == *core::ptr::addr_of!(USED)
     }
 }
 
@@ -131,5 +151,6 @@ pub fn free(pa: usize) {
         let bitmap = &mut *core::ptr::addr_of_mut!(BITMAP);
         assert!(bitmap[frame / 64] & (1 << (frame % 64)) != 0, "double free");
         bitmap[frame / 64] &= !(1 << (frame % 64));
+        *core::ptr::addr_of_mut!(USED) -= 1;
     }
 }
