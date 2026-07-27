@@ -254,11 +254,7 @@ impl Histogram {
     /// Integer mean, or 0 with no samples. Deliberately offered *beside* the
     /// percentiles rather than instead of them.
     pub fn mean(&self) -> u64 {
-        if self.count == 0 {
-            0
-        } else {
-            self.sum / self.count
-        }
+        self.sum.checked_div(self.count).unwrap_or(0)
     }
 
     fn slots(&self) -> Option<*mut u32> {
@@ -303,14 +299,14 @@ impl Histogram {
             }
         }
         let index = bucket_of(value);
-        if let Some(p) = self.slots() {
-            if index < SLOTS {
-                // SAFETY: index bounded above; exclusive via `&mut self`, and the
-                // histogram belongs to this CPU (see the module docs).
-                unsafe {
-                    let slot = p.add(index);
-                    *slot = (*slot).saturating_add(1);
-                }
+        if let Some(p) = self.slots()
+            && index < SLOTS
+        {
+            // SAFETY: index bounded above; exclusive via `&mut self`, and the
+            // histogram belongs to this CPU (see the module docs).
+            unsafe {
+                let slot = p.add(index);
+                *slot = (*slot).saturating_add(1);
             }
         }
     }
@@ -560,7 +556,21 @@ mod tests {
     /// bucket width below it.
     #[test]
     fn bucket_bounds_are_honest() {
-        for v in [0u64, 1, 15, 16, 17, 31, 32, 63, 64, 1023, 1024, 1 << 40, u64::MAX] {
+        for v in [
+            0u64,
+            1,
+            15,
+            16,
+            17,
+            31,
+            32,
+            63,
+            64,
+            1023,
+            1024,
+            1 << 40,
+            u64::MAX,
+        ] {
             let i = bucket_of(v);
             assert!(i < SLOTS, "value {v} -> slot {i} out of range");
             let lo = bucket_value(i);

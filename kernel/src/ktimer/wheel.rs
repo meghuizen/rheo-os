@@ -485,10 +485,11 @@ impl Wheel {
     fn recompute_nearest(&mut self) {
         let mut best = u64::MAX;
         for index in 0..self.high_water {
-            if let Some(n) = self.nodes.get(index) {
-                if n.state == State::Armed && n.deadline_ns < best {
-                    best = n.deadline_ns;
-                }
+            if let Some(n) = self.nodes.get(index)
+                && n.state == State::Armed
+                && n.deadline_ns < best
+            {
+                best = n.deadline_ns;
             }
         }
         self.nearest = best;

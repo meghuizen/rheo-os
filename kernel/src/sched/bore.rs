@@ -218,7 +218,11 @@ impl Burst {
     #[inline]
     pub fn score(&self) -> u8 {
         let live = score_of(self.accumulated_ns);
-        if live > self.history { live } else { self.history }
+        if live > self.history {
+            live
+        } else {
+            self.history
+        }
     }
 
     /// This vcore's scheduling weight.

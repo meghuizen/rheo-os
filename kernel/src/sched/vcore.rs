@@ -244,9 +244,9 @@ pub struct RunQueue {
     dispatches: u64,
     preemptions: u64,
     voluntary_yields: u64,
-    /// Times the eligibility gate deferred a vcore that had the earliest deadline
-    /// - direct evidence that EEVDF's distinguishing rule is doing something,
-    /// which is otherwise invisible (the result looks like plain EDF).
+    /// Times the eligibility gate deferred a vcore that held the earliest
+    /// deadline: direct evidence that EEVDF's distinguishing rule is doing
+    /// something, which is otherwise invisible (the result looks like plain EDF).
     eligibility_defers: u64,
 }
 
@@ -570,9 +570,8 @@ impl RunQueue {
     /// fair vcore was passed over because it was ineligible.
     ///
     /// Exists so a test can assert EEVDF is doing something rather than
-    /// degenerating to earliest-deadline-first - the two agree most of the time,
-    /// so "it works" is not observable from the pick alone
-    /// (docs/ENGINEERING.md 1).
+    /// degenerating to earliest-deadline-first: the two agree most of the time, so
+    /// "it works" is not observable from the pick alone (docs/ENGINEERING.md 1).
     pub fn eligibility_would_defer(&self) -> bool {
         let mut earliest: Option<(u64, bool)> = None;
         for (_, v) in self.iter() {
@@ -794,7 +793,10 @@ mod tests {
         rq.remove(b);
         assert!(rq.invariant_holds());
         rq.charge(a, 40_000_000).unwrap(); // changes the burst weight
-        assert!(rq.invariant_holds(), "a weight change must update the total");
+        assert!(
+            rq.invariant_holds(),
+            "a weight change must update the total"
+        );
     }
 
     /// A compute-bound vcore must lose weight relative to an interactive one, and

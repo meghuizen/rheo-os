@@ -1490,6 +1490,62 @@ three ISAs) proves it: a 12 MiB request's 9280 KiB of writes appear as 2380 dema
 59 when the eager mapping is restored. Still eager and named: a `.bss`-tail segment and a
 native cell's image, both riding this handler.
 
+**Substrate 2 mechanisms are built** (docs/SUBSTRATE.md, docs/DRIVERS.md):
+the pieces that replace the bring-up scaffolding - the fixed `MAX_*` tables, the
+magic VA map, the six-slot timer arbiter, the absent scheduler order - exist and
+are proven, **beside** the old paths rather than under them. **Funded kernel
+metadata** (`mm/kmeta.rs`): a `Funded<T>` table over a page directory of frames
+**charged to the owning cell**, growing past every ceiling it replaces (proven to
+4096 elements vs the old 512-entry object table), `Option`-fallible with rollback,
+per-owner charge ledger so exhaustion is attributable instead of a global "table
+full". **A per-ISA user VA ceiling** (`arch::USER_VA_TOP`: x86-64 `2^47`, ARM64
+`2^48`, RISC-V Sv39 `2^38` as its own floor rather than everyone's) plus a real
+**VA region allocator** (`mm/vaspace.rs`) - first-fit with guard gaps, overlap
+refused not evicted, a mid-range release *splits* the straddling record. **The
+per-CPU primitives are now always compiled** (`smp.rs`: `SpinLock`, the generic
+`PerCpu<T>`, a **total** `cpu_index()`), because per-CPU-ness is a property of a
+data structure, not of a build configuration - the alternative was writing every
+per-core subsystem twice, which is the shape that produced the FP/SIMD
+`SYS_YIELD` defect. The byte-identity property SMP phase 1 maintained is
+therefore superseded by a stronger one - *enabling the feature must not change
+single-CPU behaviour* - and docs/SMP.md records the trade rather than dropping it.
+The **timer arbiter is per-CPU** and gained a **hierarchical timing wheel**
+(`ktimer/wheel.rs`): O(1) arm/cancel over funded nodes with cascading, so an
+unbounded number of same-kind deadlines works (one QUIC connection needs five;
+Node arms thousands) - 64 concurrent deadlines are proven honoured **in deadline
+order** beside the named-client slots, neither losing the other's. A **metrics
+pipeline** (`metrics.rs`): per-CPU HDR-style histograms, real percentiles,
+**jitter defined once as P95-P50**, integer-only, buckets lazily funded per
+(CPU, metric). The **scheduler order** (`sched/bore.rs` + `sched/vcore.rs`): the
+BORE burst score as an integer log2 with fork inheritance, feeding **one
+deadline-ordered EEVDF queue** that holds hard-deadline reservations, virtual-
+deadline fair work and residual work together - the eligibility gate proven to
+defer an over-consumer that still holds the earliest deadline (the only
+configuration where EEVDF differs observably from EDF). **Userspace std is
+hard-float on all three ISAs** (`targets/rheo_os-*.json`: SSE2 / NEON / `+f,+d`
+with `lp64d` - the ABI name must move with the features or FP runs under a
+soft-float convention); the kernel stays FP-free as a *performance* choice (the
+Linux `-mno-sse` precedent: no syscall, trap or interrupt then saves the vector
+file), with a designed `kernel_fp_begin` escape hatch. **Per-CPU DRBG roots** so
+`getrandom` takes no cross-core lock, secondary roots *derived* (fast key erasure)
+and never copied - two cores with the same key would emit identical streams that
+look random in isolation. And **`madvise` stops being `Ret(0)`**: DONTNEED/FREE
+genuinely decommit (how every allocator returns memory), `MADV_WIPEONFORK` is
+recorded per VMA and honoured by `fork` (the fix for a forked userspace CSPRNG
+producing its parent's stream), advisory values are accepted, the rest refused
+with a reason. Proven by the **`substrate`** test kernel - nine phases against
+frame-pool deltas, the charge ledger, structural invariants and hand-computed
+oracles - on all three ISAs, with the whole pre-existing suite green **unedited**.
+It found two real defects on the way: the wheel returned fired timers in
+allocation order rather than deadline order (a transport would apply a later RTO
+before an earlier one), and RISC-V's `cpu_index()` read an uninitialised `tp`.
+**Honest and load-bearing: none of it is wired in yet.** The fixed tables are
+still fixed arrays, the magic VA map is still the map, no vcore is dispatched, no
+second core schedules anything, and `metrics` records nothing until a boot enables
+it. Building a replacement and switching onto it are different risks; the
+migration is staged as S1'-S3' in docs/SUBSTRATE.md 15, and the exit gate is
+already written - `linuxbun` flipping from its accepted partial to `rheo:42`.
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
 proofs, and the hardware-lab performance numbers.
@@ -1565,6 +1621,7 @@ build `--release` and aarch64 uses the soft-float target.
 Everything routes through the xtask runner (`xtask/src/main.rs`):
 
 ```
+cargo xtask check --arch <x86_64|aarch64|riscv64|all>   # type-check the kernel only - the fast loop
 cargo xtask build --arch <x86_64|aarch64|riscv64|all>   # cross-compile all kernels
 cargo xtask run   --arch riscv64 [--bin lsh]            # boot in QEMU, serial on terminal
 cargo xtask test  --arch all                            # boot every test kernel, pass/fail
@@ -1573,6 +1630,17 @@ cargo xtask bench --arch all                            # icount path lengths (a
 cargo fmt --all                                         # format (CI-gated)
 cargo clippy -p xtask -- -D warnings                    # lint host code (CI-gated)
 ```
+
+**`check` is the inner loop for kernel work.** `build` cross-builds the
+`userland` programs, every librheo bin (twice), four separately-featured `net`
+cells, the std programs, the coreutils multicall, the columnar dataset, the pmem
+backing file and the glibc Linux fixtures *before* it reaches a line of kernel
+code - none of which a `kernel/src/` change can affect. `check` runs `cargo
+check` on the `kernel` package only, **twice: with and without the `smp`
+feature**, because that feature is a separate compilation of the same library
+whose per-CPU paths the ordinary build only compiles at the very end. It cannot
+catch a link error or a missing fixture, so it does not replace `build`/`test` -
+it just makes a compile error surface in seconds instead of minutes.
 
 Kernel clippy needs the build-std flags:
 

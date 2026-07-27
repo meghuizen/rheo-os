@@ -61,6 +61,48 @@ build skips it) - mirroring how `librheo-embed` is built separately. Result: the
 change for code that never opts in. The per-CPU primitive also defaults to CPU
 index 0.
 
+### The byte-identity property is superseded (docs/SUBSTRATE.md pillar 3)
+
+**As of the Substrate 2 work, the paragraph above describes the bring-up phase,
+not the current tree.** The *bring-up half* of `smp.rs` - everything that calls
+`arch::smp_*` - is still behind the feature exactly as described. The
+**primitives** (`SpinLock`, the generic `PerCpu<T>`, `cpu_index`) are now
+compiled unconditionally, so the non-SMP `kernel` lib is no longer byte-identical
+to the pre-SMP one.
+
+That was a deliberate trade, and the reasoning is worth keeping: per-CPU-ness is
+a property of a *data structure*, not of a build configuration. The subsystems
+re-founded on it - the timer arbiter (one hardware one-shot per core), the
+metrics histograms, the DRBG roots, the vcore run queues - are correct only if
+each core owns its own instance, and had the container expressing that stayed
+feature-gated, every one of them would have to be written **twice**: once as a
+global `static mut` and once per-CPU. Two implementations of one subsystem is
+precisely the shape that produced the FP/SIMD `SYS_YIELD` corruption
+(docs/LIBRHEO.md), and §10.2's audit is a list of statics whose ownership
+discipline must be stated in exactly one place.
+
+The property that replaces it is stronger and more useful: **enabling the feature
+must not change single-CPU behaviour.** Without `smp`, `cpu_index()` is a
+compile-time `0`, so every `PerCpu<T>` resolves to slot 0 with no run-time
+indexing and every `SpinLock` is an uncontended flag. The guarantee moved from
+"the binary is unchanged" to "the semantics are unchanged", which is what
+actually matters once per-core state exists.
+
+**One real defect came out of this and is fixed.** `cpu_index()` is the addressing
+rule for every per-CPU structure, so it must be **total** - an out-of-range answer
+is not a wrong number, it is a wild memory access. x86-64 and ARM64 search a table
+of hardware ids and fall back to 0, so both were already safe before bring-up.
+RISC-V read `tp` directly, and nothing had set it: SBI leaves whatever the previous
+stage put there until `smp_set_this_cpu` runs. That never mattered while the only
+caller was `this_cpu()` (reached after bring-up), but the new per-core subsystems
+touch per-CPU state during boot, and the `smp` kernel panicked with
+`index out of bounds: the len is 64 but the index is 2147790848`. Fixed at both
+levels: `kernel/arch/riscv64/boot.S` zeroes `tp` before any Rust runs (the boot
+hart genuinely *is* CPU 0 until told otherwise, so the value is correct rather
+than garbage that happens to be masked), and `smp::cpu_index()` now bounds
+whatever the arch layer reports - the structural backstop, so a future port that
+forgets to initialise its identity register gets CPU 0 instead of corruption.
+
 ## 2. The portable foundation (`kernel/src/smp.rs`)
 
 **`SpinLock<T>`** - a test-and-test-and-set spinlock. The acquire loop spins on a

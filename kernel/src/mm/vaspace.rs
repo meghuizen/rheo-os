@@ -406,14 +406,15 @@ impl VaSpace {
     /// Drop the region based exactly at `base`, returning it.
     pub fn release_at(&mut self, base: usize) -> Option<Region> {
         for i in 0..self.high_water {
-            if let Some(r) = self.regions.get(i) {
-                if r.live() && r.base == base {
-                    self.regions.set(i, Region::FREE);
-                    if base < self.hint {
-                        self.hint = base;
-                    }
-                    return Some(r);
+            if let Some(r) = self.regions.get(i)
+                && r.live()
+                && r.base == base
+            {
+                self.regions.set(i, Region::FREE);
+                if base < self.hint {
+                    self.hint = base;
                 }
+                return Some(r);
             }
         }
         None

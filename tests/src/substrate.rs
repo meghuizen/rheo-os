@@ -84,7 +84,10 @@ fn test_funded_metadata() {
         3,
         "the owner must be charged for every frame the table holds"
     );
-    assert!(kmeta::ledger_consistent(), "ledger inconsistent after growth");
+    assert!(
+        kmeta::ledger_consistent(),
+        "ledger inconsistent after growth"
+    );
 
     // Elements must round-trip across a page boundary - the directory arithmetic
     // is the part that would silently alias without this.
@@ -113,7 +116,10 @@ fn test_funded_metadata() {
         before_free,
         "release must return every frame to the pool"
     );
-    assert!(kmeta::ledger_consistent(), "ledger inconsistent after release");
+    assert!(
+        kmeta::ledger_consistent(),
+        "ledger inconsistent after release"
+    );
     assert!(
         frames::used_matches_bitmap(),
         "frame accounting diverged from the bitmap"
@@ -195,7 +201,10 @@ fn test_vaspace_placement() {
         .reserve(0x10_0000, 0x10_0000, RegionKind::Grant, 3)
         .unwrap();
 
-    assert!(a >= kernel::mm::vaspace::VA_FLOOR, "allocated below the floor");
+    assert!(
+        a >= kernel::mm::vaspace::VA_FLOOR,
+        "allocated below the floor"
+    );
     assert!(
         c.is_multiple_of(0x10_0000),
         "1 MiB alignment was not honoured: {c:#x}"
@@ -213,7 +222,10 @@ fn test_vaspace_placement() {
     // could only answer by comparing against constants.
     assert_eq!(vs.find(a).map(|r| r.tag), Some(1));
     assert_eq!(vs.find(c + 0x1000).map(|r| r.kind), Some(RegionKind::Grant));
-    assert!(vs.find(a + 0x4000 + guard / 2).is_none(), "a guard page is mapped");
+    assert!(
+        vs.find(a + 0x4000 + guard / 2).is_none(),
+        "a guard page is mapped"
+    );
 
     // A fixed placement over a live region must be refused, not evicted.
     assert_eq!(
@@ -235,7 +247,9 @@ fn test_vaspace_placement() {
     assert!(vs.invariant_holds());
 
     // A fixed placement in a genuinely free span must succeed.
-    let far = vs.reserve_fixed(0x8000_0000, 0x2000, RegionKind::Queue, 7).unwrap();
+    let far = vs
+        .reserve_fixed(0x8000_0000, 0x2000, RegionKind::Queue, 7)
+        .unwrap();
     assert_eq!(far, 0x8000_0000);
     assert!(vs.invariant_holds());
 
@@ -255,7 +269,9 @@ fn test_vaspace_release_and_split() {
     let mut vs = VaSpace::new();
     vs.init(Owner::cell(12));
 
-    let base = vs.reserve_fixed(0x1000_0000, 0x8000, RegionKind::Anon, 1).unwrap();
+    let base = vs
+        .reserve_fixed(0x1000_0000, 0x8000, RegionKind::Anon, 1)
+        .unwrap();
     assert_eq!(vs.len(), 1);
 
     // Punch a hole in the middle: one record becomes two, and the hole is free.
@@ -282,7 +298,9 @@ fn test_vaspace_release_and_split() {
     assert!(vs.invariant_holds());
 
     // Releasing by exact base returns the record.
-    let dropped = vs.release_at(base).expect("release_at should find the head");
+    let dropped = vs
+        .release_at(base)
+        .expect("release_at should find the head");
     assert_eq!(dropped.tag, 1);
     assert!(vs.invariant_holds());
 
@@ -351,7 +369,10 @@ fn test_timer_wheel() {
     let mut cancelled = 0;
     for i in [10usize, 25, 40] {
         if let Some(t) = timers[i] {
-            assert!(ktimer::cancel_dynamic(t), "cancel of timer {i} reported no-op");
+            assert!(
+                ktimer::cancel_dynamic(t),
+                "cancel of timer {i} reported no-op"
+            );
             timers[i] = None;
             cancelled += 1;
         }
@@ -535,7 +556,10 @@ fn test_bore_scores() {
     for s in 1..=bore::SCORE_MAX {
         let w = bore::weight_of(s);
         assert!(w <= prev, "weight rose at score {s}");
-        assert!(w >= 1, "score {s} has zero weight - it would be unschedulable");
+        assert!(
+            w >= 1,
+            "score {s} has zero weight - it would be unschedulable"
+        );
         prev = w;
     }
     let range = bore::weight_of(0) / bore::weight_of(bore::SCORE_MAX);
@@ -551,7 +575,10 @@ fn test_bore_scores() {
         1_000_000_000,
         "preemption wrongly ended the burst"
     );
-    assert!(b.score() > 0, "a long in-flight run should already be demoted");
+    assert!(
+        b.score() > 0,
+        "a long in-flight run should already be demoted"
+    );
     b.relinquish();
     assert_eq!(b.accumulated_ns(), 0, "relinquish did not end the burst");
     assert_eq!(b.yields(), 1);
@@ -586,12 +613,17 @@ fn test_eevdf_order() {
         rq.get(quick).unwrap().vdeadline() < rq.get(bulk).unwrap().vdeadline(),
         "a smaller slice did not earn an earlier deadline"
     );
-    assert_eq!(rq.pick(), Some(quick), "the low-latency vcore was not served first");
+    assert_eq!(
+        rq.pick(),
+        Some(quick),
+        "the low-latency vcore was not served first"
+    );
     assert!(rq.invariant_holds());
 
     // A reservation precedes fair work regardless of virtual deadlines.
     let res = rq.admit(3, 0, Class::Reserved, Burst::new(), 0).unwrap();
-    rq.set_hard_deadline(res, ktimer::now_ns() + 5_000_000).unwrap();
+    rq.set_hard_deadline(res, ktimer::now_ns() + 5_000_000)
+        .unwrap();
     assert_eq!(
         rq.pick(),
         Some(res),
@@ -642,10 +674,18 @@ fn test_eevdf_order() {
 
     // Residual work runs only on slack, and is never lost.
     let idle = rq.admit(4, 0, Class::Residual, Burst::new(), 0).unwrap();
-    assert_ne!(rq.pick(), Some(idle), "residual work ran ahead of fair work");
+    assert_ne!(
+        rq.pick(),
+        Some(idle),
+        "residual work ran ahead of fair work"
+    );
     rq.block(quick, true).unwrap();
     rq.block(bulk, true).unwrap();
-    assert_eq!(rq.pick(), Some(idle), "residual work was starved on an idle queue");
+    assert_eq!(
+        rq.pick(),
+        Some(idle),
+        "residual work was starved on an idle queue"
+    );
     assert!(rq.invariant_holds());
 
     // A voluntary block ends the burst; the cached weight must follow.
@@ -659,9 +699,10 @@ fn test_eevdf_order() {
     rq.wake(quick, 0).unwrap();
     let v = rq.get(quick).unwrap();
     assert!(
-        v.vruntime() + 1 >= rq.vtime().saturating_sub(
-            v.slice_ns().saturating_mul(bore::WEIGHT_BASE) / v.weight().max(1)
-        ),
+        v.vruntime() + 1
+            >= rq
+                .vtime()
+                .saturating_sub(v.slice_ns().saturating_mul(bore::WEIGHT_BASE) / v.weight().max(1)),
         "a woken vcore banked more credit than one slice"
     );
     assert!(rq.invariant_holds(), "wake broke the weight cache");

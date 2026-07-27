@@ -293,14 +293,6 @@ pub fn is_fork(flags: u64) -> bool {
     flags & CLONE_VM == 0
 }
 
-/// `fork`: create a new cell in the parent's capability bundle with an eager
-/// private copy of the parent's memory and a deep copy of its personality state
-/// (docs/LINUX-COMPAT.md L6). Returns the child pid to the parent (which keeps
-/// running); the child's frame is primed to return 0. `-EAGAIN` if the cell
-/// table is full (the documented `MAX_CELLS` cap).
-///
-/// Reading `parent_frame` (the calling thread's saved state) is the point.
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
 /// Apply the `madvise` fork advice the parent recorded to the freshly forked
 /// child (docs/SUBSTRATE.md 10a).
 ///
@@ -357,6 +349,14 @@ fn apply_fork_advice(parent: usize, child: usize) {
     }
 }
 
+/// `fork`: create a new cell in the parent's capability bundle with an eager
+/// private copy of the parent's memory and a deep copy of its personality state
+/// (docs/LINUX-COMPAT.md L6). Returns the child pid to the parent (which keeps
+/// running); the child's frame is primed to return 0. `-EAGAIN` if the cell
+/// table is full (the documented `MAX_CELLS` cap).
+///
+/// Reading `parent_frame` (the calling thread's saved state) is the point.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn fork(cur: usize, parent_frame: *mut TrapFrame) -> i64 {
     let Some(child) = (0..MAX_CELLS).find(|&i| procs()[i].state == PState::Free) else {
         return -EAGAIN;

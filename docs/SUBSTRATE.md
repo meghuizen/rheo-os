@@ -1,11 +1,52 @@
 # Substrate 2 - re-founding the cell substrate
 
-**Status:** Draft v0.1. Design only - nothing in this document is built.
-This is the deep analysis of why the current cell substrate fights modern
-software, and the target architecture that replaces it. It changes **no
-doctrine**: the capability model, the kernel object list, the queue ABI,
-W^X, the no-OOM-killer rule and the admission rule all stand. What it
-replaces is the bring-up scaffolding underneath them.
+**Status:** Draft v0.2. **The S1-S4 mechanisms are built and proven; they are
+not yet load-bearing.** This is the deep analysis of why the current cell
+substrate fights modern software, and the target architecture that replaces
+it. It changes **no doctrine**: the capability model, the kernel object list,
+the queue ABI, W^X, the no-OOM-killer rule and the admission rule all stand.
+What it replaces is the bring-up scaffolding underneath them.
+
+## What is built, and what "not yet load-bearing" means
+
+Built and proven by the `substrate` test kernel on all three ISAs, with the
+whole pre-existing suite (62 kernels per ISA) still green:
+
+| Piece | Where | State |
+|---|---|---|
+| Funded kernel metadata (pillar 1) | `kernel/src/mm/kmeta.rs` | **Built.** `Funded<T>` grows past every old `MAX_*`, charges its owner, rolls back a failed reserve, releases exactly |
+| Per-ISA user VA ceiling (pillar 2) | `arch::USER_VA_TOP` | **Built.** x86-64 `2^47`, ARM64 `2^48`, RISC-V Sv39 `2^38` as its own floor |
+| VA region allocator (pillar 2) | `kernel/src/mm/vaspace.rs` | **Built.** First-fit with guard gaps, overlap refused, mid-range release splits |
+| Per-CPU primitives (pillar 3) | `kernel/src/smp.rs` | **Built.** `PerCpu<T>`, `cpu_index()` total, always compiled |
+| Hierarchical timer wheel (pillar 7) | `kernel/src/ktimer/wheel.rs` | **Built.** 64 concurrent deadlines honoured in deadline order beside the named-client slots |
+| Per-CPU timer arbiter (pillar 3/7) | `kernel/src/ktimer/mod.rs` | **Built.** The single-owner invariant is now stated per core |
+| Metrics histograms (pillar 7) | `kernel/src/metrics.rs` | **Built.** Integer-only percentiles, jitter fixed as P95-P50, lazily funded |
+| BORE burst score (pillar 3) | `kernel/src/sched/bore.rs` | **Built.** Integer log2, nice-shaped range, EMA smoothing, fork inheritance |
+| EEVDF run queue (pillar 3) | `kernel/src/sched/vcore.rs` | **Built as ordering logic.** Not yet dispatching |
+| Per-CPU DRBG roots (10a) | `kernel/src/rng/` | **Built.** Derived, never copied |
+| Hard-float userspace std (pillar 4) | `targets/rheo_os-*.json` | **Built.** All three targets flipped; std builds and links |
+| `madvise` (pillar 4 / 10a) | `kernel/src/linux/mem.rs` | **Built.** Real decommit; `WIPEONFORK`/`DONTFORK` honoured by `fork` |
+
+**Not yet load-bearing** is the honest part, and it is a deliberate ordering
+choice rather than an unfinished edge. The new mechanisms exist beside the old
+ones; the kernel's own paths have **not** been migrated onto them:
+
+- The fixed tables (`MAX_CELLS`, `MAX_CAPS_PER_CELL`, `MAX_MAPPED_FILES`,
+  `MAX_CELL_CHANNELS`, `MAX_THREADS`, the object table) are still fixed
+  arrays. `Funded<T>` is what they will become; nothing has moved yet.
+- The magic VA map is still the map. `VaSpace` is proven, and `load.rs` /
+  `user.rs` / `linux::mem` still use their constants.
+- No vcore is dispatched. `RunQueue` decides who *should* run; the cooperative
+  scheduler still decides who *does*, and preemption does not exist.
+- No second core schedules anything. SMP bring-up is unchanged (docs/SMP.md 9).
+- `metrics` records nothing unless a boot calls `enable()`; no subsystem does
+  yet.
+
+That split is the point. Each mechanism is provable on its own against a
+hand-computed oracle *before* anything depends on it, which is the only order
+in which a change this size stays reviewable - and it means the whole
+pre-existing suite passes **unedited**, which is the additivity requirement
+(docs/ENGINEERING.md 8). Migration is stage S1'-S3' below.
 
 Composes: ARCHITECTURE.md (objects, admission rule), SCHEDULING.md 1a (the
 multikernel model - this doc builds it), CONCURRENCY.md (vcores - this doc
@@ -627,6 +668,35 @@ unmeasured" until then.
 
 Per ENGINEERING.md: every stage lands with pre-existing proofs passing
 unedited, and names its own proof kernel.
+
+**The mechanism stages S1-S4 below are built** (see the status table at the
+top). What follows them is the *migration* - moving the kernel's own paths onto
+the new mechanisms - which is where the caps and magic numbers actually
+disappear. It is separated deliberately: building a replacement and switching
+onto it are different risks, and only the second one can break a working
+kernel.
+
+- **S1' - migrate the fixed tables onto `Funded<T>`**, one at a time, each with
+  the cap constant deleted rather than raised. Order by blast radius: the
+  Linux `filemap` and channel tables first (self-contained), the per-cell fd
+  and thread tables next, `MAX_CELLS` and the capability/object tables last
+  (they touch the isolation proofs, so they land with the `cap-invariants` and
+  `security` kernels re-run as the gate). **Done when:** no `MAX_*` capacity
+  constant remains outside the accounting bounds, and a cell's table growth is
+  refused as `-ENOMEM` attributable to that cell while a sibling is unaffected.
+- **S2' - migrate placement onto `VaSpace`.** `load.rs`'s region bases,
+  `user.rs`'s `MMAP_BASE`/`GRANT_BASE`/`FILEMMAP_BASE` and `linux::mem`'s
+  window become allocations; `USER_VA_MAX` becomes `arch::USER_VA_TOP`. The ABI
+  does not change (a cell already learns its addresses from `SYS_QUEUE_INFO` /
+  `SYS_CONNECT` / `SYS_GRANT`). **Done when:** `mmapx`-class collision tests
+  pass with regions allocated rather than fixed, and a cell reserves past the
+  old 256 GiB bound on the two ISAs that have the room.
+- **S3' - dispatch through `RunQueue`.** The cooperative scheduler's pick
+  becomes the queue's pick; every relinquish and preemption charges the burst;
+  `metrics` is enabled at boot. Then preemption, then a second core - the SMP.md
+  10.2 safety audit gating both. **Done when:** the `linuxbun` test flips from
+  its accepted partial to `rheo:42`/exit 0, which is the measured frontier
+  (SMP.md 10.1).
 
 - **S1 - funded metadata.** Statics -> typed slabs charged to cell budgets;
   no semantic change; every existing test green plus a new `substrate` test
