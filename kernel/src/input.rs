@@ -102,6 +102,8 @@ pub fn reset() {
         *addr_of_mut!(RING) = RxRing::new();
         *addr_of_mut!(SOURCE) = Source::Serial;
         *addr_of_mut!(IDLED) = false;
+        *addr_of_mut!(FIFO_TAKES) = 0;
+        *addr_of_mut!(DIRECT_PUSHES) = 0;
     }
 }
 
@@ -194,6 +196,33 @@ pub fn at_eof() -> bool {
     }
 }
 
+/// How [`pump`]'s injected byte actually reached the ring, counted per tier.
+/// **Measured, not claimed**: a non-zero `FIFO_TAKES` means the interrupt did not
+/// deliver it and a non-zero `DIRECT_PUSHES` means the wire had nothing either -
+/// precisely the facts the old code inferred away.
+static mut FIFO_TAKES: u64 = 0;
+static mut DIRECT_PUSHES: u64 = 0;
+
+fn bump(p: *mut u64) {
+    // SAFETY: single CPU, synchronous; a plain counter.
+    unsafe { *p = (*p).wrapping_add(1) };
+}
+
+/// Times [`pump`] had to recover an injected byte from the UART RX FIFO because
+/// the interrupt did not deliver it. Zero on a healthy path.
+pub fn pump_fifo_takes() -> u64 {
+    // SAFETY: single CPU.
+    unsafe { *addr_of!(FIFO_TAKES) }
+}
+
+/// Times [`pump`] had to push an injected byte into the ring itself, because
+/// neither the interrupt nor the FIFO produced it. Zero on a healthy path, and one
+/// console line per occurrence says so.
+pub fn pump_direct_pushes() -> u64 {
+    // SAFETY: single CPU.
+    unsafe { *addr_of!(DIRECT_PUSHES) }
+}
+
 /// What [`pump`] achieved.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Pump {
@@ -230,14 +259,55 @@ pub fn pump() -> Pump {
             }
             let b = data[*pos];
             *pos += 1;
-            if crate::arch::uart_irq_enabled() {
-                unsafe {
-                    *addr_of_mut!(IDLED) = true;
-                }
-                crate::arch::uart_inject_and_wait(b);
-            } else {
+            if !crate::arch::uart_irq_enabled() {
                 rx_push(b);
+                return Pump::Data;
             }
+            // Interrupt-driven: take the byte through the real UART RX interrupt -
+            // the path a live keystroke takes - and then **check that it arrived**.
+            //
+            // The check is the fix. This used to be `uart_inject_and_wait` followed
+            // by an unconditional `Pump::Data`: the arrival was inferred from having
+            // halted. A halt ends on *any* enabled interrupt, and since the timer
+            // one-shot became real on every ISA (docs/SMP.md 5) a competing deadline
+            // can end it with the UART handler never having run - `pump` then
+            // claimed data, the ring was empty, and `SYS_WAIT_INPUT` returned 0.
+            // Seen as an intermittent `schedidle` failure that passed on every
+            // re-run, which is the worst kind: a proof whose result depends on
+            // ordering is not a proof (docs/ENGINEERING.md 1, 11).
+            //
+            // Note what is *not* changed: `uart_inject_and_wait` stays one arch
+            // operation. Its per-ISA sequence - raise the controller line, halt
+            // (which returns at once *because* the interrupt is already pending),
+            // then unmask so it is taken and serviced - is coherent, and splitting
+            // the halt out of it produced a second halt with nothing left to wake
+            // it, wedging the machine. Verified by trying it.
+            unsafe {
+                *addr_of_mut!(IDLED) = true;
+            }
+            crate::arch::uart_inject_and_wait(b);
+            if has_data() {
+                return Pump::Data;
+            }
+            // The interrupt did not deliver it. On a 16550 the loopback byte is
+            // still sitting in the RX FIFO, so recover it from the wire.
+            bump(addr_of_mut!(FIFO_TAKES));
+            if let Some(got) = crate::arch::serial_read_byte() {
+                rx_push(got);
+                return Pump::Data;
+            }
+            // Neither. On ARM64 the injected byte is carried *for* the handler
+            // rather than placed in the PL011's receiver (its loopback does not feed
+            // the RX FIFO), so there is nothing for the tier above to find and only
+            // this one can recover it. Dropping the keystroke would be a silent
+            // wrong answer; the printed line plus `pump_direct_pushes` is how a
+            // degraded interrupt path stays visible instead of being papered over.
+            bump(addr_of_mut!(DIRECT_PUSHES));
+            crate::println!(
+                "input: the UART RX interrupt did not deliver an injected byte and the FIFO was \
+                 empty - delivered directly (interrupt path degraded)"
+            );
+            rx_push(b);
             Pump::Data
         }
         Source::Serial => match crate::arch::serial_read_byte() {

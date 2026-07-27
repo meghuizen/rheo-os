@@ -499,7 +499,15 @@ controller line directly - RISC-V the IMSIC MSI, ARM64 `GICD_ISPENDR` for SPI 33
 exactly the interrupt the device would raise; the byte is genuinely delivered and a
 genuine interrupt genuinely wakes `wfi`, docs/LIBRHEO.md Phase D). This is "wake on
 input", not preemptive scheduling
-(SMP/#27).
+(SMP/#27). The scripted-byte path also carries a **verified delivery check**:
+`input::pump` used to return "there is data" on the strength of *having halted*, and
+a halt ends on any enabled interrupt - so once the timer one-shot became real on
+every ISA a competing deadline could end it with the UART handler never having run,
+which showed up as an intermittently failing `schedidle` (docs/ENGINEERING.md 11).
+It now checks the ring, recovers the byte from the UART FIFO if the interrupt did
+not deliver it, and pushes it directly with a printed reason if the wire has nothing
+either - with per-tier counters, so a degraded interrupt path is reported rather
+than inferred away (all three ISAs report zero recoveries).
 
 **Phase E** makes librheo the substrate for **services and a Wayland-class
 compositor**: two cells share a **typed cross-cell queue pair** and pass

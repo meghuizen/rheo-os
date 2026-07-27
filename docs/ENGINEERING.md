@@ -418,6 +418,35 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   the same evidence discipline as its assertions. Assert the property you needed
   the tool to produce (here: `readelf` the fixture and check `p_memsz`), and be
   suspicious of any build step whose failure mode is a warning.
+- **A wait must report what it observed, not that it waited.** `input::pump`
+  injected a scripted byte, halted once for its UART RX interrupt, and returned
+  "there is data" - on the strength of *having halted*. A halt ends on **any**
+  enabled interrupt, so the moment the timer one-shot became real on every ISA
+  (docs/SMP.md 5) a competing deadline could end it with the UART handler never
+  having run: the ring was empty and `SYS_WAIT_INPUT` returned 0. It surfaced as a
+  `schedidle` failure that passed on the next five runs, which is the worst
+  possible shape - **a proof whose result depends on ordering is not a proof**, and
+  a flaky proof also poisons the evidence for every unrelated change that runs
+  after it. "I waited for X, therefore X happened" is false as soon as more than
+  one thing can end the wait; check the condition, and count the times the
+  fallback fired so a degraded path stays visible instead of being inferred away.
+- **When a fix does not reproduce on demand, build the reproduction rather than
+  shipping the reasoning.** The flake above depended on QEMU's interrupt-model
+  timing, so there was nothing to revert that would fail reliably. The
+  reproduction was to *suppress the interrupt line in the arch layer* - "the
+  interrupt did not deliver" made deterministic - and then run both directions:
+  with the fix, the byte is recovered from the UART FIFO and the run passes; with
+  the inference restored, it fails with the exact original message. That is the
+  difference between "reasoned and code-reviewed" (section 7's honest but weaker
+  label) and proven.
+- **Do not split a sequence you have not understood.** The first attempt at that
+  fix split the arch injector into "inject" and "halt" so the portable code could
+  re-halt until the byte arrived. It wedged the machine: the per-ISA sequence is
+  *raise the controller line, halt - which returns immediately **because** the
+  interrupt is already pending - then unmask so it is taken*, and a second halt has
+  nothing left to wake it. The refactor was reverted and the fix became four lines
+  at the call site. A seam that looks like two steps may be one; the way to find
+  out is to run it, not to read it.
 
 ## 12. Never dereference an address the caller chose
 

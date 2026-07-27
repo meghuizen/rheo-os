@@ -275,6 +275,19 @@ extern "C" fn kernel_main() -> ! {
     }
 
     // ---- phase 2: a console block reschedules, and a real byte wakes it ----
+    //
+    // This phase used to be **flaky on x86-64**, which is worth saying out loud
+    // because a proof whose result depends on ordering is not a proof
+    // (docs/ENGINEERING.md 1). `input::pump` injected the scripted byte, halted
+    // once, and returned "there is data" on the strength of having halted. A halt
+    // ends on *any* enabled interrupt, and phase 1 above arms the timer one-shot -
+    // real on every ISA since docs/SMP.md 5 - so a timer wake could end that halt
+    // with the UART handler never having run: the ring was empty and
+    // `SYS_WAIT_INPUT` returned 0. `pump` now checks, re-parks, and finally reads
+    // the FIFO directly; the counters below make the delivery path measured rather
+    // than assumed.
+    //
+    // Deliberately run **after** the timer phase, so the competing one-shot is live.
     input::reset();
     input::install_script(SCRIPT);
     let (outcome, ret, rounds) = run_pair(BLOCK_CONSOLE, 0);
@@ -290,14 +303,20 @@ extern "C" fn kernel_main() -> ! {
     assert_eq!(io_byte(0), b'Z', "console phase: wrong byte delivered");
     assert_eq!(rounds, ROUNDS, "console phase: peer round counter");
     assert_interleave("console");
+    // **Which** tier delivered the byte, reported rather than assumed. On a healthy
+    // interrupt path both recovery counters are 0; a non-zero one is the fact the
+    // old code inferred away, and the run says so instead of failing at random.
     println!(
-        "schedidle: console: byte 'Z' delivered to the parked cell ({}), {} halt(s)",
+        "schedidle: console: byte 'Z' delivered to the parked cell ({}), {} scheduler halt(s); \
+         pump recovery: {} from the FIFO, {} pushed directly",
         if input::interrupt_driven() {
             "UART RX interrupt"
         } else {
             "polled UART - honest, not an idle"
         },
-        idle::halts()
+        idle::halts(),
+        input::pump_fifo_takes(),
+        input::pump_direct_pushes()
     );
 
     // ---- phase 3: a network block with no NIC keeps its in-trap wait ----
