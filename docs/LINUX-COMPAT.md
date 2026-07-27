@@ -151,7 +151,12 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 | tgkill / tkill / rt_sigqueueinfo | partial | self-targeting only (own pid 1000 / own tids): `raise`/`abort` paths. A signal to a *non-running* sibling **context** is recorded pending, not force-delivered - no fixture needs it. Non-self tgid `-ESRCH` |
 | rt_sigtimedwait | partial | never blocks; returns -EAGAIN so callers loop/bail rather than hang (no fixture waits in it) (L5) |
 | mremap | full | shrink unmaps the tail in place; grow requires MREMAP_MAYMOVE (map a fresh region, copy, free the old); else -ENOMEM. glibc's large-block `realloc` needs it (the malloc-copy-free fallback otherwise leaks frames) |
-| rseq / clone3 | ENOSYS | glibc has documented fallbacks (rseq→unregistered, clone3→clone); verified via the ENOSYS logger that glibc/rust fall back to `clone`, so clone3 stays ENOSYS |
+| rseq / clone3 | ENOSYS | glibc has documented fallbacks (rseq→unregistered, clone3→clone); verified via the ENOSYS logger that glibc/rust fall back to `clone`, so clone3 stays ENOSYS. Both are now **dispatched** to that refusal rather than falling through the unknown-number path, so the log no longer says `ENOSYS nr=435` as if the number were unrecognised (docs/ARCHITECTURE-DEBT.md 4.0) |
+| open (x86-64 legacy) | full | Routed to `openat` with `AT_FDCWD` - the same call. It had been missing, and glibc issues `open` in preference to `openat` on x86-64, so every `open` was refused on **that ISA and nowhere else** (docs/ENGINEERING.md 11, the two-numbers hazard). An unreachable sentinel on the asm-generic tables |
+| eventfd2 | full for the wakeup contract | A 64-bit counter as a per-cell fd over a per-personality registry (`linux::eventfd`), **no kernel object** - the counter lives in the registry, not the descriptor, so `dup`/`fork` share it. Write adds (refusing `u64::MAX` and refusing to overflow), read drains, `EFD_SEMAPHORE` yields 1 and decrements, a zero counter is **not** readable (so poll/epoll report it unready and a blocking read parks under the pipe's runnable-peer rule), sub-8-byte transfers are `-EINVAL`, an unknown flag bit is `-EINVAL` rather than dropped. Scope: a **sibling context** writing it does not wake a context parked on it, which is the L4 cell-level block limitation, not an eventfd one |
+| sysinfo | partial, honestly | `uptime` from the cell's own clock domain, `totalram`/`freeram` from the frame pool, `procs` from the live process count, `mem_unit` 1. `sharedram`/`bufferram`/`totalhigh`/`freehigh`/swap/`loads` are **0 because they are 0** - no page cache, no highmem, no swap, no load average is computed. Bun sizes its heap from these, so a placeholder would be worse than a refusal |
+| sched_setscheduler / getscheduler / get_priority_{max,min} | partial, honestly | One class exists: `SCHED_OTHER`, cooperative round-robin. Setting it at priority 0 succeeds *because it is already in force*; `SCHED_FIFO`/`RR`/`BATCH`/`IDLE` are refused `-EPERM` (the unprivileged-Linux errno every caller handles) rather than accepted and dropped - a real-time guarantee this scheduler cannot keep must not be reported as granted. `getscheduler` reports `SCHED_OTHER`; the priority range is 0..0 |
+| close_range | full | Closes every open descriptor in the inclusive range, skipping already-closed slots as Linux does. `CLOSE_RANGE_CLOEXEC` marks instead of closing; `CLOSE_RANGE_UNSHARE` is refused `-EINVAL` (this personality has no fd table shared separately from the address space) rather than ignored |
 | fork / vfork | full | clone-cell-within-capability-bundle (docs/POSIX-PERSONALITY.md 2): a new `user` cell in the parent's bundle, the parent's committed pages **eager-copied** (COW deferred + documented), `LinuxState`/fd table/cwd/signal dispositions deep-copied, a child pid synthesized; child returns 0, parent returns the pid. Only the calling thread is duplicated (POSIX). Reached via `clone` without `CLONE_VM` on every ISA (glibc's `fork`), or the x86-64 `fork`/`vfork` numbers. Over the `MAX_CELLS` (16) cap → -EAGAIN. `vfork` is treated as `fork` (eager copy, no COW share - safe, just less lazy) (`kernel/src/linux/proc.rs`) |
 | execve | full | replaces the calling cell's image with one **streamed** from the VFS (`load::exec_elf_from_vfs`: only the ELF header + phdrs are buffered; each `PT_LOAD` segment is read page-by-page straight into its destination frame, so the kernel holds no whole-image buffer). Keeps the same cell/pid, cwd, and fd table **except descriptors marked FD_CLOEXEC, which are closed** (it used to keep every fd regardless); resets signal handlers to default and starts single-threaded. ET_EXEC + static-PIE ET_DYN, stock base |
 | wait4 / waitpid | full | the parent blocks cooperatively (switching to a runnable child) until a child exits, then reaps: WIFEXITED/WEXITSTATUS for a normal exit, WIFSIGNALED for a signal-killed child; frees the child cell + its frames. `pid > 0` waits for that child, `pid <= 0` for any; WNOHANG honored; -ECHILD with no children. SIGCHLD is not queued to a handler (the parent reaps directly; documented) |
@@ -693,6 +698,43 @@ it is a later rung of work.
     userspace service is a later phase); `epoll` on a remote TCP socket reports
     "always readable" (the N4b datapath has no non-blocking readiness probe),
     while remote UDP readiness is real.
+
+- **L8-EVENTFD [done]** - **`eventfd2`, plus the six other syscalls the real
+  Claude Code binary was measured issuing** (docs/ARCHITECTURE-DEBT.md 4.0,
+  blocker 3). The seven were taken from that binary's startup `strace`, not
+  guessed. Six are advisory - a program keeps going without them, or glibc has a
+  documented fallback. `eventfd2` is not: it is the epoll event loop's only
+  wakeup path, so refusing it does not degrade the program, it removes the
+  mechanism.
+
+  **No kernel object.** An eventfd is a per-cell fd (`fd::FdKind::EventFd`)
+  indexing a per-personality registry (`kernel/src/linux/eventfd.rs`), exactly as
+  an epoll instance and a pipe are. The counter lives in the **registry**, not in
+  the descriptor: `dup` and `fork` produce a second descriptor for the *same*
+  object, and a counter copied per descriptor gives two counters that silently
+  stop waking each other (docs/ENGINEERING.md 11). Sharing is the whole point of
+  the object, so the shared state *is* the object.
+
+  Blocking is the pipe's machinery, reused: `proc::Block::EventFdRead`, judged by
+  `satisfiable` from kernel state (the waiter's address space is not active
+  there), completed by `complete_block` once it is, classified as an `idle::PEER`
+  wake source, and named in the deadlock diagnostic.
+
+  The other six are in the syscall table above (legacy `open`, `sysinfo`,
+  `sched_setscheduler` + `getscheduler` + `get_priority_{max,min}`,
+  `close_range`, `clone3`, `rseq`). Two are worth repeating here because they are
+  *honesty* fixes rather than features: `sched_setscheduler` accepts the policy
+  already in force and refuses real-time with `-EPERM` instead of accepting and
+  dropping it, and `sysinfo` reports the real frame pool rather than zeros.
+
+  Proven by the `sysx` fixture in `linuxproc` on all three ISAs, asserting each
+  refusal **as** a refusal. Four narrow reverts were each observed failing.
+
+  *Scope (honest):* a **sibling context** writing an eventfd does not wake a
+  context parked on it - a blocking eventfd read parks the whole **cell** under
+  the same `runnable_peer_exists` rule a pipe read uses, which is the L4
+  cell-level block limitation (task #27), not an eventfd-specific one. Within one
+  context, and across processes, the semantics are exact.
 
 ## 6. Fixture build matrix (reproducibility)
 

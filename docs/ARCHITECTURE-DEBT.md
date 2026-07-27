@@ -425,7 +425,9 @@ that change the plan, which is the reason to measure before building.
 | Distinct startup syscalls | **41** | (unstated) |
 | SIMD | AVX2 **and AVX-512** (`vmovdqu64` x857) | "AVX2 baseline" - **AVX-512 not expected** |
 
-Four blockers follow, and they are now facts rather than predictions:
+Four blockers followed, and they were facts rather than predictions. **Three are
+now closed** (1, 3 and 4); the one that remains is **blocker 2, eager paging**,
+and it is the largest piece of work of the four.
 
 1. ~~**The stack is too small by 4.8 MiB.**~~ **CLOSED.** `PT_GNU_STACK` asks
    for 12.8 MiB and `stack::LINUX_STACK_PAGES` was 2048 = 8 MiB. The fix is not
@@ -457,18 +459,26 @@ Four blockers follow, and they are now facts rather than predictions:
    demand-paged from the file and most are never touched; here `mmap` of a file
    reads every page eagerly. This is **exactly** what demand paging (blocker 3)
    deletes, and it is why that rung comes before any attempt to run this.
-3. **Seven syscalls the personality does not dispatch**, measured from the real
-   startup trace rather than guessed:
+3. ~~**Seven syscalls the personality does not dispatch**~~ **CLOSED.** Measured
+   from the real startup trace rather than guessed, and all seven now dispatched:
 
-   | Syscall | Calls | Notes |
+   | Syscall | Calls | What landed |
    |---|---|---|
-   | `open` (x86-64 legacy **2**) | 2 | **A genuine defect of the two-numbers class** (`ENGINEERING.md` §11): glibc issues legacy `open` in preference to `openat`, and the personality implements only `openat`. The same trap that made `readlink` fail on x86-64 alone |
-   | `clone3` | 5 | Constant defined, never dispatched. glibc falls back to `clone` on `-ENOSYS`, so refusing honestly is correct and sufficient |
-   | `rseq` | 6 | Constant defined, never dispatched. Restartable sequences; `-ENOSYS` is the documented fallback |
-   | `sched_setscheduler` | 4 | No constant. JSC sets thread priorities; failure is non-fatal |
-   | `sysinfo` | 2 | No constant. Bun reads total/free memory to size its heap |
-   | `eventfd2` | 1 | No constant. **The epoll event loop's wakeup fd** - this one is load-bearing, not advisory |
-   | `close_range` | 1 | No constant. glibc falls back to a `close` loop |
+   | `open` (x86-64 legacy **2**) | 2 | **Was a genuine defect of the two-numbers class** (`ENGINEERING.md` §11): glibc issues legacy `open` in preference to `openat`, and the personality implemented only `openat`, so every `open` was refused on x86-64 **and nowhere else** - the same trap that made `readlink` fail there alone. Now routed to `openat` with `AT_FDCWD`; an unreachable sentinel on the asm-generic tables, covered by the existing uniqueness guard |
+   | `eventfd2` | 1 | **The load-bearing one**: the epoll event loop's only wakeup path, so refusing it does not degrade the program, it removes the mechanism. `kernel/src/linux/eventfd.rs` - a 64-bit counter as a per-cell fd indexing a per-personality registry (the `linux::epoll` / `linux::pipe` pattern, **no kernel object**). The counter is in the registry, **not** in the `FdKind` variant: `dup`/`fork` make a second descriptor for the *same* object, and a counter copied per descriptor gives two counters that silently stop waking each other. `EFD_SEMAPHORE`, poll/epoll readiness, and a blocking read that parks through the same runnable-peer rule a pipe read uses |
+   | `sysinfo` | 2 | Real numbers, from the frame pool and the cell's own clock domain. Bun sizes its heap from `totalram`/`freeram`, so a zeroed answer is worse than a refusal. `sharedram`/`bufferram`/highmem/swap/`loads` are genuinely 0 here - the true values, not placeholders. `struct sysinfo` is identical on all three LP64 targets, so it lives in portable code with its 112-byte ABI size asserted |
+   | `sched_setscheduler` | 4 | Honest rather than accepted-and-dropped. One scheduling class exists here (cooperative round-robin), so `SCHED_OTHER` at priority 0 succeeds *because it is already in force*, and `SCHED_FIFO`/`RR` are refused `-EPERM` - the errno an unprivileged Linux process gets, which every caller handles. Telling a program it got real-time scheduling on this scheduler would be a lie. `sched_getscheduler` and `sched_get_priority_{max,min}` came with it |
+   | `close_range` | 1 | glibc falls back to a `close` loop, so this is a *performance* call - but it must do the thing, and it does. `CLOSE_RANGE_CLOEXEC` honoured; `CLOSE_RANGE_UNSHARE` refused rather than ignored |
+   | `clone3` | 5 | Constant existed but was never dispatched, so it logged `ENOSYS nr=435` as if the number were unknown. It is known, and refusing it is the *correct* answer - glibc falls back to `clone` - so it now says so deliberately |
+   | `rseq` | 6 | Same shape: known, and "no restartable sequences" is glibc's documented fallback |
+
+   Proven by the `sysx` fixture in `linuxproc` on all three ISAs, which asserts
+   each refusal **as** a refusal. Four narrow reverts were each observed failing:
+   removing the `nr::OPEN` arm (x86-64 only), making an eventfd always report
+   pollable-readable, ending `sched_setscheduler` in `_ => 0`, and zeroing the
+   `sysinfo` totals. The legacy-`open` transcript line differs by ISA on purpose -
+   syscall 2 exists only on the x86-64 table, and that ISA-only existence *was*
+   the defect.
 
 4. ~~**AVX-512 is in the binary.**~~ **NOT A BLOCKER - measured and
    eliminated.** The 857 EVEX instructions sit behind runtime CPU dispatch, and

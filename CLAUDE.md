@@ -361,6 +361,30 @@ unmodified static-glibc AF_UNIX C fixture (socketpair+fork + bind/listen/connect
 accept over an abstract name) on **all three ISAs**. SCM_RIGHTS fd-passing and
 SOCK_DGRAM are documented deferrals.
 
+**The seven measured syscalls are closed** (docs/LINUX-COMPAT.md L8-EVENTFD,
+docs/ARCHITECTURE-DEBT.md 4.0 blocker 3): the set the real Claude Code binary was
+observed issuing in its startup `strace` and the personality did not dispatch. Six
+were advisory; **`eventfd2` was not** - it is the epoll event loop's only wakeup
+path, so refusing it removes the mechanism rather than degrading the program. It
+lands as a per-cell fd over a per-personality registry
+(`kernel/src/linux/eventfd.rs`) - **no new kernel object**, the `epoll`/`pipe`
+precedent - with the counter in the **registry, not the descriptor**, because
+`dup`/`fork` alias one object and a per-descriptor counter would give two counters
+that silently stop waking each other; a zero counter is genuinely not readable, so
+`poll`/`epoll` report it unready and a blocking read parks through the pipe's
+`Block::EventFdRead` machinery. Alongside it: the **legacy x86-64 `open`** (nr 2),
+whose absence refused every `open` on that ISA **and nowhere else** - glibc
+prefers it over `openat` there, the same two-numbers trap as `readlink`;
+**`sysinfo`** with real frame-pool and cell-clock numbers (Bun sizes its heap from
+them, so a zeroed answer is worse than a refusal, and the fields that read 0 are 0
+because they are 0 - no page cache, no swap, no load average);
+**`sched_setscheduler`** accepting the one policy in force and refusing real-time
+`-EPERM` rather than accepting and dropping it; **`close_range`** actually closing
+its range; and **`clone3`/`rseq`** refused *deliberately* instead of falling
+through the unknown-number log. The `sysx` fixture in `linuxproc` proves it on
+**all three ISAs**, asserting each refusal *as* a refusal, with four narrow
+reverts each observed failing.
+
 **librheo** (`librheo/`, docs/LIBRHEO.md) is the greenfield **native userspace
 foundation library** - the role a libc plays, rebuilt for this kernel:
 async-first, capability-native, built ON `runtime/` (not a POSIX threading
@@ -1393,7 +1417,8 @@ kernel/       the no_std kernel library + boot demo bin
               cross-cell scheduler - docs/LIBRHEO.md Phase F, docs/NETSTACK.md 17),
               linux (the Linux personality:
               docs/LINUX-COMPAT.md - incl. the blocking, readiness-computing
-              poll/epoll_wait, a real nanosleep, and blocking stdin), U-mode programs
+              poll/epoll_wait, a real nanosleep, blocking stdin, and eventfd2 as
+              a shared counter registry - eventfd.rs), U-mode programs
               (user_progs.rs incl. the lsh shell), abi
   src/arch/   per-ISA Rust modules incl. paging.rs (one dir per ISA)
   arch/       per-ISA assembly (boot, vectors/traps, context switch, user)
@@ -1441,7 +1466,12 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               multi-process C fixture + the P11 coreutils-suite shell; plus
               `stackx`, which asks for 12 MiB of stack via PT_GNU_STACK and both
               reads it back through RLIMIT_STACK and writes 9280 KiB of it
-              through - the loader used to hand every cell a fixed 8 MiB),
+              through - the loader used to hand every cell a fixed 8 MiB - and
+              `sysx`, the seven measured syscalls: eventfd2's full wakeup contract
+              (an empty counter is NOT pollable-readable, a dup shares it,
+              EFD_SEMAPHORE decrements), a real sysinfo, sched_setscheduler
+              refusing real-time with EPERM, close_range, and clone3/rseq refused
+              deliberately),
               linuxdyn (L7: an unmodified dynamically-linked glibc C hello over
               PT_INTERP + ld-linux + fd-backed mmap), librheoproc (librheo Phase
               F: native spawn/wait + one-shot timer + the lrsh shell + the
