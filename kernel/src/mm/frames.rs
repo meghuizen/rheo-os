@@ -38,7 +38,7 @@ pub fn init() {
     }
 }
 
-/// Frames held back from **cell-driven** allocation (docs/ENGINEERING.md 13):
+/// Frames held back from **cell-driven** allocation (docs/ENGINEERING.md 12):
 /// `SYS_MMAP`/`SYS_COMMIT` and the Linux `mmap`/`mprotect` path refuse once the
 /// free pool would drop below this, so a cell can never take the last frame out
 /// from under the kernel's own allocations - the page tables its mappings need,

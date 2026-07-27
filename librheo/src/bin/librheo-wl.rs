@@ -66,10 +66,42 @@ fn client(ch: &Channel) -> ! {
 /// into the framebuffer, reply with the flip completion.
 fn server(ch: &Channel) -> ! {
     let mut comp = Compositor::new(W, H).expect("librheo-wl: compositor alloc");
-    let (frame_id, sum) = comp.present(ch);
+    let (frame_id, sum, peer_va) = comp.present(ch);
     librheo::println!(
         "compositor: composited frame {frame_id} into framebuffer, checksum {sum:#010x}"
     );
+    // Security regression (docs/ENGINEERING.md 12, finding F3). The client's
+    // sealed grant is mapped read-only *here*, but its frames belong to the
+    // client: freeing them would be a cross-cell use-after-free, and a second
+    // free would panic the kernel. The peer's capability on that grant is
+    // READ-only, so `SYS_MUNMAP`'s grant check (which requires MAP) must refuse
+    // it. Same for this cell's own shared channel ring and its queue region -
+    // one is shared with the client, the other the kernel still holds an overlay
+    // onto. The evidence is unfakeable: after all four refusals the compositor
+    // re-reads the shared buffer and re-checksums it, and the client asserts
+    // that checksum against its own known value.
+    let attempts = [
+        ("peer sealed grant", peer_va),
+        ("shared channel ring", ch.base() as u64),
+        (
+            "own queue region",
+            sys::queue_info().map(|q| q.qp_va).unwrap_or(0),
+        ),
+    ];
+    for (what, va) in attempts {
+        let r = sys::munmap_checked(va as usize, 4096);
+        if r == 0 {
+            librheo::println!("compositor: SYS_MUNMAP of the {what} was ACCEPTED - F3 regression");
+            sys::exit(2)
+        }
+        librheo::println!("compositor: SYS_MUNMAP of the {what} refused OK");
+    }
+    let sum2 = comp.rechecksum();
+    if sum2 != sum {
+        librheo::println!("compositor: framebuffer changed after the refusals ({sum2:#010x})");
+        sys::exit(3)
+    }
+    librheo::println!("compositor: framebuffer intact after all refusals, checksum {sum2:#010x}");
     // Deliver the flip completion to the client (which reaps it, verifies, and
     // exits - ending the run; the compositor is not resumed after this).
     ch.switch_to_peer();

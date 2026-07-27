@@ -47,6 +47,10 @@ name = "isolation-hw"
 path = "src/isolation_hw.rs"
 
 [[bin]]
+name = "security"
+path = "src/security.rs"
+
+[[bin]]
 name = "resources"
 path = "src/resources.rs"
 

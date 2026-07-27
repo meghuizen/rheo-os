@@ -50,6 +50,12 @@ pub struct Channel {
 }
 
 impl Channel {
+    /// Base VA of this end's shared ring region (the frames the two cells drive
+    /// directly). Not this cell's to free - they are shared.
+    pub fn base(&self) -> usize {
+        self.chan_va as usize
+    }
+
     /// Discover and attach this cell's end of the shared channel (slot 0). `None`
     /// if no channel is wired for this cell.
     pub fn open() -> Option<Channel> {

@@ -66,7 +66,7 @@ impl Grant {
         }
         for _ in 0..pages {
             // Exhaustion is a refusal, never a panic: the caller decommits what
-            // it already got (docs/ENGINEERING.md 13).
+            // it already got (docs/ENGINEERING.md 12).
             let Some(pa) = alloc_frame(self.kind) else {
                 return Err(GrantError::TooLarge);
             };

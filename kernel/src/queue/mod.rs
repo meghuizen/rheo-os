@@ -550,7 +550,7 @@ fn rd_u64(p: &[u8; 24], o: usize) -> u64 {
 /// the ring - so each one is bound to that cell's user VA range before it is
 /// handed to a `svc::FileOps` handler or a device driver. A rejected address
 /// completes `STATUS_DENIED`: no dereference, no fault, no panic
-/// (docs/ENGINEERING.md 13).
+/// (docs/ENGINEERING.md 12).
 fn run_opcode(entry: &SqEntry) -> (u32, u32) {
     let p = &entry.payload;
     // Validated cell buffer, or an early `STATUS_DENIED` completion.

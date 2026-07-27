@@ -123,7 +123,7 @@ pub fn handle(nr: u64, args: &[u64; 6]) -> Option<u64> {
                 }
                 // A rejected out-parameter reports **zero** engines, so a cell
                 // that gates on `index < count` (librheo `Engine::info_at`)
-                // reads nothing (docs/ENGINEERING.md 13).
+                // reads nothing (docs/ENGINEERING.md 12).
                 (_, None) => Some(0),
                 (None, _) => Some(n as u64), // index out of range: nothing written
             }
@@ -170,7 +170,7 @@ pub fn handle(nr: u64, args: &[u64; 6]) -> Option<u64> {
         // kernel VAs the *kernel* legitimately passes it (`load::stream_segment`
         // hands it `phys_to_virt(frame)`). So the check belongs here, at the
         // syscall boundary: a rejected address is `-EFAULT`, never a
-        // dereference (docs/ENGINEERING.md 13).
+        // dereference (docs/ENGINEERING.md 12).
         SYS_OPEN => file_ops().map(|o| match path_ok(args[0], args[1]) {
             Some(()) => (o.open)(args[0], args[1], args[2]) as u64,
             None => EFAULT_RET,
@@ -347,7 +347,7 @@ pub fn socket_ops() -> Option<&'static SocketOps> {
 /// directly readable. `len` is capped so a bad request cannot run away.
 fn debug_write(req_va: u64) -> u64 {
     // Both the descriptor and the bytes it points at are cell-supplied
-    // addresses (docs/ENGINEERING.md 13): validate the descriptor, then its
+    // addresses (docs/ENGINEERING.md 12): validate the descriptor, then its
     // payload range, before either is read.
     let Some(req_ptr) = user::user_in::<DebugWrite>(req_va) else {
         return 0;
@@ -496,7 +496,7 @@ fn print_numa() {
 /// Read one PTY line into ShellIo.in_buf. Returns 1 for a line, 0 at EOF.
 fn read_line(io_va: u64) -> u64 {
     // The shell passes the VA of its own `ShellIo`; validated because it is
-    // still a cell-supplied address (docs/ENGINEERING.md 13).
+    // still a cell-supplied address (docs/ENGINEERING.md 12).
     let Some(io) = user::user_out::<ShellIo>(io_va) else {
         return 0;
     };
@@ -545,7 +545,7 @@ fn write(io_va: u64) -> u64 {
 /// Every cell-supplied address reaching this function - the node array, the
 /// result array, each tile descriptor and each matrix/buffer VA inside a
 /// descriptor - is validated against the calling cell's user VA range before it
-/// is dereferenced (docs/ENGINEERING.md 13); a rejected address completes
+/// is dereferenced (docs/ENGINEERING.md 12); a rejected address completes
 /// `STATUS_DENIED`, never a fault and never a kernel access.
 ///
 /// # Safety
@@ -559,7 +559,7 @@ pub fn graph_submit(nodes_va: u64, count: u32, results_va: u64) -> (u32, u32) {
     }
     // Both arrays are cell-supplied addresses: validate the whole extent up
     // front (`count` is already capped at MAX_NODES, so neither product can
-    // overflow) - docs/ENGINEERING.md 13. No alignment is required because the
+    // overflow) - docs/ENGINEERING.md 12. No alignment is required because the
     // accesses below are deliberately unaligned.
     if user::user_buf(nodes_va, count * core::mem::size_of::<GraphNode>()).is_none()
         || user::user_buf_mut(results_va, count * 8).is_none()
@@ -588,7 +588,7 @@ pub fn graph_submit(nodes_va: u64, count: u32, results_va: u64) -> (u32, u32) {
                     return (STATUS_DENIED, 0);
                 }
                 // SAFETY: `node.a` was validated as a readable descriptor-sized
-                // range in the calling cell (docs/ENGINEERING.md 13).
+                // range in the calling cell (docs/ENGINEERING.md 12).
                 let d = unsafe { (node.a as *const BufReduceDesc).read_unaligned() };
                 if d.elems == 0 || d.elems > (1 << 20) || d.dtype > 2 {
                     return (STATUS_DENIED, 0);
@@ -625,7 +625,7 @@ pub fn graph_submit(nodes_va: u64, count: u32, results_va: u64) -> (u32, u32) {
                 }
                 // The three matrix VAs are cell-supplied and the engine walks
                 // them, so bound each by the exact extent the kernel touches
-                // (docs/ENGINEERING.md 13): row `i` of A starts at
+                // (docs/ENGINEERING.md 12): row `i` of A starts at
                 // `i*a_stride`, so A spans `(m-1)*a_stride + k` i8 elements; B
                 // spans `(k-1)*b_stride + n` i8; C spans `(m-1)*c_stride + n`
                 // i32. Dims and strides are already capped at 256 above, so no

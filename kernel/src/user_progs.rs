@@ -16,9 +16,9 @@
 
 use crate::abi::{
     Params, SHELL_BUF, SYS_CAPS, SYS_CPUINFO, SYS_CYCLES, SYS_DOORBELL, SYS_EVENT_COUNT,
-    SYS_EVENT_EMIT, SYS_EXIT, SYS_GRAPH, SYS_LEASE, SYS_LSPCI, SYS_MEMINFO, SYS_NUMA, SYS_PS,
-    SYS_RANDOM, SYS_READLINE, SYS_RESERVE, SYS_SWITCH, SYS_UPTIME, SYS_WRITE, ShellIo,
-    WORKLOAD_CROSSCELL, WORKLOAD_ROUNDTRIP, WORKLOAD_SYSCALL,
+    SYS_EVENT_EMIT, SYS_EXIT, SYS_GRAPH, SYS_LEASE, SYS_LSPCI, SYS_MEMINFO, SYS_MMAP, SYS_MUNMAP,
+    SYS_NUMA, SYS_PS, SYS_QUEUE_INFO, SYS_RANDOM, SYS_READLINE, SYS_RESERVE, SYS_SWITCH,
+    SYS_UPTIME, SYS_WRITE, ShellIo, WORKLOAD_CROSSCELL, WORKLOAD_ROUNDTRIP, WORKLOAD_SYSCALL,
 };
 use crate::queue::{OP_NOP, QueuePair};
 
@@ -88,6 +88,67 @@ fn rdcycle() -> u64 {
         core::arch::asm!("lfence", "rdtsc", out("eax") lo, out("edx") hi, options(nostack, nomem))
     };
     ((hi as u64) << 32) | lo as u64
+}
+
+// A four-argument syscall, for the verbs whose ABI needs more than one
+// register (`SYS_MUNMAP(va, len)`, `SYS_GRANT(out_va, len, kind, flags)`).
+// Same shape and register convention as `syscall` above; unused arguments are
+// passed as zero. Per-ISA because it is the U-mode syscall instruction itself.
+
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    let ret;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") nr,
+            inlateout("a0") a0 => ret,
+            in("a1") a1,
+            in("a2") a2,
+            in("a3") a3,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    let ret;
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") nr,
+            inlateout("x0") a0 => ret,
+            in("x1") a1,
+            in("x2") a2,
+            in("x3") a3,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    let ret;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") nr => ret,
+            in("rdi") a0,
+            in("rsi") a1,
+            in("rdx") a2,
+            in("r10") a3,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
 }
 
 // -------------------------------------------------------------- programs
@@ -193,6 +254,118 @@ pub extern "C" fn user_prober(params_va: usize) -> ! {
     unsafe {
         (*p).status = 1;
         syscall(SYS_EXIT, 1);
+    }
+    loop {}
+}
+
+// ------------------------------------------------------- security attacker
+//
+// The `security` test kernel's probes (docs/ENGINEERING.md 12). An
+// **unprivileged** U-mode cell attempts each of the three audited attacks and
+// reports what the kernel returned; the kernel then asserts both the return code
+// and an invariant the cell cannot fake (a canary word it never mapped, the
+// frame-pool free count, a still-working queue ring).
+//
+// Each attack is its **own entry point** rather than one function switching on
+// `Params.workload`: a dense integer dispatch - `match` or an if/else chain -
+// lowers to a jump table in kernel `.rodata`, which a cell cannot read, so the
+// probe would fault before attacking anything. `Params.iters` carries the
+// address the kernel wants probed; `ticks`/`ops`/`status` carry results back.
+
+/// Call `SYS_QUEUE_INFO(out_va = Params.iters)` and report the return in
+/// `status`. With a kernel VA (or a null / unaligned / out-of-range one) the call
+/// must be refused; with the cell's own `Params.ticks` it must succeed, and the
+/// 16-byte `QueueInfo` then lands in `ticks` (qp_va) and `ops` (cap_id).
+#[unsafe(link_section = ".user.text")]
+#[unsafe(no_mangle)]
+pub extern "C" fn user_attack_out(params_va: usize) -> ! {
+    let p = params_va as *mut Params;
+    // SAFETY: the cell's own mapped Params page (its entry argument).
+    unsafe {
+        let out = (*p).iters;
+        (*p).status = syscall(SYS_QUEUE_INFO, out);
+        syscall(SYS_EXIT, 0);
+    }
+    loop {}
+}
+
+/// Call `SYS_MMAP(len = Params.iters)` and report the base VA in `ticks`
+/// (0 = refused).
+#[unsafe(link_section = ".user.text")]
+#[unsafe(no_mangle)]
+pub extern "C" fn user_attack_mmap(params_va: usize) -> ! {
+    let p = params_va as *mut Params;
+    // SAFETY: as above.
+    unsafe {
+        let len = (*p).iters;
+        (*p).ticks = syscall(SYS_MMAP, len);
+        syscall(SYS_EXIT, 0);
+    }
+    loop {}
+}
+
+/// The legitimate anon round trip librheo's `mem::Grant`/`Mapping` drop relies
+/// on: map two pages, write one, read it back, unmap them. `ticks` = the base VA,
+/// `status` = the value read back (1 if the mapping worked), `ops` = the
+/// `SYS_MUNMAP` return (0 = accepted).
+#[unsafe(link_section = ".user.text")]
+#[unsafe(no_mangle)]
+pub extern "C" fn user_attack_mmap_roundtrip(params_va: usize) -> ! {
+    let p = params_va as *mut Params;
+    // SAFETY: as above; `base` is a mapping the kernel just made for this cell.
+    unsafe {
+        let base = syscall(SYS_MMAP, 8192);
+        (*p).ticks = base;
+        if base != 0 {
+            (base as *mut u64).write_volatile(1);
+            (*p).status = (base as *const u64).read_volatile();
+            (*p).ops = syscall4(SYS_MUNMAP, base, 8192, 0, 0);
+        }
+        syscall(SYS_EXIT, 0);
+    }
+    loop {}
+}
+
+/// Call `SYS_MUNMAP(Params.iters, 4096)` and report the return in `ticks`
+/// (`u64::MAX` = refused). Used for a kernel VA, the cell's own `.user` stack,
+/// and the channel / loaded-queue / unreserved-grant region bases.
+#[unsafe(link_section = ".user.text")]
+#[unsafe(no_mangle)]
+pub extern "C" fn user_attack_munmap(params_va: usize) -> ! {
+    let p = params_va as *mut Params;
+    // SAFETY: as above.
+    unsafe {
+        let va = (*p).iters;
+        (*p).ticks = syscall4(SYS_MUNMAP, va, 4096, 0, 0);
+        syscall(SYS_EXIT, 0);
+    }
+    loop {}
+}
+
+/// `SYS_MUNMAP` of the cell's **own queue-pair region** (`Params.iters`), then a
+/// full `OP_NOP` round trip over that ring. `ticks` = the munmap return,
+/// `ops` = the completion status, `status` = 1 if a completion came back - so a
+/// refused munmap is proven not to have broken the ring the kernel still holds an
+/// overlay onto.
+#[unsafe(link_section = ".user.text")]
+#[unsafe(no_mangle)]
+pub extern "C" fn user_attack_munmap_queue(params_va: usize) -> ! {
+    let p = params_va as *mut Params;
+    // SAFETY: as above; `qp_addr`/`cap_id` are the cell's own queue overlay and
+    // capability, handed to it by the loader.
+    unsafe {
+        let va = (*p).iters;
+        (*p).ticks = syscall4(SYS_MUNMAP, va, 4096, 0, 0);
+        let qp = (*p).qp_addr as *const QueuePair;
+        let cap = (*p).cap_id as u32;
+        if (*qp).submit(OP_NOP, cap, 0, 0) {
+            syscall(SYS_DOORBELL, 0);
+            if let Some(st) = (*qp).reap() {
+                (*p).ops = st as u64;
+                (*p).status = 1;
+            }
+        }
+        syscall(SYS_EXIT, 0);
     }
     loop {}
 }

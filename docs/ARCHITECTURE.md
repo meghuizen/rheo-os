@@ -525,6 +525,25 @@ revoke-by-epoch, grant check. Properties to machine-check (Verus):
 4. **Isolation lemma:** two cells with disjoint capability sets cannot affect
    each other's memory or queues through any kernel path.
 
+Property 4 has a **precondition that is not itself about capabilities**, and an
+audit found the implementation missing it: the kernel services a trap in
+S-mode/EL1/ring 0 *with the calling cell's root active*, and every cell root maps
+all of kernel RAM supervisor-RWX through the linear map. So an address a cell puts
+in a syscall argument reaches kernel memory unless the kernel bounds it, and a
+resource a cell names by address is freed out from under another cell unless the
+kernel checks ownership. Neither is visible to a proof about mint/delegate/revoke:
+the capability core can be perfectly sound while an out-parameter write, an
+unbounded allocation length, or an unowned `munmap` walks straight through it.
+
+The isolation lemma therefore reads, in full: **for every kernel entry point, an
+address or length or handle a cell supplies is bounded, budgeted or
+ownership-checked before use** - and only then does "disjoint capability sets"
+imply non-interference. `docs/ENGINEERING.md` 12 is the corresponding engineering
+rule, the `security` test kernel is the runtime evidence from an unprivileged
+cell, and the three findings behind it are recorded there. When the Verus work
+starts, this precondition is part of what layer 1 must state, not an assumption
+underneath it.
+
 Benchmark: seL4 proved this class of property is achievable. Kill criterion:
 if the proof effort exceeds ~2 person-years without closing, shrink the core
 further or adopt seL4's kernel as the bottom layer instead of writing one.

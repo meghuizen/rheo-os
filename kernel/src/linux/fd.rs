@@ -308,7 +308,7 @@ impl FdTable {
     ///
     /// `buf_va` is bound to the calling cell's user VA range here rather than
     /// only at the syscall entry, because `readv`/`writev` reach this with a
-    /// **per-iovec** base the entry check never saw (docs/ENGINEERING.md 13).
+    /// **per-iovec** base the entry check never saw (docs/ENGINEERING.md 12).
     pub fn read(&mut self, fd: i64, buf_va: u64, count: u64) -> i64 {
         let Some(slot) = usize_fd(fd) else {
             return -EBADF;

@@ -205,7 +205,7 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
     // kernel services this trap with the cell's root active, in which all of
     // kernel RAM is mapped supervisor-RWX. So the whole Linux ABI surface is
     // bounded here, at the single dispatch point, rather than at ~60 individual
-    // dereferences (docs/ENGINEERING.md 13). A rejected address is `-EFAULT`,
+    // dereferences (docs/ENGINEERING.md 12). A rejected address is `-EFAULT`,
     // exactly as Linux reports it.
     if !ptr_args_ok(nr_val, args) {
         return err(errno::EFAULT);
@@ -413,7 +413,7 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
 }
 
 /// Bound every cell-supplied pointer argument of Linux syscall `nr_val`
-/// against the calling cell's user VA range (docs/ENGINEERING.md 13). `false`
+/// against the calling cell's user VA range (docs/ENGINEERING.md 12). `false`
 /// means the call is refused `-EFAULT` before any handler runs.
 ///
 /// The table is deliberately in one place: the mapping from a syscall number to

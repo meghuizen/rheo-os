@@ -32,7 +32,7 @@ const MMAP_BASE: usize = 0x3_0000_0000;
 static mut MMAP_NEXT: usize = MMAP_BASE;
 
 // ======================================================================
-// User-pointer validation (docs/ENGINEERING.md 13)
+// User-pointer validation (docs/ENGINEERING.md 12)
 // ======================================================================
 //
 // Every syscall out-parameter, every queue payload VA and every buffer a
@@ -515,7 +515,7 @@ pub fn with_current_aspace<R>(f: impl FnOnce(&mut AddressSpace) -> R) -> R {
 }
 
 // ======================================================================
-// Per-cell frame budget (docs/ENGINEERING.md 13, docs/ARCHITECTURE.md 5)
+// Per-cell frame budget (docs/ENGINEERING.md 12, docs/ARCHITECTURE.md 5)
 // ======================================================================
 //
 // `len` on `SYS_MMAP`/`SYS_COMMIT` (and the Linux `mmap`/`mprotect` path) is
@@ -649,7 +649,7 @@ pub fn map_anon_at(va: usize, len: usize, perm: MapPerm) -> bool {
 /// or, on aarch64 where the `.user` window is linked low, of the shared U-mode
 /// code - from reaching the allocator at all. **Ownership** of the range is a
 /// separate, stronger check the native `SYS_MUNMAP` applies on top
-/// (docs/ENGINEERING.md 13).
+/// (docs/ENGINEERING.md 12).
 pub fn unmap_range(va: usize, len: usize) -> usize {
     if len == 0 {
         return 0;
@@ -756,7 +756,7 @@ pub fn protect_range(va: usize, len: usize, perm: MapPerm) {
 /// Returns 0 when the request is refused: an empty `len`, a `len` the cell's
 /// frame budget or the pool (less the kernel reserve) cannot cover, or a span
 /// that would run past the cell's user VA range. Refusing costs no frames
-/// (docs/ENGINEERING.md 13) - before this check, `SYS_MMAP(1 << 40)` from an
+/// (docs/ENGINEERING.md 12) - before this check, `SYS_MMAP(1 << 40)` from an
 /// unprivileged cell panicked the kernel with "frame pool exhausted".
 fn mmap_anon(cur: usize, len: usize) -> usize {
     if len == 0 {
@@ -813,7 +813,7 @@ fn grant_create(cur: usize, out_va: u64, len: usize, kind: u64, _flags: u64) -> 
         return u64::MAX; // empty / unknown kind / device-BAR (no backing)
     }
     // Validate the out-parameter BEFORE minting anything: a refused call must
-    // consume no capability and no grant slot (docs/ENGINEERING.md 13).
+    // consume no capability and no grant slot (docs/ENGINEERING.md 12).
     let Some(out) = user_out::<GrantInfo>(out_va) else {
         return u64::MAX;
     };
@@ -878,7 +878,7 @@ fn grant_create(cur: usize, out_va: u64, len: usize, kind: u64, _flags: u64) -> 
 ///
 /// Three sets of frames reachable in a cell's address space are *not* its own,
 /// and freeing any of them is a cross-cell use-after-free plus a reachable
-/// "double free" kernel panic (docs/ENGINEERING.md 13):
+/// "double free" kernel panic (docs/ENGINEERING.md 12):
 ///
 ///  - the **shared channel** ring, one region mapped RW into two cells
 ///    (`nproc::spawn`, `load::map_channel_into`);
@@ -1019,7 +1019,7 @@ fn grant_seal(cur: usize, cap_id: u32) -> u64 {
 fn grant_share(cur: usize, cap_id: u32, out_va: u64) -> u64 {
     let peer = cur ^ 1;
     // Validate the out-parameter before mapping anything into the peer: a
-    // refused call must leave both cells untouched (docs/ENGINEERING.md 13).
+    // refused call must leave both cells untouched (docs/ENGINEERING.md 12).
     let Some(out) = user_out::<ShareInfo>(out_va) else {
         return u64::MAX;
     };
@@ -1119,7 +1119,7 @@ fn mmap_file(cur: usize, fd: u64, offset: u64, len: usize) -> usize {
     let base = cells()[cur].filemmap_next;
     let pages = bytes / frames::FRAME_SIZE;
     // `len` is cell-supplied here too: bound the span and charge the frames
-    // before mapping anything (docs/ENGINEERING.md 13).
+    // before mapping anything (docs/ENGINEERING.md 12).
     let Some(top) = base.checked_add(bytes) else {
         return 0;
     };
@@ -1174,7 +1174,7 @@ fn reserve_admit(
         return 1; // no capability tables - treat as bad params
     }
     // Validate the out-parameter before admitting anything: a refused call must
-    // not move the admission total (docs/ENGINEERING.md 13). A bad out-pointer
+    // not move the admission total (docs/ENGINEERING.md 12). A bad out-pointer
     // is reported as BadParams (1) - it is exactly that.
     let Some(out) = user_out::<ReserveInfo>(out_va) else {
         return 1;
@@ -1643,7 +1643,7 @@ pub fn on_user_trap(
                     0
                 }
                 // No mapped queue, or a rejected out-parameter: refuse without
-                // writing (docs/ENGINEERING.md 13).
+                // writing (docs/ENGINEERING.md 12).
                 _ => u64::MAX,
             };
             arch::set_syscall_ret(unsafe { &mut *frame }, ret);
@@ -1777,7 +1777,7 @@ pub fn on_user_trap(
             frame
         }
         // Ownership-checked teardown: only frames the cell holds through a live
-        // MemoryGrant capability or its own bump regions (docs/ENGINEERING.md 13).
+        // MemoryGrant capability or its own bump regions (docs/ENGINEERING.md 12).
         SYS_MUNMAP => {
             let r = sys_munmap(cur, args[0] as usize, args[1] as usize);
             arch::set_syscall_ret(unsafe { &mut *frame }, r);

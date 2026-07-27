@@ -274,6 +274,14 @@ pub fn seal(cap_id: u32) -> u64 {
 pub fn munmap(va: usize, len: usize) {
     unsafe { syscall2(SYS_MUNMAP, va as u64, len as u64) };
 }
+/// [`munmap`] keeping the kernel's answer: 0 accepted, `u64::MAX` refused. The
+/// kernel only tears down frames this cell owns - a typed grant it holds a MAP
+/// capability on, or its own anon/file mmap regions - so a shared channel ring, a
+/// peer's shared grant and the queue region are all refused
+/// (docs/ENGINEERING.md 12).
+pub fn munmap_checked(va: usize, len: usize) -> u64 {
+    unsafe { syscall2(SYS_MUNMAP, va as u64, len as u64) }
+}
 /// Map `len` bytes of the file open on `fd` at `offset` into the cell; returns
 /// the base VA (0 fails).
 pub fn mmap_file(fd: u64, offset: u64, len: usize, flags: u64) -> usize {

@@ -61,7 +61,7 @@ pub fn brk(st: &mut LinuxState, addr: u64) -> u64 {
     if new > st.brk_cur {
         // A refused grow leaves the break where it was: glibc treats the
         // returned break as authoritative and falls back to mmap
-        // (docs/ENGINEERING.md 13).
+        // (docs/ENGINEERING.md 12).
         if !user::map_anon_at(st.brk_cur, new - st.brk_cur, MapPerm::UserRw) {
             return st.brk_cur as u64;
         }
@@ -159,7 +159,7 @@ fn map_file(
         // also uncharges it, and refuses a VA outside the cell's user range.
         user::unmap_range(va, FRAME_SIZE);
         // A file mapping is charged to the cell like an anonymous one; a
-        // refusal maps nothing further (docs/ENGINEERING.md 13).
+        // refusal maps nothing further (docs/ENGINEERING.md 12).
         let Some(pa) = user::alloc_user_frame() else {
             return false;
         };
