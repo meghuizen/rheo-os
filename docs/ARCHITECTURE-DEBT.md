@@ -492,16 +492,25 @@ so was its claim of 182 MiB of `.bss`, which measurement shows does not exist.
    image lazy, a cell passes a pointer into its own untouched rodata to `write` and
    the *kernel* dereferences an absent user page - a load fault at a kernel PC, which
    is not resumable here. That is why Linux has `copy_from_user` with a fixup table.
-   The fix needs no new mechanism: the F1 hardening already routes **every**
-   cell-supplied pointer through `user::user_read_ok`/`user_write_ok`/`user_buf`, so
-   those checks gain "ensure present" alongside "in range". That was implemented and
-   **functionally proven** - with it, unmodified static *and* dynamic glibc run with
-   their images demand-paged - and then **reverted on a measurement**: 11,516 of
-   11,520 demand fills came from the kernel pre-faulting rather than from the program,
-   a ~2,900x amplification in the hottest path in the kernel. Right answer, wrong
-   cost; the outstanding question is which call site asks for pages the program never
-   touches (a range validated in full versus the bytes actually transferred is the
-   leading candidate). It must land, correctly, first.
+   **That prerequisite is now closed.** The F1 hardening already routes every
+   cell-supplied pointer through one set of helpers, so those gained "ensure present"
+   beside "in range" - the same question a `copy_from_user` fixup answers, asked once
+   at the seam instead of at every dereference. The placement was the whole problem:
+   putting it in the bare `user_read_ok`/`user_write_ok` predicates cost a **~2,900x**
+   amplification (11,516 of 11,520 demand fills came from the kernel), because
+   `unmap_range` uses them purely to *bound* a range and so materialised every page
+   immediately before freeing it. Moving it to the helpers that hand back something to
+   **dereference** brings it to **0** kernel pre-faults, measured every run.
+
+   With that in place, demand-paging the ELF image **works for the cases that were
+   measured to matter**: `linuxrun` and `linuxdyn` pass with unmodified static and
+   *dynamically linked* glibc running from demand-paged images. It is still not merged,
+   because a third failure remains - `procdemo` (fork + pipe + execve) takes a SIGILL,
+   and it does so with `execve` left eager, so the interaction is with **`fork`**: a
+   demand-paged parent hands the child an address space missing most of the image while
+   the child's copied VMA records name the backing store. Two of the three failures on
+   this path are fixed (a reset-ordering hazard, and a segment with a `.bss` tail in one
+   record); the third is the next thing to chase.
 
    **Still open:** the ELF image itself. `load::load_elf_linux` streams every
    `PT_LOAD` page into a frame at load time, and for an `ET_EXEC`-with-`PT_INTERP`

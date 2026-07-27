@@ -439,6 +439,15 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   the inference restored, it fails with the exact original message. That is the
   difference between "reasoned and code-reviewed" (section 7's honest but weaker
   label) and proven.
+- **"Am I allowed to address this?" and "am I about to touch it?" are different
+  questions.** Demand paging needed the kernel to make a user page present before
+  dereferencing it. The tree already had one choke point for cell-supplied pointers, so
+  the guard went there - into `user_read_ok`/`user_write_ok`. It cost a ~2,900x
+  amplification, because `unmap_range` calls the *same predicate* purely to bound a
+  range, and so materialised every page in it immediately before freeing it. The guard
+  belongs on the helpers that hand back something to dereference, not on the predicate
+  that answers whether an address is permissible. When one function answers two
+  questions, a change to it lands on both callers.
 - **A correctness fix that works must still be measured before it ships.** Adding
   "ensure the page is present" to the kernel's user-pointer checks made unmodified
   static *and* dynamic glibc run with demand-paged images - the functional proof was
