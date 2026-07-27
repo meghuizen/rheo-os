@@ -194,11 +194,11 @@ fn test_ddr_unaffected() {
 /// `grant_commit` recorded the kind and then called `frames::alloc`, so a `Pmem`
 /// grant was DDR with nothing printed.
 ///
-/// Where the machine exposes no nvdimm (arm/riscv `virt`) the cell still succeeds
-/// - the commit falls back to DDR - but the kernel must have **said so**, which
-/// is the other half of the honesty requirement (docs/ENGINEERING.md 7). That
-/// path is asserted as "the DDR pool paid instead", with the printed reason
-/// visible in the log.
+/// Where the machine exposes no nvdimm (arm/riscv `virt`) the cell still
+/// succeeds, because the commit falls back to DDR, but the kernel must have
+/// **said so** - the other half of the honesty requirement
+/// (docs/ENGINEERING.md 7). That path is asserted as "the DDR pool paid
+/// instead", with the printed reason visible in the log.
 fn test_cell_grant_reaches_the_pmem_pool() {
     let have_nvdimm = frames_pmem::region().is_some();
     let (free_pmem_before, _) = frames_pmem::stats();

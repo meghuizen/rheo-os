@@ -320,13 +320,25 @@ blocker (Bun >= 1.0.16 uses epoll).
 
 Three blockers are **design decisions**, not unfinished work:
 
-1. **W^X is structural.** `MapPerm` has three variants and no RWX
-   (`arch/mod.rs:44-51`), and `mmap(PROT_READ|WRITE|EXEC)` **returns success
-   while silently dropping EXEC** (`linux/mem.rs:42-50`). JSC maps its JIT pool
-   RWX on Linux, so it would fault jumping into generated code with **no
-   diagnostic**. The `mprotect` RW->RX flip path does work, so a flipping JIT is
-   viable where an RWX one is not. Either add `UserRwx` (a doctrine change
-   needing a §6 pass) or run with the JIT off via an environment variable.
+1. **W^X is structural** - *the silent part is now closed; the doctrine question
+   is still open.* `MapPerm` has three variants and no RWX (`arch/mod.rs:44-51`),
+   by design (ARCHITECTURE.md 5). But `mmap(PROT_READ|WRITE|EXEC)` **returned
+   success while silently dropping EXEC**, so JSC - which maps its JIT pool RWX on
+   Linux - would fault on its first jump into generated code with **no diagnostic
+   near the cause**.
+
+   Fixed: `mmap` and `mprotect` refuse `PROT_WRITE | PROT_EXEC` with `-EPERM` and
+   a printed reason. That is the answer a caller can act on, because the `mprotect`
+   RW->RX **flip** path works - a flipping JIT is viable where an RWX one is not,
+   and silently dropping the bit removed that choice. `mmapx.c` asserts the
+   refusal on both syscalls *and* that the flip path works, on all three ISAs;
+   observed failing reverted (*"PROT_WRITE|PROT_EXEC was accepted"*).
+
+   **Still a decision, not a task:** whether to add a `UserRwx` variant. It needs
+   the ARCHITECTURE.md 6 admission pass - W^X is a constitutional property here,
+   not an implementation detail - and the alternative (run Claude Code's JIT off
+   via its environment) trades a doctrine change for a large performance loss on a
+   JavaScript workload. Deliberately not decided in a patch.
 2. **No VMA list at all** - *the silent-corruption half is now closed.* `mmap` is
    a forward bump cursor (`mem.rs`), so nothing detects placement collisions. The
    cursor was also **unbounded**, which is what made it dangerous rather than

@@ -254,6 +254,8 @@ extern "C" fn kernel_main() -> ! {
     let want_mmap: &[u8] = b"mmap: small anonymous mapping usable\n\
         mmap: oversized reservation ENOMEM\n\
         mmap: MAP_FIXED over the queue region EINVAL\n\
+        wx: mmap PROT_WRITE|PROT_EXEC EPERM\n\
+        wx: RW->RX flip works, mprotect to RWX EPERM\n\
         mmapx OK\n";
     let (code, out) = run_capture(MMAPX, &[b"mmapx"]);
     assert!(
@@ -265,8 +267,10 @@ extern "C" fn kernel_main() -> ! {
     assert!(code == 0, "mmapx: exit {code}, expected 0");
     println!(
         "linuxproc: mmap bound OK - an ordinary mapping works, a request larger \
-         than the region is ENOMEM instead of running into ld.so, and MAP_FIXED \
-         over the cell's queue region is EINVAL"
+         than the region is ENOMEM instead of running into ld.so, MAP_FIXED \
+         over the cell's queue region is EINVAL, and W^X is honest - RWX is \
+         EPERM rather than a success that silently drops EXEC, while the RW->RX \
+         flip a JIT falls back to works"
     );
 
     println!("linuxproc: PASS");

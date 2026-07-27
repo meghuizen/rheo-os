@@ -76,6 +76,52 @@ int main(void) {
   }
   puts("mmap: MAP_FIXED over the queue region EINVAL");
 
+  /* 4. W^X is structural, and now honest. `mmap(PROT_WRITE|PROT_EXEC)` used to
+   *    return success and silently drop EXEC - so a JIT that maps its code pool
+   *    RWX (which is what JavaScriptCore does on Linux) would fault on its first
+   *    jump into generated code, with no diagnostic near the cause. `EPERM` is
+   *    the answer that lets a caller act. */
+  void *wx = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (wx != MAP_FAILED) {
+    puts("wx: PROT_WRITE|PROT_EXEC was accepted");
+    return 1;
+  }
+  if (errno != EPERM) {
+    puts("wx: PROT_WRITE|PROT_EXEC refused with the wrong errno");
+    return 1;
+  }
+  puts("wx: mmap PROT_WRITE|PROT_EXEC EPERM");
+
+  /* 5. And the fallback a JIT can actually take: map RW, write code bytes, then
+   *    flip to RX. That path works, which is why refusing RWX is a choice a
+   *    caller can route around rather than a dead end. */
+  unsigned char *code = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (code == MAP_FAILED) {
+    puts("wx: RW mapping for the flip path failed");
+    return 1;
+  }
+  memset(code, 0x90, 64); /* filler; not executed - see below */
+  if (mprotect(code, 4096, PROT_READ | PROT_EXEC) != 0) {
+    puts("wx: RW->RX flip failed");
+    return 1;
+  }
+  /* Deliberately NOT jumping into it: the point being proven is that the
+   * permission transition is available, and emitting real instructions for three
+   * ISAs from one fixture would prove something else. Reading it back confirms the
+   * page is still mapped and readable after the flip. */
+  if (code[0] != 0x90) {
+    puts("wx: page unreadable after the flip");
+    return 1;
+  }
+  if (mprotect(code, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) == 0 ||
+      errno != EPERM) {
+    puts("wx: mprotect to RWX was not refused");
+    return 1;
+  }
+  puts("wx: RW->RX flip works, mprotect to RWX EPERM");
+
   puts("mmapx OK");
   return 0;
 }

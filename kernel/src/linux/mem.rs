@@ -85,6 +85,10 @@ pub const fn mmap_base() -> usize {
 /// Map mmap `prot` bits onto a W^X `MapPerm`. PROT_EXEC without PROT_WRITE is
 /// executable-read; PROT_WRITE is read-write; anything else (PROT_READ,
 /// PROT_NONE) is read-only.
+///
+/// Callers must reject `PROT_WRITE | PROT_EXEC` **before** calling this (see
+/// [`wx_refused`]): there is no RWX `MapPerm`, and this function would quietly
+/// return `UserRw`.
 fn perm_from_prot(prot: u64) -> MapPerm {
     if prot & PROT_EXEC != 0 && prot & PROT_WRITE == 0 {
         MapPerm::UserRx
@@ -93,6 +97,35 @@ fn perm_from_prot(prot: u64) -> MapPerm {
     } else {
         MapPerm::UserRo
     }
+}
+
+/// Refuse a simultaneously writable and executable mapping - and **say so** -
+/// rather than granting it and dropping EXEC (docs/ARCHITECTURE-DEBT.md 4,
+/// blocker 1).
+///
+/// W^X is structural here: [`MapPerm`] has three variants and no RWX, by design
+/// (ARCHITECTURE.md 5). But `mmap`/`mprotect` used to *accept* `PROT_WRITE |
+/// PROT_EXEC`, run it through [`perm_from_prot`], and hand back a plain
+/// read-write mapping while **reporting success**. A JIT that maps its code pool
+/// RWX - which is what JavaScriptCore does on Linux - would then fault on its
+/// first jump into generated code, with no diagnostic anywhere near the cause.
+///
+/// `-EPERM` is the answer that lets a caller act: the W->X *flip* path
+/// (`mprotect` RW then RX) works here, and a JIT that checks its `mmap` result
+/// can take it. Silently dropping the bit removes that choice.
+///
+/// Whether to add a `UserRwx` variant is a **doctrine** question - it needs the
+/// ARCHITECTURE.md 6 admission pass, not a patch - and is deliberately left open.
+/// This only makes the current answer honest.
+fn wx_refused(prot: u64, what: &str) -> bool {
+    if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+        crate::println!(
+            "linux: {what} PROT_WRITE|PROT_EXEC refused (W^X is structural; \
+             use mprotect RW then RX)"
+        );
+        return true;
+    }
+    false
 }
 
 /// brk(addr): grow or shrink the heap. `brk(0)` (and any address below the
@@ -144,6 +177,9 @@ pub fn mmap(
 ) -> i64 {
     if len == 0 {
         return -EINVAL;
+    }
+    if wx_refused(prot, "mmap") {
+        return -EPERM;
     }
     let bytes = page_up(len as usize);
     let fixed = flags & MAP_FIXED != 0;
@@ -307,6 +343,9 @@ pub fn munmap(addr: u64, len: u64) -> i64 {
 /// arena/stack growth path, docs/LINUX-COMPAT.md L4); PROT_NONE decommits the
 /// range, returning its frames to the pool.
 pub fn mprotect(addr: u64, len: u64, prot: u64) -> i64 {
+    if wx_refused(prot, "mprotect") {
+        return -EPERM;
+    }
     if prot & PROT_ANY == 0 {
         user::unmap_range(addr as usize, len as usize);
     } else {
