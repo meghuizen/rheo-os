@@ -667,19 +667,22 @@ mirroring the Linux personality's `linux::proc` (docs/LINUX-COMPAT.md L6) for
   the Linux personality's job, L5); a native fault is terminal for the child.
 - **`SYS_ARM_TIMER` (47)** - `arm_timer(deadline_ns)`. Blocks until `deadline_ns`
   of monotonic time elapse. The "arm timer" verb, a one-shot deadline - now the
-  OS's **second interrupt**, and a **genuine 0%-CPU park on riscv64 and aarch64**
-  (the kernel arms the per-ISA timer and halts at `wfi` until it fires): **riscv**
-  the Sstc `stimecmp` CSR (S timer interrupt, `scause` = int | 5); **aarch64** the
-  CNTV virtual timer (`CNTV_CVAL_EL0` / `CNTV_CTL_EL0`, PPI 27 through the GICv3
-  redistributor). **x86-64** drives the LAPIC one-shot LVT timer (vector 0x20) over
-  the **x2APIC MSR block**, and this was documented as working on all three ISAs -
-  but rheo-net N2h made bring-up *verify* it and found that QEMU 8.2 TCG `-cpu max`
-  reports **no x2APIC** (CPUID.01H:ECX[21] = 0), which makes the whole MSR block
-  inert: the one-shot never fires and its count reads 0 (i.e. "already expired"), so
-  a `SYS_ARM_TIMER` on x86-64 used to return **immediately**. `enable_timer_irq()`
-  now probes the interrupt and reports the timer only if it arrives; x86-64
-  therefore takes the fallback honestly, and reaching the LAPIC through its xAPIC
-  **MMIO** page is a separate phase (docs/NETSTACK.md 16, Phase N2h).
+  OS's **second interrupt**, and a **genuine 0%-CPU park on all three ISAs**
+  (the kernel arms the per-ISA timer and halts at `wfi`/`hlt` until it fires):
+  **riscv** the Sstc `stimecmp` CSR (S timer interrupt, `scause` = int | 5);
+  **aarch64** the CNTV virtual timer (`CNTV_CVAL_EL0` / `CNTV_CTL_EL0`, PPI 27 through
+  the GICv3 redistributor); **x86-64** the LAPIC one-shot LVT timer (vector 0x20).
+  x86-64 took the long way there, and the history is the tree's canonical
+  observe-never-infer case (docs/ENGINEERING.md 1): the LVT timer was driven over the
+  **x2APIC MSR block** and documented as working, until rheo-net N2h made bring-up
+  *verify* it and found QEMU 8.2 TCG `-cpu max` reports **no x2APIC**
+  (CPUID.01H:ECX[21] = 0), which leaves the whole MSR block inert - the one-shot never
+  fires and its count reads 0 ("already expired"), so `SYS_ARM_TIMER` returned
+  **immediately**. N2h made the fallback honest; **docs/SMP.md phase 1** fixed the
+  capability, driving the same LAPIC over its **xAPIC MMIO** page (which QEMU does
+  model) with the access mode chosen by probe - x2APIC requested, `EXTD` read back,
+  and declined when it does not latch. `enable_timer_irq()` still refuses to claim the
+  timer on anything but an interrupt it actually took.
   Where the timer IRQ is not wired it falls back to a cooperative
   deadline check against the monotonic counter (deterministic under QEMU `-icount`).
   All deadlines are registered with the kernel **timer arbiter**
@@ -1027,9 +1030,9 @@ What is **async-real** vs **sync-translated** vs **deferred**, without varnish:
   a reactor network slot; a genuine WFI park on riscv64/aarch64, a bounded kernel
   poll on x86-64 - docs/NETSTACK.md §16).
 - **Sync-translated / cooperative** (single-CPU, honest): the **timer is
-  interrupt-driven on riscv64 (Sstc) and aarch64 (CNTV)** - a genuine 0%-CPU park,
-  verified at bring-up since N2h - and falls back to a cooperative deadline check on
-  x86-64, whose x2APIC MSR block is inert under QEMU TCG (docs/NETSTACK.md 16); the cross-cell IPC channel now has a **fully symmetric
+  interrupt-driven on all three ISAs** - riscv64 (Sstc), aarch64 (CNTV) and, since
+  docs/SMP.md phase 1, x86-64 (the LAPIC one-shot over xAPIC MMIO) - a genuine 0%-CPU
+  park, verified at bring-up on each; the cross-cell IPC channel now has a **fully symmetric
   async `Sender`/`Receiver`** (Phase J: it parks on the reactor - the in-cell wait
   is a genuine park, only the cell-boundary hand-off stays a cooperative
   `SYS_SWITCH`); parallel `compute` strands **interleave** on one CPU

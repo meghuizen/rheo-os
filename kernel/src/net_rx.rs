@@ -42,8 +42,11 @@
 //! 2. **[`IdleMode::TimerIdle`]** - no NIC RX interrupt on this ISA, but the timer
 //!    interrupt is. The kernel then polls the receive queue and **halts on a timer
 //!    slice** between polls: a real halt, not a spin, at a low duty cycle. This is
-//!    x86-64, whose *timer* is genuinely interrupt-driven (LAPIC one-shot, x2APIC)
-//!    while its virtio-*pci* NIC has no usable interrupt line under QEMU TCG. The
+//!    x86-64, whose *timer* is genuinely interrupt-driven (the LAPIC one-shot,
+//!    reached over the **xAPIC MMIO** page - docs/SMP.md; the x2APIC MSR block it
+//!    used before is inert under QEMU TCG, which for a while made this mode a spin
+//!    in disguise, docs/ENGINEERING.md 1) while its virtio-*pci* NIC has no usable
+//!    interrupt line under QEMU TCG. The
 //!    wake comes from the timer, never from the NIC - which is why this is reported
 //!    as its own mode and never as "interrupt-driven".
 //! 3. **[`IdleMode::Poll`]** - neither interrupt available: the honest last-resort

@@ -306,9 +306,16 @@ extern "C" fn kernel_main() -> ! {
             net_rx::did_idle()
         );
     } else {
+        // No NIC RX interrupt here, but that does not by itself mean a spin: the
+        // wait has three modes and only the last one spins (docs/NETSTACK.md 16).
+        // Report the one that was actually taken, plus whether it halted.
         println!(
-            "linuxnet: kernel poll fallback (no NIC RX interrupt on this ISA) - the remote \
-             receive still parks once, but the CPU spins while waiting"
+            "linuxnet: no NIC RX interrupt on this ISA - the remote receive parked in {:?} mode \
+             (halted: {}, {} timer slice(s), {} spin poll(s))",
+            net_rx::idle_mode(),
+            net_rx::did_idle(),
+            net_rx::timer_slices(),
+            net_rx::spin_polls()
         );
     }
 

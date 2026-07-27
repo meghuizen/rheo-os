@@ -27,6 +27,15 @@ interrupt-driven on all three ISAs. It surfaced only when a later phase made the
 halt *measured* instead of asserted, and it invalidated a conclusion drawn about
 the x86 UART/IOAPIC path, which had rested on the same inert registers.
 
+**How it ended.** The wording was corrected first (an honest fallback), then the
+*capability* was fixed: the LAPIC is now reached over the **xAPIC MMIO** page, which
+QEMU does model, with the access mode chosen by probe - x2APIC requested, `EXTD`
+read back, kept only if it latched. The timer is genuinely interrupt-driven on all
+three ISAs (docs/SMP.md 5). Enabling it immediately exposed a second instance of the
+same rule: the LAPIC tick-rate calibration busy-spun a fixed window *inside the
+first `timer_arm`*, so the first `sleep` on a fresh kernel had its whole deadline
+consumed by bring-up cost and reported no park. Bring-up cost belongs at bring-up.
+
 **The good pattern, already in the tree.** The x86 FP/XSAVE bring-up enables
 `XCR0`, **reads it back, and records only the bits that stuck** - graceful
 fallback to `FXSAVE`/SSE when a component is dropped. Enable, verify, keep what

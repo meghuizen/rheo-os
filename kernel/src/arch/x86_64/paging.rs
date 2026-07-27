@@ -32,6 +32,8 @@ const RW: u64 = 1 << 1; // writable
 const US: u64 = 1 << 2; // user-accessible
 const PS: u64 = 1 << 7; // page size (2 MiB leaf at PD level)
 const G: u64 = 1 << 8; // global
+const PWT: u64 = 1 << 3; // page write-through
+const PCD: u64 = 1 << 4; // page cache disable (with PWT: PAT entry 3 = UC)
 const NX: u64 = 1 << 63; // no-execute
 
 const PAGE_SIZE: usize = 4096;
@@ -121,6 +123,15 @@ pub fn paging_new_root() -> PagingRoot {
     pdpt[pdpt_index(KVA) + 1] = addr_bits(pd_hi_pa) | P | RW | US; // phys 1-2 GiB
     fill_high_pd(table_mut(pd_lo_pa), 0, true);
     fill_high_pd(table_mut(pd_hi_pa), 1 << 30, false);
+    // The APIC register window, when a kernel has brought it up: one shared PML4
+    // entry (see `apic_map_window`), so an interrupt taken with this root active
+    // can reach the local APIC's EOI register. Zero - and thus skipped entirely -
+    // in every kernel that never enables an APIC-driven interrupt.
+    // SAFETY: single CPU; a plain read of a bring-up-time static.
+    let apic_pml4e = unsafe { *core::ptr::addr_of!(APIC_PML4E) };
+    if apic_pml4e != 0 {
+        pml4[pml4_index(APIC_WINDOW_VA)] = apic_pml4e;
+    }
     PagingRoot { pml4_pa }
 }
 
@@ -361,6 +372,60 @@ pub fn mmio_map_window(base_pa: usize, len: usize) -> usize {
     }
     paging_activate_kernel(); // flush the TLB (reload CR3)
     MMIO_WINDOW_VA + offset
+}
+
+/// Kernel VA of the **APIC register window** (docs/SMP.md). The x86 APIC
+/// registers live at a fixed physical region just under 4 GiB - the IO-APIC at
+/// `0xFEC00000` and each CPU's local APIC at `0xFEE00000` - which is above the
+/// kernel's top-2 GiB linear map, so like the nvdimm and the PCI BAR it needs its
+/// own window. A third fixed PML4 slot (386) keeps it disjoint from pmem (384)
+/// and MMIO (385).
+///
+/// Unlike those two, this window must be reachable from **every** page-table root,
+/// not just the kernel's: an interrupt can land while a cell root is active, and
+/// its handler has to write the local APIC's EOI register. So the window's PDPT is
+/// allocated once and its PML4 entry is recorded in [`APIC_PML4E`], which
+/// [`paging_new_root`] stamps into each cell root - one shared entry, no extra
+/// frame per cell. Kernels that never call [`apic_map_window`] leave PML4[386]
+/// empty and are byte-for-byte unchanged.
+const APIC_WINDOW_VA: usize = 0xFFFF_C100_0000_0000;
+/// Physical base of the APIC window: 2 MiB aligned, and 4 MiB covers both the
+/// IO-APIC (`0xFEC00000`) and the local APIC (`0xFEE00000`).
+const APIC_WINDOW_PA: usize = 0xFEC0_0000;
+const APIC_WINDOW_LEN: usize = 0x40_0000;
+
+/// The PML4 entry for the APIC window once mapped, else 0. Shared by every root.
+static mut APIC_PML4E: u64 = 0;
+
+/// Map the APIC register window into the kernel root (idempotent) and return its
+/// kernel VA. Physical `APIC_WINDOW_PA` lands at the returned VA, so the local
+/// APIC is at `va + (0xFEE00000 - 0xFEC00000)`.
+///
+/// The pages are **strongly uncacheable**: `PCD|PWT` with the default PAT selects
+/// entry 3 = UC, which is what a register file needs (a cached APIC register would
+/// be a correctness bug on real hardware; QEMU TCG models no caches, so it is
+/// invisible here - stated so the attribute is not mistaken for decoration).
+pub fn apic_map_window() -> usize {
+    // SAFETY: single CPU, called at bring-up before any secondary exists.
+    if unsafe { *core::ptr::addr_of!(APIC_PML4E) } != 0 {
+        return APIC_WINDOW_VA;
+    }
+    let pml4_pa = core::ptr::addr_of!(boot_page_tables) as usize;
+    for p in 0..APIC_WINDOW_LEN / MIB2 {
+        let va = APIC_WINDOW_VA + p * MIB2;
+        let pa = APIC_WINDOW_PA + p * MIB2;
+        let pml4 = table_mut(pml4_pa);
+        let pdpt = table_mut(ensure_table(pml4, pml4_index(va)));
+        let pd = table_mut(ensure_table(pdpt, pdpt_index(va)));
+        // 2 MiB supervisor page: present, writable, size, global, NX, uncacheable.
+        pd[pd_index(va)] = addr_bits(pa) | P | RW | PS | G | NX | PCD | PWT;
+    }
+    // SAFETY: single CPU; publish the shared PML4 entry for cell roots.
+    unsafe {
+        *core::ptr::addr_of_mut!(APIC_PML4E) = table_mut(pml4_pa)[pml4_index(APIC_WINDOW_VA)];
+    }
+    paging_activate_kernel(); // flush the TLB (reload CR3)
+    APIC_WINDOW_VA
 }
 
 /// Finish paging bring-up. The MMU and the kernel working root are already

@@ -28,11 +28,11 @@ library level.
     delivers a byte (RISC-V S-mode external via the AIA IMSIC; ARM64 PL011 SPI
     via the GICv3; x86-64 still polls - its QEMU TCG split-irqchip IOAPIC/LAPIC
     does not re-deliver reliably). A cell blocking on a deadline (`SYS_ARM_TIMER`)
-    parks until the **timer interrupt** fires (RISC-V Sstc `stimecmp`; ARM64 CNTV
-    virtual timer via the GICv3) - a genuine 0%-CPU park on those two ISAs;
-    x86-64's LAPIC one-shot is driven over an x2APIC MSR block that QEMU TCG leaves
-    inert, so it falls back to a cooperative deadline check (verified at bring-up,
-    docs/NETSTACK.md 16 Phase N2h). Every deadline goes through the kernel **timer
+    parks until the **timer interrupt** fires - a genuine 0%-CPU park on **all three
+    ISAs**: RISC-V Sstc `stimecmp`, ARM64 CNTV virtual timer via the GICv3, and the
+    x86-64 LAPIC one-shot reached over the **xAPIC MMIO** page (docs/SMP.md phase 1;
+    the x2APIC MSR block it used before is inert under QEMU TCG, which bring-up
+    verification caught, docs/NETSTACK.md 16 Phase N2h). Every deadline goes through the kernel **timer
     arbiter** (`kernel/src/ktimer.rs`), the single owner of the one-shot. The general
     per-queue completion IRQ is future work.
 

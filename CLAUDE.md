@@ -557,13 +557,15 @@ from the caller's argv/envp, and returns a child handle; **`SYS_WAIT` (46)** blo
 the parent cooperatively (generalizing the L6 cross-cell run loop), runs the child,
 and reaps its exit code (a faulted native child is reaped with `FAULT_EXIT`=139 -
 native cells have no signals); **`SYS_ARM_TIMER` (47)** is a one-shot deadline,
-now the OS's **second interrupt**, **interrupt-driven on RISC-V and ARM64** (the
-kernel arms the per-ISA timer and halts at `wfi` until it fires - a genuine
-0%-CPU park: RISC-V Sstc `stimecmp`, ARM64 CNTV virtual timer via the GICv3;
-opt-in via `arch::enable_timer_irq`, with a cooperative deadline-check fallback
-where not wired). x86-64's LAPIC one-shot was claimed here too, but rheo-net N2h
-made bring-up **verify** it and found QEMU 8.2 TCG reports no x2APIC, leaving that
-MSR block inert - so x86-64 takes the honest fallback (below).
+now the OS's **second interrupt**, **interrupt-driven on all three ISAs** (the
+kernel arms the per-ISA timer and halts at `wfi`/`hlt` until it fires - a genuine
+0%-CPU park: RISC-V Sstc `stimecmp`, ARM64 CNTV virtual timer via the GICv3,
+x86-64 the LAPIC one-shot; opt-in via `arch::enable_timer_irq`, with a cooperative
+deadline-check fallback where not wired). x86-64 took the long way: its LAPIC
+one-shot was claimed, rheo-net N2h made bring-up **verify** it and found QEMU 8.2
+TCG reports no x2APIC (leaving that MSR block inert) so it fell back honestly, and
+**SMP phase 1** then fixed the capability by driving the LAPIC over **xAPIC MMIO**
+(docs/SMP.md 5).
 librheo gained **`proc`** (`spawn`/`Child::wait().await`/`args`/`env`/`identity`),
 **`time`** (monotonic `Instant`/`now` + async `sleep`/`timeout`/`interval` over the
 reactor's timer slot), and a **`net`** stub (deferred - networking is a service).
@@ -575,18 +577,15 @@ Phase D console path; **Phase J** wires in the full `term` line editor - see
 below). The `librheoproc` test proves it on **all three ISAs**: an
 orchestrator spawns `/bin/echo` + three `/bin/child` cells (argv fan-out), reduces
 exit codes to 12, and a `time::sleep` wakes on the timer (asserting a genuine
-`wfi` idle-park on RISC-V and ARM64, and reporting the cooperative fallback on
-x86-64); `lrsh` runs a scripted keystroke
+`wfi`/`hlt` idle-park on all three ISAs since SMP phase 1); `lrsh` runs a scripted keystroke
 session through the term editor (committed-command evidence + exit `0x42`); and the spine-only `librheo-embed`
 round-trips. Benchmarks (icount, per TOOLING.md): full async round-trip ~1,433
 (x86-64) / ~2,048 (riscv64) instructions, spawn+wait ~263k (x86-64) / ~539k
 (riscv64) - process create is dominated by ELF stream-load + child crt0, the honest
-price of a new address space. Honest deferrals: the
-**x86-64 UART RX interrupt** *and* (since N2h verified it) the **x86-64 timer**
-(poll / cooperative fallbacks - its QEMU TCG `-cpu max` reports no x2APIC, so the
-LAPIC MSR block is inert; the riscv/arm timer + UART RX are genuinely
-interrupt-driven), and the `net` stack - docs/LIBRHEO.md has the full A-F
-accounting. **librheo A-F is complete.**
+price of a new address space. Honest deferrals: the `net` stack -
+docs/LIBRHEO.md has the full A-F accounting. (The **x86-64 timer** was a deferral
+here until SMP phase 1 gave it a real LAPIC over xAPIC MMIO; see the SMP section at
+the end for the x86-64 UART RX outcome.) **librheo A-F is complete.**
 
 **Phase G** turns the Phase F `net` stub into the real **NIC data path - raw
 Ethernet frames over a virtio-net driver** (docs/NETWORKING.md, LIBRHEO.md Phase
@@ -675,10 +674,11 @@ mode -> IMSIC -> `sip.SEIP`) and **aarch64** (GICv3 SPI `16+slot`) are genuinely
 RX interrupt** (its NIC is virtio-*pci* driven through the `VIRTIO_PCI_CAP_PCI_CFG`
 tunnel with no mapped BAR for an MSI-X table, and legacy INTx rides the same QEMU-TCG
 IOAPIC path that does not re-deliver); its wait was documented as a **timer-backed
-idle** borrowing the LAPIC (poll, `hlt` for a 500 us slice, re-poll), but **N2h verified
+idle** borrowing the LAPIC (poll, `hlt` for a 500 us slice, re-poll), and **N2h verified
 that claim and it did not hold** - QEMU 8.2 TCG reports no x2APIC, so the LAPIC MSR
-block is inert and x86-64 is honestly `IdleMode::Poll`, a spin (the slice tiers
-themselves are real and exercised on riscv64/aarch64). `interrupt_driven()` reports
+block was inert and x86-64 was honestly `IdleMode::Poll`, a spin; **SMP phase 1** then
+made the LAPIC real over xAPIC MMIO, so x86-64 is back in `TimerIdle` with the halts
+**measured** (21 on a bounded wait, 253 in the escalation phase). `interrupt_driven()` reports
 **false** wherever no NIC line exists, so a timer wake is never dressed up as a NIC
 interrupt. `timeout_ns` is a
 **monotonic deadline in every mode** - `POLL_BUDGET` is only a backstop for an
@@ -720,10 +720,11 @@ claimed** - and `did_idle()` is now set only when a park genuinely halted, which
 exposed the x86-64 LAPIC above (and a `librheo-orch` 4 us sleep that could never reach a
 park - now 2 ms and genuinely parking). The `netwait` test proves it on **all three
 ISAs**: the pre-N2h pattern **reproduced** as a false expiry (skipped-with-reason where
-no verified one-shot exists), three concurrent arbiter deadlines each honoured at their
+no verified one-shot exists - which was x86-64 until SMP phase 1, and is now no ISA),
+three concurrent arbiter deadlines each honoured at their
 own time in order with none lost, a 30 ms cell sleep surviving a full 5 ms receive wait,
 and the escalation law asserted both as a pure function and as observed counters (4096
-spin polls then 319-331 genuine timer-slice halts on riscv64/aarch64) - with the
+spin polls then 253-331 genuine timer-slice halts on every ISA) - with the
 riscv/arm NIC-interrupt assertions unchanged.
 
 **rheo-net N4a** (docs/NETSTACK.md 17) is the **network service cell + concurrent

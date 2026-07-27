@@ -68,8 +68,9 @@ pub fn uptime_ticks() -> u64 {
 ///
 /// **One path, two honest outcomes.** Where a hardware timer interrupt is wired
 /// ([`timer_interrupt_driven`]) the arbiter's park halts the CPU until the
-/// interrupt fires - a genuine 0%-CPU idle. Where it is not (x86-64 under QEMU-TCG
-/// without a modelled x2APIC, docs/NETSTACK.md 16), the arbiter honours the same
+/// interrupt fires - a genuine 0%-CPU idle. Where it is not (no ISA in this tree as
+/// of docs/SMP.md phase 1 - x86-64's LAPIC one-shot is now reached over the xAPIC
+/// MMIO page, so all three have a verified hardware timer), the arbiter honours the same
 /// deadline **in software** by comparison against its monotonic clock and this
 /// spins instead of halting: an honest deadline wait, not an idle, and
 /// [`timer_did_idle`] stays false to say so. Before rheo-net N2e that fallback was

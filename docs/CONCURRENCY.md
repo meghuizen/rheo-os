@@ -80,12 +80,12 @@ on console input drives the reactor to block in `SYS_WAIT_INPUT`, and the kernel
 the AIA IMSIC; ARM64 PL011 SPI via the GICv3) instead of spinning - a genuine
 0%-CPU park. Phase F adds the **second interrupt**, the **timer**: a strand
 parking on a deadline (`time::sleep`/`SYS_ARM_TIMER`) idles until the per-ISA timer
-interrupt fires - **interrupt-driven on RISC-V (Sstc `stimecmp`) and ARM64 (CNTV via
-the GICv3)**; x86-64's LAPIC one-shot rides an x2APIC MSR block QEMU TCG leaves inert,
-so it takes the cooperative deadline check (verified at bring-up since rheo-net N2h,
-docs/NETSTACK.md 16). x86-64's UART
-RX still polls (its QEMU TCG split-irqchip IOAPIC/LAPIC does not re-deliver
-reliably, documented). The general completion-queue IRQ and the preemption
+interrupt fires - **interrupt-driven on all three ISAs**: RISC-V Sstc `stimecmp`,
+ARM64 CNTV via the GICv3, and (since docs/SMP.md phase 1) the x86-64 LAPIC one-shot
+driven over the **xAPIC MMIO** page. x86-64 had claimed this over the x2APIC MSR
+block, which QEMU TCG leaves inert - rheo-net N2h made bring-up *verify* it, the claim
+did not hold, and phase 1 fixed the capability rather than the wording
+(docs/ENGINEERING.md 1). The general completion-queue IRQ and the preemption
 doorbell (section 4) remain future work.
 
 ## 2. Both stack disciplines

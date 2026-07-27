@@ -1,11 +1,13 @@
 # SMP - Per-CPU State, Locking, and Secondary-Core Bring-Up
 
 **Status:** Phase I (task #27). Per-CPU state + a kernel spinlock are done and
-portable; a RISC-V secondary hart genuinely runs kernel code; ARM64 and x86-64
-make an honest attempt and document a specific blocker. This is *proof of a
-second core running kernel code plus the foundation for real SMP* - not
-preemptive multi-core scheduling (still deferred; the runtime is single-CPU
-cooperative, docs/CONCURRENCY.md).
+portable; a RISC-V secondary hart genuinely runs kernel code. **Phase 1** (section
+5 onward) fixed the root cause that blocked x86: the local APIC is now driven over
+**xAPIC MMIO** with the access mode chosen by probe, which makes the x86-64 one-shot
+timer genuinely interrupt-driven and gives the kernel a working interrupt command
+register. This is *proof of a second core running kernel code plus the foundation
+for real SMP* - not preemptive multi-core scheduling (still deferred; the runtime is
+single-CPU cooperative, docs/CONCURRENCY.md).
 
 This doc pairs with CONCURRENCY.md (which describes the *userspace* strand/vcore
 model) - SMP here is the *kernel-level* story: physical cores, per-CPU kernel
@@ -153,11 +155,87 @@ the single-core boot every other kernel depends on) is out of scope for this
 phase.
 
 **Observed** (the `smp` test, x86_64): `needs a 16-bit real-mode AP trampoline
-(INIT-SIPI-SIPI) below 1 MiB; not implemented`. This mirrors how the project
-already documents the x86 UART RX line as honestly poll-only under QEMU's TCG
-split-irqchip - an honest per-ISA asymmetry, not a fake.
+(INIT-SIPI-SIPI) below 1 MiB; not implemented`.
 
-## 5. What is proven vs deferred
+**This was only half the blocker.** INIT-SIPI-SIPI is *sent through the local
+APIC's interrupt command register*, and this port drove the LAPIC through the
+x2APIC MSR block, which QEMU's TCG leaves inert - so even with a trampoline in
+place the SIPI would have gone nowhere. x86 SMP was blocked by the same root cause
+as the x86 timer (docs/ENGINEERING.md 1). Section 5 fixes that root cause first.
+
+## 5. x86-64: the local APIC, over xAPIC MMIO (phase 1)
+
+Everything interrupt-driven on x86-64 - the one-shot timer, the IPIs that release
+an application processor, and the EOI any IO-APIC-routed line needs - goes through
+the per-CPU **local APIC**. There are two ways to reach its registers, and
+`kernel/src/arch/x86_64/mod.rs` now supports **both, selected by probe** rather
+than by a feature bit:
+
+| mode | interface | why / why not |
+|---|---|---|
+| **x2APIC** | the MSR block at `0x800+` | preferred where real: needs no mapping, so it works whichever page-table root is active when an interrupt lands. QEMU's TCG does **not** implement it - x2APIC is absent from QEMU's TCG feature word, so `CPUID.01H:ECX[21]` reads 0 even with `-cpu max`, and the whole MSR block is inert (`EXTD` never latches, writes drop, `TMCCT` reads 0 = "already elapsed") |
+| **xAPIC MMIO** | the 4 KiB register page at `0xFEE00000` | QEMU **does** model this under TCG. Needs the page mapped uncacheable, and mapped into *every* page-table root |
+
+`lapic_probe()` runs three steps and keeps only what it observes:
+
+1. Software-enable the APIC (`IA32_APIC_BASE.EN`) - that MSR is architectural
+   everywhere; it is the 0x800 *register block* that TCG omits.
+2. If CPUID advertises x2APIC, request `EN|EXTD` and **read `IA32_APIC_BASE`
+   back**. x2APIC is used only if the bit actually latched.
+3. Otherwise map the xAPIC window and check the register file **answers**: write
+   the spurious-vector register, read it back out of the device, require a match.
+   A dropped MMIO write reads back as 0 or `0xFFFFFFFF`, so this distinguishes a
+   modelled APIC from an absent one.
+
+The validated mode is recorded in `ApicMode`, and every accessor (`lapic_read`,
+`lapic_write`, and the IPI path) reads the *validated* value - never
+CPUID. One set of register-offset constants serves both modes, because the x2APIC
+MSR for a register is `0x800 + (offset >> 4)`; only the ICR differs in shape (a
+32-bit low/high pair versus one 64-bit MSR) and is wrapped accordingly.
+
+**Observed under QEMU 8.2 TCG, q35, `-cpu max`:** mode **xAPIC (MMIO)**. x2APIC is
+advertised as absent and correctly declined. The register file answers, and
+`enable_timer_irq`'s probe then sees a **real LVT-timer interrupt arrive** (a
+counter incremented only inside the interrupt vector).
+
+### The mapping: a third fixed window, shared into every root
+
+`paging::apic_map_window()` maps physical `0xFEC00000..0xFF000000` (4 MiB: the
+IO-APIC page and the local-APIC page) at a fixed kernel VA in **PML4 slot 386**,
+disjoint from the pmem window (384) and the PCI-BAR MMIO window (385). Two 2 MiB
+supervisor pages, `PCD|PWT` so the default PAT selects entry 3 = **UC** - strongly
+uncacheable, which is what a register file needs (invisible under TCG, which models
+no caches; stated so the attribute is not mistaken for decoration).
+
+Unlike those two windows it must be reachable from **every** root, because an
+interrupt can land while a cell root is active and the handler has to write EOI. So
+the window's PML4 entry is recorded once (`APIC_PML4E`) and `paging_new_root`
+stamps that **same** entry into each cell root: one shared PDPT, no extra frame per
+cell. A kernel that never calls `apic_map_window` leaves PML4[386] zero and its
+page tables are byte-for-byte unchanged.
+
+### What this unlocked immediately
+
+- **A genuine one-shot timer on x86-64.** `arch::timer_arm`/`timer_expired`/
+  `timer_disarm`/`timer_park` are real, `timer_irq_enabled()` is true, and the
+  `ktimer` arbiter halts at `hlt`. `SYS_ARM_TIMER` really sleeps; `librheoproc` now
+  asserts the idle-park on this ISA too, and `nettcpcc`'s 40 continuously re-armed
+  pacer deadlines are genuine hardware arms. The **single-owner invariant** is
+  untouched: `ktimer` remains the only caller of `arch::timer_*`.
+- **A measured, not claimed, `IdleMode::TimerIdle`** for the network receive wait -
+  21 halts on a bounded wait, 253 timer-slice halts in `netwait`'s escalation
+  phase, 1771 in `nethostcfg` (docs/NETSTACK.md 16).
+- **`netwait`'s pre-N2h regression phase no longer skips on x86-64.**
+- **A working ICR**, which is what AP bring-up needs.
+
+One further defect fell out of it, of exactly the docs/ENGINEERING.md 1 class: the
+LAPIC tick-rate calibration busy-spins a fixed TSC window, and it ran **lazily
+inside the arbiter's first `timer_arm`** - so on a fresh kernel the first `sleep`'s
+entire deadline was consumed by bring-up cost before the hardware was armed, and
+the park never happened. Calibration now runs in `enable_timer_irq`, where that
+cost belongs.
+
+## 9. What is proven vs deferred
 
 **Proven**
 - A portable `SpinLock<T>` and a per-CPU registry with `this_cpu()`, zero-impact

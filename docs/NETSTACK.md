@@ -1433,25 +1433,26 @@ which also removes the timer conflict this design had.
 |---|---|---|---|
 | **RISC-V 64** | virtio-mmio (slot 7 on QEMU `virt`) | APLIC-S source `1+slot` in MSI mode -> this hart's IMSIC S-file (identity `16+slot`) -> `sip.SEIP`; dispatched by identity in `handle_ext_irq` | **NIC-interrupt-driven**, halts at `wfi` - genuine 0%-CPU park |
 | **ARM64** | virtio-mmio (slot 31 on QEMU `virt`) | GICv3 SPI `16+slot` (INTID `48+slot`) -> GICD -> `ICC_IAR1_EL1`, EOI via `ICC_EOIR1_EL1` | **NIC-interrupt-driven**, halts at `wfi` - genuine 0%-CPU park |
-| **x86-64** | virtio-**pci** (q35, driven through the `VIRTIO_PCI_CAP_PCI_CFG` tunnel) | **none wired** - see below | **bounded poll**, the CPU spins. It was documented here as a "timer-backed idle" (`hlt` for a 500 us LAPIC slice); N2h **verified** that claim and found the LAPIC one-shot inert on this QEMU - see *Phase N2h* below |
+| **x86-64** | virtio-**pci** (q35, driven through the `VIRTIO_PCI_CAP_PCI_CFG` tunnel) | **none wired** - see below | **timer-backed idle** (`hlt` between receive-queue polls). This row has been wrong in both directions once: first claimed as a timer-backed idle when the LAPIC was inert (so it was a spin), then honestly demoted to a bounded poll by N2h. docs/SMP.md phase 1 drives the LAPIC over **xAPIC MMIO** instead, so the timer is now genuine and the halts are **measured** (21 on a bounded wait, 253/1771 in the escalation phases) |
 | *(no timer either)* | any | none | **bounded poll**, the CPU spins - the honest last resort |
 
-The `TimerIdle` mode itself is real and exercised - just not by x86-64 today. The
-`netwait` kernel runs its N2h policy phase **before wiring the NIC RX interrupt**, so
-on RISC-V and ARM64 the receive wait genuinely takes the timer-slice path there (300+
-real `wfi` halts per run, asserted); once the NIC line is up those ISAs rightly prefer
-the indefinite 0%-CPU park.
+The `TimerIdle` mode is real and exercised on every ISA. The `netwait` kernel runs its
+N2h policy phase **before wiring the NIC RX interrupt**, so on RISC-V and ARM64 the
+receive wait genuinely takes the timer-slice path there (300+ real `wfi` halts per run,
+asserted); once the NIC line is up those ISAs rightly prefer the indefinite 0%-CPU park.
+x86-64 has no NIC line, so it stays in this mode.
 
 x86-64's *NIC* interrupt is a documented gap, not a claim. The NIC there is driven
 *entirely through PCI configuration space* because PVH boot has no firmware to program
 BARs - so there is no mapped BAR to hold an MSI-X table - and legacy INTx would ride
 the same IOAPIC path that, under QEMU TCG + `kernel-irqchip=split`, does not re-deliver
 reliably (the same reason the x86-64 UART RX line stays a poll, docs/LIBRHEO.md Phase
-D). Its **LAPIC timer, however, is genuinely interrupt-driven** (Phase F), which is
-exactly what the timer-backed mode uses: x86-64 *can* idle, it just cannot idle on the
-NIC. **Programming the MSI-X table through the config tunnel** (the table lives in a
-BAR the tunnel can reach) remains the specific next step, and would move x86-64 from
-`TimerIdle` to `NicInterrupt`.
+D). Its **LAPIC timer, however, is genuinely interrupt-driven** (docs/SMP.md phase 1,
+over xAPIC MMIO), which is exactly what the timer-backed mode uses: x86-64 *can* idle,
+it just cannot idle on the NIC. **Programming the MSI-X table through the config
+tunnel** (the table lives in a BAR the tunnel can reach) remains the specific next
+step, and would move x86-64 from `TimerIdle` to `NicInterrupt`; docs/SMP.md 8 records
+what re-examining it on a working APIC found.
 
 Reporting stays deliberately unblurred: `net_rx::interrupt_driven()` means **"the NIC
 RX interrupt is wired"** and nothing else (false on x86-64); `net_rx::did_idle()` means
@@ -1671,6 +1672,37 @@ model, is the fix for the *capability*; it needs that page mapped into every cel
 and is its own phase. It may also revisit the x86-64 UART-RX/IOAPIC conclusion, since
 that diagnosis ("the LAPIC ISR/IRR read 0") was made through the same inert MSRs.
 
+#### Resolved: the x86-64 timer is genuinely interrupt-driven (docs/SMP.md phase 1)
+
+That phase landed. `kernel/src/arch/x86_64/mod.rs` now has a **two-mode LAPIC driver
+selected by probe**: it requests x2APIC and keeps that mode only if `EXTD` reads back
+latched; otherwise it maps the **xAPIC MMIO** page uncacheable (`paging::apic_map_window`,
+a third fixed window at PML4[386], its PDPT shared into every cell root so an interrupt
+handler can reach EOI whichever root is active) and verifies the register file answers a
+write/read-back. Under QEMU 8.2 TCG the observed outcome is **xAPIC (MMIO)** - the
+x2APIC bit still reads 0 and is correctly declined - and `enable_timer_irq`'s probe then
+sees a **real LVT-timer interrupt arrive**. So on x86-64:
+
+- `arch::timer_arm` / `timer_expired` / `timer_disarm` / `timer_park` are genuine, and
+  `timer_irq_enabled()` is **true**. `SYS_ARM_TIMER` halts at `hlt` and wakes on the
+  interrupt - a 0%-CPU park, now asserted by `librheoproc` on this ISA too.
+- the receive wait moved from `IdleMode::Poll` back to **`IdleMode::TimerIdle`** - and
+  this time it is a measured halt, not a claim: `netwait` records 21 halts on a bounded
+  wait and 253 timer-slice halts in the `Hft` escalation phase, and `nethostcfg` records
+  1771. `interrupt_driven()` still reports **false** (that predicate is about the *NIC*
+  line), so a timer wake is never dressed up as a NIC interrupt.
+- `netwait`'s **(A)** phase - the pre-N2h lost-deadline reproduction - no longer skips on
+  x86-64: it reproduces the false expiry there too.
+
+One further defect fell out of enabling it, of exactly the §1 class: the LAPIC tick-rate
+calibration busy-spins a fixed TSC window, and it ran **lazily inside the arbiter's first
+`timer_arm`** - so the first `sleep` on a fresh kernel had its whole deadline consumed by
+bring-up cost before the hardware was armed, and reported no park. Calibration now runs in
+`enable_timer_irq`, where the cost belongs.
+
+The x86-64 **UART RX** and **NIC RX** conclusions were re-examined on top of this working
+APIC; see the per-ISA table below and docs/SMP.md 8.
+
 #### The proof (`netwait`, all 3 ISAs)
 
 Kernel-side, before the cell runs (so the receive queue is provably empty - nothing has
@@ -1681,8 +1713,9 @@ tiers are reachable on RISC-V and ARM64):
   pre-N2h pattern - an inner requester's arm+wait+disarm destroys an outer 20 ms
   deadline and `arch::timer_expired()` then reports it elapsed ~1.4 ms in. Asserted as
   a *false* expiry, so the old code demonstrably fails the property the arbiter holds.
-  Skipped with a reason where no verified one-shot exists (x86-64), since an inert timer
-  reports every deadline expired and would prove nothing.
+  Skipped with a reason where no verified one-shot exists, since an inert timer reports
+  every deadline expired and would prove nothing. That skip fired on x86-64 until
+  docs/SMP.md phase 1; all three ISAs now reproduce it.
 - **(B) three concurrent deadlines through the arbiter** (1 ms `RxPoll`, 5 ms
   `NetTimer`, 15 ms `CellSleep`): the nearest fires first **and alone**; releasing it
   leaves the other two armed; each subsequent one fires at or after **its own**
@@ -1697,7 +1730,8 @@ tiers are reachable on RISC-V and ARM64):
   observed - a 60 ms `Hft` wait on an empty queue records 4096 spin polls, then
   (RISC-V/ARM64, no NIC IRQ yet) **319-331 genuine timer-slice halts**, 2 escalations,
   ending in `Cold`; the `Embedded` contrast does the same wait with **0** spin polls and
-  halts only. x86-64 shows the spin tier and 0 halts, honestly (no timer).
+  halts only. x86-64 records the same shape (4096 spin polls then 253 genuine
+  timer-slice halts) since docs/SMP.md phase 1 gave it a working one-shot.
 - **no regression**: RISC-V and ARM64 still assert `irq_count() > 0` (only ever
   incremented from the ISA's interrupt vector) plus `did_idle()` for the cell's own
   NIC-interrupt parks.
