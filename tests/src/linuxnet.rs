@@ -191,7 +191,7 @@ const TCP_WHAT: [&str; 3] = [
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("linuxnet: start on {}", arch::NAME);
 
     // SAFETY: once, before any allocation.

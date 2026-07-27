@@ -87,7 +87,7 @@ static mut KSTACK: KStack = KStack([0; 64 * 1024]);
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("librhearun: start on {}", arch::NAME);
 
     // Seed the kernel DRBG (SYS_RANDOM, used once by librheo to seed its own).

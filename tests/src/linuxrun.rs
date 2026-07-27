@@ -212,7 +212,7 @@ fn expect_stdout(name: &str, image: &[u8], argv: &[&[u8]], code: u64, out: &[u8]
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("linuxrun: start on {}", arch::NAME);
 
     // L0/L1: bare programs speaking the raw Linux ABI; both exit 42.

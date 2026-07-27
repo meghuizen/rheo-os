@@ -113,7 +113,7 @@ unsafe fn mint_queue_cap(objects: &mut ObjectTable, caps: &mut CapTable) -> u32 
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("librheoipc: start on {}", arch::NAME);
 
     svc::init();

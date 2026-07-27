@@ -151,7 +151,7 @@ fn run_capture(image: &[u8], argv: &[&[u8]]) -> (Outcome, &'static [u8]) {
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("linuxpoll: start on {}", arch::NAME);
 
     // SAFETY: once, before any allocation.

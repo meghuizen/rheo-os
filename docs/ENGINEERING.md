@@ -272,9 +272,35 @@ frame forever once claimed), and it treated correct behaviour under emulation as
 optional. The right fix made the wait honour deadlines on every ISA and idle
 wherever *any* wake source exists.
 
+**The distinction that keeps this rule usable.** "Never tune a test parameter"
+and "make the proof deterministic" can look like the same move, so the difference
+must be stated. An idle-park assertion on x86-64 failed intermittently: the
+orchestrator slept 2 ms and the kernel was asserted to have genuinely halted. The
+boot tests run **without** `-icount`, so the guest's monotonic clock *is* host
+wall-clock - a host scheduling hiccup between arming the deadline and reaching the
+park consumes guest time the guest never spent, and a millisecond-scale deadline
+can already be elapsed when the run loop gets there. An elapsed deadline
+completes immediately and nothing idles, so the outcome was decided by host load
+rather than by the kernel.
+
+Raising the sleep to 50 ms is the *opposite* of the forbidden move, and the test
+is which way the claim moves:
+- **Forbidden:** the assertion is weakened, or a parameter is shrunk until the
+  defect stops showing. The system still misbehaves; the proof stopped looking.
+- **Required:** the assertion is untouched - it still demands a genuine halt - and
+  the *stimulus* is enlarged until emulator timing noise can no longer decide the
+  result. Nothing is routed around, because there was no defect to route around:
+  the kernel halts correctly on any deadline still in the future.
+
+Before enlarging a stimulus, prove which of the two you are doing by naming the
+mechanism. If you cannot say *why* the old value was marginal, you are guessing,
+and the answer is the forbidden one.
+
 **Required practice.**
 - Never tune a test to route around a behavioural defect. If a parameter must
   shrink to pass, find out why.
+- If a proof's outcome depends on host timing, fix the *proof's determinism* and
+  say what the mechanism was - never the claim.
 - Performance claims from the emulator are **deterministic instruction path
   lengths** only (TOOLING.md 4). Wall-clock throughput, jitter and line rate are
   hardware-lab measurements and are labelled as such - or as someone else's
@@ -300,6 +326,24 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   one of them (here: a cell-side crate supplying `_start`/panic handler/allocator
   cannot be linked into a kernel binary). Keep such builds in separate
   invocations and record the constraint in both manifests.
+- **A good pattern gets copied instead of imported.** The measured shape of most
+  structural debt in this tree is not bad judgement: it is an abstraction invented
+  correctly, used once, and then re-typed at the next site. The on-wire ABI was
+  hand-written twice (28 syscall numbers, 12 opcodes, 12 `repr(C)` structs) with a
+  "keep in sync" comment as the only enforcement; the `svc` bridge that keeps the
+  kernel filesystem-free sat twenty lines above four opcodes that named device
+  drivers directly; ten separate `macro_rules!` were written for one per-ISA
+  `include_bytes!`, two of them byte-identical *and on the same line number*. Each
+  copy is individually cheap, which is why it happens - and each one is a place a
+  future change can diverge silently. When you find yourself writing something
+  that already exists, the correct cost to pay is the import, once.
+- **A mechanical rename is not an edit to a proof.** Moving `arch::init` to
+  `kernel::boot::init` touched 61 call sites, 59 of them test kernels - which
+  looks like it violates "re-run the *old* proofs unchanged" (section 8). It does
+  not: what section 8 protects is the **assertion set**, not the spelling of a
+  call. State which one you changed. Renaming a boot call in 59 files while
+  asserting exactly what was asserted before is additive; quietly relaxing one
+  `assert!` in one file is not, however few lines it touches.
 - **A state machine must not serve both a bounded sequence and an unbounded
   steady state from one entry point.** An announce routine that also served
   post-claim defence returned a frame forever once claimed, so

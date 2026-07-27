@@ -25,7 +25,7 @@ const BATCH: usize = 16;
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("queue-pipeline: start on {}", arch::NAME);
 
     let mut objects = ObjectTable::new();

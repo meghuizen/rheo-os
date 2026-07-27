@@ -36,7 +36,7 @@ static mut HEAP_MEM: [u8; 1024 * 1024] = [0; 1024 * 1024];
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("runtime: start on {}", arch::NAME);
 
     // SAFETY: called once, before any allocation; HEAP_MEM is a unique static.

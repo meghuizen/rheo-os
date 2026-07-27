@@ -30,7 +30,7 @@ static EXT4_IMG: &[u8] = include_bytes!("../fixtures/ext4.img");
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("posix: start on {}", arch::NAME);
 
     // SAFETY: once, before any allocation; HEAP_MEM is a unique static.

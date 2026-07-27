@@ -226,7 +226,7 @@ fn assert_interleave(what: &str) {
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("schedidle: start on {}", arch::NAME);
     // Both interrupt paths this proof can idle on, opt-in exactly as the Phase D/F
     // kernels do (so the other 57 kernels are untouched).

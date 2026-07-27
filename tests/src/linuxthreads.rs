@@ -139,7 +139,7 @@ fn run(image: &[u8], argv: &[&[u8]]) -> Outcome {
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("linuxthreads: start on {}", arch::NAME);
     println!(
         "linuxthreads: loaded multi-threaded Rust std ({} bytes)",

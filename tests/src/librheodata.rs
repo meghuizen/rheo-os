@@ -146,7 +146,7 @@ fn rd_u32(b: &[u8], o: usize) -> u32 {
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("librheodata: start on {}", arch::NAME);
 
     // SAFETY: once, before any allocation; HEAP_MEM is a unique static.

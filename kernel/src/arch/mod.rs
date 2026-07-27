@@ -135,14 +135,17 @@ pub use imp::{
 #[cfg(feature = "smp")]
 pub use imp::{boot_cpu_hw_id, cpu_index, smp_set_this_cpu, smp_start_secondary};
 
-/// Full arch bring-up for a kernel binary: console, exception vectors,
-/// then the frame allocator and the kernel address space (MMU on).
+/// The **arch's own** bring-up: serial console, exception vectors, then the
+/// kernel address space with the MMU on.
+///
+/// It deliberately stops there. The portable subsystems that must also start
+/// before a cell runs (clock, hardware discovery, DRBG, `svc`) are sequenced by
+/// [`crate::boot::init`], which is what every kernel binary calls. Starting them
+/// from here made `arch` reference four modules that depend on `arch` - three
+/// module cycles from three lines, none of them per-ISA
+/// (docs/ARCHITECTURE-DEBT.md 3.6). Nothing above `arch` is named here now.
 pub fn init() {
     serial_init();
     trap_init();
     paging_kernel_init();
-    crate::time::init();
-    crate::hw::detect();
-    crate::rng::init();
-    crate::svc::init();
 }

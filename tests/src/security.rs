@@ -157,7 +157,7 @@ fn own_out_va() -> u64 {
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("security: start on {}", arch::NAME);
 
     let canary_va = core::ptr::addr_of!(CANARY) as u64;

@@ -10,7 +10,7 @@ use kernel::{arch, println};
 /// the stack set up and the BSS cleared.
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("rheo-os: kernel booted on {}", arch::NAME);
 
     // Deliberate trap, caught and returned from (BUILD-ORDER.md step 2).

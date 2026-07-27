@@ -32,6 +32,12 @@ Recorded so the register stays honest about its own progress.
 | **§2.4 `poll` did not compute readiness at all** - every open fd reported ready, timeout ignored; `epoll_wait` never waited; `nanosleep` returned immediately; blocking stdin answered 0 = EOF; creation-time `O_NONBLOCK` dropped. | Fixed, all in one slice because DNS depended on the combination. `poll`/`ppoll`/`epoll_wait` compute real per-`FdKind` readiness and honour their timeout by parking; `svc::SocketOps` gained the missing `tcp_pending` (its absence *was* the hardcoded "remote TCP is always readable"); `nanosleep` is real in the cell's clock domain; stdin blocks; creation-time `O_NONBLOCK`/`SOCK_NONBLOCK` is honoured. |
 | **§2.5 Admission could not refuse over-commit** - sixteen cells at 90% each all succeeded, and a **second** global controller existed behind the legacy `SYS_RESERVE`, which discarded its `Reservation` and leaked monotonically. | Fixed. One machine-wide ledger (`sched::system()`); a reservation must fit its cell **and** the machine, and a refusal leaves both unchanged. The legacy verb shares that ledger instead of keeping a private one, and its no-release cumulative-probe nature is now documented at the call site rather than being a silent leak. `schedidle` asserts the hand-computed oracle: 900,000 ppm admitted, a second 900,000 refused as over-commit while each *cell's* own controller would have accepted it. |
 
+| **§3.1 The on-wire ABI was written out twice by hand** - 28 `SYS_*`, 12 `OP_*` and 12 `repr(C)` structs restated in `librheo/src/sys.rs` under a "keep in sync" comment. Values agreed, so it was latent; a field-meaning change within the same size would have been wrong numbers with no fault. | Fixed. A **`rheo-abi`** leaf crate (`no_std`, zero deps, **no lang items** - the `runtime/` model) is the single definition; `kernel::abi`, `kernel::queue`, `librheo::sys` and `libc::sys` all `pub use` it, so no call site changed and divergence is now a compile error. **943 lines of hand-kept duplicate deleted.** The asymmetric guard is gone too: `size_of::<QueueHeader>() == 64` is asserted once, for both sides. |
+| **§3.2 The object layer named concrete device drivers** - `queue/mod.rs` reached `hw::virtio_net::{tx,rx,mac}` and `hw::virtio_gpu::present` directly, twenty lines below the `svc::file_ops()` bridge that does it correctly. `ARCHITECTURE.md` §5 puts drivers permanently outside the kernel. | Fixed. `svc::NicOps`/`svc::DisplayOps` behind a new **`svc::Bridge<T>`**, registered by the driver's own `install()` - where the device is known to exist, so a kernel with no netdev answers `STATUS_IO` honestly instead of calling into a driver that is not there. `queue` names no driver. A driver **cell** installs into the same slot later with nothing above it changing. |
+| **§5 The `svc` bridge pattern was hand-written per table** - two structurally identical static/setter/getter triples, about to become four. | Fixed. One `Bridge<T>`; `install` and `get` are `unsafe` with the boot-time-only invariant named, and the four safe accessors are where it is discharged. |
+| **§3.6 `arch::init()` was a boot sequencer in the arch namespace**, reaching up into `crate::{time, hw, rng, svc}` - three module cycles from three lines, none of them per-ISA. | Fixed. `kernel::boot::init()` sequences the portable half; `arch::init()` does only console + vectors + kernel page tables and names nothing above it. 61 call sites renamed mechanically (no assertion changed). Only the three **free** cycles closed - the per-ISA modules still reach `hw`/`input`/`user`/`net_rx`, which carry real coupling and need a registration seam; see §3.6. |
+| **§3.6 Per-ISA leakage outside `arch/` had no written exemption** - 9 sites in `user_progs.rs`, 6 with no justification, and no doc claimed the rule was relaxed. | Fixed by writing it down: `TARGET-ARCHITECTURES.md` §4.1 states both exemptions and their bounds, with the counts (138 of 146 `tests/src` sites are per-target *file paths*), and names `iommu.rs`'s five sites as a **defect, not an exemption**. |
+
 The lesson is recorded in `ENGINEERING.md` §1: when a capability lie is found,
 every conclusion that touched it is a suspect.
 
@@ -109,7 +115,7 @@ not honest is presenting the per-entry grant check as gating the operation.
 
 ## 3. Structural defects found by the dependency graph
 
-### 3.1 The on-wire ABI is written out twice, by hand (A - silent-corruption class)
+### 3.1 The on-wire ABI was written out twice, by hand - **CLOSED** (see §1)
 
 | Item | Kernel | Cell |
 |---|---|---|
@@ -127,10 +133,12 @@ fault, which is exactly the failure mode the FP/SIMD switch bug already taught
 this tree. Asymmetric guard: the kernel asserts
 `size_of::<QueueHeader>() == 64`; **librheo does not**.
 
-Fix: a `rheo-abi` leaf crate (`no_std`, zero deps, **no lang items** - the
-`runtime/` model). Divergence becomes a compile error.
+Fixed: the `rheo-abi` leaf crate (`no_std`, zero deps, **no lang items** - the
+`runtime/` model) is now the single definition and all four consumers re-export
+it. Divergence is a compile error. The table above is kept as the record of what
+the duplication *was*.
 
-### 3.2 The object layer names concrete device drivers (A - `ARCHITECTURE.md` §5)
+### 3.2 The object layer named concrete device drivers - **CLOSED** (see §1)
 
 One 90-line `match` in `kernel/src/queue/mod.rs` contains both the disciplined
 and the undisciplined approach:
@@ -143,9 +151,10 @@ and the undisciplined approach:
 ```
 
 §5 puts "device drivers beyond queue/IOMMU/reset plumbing" permanently outside
-the kernel. The remedy sits 20 lines above the defect: two more `svc` tables,
-`NicOps { tx, rx, mac }` and `DisplayOps { present }`. **Cheapest §5 compliance
-win in the tree**, and it composes rather than extends.
+the kernel. The remedy sat 20 lines above the defect, and is what landed: two
+more `svc` tables, `NicOps { tx, rx, mac }` and `DisplayOps { present }`, behind
+the new `Bridge<T>`. It composed rather than extended - the virtio drivers did
+not move, they register themselves.
 
 ### 3.3 A hidden layering edge cargo cannot see (A)
 
@@ -191,10 +200,22 @@ feature.
 
 ### 3.6 Smaller structural items
 
-- **Three free module cycles.** `arch -> time`, `arch -> rng`, `arch -> svc` are
-  **3 references total**, all at `arch/mod.rs:144,146,147` - `arch::init()` is a
-  *boot sequencer* living in the arch namespace. Moving it to
-  `kernel::boot::init()` deletes three cycles in a five-line change. **(B)**
+- ~~**Three free module cycles.**~~ **CLOSED.** `arch -> time`, `arch -> rng`,
+  `arch -> svc` were 3 references total, all in `arch::init()` - a *boot
+  sequencer* living in the arch namespace. `kernel::boot::init()` now sequences
+  the portable half and `arch::init()` names nothing above it. The five-line
+  estimate was right about the logic and wrong about the blast radius: 61 call
+  sites had to be renamed, mechanically and with no assertion touched.
+
+  Scope, stated so the claim is not read wider than it is: these three were the
+  **free** cycles - a sequencer that happened to live in the wrong namespace, with
+  no coupling behind it. The per-ISA modules still reference `crate::hw` (20
+  sites), `crate::input` (5), `crate::user` (4) and `crate::net_rx` (2), and those
+  edges are **not** free: an interrupt handler written in `arch` genuinely has to
+  deliver the byte or the frame to the portable sink, and paging genuinely needs
+  `mm`. Removing them means inverting the direction with a registration seam (the
+  `Bridge<T>` shape, or a per-ISA `IrqSink`), which is real design work and a
+  separate item - not part of this one.
 - **The `arch` seam is not trait-shaped.** 83 flat re-exports, **zero traits**,
   against a doc that says "one trait per concern". But the naming already
   clusters them into 9 coherent concerns (`TrapContext` 15, `Paging` 13, `Timer`
@@ -207,12 +228,13 @@ feature.
   **consumer, in a test** (`tests/src/iommu.rs:26,28`). 599 lines reachable only
   from one test kernel. It is the only §4 area that is implemented and
   misplaced. **(A, small)**
-- **Per-ISA leakage: 9 sites, one file.** All in `kernel/src/user_progs.rs`; 3
-  carry a written justification, **6 do not**, and no doc claims the exemption.
-  The reason is good and identical for all nine - a U-mode syscall instruction
-  and a cycle counter *are* the ISA, and these programs cannot reach `arch/`
-  because kernel `.text` is not mapped in a cell. Fix is a paragraph, not a
-  refactor. **(C once written; a rule violation until then.)**
+- ~~**Per-ISA leakage: 9 sites, one file.**~~ **CLOSED (C).** The paragraph is
+  written: `TARGET-ARCHITECTURES.md` §4.1 states the two exemptions and their
+  exact bounds - inline asm for the syscall instruction and counter read in code
+  that *runs in U-mode* (which cannot reach `arch/`, because kernel `.text` is
+  not mapped in a cell), and per-target file paths in test kernels. Writing it
+  down also separated a real defect from the noise: `iommu.rs`'s five sites are
+  named there as a violation, not an exemption.
 - **Two `install_script` implementations in the kernel** with the same doc
   comment (`input.rs:96`, `pty.rs:20-34`), each with its own `static mut SOURCE`
   and `Source::Script` variant, consumers split between them. **(B)**
@@ -322,7 +344,7 @@ Measured, not estimated.
 | **Test-kernel boilerplate** | **~2,684 removable lines** across 26 kernels; 130 boilerplate : 28 unique per kernel (4.5:1; 11:1 for pure-net); the console `FileOps` 8-stub block copied **22 times verbatim**; 14 launch blocks differing by **2 lines**; **10** independent `macro_rules!` for the same per-ISA `include_bytes!`, two byte-identical *and on the same line number* | `console_personality::ops()` + `harness::run_elf_cell` + `elf!`/`heap!` macros | M / **LOW** (test-only; failures are loud) |
 | **The virtio trio** | **~860 of 2,391 lines (36%)**; 48 constants in >1 driver; `PciXport` 3x (net vs gpu diff to **zero lines**); 5 ring structs 3x; the reset sequence character-identical in **all six** places | `hw/virtio/`: `trait VirtioTransport`, `VirtQueue<N>` with `submit_chain(&[Seg])`, `negotiate()` | L / **S(gpu) → M(blk) → L(net)** |
 | **Fixed-slot registries** | 22 registries, ~1,080 lines; **12 fit one generic** (7 are literally the same 8 lines) | `Registry<T: Slot, N>` - **without** generations (the only site needing them stays bespoke) | M / MEDIUM (live kernel state; quiet failures) |
-| **The `svc` bridge** | two structurally identical 17-line static/setter/getter triples; **31** hand-written null-check call sites in two idioms | `Bridge<T>` + `NicOps`/`DisplayOps` (+ `PersonalityOps` later) | S / LOW |
+| ~~**The `svc` bridge**~~ **DONE** | two structurally identical 17-line static/setter/getter triples; **31** hand-written null-check call sites in two idioms | `Bridge<T>` + `NicOps`/`DisplayOps` landed (`PersonalityOps` still later) | S / LOW |
 | **The proof harness** | `VirtualLink` defined once (good) but the **pump loop exists in 4 hand-written copies** (~131 lines) and there are **six** notions of "advance a controlled clock" | `net::proof` behind a non-default feature: `LogicalClock`, `VirtualLink`, one `pump()` | S-M / LOW |
 | **The honesty pattern** | re-invented three times (`input`, `net_rx`, `ktimer`) - same accessor bodies, same `SAFETY` comment text; skip-with-reason is free-form prose at **19** sites with **three** different markers | `Validated<T>` + `Evidence`; a typed `Skip` enum | M / **MEDIUM** on `Evidence` (the counters *are* the proofs), LOW on `Skip` |
 
@@ -354,10 +376,11 @@ Chosen by (correctness at risk) first, then (leverage ÷ risk).
 admission ledger~~ are **closed** (§1). Next: §2.1-2.3 the capability surface,
 complete revocation, per-child tables; §2.6 the ambient-authority sweep.
 
-**First week - four Small, near-zero-risk items closing three structural
-defects.** `arch::init -> kernel::boot::init` (5 lines, deletes 3 cycles);
-`rheo-abi` (removes the only silent-corruption duplication); `svc::Bridge<T>` +
-`NicOps`/`DisplayOps` (closes the §5 defect); write the two `cfg` exemptions.
+~~**First week - four Small, near-zero-risk items closing three structural
+defects.**~~ **DONE** (all four; see §1): `kernel::boot::init` deletes the three
+cycles, `rheo-abi` removes the silent-corruption duplication (-943 lines),
+`svc::Bridge<T>` + `NicOps`/`DisplayOps` closes the §3.2 defect, and
+`TARGET-ARCHITECTURES.md` §4.1 states the `cfg` exemptions.
 
 **Then - leverage.** The test harness (largest line win, lowest risk, and it
 makes every later refactor cheaper to prove); gate `VirtualLink`;

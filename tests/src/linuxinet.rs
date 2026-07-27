@@ -127,7 +127,7 @@ fn run(image: &[u8], argv: &[&[u8]]) -> Outcome {
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("linuxinet: start on {}", arch::NAME);
 
     // SAFETY: once, before any allocation.

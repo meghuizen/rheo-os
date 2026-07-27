@@ -139,7 +139,7 @@ fn check(name: &str, image: &[u8], want_code: u64, want_out: &[u8]) {
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("linuxsig: start on {}", arch::NAME);
     println!(
         "linuxsig: fixtures raise={} segv={} dfl={} bytes",

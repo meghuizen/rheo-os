@@ -86,7 +86,7 @@ fn assert_fault_at(outcome: Outcome, want: usize, what: &str) {
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("isolation-hw: start on {}", arch::NAME);
 
     // Addresses used as probe targets.

@@ -154,7 +154,7 @@ fn check(argv: &[&[u8]], want_code: u64, want_out: &[u8]) {
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("linuxtools: start on {}", arch::NAME);
 
     // SAFETY: once, before any allocation.

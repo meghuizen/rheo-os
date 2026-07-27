@@ -105,7 +105,7 @@ extern "C" fn worker_entry() -> ! {
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("bench-core: start on {}", arch::NAME);
 
     // SAFETY: once, before any allocation; HEAP_MEM is a unique static.

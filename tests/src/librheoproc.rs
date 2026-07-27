@@ -195,7 +195,7 @@ fn expect_exit(label: &str, outcome: Outcome) {
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("librheoproc: start on {}", arch::NAME);
 
     // SAFETY: once, before any allocation.

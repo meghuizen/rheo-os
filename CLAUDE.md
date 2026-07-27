@@ -1339,8 +1339,18 @@ QEMU 8.x system emulators must be installed to run or test.
 
 ```
 docs/         the design documents (the spec - keep code consistent with it)
+abi/          rheo-abi: the on-wire user/kernel ABI, defined **once** - syscall
+              numbers, queue opcodes/status codes, the ring header + entry
+              layouts, and every repr(C) block a syscall writes into a cell.
+              no_std, zero deps, **no lang items** (the runtime/ model), so it
+              links into a kernel binary and a cell alike; kernel::abi,
+              kernel::queue, librheo::sys and libc::sys all re-export it, which
+              is what makes divergence a compile error instead of a wrong number
+              at runtime (docs/ARCHITECTURE-DEBT.md 3.1)
 kernel/       the no_std kernel library + boot demo bin
-  src/        ISA-independent: capability core, queue ABI, cells, mm
+  src/        ISA-independent: boot (the portable boot sequencer - arch::init
+              does only console/vectors/page tables, so arch names nothing above
+              itself), capability core, queue ABI, cells, mm
               (frames + frames_pmem real-nvdimm allocator + grants), time (clock), rng (ChaCha20 DRBG +
               hwrng seeding), event streams,
               sched (reservations + the **system-wide admission ledger**:
@@ -1362,10 +1372,14 @@ kernel/       the no_std kernel library + boot demo bin
               deadline-honouring wait modes: a NIC-interrupt park, a timer-backed
               idle where only the timer interrupt exists, else a bounded poll -
               docs/NETSTACK.md 16), svc
-              (shell/resource/POSIX-file syscalls + the N4b SocketOps
-              remote-INET bridge - a FileOps-shaped fn-pointer table a service
-              registers, so the kernel stays network-stack-free -
-              docs/NETSTACK.md 18), hw (ACPI/FDT/PCIe
+              (shell/resource syscalls + the **bridge framework**: Bridge<T> +
+              FileOps (POSIX files) / SocketOps (N4b remote INET) / NicOps /
+              DisplayOps - fn-pointer tables whatever owns the real
+              implementation registers at boot, so the kernel stays
+              filesystem-free, network-stack-free and **driver-free**: the queue's
+              opcode dispatch names no device driver, and a driver cell installs
+              into the same slot later - docs/NETSTACK.md 18,
+              docs/ARCHITECTURE-DEBT.md 3.2), hw (ACPI/FDT/PCIe
               discovery + the machine Inventory; block BlockDevice trait +
               virtio_blk driver; virtio_net raw-frame NIC driver -
               docs/NETWORKING.md; virtio_gpu 2D display driver -

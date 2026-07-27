@@ -28,7 +28,7 @@ use kernel::{arch, println};
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init(); // runs hw::detect -> frames_pmem::init_from_inventory
+    kernel::boot::init(); // runs hw::detect -> frames_pmem::init_from_inventory
     println!("pmem: start on {}", arch::NAME);
 
     match frames_pmem::region() {

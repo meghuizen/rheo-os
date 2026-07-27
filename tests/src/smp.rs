@@ -32,7 +32,7 @@ use kernel::{arch, println};
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("smp: start on {}", arch::NAME);
 
     test_spinlock();

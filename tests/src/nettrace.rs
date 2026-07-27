@@ -106,7 +106,7 @@ static mut KSTACK: KStack = KStack([0; 64 * 1024]);
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("nettrace: start on {}", arch::NAME);
 
     // SAFETY: once, before any allocation; HEAP_MEM is a unique static.

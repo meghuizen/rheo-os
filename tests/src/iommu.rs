@@ -35,7 +35,7 @@ static mut BUF: [u8; 512] = [0; 512];
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("iommu: start on {}", arch::NAME);
 
     let iommu_base = hw::inventory().iommu_base;

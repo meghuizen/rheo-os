@@ -21,7 +21,7 @@ use kernel::{arch, println, svc};
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("gpuhw: start on {}", arch::NAME);
 
     hw::print_summary();

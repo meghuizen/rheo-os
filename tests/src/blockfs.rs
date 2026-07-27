@@ -28,7 +28,7 @@ static mut HEAP_MEM: [u8; 2 * 1024 * 1024] = [0; 2 * 1024 * 1024];
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    arch::init();
+    kernel::boot::init();
     println!("blockfs: start on {}", arch::NAME);
 
     // SAFETY: once, before any allocation; HEAP_MEM is a unique static.
