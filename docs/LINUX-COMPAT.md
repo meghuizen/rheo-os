@@ -152,6 +152,7 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 | rt_sigtimedwait | partial | never blocks; returns -EAGAIN so callers loop/bail rather than hang (no fixture waits in it) (L5) |
 | mremap | full | shrink unmaps the tail in place; grow requires MREMAP_MAYMOVE (map a fresh region, copy, free the old); else -ENOMEM. glibc's large-block `realloc` needs it (the malloc-copy-free fallback otherwise leaks frames) |
 | rseq / clone3 | ENOSYS | glibc has documented fallbacks (rseq→unregistered, clone3→clone); verified via the ENOSYS logger that glibc/rust fall back to `clone`, so clone3 stays ENOSYS. Both are now **dispatched** to that refusal rather than falling through the unknown-number path, so the log no longer says `ENOSYS nr=435` as if the number were unrecognised (docs/ARCHITECTURE-DEBT.md 4.0) |
+| io_uring_setup / _enter / _register | ENOSYS, deliberately | The async-IO submission mechanism. This OS's async path is the queue-pair reactor, not io_uring, so refusing it is a design statement, not a gap. Node 22's libuv probes `io_uring_setup` at startup and falls back to epoll+threadpool on ENOSYS (observed in the real `node` trace: `io_uring_setup` then epoll_create1/epoll_ctl/epoll_pwait). **Dispatched** to the refusal rather than falling through the unknown-number path, the clone3/rseq class. Numbers 425/426/427 are shared across the x86-64 and asm-generic tables (added after the split) |
 | open (x86-64 legacy) | full | Routed to `openat` with `AT_FDCWD` - the same call. It had been missing, and glibc issues `open` in preference to `openat` on x86-64, so every `open` was refused on **that ISA and nowhere else** (docs/ENGINEERING.md 11, the two-numbers hazard). An unreachable sentinel on the asm-generic tables |
 | eventfd2 | full for the wakeup contract | A 64-bit counter as a per-cell fd over a per-personality registry (`linux::eventfd`), **no kernel object** - the counter lives in the registry, not the descriptor, so `dup`/`fork` share it. Write adds (refusing `u64::MAX` and refusing to overflow), read drains, `EFD_SEMAPHORE` yields 1 and decrements, a zero counter is **not** readable (so poll/epoll report it unready and a blocking read parks under the pipe's runnable-peer rule), sub-8-byte transfers are `-EINVAL`, an unknown flag bit is `-EINVAL` rather than dropped. Scope: a **sibling context** writing it does not wake a context parked on it, which is the L4 cell-level block limitation, not an eventfd one |
 | timerfd_create / settime / gettime | full for the event-loop use | A timer as a per-cell fd over a per-personality registry (`linux::timerfd`), **no kernel object** - the armed deadline is an ordinary cell-clock wait, the same kind `nanosleep` parks on. One-shot and periodic; `TFD_TIMER_ABSTIME`, `CLOCK_MONOTONIC`/`CLOCK_REALTIME`; an all-zero `it_value` disarms. `read` returns the expiration count and consumes it (a periodic timer advances to its next future expiry); a blocking read on a not-yet-expired timer **parks on the deadline** (the scheduler idles on the timer, no runnable-peer needed, unlike an eventfd), a non-blocking one is `-EAGAIN`. `POLLIN` once expired, never `POLLOUT` - so an epoll loop wakes when the timer fires (the libuv timer source). `write` is `-EINVAL`. Scope: the cell-level block limit (L4) and no `TFD_TIMER_CANCEL_ON_SET` (the cell clock does not step) |
@@ -996,6 +997,32 @@ fixup path.
   the OS, the strongest evidence to date that the personality carries a real
   language runtime, and the honest step short of Node itself (whose V8 + libuv +
   ~100 MB binary is the remaining distance).
+
+- **The syscall surface for real Node is closed; the remaining distance is V8's
+  JIT, not the syscalls** (measured, not guessed). An `strace` of the real
+  `node` binary (v22, dynamic, 124 MB) evaluating JavaScript (`node -e
+  'console.log(40+2)'`) issues 49 distinct syscalls; every one is now dispatched
+  or **deliberately** refused. `node --version` (the loader + startup path)
+  issues only syscalls the personality already handled once `capget` landed - it
+  was the single call falling through the unknown-number log. Real JS execution
+  adds `io_uring_setup`/`_enter` (refused ENOSYS, libuv falls back to
+  epoll+threadpool - the trace shows exactly that fallback), `clone3` (refused,
+  glibc falls back to `clone`), and `epoll_pwait` (already dispatched, shares the
+  `epoll_wait` arm). **The one thing the personality's doctrine refuses is V8's
+  JIT code space**: the trace contains a single `mprotect(..., PROT_READ |
+  PROT_WRITE | PROT_EXEC)` - V8's writable-executable code region - which the W^X
+  invariant (docs/ARCHITECTURE.md 5, enforced structurally in
+  `kernel/src/linux/mem.rs`) refuses with `-EPERM`. Every other `PROT_EXEC`
+  mapping in the trace is a file-backed `PROT_READ|PROT_EXEC` shared-library
+  segment (legitimate W^X). So the honest path to Node on this OS is V8's
+  **`--jitless`** mode (the Ignition bytecode interpreter, no executable
+  allocation - the same interpreter shape `boa` already proves runs), *not*
+  relaxing W^X. The remaining engineering is mechanical, not doctrinal: stream
+  the ~124 MB binary + its shared-library set off a live ext4 disk (the
+  `linuxdyn` disk path, demand-paged) and confirm V8 initialises within the
+  QEMU-TCG boot budget. A W^X-clean JIT (write-then-flip RW→RX code space, or a
+  MAP_JIT-style dual mapping) is the follow-on that would let V8 optimise rather
+  than only interpret.
 
 ## 6. Fixture build matrix (reproducibility)
 

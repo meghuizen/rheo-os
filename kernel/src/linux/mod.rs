@@ -578,7 +578,13 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
         // *correct* answer - glibc's documented fallbacks are `clone` for `clone3`
         // and "no restartable sequences" for `rseq` - so say so deliberately
         // instead of by accident (docs/ARCHITECTURE-DEBT.md 4.0, blocker 3).
-        nr::CLONE3 | nr::RSEQ => err(errno::ENOSYS),
+        // io_uring joins them: Node/libuv probes it and falls back to
+        // epoll+threadpool on ENOSYS - our async path is the queue-pair reactor,
+        // not io_uring, so this refusal is a design statement, not a gap
+        // (docs/LINUX-COMPAT.md).
+        nr::CLONE3 | nr::RSEQ | nr::IO_URING_SETUP | nr::IO_URING_ENTER | nr::IO_URING_REGISTER => {
+            err(errno::ENOSYS)
+        }
 
         // -- resource limits --
         nr::PRLIMIT64 => ret(sys_prlimit64(cur, args[1], args[2], args[3])),

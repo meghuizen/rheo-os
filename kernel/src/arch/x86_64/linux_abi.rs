@@ -110,6 +110,13 @@ pub mod nr {
     pub const STATX: u64 = 332;
     pub const RSEQ: u64 = 334;
     pub const CLONE3: u64 = 435;
+    /// io_uring - the async-IO submission mechanism (numbers shared with the
+    /// asm-generic table, added after the split). rheo-net's async path is the
+    /// queue-pair reactor, not io_uring; refused ENOSYS so libuv falls back to
+    /// epoll+threadpool (docs/LINUX-COMPAT.md). Node/libuv probes `setup` first.
+    pub const IO_URING_SETUP: u64 = 425;
+    pub const IO_URING_ENTER: u64 = 426;
+    pub const IO_URING_REGISTER: u64 = 427;
     pub const FACCESSAT2: u64 = 439;
 
     // Measured from the real Claude Code startup trace

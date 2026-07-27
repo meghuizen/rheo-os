@@ -266,6 +266,19 @@ int main(void) {
     puts("capget: empty caps, version probe answered");
   }
 
+  /* 9. io_uring - refused ENOSYS deliberately, the clone3/rseq class. Node 22's
+   *    libuv probes io_uring_setup at startup and falls back to epoll+threadpool
+   *    when it is ENOSYS (observed in the real `node` trace); our async path is
+   *    the queue-pair reactor, not io_uring, so the refusal is a design
+   *    statement. The number is *known* and answered ENOSYS - not the
+   *    unknown-number log. (A real Linux would answer EINVAL for 0 entries; this
+   *    fixture only ever runs under the rheo-os personality.) */
+  if (syscall(SYS_io_uring_setup, 0u, (void *)0) != -1 || errno != ENOSYS) {
+    puts("io_uring: not refused with ENOSYS");
+    return 1;
+  }
+  puts("io_uring: refused ENOSYS deliberately");
+
   puts("sysx OK");
   return 0;
 }

@@ -426,6 +426,7 @@ extern "C" fn kernel_main() -> ! {
         close_range: closed the range and nothing beyond it\n\
         clone3/rseq: refused ENOSYS deliberately\n\
         capget: empty caps, version probe answered\n\
+        io_uring: refused ENOSYS deliberately\n\
         sysx OK\n";
     let (code, out) = run_capture(SYSX, &[b"sysx"]);
     assert!(
