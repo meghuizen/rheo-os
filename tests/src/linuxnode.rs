@@ -44,5 +44,11 @@ extern "C" fn kernel_main() -> ! {
         // Node completes fully (prints rheo:42, exits 0), so it is held to the strict
         // exit-0 gate - no thread-abort partial.
         false,
+        // **Preemptive dispatch** (docs/SUBSTRATE.md 15, S3'): Node runs to its
+        // correct answer with the CPU genuinely being taken away from it mid-run,
+        // which is the useful half of that migration's proof - a preemption kernel
+        // that only ever preempts a purpose-built spinner has not been tested by
+        // anything.
+        true,
     )
 }

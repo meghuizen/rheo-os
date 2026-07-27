@@ -547,6 +547,15 @@ const MADV_FREE: u64 = 8;
 const MADV_HUGEPAGE: u64 = 14;
 const MADV_NOHUGEPAGE: u64 = 15;
 /// Zero this range in the child on `fork` / stop doing so.
+/// `MADV_DONTDUMP` / `MADV_DODUMP`: exclude a range from, or include it in, a core
+/// dump. Accepted as genuinely advisory - this OS produces no core dumps at all, so
+/// the request's whole observable effect is provided vacuously, which is a different
+/// thing from dropping a request that has one. Refusing them was the previous
+/// behaviour and it is what a runtime marking its large reservations (JSC marks the
+/// Gigacage `MADV_DONTDUMP`, which is the sane thing to do with 128 GiB of mostly
+/// untouched address space) sees as an unexplained failure.
+const MADV_DONTDUMP: u64 = 16;
+const MADV_DODUMP: u64 = 17;
 const MADV_WIPEONFORK: u64 = 18;
 const MADV_KEEPONFORK: u64 = 19;
 
@@ -584,7 +593,7 @@ pub fn madvise(st: &mut LinuxState, addr: u64, len: u64, advice: u64) -> i64 {
     match advice {
         // Genuinely advisory: no read-ahead or page-size machinery to inform.
         MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_HUGEPAGE
-        | MADV_NOHUGEPAGE => 0,
+        | MADV_NOHUGEPAGE | MADV_DONTDUMP | MADV_DODUMP => 0,
 
         // Free the pages now. The mapping's *record* stays - this is a decommit,
         // not an unmap, so the next touch re-faults (anonymous pages come back

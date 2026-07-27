@@ -125,9 +125,32 @@ pub fn prove(
     envp: &[&[u8]],
     want: &[u8],
     thread_abort_partial: bool,
+    preemptive: bool,
 ) -> ! {
     kernel::boot::init();
     println!("{name}: start on {}", arch::NAME);
+
+    // **Preemptive dispatch** (docs/SUBSTRATE.md 15, S3'), per boot.
+    //
+    // This is the boot the migration exists for: a production JavaScript runtime
+    // spawns worker threads its main thread waits on, and under a cooperative
+    // scheduler a context that does not block never gives the CPU back. `linuxnode`
+    // turns it on and **completes** - a real V8 + libuv runtime running to a correct
+    // answer on a preemptively scheduled kernel, which is the result worth having.
+    //
+    // It is a per-boot argument rather than a global default because the two runtimes
+    // that share this harness are in different states, and the honest thing is to run
+    // each under the scheduler its outcome has actually been characterised against
+    // (see `linuxbun`'s module docs for what changing it did).
+    //
+    // Set before the cell's trap frame is built: on x86-64 and ARM64 a frame's
+    // interrupt mask is derived from this setting at construction time, so a frame
+    // built with interrupts masked cannot be preempted whatever the scheduler later
+    // decides.
+    if preemptive {
+        arch::enable_timer_irq();
+    }
+    kernel::sched::dispatch::enable(preemptive);
 
     // SAFETY: once, before any allocation.
     unsafe {
@@ -177,6 +200,14 @@ pub fn prove(
     // Streaming witness: the binary + ld.so + its libraries came off the device on
     // demand through the bounded cache, not a whole-image preload. This must hold in
     // every non-skip outcome, so it is checked before branching on the result.
+    // The preemption witness, printed in every outcome. A partial that is still
+    // blamed on the cooperative scheduler has to be able to show that preemption
+    // *was* delivered - otherwise "the worker never ran" and "the CPU never moved"
+    // are indistinguishable (docs/ENGINEERING.md 1).
+    let (armed, taken, unarmable, to_sibling, to_cell) = kernel::sched::preempt::counters();
+    println!(
+        "{name}: preemption {taken}/{armed} slices taken ({to_sibling} to a sibling          context, {to_cell} to another cell, {unarmable} unarmable)"
+    );
     let fills = block::cache_fills() - fills_before;
     assert!(
         fills > 0,

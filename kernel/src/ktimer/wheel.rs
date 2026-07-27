@@ -512,6 +512,17 @@ impl Wheel {
         if target_tick.saturating_sub(self.now_tick) >= (SLOTS as u64) {
             self.now_tick = target_tick;
             fired += self.refile_all(now_ns);
+            // ...and then the current level-0 bucket, exactly as the step path does
+            // below. Without this the bulk path can leave a timer that is *already
+            // due* sitting in the bucket it was just re-filed into, to fire on the
+            // next service - **after** timers with later deadlines that this pass
+            // fired. That breaks the one property the wheel exists to guarantee, and
+            // it breaks it only after a long stall, so it presents as a rare
+            // load-dependent flake rather than a bug (`substrate`'s ordering
+            // assertion, observed failing while the host was building three ISAs).
+            // A transport would apply a later RTO before an earlier one.
+            let slot = (self.now_tick as usize) & (SLOTS - 1);
+            fired += self.expire_bucket(0, slot, now_ns);
             self.after_removals();
             return fired;
         }

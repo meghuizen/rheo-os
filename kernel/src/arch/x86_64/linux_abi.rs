@@ -132,6 +132,11 @@ pub mod nr {
     /// (docs/ENGINEERING.md 11).
     pub const OPEN: u64 = 2;
     pub const SYSINFO: u64 = 99;
+    /// `getrusage(who, usage)`. Bun prints an "Elapsed / User / Sys / RSS" line from
+    /// it at startup; refused, it printed **garbage** (`Sys: 8589934ms` - an errno
+    /// reinterpreted as microseconds), which is worse than a refusal because it looks
+    /// like a measurement (docs/ENGINEERING.md 1).
+    pub const GETRUSAGE: u64 = 98;
     /// gettimeofday(tv, tz) - the legacy wall-clock read. libuv's
     /// `uv_gettimeofday` calls it directly (not `clock_gettime`) and *asserts* it
     /// returns 0, so an unimplemented number aborts Node at startup

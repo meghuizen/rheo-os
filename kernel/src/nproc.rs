@@ -618,9 +618,22 @@ pub fn yield_cell(cur: usize) -> Sched {
 /// across the native cross-cell switch"): preemption is a **fourth** path into that
 /// invariant, and it holds here for the same structural reason the other three do.
 pub fn preempt_cell(cur: usize) -> Option<*mut TrapFrame> {
+    // The vector-register file is saved **first**, before the wake scan and the pick
+    // run any kernel code: on x86-64 an ordinary struct move or a `compiler_builtins`
+    // `mem*` call uses vector registers even in a soft-float kernel, and a preemption
+    // lands at an arbitrary instruction inside the cell's own vector code
+    // (`user::on_user_interrupt` carries the full argument). `switch_native_cell`
+    // would otherwise do the save here, after that work.
+    user::save_native_fp(cur);
     wake_satisfiable();
     let next = crate::sched::dispatch::pick_excluding_self(cur, MAX_CELLS, schedulable)?;
-    user::switch_native_cell(cur, next);
+    // Deliberately **not** `switch_native_cell`: its first action is the save that
+    // already happened above, and doing it twice would overwrite the good image with
+    // whatever the pick left in the registers. The invariant CLAUDE.md states - every
+    // native cross-cell switch swaps the FP/SIMD register file - holds here in two
+    // stages rather than one, which is why this is the only site allowed to say so.
+    user::switch_to_cell(next);
+    user::restore_native_fp(next);
     complete_block(next);
     Some(user::cell_frame(next))
 }

@@ -447,7 +447,8 @@ byte-for-byte the old behaviour, which is why the whole Linux suite stays green.
 Still cooperative + single-CPU (#27); one `poll` waiter per cell (the copied
 pollset is per-cell; `epoll`, which Node uses, is unlimited).
 
-**The real Bun binary loads to the concurrency frontier** (GOAL-BUN,
+**The real Bun binary loads deep into JavaScriptCore, and its old diagnosis is
+withdrawn** (GOAL-BUN,
 docs/LINUX-COMPAT.md, the `linuxbun` test - a **partial**): the actual
 `/root/.bun/bin/bun` (v1.3, dynamic, 99 MB, JavaScriptCore + a Zig runtime) streams
 off a live ext4 disk (~3,500 fills), dynamically links its whole library set, and
@@ -456,15 +457,44 @@ reservation the kernel now demand-fills (the Linux mmap window was raised to
 80..252 GiB for it, and a failed eager commit no longer leaks a phantom VMA), spawns
 a worker via **`clone3`** (now implemented: it decodes `struct clone_args` and routes
 to the same context-creation path as `clone`), and sets up its libuv event loop
-(`BUN_JSC_useJIT=0`, host-verified zero RWX). It then `abort()`s **before evaluating**,
-and the cause is measured not guessed: **all 205 of its syscalls came from the main
-thread; the worker it spawned never got the CPU** - the cooperative single-CPU
-scheduler switches to a sibling only when the current context blocks, and Bun's main
-requires the worker to progress *concurrently* first. That is the preemptive-SMP
-frontier (#132), not a missing syscall - the whole load path works. `linuxbun` accepts
-the bounded partial (exit 134 + no output); when #132 lands Bun should print `rheo:42`.
-Node completes fully because its coordination aligns with blocking points; Bun's needs
-true parallelism.
+(`BUN_JSC_useJIT=0`, host-verified zero RWX). It then `abort()`s **before evaluating**.
+The whole load path works (streaming, demand paging, 7-library dynamic linking, the
+Gigacage, `clone3`, the event loop) and `linuxbun` accepts that bounded partial - exit
+134 **and** empty output, so any other failure still fails.
+
+**What it aborts on is now honestly unknown.** The previous answer was measured and
+plausible - all 205 of its syscalls came from the main thread and the worker it spawned
+never got the CPU, so the cooperative scheduler was blamed and the prediction was "when
+#132 lands, Bun prints `rheo:42`". **Timer preemption has since landed** (see the
+substrate section below), the worker measurably *does* get the CPU (66 preemptions,
+all to a sibling context of Bun's own cell), and Bun aborts **identically with
+preemption disabled** - same exit, same empty output, same point. The starved worker was
+the first difference anyone measured between Bun and Node, not the cause. The prediction
+is withdrawn rather than reattached to a later milestone (docs/ENGINEERING.md 1), and
+the `linuxbun` boot stays cooperative because that is the scheduler its partial is
+characterised against - turning preemption on is not a no-op (Bun gets *further*, all the
+way to printing its banner) but it then fails differently, and widening an accepted
+partial to cover a second unexplained failure would turn a bounded disclosure into a
+blanket one.
+
+The experiment paid for itself in three real defects, each fixed: the **vector-register
+file was saved after the scheduler's bookkeeping** rather than before it (the kernel is
+soft-float, but that bounds the floating point it *emits*, not the vector registers
+`compiler_builtins`' `mem*` routines and ordinary struct moves use on x86-64 - so
+anything between the interrupt and the save clobbers what is about to be saved; the save
+is now the first action on every preemption path, a fourth path into the `SYS_YIELD` FP
+scar); **`getrusage` was refused**, and Bun printed `Sys: 8589934ms` from the `-ENOSYS`
+return reinterpreted as microseconds - a fabricated measurement, worse than a refusal -
+so it now reports the counters this kernel actually has (elapsed CPU, the cell's own
+committed frames as `maxrss`, its fault count) with the rest 0 *because they are 0*; and
+**`MADV_DONTDUMP`/`MADV_DODUMP` were refused** where this OS can provide their entire
+observable effect, since it produces no core dumps (JSC marks the 128 GiB Gigacage
+`MADV_DONTDUMP`, which is the sane thing to do with mostly-untouched address space).
+
+**Node, by contrast, now completes *under* preemption** - 30 slices taken to sibling
+contexts, exact stdout, exit 0. That is the more useful half of the experiment: a
+preemption kernel that only ever preempts a purpose-built spinner has not been tested by
+anything.
 
 **timerfd is done** (docs/LINUX-COMPAT.md L8-TIMERFD, GOAL-TIMERFD):
 `timerfd_create`/`settime`/`gettime` - the **timer source of libuv**, and thus of

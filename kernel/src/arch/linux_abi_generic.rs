@@ -115,6 +115,8 @@ pub mod nr {
     // Measured from the real Claude Code startup trace
     // (docs/ARCHITECTURE-DEBT.md 4.0, blocker 3).
     pub const SYSINFO: u64 = 179;
+    /// `getrusage(who, usage)` - see the x86-64 table for why it is not a stub.
+    pub const GETRUSAGE: u64 = 165;
     /// gettimeofday(tv, tz) - the legacy wall-clock read libuv asserts on
     /// (docs/LINUX-COMPAT.md). asm-generic number.
     pub const GETTIMEOFDAY: u64 = 169;

@@ -605,6 +605,7 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
             ret(sys_sched_priority_bound(args[0]))
         }
         nr::SYSINFO => ret(sys_sysinfo(args[0])),
+        nr::GETRUSAGE => ret(sys_getrusage(cur, args[0], args[1])),
         nr::EVENTFD2 => ret(st.fds.eventfd_create(args[0], args[1])),
         // timerfd (docs/LINUX-COMPAT.md L8-TIMERFD): the libuv event-loop timer
         // source. A per-cell fd over the timerfd registry; a deadline is an
@@ -854,6 +855,7 @@ fn ptr_args_ok(nr_val: u64, args: &[u64; 6]) -> bool {
         nr::PRLIMIT64 => rd_opt(2, 16) && wr_opt(3, 16),
         nr::GETRLIMIT => wr(1, 16),
         nr::SYSINFO => wr(0, core::mem::size_of::<SysInfo>() as u64),
+        nr::GETRUSAGE => wr(1, core::mem::size_of::<RUsage>() as u64),
         // eventfd read/write carry an 8-byte value through the *fd* path, which
         // does its own bounding in `linux::eventfd`; the create call takes scalars.
 
@@ -1919,6 +1921,82 @@ fn sys_sysinfo(info_va: u64) -> i64 {
     // SAFETY: `out` was validated non-null, aligned and inside the calling cell's
     // user VA range; its address space is active.
     unsafe { out.write(si) };
+    0
+}
+
+/// A Linux `struct rusage`: two `timeval`s then 14 `long`s.
+#[repr(C)]
+#[derive(Default)]
+struct RUsage {
+    utime_sec: i64,
+    utime_usec: i64,
+    stime_sec: i64,
+    stime_usec: i64,
+    maxrss: i64,
+    ixrss: i64,
+    idrss: i64,
+    isrss: i64,
+    minflt: i64,
+    majflt: i64,
+    nswap: i64,
+    inblock: i64,
+    oublock: i64,
+    msgsnd: i64,
+    msgrcv: i64,
+    nsignals: i64,
+    nvcsw: i64,
+    nivcsw: i64,
+}
+
+/// `getrusage(who, usage)`: the resource counters this kernel actually has.
+///
+/// Not a zeroed stub, and not a refusal. Refusing it made Bun print
+/// `Sys: 8589934ms` at startup - the `-ENOSYS` return reinterpreted as
+/// microseconds - which is the worst of the three outcomes, because it *looks* like a
+/// measurement (docs/ENGINEERING.md 1). Zeroing it would be the second worst for the
+/// same reason.
+///
+/// So the fields that have an answer here get the real one, and the rest are 0
+/// **because they are 0**, exactly as `sysinfo` is documented: there is no
+/// user/system time split (a cell's syscalls run in the same trap as its user code
+/// and nothing separates the two counters), no swap, no page cache, and no message
+/// queues. `maxrss` is the cell's own committed frames, which is a number the kernel
+/// keeps per cell for its budget, so it is genuinely this process's high-water
+/// resident set rather than the machine's.
+///
+/// `who` is accepted for SELF (0), the calling *thread* (1, which here is the same
+/// accounting - contexts share the cell's frames), and CHILDREN (-1), which reports
+/// zeros because reaped children's usage is not accumulated. RUSAGE_CHILDREN
+/// returning zeros is what a Linux process sees before it has waited on anything, so
+/// it is a truthful answer rather than a placeholder.
+fn sys_getrusage(cell: usize, who: u64, out_va: u64) -> i64 {
+    const RUSAGE_SELF: i64 = 0;
+    const RUSAGE_CHILDREN: i64 = -1;
+    const RUSAGE_THREAD: i64 = 1;
+    let who = who as i32 as i64;
+    if who != RUSAGE_SELF && who != RUSAGE_CHILDREN && who != RUSAGE_THREAD {
+        return -errno::EINVAL;
+    }
+    let Some(out) = crate::user::user_out::<RUsage>(out_va) else {
+        return -errno::EFAULT;
+    };
+    let mut ru = RUsage::default();
+    if who != RUSAGE_CHILDREN {
+        // The cell's whole elapsed CPU, reported as *user* time: there is no split to
+        // report, and putting it all in `utime` is the honest half - a program
+        // summing the two gets the right total either way, whereas splitting it by a
+        // guessed ratio would fabricate the distinction.
+        let ns = cell_clock_ns(false);
+        ru.utime_sec = (ns / 1_000_000_000) as i64;
+        ru.utime_usec = ((ns % 1_000_000_000) / 1_000) as i64;
+        // KiB, as Linux reports it.
+        ru.maxrss =
+            (crate::user::cell_frames_charged(cell) * crate::mm::frames::FRAME_SIZE / 1024) as i64;
+        ru.minflt = crate::linux::mem::faults() as i64;
+    }
+    // SAFETY: `out` was validated non-null, aligned and inside the calling cell's
+    // user VA range; its address space is active.
+    unsafe { out.write(ru) };
     0
 }
 

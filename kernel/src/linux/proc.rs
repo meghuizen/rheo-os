@@ -767,6 +767,10 @@ pub fn yield_cell(cur: usize) -> Ctl {
 ///   syscall boundary. Nothing is lost, only deferred - and deferring is what keeps
 ///   preemption from being able to end a process at an arbitrary instruction.
 pub(crate) fn preempt_cell(cur: usize) -> Option<*mut TrapFrame> {
+    // First, before the wake scan and the pick run any kernel code: on x86-64 an
+    // ordinary struct move uses vector registers even in a soft-float kernel, and a
+    // preemption lands at an arbitrary instruction inside the cell's own vector code
+    // (`user::on_user_interrupt` carries the argument).
     thread::save_current_fp(cur);
     for i in 0..MAX_CELLS {
         if procs()[i].state == PState::Blocked && satisfiable(i) {
@@ -820,11 +824,19 @@ fn reschedule(leaving: usize) -> Ctl {
             thread::set_current(n, idx);
             user::switch_to_cell(n);
             thread::restore_current(n);
-            // Record who is running, from which the next relinquish computes what to
-            // charge. The returned slice is what a preemption timer is armed with;
-            // it is armed by the trap-return path, which is the only place that
-            // knows the cell is about to actually execute.
-            crate::sched::dispatch::running(n, idx);
+            // Record who is running, from which the next relinquish computes what
+            // to charge, and arm its preemption slice.
+            //
+            // Context **0**, not `idx`: a cell has one vcore on the ready queue
+            // today, because the queue is asked for a *cell* order and the
+            // personality schedules contexts within a cell itself. Passing `idx`
+            // would look more precise and be wrong - `find(cell, idx)` would miss
+            // for every context but the first, so nothing would be charged and
+            // every burst score would stay zero. One vcore per context is the
+            // natural next step (a Linux thread becomes a vcore,
+            // docs/CONCURRENCY.md), and it is a change to what is *tracked*, not
+            // to this call.
+            crate::sched::dispatch::running(n, 0);
             complete_pblock(n, idx);
             // A signal another process sent while `n` was not running is
             // delivered *here* and nowhere else: delivery is a rewrite of the

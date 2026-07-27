@@ -1793,10 +1793,24 @@ pub fn on_user_interrupt(frame: *mut TrapFrame) -> *mut TrapFrame {
     if !cell_present(cur) {
         return frame;
     }
-    // Charge the interrupted cell for the slice it just ran and record the stop as
-    // **involuntary** - the distinction the burst score depends on, and the reason a
-    // compute-bound cell does not accumulate interactive weight by being preempted.
-    crate::sched::dispatch::preempted();
+    // **Save the interrupted vector-register file before any other kernel work.**
+    //
+    // The kernel is soft-float, which is what makes the ordinary syscall path safe
+    // to leave until the switch site - but "soft-float" bounds the *floating-point*
+    // it emits, not the vector registers `compiler_builtins`' `mem*` routines and
+    // ordinary struct moves use on x86-64. So anything running between the interrupt
+    // and the save can clobber exactly what is about to be saved, and a preemption
+    // arrives at an arbitrary instruction in the middle of the cell's own vector
+    // code. The symptom is not a fault at the switch: it is the *resumed* context
+    // computing with someone else's registers, which showed up as Bun dying with
+    // `Illegal instruction` at a nonsense address (docs/LIBRHEO.md, the `SYS_YIELD`
+    // FP scar - a fourth path into the same invariant).
+    //
+    // So the switch functions below do the save as their own first action, and the
+    // charging - which reads a clock, walks a funded table and records a histogram -
+    // is deliberately moved to *after* the switch. Nothing about the charge depends
+    // on running first: it names the outgoing vcore through the scheduler's own
+    // per-CPU record, not through `current_index()`.
     let resumed = match cells()[cur].personality {
         // A Linux cell: try its own ready contexts first (this is the fix for "a
         // spinning thread starves its siblings"), then other cells.
@@ -1822,6 +1836,11 @@ pub fn on_user_interrupt(frame: *mut TrapFrame) -> *mut TrapFrame {
             None => frame,
         },
     };
+    // Charge the interrupted vcore for the slice it just ran and record the stop as
+    // **involuntary** - the distinction the burst score depends on, and the reason a
+    // compute-bound cell does not earn interactive weight by being preempted. After
+    // the switch, per the FP note above.
+    crate::sched::dispatch::preempted();
     // Whoever runs next gets a fresh slice. Re-arming here rather than at the switch
     // sites keeps "every entry into a cell is under a slice" true of the preemption
     // path as well as the syscall path.
