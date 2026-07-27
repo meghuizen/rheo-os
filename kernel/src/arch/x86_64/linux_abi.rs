@@ -127,6 +127,10 @@ pub mod nr {
     pub const EVENTFD2: u64 = 290;
     pub const CLOSE_RANGE: u64 = 436;
 
+    // capget: a non-root process's capability query (docs/LINUX-COMPAT.md). Node
+    // probes it at startup. x86-64 legacy number.
+    pub const CAPGET: u64 = 125;
+
     // timerfd (docs/LINUX-COMPAT.md L8-TIMERFD). x86-64 legacy numbers.
     pub const TIMERFD_CREATE: u64 = 283;
     pub const TIMERFD_SETTIME: u64 = 286;

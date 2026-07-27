@@ -425,6 +425,7 @@ extern "C" fn kernel_main() -> ! {
         sched: SCHED_OTHER ok, SCHED_FIFO EPERM, range 0..0\n\
         close_range: closed the range and nothing beyond it\n\
         clone3/rseq: refused ENOSYS deliberately\n\
+        capget: empty caps, version probe answered\n\
         sysx OK\n";
     let (code, out) = run_capture(SYSX, &[b"sysx"]);
     assert!(

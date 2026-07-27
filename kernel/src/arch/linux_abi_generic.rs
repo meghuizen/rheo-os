@@ -114,6 +114,10 @@ pub mod nr {
     pub const EVENTFD2: u64 = 19;
     pub const CLOSE_RANGE: u64 = 436;
 
+    // capget: a non-root process's capability query (docs/LINUX-COMPAT.md). Node
+    // probes it at startup. asm-generic number.
+    pub const CAPGET: u64 = 90;
+
     // timerfd (docs/LINUX-COMPAT.md L8-TIMERFD). asm-generic numbers.
     pub const TIMERFD_CREATE: u64 = 85;
     pub const TIMERFD_SETTIME: u64 = 86;

@@ -229,6 +229,43 @@ int main(void) {
   }
   puts("clone3/rseq: refused ENOSYS deliberately");
 
+  /* 8. capget - a non-root process's capability query (Node.js probes it nine
+   *    times at startup). The honest answer for our unprivileged identity (uid
+   *    1000, no caps) is empty capability sets, not a stub that claims caps the
+   *    process does not have. The kernel also answers the version-probe protocol:
+   *    an unknown version returns EINVAL with the supported version written back. */
+  {
+    struct {
+      uint32_t version;
+      int pid;
+    } hdr;
+    struct {
+      uint32_t eff, perm, inh;
+    } data[2];
+    hdr.version = 0x20080522; /* _LINUX_CAPABILITY_VERSION_3 */
+    hdr.pid = 0;
+    memset(data, 0xff, sizeof data);
+    if (syscall(SYS_capget, &hdr, data) != 0) {
+      puts("capget: v3 query failed");
+      return 1;
+    }
+    if (data[0].eff | data[0].perm | data[0].inh | data[1].eff | data[1].perm |
+        data[1].inh) {
+      puts("capget: non-empty capabilities");
+      return 1;
+    }
+    hdr.version = 0xdeadbeef;
+    if (syscall(SYS_capget, &hdr, (void *)0) != -1 || errno != EINVAL) {
+      puts("capget: unknown version not refused");
+      return 1;
+    }
+    if (hdr.version != 0x20080522) {
+      puts("capget: version probe not answered");
+      return 1;
+    }
+    puts("capget: empty caps, version probe answered");
+  }
+
   puts("sysx OK");
   return 0;
 }

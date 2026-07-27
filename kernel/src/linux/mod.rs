@@ -569,6 +569,9 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
         nr::TIMERFD_CREATE => ret(st.fds.timerfd_create(args[0], args[1])),
         nr::TIMERFD_SETTIME => ret(sys_timerfd_settime(st, args[0], args[1], args[2], args[3])),
         nr::TIMERFD_GETTIME => ret(sys_timerfd_gettime(st, args[0], args[1])),
+        // capget: a non-root process's capability query (Node probes it 9x at
+        // startup). Our identity is unprivileged, so every capability mask is 0.
+        nr::CAPGET => ret(sys_capget(args[0], args[1])),
         nr::CLOSE_RANGE => ret(st.fds.close_range(args[0], args[1], args[2])),
         // Defined-but-never-dispatched before, so these logged `ENOSYS nr=<n>` as if
         // the number were unknown. They are known, and refusing them is the
@@ -1297,6 +1300,46 @@ fn sys_timerfd_settime(st: &mut LinuxState, fd: u64, flags: u64, new_va: u64, ol
     let prev = timerfd::settime(tf, abstime, value_ns, interval_ns);
     if old_va != 0 && !write_itimerspec(old_va, prev.interval_ns, prev.value_ns) {
         return -errno::EFAULT;
+    }
+    0
+}
+
+/// capget(hdrp, datap): a non-root process's capability sets - all empty
+/// (docs/LINUX-COMPAT.md). glibc/Node probe the supported version: an unknown
+/// version makes the kernel write its preferred one back and return `-EINVAL`; a
+/// known version with a data pointer fills the cap masks. Our identity is
+/// unprivileged (uid 1000, no capabilities), so every mask is 0 - the honest
+/// answer, not a stub claiming capabilities the process does not have. Version 1
+/// has one `cap_user_data_t`, versions 2/3 have two (64-bit caps).
+fn sys_capget(hdr_va: u64, data_va: u64) -> i64 {
+    const V1: u32 = 0x1998_0330;
+    const V2: u32 = 0x2007_1026;
+    const V3: u32 = 0x2008_0522;
+    if hdr_va == 0 {
+        return -errno::EFAULT;
+    }
+    let Some(version) = crate::uaccess::read_unaligned::<u32>(hdr_va) else {
+        return -errno::EFAULT;
+    };
+    let entries: u64 = match version {
+        V1 => 1,
+        V2 | V3 => 2,
+        _ => {
+            // Probe protocol: report the version we support, then -EINVAL.
+            crate::uaccess::write_unaligned::<u32>(hdr_va, V3);
+            return -errno::EINVAL;
+        }
+    };
+    // A NULL data pointer is a version probe: succeed without filling.
+    if data_va != 0 {
+        // Each `cap_user_data_t` is { effective, permitted, inheritable } = 3 u32.
+        for i in 0..entries {
+            for k in 0..3u64 {
+                if !crate::uaccess::write_unaligned::<u32>(data_va + i * 12 + k * 4, 0) {
+                    return -errno::EFAULT;
+                }
+            }
+        }
     }
     0
 }
