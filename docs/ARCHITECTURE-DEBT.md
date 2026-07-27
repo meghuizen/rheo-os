@@ -426,8 +426,10 @@ that change the plan, which is the reason to measure before building.
 | SIMD | AVX2 **and AVX-512** (`vmovdqu64` x857) | "AVX2 baseline" - **AVX-512 not expected** |
 
 Four blockers followed, and they were facts rather than predictions. **Three are
-now closed** (1, 3 and 4); the one that remains is **blocker 2, eager paging**,
-and it is the largest piece of work of the four.
+now closed** (1, 3 and 4), and the fourth - **blocker 2, eager paging** - is
+**partly** closed: file-backed `mmap` is demand-paged, the ELF image is not yet.
+Its old framing ("this binary is too big") was wrong and is corrected in place;
+so was its claim of 182 MiB of `.bss`, which measurement shows does not exist.
 
 1. ~~**The stack is too small by 4.8 MiB.**~~ **CLOSED.** `PT_GNU_STACK` asks
    for 12.8 MiB and `stack::LINUX_STACK_PAGES` was 2048 = 8 MiB. The fix is not
@@ -453,12 +455,46 @@ and it is the largest piece of work of the four.
    Each half was observed failing when reverted alone: with the mapping reverted
    the run prints **nothing at all**, because the fault eats glibc's buffered
    stdout - which is exactly why the original defect was hard to attribute.
-2. **262 MiB of eagerly-copied private frames** against a 384 MiB per-cell budget
-   and a 512 MiB pool. It fits arithmetically and leaves almost nothing for the
-   heap, `ld.so`, `libc.so.6` or 182 MiB of `.bss`. On Linux those pages are
-   demand-paged from the file and most are never touched; here `mmap` of a file
-   reads every page eagerly. This is **exactly** what demand paging (blocker 3)
-   deletes, and it is why that rung comes before any attempt to run this.
+2. **Eager paging.** *Partly closed - `mmap` is done, the ELF image is not.*
+
+   The framing this section used to carry was wrong, and worth correcting rather
+   than quietly rewriting: 262 MiB is **unremarkable for modern software**, and the
+   defect was never the binary's size. It was that the kernel *eagerly
+   materialized what Linux demand-pages* - a mapping cost what it reserved rather
+   than what the program touched - which is the wrong design at any size. Framing
+   it as "this binary is too big" points at a bigger pool; framing it correctly
+   points at demand paging.
+
+   Also corrected by measurement: this section claimed "182 MiB of `.bss`".
+   `readelf` says `filesz == memsz` for **all three** `PT_LOAD`s, so there is **no
+   `.bss`** - the whole image is file-backed. Anonymous demand paging, which was
+   the planned first slice, would have covered none of it.
+
+   **Done:** file-backed `mmap` is demand-paged. `arch::paging_mapped` +
+   `AddressSpace::is_mapped` let the fault handler tell an absent page from a
+   refused access (`FaultCause` has no read/write bit, so the page tables are the
+   source of truth - and a permission fault mistaken for a missing page
+   repopulates and re-faults forever, measured at 78,780 fills in the revert
+   probe). `linux::filemap` holds the VFS handles that *mappings* own, because
+   `ld.so` closes the fd immediately after `mmap`. `Vma` carries the backing and
+   offset under a one-reference-per-record rule. Proven by `mmapdp` in `linuxproc`
+   on all three ISAs (64 pages mapped, 4 filled) and by `linuxdyn`, where `ld.so`
+   maps a real 1.5-2.1 MB `libc` and an unmodified dynamic glibc binary runs.
+
+   That slice also uncovered and fixed a **latent x86-64 defect**: a ring-3 fault
+   resumed through `sysretq`, which consumes RCX and R11. Harmless while signal
+   delivery was the only fault resume (a handler entry does not re-execute
+   anything); fatal for the first path that does. Faults now resume through
+   `iret_resume`, restoring every register.
+
+   **Still open:** the ELF image itself. `load::load_elf_linux` streams every
+   `PT_LOAD` page into a frame at load time, and for an `ET_EXEC`-with-`PT_INTERP`
+   binary like this one the *kernel* loads the main program - so that path, not
+   `mmap`, is where the 262 MiB currently lands. Mapping those segments as
+   file-backed VMAs and letting the same fault handler fill them is the next rung,
+   and it is now a small change rather than a new mechanism. **COW `fork`** (still
+   an eager copy of every committed page) and a **guard-page + grow-on-fault
+   stack** ride the same handler.
 3. ~~**Seven syscalls the personality does not dispatch**~~ **CLOSED.** Measured
    from the real startup trace rather than guessed, and all seven now dispatched:
 

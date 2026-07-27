@@ -439,6 +439,31 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   the inference restored, it fails with the exact original message. That is the
   difference between "reasoned and code-reviewed" (section 7's honest but weaker
   label) and proven.
+- **A return path that "works" may be working for the wrong reason.** The x86-64
+  ring-3 fault resume used `sysretq`, which takes RIP from RCX and RFLAGS from R11 -
+  it *consumes* both registers. Correct for a syscall return (SYSCALL is defined to
+  clobber them); wrong for a fault, where the interrupted instruction re-executes and
+  needs the register file it had. It was invisible for as long as signal delivery was
+  the only ring-3 fault resume, because a handler entry is a fresh function boundary
+  that does not care about two caller-saved registers. The first path that genuinely
+  re-executed - demand paging - broke immediately. When a mechanism has exactly one
+  caller, "it passes" is evidence about that caller, not about the mechanism.
+- **Bisect the layers before theorising about either.** That defect looked like
+  wrong bookkeeping (a mis-computed file offset, a bad merge) and there were four
+  plausible stories. Keeping the new bookkeeping and restoring the *old eager fill*
+  through the new fault path made x86-64 pass, which located the bug in the resume in
+  one run. When a change has an independent "what" and "when", hold one fixed.
+- **Measure the artifact before choosing which half to build.** The plan was to
+  demand-page anonymous memory first, on the assumption that a large image is mostly
+  `.bss`. `readelf` on the actual target says `filesz == memsz` for every `PT_LOAD` -
+  no `.bss` at all - so anonymous demand paging would have covered none of it. Ten
+  minutes of measurement inverted a week's ordering.
+- **A proof whose oracle cannot fail is not an oracle.** The first demand-paging
+  fixture "verified" the present-page check by re-reading a filled page 100 times.
+  Removing the check entirely still passed: a filled page never faults again on a
+  read, so that phase never reached the code it claimed to test. The discriminating
+  case was a *write* to a filled read-only page. Before trusting a phase, delete the
+  thing it guards and watch it fail.
 - **Do not split a sequence you have not understood.** The first attempt at that
   fix split the arch injector into "inject" and "halt" so the portable code could
   re-halt until the byte arrived. It wedged the machine: the per-ISA sequence is
