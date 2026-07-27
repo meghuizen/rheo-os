@@ -134,6 +134,9 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 | getuid / geteuid / getgid / getegid | full | 1000 (no root, SECURITY-IDENTITY) |
 | uname | full | sysname "Linux", release "6.6.0-rheo", machine per ISA |
 | clock_gettime | partial | MONOTONIC via `arch::ticks_to_ns`; REALTIME = fixed epoch + monotonic (unsynced, disclosed) |
+| gettimeofday | full | The legacy wall-clock read, same REALTIME domain as `clock_gettime`, reported as seconds + microseconds. `tz` (obsolete) ignored; a NULL `tv` is a no-op success. **libuv calls this directly and *asserts* it returns 0** (`uv_gettimeofday` → `GetCurrentTimeInMicroseconds`), so an unimplemented number aborts Node at startup - it was the first gap the real `node` binary hit (docs/LINUX-COMPAT.md, the real-Node section) |
+| clock_getres | full | The clock's resolution. This OS's clock derives from the cycle counter (`arch::ticks_to_ns`), so it is nanosecond-granular: reports `{0 s, 1 ns}` for any `clk_id` (all clocks share the one source). A NULL `res` is success (a clock-existence probe). V8 reads it at init |
+| time (x86-64) | full | The legacy whole-second wall clock, same REALTIME domain. Returns the seconds; writes `*tloc` too if non-NULL. x86-64 only - asm-generic glibc uses `clock_gettime` (an unreachable sentinel on those tables). V8/libuv call it |
 | clock_nanosleep / nanosleep | full for the blocking case | **A real sleep** (docs/ARCHITECTURE-DEBT.md 2.4); it used to return 0 immediately. The deadline is computed and compared in the **cell's own clock domain** (`cell_clock_ns` - the domain the program's own `clock_gettime` reports), parked on as a `proc::Block::Timer`, so a sibling process runs while one sleeps. `clock_nanosleep`'s `TIMER_ABSTIME` is honoured; a deadline already in the past returns 0 at once. `rem` is **never written**, because no signal is delivered to a parked process, so the sleep cannot be interrupted - stated rather than implied. Note that glibc routes `nanosleep` through `clock_nanosleep` on every ISA here, so the latter is the number that matters (fixing only the former would be invisible - observed) |
 | getrandom | full | fills from the cell's DRBG; flags ignored (never blocks) |
 | sched_yield | full | switches to the next ready context of this cell (L4); with no ready sibling it crosses to the next runnable **process** (`proc::yield_cell`, the `SYS_YIELD` hand-off), so a yield is a real preemption point and not a no-op. Returns 0. Only when the caller is the sole runnable process is it picked again |
@@ -1023,6 +1026,31 @@ fixup path.
   QEMU-TCG boot budget. A W^X-clean JIT (write-then-flip RW→RX code space, or a
   MAP_JIT-style dual mapping) is the follow-on that would let V8 optimise rather
   than only interpret.
+
+- **The real Node binary loads, links, and initialises V8 on the OS - and the
+  final blocker is the cooperative scheduler, not a missing syscall** (GOAL-NODE,
+  task #174, the `linuxnode` test). The actual `/opt/node22/bin/node` (v22,
+  dynamic, 124 MB) is streamed off a live ext4 disk over virtio-blk-pci
+  (`ext4fs`/`ext4plus` + the block cache, ~6500 block-cache fills - none of the
+  binary or its libraries resident whole), its `ld-linux-x86-64.so.2` links all
+  **seven** shared libraries (glibc + libstdc++ + libgcc_s), **V8 initialises**,
+  and **libuv starts its event loop** - reached only after these three new legacy
+  clock calls landed (`gettimeofday`, `clock_getres`, `time`), each found by
+  running the real binary and observing exactly where it aborted. It then blocks
+  on `epoll_wait` for an **eventfd a sibling thread must write** - V8's
+  cross-thread startup handshake - which the personality's **per-*cell*** (not
+  per-*context*) block model cannot schedule: when one context blocks on
+  `epoll_wait` the whole cell parks, freezing the sibling threads that would wake
+  it, so the scheduler correctly reports a genuine `DEADLOCK` rather than hanging.
+  This is the documented L4 cooperative frontier (futex already switches between
+  contexts of a cell; `epoll_wait`/`poll`/`nanosleep` do not - they park the
+  cell), and closing it - **per-context blocking**, so a thread-level block runs a
+  runnable sibling context instead of the whole cell - is what turns this
+  skip-with-reason into `node` printing its answer. It is deliberately a separate,
+  careful slice (it touches every wait path and the 47-kernel Linux suite), not a
+  session-tail bolt-on. The `linuxnode` test asserts the reproducible partial
+  every run (streamed off disk + reached the event loop before any output) and
+  auto-upgrades to a full `rheo:42` PASS when per-context blocking lands.
 
 ## 6. Fixture build matrix (reproducibility)
 

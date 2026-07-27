@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 59] = [
+const TEST_KERNELS: [&str; 60] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -53,6 +53,7 @@ const TEST_KERNELS: [&str; 59] = [
     "linuxsig",
     "linuxproc",
     "linuxdyn",
+    "linuxnode",
     "librheoproc",
     "librheonet",
     "netwait",
@@ -130,6 +131,20 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
         ("linuxdyn", Arch::X86_64) => &[
             "-drive",
             "file=tests/linux-fixtures/build/x86_64/dyn-disk.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-pci,drive=blk0,disable-legacy=on",
+        ],
+        // linuxnode (GOAL-NODE): the real x86-64 `node` binary + its glibc/libstdc++
+        // shared-library set on a live virtio-blk disk, streamed + `execve`d off ext4
+        // (the linuxdyn disk path at production scale, ~124 MB). x86-64 only - there
+        // is no arm64/riscv64 node build here, so those ISAs get no drive, and the
+        // test skips-with-reason (`virtio_blk::probe()` returns None). The image is
+        // built by `build_node_disk_fixture` (gitignored); a placeholder when
+        // /opt/node22 or mkfs.ext4 is absent makes the test skip on x86-64 too, so CI
+        // (no node binary) stays green.
+        ("linuxnode", Arch::X86_64) => &[
+            "-drive",
+            "file=tests/linux-fixtures/build/x86_64/node-disk.img,if=none,id=blk0,format=raw",
             "-device",
             "virtio-blk-pci,drive=blk0,disable-legacy=on",
         ],
@@ -1354,6 +1369,7 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         return false;
     }
     build_dyn_disk_fixture(arch, &out_dir);
+    build_node_disk_fixture(arch, &out_dir);
 
     build_coreutils_fixture(arch)
 }
@@ -1463,6 +1479,115 @@ fn build_dyn_disk_fixture(arch: Arch, out_dir: &str) {
         arch.name(),
         arch.interp_path()
     );
+}
+
+/// Build the `linuxnode` fixture (GOAL-NODE, docs/LINUX-COMPAT.md): a real ext4
+/// image holding the **real x86-64 `node` binary** (~124 MB, dynamic) at
+/// `/bin/node`, its `ld-linux-x86-64.so.2` at the PT_INTERP path, and the whole
+/// glibc + libstdc++ shared-library set under `/lib` - so the `linuxnode` test
+/// mounts it off a live virtio-blk disk (`ext4fs`/`ext4plus` + the block cache)
+/// and `execve`s node straight from ext4, streamed demand-paged, none resident
+/// whole. The image is gitignored (a 124 MB binary is never committed).
+///
+/// **x86-64 only.** The node binary is an x86-64 ELF; for arm64/riscv64 (no node
+/// build available) no image is written and no `-drive` is attached, so the test
+/// skips-with-reason. On x86-64, if `/opt/node22/bin/node` is absent (e.g. CI) or
+/// any host glibc `.so` cannot be found or `mkfs.ext4`/`debugfs` are missing, a
+/// small placeholder image is written so QEMU's `-drive` still has a file and the
+/// test detects a non-ext4 disk and skips - CI stays green. Never fails the build.
+fn build_node_disk_fixture(arch: Arch, out_dir: &str) {
+    if arch != Arch::X86_64 {
+        return; // no node binary for arm64/riscv64; no drive attached, test skips
+    }
+    let img = format!("{out_dir}/node-disk.img");
+    let placeholder = |img: &str| {
+        let _ = std::fs::write(img, vec![0u8; 64 * 1024]);
+    };
+
+    // The real node binary and the host's x86-64 glibc + libstdc++ set (the exact
+    // libraries `ldd node` resolves). The interpreter goes at its PT_INTERP path;
+    // the DT_NEEDED libraries under /lib, found via LD_LIBRARY_PATH=/lib:/lib64.
+    const NODE: &str = "/opt/node22/bin/node";
+    const INTERP_SRC: &str = "/lib64/ld-linux-x86-64.so.2";
+    const LIBDIR: &str = "/lib/x86_64-linux-gnu";
+    let libs = [
+        "libc.so.6",
+        "libm.so.6",
+        "libdl.so.2",
+        "libpthread.so.0",
+        "libstdc++.so.6",
+        "libgcc_s.so.1",
+    ];
+
+    let exists = |p: &str| std::path::Path::new(p).exists();
+    if !exists(NODE)
+        || !exists(INTERP_SRC)
+        || libs.iter().any(|l| !exists(&format!("{LIBDIR}/{l}")))
+    {
+        eprintln!(
+            "[xtask] SKIP linuxnode image for x86_64: node binary or host glibc not \
+             present (linuxnode will skip - CI/other hosts unaffected)"
+        );
+        placeholder(&img);
+        return;
+    }
+    if !(have_tool("mkfs.ext4") && have_tool("debugfs")) {
+        eprintln!(
+            "[xtask] SKIP linuxnode image for x86_64: mkfs.ext4/debugfs not installed \
+             (linuxnode will skip)"
+        );
+        placeholder(&img);
+        return;
+    }
+
+    // A 200 MiB ext4 (same driver-parseable flags as the linuxdisk image, 1 KiB
+    // blocks) holds the 124 MB node + ~10 MB of libraries with slack.
+    let _ = std::fs::remove_file(&img);
+    let ok = matches!(
+        Command::new("dd")
+            .args([
+                "if=/dev/zero",
+                &format!("of={img}"),
+                "bs=1024",
+                "count=204800"
+            ])
+            .output()
+            .map(|o| o.status.success()),
+        Ok(true)
+    ) && matches!(
+        Command::new("mkfs.ext4")
+            .args([
+                "-q",
+                "-b",
+                "1024",
+                "-O",
+                "^has_journal,^metadata_csum,^64bit,^resize_inode,^dir_index,extent",
+                "-F",
+                &img,
+            ])
+            .output()
+            .map(|o| o.status.success()),
+        Ok(true)
+    );
+    if !ok {
+        placeholder(&img);
+        return;
+    }
+
+    let debugfs = |cmd: &str| {
+        let _ = Command::new("debugfs")
+            .args(["-w", "-R", cmd, &img])
+            .output();
+    };
+    debugfs("mkdir /bin");
+    debugfs("mkdir /lib");
+    debugfs("mkdir /lib64");
+    debugfs(&format!("write {NODE} bin/node"));
+    debugfs(&format!("write {INTERP_SRC} lib64/ld-linux-x86-64.so.2"));
+    for l in libs {
+        debugfs(&format!("write {LIBDIR}/{l} lib/{l}"));
+    }
+    println!("[xtask] built linuxnode ext4 image for x86_64 ({img}; real node + glibc set)");
 }
 
 /// Build the L7 **dynamically-linked** glibc fixture (docs/LINUX-COMPAT.md L7):

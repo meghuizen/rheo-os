@@ -426,15 +426,28 @@ extern "C" fn kernel_main() -> ! {
         close_range: closed the range and nothing beyond it\n\
         clone3/rseq: refused ENOSYS deliberately\n\
         capget: empty caps, version probe answered\n\
-        io_uring: refused ENOSYS deliberately\n\
-        sysx OK\n";
+        io_uring: refused ENOSYS deliberately\n";
+    // The legacy `time` syscall exists only on x86-64 (asm-generic glibc uses
+    // clock_gettime), so the clocks line differs per ISA, like `open`.
+    let clocks_line: &[u8] = if cfg!(target_arch = "x86_64") {
+        b"clocks: gettimeofday + clock_getres + time OK\n"
+    } else {
+        b"clocks: gettimeofday + clock_getres OK (no legacy time on this ABI)\n"
+    };
     let (code, out) = run_capture(SYSX, &[b"sysx"]);
+    let matched = out.starts_with(open_line) && {
+        let r1 = &out[open_line.len()..];
+        r1.starts_with(want_rest) && {
+            let r2 = &r1[want_rest.len()..];
+            r2.starts_with(clocks_line) && &r2[clocks_line.len()..] == b"sysx OK\n"
+        }
+    };
     assert!(
-        out.starts_with(open_line) && &out[open_line.len()..] == want_rest,
-        "sysx: stdout mismatch\n  got:      {:?}\n  expected: {:?} then {:?}",
+        matched,
+        "sysx: stdout mismatch\n  got:      {:?}\n  expected: {:?} + rest + {:?} + sysx OK",
         core::str::from_utf8(out),
         core::str::from_utf8(open_line),
-        core::str::from_utf8(want_rest),
+        core::str::from_utf8(clocks_line),
     );
     assert!(code == 0, "sysx: exit {code}, expected 0");
     println!(

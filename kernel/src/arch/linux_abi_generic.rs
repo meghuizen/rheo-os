@@ -62,6 +62,7 @@ pub mod nr {
     pub const SET_ROBUST_LIST: u64 = 99;
     pub const NANOSLEEP: u64 = 101;
     pub const CLOCK_GETTIME: u64 = 113;
+    pub const CLOCK_GETRES: u64 = 114;
     pub const CLOCK_NANOSLEEP: u64 = 115;
     pub const SCHED_GETAFFINITY: u64 = 123;
     pub const SCHED_YIELD: u64 = 124;
@@ -114,6 +115,9 @@ pub mod nr {
     // Measured from the real Claude Code startup trace
     // (docs/ARCHITECTURE-DEBT.md 4.0, blocker 3).
     pub const SYSINFO: u64 = 179;
+    /// gettimeofday(tv, tz) - the legacy wall-clock read libuv asserts on
+    /// (docs/LINUX-COMPAT.md). asm-generic number.
+    pub const GETTIMEOFDAY: u64 = 169;
     pub const SCHED_SETSCHEDULER: u64 = 119;
     pub const SCHED_GETSCHEDULER: u64 = 120;
     pub const SCHED_GET_PRIORITY_MAX: u64 = 125;
@@ -134,6 +138,11 @@ pub mod nr {
     /// `openat`). Named as unreachable so portable dispatch can list it, like
     /// `ACCESS` and `READLINK`.
     pub const OPEN: u64 = u64::MAX - 10;
+
+    /// Not part of this table: x86-64's legacy `time` (asm-generic ISAs use
+    /// `clock_gettime`/`gettimeofday`). An unreachable sentinel so portable
+    /// dispatch can list it, like `OPEN`.
+    pub const TIME: u64 = u64::MAX - 11;
 
     // epoll (docs/LINUX-COMPAT.md L8-INET). asm-generic has create1/ctl/pwait
     // only (no legacy create/wait; those are named as unreachable sentinels

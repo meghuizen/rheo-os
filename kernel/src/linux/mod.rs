@@ -540,6 +540,9 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
 
         // -- time / entropy / scheduling --
         nr::CLOCK_GETTIME => ret(sys_clock_gettime(args[0], args[1])),
+        nr::GETTIMEOFDAY => ret(sys_gettimeofday(args[0])),
+        nr::CLOCK_GETRES => ret(sys_clock_getres(args[1])),
+        nr::TIME => ret(sys_time(args[0])),
         // nanosleep(req, rem) / clock_nanosleep(clk, flags, req, rem): a real sleep
         // (docs/ARCHITECTURE-DEBT.md 2.4).
         nr::NANOSLEEP => sys_nanosleep(cur, false, 0, args[0]),
@@ -1626,6 +1629,49 @@ fn sys_clock_gettime(clk_id: u64, ts_va: u64) -> i64 {
         return -errno::EFAULT;
     }
     0
+}
+
+/// gettimeofday(tv, tz): the legacy wall-clock read, from the same REALTIME
+/// domain as `clock_gettime` (`cell_clock_ns(true)`), reported as seconds +
+/// **micro**seconds. `tz` (the obsolete timezone) is ignored. libuv calls this
+/// directly and asserts it returns 0, so it must succeed (docs/LINUX-COMPAT.md).
+fn sys_gettimeofday(tv_va: u64) -> i64 {
+    if tv_va == 0 {
+        return 0; // a NULL tv is a no-op success (only tz was wanted)
+    }
+    let ns = cell_clock_ns(true);
+    let secs = (ns / 1_000_000_000) as i64;
+    let usec = (ns % 1_000_000_000 / 1_000) as i64;
+    if !crate::uaccess::write::<i64>(tv_va, secs) || !crate::uaccess::write::<i64>(tv_va + 8, usec)
+    {
+        return -errno::EFAULT;
+    }
+    0
+}
+
+/// clock_getres(clk_id, res): the clock's resolution. This OS's clock is derived
+/// from the cycle counter via `arch::ticks_to_ns`, so it is nanosecond-granular;
+/// report `{0 s, 1 ns}`. `clk_id` is not validated (every clock shares the one
+/// source). A NULL `res` is success (glibc/V8 probe the clock's existence).
+fn sys_clock_getres(res_va: u64) -> i64 {
+    if res_va == 0 {
+        return 0;
+    }
+    if !crate::uaccess::write::<i64>(res_va, 0) || !crate::uaccess::write::<i64>(res_va + 8, 1) {
+        return -errno::EFAULT;
+    }
+    0
+}
+
+/// time(tloc): whole-second REALTIME wall clock (the same domain as
+/// `gettimeofday`/`clock_gettime`). Returns the seconds; if `tloc` is non-NULL it
+/// is also written there. x86-64 only (asm-generic glibc uses `clock_gettime`).
+fn sys_time(tloc_va: u64) -> i64 {
+    let secs = (cell_clock_ns(true) / 1_000_000_000) as i64;
+    if tloc_va != 0 && !crate::uaccess::write::<i64>(tloc_va, secs) {
+        return -errno::EFAULT;
+    }
+    secs
 }
 
 /// getrandom(buf, count, flags): fill from the cell's DRBG (docs/

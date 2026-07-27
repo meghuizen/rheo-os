@@ -23,6 +23,8 @@
 #include <sys/eventfd.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 /* A path the harness seeds for this fixture, used only as something openable. */
@@ -278,6 +280,42 @@ int main(void) {
     return 1;
   }
   puts("io_uring: refused ENOSYS deliberately");
+
+  /* 10. The legacy clock reads the real `node` binary calls at startup (V8 +
+   *     libuv): gettimeofday, clock_getres, and (x86-64 only) time. libuv's
+   *     uv_gettimeofday *asserts* gettimeofday returns 0, so a stub that refused
+   *     it aborted Node (docs/LINUX-COMPAT.md). Assert each returns success with a
+   *     plausible, monotone-consistent value - never the exact figure. */
+  {
+    struct timeval tv1 = {0, 0}, tv2 = {0, 0};
+    if (gettimeofday(&tv1, NULL) != 0 || tv1.tv_sec <= 0 || tv1.tv_usec < 0 ||
+        tv1.tv_usec >= 1000000) {
+      puts("gettimeofday: implausible");
+      return 1;
+    }
+    struct timespec res = {-1, -1};
+    if (clock_getres(CLOCK_MONOTONIC, &res) != 0 || res.tv_sec != 0 ||
+        res.tv_nsec <= 0) {
+      puts("clock_getres: implausible");
+      return 1;
+    }
+    /* gettimeofday must not run backwards on a second read. */
+    if (gettimeofday(&tv2, NULL) != 0 || tv2.tv_sec < tv1.tv_sec) {
+      puts("gettimeofday: went backwards");
+      return 1;
+    }
+#ifdef SYS_time
+    time_t t = (time_t)syscall(SYS_time, NULL);
+    time_t tstore = 0;
+    if (t <= 0 || (time_t)syscall(SYS_time, &tstore) <= 0 || tstore < t) {
+      puts("time: implausible");
+      return 1;
+    }
+    puts("clocks: gettimeofday + clock_getres + time OK");
+#else
+    puts("clocks: gettimeofday + clock_getres OK (no legacy time on this ABI)");
+#endif
+  }
 
   puts("sysx OK");
   return 0;

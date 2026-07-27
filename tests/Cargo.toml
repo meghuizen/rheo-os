@@ -152,6 +152,10 @@ name = "linuxdyn"
 path = "src/linuxdyn.rs"
 
 [[bin]]
+name = "linuxnode"
+path = "src/linuxnode.rs"
+
+[[bin]]
 name = "librheoproc"
 path = "src/librheoproc.rs"
 
