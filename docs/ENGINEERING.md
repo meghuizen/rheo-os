@@ -575,6 +575,16 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   adds a *strength* the accessor must reach, so the accessor has to be one place, or
   the audit is unbounded. `uaccess::Access::{Read,Write}` is that strength made
   explicit.
+- **Measure whether the next proof is redundant before building it.** The plan for
+  loading a large binary was a `linuxdisk` test: slurp a small ext4 off virtio-blk,
+  load a binary from it. Measuring the tree first showed `linuxproc` already `execve`s
+  a 4.7 MB binary from a mounted VFS demand-paged, and `blockfs` already proves the
+  virtio-blk -> ext4 transport - so the test would have combined two proven things and
+  demonstrated nothing new, while the actual blocker (the ext4 *source* being
+  whole-in-RAM) went untouched. A proof that a capability exists is worth nothing if a
+  differently-shaped existing proof already covers it; the effort belongs on the part
+  that is genuinely open. Building the redundant one to show motion is the exact
+  shortcut "no shortcuts" forbids.
 
 ## 12. Never dereference an address the caller chose
 

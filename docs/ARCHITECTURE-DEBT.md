@@ -598,14 +598,32 @@ so was its claim of 182 MiB of `.bss`, which measurement shows does not exist.
    **Still eager, and named:** a segment with a `.bss` tail, and every **native** cell's
    image. Both ride this same handler.
 
-   **What remains before the real target can be attempted**, from measuring it: the
-   275 MB binary cannot be `include_bytes!`d (a kernel image that large runs past the
-   frame-pool base 64 MiB into RAM), so it has to live on a disk - the `blockfs`
-   pattern, an ext4 image on virtio-blk reachable through `svc::FileOps`. With that,
-   `filemap::read_at` per fault is an lseek+read through the read-only ext4 driver, so
-   a full extent walk per page; a program touching 30 MiB is ~7,500 of those inside a
-   120 s boot-test budget, which is a thing to measure rather than assume. The registry
-   ceiling (`MAX_MAPPED_FILES` 8) also sits right at main + `ld.so` + 5 libs.
+   **What remains before the real target can be attempted** splits into two
+   independent sub-problems, and measuring the tree sharpened which one is actually
+   open (task #167):
+
+   (a) The binary cannot live in the **kernel image** - a 275 MB `include_bytes!` runs
+   past the frame-pool base 64 MiB into RAM. *Effectively solved and proven:*
+   `linuxproc` already `execve`s the unmodified 4-4.7 MB coreutils multicall from a
+   mounted VFS, demand-paged, and `blockfs` proves virtio-blk -> ext4 -> VFS. A test
+   that merely slurped a small ext4 off the disk and loaded from it would combine two
+   proven things and add nothing.
+
+   (b) The binary's bytes cannot all reside in **RAM at once** - and this is the open
+   one, easy to miss. `posix::Ext4` is pure over an in-RAM `&[u8]` (and `blockfs`
+   slurps the whole disk with `Vec::leak`), so mounting a 275 MB image means 275 MB
+   resident *regardless of demand paging* - demand paging makes the **cell's** pages
+   lazy, not the **source**. Closing (b) needs a **block-cached ext4**: a `BlockSource`
+   seam read through a fixed LRU of 4 KiB blocks over `hw::block::BlockDevice`, and an
+   ext4 driver that copies the bytes it needs out of a cache block rather than
+   returning `&[u8]` borrows into a whole image. That is a whole-driver refactor, sized
+   in #167, and it is the honest next rung - not another load-from-disk proof.
+
+   Cost to measure when it lands, not assume: a fault becomes an ext4 extent walk plus
+   at most one block read if uncached; the registry ceiling (`MAX_MAPPED_FILES` 8) sits
+   right at main + `ld.so` + 5 libs; and the streaming `execve` path does not yet load
+   a `PT_INTERP` interpreter (only the from-slice `load_elf_linux` does), which a
+   dynamic binary from disk needs.
 3. ~~**Seven syscalls the personality does not dispatch**~~ **CLOSED.** Measured
    from the real startup trace rather than guessed, and all seven now dispatched:
 
