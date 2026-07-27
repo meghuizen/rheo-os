@@ -19,6 +19,7 @@
 
 use crate::arch;
 use crate::linux::errno::*;
+use crate::linux::vma;
 use crate::linux::{Ctl, err, pipe, ret, signal, stack, thread};
 use crate::load;
 use crate::mm::AddressSpace;
@@ -300,6 +301,62 @@ pub fn is_fork(flags: u64) -> bool {
 ///
 /// Reading `parent_frame` (the calling thread's saved state) is the point.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
+/// Apply the `madvise` fork advice the parent recorded to the freshly forked
+/// child (docs/SUBSTRATE.md 10a).
+///
+/// `fork_from` shares every committed page copy-on-write, which is the right
+/// default and the wrong answer for two ranges a caller has explicitly marked:
+///
+/// - **`MADV_WIPEONFORK`**: the child must see zeroes, not a copy. Unmapping the
+///   range in the child is exactly that - the record is still there (it was
+///   deep-copied with the rest of the VMA list), so the child's first touch faults
+///   and the handler fills a fresh **zeroed** frame. This is what stops a
+///   `fork`ed userspace CSPRNG from producing the parent's stream.
+/// - **`MADV_DONTFORK`**: the child must not have the mapping at all, so the
+///   range is unmapped *and* its record removed.
+///
+/// Done after `dup_state` (which copies the VMA list) so the child has its own
+/// records to consult and edit.
+fn apply_fork_advice(parent: usize, child: usize) {
+    // Read the parent's advice, act on the child. Collect first: the child's list
+    // is mutated below, and the parent's is the authority for what was asked.
+    let parent_state = super::state(parent);
+    let mut wipe: [(usize, usize); vma::MAX_VMAS] = [(0, 0); vma::MAX_VMAS];
+    let mut nowipe = 0usize;
+    let mut drop_ranges: [(usize, usize); vma::MAX_VMAS] = [(0, 0); vma::MAX_VMAS];
+    let mut ndrop = 0usize;
+    for m in parent_state.vmas.with_advice(vma::ADV_WIPEONFORK) {
+        if nowipe < wipe.len() {
+            wipe[nowipe] = (m.base, m.len);
+            nowipe += 1;
+        }
+    }
+    for m in parent_state.vmas.with_advice(vma::ADV_DONTFORK) {
+        if ndrop < drop_ranges.len() {
+            drop_ranges[ndrop] = (m.base, m.len);
+            ndrop += 1;
+        }
+    }
+    if nowipe == 0 && ndrop == 0 {
+        return;
+    }
+
+    // The unmapping must happen in the **child's** address space, which is not the
+    // active one - so it goes through the child's `AddressSpace` directly rather
+    // than through `user::unmap_range` (which operates on the running cell).
+    // SAFETY: the child was just installed; its address space pointer is valid and
+    // nothing else is touching it (it has not run).
+    let child_aspace = unsafe { &mut *user::cell_aspace_mut(child) };
+    for &(base, len) in wipe.iter().take(nowipe) {
+        child_aspace.free_user_range(base, len);
+    }
+    let child_state = super::state(child);
+    for &(base, len) in drop_ranges.iter().take(ndrop) {
+        child_aspace.free_user_range(base, len);
+        child_state.vmas.remove(base, len);
+    }
+}
+
 pub fn fork(cur: usize, parent_frame: *mut TrapFrame) -> i64 {
     let Some(child) = (0..MAX_CELLS).find(|&i| procs()[i].state == PState::Free) else {
         return -EAGAIN;
@@ -331,6 +388,7 @@ pub fn fork(cur: usize, parent_frame: *mut TrapFrame) -> i64 {
     unsafe { user::install_forked(child, aspace_ptr, frame_ptr, cur) };
     super::dup_state(cur, child);
     signal::fork_copy(cur, child);
+    apply_fork_advice(cur, child);
 
     procs()[child] = Proc {
         state: PState::Runnable,

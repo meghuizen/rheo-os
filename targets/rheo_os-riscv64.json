@@ -7,14 +7,14 @@
   "eh-frame-header": false,
   "emit-debug-gdb-scripts": false,
   "executables": true,
-  "features": "+m,+a,+c",
+  "features": "+m,+a,+c,+f,+d",
   "linker": "rust-lld",
   "linker-flavor": "gnu-lld",
-  "llvm-abiname": "lp64",
+  "llvm-abiname": "lp64d",
   "llvm-target": "riscv64",
   "max-atomic-width": 64,
   "metadata": {
-    "description": "rheo-os on RV64GC",
+    "description": "rheo-os on RV64GC (hard-float, F+D baseline)",
     "host_tools": false,
     "std": true,
     "tier": 3

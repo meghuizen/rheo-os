@@ -10,6 +10,7 @@ use crate::arch::{self, MapPerm};
 use crate::linux::LinuxState;
 use crate::linux::errno::*;
 use crate::linux::filemap;
+use crate::linux::vma;
 use crate::mm::frames::FRAME_SIZE;
 use crate::user;
 
@@ -509,6 +510,148 @@ pub fn munmap(st: &mut LinuxState, addr: u64, len: u64) -> i64 {
     user::unmap_range(base, bytes);
     st.vmas.remove(base, bytes);
     0
+}
+
+// --------------------------------------------------------------------- madvise
+//
+// `madvise` advice values (asm-generic; identical on x86-64).
+
+/// No advice.
+const MADV_NORMAL: u64 = 0;
+/// Access will be random / sequential / is expected soon. Genuinely advisory
+/// here: there is no read-ahead machinery to inform, so these are accepted and
+/// do nothing - which is what "advisory" means and is not a stub.
+const MADV_RANDOM: u64 = 1;
+const MADV_SEQUENTIAL: u64 = 2;
+const MADV_WILLNEED: u64 = 3;
+/// The caller is done with these pages: **free them now**.
+const MADV_DONTNEED: u64 = 4;
+/// Punch a hole in the backing store. Needs a writable file mapping this kernel
+/// does not have.
+const MADV_REMOVE: u64 = 9;
+/// Do not inherit / do inherit this range across `fork`.
+const MADV_DONTFORK: u64 = 10;
+const MADV_DOFORK: u64 = 11;
+/// The caller is done with these pages, but the kernel may free them lazily.
+const MADV_FREE: u64 = 8;
+/// Transparent-hugepage hints. Accepted and advisory: page size is chosen by the
+/// mapping's own alignment here, not by a hint.
+const MADV_HUGEPAGE: u64 = 14;
+const MADV_NOHUGEPAGE: u64 = 15;
+/// Zero this range in the child on `fork` / stop doing so.
+const MADV_WIPEONFORK: u64 = 18;
+const MADV_KEEPONFORK: u64 = 19;
+
+/// madvise(addr, len, advice).
+///
+/// This used to be `Ctl::Ret(0)` with the comment "advisory by specification",
+/// which is true of *some* advice values and false of the ones that matter. Two
+/// of them are requests for action, and reporting success without acting is the
+/// docs/ENGINEERING.md 7 shape - a stub that claims to have done something:
+///
+/// - **`MADV_DONTNEED`/`MADV_FREE`** is how every serious allocator returns
+///   memory. V8 and JavaScriptCore trim their heaps with it; glibc's malloc uses
+///   it on arena teardown. Answering 0 without freeing means a long-running
+///   program's resident set only ever grows, and the program has no way to tell -
+///   it asked, and was told yes. With demand paging landed, honouring it is
+///   cheap: drop the frames and let the next touch re-fault.
+/// - **`MADV_WIPEONFORK`** is a *security* request. A userspace CSPRNG that is
+///   `fork`ed without it produces identical streams in parent and child
+///   (docs/SUBSTRATE.md 10a); OpenSSL asks for this precisely so that cannot
+///   happen. Accepting and ignoring it leaves the caller believing it is safe.
+///
+/// Everything genuinely advisory is accepted and does nothing, and everything
+/// unimplemented is **refused with a reason** rather than absorbed - the
+/// `fcntl`/`sched_setscheduler` discipline.
+pub fn madvise(st: &mut LinuxState, addr: u64, len: u64, advice: u64) -> i64 {
+    let base = (addr as usize) & !(FRAME_SIZE - 1);
+    let bytes = page_up(len as usize);
+    if bytes == 0 {
+        return 0;
+    }
+    // Linux requires the range to be mapped for the advice values that act on
+    // pages; an unmapped range is ENOMEM.
+    let mapped = st.vmas.overlapping(base, bytes).next().is_some();
+
+    match advice {
+        // Genuinely advisory: no read-ahead or page-size machinery to inform.
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_HUGEPAGE
+        | MADV_NOHUGEPAGE => 0,
+
+        // Free the pages now. The mapping's *record* stays - this is a decommit,
+        // not an unmap, so the next touch re-faults (anonymous pages come back
+        // zeroed, file-backed pages come back from the file). That is exactly the
+        // `mprotect(PROT_NONE)` decommit path, which is why it reuses it.
+        MADV_DONTNEED | MADV_FREE => {
+            if !mapped {
+                return -ENOMEM;
+            }
+            user::unmap_range(base, bytes);
+            0
+        }
+
+        // Zero in the child on fork. Recorded per range; applied by `proc::fork`.
+        MADV_WIPEONFORK => {
+            if !mapped {
+                return -ENOMEM;
+            }
+            st.vmas
+                .set_advice(base, bytes, vma::ADV_WIPEONFORK, vma::ADV_DONTFORK);
+            0
+        }
+        MADV_KEEPONFORK => {
+            if !mapped {
+                return -ENOMEM;
+            }
+            st.vmas.set_advice(base, bytes, 0, vma::ADV_WIPEONFORK);
+            0
+        }
+
+        // Do not inherit across fork. Refused when it would have to be applied to
+        // more than the caller asked for: widening this one is observable in the
+        // child as a mapping that should exist and does not, so an honest refusal
+        // beats a silent over-application (see `VmaList::set_advice`).
+        MADV_DONTFORK => {
+            if !mapped {
+                return -ENOMEM;
+            }
+            if st.vmas.advice_would_widen(base, bytes) {
+                crate::println!(
+                    "linux: madvise(MADV_DONTFORK) refused for {base:#x}..{:#x} - it \
+                     covers part of a larger mapping, and this VMA list records advice \
+                     per mapping, so honouring it would withhold pages the caller did \
+                     not name (docs/SUBSTRATE.md 10a)",
+                    base + bytes
+                );
+                return -EINVAL;
+            }
+            st.vmas
+                .set_advice(base, bytes, vma::ADV_DONTFORK, vma::ADV_WIPEONFORK);
+            0
+        }
+        MADV_DOFORK => {
+            if !mapped {
+                return -ENOMEM;
+            }
+            st.vmas.set_advice(base, bytes, 0, vma::ADV_DONTFORK);
+            0
+        }
+
+        // Punching a hole in the backing store needs a writable file mapping,
+        // which this kernel's file mappings are not (MAP_PRIVATE only).
+        MADV_REMOVE => {
+            crate::println!(
+                "linux: madvise(MADV_REMOVE) unsupported - file mappings here are \
+                 MAP_PRIVATE, so there is no shared backing store to punch"
+            );
+            -EOPNOTSUPP
+        }
+
+        other => {
+            crate::println!("linux: madvise advice {other} not implemented - refused EINVAL");
+            -EINVAL
+        }
+    }
 }
 
 /// mprotect(addr, len, prot): change page permissions. Making a reserved

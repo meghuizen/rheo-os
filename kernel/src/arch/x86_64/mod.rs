@@ -45,6 +45,21 @@ pub const NAME: &str = "x86-64";
 /// within the low-1 GiB identity map (checked in frames::init).
 pub const FRAME_POOL_BASE: usize = 0x0400_0000;
 
+/// Exclusive top of this ISA's **user** virtual address range
+/// (docs/SUBSTRATE.md pillar 2).
+///
+/// x86-64 4-level paging gives a 48-bit canonical space split in half, so the
+/// low (user) half is `[0, 2^47)` - everything above is the non-canonical hole
+/// and then the kernel half. 128 TiB.
+///
+/// The portable code above `arch` reads this rather than a single shared bound:
+/// before pillar 2 every ISA was held to RISC-V Sv39's `2^38` (256 GiB), which
+/// is the narrowest of the three, so x86-64 and ARM64 gave up 99.8% of their
+/// user space to keep one constant portable. A cell that reserves large spans
+/// (a JavaScript engine's pointer cage, a 128 GiB JSC Gigacage, a terabyte file
+/// mapping) needs the real ceiling.
+pub const USER_VA_TOP: usize = 1 << 47;
+
 /// Kernel linear-map offset (docs/MEMORY.md): the kernel, all MMIO, and the
 /// `.user` window run in the top-2 GiB high half (the x86-64 "kernel" code
 /// model), so a physical address is reached at `pa | KERNEL_VA_BASE`. The whole

@@ -36,6 +36,23 @@ pub const NAME: &str = "RISC-V 64";
 /// image (checked against __kernel_end in frames::init).
 pub const FRAME_POOL_BASE: usize = 0x8400_0000;
 
+/// Exclusive top of this ISA's **user** virtual address range
+/// (docs/SUBSTRATE.md pillar 2).
+///
+/// `paging_activate` writes `satp` in **Sv39** mode (`8 << 60`), a 39-bit VA
+/// whose low (user) portion is `[0, 2^38)` - 256 GiB - everything above being
+/// the sign-extended kernel half (docs/MEMORY.md).
+///
+/// This is the **floor profile** of the three ISAs, and it is now only RISC-V's
+/// own bound rather than everyone's: x86-64 and ARM64 report their real, far
+/// wider ceilings. Widening this means bringing up **Sv48** (`9 << 60`, four
+/// levels, `[0, 2^47)`) or Sv57, which is a paging change - the mode must be
+/// probed rather than assumed, because `satp` silently ignores an unsupported
+/// mode and leaves translation bare. Deliberately not done here: the VA
+/// allocator above works against whatever ceiling this reports, so the port is
+/// a paging-level change with no caller to revisit.
+pub const USER_VA_TOP: usize = 1 << 38;
+
 /// Kernel linear-map offset (docs/MEMORY.md): the kernel, all MMIO, and the
 /// `.user` window run in the Sv39 high canonical half, so a physical address
 /// is reached at `pa | KERNEL_VA_BASE`. The whole low half is left to user

@@ -9,6 +9,8 @@
 pub mod frames;
 pub mod frames_pmem;
 pub mod grant;
+pub mod kmeta;
+pub mod vaspace;
 
 use crate::arch::{self, MapPerm};
 
@@ -350,6 +352,33 @@ impl AddressSpace {
             // part of the kernel image), and `free` would panic on it.
             frames::free_if_pool(pa);
         });
+    }
+
+    /// Unmap `[base, base+len)` in **this** address space and return its frames,
+    /// reporting how many pages were actually mapped.
+    ///
+    /// The range form of [`AddressSpace::unmap`], for a caller acting on an
+    /// address space that is **not** the running one - which is why it exists
+    /// rather than the caller looping: `user::unmap_range` operates on the active
+    /// cell, and a freshly forked child is not active. `madvise(MADV_WIPEONFORK)`
+    /// applied to a child is exactly that case (docs/SUBSTRATE.md 10a).
+    ///
+    /// Frames are released with `free_if_pool`, so a range that happens to cover a
+    /// non-pool page (the shared `.user` window) is skipped rather than panicking -
+    /// the same reasoning as [`AddressSpace::free_user_frames`]. The TLB is flushed
+    /// by the next `activate()`, which for a not-yet-run child is its first entry.
+    pub fn free_user_range(&mut self, base: usize, len: usize) -> usize {
+        let mut va = base & !(frames::FRAME_SIZE - 1);
+        let end = base.saturating_add(len);
+        let mut freed = 0;
+        while va < end {
+            if let Some(pa) = self.unmap(va) {
+                frames::free_if_pool(pa);
+                freed += 1;
+            }
+            va += frames::FRAME_SIZE;
+        }
+        freed
     }
 }
 

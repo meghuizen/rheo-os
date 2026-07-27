@@ -63,17 +63,46 @@
 //! is honoured by comparison against [`now_ns`], which is what the honest
 //! bounded-poll receive path needs.
 //!
-//! ## SMP
+//! ## SMP - the arbiter is per-CPU
 //!
-//! Single-CPU today (task #27, docs/SMP.md). The table is a plain fixed array of
-//! `static mut` like the rest of the kernel's single-CPU state. The natural SMP
-//! shape is one arbiter **per CPU** (each CPU has its own one-shot): the table
-//! becomes per-CPU state in `smp.rs` and `this_cpu()` selects it, with a
-//! cross-CPU deadline delivered as an IPI. Nothing here assumes a global table
-//! beyond the statics themselves.
+//! Every CPU has its **own** one-shot timer, so there is one arbiter per CPU
+//! (docs/SMP.md 10.2 names this: "`ktimer` ... becomes per-CPU: every core has
+//! its own timer arbiter over its own local timer"). The deadline table is
+//! therefore [`crate::smp::PerCpu`] state rather than a global `static mut`, and
+//! the single-owner invariant is stated per core: *this module is the only caller
+//! of `arch::timer_*`, and a given core's deadlines are owned by that core.*
+//!
+//! No locking is needed or used: a core registers, cancels and services only its
+//! own deadlines, which is the multikernel discipline (docs/SCHEDULING.md 1a) -
+//! partitioning instead of synchronisation. A deadline that must wake a
+//! *different* core is delivered by asking that core (an IPI), never by reaching
+//! into its table; that path is part of SMP phase 2 and is deliberately absent
+//! here rather than approximated.
+//!
+//! On the single-CPU build `crate::smp::cpu_index()` is a compile-time 0, so
+//! every access resolves to slot 0 with no indexing - the behaviour is
+//! identical to the fixed global table this replaced.
+//!
+//! ## Two deadline shapes, one owner
+//!
+//! - **Named clients** ([`TimerClient`]): one slot per kernel subsystem, a closed
+//!   vocabulary. This is what makes the single-owner property checkable and is
+//!   unchanged.
+//! - **Dynamic timers** ([`wheel`]): an unbounded number of deadlines of the same
+//!   kind, for the callers a fixed slot cannot serve (thousands of QUIC
+//!   connection timeouts, a JavaScript runtime's `setTimeout` set). Funded
+//!   storage, O(1) arm and cancel.
+//!
+//! Both feed the same "nearest deadline" computation, so the hardware is armed
+//! once for whichever of the two is sooner and neither can lose the other's
+//! deadline.
+
+pub mod wheel;
 
 use crate::arch;
-use core::ptr::{addr_of, addr_of_mut};
+use crate::mm::kmeta::Owner;
+use crate::smp::PerCpu;
+use wheel::Wheel;
 
 /// Who a deadline belongs to. One fixed slot each - the kernel stays
 /// allocation-free, so the client set is closed and named here.
@@ -126,32 +155,97 @@ const EMPTY: Slot = Slot {
     fired: false,
 };
 
-static mut SLOTS: [Slot; CLIENTS] = [EMPTY; CLIENTS];
-/// Hardware arm operations performed (an arm of the nearest deadline).
-static mut ARMS: u64 = 0;
-/// Client deadlines marked due.
-static mut FIRINGS: u64 = 0;
-/// Halts performed by [`park`].
-static mut PARKS: u64 = 0;
-/// Times a still-pending **other** client's deadline was re-armed after some
-/// client fired or cancelled - i.e. the deadlines the pre-N2h direct-`timer_arm`
-/// pattern would have silently lost. The conflict-avoidance counter.
-static mut PRESERVED: u64 = 0;
-/// Deadlines registered per client. Instrumentation only: it is what lets a test
-/// assert that a *cell's* pacer went through the [`TimerClient::Pacer`] slot (and
-/// how many times it re-armed) rather than some other client's.
-static mut REGS: [u64; CLIENTS] = [0; CLIENTS];
+/// One CPU's arbiter state: the named-client deadline table, this core's dynamic
+/// timer wheel, and the counters that make its behaviour observable.
+///
+/// Grouped into one struct rather than six parallel `PerCpu` statics so that
+/// "this core's arbiter" is a single thing with a single owner, which is what the
+/// invariant in the module header is about.
+struct Arbiter {
+    slots: [Slot; CLIENTS],
+    /// Hardware arm operations performed (an arm of the nearest deadline).
+    arms: u64,
+    /// Client deadlines marked due.
+    firings: u64,
+    /// Halts performed by [`park`].
+    parks: u64,
+    /// Times a still-pending **other** client's deadline was re-armed after some
+    /// client fired or cancelled - i.e. the deadlines the pre-N2h
+    /// direct-`timer_arm` pattern would have silently lost. The
+    /// conflict-avoidance counter.
+    preserved: u64,
+    /// Deadlines registered per client. Instrumentation only: it is what lets a
+    /// test assert that a *cell's* pacer went through the [`TimerClient::Pacer`]
+    /// slot (and how many times it re-armed) rather than some other client's.
+    regs: [u64; CLIENTS],
+}
 
-/// Clear every deadline and counter (call before installing a fresh set of cells).
+impl Arbiter {
+    const fn new() -> Arbiter {
+        Arbiter {
+            slots: [EMPTY; CLIENTS],
+            arms: 0,
+            firings: 0,
+            parks: 0,
+            preserved: 0,
+            regs: [0; CLIENTS],
+        }
+    }
+}
+
+/// Per-CPU arbiter state. `Copy`, so the plain [`PerCpu::new`] constructor works.
+static ARB: PerCpu<Arbiter> = PerCpu::new(Arbiter::new());
+
+// `Arbiter` holds only integers and bools, so it is `Copy` - but deriving `Copy`
+// on it would also make it silently duplicable, and a duplicated arbiter would
+// mean two views of one core's deadlines. It is constructed once per core and
+// only ever mutated in place, so the `Copy` bound `PerCpu::new` needs is provided
+// explicitly here rather than by a derive that invites copying.
+impl Clone for Arbiter {
+    fn clone(&self) -> Arbiter {
+        *self
+    }
+}
+impl Copy for Arbiter {}
+
+/// Per-CPU dynamic timer wheels. Not `Copy` (a wheel owns funded frames), so this
+/// uses [`PerCpu::from_array`] with a const block.
+static WHEELS: PerCpu<Wheel> = PerCpu::from_array([const { Wheel::new() }; crate::smp::MAX_CPUS]);
+
+/// This CPU's arbiter state.
+///
+/// # Safety
+/// The returned reference must not outlive the caller's critical section, and no
+/// second reference may be taken while it lives. Every use below is a short,
+/// straight-line update inside one function, and nothing here calls back into
+/// this module.
+#[inline(always)]
+#[allow(clippy::mut_from_ref)]
+unsafe fn arb() -> &'static mut Arbiter {
+    // SAFETY: this CPU's own slot (see the module's SMP section); the obligation
+    // above is discharged at each call site.
+    unsafe { ARB.this_mut() }
+}
+
+/// This CPU's dynamic timer wheel.
+///
+/// # Safety
+/// As [`arb`].
+#[inline(always)]
+#[allow(clippy::mut_from_ref)]
+unsafe fn wheel_mut() -> &'static mut Wheel {
+    // SAFETY: as `arb`.
+    unsafe { WHEELS.this_mut() }
+}
+
+/// Clear every deadline and counter on **this CPU** (call before installing a
+/// fresh set of cells).
 pub fn reset() {
-    // SAFETY: single CPU, between runs; no deadline can be outstanding.
+    // SAFETY: single short update of this CPU's own state.
     unsafe {
-        *addr_of_mut!(SLOTS) = [EMPTY; CLIENTS];
-        *addr_of_mut!(ARMS) = 0;
-        *addr_of_mut!(FIRINGS) = 0;
-        *addr_of_mut!(PARKS) = 0;
-        *addr_of_mut!(PRESERVED) = 0;
-        *addr_of_mut!(REGS) = [0; CLIENTS];
+        *arb() = Arbiter::new();
+        let now = arch::timer_now_ns();
+        wheel_mut().init(Owner::KERNEL, now);
     }
     if arch::timer_irq_enabled() {
         arch::timer_disarm();
@@ -171,16 +265,15 @@ pub fn now_ns() -> u64 {
 /// nearer one and vice versa.
 pub fn register(client: TimerClient, in_ns: u64) {
     let now = now_ns();
-    // SAFETY: single CPU; a plain table write.
+    // SAFETY: a plain update of this CPU's own table.
     unsafe {
-        let slots = &mut *addr_of_mut!(SLOTS);
-        slots[client as usize] = Slot {
+        let a = arb();
+        a.slots[client as usize] = Slot {
             deadline_ns: now.wrapping_add(in_ns.max(1)),
             armed: true,
             fired: false,
         };
-        let regs = &mut *addr_of_mut!(REGS);
-        regs[client as usize] = regs[client as usize].wrapping_add(1);
+        a.regs[client as usize] = a.regs[client as usize].wrapping_add(1);
     }
     rearm(now, false);
 }
@@ -189,11 +282,11 @@ pub fn register(client: TimerClient, in_ns: u64) {
 /// client's pending deadline: the hardware is re-armed for the nearest remaining
 /// one, which is the whole point of this module.
 pub fn cancel(client: TimerClient) {
-    // SAFETY: single CPU; a plain table write.
+    // SAFETY: a plain update of this CPU's own table.
     let was_armed = unsafe {
-        let slots = &mut *addr_of_mut!(SLOTS);
-        let was = slots[client as usize].armed;
-        slots[client as usize] = EMPTY;
+        let a = arb();
+        let was = a.slots[client as usize].armed;
+        a.slots[client as usize] = EMPTY;
         was
     };
     rearm(now_ns(), was_armed);
@@ -203,30 +296,39 @@ pub fn cancel(client: TimerClient) {
 /// so a caller that only polls (never [`park`]s) still observes its deadline.
 pub fn expired(client: TimerClient) -> bool {
     service();
-    // SAFETY: single CPU; a plain table read.
-    unsafe { (*addr_of!(SLOTS))[client as usize].fired }
+    // SAFETY: a plain read of this CPU's own table.
+    unsafe { arb().slots[client as usize].fired }
 }
 
 /// Whether `client` has an outstanding (registered, not yet due) deadline.
 pub fn pending(client: TimerClient) -> bool {
-    // SAFETY: single CPU; a plain table read.
-    unsafe { (*addr_of!(SLOTS))[client as usize].armed }
+    // SAFETY: a plain read of this CPU's own table.
+    unsafe { arb().slots[client as usize].armed }
 }
 
-/// The nearest outstanding deadline, if any (absolute ns, timer domain).
+/// The nearest outstanding deadline across **both** the named-client table and
+/// the dynamic wheel, if any (absolute ns, timer domain).
 pub fn nearest_ns() -> Option<u64> {
-    // SAFETY: single CPU; a plain table read.
-    let slots = unsafe { *addr_of!(SLOTS) };
-    slots
-        .iter()
-        .filter(|s| s.armed)
-        .map(|s| s.deadline_ns)
-        .min()
+    // SAFETY: plain reads/updates of this CPU's own state.
+    unsafe {
+        let named = arb()
+            .slots
+            .iter()
+            .filter(|s| s.armed)
+            .map(|s| s.deadline_ns)
+            .min();
+        let dynamic = wheel_mut().nearest();
+        match (named, dynamic) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
+        }
+    }
 }
 
-/// Mark **every** client whose deadline has passed as due, then re-arm the
-/// hardware for the nearest remaining deadline. Returns whether anything became
-/// due.
+/// Mark **every** client whose deadline has passed as due (and advance the
+/// dynamic wheel), then re-arm the hardware for the nearest remaining deadline.
+/// Returns whether anything became due.
 ///
 /// Called after a halt (from [`park`]) and lazily from [`expired`]. Marking *all*
 /// due clients - not just the one the hardware was armed for - is what makes two
@@ -234,16 +336,19 @@ pub fn nearest_ns() -> Option<u64> {
 pub fn service() -> bool {
     let now = now_ns();
     let mut due = false;
-    // SAFETY: single CPU; a plain table update.
+    // SAFETY: plain updates of this CPU's own state.
     unsafe {
-        let slots = &mut *addr_of_mut!(SLOTS);
-        for s in slots.iter_mut() {
+        let a = arb();
+        for s in a.slots.iter_mut() {
             if s.armed && now.wrapping_sub(s.deadline_ns) < (1 << 63) {
                 s.armed = false;
                 s.fired = true;
                 due = true;
-                *addr_of_mut!(FIRINGS) = (*addr_of!(FIRINGS)).wrapping_add(1);
+                a.firings = a.firings.wrapping_add(1);
             }
+        }
+        if wheel_mut().advance(now) > 0 {
+            due = true;
         }
     }
     if due {
@@ -285,9 +390,10 @@ pub fn park(other_source: bool) -> bool {
             return false;
         }
     }
-    // SAFETY: single CPU.
+    // SAFETY: a plain counter update of this CPU's own state.
     unsafe {
-        *addr_of_mut!(PARKS) = (*addr_of!(PARKS)).wrapping_add(1);
+        let a = arb();
+        a.parks = a.parks.wrapping_add(1);
     }
     arch::timer_park();
     service();
@@ -301,9 +407,10 @@ pub fn park(other_source: bool) -> bool {
 fn rearm(now: u64, after_release: bool) {
     let nearest = nearest_ns();
     if after_release && nearest.is_some() {
-        // SAFETY: single CPU.
+        // SAFETY: a plain counter update of this CPU's own state.
         unsafe {
-            *addr_of_mut!(PRESERVED) = (*addr_of!(PRESERVED)).wrapping_add(1);
+            let a = arb();
+            a.preserved = a.preserved.wrapping_add(1);
         }
     }
     if !arch::timer_irq_enabled() {
@@ -320,31 +427,32 @@ fn rearm(now: u64, after_release: bool) {
             // one-shot, so a park cannot sleep through it.
             let delta = if delta >= (1 << 63) { 1 } else { delta.max(1) };
             arch::timer_arm(delta);
-            // SAFETY: single CPU.
+            // SAFETY: a plain counter update of this CPU's own state.
             unsafe {
-                *addr_of_mut!(ARMS) = (*addr_of!(ARMS)).wrapping_add(1);
+                let a = arb();
+                a.arms = a.arms.wrapping_add(1);
             }
         }
         None => arch::timer_disarm(),
     }
 }
 
-/// Hardware arm operations performed.
+/// Hardware arm operations performed on this CPU.
 pub fn arms() -> u64 {
-    // SAFETY: single CPU.
-    unsafe { *addr_of!(ARMS) }
+    // SAFETY: a plain read of this CPU's own state.
+    unsafe { arb().arms }
 }
 
-/// Client deadlines marked due.
+/// Client deadlines marked due on this CPU.
 pub fn firings() -> u64 {
-    // SAFETY: single CPU.
-    unsafe { *addr_of!(FIRINGS) }
+    // SAFETY: a plain read.
+    unsafe { arb().firings }
 }
 
-/// Halts performed by [`park`].
+/// Halts performed by [`park`] on this CPU.
 pub fn parks() -> u64 {
-    // SAFETY: single CPU.
-    unsafe { *addr_of!(PARKS) }
+    // SAFETY: a plain read.
+    unsafe { arb().parks }
 }
 
 /// Deadlines `client` has registered since the last [`reset`]. A continuously
@@ -352,14 +460,79 @@ pub fn parks() -> u64 {
 /// a test sees that a cell's pacing deadlines really landed in the pacer's own slot
 /// (docs/NETSTACK.md 21).
 pub fn registrations(client: TimerClient) -> u64 {
-    // SAFETY: single CPU.
-    unsafe { (*addr_of!(REGS))[client as usize] }
+    // SAFETY: a plain read.
+    unsafe { arb().regs[client as usize] }
 }
 
 /// Deadlines that survived another client's completion because the arbiter
 /// re-armed the nearest **remaining** deadline instead of disarming. Non-zero is
 /// direct evidence of the conflict the pre-N2h code had (docs/NETSTACK.md 16).
 pub fn preserved() -> u64 {
-    // SAFETY: single CPU.
-    unsafe { *addr_of!(PRESERVED) }
+    // SAFETY: a plain read.
+    unsafe { arb().preserved }
+}
+
+// ------------------------------------------------------------- dynamic timers
+
+/// Arm a **dynamic** deadline `in_ns` from now, tagged with `tag`, on this CPU's
+/// wheel. Returns a handle, or `None` when the wheel's funded storage could not
+/// grow.
+///
+/// Unlike [`register`], any number of these may be outstanding at once - that is
+/// the whole point (see "Two deadline shapes" in the module header). The hardware
+/// is re-armed if this deadline is nearer than everything else outstanding, so a
+/// dynamic timer and a named client cannot lose each other's deadline any more
+/// than two named clients can.
+pub fn arm_dynamic(in_ns: u64, tag: u64) -> Option<wheel::Timer> {
+    let now = now_ns();
+    let deadline = now.wrapping_add(in_ns.max(1));
+    // SAFETY: a short update of this CPU's own wheel.
+    let timer = unsafe { wheel_mut().arm(deadline, tag).ok() }?;
+    rearm(now, false);
+    Some(timer)
+}
+
+/// Cancel a dynamic timer. Returns whether it was still armed. Cannot disturb any
+/// other deadline, named or dynamic.
+pub fn cancel_dynamic(timer: wheel::Timer) -> bool {
+    // SAFETY: a short update of this CPU's own wheel.
+    let was_armed = unsafe { wheel_mut().cancel(timer) };
+    rearm(now_ns(), was_armed);
+    was_armed
+}
+
+/// Collect one fired dynamic timer as `(handle, tag)`, freeing it. `None` when
+/// none has fired. Drain in a loop; services the wheel first so a caller that
+/// only polls still observes its deadlines.
+pub fn take_fired_dynamic() -> Option<(wheel::Timer, u64)> {
+    service();
+    // SAFETY: a short update of this CPU's own wheel.
+    unsafe { wheel_mut().take_fired() }
+}
+
+/// Whether a dynamic timer has fired and not yet been collected.
+pub fn fired_dynamic(timer: wheel::Timer) -> bool {
+    // SAFETY: a plain read of this CPU's own wheel.
+    unsafe { wheel_mut().fired(timer) }
+}
+
+/// Dynamic timers currently armed on this CPU.
+pub fn dynamic_armed() -> usize {
+    // SAFETY: a plain read.
+    unsafe { wheel_mut().armed() }
+}
+
+/// `(arms, cancels, firings, cascades)` for this CPU's wheel - the evidence a
+/// test asserts against, including that a cascade actually happened (a lost
+/// cascade shows up as a deadline that never fires).
+pub fn dynamic_counters() -> (u64, u64, u64, u64) {
+    // SAFETY: a plain read.
+    unsafe { wheel_mut().counters() }
+}
+
+/// Whether this CPU's wheel's structural invariants hold. Asserted by the
+/// `substrate` test kernel around the deadlines it drives.
+pub fn dynamic_invariant_holds() -> bool {
+    // SAFETY: a plain read.
+    unsafe { wheel_mut().invariant_holds() }
 }

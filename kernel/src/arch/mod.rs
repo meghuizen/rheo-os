@@ -123,7 +123,7 @@ pub use imp::{
     paging_activate, paging_activate_kernel, paging_cow_at, paging_cow_clear,
     paging_cow_protect_user, paging_for_each_user_leaf, paging_kernel_init, paging_map,
     paging_map_frame, paging_mapped, paging_new_root, paging_protect, paging_unmap_frame,
-    pci_cfg_read32, pci_cfg_write32, pci_mmio_window, phys_to_virt, pmem_map_window,
+    pci_cfg_read32, pci_cfg_write32, pci_mmio_window, phys_to_virt, pmem_map_window, USER_VA_TOP,
     restore_rt_frame, restore_user_fp, return_to_kernel, save_user_fp, serial_init,
     serial_read_byte, serial_write_byte, set_syscall_ret, set_user_fs_base, setup_rt_frame,
     sig_tramp_code, spin_loop, ticks_to_ns, timer_arm, timer_disarm, timer_expired,

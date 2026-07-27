@@ -33,6 +33,9 @@ pub mod ktimer;
 pub mod lease;
 pub mod linux;
 pub mod load;
+/// Per-CPU latency histograms with real percentiles (docs/SUBSTRATE.md
+/// pillar 7). Integer-only, funded storage, off until a boot enables it.
+pub mod metrics;
 pub mod mm;
 pub mod net_rx;
 pub mod nproc;
@@ -41,7 +44,11 @@ pub mod pty;
 pub mod queue;
 pub mod rng;
 pub mod sched;
-#[cfg(feature = "smp")]
+/// Per-CPU state, the kernel spinlock, and secondary-core bring-up. The
+/// **primitives** (`SpinLock`, `PerCpu<T>`, `cpu_index`) are always compiled so
+/// that per-core subsystems are written once rather than once per build
+/// configuration; only the bring-up half, which drives `arch::smp_*`, is behind
+/// the `smp` feature. See the module header and docs/SUBSTRATE.md pillar 3.
 pub mod smp;
 pub mod svc;
 pub mod time;

@@ -7,8 +7,19 @@
 //! Single-host, single-core scope: EDF on one core is schedulable iff the
 //! total utilization U = sum(budget_i / period_i) <= 1. Utilization is
 //! tracked in fixed-point parts-per-million to stay integer-only (no FPU
-//! in the kernel). Pools (latency/shared/system) and the run queue itself
-//! are later work (BUILD-ORDER.md step 9).
+//! in the kernel). Pools (latency/shared/system) are later work
+//! (BUILD-ORDER.md step 9).
+//!
+//! The **ready order** the admitted reservations are dispatched in lives in
+//! [`vcore`], which unifies them with best-effort work in one deadline-ordered
+//! queue (EEVDF virtual deadlines beside these hard ones), weighted by the BORE
+//! burst score in [`bore`] - docs/SCHEDULING.md 11.3-11.4, docs/SUBSTRATE.md
+//! pillar 3. Admission (this module) decides *whether* a guarantee can be kept;
+//! the run queue decides *who runs next*. Keeping the two apart is what lets the
+//! admission math stay unchanged while the dispatch order is re-founded.
+
+pub mod bore;
+pub mod vcore;
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum AdmitError {
@@ -135,5 +146,57 @@ pub fn reset_system() {
     // SAFETY: single CPU, between runs.
     unsafe {
         *core::ptr::addr_of_mut!(SYSTEM) = Admission::new();
+    }
+}
+
+// ------------------------------------------------------- the per-CPU run queue
+
+/// Per-CPU ready queues (docs/SUBSTRATE.md pillar 3).
+///
+/// One queue per core, never a global one: the multikernel model partitions cores
+/// rather than balancing across shared scheduler state, and a cross-LLC balancer
+/// is explicitly not taken (docs/SCHEDULING.md 1a, 11.5). Not `Copy` - a queue
+/// owns funded storage - so this uses [`crate::smp::PerCpu::from_array`].
+static QUEUES: crate::smp::PerCpu<vcore::RunQueue> =
+    crate::smp::PerCpu::from_array([const { vcore::RunQueue::new() }; crate::smp::MAX_CPUS]);
+
+/// This CPU's ready queue.
+///
+/// # Safety
+/// The returned reference must not outlive the caller's critical section and no
+/// second reference may be taken while it lives. A core touches only its own
+/// queue, so there is no cross-core obligation.
+#[inline]
+#[allow(clippy::mut_from_ref)]
+pub unsafe fn run_queue() -> &'static mut vcore::RunQueue {
+    // SAFETY: this CPU's own slot; the intra-CPU obligation is the caller's.
+    unsafe { QUEUES.this_mut() }
+}
+
+/// CPU `cpu`'s ready queue, for a cross-core placement decision or a test oracle.
+///
+/// # Safety
+/// The caller must know CPU `cpu` is not concurrently mutating its queue (it is
+/// parked, or not yet online).
+#[inline]
+#[allow(clippy::mut_from_ref)]
+pub unsafe fn run_queue_of(cpu: usize) -> &'static mut vcore::RunQueue {
+    // SAFETY: delegated to the caller per the contract above.
+    unsafe { QUEUES.get_mut(cpu) }
+}
+
+/// Initialise this CPU's ready queue, charging its storage to the kernel.
+pub fn init_run_queue() {
+    // SAFETY: a short setup call on this CPU's own queue.
+    unsafe {
+        run_queue().init(crate::mm::kmeta::Owner::KERNEL);
+    }
+}
+
+/// Release this CPU's ready queue (between runs).
+pub fn reset_run_queue() {
+    // SAFETY: a short teardown call on this CPU's own queue.
+    unsafe {
+        run_queue().release();
     }
 }

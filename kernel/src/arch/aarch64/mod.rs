@@ -36,6 +36,17 @@ pub const NAME: &str = "ARM64";
 /// image (checked against __kernel_end in frames::init).
 pub const FRAME_POOL_BASE: usize = 0x4400_0000;
 
+/// Exclusive top of this ISA's **user** virtual address range
+/// (docs/SUBSTRATE.md pillar 2).
+///
+/// The boot trampoline programs `TCR_EL1.T0SZ = 16` (arch/aarch64/boot.S), so
+/// TTBR0 - the low half, which is entirely user - translates a 48-bit VA:
+/// `[0, 2^48)`. 256 TiB, the widest of the three ISAs.
+///
+/// The portable code above `arch` reads this rather than a single shared bound;
+/// see the x86-64 counterpart for why one shared `2^38` was the wrong shape.
+pub const USER_VA_TOP: usize = 1 << 48;
+
 /// Kernel linear-map offset (docs/MEMORY.md): the kernel runs in the high
 /// canonical half over TTBR1_EL1, so a physical address is reached at
 /// `pa | KERNEL_VA_BASE`. The whole low half (TTBR0_EL1) is left to user

@@ -168,35 +168,139 @@ pub enum SeedSource {
     None,
 }
 
-static mut ROOT: Drbg = Drbg::ZERO;
-static mut SEED_SOURCE: SeedSource = SeedSource::None;
+/// **Per-CPU root DRBGs** (docs/SUBSTRATE.md 10a).
+///
+/// One root per core rather than one for the machine, for the same reason the
+/// timer arbiter is per-core: `getrandom` is on the hot path of real programs
+/// (every TLS nonce, every hash-map seed, glibc's own startup), and a single
+/// global root would make it the one place every core serialises. A per-core root
+/// needs no lock at all - the multikernel discipline of partitioning instead of
+/// synchronising (docs/SCHEDULING.md 1a).
+///
+/// **This is safe only because of how the roots are seeded.** Each core's root is
+/// keyed independently: [`init`] seeds CPU 0 from the hardware RNG after the
+/// SP 800-90B health tests, and [`init_secondary`] keys each further core by
+/// *deriving* from an already-seeded root (fast key erasure, so the parent's state
+/// is not recoverable from the child's) and then folding in whatever fresh hardware
+/// entropy that core can read itself. Two cores therefore never produce the same
+/// stream, which is the property a naive "copy the root to every core" would
+/// silently destroy - and it would destroy it invisibly, because two identical
+/// ChaCha streams look perfectly random in isolation.
+static ROOTS: crate::smp::PerCpu<Drbg> = crate::smp::PerCpu::new(Drbg::ZERO);
+/// How each core's root was seeded. Per-core because the answer can genuinely
+/// differ: a secondary may read the hardware RNG successfully where the primary
+/// did not, or the reverse.
+static SOURCES: crate::smp::PerCpu<SeedSource> = crate::smp::PerCpu::new(SeedSource::None);
 
-/// Seed the root DRBG. Called once during arch::init, before any cell runs.
+/// This CPU's root DRBG.
+///
+/// # Safety
+/// The reference must not outlive the caller's critical section, and no second
+/// reference may be taken while it lives. A core touches only its own root, so
+/// there is no cross-core obligation.
+#[inline]
+#[allow(clippy::mut_from_ref)]
+unsafe fn root() -> &'static mut Drbg {
+    // SAFETY: this CPU's own slot; the intra-CPU obligation is discharged at each
+    // call site below (short, straight-line uses).
+    unsafe { ROOTS.this_mut() }
+}
+
+/// Seed **this CPU's** root DRBG. Called once during boot on the primary, before
+/// any cell runs.
 pub fn init() {
     let mut key = [0u8; 32];
     let src = gather_seed(&mut key);
+    // SAFETY: short setup on this CPU's own state.
     unsafe {
-        *core::ptr::addr_of_mut!(ROOT) = Drbg::from_key(key);
-        *core::ptr::addr_of_mut!(SEED_SOURCE) = src;
+        *root() = Drbg::from_key(key);
+        *SOURCES.this_mut() = src;
     }
     for b in key.iter_mut() {
         unsafe { core::ptr::write_volatile(b, 0) };
     }
 }
 
-/// How the root DRBG was seeded.
+/// Seed a **secondary** CPU's root, called on that CPU as it comes up.
+///
+/// Keys from `parent` (an already-seeded root, normally the boot CPU's) by
+/// derivation rather than by copy - fast key erasure means the derived key does
+/// not reveal the parent's state and, critically, the parent's own state advances,
+/// so no two cores can be handed the same key. Then folds in this core's own
+/// hardware entropy if it passes the health tests, which is why the reported
+/// [`SeedSource`] is per-core.
+///
+/// Returns the seed source recorded for this CPU.
+pub fn init_secondary(parent: &mut Drbg) -> SeedSource {
+    let derived = parent.derive();
+    // SAFETY: short setup on this CPU's own state.
+    unsafe {
+        *root() = derived;
+    }
+    let mut pool = [0u64; 8];
+    let got = gather_hwrng(&mut pool);
+    let src = if got >= 4 && health_ok(&pool[..got]) {
+        let mut chunk = [0u8; 32];
+        fold(&pool[..got], &mut chunk);
+        // SAFETY: as above.
+        unsafe {
+            root().reseed(&chunk);
+        }
+        for b in chunk.iter_mut() {
+            unsafe { core::ptr::write_volatile(b, 0) };
+        }
+        SeedSource::Hwrng
+    } else if got > 0 {
+        SeedSource::HwrngRejected
+    } else {
+        // No hardware entropy of its own, but the derived key is genuinely
+        // independent of every other core's, so this is not the documented weak
+        // floor - it is inherited strength. Reported as such.
+        SeedSource::Fallback
+    };
+    // SAFETY: as above.
+    unsafe {
+        *SOURCES.this_mut() = src;
+    }
+    src
+}
+
+/// Take a derived DRBG from this CPU's root, for seeding another core (see
+/// [`init_secondary`]). Kept separate from [`derive_cell_drbg`] so that "seed a
+/// CPU" and "seed a cell" are distinguishable at the call site.
+pub fn derive_for_cpu() -> Drbg {
+    // SAFETY: short use of this CPU's own root.
+    unsafe { root().derive() }
+}
+
+/// How **this CPU's** root DRBG was seeded.
 pub fn seed_source() -> SeedSource {
-    unsafe { *core::ptr::addr_of!(SEED_SOURCE) }
+    *SOURCES.this()
 }
 
-/// Mint a fresh per-cell DRBG derived from the root.
+/// How CPU `cpu`'s root was seeded, for a boot report that names every core.
+///
+/// # Safety
+/// An aggregation read; see [`crate::smp::PerCpu::get`].
+pub unsafe fn seed_source_of(cpu: usize) -> SeedSource {
+    // SAFETY: delegated to the caller.
+    unsafe { *SOURCES.get(cpu) }
+}
+
+/// Mint a fresh per-cell DRBG derived from **this CPU's** root.
+///
+/// Every `SYS_RANDOM`/`getrandom`/`/dev/urandom` read goes through here, so
+/// kernel-served randomness holds no per-cell state that could go stale or be
+/// duplicated by a `fork` - the duplication hazard is confined to a cell's *own*
+/// userspace DRBG, which is what `MADV_WIPEONFORK` exists to handle
+/// (docs/SUBSTRATE.md 10a).
 pub fn derive_cell_drbg() -> Drbg {
-    let root = unsafe { &mut *core::ptr::addr_of_mut!(ROOT) };
-    root.derive()
+    // SAFETY: short use of this CPU's own root.
+    unsafe { root().derive() }
 }
 
-/// Pull fresh entropy from the hardware RNG (if any) and fold it into the
-/// root. Continuous reseeding; safe to call periodically. Returns true if
+/// Pull fresh entropy from the hardware RNG (if any) and fold it into **this
+/// CPU's** root. Continuous reseeding; safe to call periodically. Returns true if
 /// hardware entropy was actually mixed in.
 pub fn reseed_root() -> bool {
     let mut pool = [0u64; 8];
@@ -204,8 +308,10 @@ pub fn reseed_root() -> bool {
     if got >= 4 && health_ok(&pool[..got]) {
         let mut chunk = [0u8; 32];
         fold(&pool[..got], &mut chunk);
-        let root = unsafe { &mut *core::ptr::addr_of_mut!(ROOT) };
-        root.reseed(&chunk);
+        // SAFETY: short use of this CPU's own root.
+        unsafe {
+            root().reseed(&chunk);
+        }
         true
     } else {
         false

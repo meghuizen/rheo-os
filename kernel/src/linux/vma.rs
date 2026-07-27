@@ -91,7 +91,28 @@ pub struct Vma {
     /// For a `mmap` of a file it is simply the mapping length: a read past end of
     /// file already short-reads, leaving the rest of the frame zero.
     pub file_len: usize,
+    /// `madvise` state for this range: [`ADV_DONTFORK`], [`ADV_WIPEONFORK`].
+    ///
+    /// Per record rather than per process because that is the granularity
+    /// `madvise` works at - a library marks *its own* pages - and a split or merge
+    /// must carry it, which the operations below do.
+    pub advice: u16,
 }
+
+/// [`Vma::advice`] bit: `MADV_DONTFORK` - the range is **not** inherited by a
+/// child, so `fork` leaves it unmapped there.
+pub const ADV_DONTFORK: u16 = 1 << 0;
+/// [`Vma::advice`] bit: `MADV_WIPEONFORK` - the range is inherited but **zeroed**
+/// in the child (docs/SUBSTRATE.md 10a).
+///
+/// The reason this bit is worth carrying: a userspace CSPRNG's state lives in
+/// ordinary anonymous memory, and copy-on-write `fork` duplicates it, so parent
+/// and child would generate **identical random streams** - which looks perfectly
+/// random in isolation and is therefore not something a test notices by accident.
+/// OpenSSL and other libraries defend themselves by asking for exactly this, and
+/// a kernel that accepted the request and did nothing would leave them believing
+/// they were safe. Honouring it is what makes the promise real.
+pub const ADV_WIPEONFORK: u16 = 1 << 1;
 
 impl Vma {
     const EMPTY: Vma = Vma {
@@ -102,7 +123,13 @@ impl Vma {
         file: None,
         file_off: 0,
         file_len: 0,
+        advice: 0,
     };
+
+    /// Whether this range carries an advice bit.
+    pub fn has_advice(&self, bit: u16) -> bool {
+        self.advice & bit != 0
+    }
 
     /// Bytes of file content still available at `at` (>= `base`), i.e. how much of a
     /// page starting there may be read from the file before zero-fill takes over.
@@ -357,6 +384,8 @@ impl VmaList {
                         file,
                         file_off,
                         file_len,
+                        // A fresh mapping starts with no advice; `madvise` sets it.
+                        advice: 0,
                     };
                     true
                 }
@@ -412,6 +441,12 @@ impl VmaList {
                                 file: m.file,
                                 file_off: m.file_off + (end - m.base) as u64,
                                 file_len: m.avail_at(end),
+                                // The advice belongs to the *range*, so both
+                                // halves of a split keep it - otherwise a
+                                // WIPEONFORK region silently loses the property
+                                // above the hole, which is precisely the kind of
+                                // partial guarantee that is worse than none.
+                                advice: m.advice,
                             }
                         }
                         None => crate::println!(
@@ -450,6 +485,61 @@ impl VmaList {
     ///
     /// Implemented as remove-then-insert over the affected pages, one record per
     /// distinct old protection, so the splitting logic lives in one place.
+    /// Set or clear advice bits over `[base, base+bytes)`.
+    ///
+    /// Unlike [`VmaList::set_prot`] this does **not** re-record the mappings: an
+    /// advice change alters no permission and no backing, so splitting a record
+    /// would be pure churn (and would consume table slots a program calling
+    /// `madvise` in a loop cannot spare). Instead every record that *overlaps* the
+    /// range takes the bits.
+    ///
+    /// The cost of that simplification, stated: advice applied to part of a record
+    /// is recorded for the whole record. For [`ADV_WIPEONFORK`] that errs toward
+    /// wiping more than asked, which is the safe direction (a wiped page the caller
+    /// did not need wiped costs a fault; an unwiped page it did need wiped is a
+    /// duplicated random stream). For [`ADV_DONTFORK`] it errs toward *not*
+    /// inheriting, which a child could observe as a missing mapping - so
+    /// `MADV_DONTFORK` over a partial record is reported as unsupported by the
+    /// caller in [`crate::linux::mem::madvise`] rather than silently widened.
+    pub fn set_advice(&mut self, base: usize, bytes: usize, set: u16, clear: u16) {
+        if bytes == 0 {
+            return;
+        }
+        let end = base.saturating_add(bytes);
+        for m in self.v.iter_mut() {
+            if m.len == 0 {
+                continue;
+            }
+            let m_end = m.base + m.len;
+            if base < m_end && m.base < end {
+                m.advice = (m.advice | set) & !clear;
+            }
+        }
+    }
+
+    /// Whether any record overlapping `[base, base+bytes)` extends outside it -
+    /// i.e. whether an advice change here would widen beyond what was asked.
+    pub fn advice_would_widen(&self, base: usize, bytes: usize) -> bool {
+        let end = base.saturating_add(bytes);
+        self.live()
+            .any(|m| base < m.end() && m.base < end && (m.base < base || m.end() > end))
+    }
+
+    /// Every live record overlapping `[base, base+bytes)`, as `(base, len,
+    /// advice)`. Used by `fork` to apply [`ADV_WIPEONFORK`]/[`ADV_DONTFORK`] to a
+    /// child, and by `madvise` to walk what it is about to change.
+    pub fn overlapping(&self, base: usize, bytes: usize) -> impl Iterator<Item = Vma> + '_ {
+        let end = base.saturating_add(bytes);
+        self.live()
+            .filter(move |m| base < m.end() && m.base < end)
+            .copied()
+    }
+
+    /// Every live record carrying `bit`.
+    pub fn with_advice(&self, bit: u16) -> impl Iterator<Item = Vma> + '_ {
+        self.live().filter(move |m| m.advice & bit != 0).copied()
+    }
+
     pub fn set_prot(&mut self, base: usize, bytes: usize, prot: u64) {
         if bytes == 0 {
             return;

@@ -427,7 +427,11 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
         nr::MREMAP => ret(mem::mremap(st, args[0], args[1], args[2], args[3])),
         nr::MUNMAP => ret(mem::munmap(state(cur), args[0], args[1])),
         nr::MPROTECT => ret(mem::mprotect(state(cur), args[0], args[1], args[2])),
-        nr::MADVISE => Ctl::Ret(0), // advisory by specification
+        // madvise: real behaviour, not a blanket 0. DONTNEED/FREE decommit,
+        // WIPEONFORK/DONTFORK are recorded and honoured by `fork`, the genuinely
+        // advisory values are accepted, and everything else is refused with a
+        // reason (docs/SUBSTRATE.md 10a).
+        nr::MADVISE => ret(mem::madvise(state(cur), args[0], args[1], args[2])),
 
         // -- threads (multi-context cell, docs/LINUX-COMPAT.md L4) --
         // clone(flags, child_stack, parent_tid, {child_tid, tls}) - the last

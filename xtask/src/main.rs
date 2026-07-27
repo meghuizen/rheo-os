@@ -763,6 +763,8 @@ fn main() -> ExitCode {
         // Benchmarks always run the release build: instruction path
         // lengths of an unoptimized kernel are not the system's numbers.
         "bench" => arches.iter().all(|&a| build(a, true) && bench(a, true)),
+        // Type-check only: the fast inner development loop (see `check`).
+        "check" => arches.iter().all(|&a| check(a)),
         // Patch the toolchain's vendored rust-src to add `target_os = "rheo"`
         // so `std` can be built for the rheo-os target (docs/USERLAND.md M4).
         // Idempotent; run once per toolchain before building std programs.
@@ -782,9 +784,60 @@ fn main() -> ExitCode {
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo xtask <build|run|test|bench|std-patch> \
+        "usage: cargo xtask <build|check|run|test|bench|std-patch> \
          [--arch x86_64|aarch64|riscv64|all] [--bin <kernel>[,<kernel>...]] [--release]"
     );
+}
+
+/// **Type-check the kernel library, both with and without the `smp` feature** -
+/// the fast inner loop for kernel work.
+///
+/// `build` is the honest gate, but it is not a development loop: before it reaches
+/// a single line of kernel code it cross-builds the `userland` programs, every
+/// librheo bin (twice, for the embedded spine), four separately-featured `net`
+/// cells, the std programs, the coreutils multicall, the columnar dataset, the
+/// pmem backing file, and the glibc Linux fixtures - none of which a change to
+/// `kernel/src/` can affect. `check` skips all of it, so a compile error in kernel
+/// code surfaces in seconds rather than minutes.
+///
+/// **Scope, deliberately: the `kernel` package only.** The `qemu-tests` package
+/// `include_bytes!`s cell ELFs that do not exist until `build` has produced them,
+/// so checking it without a prior build reports missing fixtures rather than
+/// anything about the code. Test kernels are covered by `build`/`test`.
+///
+/// It checks the **`smp` feature in its own invocation**, because that is a
+/// separate compilation of the same library: per-CPU code paths that exist only
+/// under `kernel/smp` are the ones a portable change is most likely to break, and
+/// the ordinary build hides them until the very end (`build` compiles the feature
+/// only for the single `smp` bin). Both configurations must be clean.
+///
+/// Same target and RUSTFLAGS as `build` per ISA, so what it checks is what will be
+/// built. It does **not** replace `build`/`test`: it cannot catch a link error, a
+/// missing fixture, or anything about running.
+fn check(arch: Arch) -> bool {
+    for (label, features) in [("kernel", None), ("kernel + smp feature", Some("smp"))] {
+        println!("[xtask] checking {label} for {}", arch.name());
+        let mut cmd = Command::new("cargo");
+        cmd.args([
+            "check",
+            "-p",
+            "kernel",
+            "--target",
+            arch.target(),
+            "-Zbuild-std=core,alloc,compiler_builtins",
+            "-Zbuild-std-features=compiler-builtins-mem",
+        ]);
+        if let Some(feature) = features {
+            cmd.args(["--features", feature]);
+        }
+        if let Some(flags) = kernel_rustflags(arch) {
+            cmd.env("RUSTFLAGS", flags);
+        }
+        if !matches!(cmd.status().map(|s| s.success()), Ok(true)) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Apply the rheo-os std patch to the active toolchain's rust-src
