@@ -419,6 +419,34 @@ through the unknown-number log. The `sysx` fixture in `linuxproc` proves it on
 **all three ISAs**, asserting each refusal *as* a refusal, with four narrow
 reverts each observed failing.
 
+**The real Node.js binary runs unmodified on the OS** (GOAL-NODE,
+docs/LINUX-COMPAT.md, the `linuxnode` test): the actual `/opt/node22/bin/node`
+(v22, dynamic, 124 MB, V8 + libuv) streams off a live ext4 disk over
+virtio-blk-pci (`ext4fs`/`ext4plus` + block cache, ~15k fills, none resident
+whole), `ld-linux` links all **seven** shared libraries (glibc + libstdc++ +
+libgcc_s), V8 initialises, libuv runs its event loop, and it evaluates
+`console.log("rheo:"+(40+2))`, prints exactly `rheo:42`, and **exits 0** on
+x86-64 (arm/riscv have no node build and skip). It runs `--jitless` so V8's
+Ignition interpreter needs no writable-executable code page (W^X is structural,
+ARCHITECTURE.md 5 - the one `mprotect(RWX)` V8 would issue is refused). This is
+the production JavaScript runtime Claude Code runs on, executing unmodified via
+the Linux personality + POSIX translation. It needed four measured legacy calls
+(`gettimeofday` - which libuv *asserts* on -, `clock_getres`, `time`; io_uring
+refused deliberately) and, the real blocker, **per-context blocking**: a cell's
+proc-level block (`epoll_wait`/`poll`/`nanosleep`/pipe/eventfd/console/`wait4`)
+now lives **per execution context** (`thread.rs` `pblock`, judged + completed by
+`proc.rs`) rather than parking the whole cell - so Node's main thread can block on
+`epoll_wait` for an eventfd a V8 worker must write while the worker keeps running
+(before, the whole cell parked and the scheduler correctly reported a deadlock).
+When a context blocks the scheduler runs a `Ready` sibling first, then an
+already-satisfiable sibling (Node's teardown: main writes the eventfd then
+futex-waits for the worker parked on it, which is resumed and `FUTEX_WAKE`s main),
+and only parks the whole cell (the pre-existing cross-cell path) when every
+context is blocked - a single-context cell falls straight to that path,
+byte-for-byte the old behaviour, which is why the whole Linux suite stays green.
+Still cooperative + single-CPU (#27); one `poll` waiter per cell (the copied
+pollset is per-cell; `epoll`, which Node uses, is unlimited).
+
 **timerfd is done** (docs/LINUX-COMPAT.md L8-TIMERFD, GOAL-TIMERFD):
 `timerfd_create`/`settime`/`gettime` - the **timer source of libuv**, and thus of
 Node.js and the async/JS world. A per-cell fd over a per-personality registry

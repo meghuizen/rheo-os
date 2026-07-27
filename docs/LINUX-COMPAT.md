@@ -1027,30 +1027,45 @@ fixup path.
   MAP_JIT-style dual mapping) is the follow-on that would let V8 optimise rather
   than only interpret.
 
-- **The real Node binary loads, links, and initialises V8 on the OS - and the
-  final blocker is the cooperative scheduler, not a missing syscall** (GOAL-NODE,
-  task #174, the `linuxnode` test). The actual `/opt/node22/bin/node` (v22,
-  dynamic, 124 MB) is streamed off a live ext4 disk over virtio-blk-pci
-  (`ext4fs`/`ext4plus` + the block cache, ~6500 block-cache fills - none of the
-  binary or its libraries resident whole), its `ld-linux-x86-64.so.2` links all
-  **seven** shared libraries (glibc + libstdc++ + libgcc_s), **V8 initialises**,
-  and **libuv starts its event loop** - reached only after these three new legacy
-  clock calls landed (`gettimeofday`, `clock_getres`, `time`), each found by
-  running the real binary and observing exactly where it aborted. It then blocks
-  on `epoll_wait` for an **eventfd a sibling thread must write** - V8's
-  cross-thread startup handshake - which the personality's **per-*cell*** (not
-  per-*context*) block model cannot schedule: when one context blocks on
-  `epoll_wait` the whole cell parks, freezing the sibling threads that would wake
-  it, so the scheduler correctly reports a genuine `DEADLOCK` rather than hanging.
-  This is the documented L4 cooperative frontier (futex already switches between
-  contexts of a cell; `epoll_wait`/`poll`/`nanosleep` do not - they park the
-  cell), and closing it - **per-context blocking**, so a thread-level block runs a
-  runnable sibling context instead of the whole cell - is what turns this
-  skip-with-reason into `node` printing its answer. It is deliberately a separate,
-  careful slice (it touches every wait path and the 47-kernel Linux suite), not a
-  session-tail bolt-on. The `linuxnode` test asserts the reproducible partial
-  every run (streamed off disk + reached the event loop before any output) and
-  auto-upgrades to a full `rheo:42` PASS when per-context blocking lands.
+- **The real Node.js binary runs unmodified on the OS and prints its answer**
+  (GOAL-NODE [done], task #174, the `linuxnode` test). The actual
+  `/opt/node22/bin/node` (v22, dynamic, 124 MB, shipping V8 + libuv) streams off a
+  live ext4 disk over virtio-blk-pci (`ext4fs`/`ext4plus` + the block cache,
+  ~15,000 block-cache fills - none of the binary or its libraries resident whole),
+  its `ld-linux-x86-64.so.2` links all **seven** shared libraries (glibc +
+  libstdc++ + libgcc_s), V8 initialises, libuv runs its event loop, it evaluates
+  `console.log("rheo:"+(40+2))`, prints exactly `rheo:42`, and **exits 0** - on
+  x86-64 (arm64/riscv64 have no node build and skip-with-reason). It runs
+  `--jitless` so V8's Ignition interpreter needs no writable-executable code page
+  (W^X, ARCHITECTURE.md 5, the one `mprotect(RWX)` V8 would issue is refused;
+  host-verified that `--jitless` avoids it). This is the production JavaScript
+  runtime Claude Code runs on, executing unmodified. Reaching it took two things,
+  both measured by running the real binary and seeing exactly where it stopped:
+  four legacy calls (`gettimeofday` - which libuv *asserts* on -, `clock_getres`,
+  `time`, and io_uring refused deliberately), and **per-context blocking** (below),
+  which was the real blocker - not a missing syscall.
+
+- **Per-context blocking** (docs/LINUX-COMPAT.md L4, the scheduler change that made
+  Node run). A cell holds up to 8 execution contexts (threads); before this, a
+  proc-level blocking syscall (`epoll_wait`/`poll`/`nanosleep`/pipe/eventfd/
+  console/`wait4`) parked the **whole cell**, freezing every sibling thread - fine
+  for a single-threaded program, fatal for an event loop: Node's main thread blocks
+  on `epoll_wait` for an eventfd a V8 worker must write, and parking the cell froze
+  the worker, so the scheduler reported a genuine `DEADLOCK`. Now the block
+  condition lives **per context** (`thread.rs` `pblock`, judged and completed by
+  `proc.rs`): when a context blocks, the scheduler runs a `Ready` **sibling**
+  context first, then a sibling that is **already satisfiable** (Node's teardown:
+  main writes the eventfd, then futex-waits for the worker parked on it - the
+  worker is resumed and `FUTEX_WAKE`s main), and only parks the whole cell (the
+  pre-existing cross-cell path) when every context is blocked with no sibling
+  runnable or satisfiable. A **single-context** cell has no sibling and falls
+  straight to that cross-cell park - byte-for-byte the old behaviour, which is why
+  the entire existing Linux suite (threads/futex/poll/signals/processes) stays
+  green. The futex path integrates with it: a futex WAIT with no `Ready` sibling
+  resumes a satisfiable proc-blocked sibling rather than spinning `EAGAIN`. Still
+  cooperative and single-CPU (a compute-bound thread starves siblings until timer
+  preemption, #27); one context per cell may block on `poll` at a time (the copied
+  `pollset` is per-cell - `epoll`, which Node uses, has no such limit).
 
 ## 6. Fixture build matrix (reproducibility)
 

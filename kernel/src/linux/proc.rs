@@ -26,10 +26,13 @@ use crate::user::{self, MAX_CELLS};
 use core::mem::MaybeUninit;
 use core::ptr::addr_of_mut;
 
-/// What a parked process is waiting for (docs/LINUX-COMPAT.md L6). Completed by
-/// `complete_block` when the scheduler switches into the cell.
+/// What a parked context is waiting for (docs/LINUX-COMPAT.md L6). Completed by
+/// `complete_pblock` when the scheduler switches into the context. Stored
+/// **per-context** in `thread.rs` (per-context blocking, docs/LINUX-COMPAT.md L4):
+/// one context of a cell can block on `epoll_wait` while a sibling keeps running,
+/// which is what an event-loop program (Node's V8 + libuv) needs.
 #[derive(Copy, Clone)]
-enum Block {
+pub(crate) enum Block {
     None,
     /// `wait4`: parked until a child matching `want` (a pid, or <=0 for any)
     /// becomes a zombie. `wstatus_va` receives the encoded status.
@@ -137,7 +140,6 @@ enum PState {
 #[derive(Copy, Clone)]
 struct Proc {
     state: PState,
-    block: Block,
     /// Parent cell index, or -1 for the top of the tree.
     parent: i32,
     pid: u32,
@@ -149,7 +151,6 @@ impl Proc {
     const fn free() -> Proc {
         Proc {
             state: PState::Free,
-            block: Block::None,
             parent: -1,
             pid: 0,
             wstatus: 0,
@@ -195,7 +196,6 @@ pub fn reset() {
 pub fn init_top(cell: usize) {
     procs()[cell] = Proc {
         state: PState::Runnable,
-        block: Block::None,
         parent: -1,
         pid: 1000,
         wstatus: 0,
@@ -276,7 +276,6 @@ pub fn mark_signaled_remote(cell: usize, signo: u32) -> bool {
     unsafe { (*user::cell_aspace(cell)).free_user_frames() };
     procs()[cell].state = PState::Zombie;
     procs()[cell].wstatus = signo & 0x7f; // WIFSIGNALED
-    procs()[cell].block = Block::None;
     false
 }
 
@@ -335,7 +334,6 @@ pub fn fork(cur: usize, parent_frame: *mut TrapFrame) -> i64 {
 
     procs()[child] = Proc {
         state: PState::Runnable,
-        block: Block::None,
         parent: cur as i32,
         pid: child_pid,
         wstatus: 0,
@@ -424,7 +422,6 @@ pub fn execve(cur: usize, path_va: u64, argv_va: u64, envp_va: u64, frame: *mut 
     let aspace_ptr = unsafe { (*addr_of_mut!(ASPACE))[cur].as_ptr() };
     user::set_cell_aspace(cur, aspace_ptr);
     user::set_cell_frame(cur, frame_ptr);
-    procs()[cur].block = Block::None;
     user::switch_to_cell(cur); // activate the new address space
     thread::restore_current(cur); // load the (zeroed) FP + fs_base of the new image
     Ctl::Switch(frame_ptr)
@@ -523,9 +520,8 @@ pub fn wait4(cur: usize, upid: i64, wstatus_va: u64, options: u64) -> Ctl {
     if options & WNOHANG != 0 {
         return ret(0);
     }
-    procs()[cur].state = PState::Blocked;
-    procs()[cur].block = Block::Wait { wstatus_va, want };
-    reschedule(cur)
+    thread::set_current_pblock(cur, Block::Wait { wstatus_va, want });
+    park_or_switch(cur)
 }
 
 /// Reap zombie cell `z` into `wstatus_va` (in the active reaper's address
@@ -599,7 +595,6 @@ fn process_exit(cell: usize, status: u32, top_code: u64) -> Ctl {
     super::state(cell).vmas.clear();
     procs()[cell].state = PState::Zombie;
     procs()[cell].wstatus = status;
-    procs()[cell].block = Block::None;
     reschedule(cell)
 }
 
@@ -617,33 +612,29 @@ pub fn runnable_peer_exists(cur: usize) -> bool {
 /// Park `cur` on an empty pipe read; the scheduler completes the read (with
 /// `cur`'s address space active) when data arrives or all write ends close.
 pub fn block_pipe_read(cur: usize, buf_va: u64, count: u64, idx: usize) -> Ctl {
-    procs()[cur].state = PState::Blocked;
-    procs()[cur].block = Block::PipeRead { buf_va, count, idx };
-    reschedule(cur)
+    thread::set_current_pblock(cur, Block::PipeRead { buf_va, count, idx });
+    park_or_switch(cur)
 }
 
 /// Park `cur` on an eventfd read whose counter is zero; the scheduler completes
 /// the read (with `cur`'s address space active) once a peer writes the counter.
 pub fn block_eventfd_read(cur: usize, buf_va: u64, count: u64, ev: u8) -> Ctl {
-    procs()[cur].state = PState::Blocked;
-    procs()[cur].block = Block::EventFdRead { buf_va, count, ev };
-    reschedule(cur)
+    thread::set_current_pblock(cur, Block::EventFdRead { buf_va, count, ev });
+    park_or_switch(cur)
 }
 
 /// Park `cur` on a not-yet-expired timerfd read; the scheduler completes the read
 /// (writing the expiration count, `cur`'s address space active) once the deadline
 /// passes. The wait is honoured by the scheduler's timer slices, like `nanosleep`.
 pub fn block_timerfd_read(cur: usize, buf_va: u64, count: u64, tf: u8) -> Ctl {
-    procs()[cur].state = PState::Blocked;
-    procs()[cur].block = Block::TimerFdRead { buf_va, count, tf };
-    reschedule(cur)
+    thread::set_current_pblock(cur, Block::TimerFdRead { buf_va, count, tf });
+    park_or_switch(cur)
 }
 
 /// Park `cur` on a full pipe write; completed when space frees or read ends close.
 pub fn block_pipe_write(cur: usize, buf_va: u64, count: u64, idx: usize) -> Ctl {
-    procs()[cur].state = PState::Blocked;
-    procs()[cur].block = Block::PipeWrite { buf_va, count, idx };
-    reschedule(cur)
+    thread::set_current_pblock(cur, Block::PipeWrite { buf_va, count, idx });
+    park_or_switch(cur)
 }
 
 // ----------------------------------------------------------------- scheduler
@@ -693,9 +684,15 @@ fn reschedule(leaving: usize) -> Ctl {
             .map(|k| (leaving + k) % MAX_CELLS)
             .find(|&i| user::cell_present(i) && procs()[i].state == PState::Runnable);
         if let Some(n) = next {
+            // Resume the context whose per-context block is satisfiable (a
+            // multi-threaded cell can have several parked); a cell that only
+            // yielded has none, so its current context resumes unchanged. Set it
+            // current *before* `restore_current`, which reloads that context's FP.
+            let idx = first_satisfiable_context(n).unwrap_or_else(|| thread::current_context(n));
+            thread::set_current(n, idx);
             user::switch_to_cell(n);
             thread::restore_current(n);
-            complete_block(n);
+            complete_pblock(n, idx);
             // A signal another process sent while `n` was not running is
             // delivered *here* and nowhere else: delivery is a rewrite of the
             // target's own saved frame, pushing a `rt_sigframe` onto the target's
@@ -749,6 +746,58 @@ fn reschedule(leaving: usize) -> Ctl {
 /// same reasoning as the futex timeout's park slice.
 const SLEEP_SLICE_NS: u64 = 1_000_000;
 
+/// The calling context just recorded a proc-level block ([`thread::set_current_pblock`]).
+/// Decide what runs next, **per-context** (docs/LINUX-COMPAT.md L4):
+///
+/// 1. a `Ready` **sibling** context of this cell, if any - so one thread blocking on
+///    `epoll_wait` does not freeze the thread that will wake it (the Node V8 + libuv
+///    case: main parks on an eventfd a worker must write);
+/// 2. else a **sibling that is already satisfiable** - a peer wrote the fd before it
+///    got a turn to park, so complete it and switch to it;
+/// 3. else every context of this cell is blocked and none is satisfiable, so the
+///    whole cell parks and the CPU goes to another process (the pre-existing
+///    cross-cell [`reschedule`]).
+///
+/// A **single-context** cell has no sibling and its lone context is the one that
+/// just blocked, so it always falls straight to (3) - byte-for-byte the behaviour
+/// before per-context blocking, which is what keeps every non-threaded program
+/// (and the whole existing test suite) unchanged.
+fn park_or_switch(cell: usize) -> Ctl {
+    if let Some(sib) = thread::pick_ready_sibling(cell) {
+        return thread::switch_current_to(cell, sib);
+    }
+    if let Some(idx) = first_satisfiable_context(cell) {
+        let frame = thread::resume_pblocked(cell, idx);
+        complete_pblock(cell, idx);
+        return Ctl::Switch(frame);
+    }
+    procs()[cell].state = PState::Blocked;
+    reschedule(cell)
+}
+
+/// A futex WAIT found no `Ready` sibling to switch to. If a **sibling context** is
+/// parked on a proc-level condition that is satisfiable *right now*, resume it - the
+/// mixed futex+event-loop case (Node's teardown: the main thread writes an eventfd,
+/// then futex-waits for the worker thread that is parked on that eventfd; the worker
+/// is now satisfiable and, once resumed, will `FUTEX_WAKE` the main thread). The
+/// futex waiter stays `Blocked` until that wake. Returns `None` if no sibling is
+/// immediately satisfiable, so the futex path keeps its survivable `EAGAIN` (a lone
+/// futex spinner is unchanged - it has no such sibling).
+pub fn resume_satisfiable_sibling(cell: usize) -> Option<Ctl> {
+    let idx = first_satisfiable_context(cell)?;
+    let frame = thread::resume_pblocked(cell, idx);
+    complete_pblock(cell, idx);
+    Some(Ctl::Switch(frame))
+}
+
+/// The first context of `cell` parked on a proc-level condition that is satisfiable
+/// right now, if any - the scheduler's per-context wake test.
+fn first_satisfiable_context(cell: usize) -> Option<usize> {
+    (0..thread::MAX_THREADS).find(|&i| {
+        thread::is_pblocked(cell, i) && satisfiable_block(cell, thread::pblock_of(cell, i))
+    })
+}
+
 /// The union of wake sources every blocked cell is waiting on ([`crate::idle`]).
 fn blocked_sources() -> crate::idle::Sources {
     let mut src = 0;
@@ -760,10 +809,22 @@ fn blocked_sources() -> crate::idle::Sources {
     src
 }
 
-/// The wake sources cell `i`'s current block can be satisfied by.
-fn sources_of(i: usize) -> crate::idle::Sources {
+/// The union of wake sources blocked cell `cell` is waiting on - the union over
+/// all of its parked contexts' per-context conditions (per-context blocking).
+fn sources_of(cell: usize) -> crate::idle::Sources {
+    let mut s = 0;
+    for i in 0..thread::MAX_THREADS {
+        if thread::is_pblocked(cell, i) {
+            s |= sources_of_block(thread::pblock_of(cell, i));
+        }
+    }
+    s
+}
+
+/// The wake sources one block condition can be satisfied by.
+fn sources_of_block(b: Block) -> crate::idle::Sources {
     use crate::idle;
-    match procs()[i].block {
+    match b {
         Block::None => 0,
         // A pipe/socket ring or a child exit is another *process*'s doing.
         Block::Wait { .. }
@@ -801,14 +862,20 @@ fn report_deadlock(src: crate::idle::Sources) -> Ctl {
                 procs()[i].pid,
                 block_name(i)
             );
+            thread::dump_contexts(i);
         }
     }
     Ctl::Exit(crate::abi::DEADLOCK_EXIT)
 }
 
-/// The name of cell `i`'s block, for the deadlock diagnostic.
+/// The name of cell `i`'s block, for the deadlock diagnostic - the first parked
+/// context's condition (per-context blocking).
 fn block_name(i: usize) -> &'static str {
-    match procs()[i].block {
+    let b = (0..thread::MAX_THREADS)
+        .find(|&k| thread::is_pblocked(i, k))
+        .map(|k| thread::pblock_of(i, k))
+        .unwrap_or(Block::None);
+    match b {
         Block::None => "nothing",
         Block::Wait { .. } => "wait4 (child exit)",
         Block::PipeRead { .. } => "read (empty pipe/socket)",
@@ -822,10 +889,20 @@ fn block_name(i: usize) -> &'static str {
     }
 }
 
-/// Whether blocked cell `i`'s wait condition is now satisfiable.
+/// Whether blocked cell `i` has any context whose per-context condition is now
+/// satisfiable (the reschedule wake test).
 fn satisfiable(i: usize) -> bool {
-    match procs()[i].block {
-        Block::Wait { want, .. } => find_zombie_child(i, want).is_some() || !has_child(i, want),
+    first_satisfiable_context(i).is_some()
+}
+
+/// Whether one block condition of cell `cell` is now satisfiable. Judged entirely
+/// from kernel state (fd tables, pipe/eventfd/timerfd registries, the cell clock),
+/// so the scheduler can ask it while another cell's address space is active.
+fn satisfiable_block(cell: usize, b: Block) -> bool {
+    match b {
+        Block::Wait { want, .. } => {
+            find_zombie_child(cell, want).is_some() || !has_child(cell, want)
+        }
         Block::PipeRead { idx, .. } => pipe::has_data(idx) || pipe::writers(idx) == 0,
         Block::PipeWrite { idx, .. } => pipe::has_space(idx) || pipe::readers(idx) == 0,
         Block::EventFdRead { ev, .. } => super::eventfd::readable(ev),
@@ -835,13 +912,13 @@ fn satisfiable(i: usize) -> bool {
         Block::Poll {
             nfds, deadline_ns, ..
         } => {
-            poll_ready_count(i, nfds) > 0
+            poll_ready_count(cell, nfds) > 0
                 || (deadline_ns != 0 && super::cell_clock_ns(false) >= deadline_ns)
         }
         Block::Epoll {
             epfd, deadline_ns, ..
         } => {
-            super::state(i).fds.epoll_ready(epfd) > 0
+            super::state(cell).fds.epoll_ready(epfd) > 0
                 || (deadline_ns != 0 && super::cell_clock_ns(false) >= deadline_ns)
         }
         Block::None => false,
@@ -868,12 +945,17 @@ fn poll_ready_count(i: usize, nfds: usize) -> usize {
     ready
 }
 
-/// Apply a woken cell's pending syscall (its address space is now active) and
-/// set its return value, then clear the block.
-fn complete_block(n: usize) {
-    let block = procs()[n].block;
-    procs()[n].block = Block::None;
-    let frame = thread::current_frame(n);
+/// Apply woken context `idx` of cell `n`'s pending syscall (its address space is now
+/// active, and `idx` is current) and set its return value, then clear its
+/// per-context block and mark it ready. A `None` block is a no-op (a cell that only
+/// yielded resumes its current context with nothing to complete).
+fn complete_pblock(n: usize, idx: usize) {
+    let block = thread::pblock_of(n, idx);
+    if matches!(block, Block::None) {
+        return;
+    }
+    thread::clear_pblock_ready(n, idx);
+    let frame = thread::frame_ptr(n, idx);
     let r: i64 = match block {
         Block::None => return,
         Block::Wait { wstatus_va, want } => match find_zombie_child(n, want) {
@@ -958,16 +1040,14 @@ fn write_poll_result(n: usize, fds_va: u64, nfds: usize) -> i64 {
 
 /// Park `cur` until `deadline_ns` (cell clock domain) - `nanosleep`.
 pub fn block_timer(cur: usize, deadline_ns: u64) -> Ctl {
-    procs()[cur].state = PState::Blocked;
-    procs()[cur].block = Block::Timer { deadline_ns };
-    reschedule(cur)
+    thread::set_current_pblock(cur, Block::Timer { deadline_ns });
+    park_or_switch(cur)
 }
 
 /// Park `cur` on an empty console read - blocking `stdin`.
 pub fn block_console(cur: usize, buf_va: u64, count: u64) -> Ctl {
-    procs()[cur].state = PState::Blocked;
-    procs()[cur].block = Block::Console { buf_va, count };
-    reschedule(cur)
+    thread::set_current_pblock(cur, Block::Console { buf_va, count });
+    park_or_switch(cur)
 }
 
 /// Copy `cur`'s `poll` request set into kernel state and park on it. `None` if the
@@ -994,14 +1074,16 @@ pub unsafe fn block_poll(cur: usize, fds_va: u64, nfds: usize, deadline_ns: u64)
     if sources & (crate::idle::WAITABLE | crate::idle::PEER) == 0 {
         return None;
     }
-    procs()[cur].state = PState::Blocked;
-    procs()[cur].block = Block::Poll {
-        fds_va,
-        nfds,
-        deadline_ns,
-        sources,
-    };
-    Some(reschedule(cur))
+    thread::set_current_pblock(
+        cur,
+        Block::Poll {
+            fds_va,
+            nfds,
+            deadline_ns,
+            sources,
+        },
+    );
+    Some(park_or_switch(cur))
 }
 
 /// Park `cur` on an epoll instance. `None` when no watched descriptor has a wake
@@ -1022,15 +1104,17 @@ pub fn block_epoll(
     if sources & (crate::idle::WAITABLE | crate::idle::PEER) == 0 {
         return None;
     }
-    procs()[cur].state = PState::Blocked;
-    procs()[cur].block = Block::Epoll {
-        epfd,
-        events_va,
-        maxevents,
-        deadline_ns,
-        sources,
-    };
-    Some(reschedule(cur))
+    thread::set_current_pblock(
+        cur,
+        Block::Epoll {
+            epfd,
+            events_va,
+            maxevents,
+            deadline_ns,
+            sources,
+        },
+    );
+    Some(park_or_switch(cur))
 }
 
 /// The wake sources cell `cur`'s copied poll set can be woken by.
