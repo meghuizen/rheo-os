@@ -617,6 +617,25 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   plumbs the real `NodeId` from `posix::Metadata` through a widened `abi::Stat.ino` into
   every Linux `st_ino`/`stx_ino`; the `linuxdyn` multi-library phase is the two-instance
   proof, verified failing when the inode is reverted to a constant.
+- **A mechanism-witness assertion must gate on what is load-invariant, not on which of
+  several correct paths happened to run.** `linuxthreads`'s `condwait` phase asserted
+  that a `pthread_cond_timedwait` timeout registered a deadline with the kernel timer
+  arbiter (`registrations(FutexWait) > 0`). True in isolation and in a lightly-loaded
+  matrix; wrongly **red** under a heavier parallel matrix (task #162), because a futex
+  whose deadline is *already elapsed* when the syscall runs returns `-ETIMEDOUT`
+  immediately without ever arming the arbiter - a second, equally correct path - and
+  under load the cell clock routinely passes a short deadline before the syscall is
+  serviced. The assertion conflated "the timeout was honoured against a real deadline"
+  (the property) with "a future deadline was registered" (one of two ways to honour it).
+  Measured, the split is wild and timing-dependent: x86_64 registered 75, aarch64 86,
+  riscv64 registered 0 and took the immediate path once - all the *same* run's two
+  waits. The lesson: when an assertion witnesses a mechanism that has more than one
+  correct realization, gate on the **invariant floor of their sum** (`registrations +
+  immediate_timeouts >= 1`, the first wait always reaching the kernel deadline path) and
+  report the split as a diagnostic - never require a particular branch that timing can
+  legitimately steer away from. The behavioural proof (exact transcript + exit 0 +
+  `deadlock_waits() == 0`) is what actually excludes the ignored-timeout bug; the counter
+  is the bonus witness, and a bonus witness must not be stricter than the invariant.
 
 ## 12. Never dereference an address the caller chose
 

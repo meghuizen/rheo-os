@@ -163,7 +163,10 @@ pub fn init_cell(cell: usize) {
 /// Clear every cell's thread table (called from `linux::reset`).
 pub fn reset() {
     // SAFETY: single CPU, between runs.
-    unsafe { *addr_of_mut!(DEADLOCK_WAITS) = 0 };
+    unsafe {
+        *addr_of_mut!(DEADLOCK_WAITS) = 0;
+        *addr_of_mut!(IMMEDIATE_TIMEOUTS) = 0;
+    }
     for cell in 0..MAX_CELLS {
         for th in threads(cell).iter_mut() {
             *th = Thread::new();
@@ -405,7 +408,17 @@ pub fn futex(cell: usize, uaddr: u64, op: u64, val: u32, timeout_va: u64) -> Ctl
             let deadline = match wait_deadline(cmd, op, timeout_va) {
                 Deadline::None => 0,
                 Deadline::At(d) => d,
-                Deadline::Passed => return Ctl::Ret((-ETIMEDOUT) as u64),
+                Deadline::Passed => {
+                    // Deadline already elapsed: honour the timeout immediately. This
+                    // registers no arbiter deadline, so it is counted separately as
+                    // evidence the timeout was honoured this way (task #162).
+                    // SAFETY: single CPU, synchronous trap.
+                    unsafe {
+                        let p = addr_of_mut!(IMMEDIATE_TIMEOUTS);
+                        *p = (*p).wrapping_add(1);
+                    }
+                    return Ctl::Ret((-ETIMEDOUT) as u64);
+                }
             };
             let ci = cur_thread(cell);
             threads(cell)[ci].state = TState::Blocked;
@@ -597,6 +610,23 @@ pub fn deadlock_waits() -> u64 {
 }
 
 static mut DEADLOCK_WAITS: u64 = 0;
+
+/// Futex waits whose deadline was **already in the past** when the syscall ran, so
+/// `-ETIMEDOUT` was returned immediately without ever parking on the timer arbiter
+/// ([`futex`]'s `Deadline::Passed` fast path).
+///
+/// This is a genuine, correct honouring of the timeout - not the ignored-timeout
+/// bug - but it registers no arbiter deadline, so a test asserting "the timeout was
+/// honoured by a real deadline mechanism" must accept **either** this counter or the
+/// arbiter's `FutexWait` registrations. It is reachable whenever the cell's clock
+/// advances past a short deadline before the futex syscall is serviced, which under
+/// heavy parallel test load is routine (docs/ENGINEERING.md 1, task #162).
+pub fn immediate_timeouts() -> u64 {
+    // SAFETY: single CPU.
+    unsafe { *addr_of_mut!(IMMEDIATE_TIMEOUTS) }
+}
+
+static mut IMMEDIATE_TIMEOUTS: u64 = 0;
 
 /// Move up to `max` contexts parked on `uaddr` back to ready, setting each one's
 /// futex return value to 0. Returns the number woken.

@@ -125,21 +125,38 @@ extern "C" fn kernel_main() -> ! {
         }
         Outcome::Faulted(addr) => panic!("condwait faulted at {addr:#x}"),
     }
-    // Both waits must have gone through the arbiter's futex slot - evidence the
-    // deadline was a registered deadline, not a spin that happened to end.
+    // The kernel's futex-timeout mechanism must have been exercised - the wait was
+    // honoured against a **real deadline**, one of exactly two correct outcomes,
+    // never the ignored-timeout bug (which would hang to the boot timeout). Either
+    // the deadline was in the future and the wait parked on the arbiter's futex slot
+    // (a registered deadline), OR it was already in the past when the syscall ran and
+    // `-ETIMEDOUT` was returned immediately (`immediate_timeouts`).
+    //
+    // The floor is **1**, not 2, and which of the two counters carries it is not
+    // load-invariant (task #162). The *first* wait always reaches the kernel deadline
+    // path: modern glibc passes the absolute deadline straight to FUTEX_WAIT_BITSET
+    // with no userspace pre-check, and `cur == val` on a never-signalled condvar, so
+    // it blocks (register) or its deadline has already elapsed (immediate). The
+    // *second* wait may instead time out in glibc's own recheck after a kernel EAGAIN
+    // (the condvar's internal word changed), contributing nothing - so requiring 2,
+    // or requiring `regs > 0` specifically, was wrongly red under parallel load. What
+    // the bug cannot produce, and this does, is at least one deadline-honoured return
+    // plus the exact-transcript/exit-0/`deadlock_waits() == 0` evidence below.
     let regs = ktimer::registrations(ktimer::TimerClient::FutexWait);
+    let immediate = kernel::linux::thread::immediate_timeouts();
     assert!(
-        regs > 0,
-        "condwait timed out without ever registering a futex deadline with the timer \
-         arbiter - the wait was not honoured the way it claims to be"
+        regs + immediate >= 1,
+        "condwait timed out with no deadline honoured by the kernel futex mechanism \
+         ({regs} arbiter registrations + {immediate} already-elapsed immediates) - \
+         the wait was not honoured the way it claims to be"
     );
     let parks = ktimer::parks() - parks_before;
     println!(
         "linuxthreads: futex timeout OK - two pthread_cond_timedwait waits on a \
          never-signalled condvar returned ETIMEDOUT no earlier than their own \
-         deadlines ({regs} arbiter futex deadlines, {parks} genuine CPU halts; \
-         0 halts means this ISA has no wired one-shot and the deadline was honoured \
-         by comparison)"
+         deadlines ({regs} arbiter futex deadlines + {immediate} already-elapsed \
+         immediates, {parks} genuine CPU halts; an already-elapsed deadline honours \
+         the timeout immediately without parking, routine under parallel load)"
     );
     assert!(
         kernel::linux::thread::deadlock_waits() == 0,
