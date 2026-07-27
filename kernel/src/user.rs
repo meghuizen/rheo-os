@@ -706,8 +706,12 @@ pub fn unmap_range(va: usize, len: usize) -> usize {
 /// (docs/LINUX-COMPAT.md L4) - glibc reserves large `PROT_NONE` regions
 /// (per-thread malloc arenas, thread-stack guards) and commits sub-ranges as it
 /// grows, so eager backing on `mmap` would exhaust the frame pool.
-/// Returns `false` (having committed nothing new) when the range is outside the
-/// cell's user VA range or its frame budget cannot cover the uncommitted pages.
+/// Returns `false` when the range is outside the cell's user VA range or the
+/// cell's frame budget cannot cover the uncommitted pages. A budget refusal
+/// commits nothing; if the pool runs out *mid-range* (only reachable past the
+/// kernel reserve) the pages already committed **stay** committed and only the
+/// charge is trued up - unlike a fresh `mmap`, a reprotect cannot be rolled back
+/// without discarding page contents the cell already had (docs/ENGINEERING.md 12).
 pub fn commit_range(va: usize, len: usize, perm: MapPerm) -> bool {
     if len == 0 {
         return true;

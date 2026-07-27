@@ -336,7 +336,12 @@ Three consequences worth separating, because each needs its own kind of check:
   ARCHITECTURE.md 5 forbids an OOM killer; an OOM **panic** is strictly worse.
   Allocation on a path a cell can drive must be *refusable*, must be charged
   against a per-cell limit, and must leave a global reserve the kernel's own
-  allocations draw from. A partial failure rolls back.
+  allocations draw from. Where a partial result is meaningless the failure rolls
+  back (a fresh `mmap` frees what it took and returns 0); where it is not, say so
+  - a `mprotect` that commits some pages and then cannot commit the rest keeps
+  them, because reversing a *reprotect* would discard page contents the cell
+  already had. Both behaviours are fine; leaving which one applies unstated is
+  not.
 - **A cell-supplied address that names a resource** needs an *ownership* check,
   not just a range check. `SYS_MUNMAP` freed whatever the page tables gave back;
   three frame sets in a cell's address space are not its own (a shared channel
@@ -364,6 +369,11 @@ capability minted into the peer carries READ and not MAP.
   number-to-pointer-argument map over dozens of handlers is exactly what let this
   go unchecked; the Linux personality is bounded at its single dispatch point.
 - Where a length is itself an argument, use it: that bounds the array walk too.
+- A **NUL-terminated** argument is the one shape whose length the caller never
+  states, so the entry check can only bound its first byte. The scan for the
+  terminator must carry its own bound - how much of the cell's range remains at
+  that pointer - or a string placed at the top of the range walks the scan into
+  the kernel half. Same for a NULL-terminated *pointer* array (`execve`'s argv).
 - Prove it from an unprivileged cell, against evidence the cell cannot fake - a
   canary word in memory it has no mapping for, a frame-pool count, a resource
   that still works after the refusal - and prove the legitimate path still works
