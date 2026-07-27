@@ -335,6 +335,13 @@ pub fn mmap(
 /// paging changes *when* a page is paid for, never *whether*.
 pub fn fault(st: &mut LinuxState, addr: usize) -> bool {
     let page = addr & !(FRAME_SIZE - 1);
+    // (0) A **copy-on-write** write, asked before anything else and answered from the
+    // page table rather than from the VMA list. That is deliberate: a fork shares the
+    // stack and the `brk` heap too, and neither has a VMA record, so a COW test that
+    // went through `st.vmas` would refuse the first stack write after every fork.
+    if user::with_current_aspace(|aspace| aspace.cow_fault(page)) {
+        return true;
+    }
     let Some(m) = st.vmas.find(page) else {
         return false; // (1) nothing mapped here
     };

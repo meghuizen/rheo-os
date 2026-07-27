@@ -32,6 +32,28 @@ pub const POOL_FRAMES: usize = 131072;
 static mut BITMAP: [u64; POOL_FRAMES / 64] = [0; POOL_FRAMES / 64];
 static mut NEXT_HINT: usize = 0;
 static mut INITIALIZED: bool = false;
+
+/// How many mappings hold each allocated frame, for **copy-on-write `fork`**
+/// (docs/ARCHITECTURE-DEBT.md 4.0, blocker 2). One byte per frame = 128 KiB of
+/// static, which buys a `share`/`free` pair simple enough to reason about; a
+/// bitmap-plus-overflow-table would save 112 KiB and cost that.
+///
+/// Zero for a free frame, 1 for the normal case, higher only while a COW `fork`
+/// has the frame mapped read-only in more than one address space. **`free` is a
+/// decrement**, which is the property that lets every pre-existing caller stay
+/// unchanged: with no sharing a decrement from 1 releases the frame exactly as
+/// the old unconditional free did.
+///
+/// [`SHARE_MAX`] is the ceiling. It cannot be reached by `fork` alone (a fork adds
+/// one reference and `MAX_CELLS` is 16), but a saturating count that silently
+/// stopped counting would leak a frame forever, so the share is **refused** at the
+/// ceiling and the caller copies instead.
+static mut REFS: [u8; POOL_FRAMES] = [0; POOL_FRAMES];
+
+/// The most mappings one frame may be shared by. `MAX_CELLS` is 16, so a chain of
+/// forks cannot exceed it; the check exists so that if something ever could, the
+/// answer is a copy rather than a lost count.
+pub const SHARE_MAX: u8 = u8::MAX;
 /// Frames currently allocated. Kept incrementally so [`stats`] - and therefore
 /// [`user_available`], which every cell-driven allocation consults - is O(1)
 /// rather than a 512-word popcount of the bitmap. The bitmap stays the source of
@@ -101,6 +123,7 @@ pub fn alloc() -> Option<usize> {
             let (word, bit) = (frame / 64, frame % 64);
             if bitmap[word] & (1 << bit) == 0 {
                 bitmap[word] |= 1 << bit;
+                (*core::ptr::addr_of_mut!(REFS))[frame] = 1;
                 *core::ptr::addr_of_mut!(USED) += 1;
                 *core::ptr::addr_of_mut!(NEXT_HINT) = frame + 1;
                 let pa = arch::FRAME_POOL_BASE + frame * FRAME_SIZE;
@@ -159,8 +182,47 @@ pub fn free_if_pool(pa: usize) -> bool {
     true
 }
 
-/// Return a frame to the pool. `pa` must be a pool frame (see [`free_if_pool`]
-/// for the path that cannot promise that).
+/// Take an extra reference to an already-allocated frame, so it survives until
+/// every holder has [`free`]d it. Returns false - and takes no reference - if `pa`
+/// is not a live pool frame or the count is at [`SHARE_MAX`]; the caller must then
+/// copy the page instead of sharing it.
+///
+/// This is the COW `fork` primitive: the parent's pages are mapped read-only into
+/// the child and shared rather than copied (docs/ARCHITECTURE-DEBT.md 4.0).
+pub fn share(pa: usize) -> bool {
+    if !in_pool(pa) {
+        return false;
+    }
+    let frame = (pa - arch::FRAME_POOL_BASE) / FRAME_SIZE;
+    // SAFETY: single CPU, synchronous traps.
+    unsafe {
+        let refs = &mut *core::ptr::addr_of_mut!(REFS);
+        if refs[frame] == 0 || refs[frame] == SHARE_MAX {
+            return false;
+        }
+        refs[frame] += 1;
+    }
+    true
+}
+
+/// How many mappings hold `pa`, or 0 if it is free or not ours. The witness a test
+/// asserts against, and what a COW fault consults to decide between "copy this
+/// page" and "it is mine alone, just make it writable".
+pub fn refs(pa: usize) -> u8 {
+    if !in_pool(pa) {
+        return 0;
+    }
+    let frame = (pa - arch::FRAME_POOL_BASE) / FRAME_SIZE;
+    // SAFETY: single CPU.
+    unsafe { (*core::ptr::addr_of!(REFS))[frame] }
+}
+
+/// Drop one reference to a frame, releasing it to the pool at zero. `pa` must be a
+/// pool frame (see [`free_if_pool`] for the path that cannot promise that).
+///
+/// A decrement rather than an unconditional release, so that every caller written
+/// before COW existed still reads correctly: with no sharing the count is 1 and this
+/// releases, exactly as before.
 pub fn free(pa: usize) {
     assert!(in_pool(pa), "frames::free of a non-pool address {pa:#x}");
     let offset = pa - arch::FRAME_POOL_BASE;
@@ -168,6 +230,14 @@ pub fn free(pa: usize) {
     unsafe {
         let bitmap = &mut *core::ptr::addr_of_mut!(BITMAP);
         assert!(bitmap[frame / 64] & (1 << (frame % 64)) != 0, "double free");
+        let refs = &mut *core::ptr::addr_of_mut!(REFS);
+        // A live frame always has at least one reference; a zero here would mean the
+        // bitmap and the counts disagreed, so treat it as the last reference rather
+        // than wrapping.
+        refs[frame] = refs[frame].saturating_sub(1);
+        if refs[frame] != 0 {
+            return; // still held by another mapping
+        }
         bitmap[frame / 64] &= !(1 << (frame % 64));
         *core::ptr::addr_of_mut!(USED) -= 1;
     }

@@ -1225,6 +1225,7 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         ("stackx.c", "stackx", &["-Wl,-z,stack-size=12582912"]),
         ("sysx.c", "sysx", NO_EXTRA),
         ("mmapdp.c", "mmapdp", NO_EXTRA),
+        ("cowfork.c", "cowfork", NO_EXTRA),
     ] {
         let mut sc = Command::new(cc);
         sc.arg("-static").arg("-no-pie");

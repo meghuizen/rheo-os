@@ -38,6 +38,11 @@ const PTE_U: u64 = 1 << 4;
 const PTE_G: u64 = 1 << 5;
 const PTE_A: u64 = 1 << 6;
 const PTE_D: u64 = 1 << 7;
+/// Sv39 reserves bits 8-9 (`RSW`) for software. Bit 8 marks a page a
+/// **copy-on-write** page: it was writable, `fork` cleared the write bit, and the
+/// next write must private it rather than fault the process
+/// (docs/ARCHITECTURE-DEBT.md 4.0, blocker 2). The hardware ignores it.
+const PTE_COW: u64 = 1 << 8;
 
 const PAGE_SIZE: usize = 4096;
 const GIB: usize = 1 << 30;
@@ -190,6 +195,74 @@ fn leaf(root: &PagingRoot, va: usize) -> Option<(usize, usize)> {
         return None;
     }
     Some((pte_to_table(e), (va >> 12) & 0x1FF))
+}
+
+/// Clear the write bit on every **writable** user leaf and mark it copy-on-write,
+/// returning how many were changed - the `fork` half of COW
+/// (docs/ARCHITECTURE-DEBT.md 4.0, blocker 2). The caller re-activates the root to
+/// flush, and [`paging_cow_at`] recognises the pages afterwards.
+///
+/// Written here rather than as a loop over `paging_protect` in portable code because
+/// it rewrites the very leaf entries a walk would be iterating over, and because a
+/// software PTE bit is not something `MapPerm` can express.
+pub fn paging_cow_protect_user(root: &mut PagingRoot) -> usize {
+    let mut n = 0usize;
+    for_each_user_leaf_slot(root, &mut |e: &mut u64| {
+        if *e & PTE_W != 0 {
+            *e = (*e & !PTE_W) | PTE_COW;
+            n += 1;
+        }
+    });
+    n
+}
+
+/// The frame behind `va` if its leaf is marked copy-on-write, else `None` - asked by
+/// the page-fault handler to tell "this write must private a shared page" from "this
+/// write is genuinely refused".
+pub fn paging_cow_at(root: &PagingRoot, va: usize) -> Option<usize> {
+    let (l0_pa, idx) = leaf(root, va)?;
+    let e = table_mut(l0_pa)[idx];
+    if e & PTE_V == 0 || e & PTE_COW == 0 {
+        return None;
+    }
+    Some(pte_to_table(e))
+}
+
+/// Resolve a copy-on-write page: clear the COW mark, restore write access, and
+/// repoint the leaf at `new_pa` when the page had to be copied (`None` keeps the
+/// frame - the case where this mapping turned out to be the only holder). The caller
+/// re-activates the root to flush the stale read-only entry.
+pub fn paging_cow_clear(root: &mut PagingRoot, va: usize, new_pa: Option<usize>) {
+    let Some((l0_pa, idx)) = leaf(root, va) else {
+        return;
+    };
+    let l0 = table_mut(l0_pa);
+    let e = l0[idx];
+    let pa = new_pa.unwrap_or_else(|| pte_to_table(e));
+    l0[idx] = table_to_pte(pa, (e & 0x3FF & !PTE_COW) | PTE_W);
+}
+
+/// Invoke `f` on every mapped 4 KiB **user** leaf entry of `root`, by mutable
+/// reference so the callback may rewrite it in place. Kept private: handing out a
+/// raw PTE is a paging-internal thing, and the portable callers want
+/// [`paging_for_each_user_leaf`]'s decoded `(va, pa, perm)` instead.
+fn for_each_user_leaf_slot(root: &mut PagingRoot, f: &mut dyn FnMut(&mut u64)) {
+    for &e2 in table_mut(root.l2_pa).iter() {
+        if e2 & PTE_V == 0 || e2 & (PTE_R | PTE_W | PTE_X) != 0 {
+            continue;
+        }
+        for &e1 in table_mut(pte_to_table(e2)).iter() {
+            if e1 & PTE_V == 0 || e1 & (PTE_R | PTE_W | PTE_X) != 0 {
+                continue;
+            }
+            for e0 in table_mut(pte_to_table(e1)).iter_mut() {
+                if *e0 & PTE_V == 0 || *e0 & PTE_U == 0 {
+                    continue;
+                }
+                f(e0);
+            }
+        }
+    }
 }
 
 /// Invoke `f(va, pa, perm)` for every mapped 4 KiB **user** leaf (U bit set) in

@@ -640,6 +640,14 @@ fn deliver_or_signal(
 /// # Safety
 /// `frame` is the target context's saved state and the cell root is active, so
 /// the user stack it selects is writable.
+/// Stack bytes to make writable below the chosen SP before building a signal frame.
+///
+/// A bound rather than an exact size on purpose: the frame's layout is per-ISA
+/// (`arch::setup_rt_frame`), x86-64's is the largest (siginfo + ucontext + a 512-byte
+/// FP area), and 8 KiB covers every ISA with room. Over-resolving costs at most one
+/// extra copy-on-write break on the very stack the handler is about to run on.
+const SIGFRAME_SPAN: u64 = 8192;
+
 unsafe fn build_frame(
     cell: usize,
     idx: usize,
@@ -668,6 +676,19 @@ unsafe fn build_frame(
     } else {
         arch::user_sp(frame)
     };
+
+    // `arch::setup_rt_frame` writes the `rt_sigframe` straight onto the user stack, so
+    // that span has to be **writable** before it does - and after a copy-on-write
+    // `fork` a present stack page can still be read-only, which makes the kernel's
+    // store an unresumable fault at a kernel PC. Resolving it here keeps the per-ISA
+    // frame builders free of mapping concerns (docs/ENGINEERING.md 11).
+    let lo = stack_top.saturating_sub(SIGFRAME_SPAN);
+    if crate::uaccess::buf_mut(lo, SIGFRAME_SPAN as usize).is_none() {
+        crate::println!(
+            "linux: no writable stack at {lo:#x} for a signal {signo} frame - not delivering"
+        );
+        return;
+    }
 
     let spec = SigFrameSpec {
         signo,

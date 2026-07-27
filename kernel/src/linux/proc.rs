@@ -296,9 +296,13 @@ pub fn fork(cur: usize, parent_frame: *mut TrapFrame) -> i64 {
         return -EAGAIN;
     };
 
-    // Eager-copy the parent's committed pages into a fresh address space.
-    // SAFETY: the parent is the running cell; its address space pointer is valid.
-    let parent_aspace = unsafe { &*user::cell_aspace(cur) };
+    // Share the parent's committed pages copy-on-write into a fresh address space, so
+    // a fork costs page tables and not the resident set (docs/ARCHITECTURE-DEBT.md 4.0,
+    // blocker 2). `&mut` because the *parent* is write-protected too - the half that
+    // produces wrong values rather than a fault when it is missing.
+    // SAFETY: the parent is the running cell; its address space pointer is valid, and
+    // it is the active address space, which is what lets `fork_from` flush its TLB.
+    let parent_aspace = unsafe { &mut *user::cell_aspace_mut(cur) };
     let child_aspace = parent_aspace.fork_from((child as u16) + 32);
     // SAFETY: single CPU; ASPACE[child] is free (the slot was Free).
     unsafe { (*addr_of_mut!(ASPACE))[child].write(child_aspace) };
@@ -462,7 +466,9 @@ fn copy_str_array(arr_va: u64, out: &mut [&'static [u8]; EXEC_PTR_MAX], off: &mu
     unsafe {
         let base = addr_of_mut!(EXEC_STR) as *mut u8;
         for (i, slot) in out.iter_mut().enumerate() {
-            let p = (arr_va as *const u64).add(i).read();
+            let Some(p) = crate::uaccess::read::<u64>(arr_va + (i as u64) * 8) else {
+                break;
+            };
             if p == 0 {
                 break;
             }
@@ -517,8 +523,13 @@ pub fn wait4(cur: usize, upid: i64, wstatus_va: u64, options: u64) -> Ctl {
 fn reap(z: usize, wstatus_va: u64) -> u32 {
     let pid = procs()[z].pid;
     if wstatus_va != 0 {
-        // SAFETY: `wstatus_va` is a writable `int` in the active cell.
-        unsafe { (wstatus_va as *mut i32).write(procs()[z].wstatus as i32) };
+        // Through `uaccess`, not a raw store: the parent's stack is copy-on-write
+        // after a fork, so a present page here can still be read-only and a kernel
+        // store to it faults at a kernel PC (docs/ENGINEERING.md 11). A refusal loses
+        // the status rather than the machine, and `wait4` still reaps.
+        if !crate::uaccess::write(wstatus_va, procs()[z].wstatus as i32) {
+            crate::println!("linux: wait4 could not store the status at {wstatus_va:#x}");
+        }
     }
     procs()[z] = Proc::free();
     user::free_cell(z);
@@ -900,12 +911,10 @@ fn write_poll_result(n: usize, fds_va: u64, nfds: usize) -> i64 {
         } else {
             super::poll_revents(&st.fds, r.fd as i64, r.events)
         };
-        // SAFETY: the array was bounded to `nfds` entries in this cell's user VA
-        // range when the block was registered, and that space is active again.
-        unsafe {
-            let p = (fds_va as *mut i16).add(k * 4 + 3);
-            p.write(revents);
-        }
+        // `revents` sits at an odd 2-byte offset in the caller's `pollfd`, so the
+        // write is unaligned by the ABI's own layout - and it goes through `uaccess`,
+        // which resolves the page's writability (the array may be COW after a fork).
+        crate::uaccess::write_unaligned::<i16>(fds_va + (k as u64) * 8 + 6, revents);
         if revents != 0 {
             ready += 1;
         }
@@ -948,14 +957,11 @@ pub unsafe fn block_poll(cur: usize, fds_va: u64, nfds: usize, deadline_ns: u64)
     }
     let set = pollset(cur);
     for (k, slot) in set.iter_mut().enumerate().take(nfds) {
-        // SAFETY: the array was bounded to `nfds` 8-byte entries in the active cell.
-        unsafe {
-            let p = (fds_va as *const i32).add(k * 2);
-            *slot = PollReq {
-                fd: p.read(),
-                events: (fds_va as *const i16).add(k * 4 + 2).read(),
-            };
-        }
+        let base = fds_va + (k as u64) * 8;
+        *slot = PollReq {
+            fd: crate::uaccess::read_unaligned::<i32>(base).unwrap_or(-1),
+            events: crate::uaccess::read_unaligned::<i16>(base + 4).unwrap_or(0),
+        };
     }
     let sources = poll_sources(cur, nfds, deadline_ns);
     if sources & (crate::idle::WAITABLE | crate::idle::PEER) == 0 {

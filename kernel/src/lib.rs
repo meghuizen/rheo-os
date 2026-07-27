@@ -45,5 +45,6 @@ pub mod sched;
 pub mod smp;
 pub mod svc;
 pub mod time;
+pub mod uaccess;
 pub mod user;
 pub mod user_progs;

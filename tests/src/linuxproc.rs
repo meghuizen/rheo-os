@@ -50,6 +50,7 @@ static YIELDX: &[u8] = fixture::linux!("yieldx");
 static STACKX: &[u8] = fixture::linux!("stackx");
 static SYSX: &[u8] = fixture::linux!("sysx");
 static MMAPDP: &[u8] = fixture::linux!("mmapdp");
+static COWFORK: &[u8] = fixture::linux!("cowfork");
 static COREUTILS: &[u8] = fixture::linux!("cu/bin/coreutils");
 
 // -- stdout capture, wired to the Linux personality's stdout tap --
@@ -487,6 +488,63 @@ extern "C" fn kernel_main() -> ! {
          of a filled page cost nothing, a page still fills from the file after a \
          forked sharer exited (the fork takes a backing-store reference and the exit \
          gives it back), and the mapping outlived close(fd) then returned its handle"
+    );
+
+    // --- a fork must share pages, not copy them (docs/ARCHITECTURE-DEBT.md 4.0,
+    // blocker 2). The fixture proves the *semantics* - three isolation properties
+    // that each catch a different mistake, including the parent-write-protect half
+    // that produces wrong values rather than a fault. The oracle here is the
+    // *saving*: how many frames the pool lost across a fork of a process holding a
+    // 1 MiB dirty heap. An eager fork paid for all of it.
+    let cow_before = kernel::mm::cow_faults();
+    let fork_before = kernel::mm::fork_pages();
+    let fork_frames_before = kernel::mm::fork_frames();
+    let want_cow: &[u8] = b"cow: 256 pages dirtied\n\
+        cow: parent and child are isolated after a shared fork\n\
+        cowfork OK\n";
+    let (code, out) = run_capture(COWFORK, &[b"cowfork"]);
+    assert!(
+        out == want_cow,
+        "cowfork: stdout mismatch\n  got:      {:?}\n  expected: {:?}",
+        core::str::from_utf8(out),
+        core::str::from_utf8(want_cow),
+    );
+    assert!(code == 0, "cowfork: exit {code}, expected 0");
+    let cow_breaks = kernel::mm::cow_faults() - cow_before;
+    let (shared, copied) = {
+        let now = kernel::mm::fork_pages();
+        (now.0 - fork_before.0, now.1 - fork_before.1)
+    };
+    let fork_cost = kernel::mm::fork_frames() - fork_frames_before;
+    // The property, stated as the kernel measured it rather than as a pool delta:
+    // **every** page was shared and **none** copied. A pool delta around the whole
+    // run cannot say this - it also counts the fixture's 8 MiB stack and its heap, and
+    // the first version of this assertion reported 2431 frames for a fork that had in
+    // fact copied nothing at all (docs/ENGINEERING.md 11).
+    assert!(
+        copied == 0 && shared >= 256,
+        "cowfork: the fork shared {shared} page(s) and copied {copied} - it must share \
+         every page of a 256-page dirty heap and copy none"
+    );
+    // What the fork actually cost: the child's page tables, and nothing else. An eager
+    // fork of this process paid `shared` frames on top.
+    assert!(
+        fork_cost < shared / 8,
+        "cowfork: the fork consumed {fork_cost} frame(s) to share {shared} page(s) - \
+         that is not page tables, something is still copying"
+    );
+    // And the sharing was genuinely *broken* on write, rather than never established:
+    // both sides wrote, so their pages each had to be privated.
+    assert!(
+        cow_breaks >= 5,
+        "cowfork: only {cow_breaks} copy-on-write break(s) - the writes on both sides \
+         should each have privated a page"
+    );
+    println!(
+        "linuxproc: COW fork OK - the fork shared {shared} page(s), copied {copied}, \
+         and consumed {fork_cost} frame(s) of page tables; {cow_breaks} page(s) were \
+         privated on write and parent and child stayed isolated in both directions \
+         (an eager fork would have copied all {shared})"
     );
 
     // The pre-fault path's cost, measured rather than assumed (docs/ENGINEERING.md 1).

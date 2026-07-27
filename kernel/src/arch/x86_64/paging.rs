@@ -35,6 +35,11 @@ const G: u64 = 1 << 8; // global
 const PWT: u64 = 1 << 3; // page write-through
 const PCD: u64 = 1 << 4; // page cache disable (with PWT: PAT entry 3 = UC)
 const NX: u64 = 1 << 63; // no-execute
+/// x86-64 leaves bits 52-58 available to software. Bit 52 marks a
+/// **copy-on-write** page: it was writable, `fork` cleared RW, and the next write
+/// must private it rather than fault the process (docs/ARCHITECTURE-DEBT.md 4.0,
+/// blocker 2). The hardware ignores it.
+const COW: u64 = 1 << 52;
 
 const PAGE_SIZE: usize = 4096;
 const MIB2: usize = 2 << 20;
@@ -206,6 +211,74 @@ fn leaf(root: &PagingRoot, va: usize) -> Option<(usize, usize)> {
         return None; // unmapped, or a 2 MiB supervisor block (never user)
     }
     Some((next_table(e), pt_index(va)))
+}
+
+/// Clear RW on every **writable** user leaf and mark it copy-on-write, returning how
+/// many were changed - the `fork` half of COW (docs/ARCHITECTURE-DEBT.md 4.0, blocker
+/// 2). See the riscv64 twin for why this is per-ISA rather than a loop over
+/// `paging_protect` in portable code.
+pub fn paging_cow_protect_user(root: &mut PagingRoot) -> usize {
+    let mut n = 0usize;
+    for_each_user_leaf_slot(root, &mut |e: &mut u64| {
+        if *e & RW != 0 {
+            *e = (*e & !RW) | COW;
+            n += 1;
+        }
+    });
+    n
+}
+
+/// The frame behind `va` if its leaf is marked copy-on-write, else `None`.
+pub fn paging_cow_at(root: &PagingRoot, va: usize) -> Option<usize> {
+    let (pt_pa, idx) = leaf(root, va)?;
+    let e = table_mut(pt_pa)[idx];
+    if e & P == 0 || e & COW == 0 {
+        return None;
+    }
+    Some((e & 0x000F_FFFF_FFFF_F000) as usize)
+}
+
+/// Resolve a copy-on-write page: clear the mark, restore RW, and repoint the leaf at
+/// `new_pa` when the page had to be copied. The caller re-activates the root to flush.
+pub fn paging_cow_clear(root: &mut PagingRoot, va: usize, new_pa: Option<usize>) {
+    let Some((pt_pa, idx)) = leaf(root, va) else {
+        return;
+    };
+    let pt = table_mut(pt_pa);
+    let e = pt[idx];
+    let pa = new_pa.unwrap_or((e & 0x000F_FFFF_FFFF_F000) as usize);
+    // Keep the flag bits, drop COW, restore RW. A writable page is never executable
+    // here (W^X), so NX stays as `paging_protect`'s `UserRw` arm sets it.
+    let flags = (e & !0x000F_FFFF_FFFF_F000 & !COW) | RW | NX;
+    pt[idx] = (pa as u64) | flags;
+}
+
+/// Invoke `f` on every mapped 4 KiB user leaf entry of `root`, by mutable reference so
+/// the callback may rewrite it in place. Private for the same reason as the riscv64
+/// twin: a raw PTE is paging-internal.
+fn for_each_user_leaf_slot(root: &mut PagingRoot, f: &mut dyn FnMut(&mut u64)) {
+    let kva_i = pml4_index(KVA);
+    for (i4, &e4) in table_mut(root.pml4_pa).iter().enumerate() {
+        if i4 == kva_i || e4 & P == 0 {
+            continue;
+        }
+        for &e3 in table_mut(next_table(e4)).iter() {
+            if e3 & P == 0 {
+                continue;
+            }
+            for &e2 in table_mut(next_table(e3)).iter() {
+                if e2 & P == 0 || e2 & PS != 0 {
+                    continue;
+                }
+                for e1 in table_mut(next_table(e2)).iter_mut() {
+                    if *e1 & P == 0 || *e1 & US == 0 {
+                        continue;
+                    }
+                    f(e1);
+                }
+            }
+        }
+    }
 }
 
 /// Invoke `f(va, pa, perm)` for every mapped 4 KiB **user** leaf (US bit set) in
