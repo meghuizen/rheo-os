@@ -435,6 +435,20 @@ count; `write` is `-EINVAL`. The `timerx` fixture in `linuxpoll` proves it on
 **all three ISAs**: a blocking read parks on a 20 ms one-shot (exactly one
 expiration), epoll_wait wakes on a second, and the disarmed timer reads zero.
 
+**A real JavaScript engine runs on the OS** (GOAL-JS, docs/LINUX-COMPAT.md): the
+`jsdemo` fixture is the pure-Rust **`boa_engine`** crate (pinned in
+`tests/linux-fixtures/jsdemo/Cargo.lock`) - a complete JS runtime (lexer, parser,
+bytecode compiler, register VM, heap, GC) built static-glibc and run **unmodified**
+under the Linux personality by `linuxrun` on **all three ISAs**. It evaluates real
+JavaScript (a function, `Array.reduce`, an arrow closure, string concat) and prints
+`js: rheo:42` (exit 0), exercising the L2-L8 syscall surface and demand-paging a
+~9.5 MB image (~1580 pages recorded, ~18 frames at load - the loader scales). This
+is the on-goal proxy for Node/Claude Code: a genuine language runtime executing on
+rheo-os. It is **not** V8/libuv/Node itself (that ~100 MB binary is the remaining
+distance) - stated plainly, not overclaimed. The `libuv` event-loop core (epoll
+multiplexing timerfd + eventfd + pipe) is separately proven by `uvloop` in
+`linuxpoll`.
+
 **librheo** (`librheo/`, docs/LIBRHEO.md) is the greenfield **native userspace
 foundation library** - the role a libc plays, rebuilt for this kernel:
 async-first, capability-native, built ON `runtime/` (not a POSIX threading

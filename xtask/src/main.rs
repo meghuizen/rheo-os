@@ -1212,6 +1212,29 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         return false;
     }
 
+    // A real JavaScript engine (pure-Rust `boa`), same static-glibc recipe - the
+    // on-goal proxy for Node/Claude Code: a language runtime (parser + bytecode VM
+    // + heap + GC) run unmodified under the Linux personality (docs/LINUX-COMPAT.md,
+    // the `linuxjs` fixture in `linuxrun`). ~10 MB, so it also exercises the
+    // demand-paged loader at scale.
+    let mut js = Command::new("cargo");
+    js.args([
+        "build",
+        "--manifest-path",
+        "tests/linux-fixtures/jsdemo/Cargo.toml",
+        "--release",
+        "--target",
+        arch.linux_gnu_target(),
+    ]);
+    js.env("RUSTFLAGS", &rustflags);
+    if !matches!(js.status().map(|s| s.success()), Ok(true)) {
+        eprintln!(
+            "[xtask] boa JS-engine fixture build failed for {}",
+            arch.name()
+        );
+        return false;
+    }
+
     // C hello: gcc -static -no-pie, stock ET_EXEC base (no relink).
     let out_dir = format!("tests/linux-fixtures/build/{}", arch.name());
     if let Err(e) = std::fs::create_dir_all(&out_dir) {

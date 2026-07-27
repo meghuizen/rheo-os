@@ -981,6 +981,21 @@ fixup path.
   independently wait), and no `TFD_TIMER_CANCEL_ON_SET` - the cell clock does not
   step, so there is nothing to cancel on.
 
+- **A real JavaScript engine runs [done]** (GOAL-JS). The `jsdemo` fixture is a
+  pure-Rust JavaScript engine - the **`boa_engine`** crate (crates.io, pinned in
+  `tests/linux-fixtures/jsdemo/Cargo.lock`) - built static-glibc for each ISA and
+  run unmodified under the Linux personality by `linuxrun`. It is the on-goal
+  proxy for Node.js/Claude Code: a complete language runtime (lexer, parser,
+  bytecode compiler, register VM, heap, garbage collector) exercising the L2-L8
+  syscall surface and the demand-paged loader at scale (~9.5 MB image, ~1580
+  demand-paged pages, ~18 frames committed at load). It evaluates real JavaScript
+  - a function, `Array.prototype.reduce`, an arrow-function closure, string
+  concatenation - and prints `js: rheo:42` (exit 0) on **all three ISAs**. This is
+  not V8 and not Node's libuv loop; it is a genuine JS interpreter executing on
+  the OS, the strongest evidence to date that the personality carries a real
+  language runtime, and the honest step short of Node itself (whose V8 + libuv +
+  ~100 MB binary is the remaining distance).
+
 ## 6. Fixture build matrix (reproducibility)
 
 All Linux test binaries are built **from source** by xtask/CI - no binaries
