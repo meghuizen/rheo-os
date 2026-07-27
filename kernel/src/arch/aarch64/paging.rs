@@ -109,6 +109,9 @@ pub fn paging_map(root: &mut PagingRoot, va: usize, perm: MapPerm) {
         MapPerm::UserRo => (AP_RO_ALL, UXN | PXN),
         MapPerm::UserRw => (AP_RW_ALL, UXN | PXN),
         MapPerm::UserRx => (AP_RO_ALL, PXN), // EL0-executable (UXN clear)
+        // Writable AND EL0-executable: PXN keeps EL1 from executing it (the kernel
+        // must never run a cell's JIT output), UXN clear lets EL0.
+        MapPerm::UserRwx => (AP_RW_ALL, PXN),
     };
     l3[l3_index(va)] = addr_bits(va) | ATTR_NORMAL | SH_INNER | ap | AF | NG | xn | TABLE | VALID;
 }
@@ -137,6 +140,9 @@ pub fn paging_map_frame(root: &mut PagingRoot, va: usize, pa: usize, perm: MapPe
         MapPerm::UserRo => (AP_RO_ALL, UXN | PXN),
         MapPerm::UserRw => (AP_RW_ALL, UXN | PXN),
         MapPerm::UserRx => (AP_RO_ALL, PXN), // EL0-executable (UXN clear)
+        // Writable AND EL0-executable: PXN keeps EL1 from executing it (the kernel
+        // must never run a cell's JIT output), UXN clear lets EL0.
+        MapPerm::UserRwx => (AP_RW_ALL, PXN),
     };
     l3[l3_index(va)] = addr_bits(pa) | ATTR_NORMAL | SH_INNER | ap | AF | NG | xn | TABLE | VALID;
 }
@@ -310,6 +316,7 @@ pub fn paging_protect(root: &mut PagingRoot, va: usize, perm: MapPerm) {
             MapPerm::UserRo => (AP_RO_ALL, UXN | PXN),
             MapPerm::UserRw => (AP_RW_ALL, UXN | PXN),
             MapPerm::UserRx => (AP_RO_ALL, PXN),
+            MapPerm::UserRwx => (AP_RW_ALL, PXN),
         };
         l3[idx] = addr_bits(pa) | ATTR_NORMAL | SH_INNER | ap | AF | NG | xn | TABLE | VALID;
     }

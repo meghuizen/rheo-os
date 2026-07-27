@@ -104,20 +104,53 @@ pub fn reserve_stack(st: &mut LinuxState, base: usize, bytes: usize) {
         .insert(base, bytes, PROT_READ | PROT_WRITE, MAP_ANONYMOUS);
 }
 
-/// Map mmap `prot` bits onto a W^X `MapPerm`. PROT_EXEC without PROT_WRITE is
-/// executable-read; PROT_WRITE is read-write; anything else (PROT_READ,
-/// PROT_NONE) is read-only.
+/// Map mmap `prot` bits onto a `MapPerm`. PROT_EXEC without PROT_WRITE is
+/// executable-read; PROT_WRITE is read-write; both together is the
+/// capability-gated `UserRwx` (docs/ARCHITECTURE.md 5.1); anything else
+/// (PROT_READ, PROT_NONE) is read-only.
 ///
-/// Callers must reject `PROT_WRITE | PROT_EXEC` **before** calling this (see
-/// [`wx_refused`]): there is no RWX `MapPerm`, and this function would quietly
-/// return `UserRw`.
+/// Callers must have run [`wx_refused`] first, which is what verifies the calling
+/// cell's authority for the `UserRwx` case. This function only translates bits; it
+/// checks no capability, and a caller that skips the gate would get an RWX mapping
+/// - which is why the gate is a separate, loudly-named function that both call
+/// sites invoke on the line before.
 fn perm_from_prot(prot: u64) -> MapPerm {
     if prot & PROT_EXEC != 0 && prot & PROT_WRITE == 0 {
         MapPerm::UserRx
+    } else if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+        MapPerm::UserRwx
     } else if prot & PROT_WRITE != 0 {
         MapPerm::UserRw
     } else {
         MapPerm::UserRo
+    }
+}
+
+/// Whether the calling cell holds the **W^X exception authority**: a `MemoryGrant`
+/// capability carrying `RIGHT_WRITE | RIGHT_EXECUTE` (docs/ARCHITECTURE.md 5.1).
+///
+/// The `SYS_SPAWN` precedent exactly - "the caller must hold an `ObjectKind::Cell`
+/// capability with WRITE, no ambient authority" (docs/LIBRHEO.md Phase F) - applied
+/// to a different object and a different pair of rights. Nothing new is invented:
+/// "may hold memory that is simultaneously writable and executable" is already
+/// expressible in the rights vocabulary, and this reads it.
+///
+/// A cell with no capability table (a bare test cell) holds nothing, so it is
+/// refused: absence of a table is absence of authority, never a bypass.
+fn holds_wx_authority(cell: usize) -> bool {
+    let caps = user::cell_caps(cell);
+    let objs = user::cell_objects(cell);
+    if caps.is_null() || objs.is_null() {
+        return false;
+    }
+    // SAFETY: single CPU, synchronous trap; the cell's tables are uniquely owned for
+    // the duration of the trap, exactly as `nproc::spawn` reads them.
+    unsafe {
+        (*caps).holds(
+            &*objs,
+            crate::capability::ObjectKind::MemoryGrant,
+            crate::capability::WRITE | crate::capability::EXECUTE,
+        )
     }
 }
 
@@ -139,15 +172,28 @@ fn perm_from_prot(prot: u64) -> MapPerm {
 /// Whether to add a `UserRwx` variant is a **doctrine** question - it needs the
 /// ARCHITECTURE.md 6 admission pass, not a patch - and is deliberately left open.
 /// This only makes the current answer honest.
-fn wx_refused(prot: u64, what: &str) -> bool {
-    if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
-        crate::println!(
-            "linux: {what} PROT_WRITE|PROT_EXEC refused (W^X is structural; \
-             use mprotect RW then RX)"
-        );
-        return true;
+fn wx_refused(cell: usize, prot: u64, what: &str) -> bool {
+    if prot & PROT_WRITE == 0 || prot & PROT_EXEC == 0 {
+        return false;
     }
-    false
+    if holds_wx_authority(cell) {
+        // Granted, and said out loud once per call: a cell running with the W^X
+        // exception is the one thing about this kernel's memory model an operator
+        // would want to see in a log, and a silently-granted exception is
+        // indistinguishable from a missing check.
+        crate::println!(
+            "linux: {what} PROT_WRITE|PROT_EXEC granted - cell {cell} holds the W^X \
+             exception capability (MemoryGrant + WRITE|EXECUTE, \
+             docs/ARCHITECTURE.md 5.1)"
+        );
+        return false;
+    }
+    crate::println!(
+        "linux: {what} PROT_WRITE|PROT_EXEC refused - cell {cell} holds no W^X \
+         exception capability (MemoryGrant + WRITE|EXECUTE). W^X is the default; \
+         use mprotect RW then RX, or be granted the authority"
+    );
+    true
 }
 
 /// brk(addr): grow or shrink the heap. `brk(0)` (and any address below the
@@ -200,7 +246,7 @@ pub fn mmap(
     if len == 0 {
         return -EINVAL;
     }
-    if wx_refused(prot, "mmap") {
+    if wx_refused(user::current_index(), prot, "mmap") {
         return -EPERM;
     }
     let bytes = page_up(len as usize);
@@ -676,7 +722,7 @@ pub fn madvise(st: &mut LinuxState, addr: u64, len: u64, advice: u64) -> i64 {
 /// arena/stack growth path, docs/LINUX-COMPAT.md L4); PROT_NONE decommits the
 /// range, returning its frames to the pool.
 pub fn mprotect(st: &mut LinuxState, addr: u64, len: u64, prot: u64) -> i64 {
-    if wx_refused(prot, "mprotect") {
+    if wx_refused(user::current_index(), prot, "mprotect") {
         return -EPERM;
     }
     let base = (addr as usize) & !(FRAME_SIZE - 1);

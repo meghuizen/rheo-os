@@ -4,7 +4,7 @@
 //! The actual production `node` (v22, dynamic, ~124 MB, V8 + libuv) is streamed
 //! off a live ext4 disk (`ext4fs`/`ext4plus` + the block cache, GOAL-DISK-2b),
 //! demand-paged, and asked to evaluate JavaScript - touching nothing of Node's
-//! own code. `--jitless` runs V8's Ignition interpreter, needing no
+//! own code. **JIT enabled** - see the W^X note at the `prove` call - needing no
 //! writable-executable code page (W^X is structural, docs/ARCHITECTURE.md 5 - the
 //! one `mprotect(RWX)` V8 would issue is refused). Per-context blocking
 //! (docs/LINUX-COMPAT.md L4) lets its V8 + libuv threads coordinate, so it prints
@@ -30,7 +30,6 @@ extern "C" fn kernel_main() -> ! {
         "/bin/node",
         &[
             b"node",
-            b"--jitless",
             b"--no-expose-wasm",
             b"-e",
             b"console.log(\"rheo:\"+(40+2))",
@@ -61,5 +60,10 @@ extern "C" fn kernel_main() -> ! {
         // (docs/LINUX-COMPAT.md), and the deterministic `preempt` kernel - which
         // carries its own negative control - remains the proof that preemption works.
         false,
+        // The **W^X exception capability** (docs/ARCHITECTURE.md 5.1), so this
+        // runtime's JIT can map its code pages writable-and-executable. Every other
+        // kernel in the suite mints nothing of the sort and is refused exactly as
+        // before, which is what makes this a capability rather than a setting.
+        true,
     )
 }

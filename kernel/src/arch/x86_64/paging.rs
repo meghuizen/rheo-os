@@ -160,6 +160,8 @@ pub fn paging_map(root: &mut PagingRoot, va: usize, perm: MapPerm) {
         MapPerm::UserRo => P | US | NX,
         MapPerm::UserRw => P | RW | US | NX,
         MapPerm::UserRx => P | US, // read + execute, not writable
+        // Writable and executable: RW set, NX left clear.
+        MapPerm::UserRwx => P | US | RW,
     };
     pt[pt_index(va)] = addr_bits(super::virt_to_phys(va)) | bits;
 }
@@ -187,6 +189,8 @@ pub fn paging_map_frame(root: &mut PagingRoot, va: usize, pa: usize, perm: MapPe
         MapPerm::UserRo => P | US | NX,
         MapPerm::UserRw => P | RW | US | NX,
         MapPerm::UserRx => P | US, // read + execute, not writable
+        // Writable and executable: RW set, NX left clear.
+        MapPerm::UserRwx => P | US | RW,
     };
     pt[pt_index(va)] = addr_bits(pa) | bits;
 }
@@ -359,6 +363,7 @@ pub fn paging_protect(root: &mut PagingRoot, va: usize, perm: MapPerm) {
             MapPerm::UserRo => P | US | NX,
             MapPerm::UserRw => P | RW | US | NX,
             MapPerm::UserRx => P | US,
+            MapPerm::UserRwx => P | US | RW,
         };
         pt[idx] = pa | bits;
     }

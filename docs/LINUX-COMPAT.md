@@ -1137,7 +1137,15 @@ fixup path.
     entire observable effect: it produces no core dumps. JSC marks the 128 GiB
     Gigacage `MADV_DONTDUMP`, which is the sane thing to do with mostly-untouched
     address space.
-  - **V8's JIT reaches baseline compilation and dies at one call.** Running `node`
+  - **V8's JIT now runs**, through the capability-gated W^X exception
+    (docs/ARCHITECTURE.md 5.1): `linuxnode` mints a `MemoryGrant` capability carrying
+    `WRITE | EXECUTE` into the cell and runs the real `node` with **no `--jitless`**,
+    so V8 tiers up to Sparkplug, gets its writable-executable code page, evaluates and
+    exits 0. Every other kernel in the suite mints nothing of the sort and its RWX
+    request is refused `-EPERM` with a printed reason exactly as before. The trace
+    below is what forced that design and is kept as its evidence.
+  - **V8's JIT reaches baseline compilation and dies at one call** *without* the
+    capability. Running `node`
     *without* `--jitless` produces a V8 fatal whose native stack trace names the exact
     site: `Runtime_BytecodeBudgetInterrupt_Ignition` ->
     `BaselineBatchCompiler::CompileBatch` -> `Compiler::CompileBaseline` ->

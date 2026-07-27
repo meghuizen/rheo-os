@@ -29,9 +29,15 @@
 //! prediction is withdrawn rather than reattached to a later milestone
 //! (docs/ENGINEERING.md 1).
 //!
-//! `linuxnode`, which shares this harness, **does** complete under preemption - so
-//! the mechanism is exercised here by a runtime that finishes, not only by one that
-//! does not.
+//! **Its JIT is now enabled too, and that changed nothing either.** The cell holds
+//! the W^X exception capability (docs/ARCHITECTURE.md 5.1), so JavaScriptCore's RWX
+//! arena is granted - the `mmap` succeeds and is logged - and Bun still aborts at the
+//! same point with the same exit and the same empty output. Two independent
+//! explanations have now been tested and neither held.
+//!
+//! `linuxnode`, which shares this harness, **does** complete - with its JIT enabled,
+//! through the same capability - so the mechanism is exercised here by a runtime that
+//! finishes, not only by one that does not.
 //!
 //! **x86-64 only** (no arm64/riscv64 bun build - those skip-with-reason). The proof
 //! lives in the shared [`disk_runtime`] harness; this bin is the `bun`-specific
@@ -47,17 +53,13 @@ mod disk_runtime;
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    // `BUN_JSC_useJIT=0` disables every JSC JIT tier -> LLInt interpreter only,
-    // so no writable-executable code page is requested (host-verified: 0 RWX).
+    // JSC's JIT is left **enabled**: the cell holds the W^X exception capability
+    // (docs/ARCHITECTURE.md 5.1), so its 1 GiB RWX arena is grantable now.
     disk_runtime::prove(
         "linuxbun",
         "/bin/bun",
         &[b"bun", b"-e", b"console.log(\"rheo:\"+(40+2))"],
-        &[
-            b"BUN_JSC_useJIT=0",
-            b"LD_LIBRARY_PATH=/lib:/lib64",
-            b"PATH=/bin",
-        ],
+        &[b"LD_LIBRARY_PATH=/lib:/lib64", b"PATH=/bin"],
         b"rheo:42\n",
         // Bun aborts before evaluating, for a reason that is no longer attributed
         // (see the module docs: preemption landed, the worker now runs, and the
@@ -71,5 +73,10 @@ extern "C" fn kernel_main() -> ! {
         // differently, and widening an accepted partial to cover a second unexplained
         // failure would turn a bounded disclosure into a blanket one.
         false,
+        // The **W^X exception capability** (docs/ARCHITECTURE.md 5.1), so this
+        // runtime's JIT can map its code pages writable-and-executable. Every other
+        // kernel in the suite mints nothing of the sort and is refused exactly as
+        // before, which is what makes this a capability rather than a setting.
+        true,
     )
 }

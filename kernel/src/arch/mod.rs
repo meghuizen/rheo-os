@@ -48,6 +48,17 @@ pub enum MapPerm {
     UserRw,
     /// User read + execute, never writable.
     UserRx,
+    /// User read + write + execute - **the capability-gated W^X exception**
+    /// (docs/ARCHITECTURE.md 5.1).
+    ///
+    /// A fourth variant rather than a flag on `UserRw`, so no code path can produce
+    /// a writable-executable mapping by forgetting a check: producing one requires
+    /// naming this, and the only place that names it is the `mprotect`/`mmap` arm
+    /// that has already verified the calling cell holds a `MemoryGrant` capability
+    /// carrying `RIGHT_WRITE | RIGHT_EXECUTE`. Every `match` over `MapPerm` in the
+    /// tree had to be updated to add it, which is the point - an exhaustive match is
+    /// how the compiler makes a security-relevant addition impossible to miss.
+    UserRwx,
 }
 
 /// Why a U-mode context trapped back into the kernel.

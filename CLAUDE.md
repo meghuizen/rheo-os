@@ -521,8 +521,27 @@ than a capability not exercised, because it trains everyone to re-run a red test
 the deterministic `preempt` kernel, which carries its own negative control, remains the
 proof and does not depend on it.
 
-**V8's JIT reaches baseline compilation and dies at one named call.** Running `node`
-without `--jitless` fatals with a V8 native stack trace giving the exact site:
+**Node.js now runs with its JIT ENABLED** (docs/ARCHITECTURE.md 5.1). W^X was a hard
+invariant - `MapPerm` had three variants and no RWX - and it is now the **default with
+one capability-gated exception**: a cell may hold a writable-and-executable mapping
+only if it holds a `MemoryGrant` capability carrying `RIGHT_WRITE | RIGHT_EXECUTE`,
+which is exactly what "may hold memory that is simultaneously writable and executable"
+means in the rights vocabulary that already existed. No new right, no new object, and
+**no ambient authority** - the capability is minted by whoever launches the cell, a
+cell cannot widen its own, and it is epoch-revocable like any other. `MapPerm` gains a
+fourth variant `UserRwx` so no path can produce such a mapping by forgetting a check:
+it has to *name* it, and every `match` in the tree had to be updated, which is the
+point. `linuxnode` mints it and runs the real `node` with no `--jitless` at all: V8
+tiers up to Sparkplug, gets its code page, evaluates and exits 0. Every other kernel in
+the suite mints nothing of the sort and its RWX request is refused `-EPERM` with a
+printed reason, exactly as before - which is what makes this a capability rather than a
+setting, and the `security` kernel's W^X assertions pass unchanged. Both the grant and
+the refusal are logged, because a silently-granted exception is indistinguishable from
+a missing check.
+
+The measured trace that forced the design, kept because it is the evidence: running
+`node` without `--jitless` and *without* the capability fatals with a V8 native stack
+trace giving the exact site:
 `Runtime_BytecodeBudgetInterrupt_Ignition` -> `BaselineBatchCompiler::CompileBatch` ->
 `Compiler::CompileBaseline` -> `BaselineCompiler::Build` ->
 `Factory::CodeBuilder::BuildInternal` -> `MemoryAllocator::AllocatePage` ->
@@ -535,10 +554,10 @@ fatals on anything else, so our `-EPERM` (the errno a hardened Linux returns) gi
 hard abort instead of V8's own graceful path; returning `ENOMEM` to steer it somewhere
 nicer would be fabricating a reason, so it is not done. And unmodified Node 22 can use
 neither a W->X flip nor a dual mapping, because
-`v8_enable_write_protect_code_memory` is **compile-time** in this build - so JIT here
-needs a rebuilt V8 or a change to W^X, which ARCHITECTURE.md 6's admission rule
-reserves and docs/ARCHITECTURE-DEBT.md 4.0 already flags as "deliberately not
-decided".
+`v8_enable_write_protect_code_memory` is **compile-time** in this build - which is why
+the answer had to be an authority somebody is given rather than a redirection: the
+three options were never run a stock JIT, allow RWX for everyone, or make it a
+capability, and only the third keeps the property auditable.
 
 **timerfd is done** (docs/LINUX-COMPAT.md L8-TIMERFD, GOAL-TIMERFD):
 `timerfd_create`/`settime`/`gettime` - the **timer source of libuv**, and thus of

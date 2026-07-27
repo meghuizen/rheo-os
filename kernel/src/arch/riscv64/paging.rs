@@ -146,6 +146,7 @@ pub fn paging_map(root: &mut PagingRoot, va: usize, perm: MapPerm) {
         MapPerm::UserRo => PTE_R,
         MapPerm::UserRw => PTE_R | PTE_W,
         MapPerm::UserRx => PTE_R | PTE_X,
+        MapPerm::UserRwx => PTE_R | PTE_W | PTE_X,
     };
     let pa = super::virt_to_phys(va);
     l0[l0_idx] = table_to_pte(pa, PTE_V | PTE_U | PTE_A | PTE_D | rights);
@@ -174,6 +175,7 @@ pub fn paging_map_frame(root: &mut PagingRoot, va: usize, pa: usize, perm: MapPe
         MapPerm::UserRo => PTE_R,
         MapPerm::UserRw => PTE_R | PTE_W,
         MapPerm::UserRx => PTE_R | PTE_X,
+        MapPerm::UserRwx => PTE_R | PTE_W | PTE_X,
     };
     l0[(va >> 12) & 0x1FF] = table_to_pte(pa, PTE_V | PTE_U | PTE_A | PTE_D | rights);
 }
@@ -343,6 +345,7 @@ pub fn paging_protect(root: &mut PagingRoot, va: usize, perm: MapPerm) {
             MapPerm::UserRo => PTE_R,
             MapPerm::UserRw => PTE_R | PTE_W,
             MapPerm::UserRx => PTE_R | PTE_X,
+            MapPerm::UserRwx => PTE_R | PTE_W | PTE_X,
         };
         l0[idx] = table_to_pte(pa, PTE_V | PTE_U | PTE_A | PTE_D | rights);
     }

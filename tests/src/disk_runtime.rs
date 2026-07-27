@@ -77,7 +77,7 @@ impl BlockSource for Cached {
 /// `execve` a dynamically-linked binary via the **streaming, demand-paged** path
 /// (`exec_elf_from_vfs_demand`): the program and its `PT_INTERP` interpreter are
 /// both streamed from the VFS and faulted in on demand - none resident whole.
-fn run_execve(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Outcome {
+fn run_execve(path: &str, argv: &[&[u8]], envp: &[&[u8]], wx: bool) -> Outcome {
     user::reset();
     let mut aspace = AddressSpace::new(1);
     let ops = svc::file_ops().expect("file ops registered");
@@ -93,6 +93,24 @@ fn run_execve(path: &str, argv: &[&[u8]], envp: &[&[u8]]) -> Outcome {
         let caps = &mut *addr_of_mut!(CAPS);
         let qp = core::ptr::addr_of!(QP) as *const QueuePair;
         user::install(0, &aspace, caps, objects, qp, addr_of_mut!(frame));
+        if wx {
+            // The **W^X exception authority** (docs/ARCHITECTURE.md 5.1): a
+            // `MemoryGrant` capability carrying WRITE|EXECUTE. Minted here, by the
+            // thing that launches the cell, because that is the whole design - a cell
+            // cannot widen its own authority, and a JIT-capable cell is visibly
+            // privileged next to every other cell in the suite, which mints nothing of
+            // the sort and is therefore refused exactly as before.
+            let obj = objects
+                .create(kernel::capability::ObjectKind::MemoryGrant)
+                .expect("W^X exception object");
+            caps.mint(
+                objects,
+                obj,
+                kernel::capability::WRITE | kernel::capability::EXECUTE,
+                kernel::capability::BUDGET_UNLIMITED,
+            )
+            .expect("W^X exception capability");
+        }
         user::set_personality(0, Personality::Linux);
         linux::install_cell(0, &img);
         user::run(0).1
@@ -126,6 +144,7 @@ pub fn prove(
     want: &[u8],
     thread_abort_partial: bool,
     preemptive: bool,
+    wx_authority: bool,
 ) -> ! {
     kernel::boot::init();
     println!("{name}: start on {}", arch::NAME);
@@ -194,7 +213,7 @@ pub fn prove(
         STDOUT_LEN = 0;
     }
     linux::set_stdout_tap(Some(tap));
-    let outcome = run_execve(path, argv, envp);
+    let outcome = run_execve(path, argv, envp, wx_authority);
     linux::set_stdout_tap(None);
 
     // Streaming witness: the binary + ld.so + its libraries came off the device on
@@ -271,9 +290,12 @@ pub fn prove(
                 "{name}: SKIP full run on {} - the real binary streamed off ext4 \
                  ({fills} fills), dynamically linked, brought up its language VM + \
                  Gigacage, spawned a worker via clone3, and set up its event loop, \
-                 then abort()ed because the worker cannot run concurrently under the \
-                 cooperative single-CPU scheduler (preemptive SMP is task #132). \
-                 Loaded and initialised; did not complete.",
+                 then abort()ed before producing any output. Loaded and initialised; \
+                 did not complete. The cause is **not attributed**: it was blamed on \
+                 the cooperative scheduler starving the worker, and preemption has \
+                 since landed - and the JIT it was also once blamed on is now granted \
+                 - without changing the outcome, so the previous diagnoses are \
+                 withdrawn rather than replaced with the next guess.",
                 arch::NAME
             );
             println!("{name}: PASS (partial: loaded + init to the concurrency frontier)");

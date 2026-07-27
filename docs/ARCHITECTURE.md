@@ -458,6 +458,44 @@ a system citizen, transparent paging or migration of any kind.
 
 Each deletion is what makes a landing zone above possible.
 
+### 5.1 W^X: a default with one capability-gated exception
+
+No mapping is writable and executable at once **unless the cell holds explicit
+authority for it**. That authority is an ordinary capability - a `MemoryGrant`
+capability carrying `RIGHT_WRITE | RIGHT_EXECUTE`, which is exactly what "may hold
+memory that is simultaneously writable and executable" means in the rights
+vocabulary that already exists. No new right, no new object, and **no ambient
+authority**: a cell that does not hold it gets its `mprotect(PROT_WRITE|PROT_EXEC)`
+refused `-EPERM` with a printed reason, which is the pre-existing behaviour and stays
+the default for every cell in the tree that does not ask.
+
+**Why this is the shape rather than a blanket ban or a blanket allow.** A JIT is the
+only real consumer, and the measured evidence is specific: V8 reaches Sparkplug
+baseline compilation and dies at a single
+`OS::SetPermissions(..., kReadWriteExecute)` call, and it cannot be redirected,
+because `v8_enable_write_protect_code_memory` is a **compile-time** option in a stock
+Node build (docs/LINUX-COMPAT.md). So the three available answers were: never run a
+stock JIT; allow RWX for everyone; or make RWX an authority somebody has to be given.
+The first refuses a whole class of workload for a property the workload could not
+satisfy at any price. The second is what mainstream systems do and is what W^X exists
+to prevent - an arbitrary write becoming arbitrary code execution anywhere in the
+process. The third keeps the property *auditable*: a JIT cell is visibly privileged,
+every other cell is not, and the boundary is a capability rather than a build flag or
+a global setting.
+
+**What it does and does not weaken.** It does not make W^X advisory: the kernel still
+has no way for a cell to widen its own authority, the capability must be minted by
+whoever launched the cell, and it is revocable by epoch like any other. It does mean a
+cell holding it has, within its own address space, the property a hardened Linux
+denies - so the honest statement is that W^X is now this kernel's **default**, enforced
+by construction for every cell without the capability, rather than an invariant of the
+address-space model. `MapPerm` gains a fourth variant to say so out loud, so no code
+path can produce an RWX mapping by forgetting a check: it has to name `UserRwx`.
+
+Against the section 6 admission rule this is not a kernel addition at all - it adds no
+object and no verb. It is a *narrowing* of an existing refusal into a capability check,
+using the rights that object already has.
+
 ---
 
 ## 6. Governance: the kernel admission rule
