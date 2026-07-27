@@ -306,6 +306,12 @@ pub fn execve(cur: usize, path_va: u64, argv_va: u64, envp_va: u64, frame: *mut 
     let Some(img) = load::exec_elf_from_vfs(ops, path_kva, path_len as u64, &mut new_aspace) else {
         return err(ENOENT);
     };
+    // Record what this cell is now running, so `readlinkat("/proc/self/exe")` has
+    // a truthful answer instead of a hardcoded `-ENOENT`
+    // (docs/ARCHITECTURE-DEBT.md 4). SAFETY: EXEC_PATH holds `path_len` bytes.
+    crate::linux::set_exe_path(cur, unsafe {
+        core::slice::from_raw_parts(addr_of_mut!(EXEC_PATH) as *const u8, path_len)
+    });
 
     // Build the new initial stack (argv/envp/auxv) - written through the kernel
     // linear map, so the new space need not be active yet.

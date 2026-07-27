@@ -55,6 +55,12 @@ pub struct LinuxState {
     /// The cell's current working directory (getcwd/chdir; AT_FDCWD base).
     cwd: [u8; CWD_MAX],
     cwd_len: usize,
+    /// The path of the program this cell is running - what `/proc/self/exe`
+    /// resolves to. Set by `execve`; empty for the cell a test kernel loaded
+    /// directly, where there is no path the cell asked for and inventing one
+    /// would be a fabricated answer (docs/ENGINEERING.md 7).
+    exe: [u8; CWD_MAX],
+    exe_len: usize,
     initialized: bool,
 }
 
@@ -69,12 +75,30 @@ impl LinuxState {
             robust_list: 0,
             cwd: [0; CWD_MAX],
             cwd_len: 0,
+            exe: [0; CWD_MAX],
+            exe_len: 0,
             initialized: false,
         }
     }
 }
 
 static mut LINUX_STATE: [LinuxState; MAX_CELLS] = [const { LinuxState::new() }; MAX_CELLS];
+
+/// Record the program path `cell` is now running (`execve`), so
+/// `readlinkat("/proc/self/exe")` can answer it.
+pub(crate) fn set_exe_path(cell: usize, path: &[u8]) {
+    let st = state(cell);
+    let n = path.len().min(CWD_MAX);
+    st.exe[..n].copy_from_slice(&path[..n]);
+    st.exe_len = n;
+}
+
+/// The recorded program path, or an empty slice when this cell was loaded
+/// directly by a test kernel rather than `execve`d.
+fn exe_path(cell: usize) -> &'static [u8] {
+    let st = state(cell);
+    &st.exe[..st.exe_len]
+}
 
 fn state(idx: usize) -> &'static mut LinuxState {
     // SAFETY: single CPU, synchronous traps; one cell runs at a time.
@@ -245,7 +269,19 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
         // access(path, mode): x86-64 legacy; ld.so probes /etc/ld.so.preload
         // etc. The path is arg0 (no dirfd), docs/LINUX-COMPAT.md L7.
         nr::ACCESS => ret(sys_faccessat(args[0])),
-        nr::READLINKAT => err(errno::ENOENT), // no symlinks in the VFS; /proc/self/exe unused
+        // readlinkat(dirfd, path, buf, bufsiz). The VFS has no symlinks, so the
+        // only readable link is the synthetic `/proc/self/exe` - which is the one
+        // real programs actually read (to re-exec themselves, or to locate
+        // resources beside their own binary). It used to be a hardcoded `-ENOENT`
+        // for everything, `/proc/self/exe` included (docs/ARCHITECTURE-DEBT.md 4).
+        nr::READLINKAT => ret(sys_readlinkat(cur, args[1], args[2], args[3])),
+        // readlink(path, buf, bufsiz) - x86-64 legacy, and the one glibc's
+        // `readlink()` issues *there*: the asm-generic table has only
+        // `readlinkat`. Missing this arm is why the first version of this work
+        // passed on riscv64/aarch64 and failed on x86-64 with the same fixture
+        // (docs/ARCHITECTURE-DEBT.md 4) - the arguments shift by one because
+        // there is no dirfd.
+        nr::READLINK => ret(sys_readlinkat(cur, args[0], args[1], args[2])),
         // poll/ppoll: real readiness + a real wait (docs/ARCHITECTURE-DEBT.md 2.4).
         // `poll`'s timeout is an `int` of milliseconds in arg 2; `ppoll`'s is a
         // `struct timespec *` in arg 2 (NULL = wait indefinitely).
@@ -438,6 +474,90 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
             err(errno::ENOSYS)
         }
     }
+}
+
+/// `readlinkat`: resolve `/proc/self/exe` (and `/proc/<own pid>/exe`) to the
+/// recorded program path; every other path is `-EINVAL` if it exists as a
+/// non-link and `-ENOENT` otherwise, which here collapses to `-EINVAL` for a
+/// readable VFS file and `-ENOENT` for anything else.
+///
+/// Returns the byte count written (never NUL-terminated - `readlink` does not),
+/// truncated to `bufsiz` as POSIX specifies rather than failing.
+fn sys_readlinkat(cell: usize, path_va: u64, buf_va: u64, bufsiz: u64) -> i64 {
+    const PROC_SELF_EXE: &[u8] = b"/proc/self/exe";
+    let plen = strlen(path_va);
+    if plen == 0 || crate::user::user_buf(path_va, plen).is_none() {
+        return -errno::EFAULT;
+    }
+    // SAFETY: `path_va..path_va+plen` was bounded above and the cell's address
+    // space is active for the trap.
+    let path = unsafe { core::slice::from_raw_parts(path_va as *const u8, plen) };
+    // `/proc/<pid>/exe` for our own pid means the same thing as `/proc/self/exe`.
+    let is_self_exe = path == PROC_SELF_EXE || {
+        let mut own = [0u8; 32];
+        let n = fmt_proc_exe(proc::pid(cell), &mut own);
+        path == &own[..n]
+    };
+    if !is_self_exe {
+        // A real file is not a symlink: EINVAL is what Linux answers, and it is
+        // what tells a caller "this path exists but is not a link".
+        let exists = crate::svc::file_ops().is_some_and(|o| {
+            let mut st = [0u8; 16];
+            (o.stat)(
+                path.as_ptr() as u64,
+                path.len() as u64,
+                st.as_mut_ptr() as u64,
+            ) >= 0
+        });
+        return if exists {
+            -errno::EINVAL
+        } else {
+            -errno::ENOENT
+        };
+    }
+    let exe = exe_path(cell);
+    if exe.is_empty() {
+        // Loaded directly by a test kernel: there is no path the cell asked for,
+        // and inventing one would be a fabricated answer.
+        return -errno::ENOENT;
+    }
+    let n = (exe.len()).min(bufsiz as usize);
+    if n == 0 {
+        return 0;
+    }
+    let Some(dst) = crate::user::user_buf_mut(buf_va, n) else {
+        return -errno::EFAULT;
+    };
+    // SAFETY: `dst` was bounded to `n` writable bytes in the active cell.
+    unsafe { core::ptr::copy_nonoverlapping(exe.as_ptr(), dst as *mut u8, n) };
+    n as i64
+}
+
+/// Format `/proc/<pid>/exe` into `out`, returning its length. No allocation and
+/// no `core::fmt` (this runs in trap context).
+fn fmt_proc_exe(pid: u32, out: &mut [u8; 32]) -> usize {
+    let head = b"/proc/";
+    out[..head.len()].copy_from_slice(head);
+    let mut n = head.len();
+    let mut digits = [0u8; 10];
+    let mut d = 0;
+    let mut v = pid;
+    loop {
+        digits[d] = b'0' + (v % 10) as u8;
+        d += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    while d > 0 {
+        d -= 1;
+        out[n] = digits[d];
+        n += 1;
+    }
+    let tail = b"/exe";
+    out[n..n + tail.len()].copy_from_slice(tail);
+    n + tail.len()
 }
 
 /// Bound every cell-supplied pointer argument of Linux syscall `nr_val`

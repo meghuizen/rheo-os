@@ -357,9 +357,68 @@ docs/LINUX-COMPAT.md for the semantics and the fixtures):
 
 **Still open, and now measured rather than suspected:**
 
-- `readlinkat` is hardcoded `-ENOENT`; cross-process `kill` does not exist and
-  `kill(0)`/`kill(-1)` **silently self-target** - which matters because subprocess
-  management is the application's core function. (`poll`/`epoll_wait`/`nanosleep`,
+- ~~`readlinkat` is hardcoded `-ENOENT`~~ **CLOSED.** `/proc/self/exe` (and
+  `/proc/<own pid>/exe`) resolves to the path `execve` recorded; a real file that
+  is not a link answers `-EINVAL` and an absent path `-ENOENT`. A cell the test
+  kernel loaded directly has no recorded path and gets `-ENOENT` rather than an
+  invented one. `killx.c` asserts all three; observed failing reverted.
+- **Cross-process `kill`: written, then reverted unshipped. Still open.** The
+  implementation was straightforward and is worth restating so it is not
+  redesigned from scratch: look the pid up in the process table
+  (`cell_of_pid`), `post` the signal pending on the target's main context, and
+  deliver it from `reschedule` immediately after switching in - a frame rewrite
+  needs the target's own context with its address space active, so that is the
+  only place it can happen. `kill(pid, 0)` becomes a real existence probe;
+  `kill(0)` fans out to every live process (there is no `setpgid`, so every
+  process genuinely *is* in the initial group); `kill(-1)` fans out **excluding
+  the top of the tree**, standing in for init; a negative pid other than -1 names
+  a group that does not exist and is refused rather than redirected to the caller.
+
+  It behaved correctly on riscv64 - including the discriminating case,
+  `kill(-1)` sparing init, observed failing as *"kill(-1) self-targeted init"*
+  when reverted - and then **failed on x86-64**, so it was reverted rather than
+  shipped broken on one ISA.
+
+  The x86-64 cause is now known, because the `readlinkat` half of the same slice
+  failed there the same way and was root-caused: **glibc on x86-64 issues the
+  legacy `readlink` (89), not `readlinkat` (267)**, and the asm-generic table has
+  only `readlinkat` - so the dispatch arm matched on two ISAs and not the third.
+  Fixed with the sentinel pattern the tree already uses for `ACCESS` (a real
+  number on x86-64, an unreachable `u64::MAX - n` on asm-generic), and now proven
+  on all three ISAs. Whether `kill` has a second, independent x86-64 problem or
+  the same class of missing legacy arm is the first thing to check when it is
+  picked up again - `kill` is 62 on x86-64 and 129 on asm-generic, both already
+  dispatched, so it is not that number.
+
+  The general hazard, worth its own line: **a syscall that exists under two
+  numbers is a portability trap that only one ISA exercises.** x86-64's legacy
+  arms (`access`, `pipe`, `dup2`, `readlink`, ...) are issued by glibc *in
+  preference to* the `*at` forms, so an implementation written against the
+  asm-generic table passes on aarch64 and riscv64 and silently does nothing on the
+  ISA that matters most for this goal.
+
+  Two notes on method, both earned here:
+  - The first three `kill` phases written (self probe, absent pid, unknown group)
+    all passed **with the fix reverted** - the old stub happened to give the same
+    three answers. A proof that does not discriminate is not a proof, and the
+    only way to find that out is to revert and re-run. That is what produced the
+    `kill(-1)`-spares-init phase, which does discriminate.
+  - Two mechanisms could let a child wait while the parent signals it, and both
+    turned out to be broken - the next two entries. Neither was known before
+    trying to write this proof.
+- **Pipe reader/writer counts are not refcounted across `fork` (A).** A child that
+  blocks reading an inherited pipe is judged *satisfiable* by
+  `Block::PipeRead => pipe::has_data(idx) || pipe::writers(idx) == 0` even though
+  the parent still holds the write end, so its `read` returns **0 = EOF** instead
+  of blocking. Found while trying to prove cross-process `kill`; the child exited
+  with the "no signal arrived" code before the parent could signal it. The same
+  suspicion was already recorded for remote sockets ("handles are not refcounted
+  across `dup`/`fork`") - it is the pipe path too.
+- **`sched_yield` does not yield across cells (B).** It reschedules among a cell's
+  own contexts (L4 threads), so a child looping `sched_yield()` runs to completion
+  before the parent is scheduled at all. A cooperative cross-cell scheduler needs
+  `sched_yield` to reach `proc::reschedule`, the way the native `SYS_YIELD` does
+  (docs/NETSTACK.md 17). (`poll`/`epoll_wait`/`nanosleep`,
   blocking stdin and creation-time `O_NONBLOCK` were this rung and are now closed -
   see §1. The DNS dependency turned out to be exactly as described: the resolver
   needed a `poll` that *waits*, because honouring `SOCK_NONBLOCK` removes the

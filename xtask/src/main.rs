@@ -1187,6 +1187,11 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         // commands refused, O_NONBLOCK honoured, F_GETFL real, FD_CLOEXEC closed
         // across execve. Part of the `linuxproc` proof (it execve's itself).
         ("fcntlx.c", "fcntlx"),
+        // Cross-process signalling + `/proc/self/exe` (docs/ARCHITECTURE-DEBT.md 4):
+        // `kill` used to refuse any pid but our own and silently self-target on
+        // pid 0/-1, and `readlinkat` was a hardcoded -ENOENT. Part of the
+        // `linuxproc` proof (it execve's itself for the exe-path phase).
+        ("killx.c", "killx"),
         // A futex wait that must END BY ITSELF (docs/LINUX-COMPAT.md L4, the
         // `futex` row): `pthread_cond_timedwait` on a never-signalled condvar.
         // Part of the `linuxthreads` proof.

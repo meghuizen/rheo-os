@@ -96,6 +96,9 @@ pub mod nr {
     pub const NEWFSTATAT: u64 = 262;
     pub const UNLINKAT: u64 = 263;
     pub const READLINKAT: u64 = 267;
+    /// x86-64 legacy `readlink(path, buf, bufsiz)` - what glibc's `readlink()`
+    /// actually issues here. The asm-generic table has no such number.
+    pub const READLINK: u64 = 89;
     pub const PPOLL: u64 = 271;
     pub const RENAMEAT: u64 = 264;
     pub const FACCESSAT: u64 = 269;

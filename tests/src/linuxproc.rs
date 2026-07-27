@@ -43,6 +43,7 @@ static PROCDEMO: &[u8] = fixture::linux!("procdemo");
 static CECHO: &[u8] = fixture::linux!("cecho");
 static RSH: &[u8] = fixture::linux!("rsh");
 static FCNTLX: &[u8] = fixture::linux!("fcntlx");
+static KILLX: &[u8] = fixture::linux!("killx");
 static COREUTILS: &[u8] = fixture::linux!("cu/bin/coreutils");
 
 // -- stdout capture, wired to the Linux personality's stdout tap --
@@ -207,6 +208,32 @@ extern "C" fn kernel_main() -> ! {
         "linuxproc: fcntl OK - F_SETLK -> ENOLCK, an unknown cmd -> EINVAL, \
          F_SETFL(O_NONBLOCK) honoured on a pipe and on stdin, F_GETFL real, \
          FD_CLOEXEC closed across execve while a plain fd survived"
+    );
+
+    // --- `/proc/self/exe` (docs/ARCHITECTURE-DEBT.md 4). `readlinkat` was a
+    // hardcoded `-ENOENT` for every path, `/proc/self/exe` included - the one
+    // link real programs actually read, to re-exec themselves or to find
+    // resources beside their own binary.
+    //
+    // This lands here because it needs `execve`: the path is recorded when a cell
+    // execs, and a cell the test kernel loaded directly never named one - the
+    // kernel answers `-ENOENT` there rather than inventing a path. So the fixture
+    // execve's itself and the re-exec'd process reads the link.
+    fs::write("/bin/killx", KILLX).expect("seed /bin/killx");
+    let want_kill: &[u8] = b"exe: /bin/killx\n\
+        exe: non-link EINVAL, absent ENOENT\n\
+        killx OK\n";
+    let (code, out) = run_capture(KILLX, &[b"killx"]);
+    assert!(
+        out == want_kill,
+        "killx: stdout mismatch\n  got:      {:?}\n  expected: {:?}",
+        core::str::from_utf8(out),
+        core::str::from_utf8(want_kill),
+    );
+    assert!(code == 0, "killx: exit {code}, expected 0");
+    println!(
+        "linuxproc: /proc/self/exe OK - resolves to the execve'd path, a real \
+         non-link reports EINVAL, an absent path ENOENT"
     );
 
     println!("linuxproc: PASS");

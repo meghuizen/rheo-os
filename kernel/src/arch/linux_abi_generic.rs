@@ -141,6 +141,10 @@ pub mod nr {
     /// `faccessat`). Named as unreachable so portable dispatch can list it;
     /// no program can issue this number here (docs/LINUX-COMPAT.md L7).
     pub const ACCESS: u64 = u64::MAX - 6;
+    /// No legacy `readlink` in the asm-generic table (only `readlinkat`), so this
+    /// is an unreachable sentinel - the dispatch arm compiles on every ISA and
+    /// matches only where the number is real.
+    pub const READLINK: u64 = u64::MAX - 7;
 }
 
 /// The asm-generic `struct epoll_event` is naturally aligned (16 bytes; the
