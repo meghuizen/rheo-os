@@ -149,6 +149,20 @@ pub struct Wheel {
     heads: [[u32; SLOTS]; LEVELS],
     /// Timers too far out for any level, re-filed as time advances.
     overflow: u32,
+    /// Head of the **fired** list, kept sorted by deadline ascending.
+    ///
+    /// Firing order is a contract, not an implementation detail: a caller draining
+    /// expiries is processing events that happened in a sequence, and handing them
+    /// back in table order instead of time order means a transport applies a later
+    /// retransmission timeout before an earlier one. The first version of this
+    /// wheel returned the first `Fired` node it found in the node table - i.e.
+    /// allocation order - which the `substrate` test caught immediately by arming
+    /// deadlines in the reverse of their firing order.
+    ///
+    /// Sorted on insertion rather than on collection so that the order holds no
+    /// matter which path fired the timer (a bucket expiry, a cascade, or the
+    /// big-jump re-file), and so collection stays O(1).
+    fired_head: u32,
     /// The node table. Funded, so timer count is bounded by memory.
     nodes: Funded<Node>,
     /// Highest node index ever used, so free-slot scans stop early.
@@ -182,6 +196,7 @@ impl Wheel {
         Wheel {
             heads: [[NIL; SLOTS]; LEVELS],
             overflow: NIL,
+            fired_head: NIL,
             nodes: Funded::new(),
             high_water: 0,
             free: NIL,
@@ -210,6 +225,7 @@ impl Wheel {
         self.nodes.release();
         self.heads = [[NIL; SLOTS]; LEVELS];
         self.overflow = NIL;
+        self.fired_head = NIL;
         self.high_water = 0;
         self.free = NIL;
         self.nearest = u64::MAX;
@@ -424,6 +440,9 @@ impl Wheel {
                 self.nearest_dirty = true;
             }
         } else {
+            // Already fired but not yet collected: take it out of the fired list
+            // too, or the list would keep a freed node and hand it back.
+            self.unlink_fired(timer.index);
             self.fired_pending = self.fired_pending.saturating_sub(1);
         }
         self.free_node(timer.index);
@@ -534,13 +553,7 @@ impl Wheel {
             let next = node.next;
             if node.state == State::Armed && node.deadline_ns <= now_ns {
                 self.unlink(index);
-                if let Some(mut n) = self.node(index) {
-                    n.state = State::Fired;
-                    self.set_node(index, n);
-                }
-                self.armed -= 1;
-                self.fired_pending += 1;
-                self.firings = self.firings.wrapping_add(1);
+                self.push_fired(index);
                 fired += 1;
             }
             index = next;
@@ -563,13 +576,7 @@ impl Wheel {
             }
             if node.state == State::Armed {
                 if node.deadline_ns <= now_ns {
-                    if let Some(mut n) = self.node(index) {
-                        n.state = State::Fired;
-                        self.set_node(index, n);
-                    }
-                    self.armed -= 1;
-                    self.fired_pending += 1;
-                    self.firings = self.firings.wrapping_add(1);
+                    self.push_fired(index);
                 } else {
                     let loc = self.locate(node.deadline_ns >> TICK_SHIFT);
                     self.link(index, loc);
@@ -594,13 +601,7 @@ impl Wheel {
             }
             if node.state == State::Armed {
                 if node.deadline_ns <= now_ns {
-                    if let Some(mut n) = self.node(index) {
-                        n.state = State::Fired;
-                        self.set_node(index, n);
-                    }
-                    self.armed -= 1;
-                    self.fired_pending += 1;
-                    self.firings = self.firings.wrapping_add(1);
+                    self.push_fired(index);
                 } else {
                     let loc = self.locate(node.deadline_ns >> TICK_SHIFT);
                     self.link(index, loc);
@@ -630,11 +631,7 @@ impl Wheel {
             node.prev = NIL;
             self.nodes.set(index, node);
             if node.deadline_ns <= now_ns {
-                node.state = State::Fired;
-                self.nodes.set(index, node);
-                self.armed -= 1;
-                self.fired_pending += 1;
-                self.firings = self.firings.wrapping_add(1);
+                self.push_fired(index as u32);
                 fired += 1;
             } else {
                 let loc = self.locate(node.deadline_ns >> TICK_SHIFT);
@@ -649,30 +646,88 @@ impl Wheel {
         self.nearest_dirty = true;
     }
 
-    /// Collect one fired timer, returning its handle and tag, and freeing it.
-    /// `None` when nothing has fired. The caller drains in a loop.
+    /// Mark `index` fired and file it into the deadline-ordered fired list.
+    ///
+    /// The single place a timer becomes `Fired`, so the ordering contract cannot
+    /// be bypassed by one of the three paths that expire timers.
+    fn push_fired(&mut self, index: u32) {
+        let Some(mut node) = self.node(index) else {
+            return;
+        };
+        node.state = State::Fired;
+        node.prev = NIL;
+        node.next = NIL;
+        self.set_node(index, node);
+        let deadline = node.deadline_ns;
+
+        // Insertion sort by deadline. The list holds only timers that have come
+        // due and not yet been collected, which is a small set (one service's
+        // worth), so this is cheap and gives a total order regardless of path.
+        let mut prev = NIL;
+        let mut cur = self.fired_head;
+        while cur != NIL {
+            let Some(c) = self.node(cur) else { break };
+            if c.deadline_ns > deadline {
+                break;
+            }
+            prev = cur;
+            cur = c.next;
+        }
+        if let Some(mut n) = self.node(index) {
+            n.next = cur;
+            self.set_node(index, n);
+        }
+        if prev == NIL {
+            self.fired_head = index;
+        } else if let Some(mut p) = self.node(prev) {
+            p.next = index;
+            self.set_node(prev, p);
+        }
+        self.armed -= 1;
+        self.fired_pending += 1;
+        self.firings = self.firings.wrapping_add(1);
+    }
+
+    /// Remove `index` from the fired list (it is being cancelled before
+    /// collection).
+    fn unlink_fired(&mut self, index: u32) {
+        let mut prev = NIL;
+        let mut cur = self.fired_head;
+        while cur != NIL {
+            let Some(c) = self.node(cur) else { break };
+            if cur == index {
+                if prev == NIL {
+                    self.fired_head = c.next;
+                } else if let Some(mut p) = self.node(prev) {
+                    p.next = c.next;
+                    self.set_node(prev, p);
+                }
+                return;
+            }
+            prev = cur;
+            cur = c.next;
+        }
+    }
+
+    /// Collect the **earliest-deadline** fired timer as `(handle, tag)`, freeing
+    /// it. `None` when nothing has fired. O(1) - the list is kept sorted by
+    /// [`Wheel::push_fired`]. The caller drains in a loop and receives expiries in
+    /// the order they occurred.
     pub fn take_fired(&mut self) -> Option<(Timer, u64)> {
-        if self.fired_pending == 0 {
+        let index = self.fired_head;
+        if index == NIL {
             return None;
         }
-        for index in 0..self.high_water {
-            if let Some(node) = self.nodes.get(index) {
-                if node.state == State::Fired {
-                    let timer = Timer {
-                        index: index as u32,
-                        generation: node.generation,
-                    };
-                    let tag = node.tag;
-                    self.fired_pending -= 1;
-                    self.free_node(index as u32);
-                    return Some((timer, tag));
-                }
-            }
-        }
-        // The counter and the table disagreed; trust the table and correct the
-        // counter rather than looping forever.
-        self.fired_pending = 0;
-        None
+        let node = self.node(index)?;
+        self.fired_head = node.next;
+        let timer = Timer {
+            index,
+            generation: node.generation,
+        };
+        let tag = node.tag;
+        self.fired_pending = self.fired_pending.saturating_sub(1);
+        self.free_node(index);
+        Some((timer, tag))
     }
 
     /// Whether `timer` has fired (and not yet been collected).
@@ -749,6 +804,35 @@ impl Wheel {
             index = n.next;
         }
         if linked != armed {
+            return false;
+        }
+        // The fired list must hold exactly the fired nodes, in ascending deadline
+        // order. Both halves matter: a length mismatch means a fired timer was
+        // lost or double-listed, and an ordering violation is the defect this list
+        // exists to prevent (see `fired_head`).
+        let mut listed = 0;
+        let mut last_deadline = 0u64;
+        let mut index = self.fired_head;
+        let mut guard = 0;
+        while index != NIL {
+            guard += 1;
+            if guard > self.high_water + 1 {
+                return false; // cycle
+            }
+            let Some(n) = self.node(index) else {
+                return false;
+            };
+            if n.state != State::Fired {
+                return false;
+            }
+            if n.deadline_ns < last_deadline {
+                return false; // out of order
+            }
+            last_deadline = n.deadline_ns;
+            listed += 1;
+            index = n.next;
+        }
+        if listed != self.fired_pending {
             return false;
         }
         // The cache may be stale-high only while dirty; it must never be *below*

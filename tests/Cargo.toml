@@ -352,6 +352,10 @@ name = "iommu"
 path = "src/iommu.rs"
 
 [[bin]]
+name = "substrate"
+path = "src/substrate.rs"
+
+[[bin]]
 name = "smp"
 path = "src/smp.rs"
 required-features = ["smp"]

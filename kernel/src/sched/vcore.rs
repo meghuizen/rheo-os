@@ -331,6 +331,12 @@ impl RunQueue {
         self.iter().count()
     }
 
+    /// Frames the vcore table holds - what the owner is charged for scheduler
+    /// bookkeeping. The counterpart of [`crate::mm::vaspace::VaSpace::metadata_frames`].
+    pub fn metadata_frames(&self) -> usize {
+        self.vcores.frames_held()
+    }
+
     /// Whether the queue holds no vcores.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
