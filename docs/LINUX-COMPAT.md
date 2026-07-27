@@ -154,7 +154,8 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 | tgkill / tkill / rt_sigqueueinfo | partial | self-targeting only (own pid 1000 / own tids): `raise`/`abort` paths. A signal to a *non-running* sibling **context** is recorded pending, not force-delivered - no fixture needs it. Non-self tgid `-ESRCH` |
 | rt_sigtimedwait | partial | never blocks; returns -EAGAIN so callers loop/bail rather than hang (no fixture waits in it) (L5) |
 | mremap | full | shrink unmaps the tail in place; grow requires MREMAP_MAYMOVE (map a fresh region, copy, free the old); else -ENOMEM. glibc's large-block `realloc` needs it (the malloc-copy-free fallback otherwise leaks frames) |
-| rseq / clone3 | ENOSYS | glibc has documented fallbacks (rseq→unregistered, clone3→clone); verified via the ENOSYS logger that glibc/rust fall back to `clone`, so clone3 stays ENOSYS. Both are now **dispatched** to that refusal rather than falling through the unknown-number path, so the log no longer says `ENOSYS nr=435` as if the number were unrecognised (docs/ARCHITECTURE-DEBT.md 4.0) |
+| clone3 | full | Decodes `struct clone_args` (>= `CLONE_ARGS_SIZE_VER0` = 64 bytes) and routes to the **same** thread/process path as legacy `clone` - the one shape difference being that `stack`+`stack_size` name the base and length, so the child SP is `stack + stack_size`. `size` is checked before the pointer is dereferenced (size 0 -> EINVAL), then each field reads through `uaccess` (EFAULT if unreadable), matching Linux. glibc's `pthread_create` falls back to `clone` on ENOSYS, but a runtime that issues `clone3` **directly** with no fallback (Bun's JavaScriptCore/Zig threading) gets a hard thread-spawn failure from ENOSYS - which is why this is now implemented rather than refused (GOAL-BUN) |
+| rseq | ENOSYS | glibc's fallback is "no restartable sequences", so ENOSYS is the correct answer and a success would mislead. **Dispatched** to the refusal rather than falling through the unknown-number path, so the log no longer says `ENOSYS nr=<n>` as if the number were unrecognised (docs/ARCHITECTURE-DEBT.md 4.0) |
 | io_uring_setup / _enter / _register | ENOSYS, deliberately | The async-IO submission mechanism. This OS's async path is the queue-pair reactor, not io_uring, so refusing it is a design statement, not a gap. Node 22's libuv probes `io_uring_setup` at startup and falls back to epoll+threadpool on ENOSYS (observed in the real `node` trace: `io_uring_setup` then epoll_create1/epoll_ctl/epoll_pwait). **Dispatched** to the refusal rather than falling through the unknown-number path, the clone3/rseq class. Numbers 425/426/427 are shared across the x86-64 and asm-generic tables (added after the split) |
 | open (x86-64 legacy) | full | Routed to `openat` with `AT_FDCWD` - the same call. It had been missing, and glibc issues `open` in preference to `openat` on x86-64, so every `open` was refused on **that ISA and nowhere else** (docs/ENGINEERING.md 11, the two-numbers hazard). An unreachable sentinel on the asm-generic tables |
 | eventfd2 | full for the wakeup contract | A 64-bit counter as a per-cell fd over a per-personality registry (`linux::eventfd`), **no kernel object** - the counter lives in the registry, not the descriptor, so `dup`/`fork` share it. Write adds (refusing `u64::MAX` and refusing to overflow), read drains, `EFD_SEMAPHORE` yields 1 and decrements, a zero counter is **not** readable (so poll/epoll report it unready and a blocking read parks under the pipe's runnable-peer rule), sub-8-byte transfers are `-EINVAL`, an unknown flag bit is `-EINVAL` rather than dropped. Scope: a **sibling context** writing it does not wake a context parked on it, which is the L4 cell-level block limitation, not an eventfd one |
@@ -197,7 +198,10 @@ Same windows as native loaded cells (docs/USERLAND.md): image at 4 GiB
 (`ET_EXEC` at its linked address; `ET_DYN` gets load bias 0x1_0000_0000),
 stack top at 8 GiB (a Linux cell's stack is sized from its own `PT_GNU_STACK`
 `p_memsz`, at least 8 MiB and at most 64 MiB - see below), anonymous mmap region at
-12 GiB, `brk` heap starting at the image end. The initial stack carries the
+**80..252 GiB** (raised from a 4 GiB window boxed below the queue region, so a
+`MAP_NORESERVE` reservation as large as JavaScriptCore's **128 GiB** Gigacage fits -
+demand-filled, costing frames only for the pages actually touched; GOAL-BUN), `brk`
+heap starting at the image end. The initial stack carries the
 System V block **plus the ELF auxiliary vector** (L1): AT_PHDR/PHENT/PHNUM,
 AT_PAGESZ, AT_BASE, AT_FLAGS, AT_ENTRY, AT_UID/EUID/GID/EGID, AT_SECURE,
 AT_RANDOM (16 DRBG bytes), AT_HWCAP, AT_CLKTCK, AT_PLATFORM, AT_EXECFN,
@@ -506,8 +510,12 @@ fixup path.
   - **Priority inheritance is a TODO**: futex wake is plain FIFO. CONCURRENCY.md
     mandates PI for RT-reservation mutexes; no reservation-holding threads exist
     in the suite, so this is deferred with a code TODO.
-  - **`clone3` stays ENOSYS**: verified via the logger that glibc/rust fall back
-    to `clone`.
+  - **`clone3` is implemented** (GOAL-BUN): it decodes `struct clone_args` and
+    routes to the same context-creation path as legacy `clone`. glibc's
+    `pthread_create` would fall back to `clone` on ENOSYS, but Bun's
+    JavaScriptCore/Zig threading issues `clone3` **directly** with no fallback, so
+    ENOSYS there is a hard thread-spawn failure. `rseq` stays ENOSYS (glibc's
+    fallback is "no restartable sequences").
   - **Futex timeouts are honored** (they were not at L4, which is what made
     `pthread_cond_timedwait` hang) - see the `futex` row in the status table for
     the clock domains and the deadline path. Proof: `condwait.c` in the
@@ -1066,6 +1074,32 @@ fixup path.
   cooperative and single-CPU (a compute-bound thread starves siblings until timer
   preemption, #27); one context per cell may block on `poll` at a time (the copied
   `pollset` is per-cell - `epoll`, which Node uses, has no such limit).
+
+- **The real Bun binary loads and initialises to the concurrency frontier**
+  (GOAL-BUN, task #175, the `linuxbun` test - a **partial** pass). The actual
+  `/root/.bun/bin/bun` (v1.3, dynamic, 99 MB, JavaScriptCore + a Zig runtime)
+  streams off a live ext4 disk over virtio-blk-pci (~3,500 block-cache fills, none
+  resident whole), its `ld-linux` links the whole library set, and JSC initialises
+  **including its 128 GiB Gigacage** (a single `MAP_NORESERVE` reservation the
+  kernel now demand-fills - the mmap window was raised to 80..252 GiB for it, and a
+  failed eager commit no longer leaks a phantom VMA), spawns a worker thread via
+  **`clone3`** (now implemented), and sets up its libuv event loop. It runs
+  `BUN_JSC_useJIT=0` (host-verified to issue zero RWX mappings, the JSC equivalent
+  of `--jitless`). Then it `abort()`s (SIGABRT) **before evaluating** - and the
+  cause is measured, not guessed: **every one of its 205 syscalls came from the
+  main thread; the worker it spawned never got the CPU**. Our scheduler is
+  cooperative single-CPU (it switches to a sibling only when the current context
+  blocks), and Bun's main thread requires the worker to have made progress
+  *concurrently* before it ever blocks. That is the **preemptive-SMP frontier**
+  (task #132), not a missing syscall or a memory bug - the entire load path
+  (streaming, demand paging, 7-library dynamic linking, the 128 GiB Gigacage,
+  `clone3`, the event loop) works. The `linuxbun` harness accepts this specific,
+  tightly-bounded partial (exit 134 **and** empty output); when #132 lands, Bun
+  should print `rheo:42` and exit 0, and the strict branch takes over. x86-64 only
+  (no arm64/riscv64 bun build). Node completes fully because its thread coordination
+  happens to align with blocking points (per-context blocking above); Bun's does
+  not - the honest difference between "syscall-driven concurrency" and "requires
+  true parallelism".
 
 ## 6. Fixture build matrix (reproducibility)
 

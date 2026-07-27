@@ -22,30 +22,37 @@ const PROT_ANY: u64 = PROT_READ | PROT_WRITE | PROT_EXEC;
 // mmap flags.
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
+/// `MAP_NORESERVE`: do not commit (reserve) backing store up front - the mapping
+/// is demand-zero-filled on first touch. JavaScriptCore's Gigacage reserves a
+/// single **128 GiB** `MAP_NORESERVE` region this way (GOAL-BUN); committing it
+/// eagerly would try to allocate ~33M frames and fail.
+const MAP_NORESERVE: u64 = 0x4000;
 
-/// Base of the per-cell anonymous mmap region: 12 GiB, above the image
-/// (1-2 GiB), stack (8 GiB), free in every cell root. Each cell has its own
-/// address space, so the same VA in two cells is isolated.
-const MMAP_BASE: usize = 0x3_0000_0000;
+/// Base of the per-cell anonymous mmap region: **80 GiB**, in the large free span
+/// **above** every fixed region - the image (4 GiB), stack (8 GiB), queue-pair
+/// (16 GiB), channels (24 GiB) and the ELF interpreter at
+/// [`load::LINUX_INTERP_BASE`] (64 GiB, `ld.so` + its libraries) all sit below it.
+/// Each cell has its own address space, so the same VA in two cells is isolated.
+///
+/// It used to be 12 GiB, boxed into the 4 GiB gap below the queue region. That is
+/// enough for glibc/V8 arenas but **not** for JavaScriptCore's Gigacage: Bun
+/// reserves a single **128 GiB** `PROT_NONE` region (plus 8 + 4 GiB) up front, and
+/// no 4 GiB window can hold it. The reservations are demand-committed (a 128 GiB
+/// cage costs one VMA record and zero frames until touched), so the fix is purely
+/// address space: place the region high, where 172 GiB is free below
+/// [`crate::user::USER_VA_MAX`] (docs/LINUX-COMPAT.md, GOAL-BUN).
+const MMAP_BASE: usize = 0x14_0000_0000;
 
-/// **End** of the per-cell mmap region - the first address the bump cursor may
-/// not reach (docs/ARCHITECTURE-DEBT.md 4, blocker 2).
-///
-/// The cursor used to be unbounded. `mmap` is a forward bump with no accounting,
-/// so a large enough run of allocations walked straight through the cell's
-/// **queue-pair** region (16 GiB), its **channel** regions (24 GiB) and then the
-/// **ELF interpreter** at [`load::LINUX_INTERP_BASE`] (64 GiB), where `ld.so` and
-/// `libc.so.6` live - handing a program addresses that alias its own dynamic
-/// linker. Silent corruption, and against a ~100 MB binary not a remote
-/// possibility: 4 GiB of mappings is enough to reach the queue.
-///
-/// 16 GiB is the queue region, so that is the ceiling: the whole 4 GiB from 12 to
-/// 16 GiB is the mmap region, and past it `mmap` reports `-ENOMEM`, which is an
-/// answer a caller can act on. A real VMA list with first-fit placement and reuse
-/// of freed spans is the proper fix and is still open; this is the bound that
-/// makes the *failure mode* correct in the meantime.
-const MMAP_END: usize = crate::load::USER_QUEUE_VA;
+/// **End** of the per-cell mmap region - the first address a mapping may not reach.
+/// 252 GiB, four GiB below [`crate::user::USER_VA_MAX`] (256 GiB = RISC-V Sv39's
+/// user half, the narrowest ISA, which is what the F1 pointer bounds check
+/// against). Placement is a first-fit VMA search in `[MMAP_BASE, MMAP_END)`; past
+/// it `mmap` reports `-ENOMEM`, an answer a caller can act on.
+const MMAP_END: usize = 0x3F_0000_0000;
 const _: () = assert!(MMAP_BASE < MMAP_END);
+const _: () = assert!(MMAP_END as u64 <= crate::user::USER_VA_MAX);
+// Above every fixed region, so the window and the queue/channel/interp cannot alias.
+const _: () = assert!(MMAP_BASE as u64 > crate::load::LINUX_INTERP_BASE as u64);
 
 /// Spans a cell's `mmap` must never place a mapping over, because something else
 /// already owns them. Checked for `MAP_FIXED` (a caller-chosen address), which the
@@ -298,10 +305,21 @@ pub fn mmap(
         if fixed {
             user::unmap_range(base, bytes);
         }
-        if prot & PROT_ANY != 0 && !user::map_anon_at(base, bytes, perm_from_prot(prot)) {
+        // A `MAP_NORESERVE` mapping reserves address space that `fault` demand-zero-
+        // fills on first touch (the record's prot has PROT_ANY, so `fault` fills it,
+        // unlike a PROT_NONE reservation which stays inaccessible). Committing every
+        // page here instead is what made JSC's 128 GiB Gigacage try to allocate ~33M
+        // frames, fail, and - the real defect - leave a phantom VMA occupying the low
+        // window so every later mapping was pushed high or refused (GOAL-BUN). This is
+        // also what Linux does for anonymous memory; only the eager path is narrowed.
+        let lazy = flags & MAP_NORESERVE != 0;
+        if prot & PROT_ANY != 0 && !lazy && !user::map_anon_at(base, bytes, perm_from_prot(prot)) {
+            // A failed eager commit must not leave the record behind, or the span is
+            // lost until the cell exits (the leak the Gigacage exposed).
+            st.vmas.remove(base, bytes);
             return -ENOMEM;
         }
-        // PROT_NONE: leave it a bare reservation (no frames).
+        // PROT_NONE (or MAP_NORESERVE): leave it a bare reservation (no frames).
     } else {
         // **File-backed private mapping: demand-paged** (docs/ARCHITECTURE-DEBT.md
         // 4.0, blocker 2). Nothing is read and no frame is allocated here - the

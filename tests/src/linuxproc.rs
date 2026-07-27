@@ -424,7 +424,7 @@ extern "C" fn kernel_main() -> ! {
         sysinfo: real totals, free <= total, mem_unit 1, procs >= 1\n\
         sched: SCHED_OTHER ok, SCHED_FIFO EPERM, range 0..0\n\
         close_range: closed the range and nothing beyond it\n\
-        clone3/rseq: refused ENOSYS deliberately\n\
+        clone3: implemented (EINVAL on bad args); rseq: refused ENOSYS\n\
         capget: empty caps, version probe answered\n\
         io_uring: refused ENOSYS deliberately\n";
     // The legacy `time` syscall exists only on x86-64 (asm-generic glibc uses
@@ -455,8 +455,9 @@ extern "C" fn kernel_main() -> ! {
          (empty is NOT pollable-readable, a dup shares it, EFD_SEMAPHORE \
          decrements), sysinfo reports the real frame pool, sched_setscheduler \
          accepts the policy in force and refuses real-time with EPERM, \
-         close_range closes exactly its range, and clone3/rseq are refused \
-         deliberately rather than falling through the unknown-number path"
+         close_range closes exactly its range, clone3 is implemented (EINVAL on a \
+         null cl_args) so a clone3-only runtime can spawn threads, and rseq is \
+         refused ENOSYS deliberately rather than falling through the unknown-number path"
     );
 
     // --- a file mapping costs what is touched, not what is reserved

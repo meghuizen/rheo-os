@@ -156,6 +156,10 @@ name = "linuxnode"
 path = "src/linuxnode.rs"
 
 [[bin]]
+name = "linuxbun"
+path = "src/linuxbun.rs"
+
+[[bin]]
 name = "librheoproc"
 path = "src/librheoproc.rs"
 

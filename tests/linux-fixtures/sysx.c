@@ -213,23 +213,25 @@ int main(void) {
   close(c);
   puts("close_range: closed the range and nothing beyond it");
 
-  /* 7. clone3 and rseq are refused - deliberately, which is different from
-   *    falling through the unknown-number path. glibc's own fallbacks are `clone`
-   *    for clone3 and "no restartable sequences" for rseq, so ENOSYS is the
-   *    correct answer and a program that got a *success* would be misled.
+  /* 7. clone3 is now *implemented* (GOAL-BUN: Bun's JavaScriptCore issues clone3
+   *    directly, with no glibc clone fallback, so refusing it is a hard failure).
+   *    It decodes `struct clone_args` and routes to the same thread/process path as
+   *    legacy `clone`. Probed here with a null cl_args + size 0, which a working
+   *    clone3 rejects with EINVAL (a too-small struct) - NOT ENOSYS. So the honest
+   *    assertion flipped: EINVAL proves the number is known *and handled*, where
+   *    ENOSYS would now be the regression.
    *
-   *    Called raw: glibc has no wrapper for either. clone3 is passed a null
-   *    cl_args, which a working implementation would reject too - the point is
-   *    that the number is *known* and answered ENOSYS. */
-  if (syscall(SYS_clone3, NULL, 0ul) != -1 || errno != ENOSYS) {
-    puts("clone3: not refused with ENOSYS");
+   *    rseq stays refused ENOSYS deliberately - glibc's fallback is "no restartable
+   *    sequences", so ENOSYS is the correct answer and a success would mislead. */
+  if (syscall(SYS_clone3, NULL, 0ul) != -1 || errno != EINVAL) {
+    puts("clone3: not implemented (want EINVAL for a null cl_args)");
     return 1;
   }
   if (syscall(SYS_rseq, NULL, 0u, 0u, 0u) != -1 || errno != ENOSYS) {
     puts("rseq: not refused with ENOSYS");
     return 1;
   }
-  puts("clone3/rseq: refused ENOSYS deliberately");
+  puts("clone3: implemented (EINVAL on bad args); rseq: refused ENOSYS");
 
   /* 8. capget - a non-root process's capability query (Node.js probes it nine
    *    times at startup). The honest answer for our unprivileged identity (uid

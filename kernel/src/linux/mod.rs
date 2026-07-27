@@ -576,16 +576,23 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
         // startup). Our identity is unprivileged, so every capability mask is 0.
         nr::CAPGET => ret(sys_capget(args[0], args[1])),
         nr::CLOSE_RANGE => ret(st.fds.close_range(args[0], args[1], args[2])),
+        // clone3(clone_args*, size): the modern thread/process creation call.
+        // glibc's `pthread_create` tries `clone3` and falls back to `clone` on
+        // ENOSYS - but a runtime that issues `clone3` *directly* (Bun's JSC/Zig
+        // threading does, never the legacy `clone`) gets no fallback, so ENOSYS
+        // there is a hard thread-spawn failure and the process aborts. It is the
+        // same operation as `clone` with a struct-shaped argument, so decode the
+        // struct and route to the identical path (docs/LINUX-COMPAT.md, GOAL-BUN).
+        nr::CLONE3 => sys_clone3(cur, frame, args[0], args[1]),
         // Defined-but-never-dispatched before, so these logged `ENOSYS nr=<n>` as if
         // the number were unknown. They are known, and refusing them is the
-        // *correct* answer - glibc's documented fallbacks are `clone` for `clone3`
-        // and "no restartable sequences" for `rseq` - so say so deliberately
-        // instead of by accident (docs/ARCHITECTURE-DEBT.md 4.0, blocker 3).
-        // io_uring joins them: Node/libuv probes it and falls back to
-        // epoll+threadpool on ENOSYS - our async path is the queue-pair reactor,
-        // not io_uring, so this refusal is a design statement, not a gap
-        // (docs/LINUX-COMPAT.md).
-        nr::CLONE3 | nr::RSEQ | nr::IO_URING_SETUP | nr::IO_URING_ENTER | nr::IO_URING_REGISTER => {
+        // *correct* answer - glibc's documented fallback for `rseq` is "no
+        // restartable sequences" - so say so deliberately instead of by accident
+        // (docs/ARCHITECTURE-DEBT.md 4.0, blocker 3). io_uring joins it: Node/libuv
+        // probes it and falls back to epoll+threadpool on ENOSYS - our async path is
+        // the queue-pair reactor, not io_uring, so this refusal is a design
+        // statement, not a gap (docs/LINUX-COMPAT.md).
+        nr::RSEQ | nr::IO_URING_SETUP | nr::IO_URING_ENTER | nr::IO_URING_REGISTER => {
             err(errno::ENOSYS)
         }
 
@@ -772,6 +779,11 @@ fn ptr_args_ok(nr_val: u64, args: &[u64; 6]) -> bool {
             rd(0, 4) && (!takes_timespec || rd_opt(3, 16))
         }
         nr::CLONE => wr_opt(2, 4), // parent_tid; child_tid is validated on use
+        // clone3's `struct clone_args` is NOT bounded here: like Linux, `sys_clone3`
+        // checks the `size` argument *first* (size 0 -> EINVAL) before dereferencing
+        // the pointer, and then reads each field through `uaccess` (EFAULT if
+        // unreadable). Bounding arg 0 here would turn the legitimate size-0 probe
+        // into EFAULT before the size check could run.
         nr::EXECVE => rd(0, 1) && rd(1, 8) && rd_opt(2, 8),
         nr::WAIT4 => wr_opt(1, 4),
         nr::PIPE | nr::PIPE2 => wr(0, 8),
@@ -1716,6 +1728,59 @@ const SCHED_OTHER: u64 = 0;
 /// answer is the same `-EPERM` an unprivileged Linux process gets, which every
 /// caller already handles, rather than a success that changes nothing. An unknown
 /// policy number is `-EINVAL`.
+/// clone3(cl_args, size): decode `struct clone_args` and route to the same
+/// thread/process creation path as legacy `clone` (docs/LINUX-COMPAT.md, GOAL-BUN).
+///
+/// The struct (uapi/linux/sched.h) is a run of `__aligned_u64` fields; only the
+/// first version (`CLONE_ARGS_SIZE_VER0` = 64 bytes, through `tls`) is required, so
+/// fields past `size` read as 0. The one shape difference from `clone`: `stack` is
+/// the **lowest** byte of the child stack and `stack_size` its length, where legacy
+/// `clone` passes the stack *top* directly - so the child SP is `stack + stack_size`
+/// (and `stack == 0` means "share the caller's stack", the fork shape).
+fn sys_clone3(cell: usize, frame: *mut TrapFrame, args_va: u64, size: u64) -> Ctl {
+    // Field offsets within `struct clone_args`.
+    const F_FLAGS: u64 = 0;
+    const F_CHILD_TID: u64 = 16;
+    const F_PARENT_TID: u64 = 24;
+    const F_STACK: u64 = 40;
+    const F_STACK_SIZE: u64 = 48;
+    const F_TLS: u64 = 56;
+    const VER0: u64 = 64;
+    if args_va == 0 || size < VER0 {
+        return err(errno::EINVAL);
+    }
+    // Each field is bounds-checked + faulted-in through `uaccess`; a missing one
+    // refuses the call rather than reading kernel memory.
+    let rd = |off: u64| crate::uaccess::read_unaligned::<u64>(args_va + off);
+    let (Some(flags), Some(child_tid), Some(parent_tid), Some(stack), Some(stack_size), Some(tls)) = (
+        rd(F_FLAGS),
+        rd(F_CHILD_TID),
+        rd(F_PARENT_TID),
+        rd(F_STACK),
+        rd(F_STACK_SIZE),
+        rd(F_TLS),
+    ) else {
+        return err(errno::EFAULT);
+    };
+    if proc::is_fork(flags) {
+        // A `clone3` without CLONE_VM is a new process (Bun uses CLONE_VM threads,
+        // but keep the fork path complete). `stack == 0` shares the caller's stack.
+        ret(proc::fork(cell, frame))
+    } else {
+        // clone3 gives the stack base + length; the SP starts at the top.
+        let child_stack = stack.saturating_add(stack_size);
+        ret(thread::clone(
+            cell,
+            frame,
+            flags,
+            child_stack,
+            parent_tid,
+            child_tid,
+            tls,
+        ))
+    }
+}
+
 fn sys_sched_setscheduler(policy: u64, param_va: u64) -> i64 {
     const SCHED_FIFO: u64 = 1;
     const SCHED_RR: u64 = 2;
