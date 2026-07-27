@@ -15,10 +15,11 @@
 #![allow(clippy::empty_loop)]
 
 use crate::abi::{
-    Params, SHELL_BUF, SYS_CAPS, SYS_CPUINFO, SYS_CYCLES, SYS_DOORBELL, SYS_EVENT_COUNT,
-    SYS_EVENT_EMIT, SYS_EXIT, SYS_GRAPH, SYS_LEASE, SYS_LSPCI, SYS_MEMINFO, SYS_MMAP, SYS_MUNMAP,
-    SYS_NUMA, SYS_PS, SYS_QUEUE_INFO, SYS_RANDOM, SYS_READLINE, SYS_RESERVE, SYS_SWITCH,
-    SYS_UPTIME, SYS_WRITE, ShellIo, WORKLOAD_CROSSCELL, WORKLOAD_ROUNDTRIP, WORKLOAD_SYSCALL,
+    Params, SHELL_BUF, SYS_ARM_TIMER, SYS_CAPS, SYS_CPUINFO, SYS_CYCLES, SYS_DOORBELL,
+    SYS_EVENT_COUNT, SYS_EVENT_EMIT, SYS_EXIT, SYS_GRAPH, SYS_LEASE, SYS_LSPCI, SYS_MEMINFO,
+    SYS_MMAP, SYS_MUNMAP, SYS_NUMA, SYS_PS, SYS_QUEUE_INFO, SYS_RANDOM, SYS_READLINE, SYS_RESERVE,
+    SYS_SWITCH, SYS_UPTIME, SYS_WAIT_INPUT, SYS_WAIT_NET, SYS_WRITE, SYS_YIELD, ShellIo,
+    WORKLOAD_CROSSCELL, WORKLOAD_ROUNDTRIP, WORKLOAD_SYSCALL,
 };
 use crate::queue::{OP_NOP, QueuePair};
 
@@ -254,6 +255,102 @@ pub extern "C" fn user_prober(params_va: usize) -> ! {
     unsafe {
         (*p).status = 1;
         syscall(SYS_EXIT, 1);
+    }
+    loop {}
+}
+
+// ------------------------------------------- scheduler idle state (2.4 keystone)
+//
+// The two cells of the `schedidle` proof (docs/ARCHITECTURE-DEBT.md 2.4). One
+// **blocks** on a wake source; the other must demonstrably **run while it is
+// blocked**. The evidence is an ordering vector in a page mapped read-write into
+// both cells: each cell appends its own marker, so neither can manufacture the
+// other's - the `netservice` interleave-witness pattern (docs/ENGINEERING.md 1).
+//
+// Shared page layout: byte 0 is the append cursor, bytes 1..=ORDER_MAX the order
+// vector, and `ORDER_MAX + 1` onward a scratch area the blocker hands to
+// `SYS_WAIT_INPUT` / `SYS_WAIT_NET` as its destination buffer.
+
+/// Order-vector capacity in the shared page.
+pub const ORDER_MAX: usize = 60;
+/// Offset of the blocker's I/O destination inside the shared page.
+pub const ORDER_IO_OFF: usize = 64;
+
+/// `Params.workload` selector for [`user_blocker`].
+pub const BLOCK_TIMER: u64 = 0;
+/// Block in `SYS_WAIT_INPUT` (console).
+pub const BLOCK_CONSOLE: u64 = 1;
+/// Block in `SYS_WAIT_NET` (a bounded receive).
+pub const BLOCK_NET: u64 = 2;
+
+/// Append one marker byte to the shared order vector. Hand-bounded (a raw compare,
+/// no slice indexing) so it cannot call a panic path in unmapped kernel `.text`.
+#[inline(always)]
+unsafe fn order_append(shared: *mut u8, c: u8) {
+    unsafe {
+        let n = shared.read_volatile();
+        if (n as usize) < ORDER_MAX {
+            shared.add(1 + n as usize).write_volatile(c);
+            shared.write_volatile(n + 1);
+        }
+    }
+}
+
+/// The **blocking** cell. `workload` picks the wait, `iters` its argument (a
+/// nanosecond deadline for the timer and the bounded receive), and `ticks` carries
+/// the shared page's VA in. Appends `b` before the wait and `B` after it, and
+/// reports the syscall's return in `ops`.
+///
+/// Pre-fix, all three waits ran to completion **inside the trap**, so the peer could
+/// not run at all and the order vector would read `b B` with no peer marker between.
+#[unsafe(link_section = ".user.text")]
+#[unsafe(no_mangle)]
+pub extern "C" fn user_blocker(params_va: usize) -> ! {
+    let p = params_va as *mut Params;
+    unsafe {
+        let mode = (*p).workload;
+        let arg = (*p).iters;
+        let shared = (*p).ticks as *mut u8;
+        let io = shared.add(ORDER_IO_OFF) as u64;
+        order_append(shared, b'b');
+        let r = match mode {
+            BLOCK_CONSOLE => syscall4(SYS_WAIT_INPUT, io, 8, 0, 0),
+            BLOCK_NET => syscall4(SYS_WAIT_NET, io, 1514, arg, 0),
+            _ => syscall4(SYS_ARM_TIMER, arg, 0, 0, 0),
+        };
+        order_append(shared, b'B');
+        (*p).ops = r;
+        (*p).status = 1; // reached the end of the wait
+        syscall(SYS_EXIT, 0);
+    }
+    loop {}
+}
+
+/// The **peer** cell: append `S` and yield, `iters` times, then park on a long
+/// deadline of its own so the run ends on the blocker's wake rather than on this
+/// cell's exit. `ticks` carries the shared page VA; `qp_addr` the parking deadline.
+#[unsafe(link_section = ".user.text")]
+#[unsafe(no_mangle)]
+pub extern "C" fn user_peer(params_va: usize) -> ! {
+    let p = params_va as *mut Params;
+    unsafe {
+        let rounds = (*p).iters;
+        let shared = (*p).ticks as *mut u8;
+        let park_ns = (*p).qp_addr;
+        let mut i = 0u64;
+        while i < rounds {
+            order_append(shared, b'S');
+            (*p).ops = i + 1;
+            syscall(SYS_YIELD, 0);
+            i += 1;
+        }
+        (*p).status = 1;
+        // Park far beyond the blocker's deadline: now neither cell is runnable, so
+        // the scheduler must reach its idle state, and the blocker's (nearer)
+        // deadline is what wakes the machine.
+        syscall4(SYS_ARM_TIMER, park_ns, 0, 0, 0);
+        (*p).status = 2; // only reached if this cell outlived the blocker
+        syscall(SYS_EXIT, 0);
     }
     loop {}
 }

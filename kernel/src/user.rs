@@ -1444,6 +1444,16 @@ fn finish(outcome: Outcome) -> *mut TrapFrame {
     core::ptr::null_mut()
 }
 
+/// End the whole run because the scheduler is **deadlocked**: nothing runnable and
+/// no blocked cell has a wake source left (docs/ARCHITECTURE-DEBT.md 2.4). The
+/// scheduler has already printed which cell is blocked on what; this records the
+/// outcome as `Exited(DEADLOCK_EXIT)` and returns the null frame the arch
+/// trampoline reads as "unwind", so the state is reportable instead of a `panic!`
+/// with a kernel stack trace.
+pub fn deadlock_finish() -> *mut TrapFrame {
+    finish(Outcome::Exited(crate::abi::DEADLOCK_EXIT))
+}
+
 /// The cell `run` was entered with - the top of the Linux process tree
 /// (docs/LINUX-COMPAT.md L6). Only its exit unwinds `run`.
 pub fn top_cell() -> usize {
@@ -1767,15 +1777,25 @@ pub fn on_user_trap(
         // 0 = the cell's sleep (the pre-N2e shape), 1 = the transport **pacer**'s
         // continuously re-armed send deadline (docs/NETSTACK.md 21). An unknown
         // value falls back to the sleep slot rather than failing the call.
+        // A sleep is a *registration*, not an in-kernel wait, whenever some other
+        // cell can run: the deadline goes to the arbiter, the caller parks, and a
+        // sibling gets the CPU (docs/ARCHITECTURE-DEBT.md 2.4). With no sibling to
+        // hand it to, the pre-existing in-trap wait is kept byte for byte - it *is*
+        // the idle in that case.
         SYS_ARM_TIMER => {
             let client = if args[1] == crate::abi::TIMER_CLIENT_PACER {
                 crate::ktimer::TimerClient::Pacer
             } else {
                 crate::ktimer::TimerClient::CellSleep
             };
-            crate::time::arm_timer_as(args[0], client);
-            arch::set_syscall_ret(unsafe { &mut *frame }, 0);
-            frame
+            match crate::nproc::block_timer(cur, args[0], client) {
+                Some(f) => f,
+                None => {
+                    crate::time::arm_timer_as(args[0], client);
+                    arch::set_syscall_ret(unsafe { &mut *frame }, 0);
+                    frame
+                }
+            }
         }
         SYS_MMAP => {
             let base = mmap_anon(cur, args[0] as usize);
@@ -1835,17 +1855,46 @@ pub fn on_user_trap(
         // OS's first block-and-wake: the kernel idles here (WFI where the UART
         // RX interrupt is wired, poll otherwise) until a byte arrives.
         SYS_WAIT_INPUT => {
-            let n = crate::input::wait_input(args[0], args[1] as usize);
-            arch::set_syscall_ret(unsafe { &mut *frame }, n as u64);
-            frame
+            // The destination is a cell-supplied address, and since the wait may now
+            // complete *later* (in the scheduler, after siblings ran) it is bounded
+            // here rather than at the write (docs/ENGINEERING.md 12). A rejected
+            // buffer reports 0 bytes and never writes.
+            let len = args[1] as usize;
+            if user_buf_mut(args[0], len).is_none() {
+                arch::set_syscall_ret(unsafe { &mut *frame }, 0);
+                return frame;
+            }
+            // SAFETY: `[args[0], args[0]+len)` was just bounded to this cell's user
+            // VA range, and the cell's address space is active whenever the block is
+            // completed (`nproc::complete_block` switches to it first).
+            match unsafe { crate::nproc::block_console(cur, args[0], len) } {
+                Some(f) => f,
+                None => {
+                    let n = crate::input::wait_input(args[0], len);
+                    arch::set_syscall_ret(unsafe { &mut *frame }, n as u64);
+                    frame
+                }
+            }
         }
         // Block until a received Ethernet frame is available (docs/NETSTACK.md,
         // rheo-net N2d) - the network twin of SYS_WAIT_INPUT. The kernel idles at
         // WFI where the NIC's RX interrupt is wired, and polls (bounded) otherwise.
         SYS_WAIT_NET => {
-            let n = crate::net_rx::wait_frame(args[0], args[1] as usize, args[2]);
-            arch::set_syscall_ret(unsafe { &mut *frame }, n as u64);
-            frame
+            let len = args[1] as usize;
+            if user_buf_mut(args[0], len).is_none() {
+                arch::set_syscall_ret(unsafe { &mut *frame }, 0);
+                return frame;
+            }
+            // SAFETY: as SYS_WAIT_INPUT - bounded just above, and the cell's address
+            // space is active when the block completes.
+            match unsafe { crate::nproc::block_net(cur, args[0], len, args[2]) } {
+                Some(f) => f,
+                None => {
+                    let n = crate::net_rx::wait_frame(args[0], len, args[2]);
+                    arch::set_syscall_ret(unsafe { &mut *frame }, n as u64);
+                    frame
+                }
+            }
         }
         // Shell / resource / file syscalls are handled by the system-service
         // module; an unrecognised number faults the cell.

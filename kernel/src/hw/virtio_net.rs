@@ -830,6 +830,25 @@ pub fn ack_irq() {
 ///
 /// # Safety
 /// `buf_va` is the calling cell's mapped buffer; called only during its trap.
+/// Whether the receive virtqueue already holds a completed frame - a
+/// **non-destructive** peek (it only compares the used-ring index against the
+/// driver's cursor, exactly what [`VirtioNet::recv_frame`] tests before copying).
+/// The scheduler needs this to decide that a cell parked on `SYS_WAIT_NET` is now
+/// satisfiable without consuming the frame in the wrong address space
+/// (docs/ARCHITECTURE-DEBT.md 2.4). False when no NIC is installed.
+pub fn rx_pending() -> bool {
+    let Some(dev) = net_mut() else {
+        return false;
+    };
+    // SAFETY: the rings live in frame-pool memory reached through the linear map;
+    // single-vcore, and this only reads two indices.
+    unsafe {
+        let vq = dev.rx();
+        fence(Ordering::SeqCst);
+        (*vq).used.idx != dev.rx_last_used
+    }
+}
+
 pub fn drain_frame(buf_va: u64, len: usize) -> Option<usize> {
     let dev = net_mut()?;
     // SAFETY: the cell passes a VA of `len` writable bytes in its own memory.

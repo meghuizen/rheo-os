@@ -579,6 +579,56 @@ pub fn wait_frame(buf_va: u64, len: usize, timeout_ns: u64) -> usize {
     result
 }
 
+/// Whether a NIC is installed at all. A receive wait with no NIC can never be
+/// satisfied, so the scheduler must not park a cell on one
+/// (docs/ARCHITECTURE-DEBT.md 2.4); [`wait_frame`] answers 0 immediately instead.
+pub fn nic_present() -> bool {
+    crate::hw::virtio_net::mac_addr().is_some()
+}
+
+/// Whether a received frame is already sitting in the receive virtqueue - the
+/// non-destructive peek the scheduler needs to decide that a cell blocked on
+/// `SYS_WAIT_NET` is now satisfiable (docs/ARCHITECTURE-DEBT.md 2.4). False when no
+/// NIC is installed.
+pub fn frame_pending() -> bool {
+    crate::hw::virtio_net::rx_pending()
+}
+
+/// Copy one already-received frame into the cell buffer at `buf_va` (up to `len`
+/// bytes) and return its length, or 0 if the queue is empty. The **non-blocking**
+/// half of [`wait_frame`]: the scheduler uses it to complete a cell's parked
+/// `SYS_WAIT_NET` once a frame has arrived, or to return 0 at its deadline.
+///
+/// # Safety
+/// `buf_va` must be a writable `len`-byte buffer in the **active** address space
+/// (the blocked cell's, which the scheduler activates before completing its block).
+pub unsafe fn complete_wait(buf_va: u64, len: usize) -> usize {
+    match crate::hw::virtio_net::drain_frame(buf_va, len) {
+        Some(n) if n > 0 => {
+            note_activity();
+            n
+        }
+        _ => 0,
+    }
+}
+
+/// The current profile's receive **poll slice** - how long the scheduler idle state
+/// halts between receive-queue checks where no NIC RX interrupt exists
+/// (docs/NETSTACK.md 16, docs/ENGINEERING.md 9). The cold slice: an idle scheduler
+/// has no reason to prefer latency over duty cycle.
+pub fn poll_slice_ns() -> u64 {
+    policy().cold_slice_ns.max(1)
+}
+
+/// Record that the kernel genuinely halted waiting for a frame. Called by the
+/// **scheduler idle state** ([`crate::idle`]) when the park it performed for a cell
+/// blocked on `SYS_WAIT_NET` really stopped the CPU: since the
+/// docs/ARCHITECTURE-DEBT.md 2.4 slice that park may happen in the scheduler rather
+/// than inside the syscall, and it is the same halt either way.
+pub fn mark_idle() {
+    mark_halt();
+}
+
 /// Record a halt inside the wait (either idle mode).
 fn mark_halt() {
     // SAFETY: single CPU.

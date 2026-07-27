@@ -20,6 +20,8 @@
 use crate::abi::{FAULT_EXIT, SPAWN_CHAN_SLOT};
 use crate::arch::{self, TrapFrame};
 use crate::capability::{BUDGET_UNLIMITED, ObjectKind, ObjectTable, READ, WRITE};
+use crate::idle;
+use crate::ktimer::{self, TimerClient};
 use crate::load;
 use crate::mm::AddressSpace;
 use crate::queue::QueuePair;
@@ -38,10 +40,52 @@ pub enum Sched {
 enum PState {
     Free,
     Runnable,
-    /// Parked in `SYS_WAIT` for the child cell in `wait_for`.
+    /// Parked on the condition in `Proc::block`.
     Blocked,
     /// Exited, holding its exit code, awaiting a parent `SYS_WAIT`.
     Zombie,
+}
+
+/// What a parked native cell is waiting for (docs/ARCHITECTURE-DEBT.md 2.4).
+///
+/// Before this existed, the only native block was `SYS_WAIT` (recorded in
+/// `Proc::wait_for`) and the other three waiting verbs - `SYS_ARM_TIMER`,
+/// `SYS_WAIT_INPUT`, `SYS_WAIT_NET` - waited **inside the trap** without ever
+/// reaching the scheduler, so one cell's `sleep` idled the machine while its
+/// siblings were runnable. They are now registrations: the cell records its
+/// condition here, the CPU goes to a sibling, and [`complete_block`] finishes the
+/// syscall with the blocked cell's own address space active.
+///
+/// The cell-visible semantics are unchanged: a `sleep` still sleeps for its full
+/// duration, a `SYS_WAIT_INPUT` still returns the bytes it drained, a
+/// `SYS_WAIT_NET` still returns the frame length or 0 at its deadline.
+#[derive(Copy, Clone)]
+enum Block {
+    None,
+    /// `SYS_WAIT` for the child cell `child`.
+    Wait {
+        child: usize,
+    },
+    /// `SYS_ARM_TIMER`: parked until `deadline_ns` (absolute, timer domain). The
+    /// arbiter slot the deadline lives in is kept so re-registration after another
+    /// client fires goes to the caller's own slot (a pacer's and a sleep's deadlines
+    /// are different clients, docs/NETSTACK.md 21).
+    Timer {
+        deadline_ns: u64,
+        client: TimerClient,
+    },
+    /// `SYS_WAIT_INPUT`: parked until a console byte is buffered, or input ends.
+    Console {
+        buf_va: u64,
+        len: usize,
+    },
+    /// `SYS_WAIT_NET`: parked until a frame arrives, or `deadline_ns` (absolute,
+    /// timer domain; 0 = indefinite) passes.
+    Net {
+        buf_va: u64,
+        len: usize,
+        deadline_ns: u64,
+    },
 }
 
 #[derive(Copy, Clone)]
@@ -50,7 +94,11 @@ struct Proc {
     /// Parent cell index, or -1 for the top of the tree (the first spawner).
     parent: i32,
     /// The child cell this proc is blocked in `SYS_WAIT` for (when `Blocked`).
+    /// Kept alongside `block` because `complete_block` reaps an awaited zombie on
+    /// **every** switch-in, including a plain `SYS_YIELD` (pre-existing behaviour).
     wait_for: usize,
+    /// What this proc is parked on (when `Blocked`).
+    block: Block,
     /// Exit code while `Zombie` (0..=255, or `FAULT_EXIT` for a faulted child).
     code: u64,
 }
@@ -61,6 +109,7 @@ impl Proc {
             state: PState::Free,
             parent: -1,
             wait_for: 0,
+            block: Block::None,
             code: 0,
         }
     }
@@ -103,6 +152,7 @@ fn ensure_top(cell: usize) {
             state: PState::Runnable,
             parent: -1,
             wait_for: 0,
+            block: Block::None,
             code: 0,
         };
     }
@@ -294,6 +344,7 @@ pub fn spawn(
         state: PState::Runnable,
         parent: cur as i32,
         wait_for: 0,
+        block: Block::None,
         code: 0,
     };
     child as u64
@@ -377,7 +428,135 @@ pub fn wait(cur: usize, handle: u64, _frame: *mut TrapFrame) -> Sched {
     // Block the caller and hand the CPU to a runnable cell (the child).
     procs()[cur].state = PState::Blocked;
     procs()[cur].wait_for = child;
+    procs()[cur].block = Block::Wait { child };
     Sched::Switch(reschedule(cur))
+}
+
+// ------------------------------------------------- the three converted waits
+//
+// docs/ARCHITECTURE-DEBT.md 2.4. Each of these used to wait in kernel context
+// inside its own syscall; each now registers its condition and hands the CPU to a
+// sibling. Each returns `None` when the caller is the **only** schedulable cell, in
+// which case the syscall keeps its pre-existing in-trap wait byte for byte - there
+// is nothing to reschedule to, and the in-trap wait *is* the idle. That is what
+// makes this change additive for every single-cell kernel in the tree
+// (docs/ENGINEERING.md 8).
+
+/// `SYS_ARM_TIMER`: register the deadline and reschedule, or `None` to wait in
+/// place. `deadline_ns` is the caller's **relative** duration.
+pub fn block_timer(cur: usize, deadline_ns: u64, client: TimerClient) -> Option<*mut TrapFrame> {
+    if deadline_ns == 0 || !can_reschedule(cur) {
+        return None;
+    }
+    ensure_tracked(cur);
+    ktimer::register(client, deadline_ns);
+    let deadline = ktimer::now_ns().wrapping_add(deadline_ns.max(1));
+    park(
+        cur,
+        Block::Timer {
+            deadline_ns: deadline,
+            client,
+        },
+    )
+}
+
+/// `SYS_WAIT_INPUT`: register the console wait and reschedule, or `None` to wait in
+/// place. A buffer already holding data is completed here rather than parked, so a
+/// cell reading available input never leaves the CPU.
+///
+/// # Safety
+/// `buf_va` must be a writable `len`-byte buffer in the caller's address space; the
+/// caller (the syscall dispatch) has range-checked it (docs/ENGINEERING.md 12).
+pub unsafe fn block_console(cur: usize, buf_va: u64, len: usize) -> Option<*mut TrapFrame> {
+    if len == 0 || !can_reschedule(cur) {
+        return None;
+    }
+    // SAFETY: the caller range-checked `[buf_va, buf_va+len)` in the active cell.
+    if crate::input::has_data() && unsafe { crate::input::drain(buf_va, len) } > 0 {
+        return None; // data was already there: `wait_input` returns it directly
+    }
+    ensure_tracked(cur);
+    park(cur, Block::Console { buf_va, len })
+}
+
+/// `SYS_WAIT_NET`: register the frame wait (with its deadline) and reschedule, or
+/// `None` to wait in place.
+///
+/// # Safety
+/// As [`block_console`]: `buf_va` is a range-checked writable buffer in the caller.
+pub unsafe fn block_net(
+    cur: usize,
+    buf_va: u64,
+    len: usize,
+    timeout_ns: u64,
+) -> Option<*mut TrapFrame> {
+    if len == 0 || !can_reschedule(cur) || crate::net_rx::frame_pending() {
+        return None;
+    }
+    // Two cases that must keep the in-trap wait, because parking on them could
+    // never end (docs/ENGINEERING.md 11 - a wait whose condition cannot occur is a
+    // wedge, and the in-trap path has the backstops):
+    //  * no NIC installed at all - `wait_frame` answers 0 immediately;
+    //  * an *indefinite* wait with no NIC RX interrupt - only `wait_frame`'s bounded
+    //    poll (its `POLL_BUDGET` backstop) can end that, and a backstop the
+    //    scheduler idle does not have must not be bypassed.
+    if !crate::net_rx::nic_present() || (timeout_ns == 0 && !crate::arch::net_irq_enabled()) {
+        return None;
+    }
+    ensure_tracked(cur);
+    let deadline_ns = if timeout_ns == 0 {
+        0
+    } else {
+        ktimer::register(TimerClient::RxDeadline, timeout_ns);
+        ktimer::now_ns().wrapping_add(timeout_ns.max(1))
+    };
+    park(
+        cur,
+        Block::Net {
+            buf_va,
+            len,
+            deadline_ns,
+        },
+    )
+}
+
+/// Mark `cur` blocked on `block` and hand the CPU on.
+fn park(cur: usize, block: Block) -> Option<*mut TrapFrame> {
+    procs()[cur].state = PState::Blocked;
+    procs()[cur].block = block;
+    Some(reschedule(cur))
+}
+
+/// Whether blocking `cur` can hand the CPU to some **other** cell - either one that
+/// is runnable now, or one that is itself parked on a wake source the scheduler idle
+/// state can wait for (that cell will run again, so parking `cur` is progress).
+/// False only in the genuinely single-cell case, where the syscall keeps its in-trap
+/// wait unchanged and that wait *is* the idle.
+fn can_reschedule(cur: usize) -> bool {
+    (0..MAX_CELLS).any(|i| {
+        i != cur
+            && (schedulable(i)
+                || (user::cell_present(i)
+                    && procs()[i].state == PState::Blocked
+                    && sources_of(i) & idle::WAITABLE != 0))
+    })
+}
+
+/// Give every present native cell a process entry before parking `cell`, so
+/// `reschedule`'s round-robin (which looks for `Runnable`) can reach them.
+///
+/// A test kernel may install two native cells that never spawn (the Phase E/J
+/// shape), which leaves both `Proc` slots `Free`. `SYS_YIELD`'s `schedulable`
+/// already treats `Free` as runnable, but `reschedule` deliberately keeps its
+/// pre-existing `Runnable` predicate (it must not start scheduling cells the Phase F
+/// proofs never gave it), so the entries are materialised here instead. Idempotent.
+fn ensure_tracked(cell: usize) {
+    ensure_top(cell);
+    for i in 0..MAX_CELLS {
+        if i != cell && user::cell_present(i) && user::cell_is_native(i) {
+            ensure_top(i);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------- yield
@@ -466,39 +645,209 @@ fn process_exit(cell: usize, code: u64) -> *mut TrapFrame {
 // ----------------------------------------------------------------- scheduler
 
 /// Hand the CPU to the next runnable native cell after `leaving` blocks or exits.
-/// Wakes any parent whose awaited child is now a zombie, round-robins to a
-/// runnable cell, and completes its pending `SYS_WAIT`. Panics only on a true
-/// deadlock (a scheduling bug, surfaced loudly).
+/// Wakes any blocked cell whose condition now holds, round-robins to a runnable
+/// cell, and completes its pending block.
+///
+/// When nothing is runnable but at least one cell is parked on a **wake source**,
+/// this **idles** ([`crate::idle`]) until a source can have fired and looks again -
+/// which is the state that used to `panic!("no runnable cell")`
+/// (docs/ARCHITECTURE-DEBT.md 2.4). "Every cell is waiting for the outside world" is
+/// the normal steady state of a server, not a scheduling bug. Only when nothing is
+/// runnable *and* no blocked cell has any source left is it a genuine deadlock, and
+/// that is reported (see [`report_deadlock`]) rather than panicked.
 fn reschedule(leaving: usize) -> *mut TrapFrame {
-    // Wake blocked parents whose awaited child is now a zombie.
-    for i in 0..MAX_CELLS {
-        if procs()[i].state == PState::Blocked {
-            let w = procs()[i].wait_for;
-            if procs()[w].state == PState::Zombie {
-                procs()[i].state = PState::Runnable;
+    loop {
+        wake_satisfiable();
+
+        let next = (1..=MAX_CELLS)
+            .map(|k| (leaving + k) % MAX_CELLS)
+            .find(|&i| user::cell_present(i) && procs()[i].state == PState::Runnable);
+        if let Some(n) = next {
+            if n != leaving {
+                // Save the outgoing cell's live FP/SIMD state (harmless if it is
+                // exiting) and load the incoming cell's - the native analogue of the
+                // Linux personality's `thread::save_current_fp`/`restore_current`.
+                user::switch_native_cell(leaving, n);
             }
+            complete_block(n);
+            return user::cell_frame(n);
         }
+
+        // Nothing runnable. Idle on whatever the blocked cells are waiting for.
+        let src = blocked_sources();
+        if src & idle::WAITABLE == 0 {
+            return report_deadlock(leaving, src);
+        }
+        refresh_deadlines();
+        idle::wait(src);
     }
-
-    let next = (1..=MAX_CELLS)
-        .map(|k| (leaving + k) % MAX_CELLS)
-        .find(|&i| user::cell_present(i) && procs()[i].state == PState::Runnable);
-    let Some(n) = next else {
-        panic!("nproc: no runnable cell (native process scheduler deadlock)");
-    };
-
-    // Save the outgoing cell's live FP/SIMD state (harmless if it is exiting)
-    // and load the incoming cell's - the native analogue of the Linux
-    // personality's `thread::save_current_fp`/`restore_current` in `linux::proc`.
-    user::switch_native_cell(leaving, n);
-    complete_block(n);
-    user::cell_frame(n)
 }
 
-/// If cell `n` is a woken waiter (Runnable, `wait_for` pointing at a now-zombie
-/// child), complete its `SYS_WAIT`: reap the child and set its return value (its
-/// address space is now active). A freshly-scheduled child running for the first
-/// time has `wait_for == 0` / no matching zombie, so nothing is completed.
+/// Promote every blocked cell whose condition now holds to `Runnable`.
+fn wake_satisfiable() {
+    for i in 0..MAX_CELLS {
+        if procs()[i].state == PState::Blocked && satisfiable(i) {
+            procs()[i].state = PState::Runnable;
+        }
+    }
+}
+
+/// Whether blocked cell `i`'s condition now holds.
+fn satisfiable(i: usize) -> bool {
+    match procs()[i].block {
+        Block::None => false,
+        // Pre-existing behaviour, now expressed through `Block`: a `SYS_WAIT`er wakes
+        // when its awaited child is a zombie.
+        Block::Wait { child } => child < MAX_CELLS && procs()[child].state == PState::Zombie,
+        Block::Timer { deadline_ns, .. } => reached(deadline_ns),
+        Block::Console { .. } => crate::input::has_data() || crate::input::at_eof(),
+        Block::Net { deadline_ns, .. } => {
+            crate::net_rx::frame_pending() || (deadline_ns != 0 && reached(deadline_ns))
+        }
+    }
+}
+
+/// Re-register the **nearest** outstanding deadline in each arbiter slot before the
+/// scheduler idles.
+///
+/// The arbiter has one slot per *client kind*, not per cell (docs/NETSTACK.md 16 -
+/// the client set is closed so the kernel stays allocation-free). Two cells sleeping
+/// at once therefore share `CellSleep`, and whichever registered last would be the
+/// only deadline the hardware is armed for - so the other cell would wake late, by
+/// however much the two deadlines differ. The scheduler multiplexes them: each
+/// blocked cell's deadline is held in its own `Block` (absolute, timer domain), and
+/// the nearest of them is what the slot gets before every idle. Satisfiability is
+/// judged from the `Block`, never from the slot, so a cell can never be woken by
+/// another cell's deadline either.
+fn refresh_deadlines() {
+    let now = ktimer::now_ns();
+    let mut nearest = [u64::MAX; ktimer::CLIENTS];
+    let mut net_nearest = u64::MAX;
+    for i in 0..MAX_CELLS {
+        if procs()[i].state != PState::Blocked {
+            continue;
+        }
+        match procs()[i].block {
+            Block::Timer {
+                deadline_ns,
+                client,
+            } => {
+                let s = &mut nearest[client as usize];
+                if deadline_ns < *s {
+                    *s = deadline_ns;
+                }
+            }
+            Block::Net { deadline_ns, .. } if deadline_ns != 0 => {
+                if deadline_ns < net_nearest {
+                    net_nearest = deadline_ns;
+                }
+            }
+            _ => {}
+        }
+    }
+    for (slot, &deadline) in nearest.iter().enumerate() {
+        if deadline != u64::MAX {
+            ktimer::register(client_of(slot), deadline.wrapping_sub(now).max(1));
+        }
+    }
+    if net_nearest != u64::MAX {
+        ktimer::register(
+            TimerClient::RxDeadline,
+            net_nearest.wrapping_sub(now).max(1),
+        );
+    }
+}
+
+/// The [`TimerClient`] for arbiter slot index `slot`. The enum is `#[repr]`-free, so
+/// the mapping is written out rather than transmuted.
+fn client_of(slot: usize) -> TimerClient {
+    match slot {
+        0 => TimerClient::RxPoll,
+        1 => TimerClient::RxDeadline,
+        2 => TimerClient::CellSleep,
+        3 => TimerClient::NetTimer,
+        4 => TimerClient::Pacer,
+        _ => TimerClient::FutexWait,
+    }
+}
+
+/// Whether the absolute timer-domain deadline `deadline_ns` has passed. Compared in
+/// the **timer's own** domain (`ktimer::now_ns`), never the instruction counter -
+/// they are different counters on RISC-V (docs/ENGINEERING.md 11).
+fn reached(deadline_ns: u64) -> bool {
+    ktimer::now_ns().wrapping_sub(deadline_ns) < (1 << 63)
+}
+
+/// The union of the wake sources every blocked cell is waiting on
+/// ([`crate::idle`]). Zero means nothing is blocked; a value with no
+/// [`idle::WAITABLE`] bit means every blocked cell is waiting on another cell, which
+/// with nothing runnable is a deadlock.
+fn blocked_sources() -> idle::Sources {
+    let mut src = 0;
+    for i in 0..MAX_CELLS {
+        if procs()[i].state == PState::Blocked {
+            src |= sources_of(i);
+        }
+    }
+    src
+}
+
+/// The wake sources cell `i`'s current block can be satisfied by.
+fn sources_of(i: usize) -> idle::Sources {
+    match procs()[i].block {
+        Block::None => 0,
+        Block::Wait { .. } => idle::PEER,
+        Block::Timer { .. } => idle::TIMER,
+        Block::Console { .. } => idle::CONSOLE,
+        // A bounded receive also waits on its deadline.
+        Block::Net { deadline_ns, .. } => {
+            idle::NET | if deadline_ns != 0 { idle::TIMER } else { 0 }
+        }
+    }
+}
+
+/// The union of wake sources the native scheduler is currently blocked on - the
+/// classifier the run loop's idle/deadlock decision is made from, exposed so a test
+/// can assert it directly (docs/ENGINEERING.md 1: assert the decision, not the
+/// consequence).
+pub fn wake_sources() -> idle::Sources {
+    blocked_sources()
+}
+
+/// No cell is runnable and no blocked cell has a wake source left: a genuine
+/// deadlock. Print what each blocked cell is waiting for and end the run with
+/// [`crate::abi::DEADLOCK_EXIT`], rather than `panic!`ing with a kernel stack trace
+/// that says nothing about the cells (docs/ARCHITECTURE-DEBT.md 2.4).
+fn report_deadlock(leaving: usize, src: idle::Sources) -> *mut TrapFrame {
+    crate::println!(
+        "nproc: DEADLOCK - no runnable native cell, no wake source (leaving={leaving}, waiting on {})",
+        idle::describe(src)
+    );
+    for i in 0..MAX_CELLS {
+        if procs()[i].state == PState::Blocked {
+            crate::println!("nproc:   cell {i} blocked on {}", block_name(i));
+        }
+    }
+    user::deadlock_finish()
+}
+
+/// The name of cell `i`'s block, for the deadlock diagnostic.
+fn block_name(i: usize) -> &'static str {
+    match procs()[i].block {
+        Block::None => "nothing",
+        Block::Wait { .. } => "SYS_WAIT (child exit)",
+        Block::Timer { .. } => "SYS_ARM_TIMER (deadline)",
+        Block::Console { .. } => "SYS_WAIT_INPUT (console)",
+        Block::Net { .. } => "SYS_WAIT_NET (frame)",
+    }
+}
+
+/// Apply woken cell `n`'s pending syscall - its address space is now active - and
+/// set its return value, then clear the block.
+///
+/// `SYS_WAIT` keeps its pre-existing shape exactly: a zombie the cell was waiting
+/// for is reaped on **every** switch-in (including a plain `SYS_YIELD`), keyed on
+/// `wait_for`, because that is what the Phase F/N4a proofs observe.
 fn complete_block(n: usize) {
     let child = procs()[n].wait_for;
     if child < MAX_CELLS
@@ -507,8 +856,37 @@ fn complete_block(n: usize) {
     {
         let code = reap(child);
         procs()[n].wait_for = 0;
+        procs()[n].block = Block::None;
         let frame = user::cell_frame(n);
         // SAFETY: `frame` is `n`'s saved trap frame.
         unsafe { arch::set_syscall_ret(&mut *frame, code) };
+        return;
     }
+    let block = procs()[n].block;
+    procs()[n].block = Block::None;
+    let r: u64 = match block {
+        Block::None | Block::Wait { .. } => return,
+        Block::Timer { client, .. } => {
+            ktimer::cancel(client);
+            0
+        }
+        // SAFETY: `buf_va`/`len` were range-checked against **this** cell's user VA
+        // range when the block was registered, and `n`'s address space is active
+        // again here (`switch_native_cell` above, or `n == leaving`).
+        Block::Console { buf_va, len } => unsafe { crate::input::drain(buf_va, len) as u64 },
+        Block::Net {
+            buf_va,
+            len,
+            deadline_ns,
+        } => {
+            if deadline_ns != 0 {
+                ktimer::cancel(TimerClient::RxDeadline);
+            }
+            // SAFETY: as `Block::Console` above.
+            unsafe { crate::net_rx::complete_wait(buf_va, len) as u64 }
+        }
+    };
+    let frame = user::cell_frame(n);
+    // SAFETY: `frame` is `n`'s saved trap frame.
+    unsafe { arch::set_syscall_ret(&mut *frame, r) };
 }

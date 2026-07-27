@@ -123,6 +123,105 @@ pub fn did_idle() -> bool {
     unsafe { *addr_of!(IDLED) }
 }
 
+/// Record that the kernel genuinely halted waiting for a console byte. Called by
+/// the **scheduler idle state** ([`crate::idle`]) when the park it performed on
+/// behalf of a cell blocked on console input really stopped the CPU: since the
+/// docs/ARCHITECTURE-DEBT.md 2.4 slice, that park may happen in the scheduler
+/// rather than inside `SYS_WAIT_INPUT`, and it is the same halt either way.
+pub fn mark_idle() {
+    // SAFETY: single CPU.
+    unsafe {
+        *addr_of_mut!(IDLED) = true;
+    }
+}
+
+/// Whether the RX ring already holds at least one byte - the non-destructive peek
+/// the scheduler needs to decide that a cell blocked on console input is now
+/// satisfiable (docs/ARCHITECTURE-DEBT.md 2.4).
+pub fn has_data() -> bool {
+    let r = ring();
+    r.head != r.tail
+}
+
+/// Whether input has **ended**: a scripted source is exhausted. A live serial
+/// console never ends, so this is false for it. A cell blocked on console input
+/// with `at_eof()` is satisfiable and its read completes with 0 (end of input).
+pub fn at_eof() -> bool {
+    // SAFETY: single CPU, synchronous trap.
+    match unsafe { &*addr_of!(SOURCE) } {
+        Source::Script(data, pos) => *pos >= data.len(),
+        Source::Serial => false,
+    }
+}
+
+/// What [`pump`] achieved.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Pump {
+    /// At least one byte is now in the ring.
+    Data,
+    /// Input has ended (a scripted source is exhausted).
+    Eof,
+    /// Nothing available yet; the caller must halt/re-check. Only a live serial
+    /// source reaches this.
+    Wait,
+}
+
+/// Make console input progress **without** committing to an unbounded wait - the
+/// entry point the scheduler idle state uses (docs/ARCHITECTURE-DEBT.md 2.4).
+///
+/// This is [`refill`] split into its bounded and unbounded halves
+/// (docs/ENGINEERING.md 11, "a state machine must not serve both a bounded sequence
+/// and an unbounded steady state from one entry point"): a scripted source
+/// *produces* its next byte here (through the real UART RX interrupt where one is
+/// wired, so the byte takes a live keystroke's path and the halt is genuine); a live
+/// serial source is polled **once** and otherwise reports [`Pump::Wait`], leaving
+/// the halt to the caller, which may have other deadlines to honour at the same
+/// time.
+pub fn pump() -> Pump {
+    if has_data() {
+        return Pump::Data;
+    }
+    // SAFETY: single CPU, synchronous trap.
+    let src = unsafe { &mut *addr_of_mut!(SOURCE) };
+    match src {
+        Source::Script(data, pos) => {
+            if *pos >= data.len() {
+                return Pump::Eof;
+            }
+            let b = data[*pos];
+            *pos += 1;
+            if crate::arch::uart_irq_enabled() {
+                unsafe {
+                    *addr_of_mut!(IDLED) = true;
+                }
+                crate::arch::uart_inject_and_wait(b);
+            } else {
+                rx_push(b);
+            }
+            Pump::Data
+        }
+        Source::Serial => match crate::arch::serial_read_byte() {
+            Some(b) => {
+                rx_push(b);
+                Pump::Data
+            }
+            None => Pump::Wait,
+        },
+    }
+}
+
+/// Copy whatever is already buffered into `[buf_va, buf_va+len)` and return the
+/// count (0 if the ring is empty). The **non-blocking** half of
+/// [`wait_input`]: the scheduler uses it to complete a cell's parked
+/// `SYS_WAIT_INPUT` once the ring has data (docs/ARCHITECTURE-DEBT.md 2.4).
+///
+/// # Safety
+/// `buf_va` must be a writable `len`-byte buffer in the **active** address space
+/// (the blocked cell's, which the scheduler activates before completing its block).
+pub unsafe fn drain(buf_va: u64, len: usize) -> usize {
+    drain_into(buf_va, len)
+}
+
 /// `SYS_WAIT_INPUT`: block until at least one input byte is available, copy up
 /// to `len` bytes into the cell buffer at `buf_va`, and return the count.
 /// Returns 0 only at end of input (a script source exhausted). The cell's
@@ -168,48 +267,25 @@ fn drain_into(buf_va: u64, len: usize) -> usize {
 }
 
 /// Make at least one byte available in the ring, or return false at end of
-/// input. This is where the block/idle happens.
+/// input. This is where the block/idle happens when `SYS_WAIT_INPUT` has nobody
+/// to hand the CPU to - the bounded [`pump`] wrapped in the unbounded wait.
 fn refill() -> bool {
-    // SAFETY: single CPU, synchronous trap.
-    let src = unsafe { &mut *addr_of_mut!(SOURCE) };
-    match src {
-        Source::Script(data, pos) => {
-            if *pos >= data.len() {
-                return false; // script exhausted = end of input
-            }
-            let b = data[*pos];
-            *pos += 1;
-            if crate::arch::uart_irq_enabled() {
-                // Deliver the scripted byte *through* the real UART RX interrupt
-                // (loopback), genuinely halting at WFI until the handler fires -
-                // the same path a live keystroke takes.
-                unsafe {
-                    *addr_of_mut!(IDLED) = true;
-                }
-                crate::arch::uart_inject_and_wait(b);
-            } else {
-                rx_push(b);
-            }
-            true
-        }
-        Source::Serial => {
-            if crate::arch::uart_irq_enabled() {
-                unsafe {
-                    *addr_of_mut!(IDLED) = true;
-                }
-                // Halt until the UART RX interrupt pushes a byte into the ring.
-                crate::arch::idle_wait();
-            } else {
-                // Poll the UART until a byte arrives (the honest spin).
-                loop {
-                    if let Some(b) = crate::arch::serial_read_byte() {
-                        rx_push(b);
-                        break;
+    loop {
+        match pump() {
+            Pump::Data => return true,
+            Pump::Eof => return false, // script exhausted = end of input
+            Pump::Wait => {
+                if crate::arch::uart_irq_enabled() {
+                    unsafe {
+                        *addr_of_mut!(IDLED) = true;
                     }
+                    // Halt until the UART RX interrupt pushes a byte into the ring.
+                    crate::arch::idle_wait();
+                } else {
+                    // Poll the UART until a byte arrives (the honest spin).
                     core::hint::spin_loop();
                 }
             }
-            true
         }
     }
 }

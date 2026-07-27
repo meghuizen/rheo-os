@@ -159,6 +159,10 @@ name = "netwait"
 path = "src/netwait.rs"
 
 [[bin]]
+name = "schedidle"
+path = "src/schedidle.rs"
+
+[[bin]]
 name = "librheogpu"
 path = "src/librheogpu.rs"
 

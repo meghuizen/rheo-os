@@ -24,6 +24,7 @@ pub mod engine;
 pub mod event;
 pub mod graph;
 pub mod hw;
+pub mod idle;
 pub mod input;
 pub mod ktimer;
 pub mod lease;

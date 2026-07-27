@@ -395,6 +395,13 @@ pub const TIMER_CLIENT_PACER: u64 = 1;
 /// no signal delivery, docs/LIBRHEO.md Phase F): 128 + a SIGSEGV-shaped 11.
 pub const FAULT_EXIT: u64 = 139;
 
+/// The exit code a run ends with when the scheduler finds **nothing runnable and no
+/// wake source left** - a genuine deadlock (docs/ARCHITECTURE-DEBT.md 2.4). The
+/// scheduler prints which cell is blocked on what and ends the run with this, rather
+/// than panicking with a kernel stack trace that names no cell. 128 + a
+/// SIGSTOP-shaped 19, so it cannot collide with `FAULT_EXIT` or a real exit code.
+pub const DEADLOCK_EXIT: u64 = 147;
+
 /// grant_share(grant_cap_id, out_va) -> 0, or u64::MAX on failure. Delegate a
 /// **sealed** memory grant to the peer cell: the kernel maps the grant's frames
 /// into the peer read-only, mints a MemoryGrant capability there referencing the

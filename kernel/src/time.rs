@@ -42,6 +42,18 @@ pub fn timer_did_idle() -> bool {
     TIMER_IDLED.load(Ordering::Relaxed) != 0
 }
 
+/// Record that the kernel genuinely halted on a timer deadline. Called by the
+/// **scheduler idle state** ([`crate::idle`]): since the
+/// docs/ARCHITECTURE-DEBT.md 2.4 slice, a cell's `sleep` registers its deadline and
+/// returns to the scheduler, so the park that used to happen inside
+/// `SYS_ARM_TIMER` now happens in the run loop when no sibling is runnable. It is
+/// the same halt on the same one-shot; recording it here keeps
+/// [`timer_did_idle`] meaning "a `sleep` really idled the CPU" and keeps it set
+/// only from **inside** a park that stopped (docs/ENGINEERING.md 1).
+pub fn mark_timer_idle() {
+    TIMER_IDLED.store(1, Ordering::Relaxed);
+}
+
 /// Monotonic counter reading (raw ticks; per-ISA meaning, see
 /// arch::cycles). Never goes backwards on a single core.
 pub fn monotonic() -> u64 {
