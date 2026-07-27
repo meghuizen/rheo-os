@@ -444,8 +444,14 @@ futex-waits for the worker parked on it, which is resumed and `FUTEX_WAKE`s main
 and only parks the whole cell (the pre-existing cross-cell path) when every
 context is blocked - a single-context cell falls straight to that path,
 byte-for-byte the old behaviour, which is why the whole Linux suite stays green.
-Still cooperative + single-CPU (#27); one `poll` waiter per cell (the copied
-pollset is per-cell; `epoll`, which Node uses, is unlimited).
+**Node now also runs under real timer preemption** (docs/SUBSTRATE.md 15, S3'): the
+`linuxnode` boot enables queue-driven dispatch, 30 slices are genuinely taken to
+sibling contexts mid-run, and it still prints exactly `rheo:42` and exits 0. That is
+the useful half of the preemption proof - a preemption kernel that only ever preempts
+a purpose-built spinner has not been tested by anything. Still **single-CPU** (one core,
+so preemption is the CPU changing hands, not two contexts running at once); one `poll`
+waiter per cell (the copied pollset is per-cell; `epoll`, which Node uses, is
+unlimited).
 
 **The real Bun binary loads deep into JavaScriptCore, and its old diagnosis is
 withdrawn** (GOAL-BUN,
@@ -489,7 +495,14 @@ so it now reports the counters this kernel actually has (elapsed CPU, the cell's
 committed frames as `maxrss`, its fault count) with the rest 0 *because they are 0*; and
 **`MADV_DONTDUMP`/`MADV_DODUMP` were refused** where this OS can provide their entire
 observable effect, since it produces no core dumps (JSC marks the 128 GiB Gigacage
-`MADV_DONTDUMP`, which is the sane thing to do with mostly-untouched address space).
+`MADV_DONTDUMP`, which is the sane thing to do with mostly-untouched address space);
+and the **timer wheel's bulk re-file path skipped its trailing bucket expiry** - taken
+when more than a level-0 revolution has elapsed with nothing serviced, it left an
+already-due timer to fire on the *next* service, after timers with later deadlines,
+breaking the one property the wheel exists to guarantee. Only after a long stall, so it
+presented as a rare load-dependent flake in `substrate` (observed failing while the host
+was building three ISAs) rather than as a bug; a transport would have applied a later
+RTO before an earlier one.
 
 **Node, by contrast, now completes *under* preemption** - 30 slices taken to sibling
 contexts, exact stdout, exit 0. That is the more useful half of the experiment: a
