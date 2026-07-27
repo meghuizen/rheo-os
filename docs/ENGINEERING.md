@@ -439,6 +439,23 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   the inference restored, it fails with the exact original message. That is the
   difference between "reasoned and code-reviewed" (section 7's honest but weaker
   label) and proven.
+- **Demand paging makes every kernel touch of a user buffer a fault site.** Making
+  file mappings demand-paged was safe because a program reads its own mapping before
+  passing it anywhere. Extending it to the ELF *image* was not: a program hands a
+  pointer into its own rodata straight to `write`, and the kernel then dereferenced a
+  page nothing had faulted in yet - a load fault at a kernel PC, which is not
+  resumable here. This is precisely why Linux has `copy_from_user` and a fixup table.
+  The lesson is general: when you make a page's presence lazy, every *other* reader
+  of that page becomes a caller that must be able to make it present. Enumerate those
+  readers before shipping the laziness, not after.
+- **State established before a reset that clears it is a silent zero, not an error.**
+  The loader registered a backing store, then the harness called `user::reset()`,
+  which cleared the registry - so the mapping records named a freed entry and every
+  page of the image came back zeroed. On RISC-V a page of zeros is an illegal
+  instruction, so the symptom was `exit 132` at the entry point with nothing in
+  between. Two fixes, and both were needed: order the reset before the thing that
+  populates, and make the consumer *check* the handle is live so the ordering mistake
+  can never again present as blank memory.
 - **A return path that "works" may be working for the wrong reason.** The x86-64
   ring-3 fault resume used `sysretq`, which takes RIP from RCX and RFLAGS from R11 -
   it *consumes* both registers. Correct for a syscall return (SYSCALL is defined to

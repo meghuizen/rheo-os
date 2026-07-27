@@ -487,6 +487,15 @@ so was its claim of 182 MiB of `.bss`, which measurement shows does not exist.
    anything); fatal for the first path that does. Faults now resume through
    `iret_resume`, restoring every register.
 
+   **Blocked, with the blocker identified:** extending demand paging to the ELF
+   image was written and reverted, because it exposed a **prerequisite**. With the
+   image lazy, a cell passes a pointer into its own untouched rodata to `write` and
+   the *kernel* dereferences an absent user page - a load fault at a kernel PC, which
+   is not resumable here. That is why Linux has `copy_from_user` with a fixup table.
+   The fix here needs no new mechanism: the F1 hardening already routes **every**
+   cell-supplied pointer through `user::user_read_ok`/`user_write_ok`/`user_buf`, so
+   those checks gain "ensure present" alongside "in range". It must land first.
+
    **Still open:** the ELF image itself. `load::load_elf_linux` streams every
    `PT_LOAD` page into a frame at load time, and for an `ET_EXEC`-with-`PT_INTERP`
    binary like this one the *kernel* loads the main program - so that path, not
