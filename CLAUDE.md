@@ -374,9 +374,14 @@ straight off ext4 - the shape a shell launching Claude Code needs. This closes
 **L0-L7 Linux personality is complete** - unpatched static and dynamic glibc C,
 unpatched Rust `std`, and the real upstream uutils/coreutils all run as cells,
 kernel-resident like `svc.rs` and adding no kernel object (`MAX_MAPPED_FILES` is
-now **64**, headroom for a production binary's dozen-plus shared libraries; a
-dynamic Rust std / uutils-0.9.x fixture exercising many libs is the documented
-next proof).
+now **64**, headroom for a production binary's dozen-plus shared libraries). An
+**open finding** gates the next rung (GOAL-DYN-MULTILIB, #169): every dynamic
+proof so far links exactly one shared library (`libc`); a binary linking a
+*second* (`libc` + `libm`) fails ld.so cross-object version resolution even
+though the seeded `libc` exports the needed versions - not a fixture skew, a real
+multi-library resolution defect in the personality (ld.so itself runs and
+version-checks correctly), documented in docs/LINUX-COMPAT.md L7 as the next
+investigation before a production multi-lib binary can run.
 **L8 has begun** (docs/LINUX-COMPAT.md L8, docs/NETSTACK.md rheo-net Phase N1d):
 **AF_UNIX (Unix domain) sockets** - `socket`/`socketpair`/`bind`/`listen`/
 `accept`/`connect`/`sendmsg`/`recvmsg` on SOCK_STREAM, sockets as per-cell fds

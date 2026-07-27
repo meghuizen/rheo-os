@@ -658,12 +658,27 @@ fixup path.
     `libc.so.6` all stream off the disk on demand (447-590 block-cache fills per
     ISA, exact stdout + exit 12, all three ISAs), none resident whole. That is the
     shell-launches-a-dynamic-binary-off-disk shape the real target needs.
-  - Accommodations, disclosed: a dynamic **Rust** `std` hello is not built (it
-    additionally needs `libgcc_s.so.1`/`libm.so.6` seeded); the C hello is the L7
-    proof. `MAX_MAPPED_FILES` is now **64** (raised from 8), headroom for a
-    production binary's dozen-plus shared libraries - a documented limit-raise,
-    not a design change. **MAP_SHARED of a file** stays unmodeled (ld.so uses
-    PRIVATE).
+  - **Open finding - multi-library resolution (GOAL-DYN-MULTILIB, task #169).**
+    Every proof above links exactly **one** shared library (`libc`). A binary that
+    links a **second** (`dmath`: a C `sqrt` program, so `libc` + `libm`) fails at
+    runtime: ld.so prints `libm.so.6: version 'GLIBC_2.34' not found (required by
+    dmath)` and `GLIBC_PRIVATE not found (required by libm.so.6)` - **even though**
+    the seeded `libc.so.6` demonstrably exports `GLIBC_2.34`/`GLIBC_PRIVATE`
+    (`readelf -V`) and the single-lib `dhello`, which also needs `GLIBC_2.34`,
+    resolves it against that same `libc`. So this is **not** a missing-version
+    fixture skew - ld.so's cross-object version resolution misbehaves once more
+    than one `DT_NEEDED` library is mapped (the error even names `libm` while
+    looking up a `libc`-provided version). ld.so *itself* runs and version-checks
+    correctly (the check firing is the linker working); the defect is in what the
+    personality gives it to resolve against for the 2nd file-backed library - the
+    next investigation (likely mmap ordering / the demand-paged file-backed read
+    of the 2nd `.so`, or the `DT_NEEDED` search list). A production binary links a
+    dozen libraries, so this gates the real target. `MAX_MAPPED_FILES` is already
+    raised to **64** for it.
+  - Accommodations, disclosed: a dynamic **Rust** `std` hello is additionally
+    skewed (rustc's bundled std targets a newer glibc than the cross sysroot), so
+    a version-consistent multi-lib fixture uses cross-gcc-built C. **MAP_SHARED of
+    a file** stays unmodeled (ld.so uses PRIVATE).
 
 - **L8 [done]** - **AF_UNIX (Unix domain) sockets** - the first slice of the
   socket surface (docs/NETSTACK.md rheo-net Phase N1d). Like every prior
