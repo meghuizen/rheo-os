@@ -235,6 +235,66 @@ fn path_ok(va: u64, len: u64) -> Option<()> {
     user::user_buf(va, len as usize).map(|_| ())
 }
 
+// ============================================================================
+// The bridge framework
+// ============================================================================
+//
+// `ARCHITECTURE.md` 5 puts filesystems, network stacks and device drivers
+// permanently **outside** the kernel, and the kernel is allocation-free, so it
+// can hold none of them. What it holds instead is a **bridge**: a table of `fn`
+// pointers that whatever owns the real implementation registers at boot. The
+// kernel serves the verb; the policy lives outside. `FileOps` established the
+// pattern (which is what keeps the kernel filesystem-free while still answering
+// `open`/`read`/`write`), `SocketOps` repeated it for the network - and by the
+// third and fourth table the static/setter/getter triple had been hand-written
+// often enough to earn a type (docs/ARCHITECTURE-DEBT.md 5).
+//
+// Adds **no kernel object** (ARCHITECTURE.md 6): a bridge is not addressable, is
+// not delegable, and carries no authority of its own - it is where a verb the
+// kernel already serves gets its implementation. Registration is a boot-time
+// act by the binary that owns the device or the service.
+
+/// A registration slot for one bridge table.
+///
+/// Installed once at boot and read-only afterwards, which is what makes the
+/// `unsafe` inside sound on the single-CPU path; when a secondary core can run
+/// cell code (SMP-2, task #27) this becomes the one place that has to change,
+/// instead of the four hand-rolled copies it replaces.
+pub struct Bridge<T: Copy + 'static> {
+    slot: Option<T>,
+}
+
+impl<T: Copy + 'static> Bridge<T> {
+    pub const fn empty() -> Bridge<T> {
+        Bridge { slot: None }
+    }
+
+    /// Install the table. Called once, at boot, by the owner of the
+    /// implementation; a second call replaces the first.
+    ///
+    /// # Safety
+    /// Must run before any cell does, and never concurrently with [`get`](Self::get).
+    pub unsafe fn install(this: *mut Bridge<T>, ops: T) {
+        // SAFETY: the caller guarantees boot-time exclusivity.
+        unsafe { (*this).slot = Some(ops) }
+    }
+
+    /// The installed table, or `None` if nothing registered one - which every
+    /// caller must handle, because "no bridge" is the honest answer for a kernel
+    /// built without that service (docs/ENGINEERING.md 7), not a reason to
+    /// pretend the operation succeeded.
+    ///
+    /// # Safety
+    /// Must not run concurrently with [`install`](Self::install). The safe
+    /// accessors below (`file_ops`, `socket_ops`, `nic_ops`, `display_ops`) are
+    /// the intended entry points: each names the boot-time-only-install
+    /// invariant that discharges this.
+    pub unsafe fn get(this: *const Bridge<T>) -> Option<&'static T> {
+        // SAFETY: the caller guarantees no concurrent install.
+        unsafe { (*this).slot.as_ref() }
+    }
+}
+
 /// The POSIX personality's file operations (docs/USERLAND.md M2). In the full
 /// design these live in a service cell reached over a queue pair; for M2 they
 /// are function pointers a test/service registers, keeping the kernel free of
@@ -253,22 +313,21 @@ pub struct FileOps {
     pub getdents: fn(path_va: u64, path_len: u64, buf_va: u64, buf_len: u64) -> i64,
 }
 
-static mut FILE_OPS: Option<FileOps> = None;
+static mut FILE_OPS: Bridge<FileOps> = Bridge::empty();
 
 /// Install the POSIX personality handler (called once at boot by the cell
 /// that provides the filesystem view).
 pub fn set_file_ops(ops: FileOps) {
-    unsafe {
-        *core::ptr::addr_of_mut!(FILE_OPS) = Some(ops);
-    }
+    // SAFETY: boot-time, before any cell runs.
+    unsafe { Bridge::install(core::ptr::addr_of_mut!(FILE_OPS), ops) }
 }
 
 /// The installed POSIX personality handler, if any. Public so the Linux
 /// personality's fd table can forward file I/O through the same VFS
 /// (docs/LINUX-COMPAT.md L2).
 pub fn file_ops() -> Option<&'static FileOps> {
-    // SAFETY: set once at boot, read-only afterwards.
-    unsafe { (*core::ptr::addr_of!(FILE_OPS)).as_ref() }
+    // SAFETY: installed once at boot, read-only afterwards.
+    unsafe { Bridge::get(core::ptr::addr_of!(FILE_OPS)) }
 }
 
 // ----------------------------------------------------- the remote-INET bridge
@@ -341,22 +400,94 @@ pub struct SocketOps {
     pub tcp_close: fn(h: u64),
 }
 
-static mut SOCKET_OPS: Option<SocketOps> = None;
+static mut SOCKET_OPS: Bridge<SocketOps> = Bridge::empty();
 
 /// Install the remote-INET datapath (called once at boot by the cell/test kernel
 /// that owns the network stack). Without it, a non-loopback destination keeps
 /// returning `ENETUNREACH` exactly as before N4b.
 pub fn set_socket_ops(ops: SocketOps) {
-    unsafe {
-        *core::ptr::addr_of_mut!(SOCKET_OPS) = Some(ops);
-    }
+    // SAFETY: boot-time, before any cell runs.
+    unsafe { Bridge::install(core::ptr::addr_of_mut!(SOCKET_OPS), ops) }
 }
 
 /// The installed remote-INET datapath, if any. Read by the Linux personality's
 /// socket calls (`linux::fd`) for non-loopback addresses.
 pub fn socket_ops() -> Option<&'static SocketOps> {
-    // SAFETY: set once at boot, read-only afterwards.
-    unsafe { (*core::ptr::addr_of!(SOCKET_OPS)).as_ref() }
+    // SAFETY: installed once at boot, read-only afterwards.
+    unsafe { Bridge::get(core::ptr::addr_of!(SOCKET_OPS)) }
+}
+
+// ------------------------------------------------- the NIC / display bridges
+//
+// `ARCHITECTURE.md` 5 keeps device drivers "beyond queue/IOMMU/reset plumbing"
+// permanently outside the kernel. The queue's opcode dispatch nevertheless named
+// `hw::virtio_net::tx` and `hw::virtio_gpu::present` **directly** - twenty lines
+// below the `file_ops()` bridge that gets it right - so the object layer knew
+// two concrete drivers by name (docs/ARCHITECTURE-DEBT.md 3.2). These two tables
+// close that: the opcodes now reach a device the same way they reach a
+// filesystem, and the kernel binary that owns the device registers it.
+//
+// This is a *seam*, not a rewrite: the virtio drivers still live in `hw/` and are
+// still what a kernel binary installs here. What changes is that `queue` no
+// longer names them, so a driver **cell** (the documented end state) can be
+// installed in exactly the same slot with no change above it. The registration is
+// `hw::register_device_bridges()`, called from boot, so nothing else moves.
+
+/// The NIC datapath the `OP_NET_*` opcodes bridge to (docs/NETWORKING.md,
+/// docs/LIBRHEO.md Phase G). Each handler runs in kernel context during the
+/// submitting cell's `SYS_DOORBELL` trap, so buffer arguments are raw VAs in the
+/// active address space - **already range-checked by the dispatcher** before the
+/// call. Each returns the opcode's `(status, result)` pair.
+#[derive(Copy, Clone)]
+pub struct NicOps {
+    /// Send the `len` bytes at `buf_va` as one Ethernet frame; `result` = bytes sent.
+    pub tx: fn(buf_va: u64, len: u64) -> (u32, u32),
+    /// Copy one received frame into `buf_va` (up to `len`); `result` = frame
+    /// length, 0 when nothing has arrived (a cell that wants to *wait* uses
+    /// `SYS_WAIT_NET`).
+    pub rx: fn(buf_va: u64, len: u64) -> (u32, u32),
+    /// Write the 6-byte MAC at `buf_va`; `result` = 6.
+    pub mac: fn(buf_va: u64) -> (u32, u32),
+}
+
+static mut NIC_OPS: Bridge<NicOps> = Bridge::empty();
+
+/// Install the NIC datapath (once, at boot, by the binary that discovered it).
+pub fn set_nic_ops(ops: NicOps) {
+    // SAFETY: boot-time, before any cell runs.
+    unsafe { Bridge::install(core::ptr::addr_of_mut!(NIC_OPS), ops) }
+}
+
+/// The installed NIC datapath, if any. `None` means this kernel has no NIC
+/// bridge, and the `OP_NET_*` opcodes complete `STATUS_IO` - the honest answer,
+/// which is also exactly what the 40-odd kernels with no netdev want.
+pub fn nic_ops() -> Option<&'static NicOps> {
+    // SAFETY: installed once at boot, read-only afterwards.
+    unsafe { Bridge::get(core::ptr::addr_of!(NIC_OPS)) }
+}
+
+/// The display datapath `OP_GPU_PRESENT` bridges to (docs/LIBRHEO.md Phase H,
+/// docs/DISPLAY.md). Same convention as [`NicOps`].
+#[derive(Copy, Clone)]
+pub struct DisplayOps {
+    /// Present the `w x h` RGBA framebuffer at `buf_va` to scanout 0;
+    /// `result` = bytes presented.
+    pub present: fn(buf_va: u64, w: u32, h: u32) -> (u32, u32),
+}
+
+static mut DISPLAY_OPS: Bridge<DisplayOps> = Bridge::empty();
+
+/// Install the display datapath (once, at boot).
+pub fn set_display_ops(ops: DisplayOps) {
+    // SAFETY: boot-time, before any cell runs.
+    unsafe { Bridge::install(core::ptr::addr_of_mut!(DISPLAY_OPS), ops) }
+}
+
+/// The installed display datapath, if any. `None` -> `OP_GPU_PRESENT` completes
+/// `STATUS_IO`.
+pub fn display_ops() -> Option<&'static DisplayOps> {
+    // SAFETY: installed once at boot, read-only afterwards.
+    unsafe { Bridge::get(core::ptr::addr_of!(DISPLAY_OPS)) }
 }
 
 /// Copy `len` bytes from a loaded program's buffer to the console

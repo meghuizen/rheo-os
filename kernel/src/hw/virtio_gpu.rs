@@ -820,12 +820,17 @@ impl VirtioGpu {
 
 static mut GPU: Option<VirtioGpu> = None;
 
-/// Install the discovered device as the kernel's GPU (called once at boot).
+/// Install the discovered device as the kernel's GPU (called once at boot), and
+/// register it as the `svc::DisplayOps` bridge `OP_GPU_PRESENT` reaches. Same
+/// reasoning as `virtio_net::install`: registration where the device is known to
+/// exist, so a kernel with no display answers `STATUS_IO` honestly and the
+/// queue's dispatch need not name this module (docs/ARCHITECTURE-DEBT.md 3.2).
 pub fn install(dev: VirtioGpu) {
     // SAFETY: single-threaded boot; set once before any cell runs.
     unsafe {
         *core::ptr::addr_of_mut!(GPU) = Some(dev);
     }
+    crate::svc::set_display_ops(crate::svc::DisplayOps { present });
 }
 
 fn gpu_mut() -> Option<&'static mut VirtioGpu> {

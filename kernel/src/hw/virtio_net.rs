@@ -753,12 +753,21 @@ impl VirtioNet {
 
 static mut NET: Option<VirtioNet> = None;
 
-/// Install the discovered device as the kernel's NIC (called once at boot).
+/// Install the discovered device as the kernel's NIC (called once at boot), and
+/// register it as the `svc::NicOps` bridge the `OP_NET_*` opcodes reach.
+///
+/// The registration lives here rather than in a boot sequencer because *this* is
+/// where the device is known to exist: a kernel binary that never discovers a NIC
+/// never installs one, and its `OP_NET_*` opcodes then complete `STATUS_IO`
+/// instead of reaching a driver that is not there. That is what lets the queue's
+/// dispatch stop naming this module (docs/ARCHITECTURE-DEBT.md 3.2) without any
+/// caller changing: a driver **cell** installs into the same slot later.
 pub fn install(dev: VirtioNet) {
     // SAFETY: single-threaded boot; set once before any cell runs.
     unsafe {
         *core::ptr::addr_of_mut!(NET) = Some(dev);
     }
+    crate::svc::set_nic_ops(crate::svc::NicOps { tx, rx, mac });
 }
 
 fn net_mut() -> Option<&'static mut VirtioNet> {
