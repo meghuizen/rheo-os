@@ -440,6 +440,22 @@ impl<T: Copy> Funded<T> {
         Some(unsafe { (base as *mut T).add(offset) })
     }
 
+    /// A reference to element `index`, or `None` beyond capacity.
+    ///
+    /// Exists beside [`Funded::get`] (which copies) because a table migrated from
+    /// a fixed array has call sites that take a reference - and, more importantly,
+    /// because **an element's address is stable for as long as it is in
+    /// capacity**. Growth allocates *new* frames and files them in the directory;
+    /// it never moves or reallocates the frames already there. That is what lets a
+    /// caller hand out a long-lived pointer to a slot - the Linux personality's
+    /// per-context `TrapFrame` is addressed exactly that way - which a `Vec`-shaped
+    /// container could not support.
+    pub fn get_ref(&self, index: usize) -> Option<&T> {
+        // SAFETY: `slot_ptr` bounds the index; the frame is zero-initialised, so
+        // every in-capacity slot holds a valid bit pattern for `T`.
+        self.slot_ptr(index).map(|p| unsafe { &*p })
+    }
+
     /// Read element `index`, or `None` beyond capacity.
     pub fn get(&self, index: usize) -> Option<T> {
         // SAFETY: `slot_ptr` bounds the index and the frame is zero-initialised,

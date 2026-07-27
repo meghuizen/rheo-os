@@ -1,0 +1,17 @@
+# Standalone crate (its own workspace): built by xtask for a
+# `*-unknown-linux-gnu` target as the many-context fixture
+# for the Linux personality (docs/LINUX-COMPAT.md L4), not part of the kernel
+# workspace. The empty [workspace] table detaches it.
+[workspace]
+
+[package]
+name = "manythreads"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "manythreads"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"

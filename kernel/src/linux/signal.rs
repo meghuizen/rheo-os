@@ -26,14 +26,11 @@
 
 use crate::arch::{self, SigFrameSpec, TrapFrame};
 use crate::linux::errno::*;
-use crate::linux::thread::{self, MAX_THREADS};
+use crate::linux::thread::{self};
 use crate::linux::{Ctl, err, ret};
+use crate::mm::kmeta::{Funded, Owner};
 use crate::user::MAX_CELLS;
 use core::ptr::addr_of_mut;
-
-/// Maximum execution contexts per cell (mirrors `thread::MAX_THREADS`), the
-/// dimension of the per-context signal state.
-const MAX_CONTEXTS: usize = MAX_THREADS;
 
 /// Number of signals (1..=NSIG). Masks are `u64` (signal n uses bit n-1).
 const NSIG: usize = 64;
@@ -115,24 +112,66 @@ impl SigCtx {
 /// per-context. Fixed-size so the kernel stays allocation-free.
 static mut ACTIONS: [[SigAction; NSIG + 1]; MAX_CELLS] =
     [const { [const { SigAction::dfl() }; NSIG + 1] }; MAX_CELLS];
-static mut CTXS: [[SigCtx; MAX_CONTEXTS]; MAX_CELLS] =
-    [const { [const { SigCtx::new() }; MAX_CONTEXTS] }; MAX_CELLS];
+/// Per-context signal state, **funded** and growing with the cell's context table
+/// (docs/SUBSTRATE.md pillar 1).
+///
+/// It has to track `thread`'s table rather than carry its own dimension: a context
+/// index is the key into both, so a fixed array here would silently become the
+/// real thread ceiling the moment `thread` stopped having one.
+static mut CTXS: [Funded<SigCtx>; MAX_CELLS] = [const { Funded::new() }; MAX_CELLS];
 
 fn actions(cell: usize) -> &'static mut [SigAction; NSIG + 1] {
     // SAFETY: single CPU, synchronous traps; one cell runs at a time.
     unsafe { &mut (*addr_of_mut!(ACTIONS))[cell] }
 }
 
+/// Per-context signal state for context `idx` of `cell`, growing the table on
+/// demand.
+///
+/// Growth is charged to the cell. If it cannot grow, this returns a reference to a
+/// **scratch** slot rather than failing: every caller here is delivering or
+/// masking a signal on a path with no way to report an allocation failure, and the
+/// alternative to a scratch slot is a panic from unprivileged code. The cost is
+/// that signal state for a context beyond the budget is not persisted, which is
+/// stated rather than silent - and a cell that cannot afford one more `SigCtx`
+/// (32 bytes) has already failed to afford the context itself, which is refused
+/// with `-EAGAIN` at `clone`.
 fn ctx(cell: usize, idx: usize) -> &'static mut SigCtx {
-    // SAFETY: single CPU, synchronous traps.
-    unsafe { &mut (*addr_of_mut!(CTXS))[cell][idx] }
+    // SAFETY: single CPU, synchronous traps; one context runs at a time.
+    unsafe {
+        let t = &mut (*addr_of_mut!(CTXS))[cell];
+        t.set_owner(Owner::cell(cell));
+        if idx >= t.capacity() {
+            let had = t.capacity();
+            if t.reserve(idx + 1) {
+                for k in had..t.capacity() {
+                    t.set(k, SigCtx::new());
+                }
+            }
+        }
+        match t.get_mut(idx) {
+            Some(r) => r,
+            None => &mut *addr_of_mut!(CTX_SCRATCH),
+        }
+    }
+}
+
+/// The fallback slot [`ctx`] hands back when a cell cannot afford to grow its
+/// per-context signal table. Shared and deliberately not per-cell: it exists so
+/// the signal paths have somewhere valid to write, not to preserve anything.
+static mut CTX_SCRATCH: SigCtx = SigCtx::new();
+
+/// Context slots cell `cell` currently has signal state for.
+fn ctx_capacity(cell: usize) -> usize {
+    // SAFETY: single CPU.
+    unsafe { (*addr_of_mut!(CTXS))[cell].capacity() }
 }
 
 /// Clear all per-cell signal state (called from `linux::reset`).
 pub fn reset() {
     for c in 0..MAX_CELLS {
         *actions(c) = [SigAction::dfl(); NSIG + 1];
-        for i in 0..MAX_CONTEXTS {
+        for i in 0..ctx_capacity(c) {
             *ctx(c, i) = SigCtx::new();
         }
     }
@@ -148,7 +187,7 @@ fn bit(signo: u32) -> u64 {
 pub fn fork_copy(from: usize, to: usize) {
     *actions(to) = *actions(from);
     *ctx(to, 0) = *ctx(from, 0);
-    for i in 1..MAX_CONTEXTS {
+    for i in 1..ctx_capacity(to) {
         *ctx(to, i) = SigCtx::new();
     }
 }
@@ -167,7 +206,7 @@ pub fn exec_reset(cell: usize) {
     ctx(cell, 0).alt_sp = 0;
     ctx(cell, 0).alt_size = 0;
     ctx(cell, 0).alt_active = false;
-    for i in 1..MAX_CONTEXTS {
+    for i in 1..thread::capacity(cell).max(ctx_capacity(cell)) {
         *ctx(cell, i) = SigCtx::new();
     }
 }

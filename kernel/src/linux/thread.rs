@@ -29,14 +29,33 @@ use crate::ktimer::{self, TimerClient};
 use crate::linux::Ctl;
 use crate::linux::errno::*;
 use crate::linux::proc::Block;
+use crate::mm::kmeta::{Funded, Owner};
 use crate::user::{self, MAX_CELLS};
 use core::ptr::addr_of_mut;
 
-/// Maximum execution contexts per cell (docs/LINUX-COMPAT.md L4). A program
-/// spawning more than this gets `-EAGAIN` from `clone` (glibc surfaces it as
-/// `pthread_create` returning `EAGAIN`). Small and fixed so the kernel stays
-/// allocation-free.
-pub const MAX_THREADS: usize = 8;
+/// Contexts a cell starts with room for. **Not a ceiling** - the context tables
+/// are [`Funded`] and grow on demand (docs/SUBSTRATE.md pillar 1), so what
+/// actually bounds a cell's thread count is its own frame budget.
+///
+/// This used to be `MAX_THREADS = 8`, a fixed array dimension, and it was the
+/// wrong shape for the target workloads: Node's libuv threadpool is 4 by default
+/// *plus* V8's helper threads *plus* any `worker_threads` the program creates, so
+/// a perfectly ordinary Node program exceeded it and got `-EAGAIN` from `clone`
+/// (surfacing as `pthread_create` failing). 8 remains the *initial* reservation
+/// because it covers the common case in one frame's worth of slots; growth past
+/// it is ordinary and costs the cell frames it is charged for.
+pub const INITIAL_CONTEXTS: usize = 8;
+
+/// A hard sanity ceiling on contexts per cell.
+///
+/// Deliberately **not** the mechanism that limits anything in practice: a cell
+/// runs out of frame budget long before this, and that refusal is the meaningful
+/// one because it is attributable. This exists only so that a runaway
+/// `clone` loop is bounded by something nameable rather than by whichever
+/// allocation happens to fail first, and so the per-context tables that are
+/// indexed by a small integer keep a stated upper bound. Linux has the same shape
+/// in `RLIMIT_NPROC`.
+pub const CONTEXT_CEILING: usize = 1024;
 
 /// Per-context FP/SIMD save area. Sized above the largest per-ISA image
 /// (x86 FXSAVE 512, ARM64 V-regs+FPSR/FPCR 528, RISC-V f-regs+fcsr 264) and
@@ -64,6 +83,10 @@ enum TState {
     Blocked,
 }
 
+/// `Copy` because it lives in a [`Funded`] table, whose storage is raw frames
+/// with no drop glue (docs/SUBSTRATE.md pillar 1). Every field already is: a raw
+/// frame pointer, small integers, and two `Copy` records.
+#[derive(Copy, Clone)]
 struct Thread {
     /// Saved register state. Context 0 points at the cell's installed frame;
     /// others point into `FRAMES`.
@@ -94,7 +117,6 @@ struct Thread {
     /// context is `Blocked` for exactly one of the two reasons at a time. The
     /// scheduler (`proc.rs`) judges its satisfiability and completes it.
     pblock: Block,
-    fp: FpArea,
 }
 
 impl Thread {
@@ -108,28 +130,234 @@ impl Thread {
             fut_addr: 0,
             fut_deadline: 0,
             pblock: Block::None,
-            fp: FpArea::new(),
         }
     }
 }
 
-static mut THREADS: [[Thread; MAX_THREADS]; MAX_CELLS] =
-    [const { [const { Thread::new() }; MAX_THREADS] }; MAX_CELLS];
+/// Per-cell context tables, **funded** rather than fixed arrays.
+///
+/// Two separate tables rather than one, because `TrapFrame` is large and its
+/// slots are addressed by long-lived pointer (see [`child_frame_ptr`]), while
+/// `Thread` is small and read by value. Keeping them apart means a cell with many
+/// contexts pays for frames in the granularity each actually needs.
+static mut THREADS: [ContextTable; MAX_CELLS] = [const { ContextTable::new() }; MAX_CELLS];
 /// Kernel-owned frames for clone-created contexts (index 0 unused - context 0
 /// reuses the cell's installed frame).
-static mut FRAMES: [[TrapFrame; MAX_THREADS]; MAX_CELLS] =
-    [const { [const { arch::trapframe_zeroed() }; MAX_THREADS] }; MAX_CELLS];
+///
+/// **Slot addresses are stable.** `child_frame_ptr` hands out a `*mut TrapFrame`
+/// into this table that the arch layer keeps and dereferences later, so the
+/// storage must never move under it. [`Funded`] guarantees that: growth allocates
+/// new frames and files them in its directory, and never relocates the frames
+/// already there (docs/SUBSTRATE.md pillar 1). A `Vec`-shaped container would
+/// have made this migration unsound.
+static mut FRAMES: [Funded<TrapFrame>; MAX_CELLS] = [const { Funded::new() }; MAX_CELLS];
+
+/// Per-context FP/SIMD save areas, in their **own** funded table.
+///
+/// Split out of [`Thread`] rather than embedded in it, for two reasons that point
+/// the same way. The forcing one: `arch::FP_AREA_LEN` is **4096 on x86-64** (an
+/// XSAVE area sized for AVX-512), so a `Thread` carrying it inline is larger than
+/// a frame - and a [`Funded`] element must fit in one, since the page directory
+/// maps an element to a `(page, offset)` pair. Embedding it made every reservation
+/// fail, and the const assert below now makes that a compile error rather than a
+/// runtime one.
+///
+/// The design reason: this is bulk state touched only at a context switch, while
+/// `Thread` is small metadata read on every scheduling decision. Keeping a 4 KiB
+/// blob out of the hot struct is what a switch-heavy path wants anyway.
+static mut FPAREAS: [Funded<FpArea>; MAX_CELLS] = [const { Funded::new() }; MAX_CELLS];
+
+// Every element type stored in a `Funded` table must fit in one frame. Asserted
+// here, per type, so exceeding it cannot compile - the failure mode it replaces was
+// a reservation that silently returned false at run time and reported the wrong
+// cause (an exhausted pool) for it.
+const _: () = assert!(crate::mm::kmeta::elems_per_page::<Thread>() > 0);
+const _: () = assert!(crate::mm::kmeta::elems_per_page::<TrapFrame>() > 0);
+const _: () = assert!(crate::mm::kmeta::elems_per_page::<FpArea>() > 0);
+
+/// Pointer to context `i`'s FP save area, or null when the slot is not reserved.
+///
+/// A raw pointer because that is what `arch::save_user_fp`/`restore_user_fp` take,
+/// and because the address must stay valid across the switch - which it does, since
+/// a `Funded` slot never moves while it is in capacity.
+fn fp_ptr(cell: usize, i: usize) -> *mut u8 {
+    // SAFETY: single CPU; the slot's address is stable (see `FRAMES`).
+    unsafe {
+        let t = &mut (*addr_of_mut!(FPAREAS))[cell];
+        match t.get_mut(i) {
+            Some(a) => a.0.as_mut_ptr(),
+            None => {
+                // Unreachable if `capacity` is respected, and worth saying rather
+                // than returning null: the arch FP save/restore would dereference
+                // it and take a *kernel-mode* page fault at address zero, which
+                // reports as a bare TRAP with no hint at the cause. `FP_SCRATCH`
+                // keeps that a wrong-but-contained value plus a diagnostic.
+                crate::println!(
+                    "linux: cell {cell} context {i} has no FP save area \
+                     (capacity {}) - using scratch",
+                    t.capacity()
+                );
+                (*addr_of_mut!(FP_SCRATCH)).0.as_mut_ptr()
+            }
+        }
+    }
+}
+
+/// Fallback FP area for the unreachable case in [`fp_ptr`]. One shared area, since
+/// it exists to keep a stray access in mapped memory rather than to preserve state.
+static mut FP_SCRATCH: FpArea = FpArea::new();
 static mut CUR_THREAD: [usize; MAX_CELLS] = [0; MAX_CELLS];
 static mut NEXT_TID: [u32; MAX_CELLS] = [1001; MAX_CELLS];
 
-fn threads(cell: usize) -> &'static mut [Thread; MAX_THREADS] {
+/// A cell's context table: a [`Funded`] array of [`Thread`] that keeps array
+/// indexing at its call sites.
+///
+/// `Index`/`IndexMut` are implemented so the ~40 existing `threads(cell)[i].field`
+/// sites read exactly as they did over the fixed array - the migration changes
+/// *where the storage comes from*, not how the personality talks about contexts.
+/// Both panic on an out-of-capacity index, which is what array indexing already
+/// did; callers bound their loops with [`ContextTable::capacity`] instead of a
+/// constant, and the one site that creates a context calls
+/// [`ContextTable::ensure`] first.
+struct ContextTable {
+    t: Funded<Thread>,
+}
+
+impl ContextTable {
+    const fn new() -> ContextTable {
+        ContextTable { t: Funded::new() }
+    }
+
+    /// Slots currently addressable.
+    fn capacity(&self) -> usize {
+        self.t.capacity()
+    }
+
+    /// Grow to at least `n` slots, charging `owner`. False when the owner is out
+    /// of budget - the caller turns that into `-EAGAIN`, which is what Linux
+    /// reports when a process cannot create another thread.
+    fn ensure(&mut self, n: usize, owner: Owner) -> bool {
+        if n > CONTEXT_CEILING {
+            return false;
+        }
+        self.t.set_owner(owner);
+        if n <= self.t.capacity() {
+            return true;
+        }
+        let had = self.t.capacity();
+        if !self.t.reserve(n) {
+            return false;
+        }
+        // Freshly grown slots are zeroed frames, and an all-zero `Thread` is not a
+        // valid free slot (`TState::Free` happens to be 0 today, but relying on
+        // that would break silently if the enum were ever reordered). Initialise
+        // them explicitly.
+        for i in had..self.t.capacity() {
+            self.t.set(i, Thread::new());
+        }
+        true
+    }
+
+    /// Release the table's frames (cell teardown).
+    fn release(&mut self) {
+        self.t.release();
+    }
+
+    /// Every slot, mutably - the `iter_mut()` the fixed array offered, kept so the
+    /// reset/teardown paths read unchanged.
+    fn for_each_mut(&mut self, mut f: impl FnMut(&mut Thread)) {
+        for i in 0..self.t.capacity() {
+            if let Some(r) = self.t.get_mut(i) {
+                f(r);
+            }
+        }
+    }
+
+    /// Every slot, by value.
+    fn iter_values(&self) -> impl Iterator<Item = Thread> + '_ {
+        (0..self.t.capacity()).filter_map(move |i| self.t.get(i))
+    }
+}
+
+impl core::ops::Index<usize> for ContextTable {
+    type Output = Thread;
+    fn index(&self, i: usize) -> &Thread {
+        self.t
+            .get_ref(i)
+            .expect("context index past the cell's table capacity")
+    }
+}
+
+impl core::ops::IndexMut<usize> for ContextTable {
+    fn index_mut(&mut self, i: usize) -> &mut Thread {
+        self.t
+            .get_mut(i)
+            .expect("context index past the cell's table capacity")
+    }
+}
+
+fn threads(cell: usize) -> &'static mut ContextTable {
     // SAFETY: single CPU, synchronous traps; one context runs at a time.
     unsafe { &mut (*addr_of_mut!(THREADS))[cell] }
 }
 
+/// Contexts cell `cell` currently has slots for - the iteration bound that
+/// replaced the old `MAX_THREADS` constant.
+///
+/// The **minimum** across the three per-context tables, which is the only safe
+/// answer: `Funded` rounds a reservation up to whole frames, and the three element
+/// types have very different sizes (a `Thread` is tens of bytes, a `TrapFrame`
+/// hundreds, an `FpArea` exactly one frame on x86-64), so reserving `n` slots
+/// leaves the three tables with *different* capacities. Taking the largest - or any
+/// one table's - yields indices that are in range for that table and out of range
+/// for another, which is precisely the bug this shape had first: `clone` picked a
+/// slot from the `Thread` table, `fp_ptr` returned null for it, and the FP save
+/// wrote to address zero from kernel mode.
+pub fn capacity(cell: usize) -> usize {
+    // SAFETY: single CPU; plain capacity reads.
+    unsafe {
+        let frames = (*addr_of_mut!(FRAMES))[cell].capacity();
+        let fp = (*addr_of_mut!(FPAREAS))[cell].capacity();
+        threads(cell).capacity().min(frames).min(fp)
+    }
+}
+
+/// Ensure cell `cell` has at least `n` context slots, charged to that cell.
+fn ensure_contexts(cell: usize, n: usize) -> bool {
+    let owner = Owner::cell(cell);
+    // SAFETY: single CPU; the two tables are distinct statics.
+    let bulk_ok = unsafe {
+        let f = &mut (*addr_of_mut!(FRAMES))[cell];
+        f.set_owner(owner);
+        let frames_ok = f.reserve(n);
+        let a = &mut (*addr_of_mut!(FPAREAS))[cell];
+        a.set_owner(owner);
+        let fp_ok = a.reserve(n);
+        if fp_ok {
+            // A fresh FP area must be the ABI-default register state, not zeroes:
+            // an all-zero x86-64 XSAVE header is not a valid state to restore.
+            for i in 0..a.capacity() {
+                if let Some(area) = a.get_mut(i) {
+                    arch::fp_area_init(area.0.as_mut_ptr());
+                }
+            }
+        }
+        frames_ok && fp_ok
+    };
+    bulk_ok && threads(cell).ensure(n, owner)
+}
+
 fn child_frame_ptr(cell: usize, i: usize) -> *mut TrapFrame {
-    // SAFETY: stable address of static storage; single CPU.
-    unsafe { addr_of_mut!((*addr_of_mut!(FRAMES))[cell][i]) }
+    // SAFETY: single CPU. The slot is in capacity (the caller grew the table
+    // first), and a `Funded` slot's address is stable for as long as it is in
+    // capacity - see the `FRAMES` docs.
+    unsafe {
+        let f = &mut (*addr_of_mut!(FRAMES))[cell];
+        match f.get_mut(i) {
+            Some(r) => r as *mut TrapFrame,
+            None => core::ptr::null_mut(),
+        }
+    }
 }
 
 fn cur_thread(cell: usize) -> usize {
@@ -157,10 +385,18 @@ fn next_tid(cell: usize) -> u32 {
 /// `linux::install_cell`.
 pub fn init_cell(cell: usize) {
     let f0 = user::cell_frame(cell);
-    let t = threads(cell);
-    for th in t.iter_mut() {
-        *th = Thread::new();
+    // The table is funded, so it starts empty: reserve before touching slot 0.
+    // A cell that cannot get even one context slot cannot run at all, so say so
+    // plainly rather than letting the index below carry the failure.
+    if !ensure_contexts(cell, INITIAL_CONTEXTS) && !ensure_contexts(cell, 1) {
+        crate::println!(
+            "linux: cell {cell} could not reserve a single execution context - \
+             the frame pool is exhausted below the metadata reserve"
+        );
+        return;
     }
+    let t = threads(cell);
+    t.for_each_mut(|th| *th = Thread::new());
     t[0].frame = f0;
     t[0].state = TState::Ready;
     t[0].tid = 1000; // main thread tid == tgid (getpid)
@@ -177,8 +413,13 @@ pub fn reset() {
         *addr_of_mut!(IMMEDIATE_TIMEOUTS) = 0;
     }
     for cell in 0..MAX_CELLS {
-        for th in threads(cell).iter_mut() {
-            *th = Thread::new();
+        // Release rather than clear: these tables hold frames now, and a reset that
+        // only zeroed them would leak every context slot every run.
+        threads(cell).release();
+        // SAFETY: single CPU, between runs.
+        unsafe {
+            (*addr_of_mut!(FRAMES))[cell].release();
+            (*addr_of_mut!(FPAREAS))[cell].release();
         }
         set_cur_thread(cell, 0);
     }
@@ -240,12 +481,12 @@ pub(crate) fn is_pblocked(cell: usize, idx: usize) -> bool {
 pub(crate) fn resume_pblocked(cell: usize, idx: usize) -> *mut TrapFrame {
     let from = cur_thread(cell);
     if from != idx {
-        let from_fp = threads(cell)[from].fp.0.as_mut_ptr();
+        let from_fp = fp_ptr(cell, from);
         // SAFETY: `from`'s user FP registers are still live (kernel is soft-float).
         unsafe { arch::save_user_fp(from_fp) };
         let (to_fp, to_fs) = {
             let th = &threads(cell)[idx];
-            (th.fp.0.as_ptr(), th.fs_base)
+            (fp_ptr(cell, idx) as *const u8, th.fs_base)
         };
         // SAFETY: `idx`'s FP image was saved when it switched away.
         unsafe { arch::restore_user_fp(to_fp) };
@@ -273,7 +514,7 @@ pub(crate) fn clear_pblock_ready(cell: usize, idx: usize) {
 /// (docs/ARCHITECTURE-DEBT.md 2.4).
 pub fn dump_contexts(cell: usize) {
     let cur = cur_thread(cell);
-    for i in 0..MAX_THREADS {
+    for i in 0..capacity(cell) {
         let th = &threads(cell)[i];
         let s = match th.state {
             TState::Free => continue,
@@ -299,8 +540,9 @@ pub fn current_context(cell: usize) -> usize {
 /// The context index whose tid is `tid`, if it is a live context of `cell`
 /// (for `tgkill`/`tkill` self-targeting, docs/LINUX-COMPAT.md L5).
 pub fn index_of_tid(cell: usize, tid: u32) -> Option<usize> {
+    let n = capacity(cell);
     let t = threads(cell);
-    (0..MAX_THREADS).find(|&i| t[i].state != TState::Free && t[i].tid == tid)
+    (0..n).find(|&i| t[i].state != TState::Free && t[i].tid == tid)
 }
 
 /// The saved `TrapFrame` of context `idx` in `cell` (for delivering a signal to
@@ -320,7 +562,7 @@ pub fn current_frame(cell: usize) -> *mut TrapFrame {
 /// (the outgoing half of a cross-cell process switch). The registers still hold
 /// the outgoing thread's values (the kernel is soft-float).
 pub fn save_current_fp(cell: usize) {
-    let fp = threads(cell)[cur_thread(cell)].fp.0.as_mut_ptr();
+    let fp = fp_ptr(cell, cur_thread(cell));
     // SAFETY: `fp` is a 16-aligned 1 KiB area; the FP registers are live.
     unsafe { arch::save_user_fp(fp) };
 }
@@ -330,7 +572,7 @@ pub fn save_current_fp(cell: usize) {
 pub fn restore_current(cell: usize) {
     let (fp, fs) = {
         let th = &threads(cell)[cur_thread(cell)];
-        (th.fp.0.as_ptr(), th.fs_base)
+        (fp_ptr(cell, cur_thread(cell)) as *const u8, th.fs_base)
     };
     // SAFETY: `fp` is a valid FP image seeded at fork/clone or saved on a prior
     // switch; reloading the TLS base is a no-op off x86-64.
@@ -351,14 +593,21 @@ pub fn init_forked(
     clear_child_tid: u64,
     frame: TrapFrame,
 ) -> *mut TrapFrame {
+    // Funded tables start empty, and `child_frame_ptr` hands out a pointer *into*
+    // the frame table - so it must be grown before the pointer is taken, not after.
+    if !ensure_contexts(cell, INITIAL_CONTEXTS) && !ensure_contexts(cell, 1) {
+        crate::println!(
+            "linux: forked cell {cell} could not reserve an execution context - \
+             the frame pool is exhausted below the metadata reserve"
+        );
+        return core::ptr::null_mut();
+    }
     let cf = child_frame_ptr(cell, 0);
     // SAFETY: `cf` is stable kernel storage (FRAMES[cell][0], unused for the
     // main thread of a test-installed cell but the owned store for a forked one).
     unsafe { cf.write(frame) };
     let t = threads(cell);
-    for th in t.iter_mut() {
-        *th = Thread::new();
-    }
+    t.for_each_mut(|th| *th = Thread::new());
     t[0].frame = cf;
     t[0].state = TState::Ready;
     t[0].tid = tid;
@@ -367,7 +616,7 @@ pub fn init_forked(
     // Seed the child's FP image from the parent's live registers (the parent is
     // the running cell at fork time).
     // SAFETY: the FP area is 16-aligned and large enough.
-    unsafe { arch::save_user_fp(t[0].fp.0.as_mut_ptr()) };
+    unsafe { arch::save_user_fp(fp_ptr(cell, 0)) };
     set_cur_thread(cell, 0);
     // SAFETY: single CPU.
     unsafe { (*addr_of_mut!(NEXT_TID))[cell] = tid + 1 };
@@ -436,9 +685,30 @@ pub fn clone(
     child_tid: u64,
     tls: u64,
 ) -> i64 {
-    let Some(slot) = (1..MAX_THREADS).find(|&i| threads(cell)[i].state == TState::Free) else {
-        return -EAGAIN;
+    // A free slot among those that exist, else grow. This is where a cell's thread
+    // count stops being a constant: growth is charged to the cell, and `-EAGAIN` -
+    // the errno `pthread_create` surfaces - now means "this cell is out of budget"
+    // rather than "the kernel was built with room for eight".
+    let slot = match (1..capacity(cell)).find(|&i| threads(cell)[i].state == TState::Free) {
+        Some(i) => i,
+        None => {
+            // Grow by exactly one and take *that* index. Deriving it from the
+            // post-growth capacity instead would pick a slot the widest table
+            // happens to have and the narrowest does not (see `capacity`).
+            let want = capacity(cell).max(1) + 1;
+            if !ensure_contexts(cell, want) {
+                return -EAGAIN;
+            }
+            let slot = want - 1;
+            debug_assert!(slot < capacity(cell), "grown slot is not addressable");
+            slot
+        }
     };
+    // The grown slot must actually be free; if the growth arithmetic ever picked an
+    // occupied one, a `clone` would silently overwrite a live context.
+    if threads(cell)[slot].state != TState::Free {
+        return -EAGAIN;
+    }
     let tid = next_tid(cell);
     let cf = child_frame_ptr(cell, slot);
     // SAFETY: `parent_frame` is the caller's saved frame; `cf` is stable
@@ -462,7 +732,7 @@ pub fn clone(
     // Give the child a valid FP image (x86 FXRSTOR needs a well-formed MXCSR);
     // the parent's current FP state is a valid one to seed with.
     // SAFETY: the FP area is 16-aligned and large enough.
-    unsafe { arch::save_user_fp(th.fp.0.as_mut_ptr()) };
+    unsafe { arch::save_user_fp(fp_ptr(cell, slot)) };
 
     if flags & CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
         // SAFETY: trap context; `parent_tid` is a writable VA in the cell.
@@ -630,7 +900,7 @@ fn wait_deadline(cmd: u64, op: u64, timeout_va: u64) -> Deadline {
 /// The nearest outstanding futex deadline among `cell`'s blocked contexts.
 fn nearest_deadline(cell: usize) -> Option<u64> {
     let t = threads(cell);
-    t.iter()
+    t.iter_values()
         .filter(|th| th.state == TState::Blocked && th.fut_deadline != 0)
         .map(|th| th.fut_deadline)
         .min()
@@ -641,7 +911,7 @@ fn nearest_deadline(cell: usize) -> Option<u64> {
 fn expire_timeouts(cell: usize) -> usize {
     let now = crate::linux::cell_clock_ns(false);
     let mut n = 0;
-    for i in 0..MAX_THREADS {
+    for i in 0..capacity(cell) {
         let (due, frame) = {
             let th = &threads(cell)[i];
             (
@@ -750,7 +1020,7 @@ static mut IMMEDIATE_TIMEOUTS: u64 = 0;
 /// futex return value to 0. Returns the number woken.
 fn wake(cell: usize, uaddr: u64, max: u32) -> u32 {
     let mut woken = 0u32;
-    for i in 0..MAX_THREADS {
+    for i in 0..capacity(cell) {
         if woken >= max {
             break;
         }
@@ -832,9 +1102,13 @@ pub fn exit_thread(cell: usize, code: u64) -> Ctl {
 
 /// Round-robin: the next `Ready` context after `from`, or None.
 fn pick_next(cell: usize, from: usize) -> Option<usize> {
+    let n = capacity(cell);
+    if n == 0 {
+        return None;
+    }
     let t = threads(cell);
-    (1..=MAX_THREADS).find_map(|k| {
-        let i = (from + k) % MAX_THREADS;
+    (1..=n).find_map(|k| {
+        let i = (from + k) % n;
         (t[i].state == TState::Ready).then_some(i)
     })
 }
@@ -842,7 +1116,7 @@ fn pick_next(cell: usize, from: usize) -> Option<usize> {
 /// Switch from context `from` to `to`: save `from`'s FP, load `to`'s FP and TLS
 /// base, and hand the trampoline `to`'s frame.
 fn switch_to(cell: usize, from: usize, to: usize) -> Ctl {
-    let from_fp = threads(cell)[from].fp.0.as_mut_ptr();
+    let from_fp = fp_ptr(cell, from);
     // SAFETY: `from`'s user FP registers are still live (kernel is soft-float).
     unsafe { arch::save_user_fp(from_fp) };
     resume(cell, to)
@@ -854,7 +1128,7 @@ fn switch_to(cell: usize, from: usize, to: usize) -> Ctl {
 fn resume(cell: usize, to: usize) -> Ctl {
     let (to_fp, to_fs, to_frame) = {
         let th = &threads(cell)[to];
-        (th.fp.0.as_ptr(), th.fs_base, th.frame)
+        (fp_ptr(cell, to) as *const u8, th.fs_base, th.frame)
     };
     // SAFETY: `to_fp` is a valid FP image (seeded at clone or saved on a prior
     // switch). Reloading the TLS base is a no-op off x86-64.

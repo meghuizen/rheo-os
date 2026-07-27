@@ -851,7 +851,7 @@ pub fn resume_satisfiable_sibling(cell: usize) -> Option<Ctl> {
 /// The first context of `cell` parked on a proc-level condition that is satisfiable
 /// right now, if any - the scheduler's per-context wake test.
 fn first_satisfiable_context(cell: usize) -> Option<usize> {
-    (0..thread::MAX_THREADS).find(|&i| {
+    (0..thread::capacity(cell)).find(|&i| {
         thread::is_pblocked(cell, i) && satisfiable_block(cell, thread::pblock_of(cell, i))
     })
 }
@@ -871,7 +871,7 @@ fn blocked_sources() -> crate::idle::Sources {
 /// all of its parked contexts' per-context conditions (per-context blocking).
 fn sources_of(cell: usize) -> crate::idle::Sources {
     let mut s = 0;
-    for i in 0..thread::MAX_THREADS {
+    for i in 0..thread::capacity(cell) {
         if thread::is_pblocked(cell, i) {
             s |= sources_of_block(thread::pblock_of(cell, i));
         }
@@ -929,7 +929,7 @@ fn report_deadlock(src: crate::idle::Sources) -> Ctl {
 /// The name of cell `i`'s block, for the deadlock diagnostic - the first parked
 /// context's condition (per-context blocking).
 fn block_name(i: usize) -> &'static str {
-    let b = (0..thread::MAX_THREADS)
+    let b = (0..thread::capacity(i))
         .find(|&k| thread::is_pblocked(i, k))
         .map(|k| thread::pblock_of(i, k))
         .unwrap_or(Block::None);

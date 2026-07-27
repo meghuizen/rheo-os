@@ -1294,6 +1294,28 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         return false;
     }
 
+    // More contexts than the old fixed ceiling (docs/SUBSTRATE.md pillar 1): 12
+    // simultaneously-live threads, where the pre-migration `MAX_THREADS = 8` array
+    // allowed 7. Same static-glibc recipe; the 4-thread L4 fixture above is left
+    // untouched so its proof still holds unedited.
+    let mut many = Command::new("cargo");
+    many.args([
+        "build",
+        "--manifest-path",
+        "tests/linux-fixtures/manythreads/Cargo.toml",
+        "--release",
+        "--target",
+        arch.linux_gnu_target(),
+    ]);
+    many.env("RUSTFLAGS", &rustflags);
+    if !matches!(many.status().map(|s| s.success()), Ok(true)) {
+        eprintln!(
+            "[xtask] many-context fixture build failed for {}",
+            arch.name()
+        );
+        return false;
+    }
+
     // A real JavaScript engine (pure-Rust `boa`), same static-glibc recipe - the
     // on-goal proxy for Node/Claude Code: a language runtime (parser + bytecode VM
     // + heap + GC) run unmodified under the Linux personality (docs/LINUX-COMPAT.md,

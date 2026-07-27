@@ -29,6 +29,11 @@ mod harness;
 /// `xtask::build_linux_fixtures` for the ISA's `*-unknown-linux-gnu` target.
 static RUSTTHREADS: &[u8] = fixture::linux_cargo!("rustthreads");
 
+/// The **many-context** fixture (docs/SUBSTRATE.md pillar 1): 12 simultaneously
+/// live threads, where the pre-migration fixed context array allowed 7 besides
+/// main. Built by `xtask::build_linux_fixtures` like the 4-thread one above.
+static MANYTHREADS: &[u8] = fixture::linux_cargo!("manythreads");
+
 /// The static-glibc `pthread_cond_timedwait` fixture (built by
 /// `xtask::build_linux_fixtures`), for the futex-timeout phase below.
 static CONDWAIT: &[u8] = fixture::linux!("condwait");
@@ -91,6 +96,43 @@ extern "C" fn kernel_main() -> ! {
     }
 
     println!("linuxthreads: OK (clone + futex + TLS + join)");
+
+    // --- more contexts than the old fixed ceiling (docs/SUBSTRATE.md pillar 1).
+    //
+    // The context tables are funded now, so a cell's thread count is bounded by its
+    // frame budget rather than by an array dimension. This asserts the consequence
+    // rather than the mechanism: 12 threads, all live at once (they rendezvous on a
+    // barrier before any of them finishes), which the previous `MAX_THREADS = 8`
+    // could not have served - the 8th `pthread_create` returned EAGAIN.
+    //
+    // The sum is hand-computed: sum over id in 1..=12 of triangular(id*10), i.e.
+    // sum of (id*10)(id*10+1)/2 = 32890. Order-independent, so stdout is exact.
+    unsafe {
+        STDOUT_LEN = 0;
+    }
+    linux::set_stdout_tap(Some(tap));
+    let many = run(MANYTHREADS, &[b"manythreads"]);
+    linux::set_stdout_tap(None);
+
+    let want_many = b"contexts 12 total 32890 channel 32890\n";
+    match many {
+        Outcome::Exited(code) => {
+            assert!(
+                code == 12,
+                "manythreads exited {code}, expected 12 - a context beyond the \
+                 old ceiling failed to start"
+            );
+            let got = captured();
+            assert!(
+                got == want_many,
+                "manythreads stdout mismatch:\n  got:      {:?}\n  expected: {:?}",
+                core::str::from_utf8(got),
+                core::str::from_utf8(want_many),
+            );
+        }
+        Outcome::Faulted(addr) => panic!("manythreads faulted at {addr:#x}"),
+    }
+    println!("linuxthreads: OK (12 simultaneous contexts - past the old 8-slot array)");
 
     // --- the futex **timeout** (docs/LINUX-COMPAT.md L4, the `futex` row).
     // `pthread_cond_timedwait` on a condvar nobody signals, in a process with no
