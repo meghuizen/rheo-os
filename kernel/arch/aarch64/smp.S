@@ -27,6 +27,9 @@
  *   returns x0 = PSCI return value, or 0xFFFF_FFFF_FFFF_FFFF if it trapped.
  */
 
+.equ AP_STACK_SHIFT, 14          /* 16 KiB per secondary stack */
+.equ AP_STACK_SLOTS, 8           /* power of two: the index is a mask */
+
 .section .text
 .p2align 2
 .global psci_call_guarded
@@ -164,8 +167,17 @@ aarch64_secondary_entry:
 .section .text
 .p2align 2
 aarch64_secondary_high:
-    adrp x0, ap_stack_top
-    add  x0, x0, :lo12:ap_stack_top
+    /* One stack per core, indexed by this core's own MPIDR affinity 0 - the same
+       value `cpu_index()` and the KERNEL_CTX slot use - so every secondary the
+       primary starts has its own; a shared stack would have the second core to
+       arrive overwrite the first's frames (docs/SMP.md 10.0). Masked, so an
+       affinity outside the array aliases slot 0; sp is the *top* of slot n. */
+    adrp x0, ap_stacks
+    add  x0, x0, :lo12:ap_stacks
+    mrs  x1, mpidr_el1
+    and  x1, x1, #(AP_STACK_SLOTS - 1)
+    add  x1, x1, #1
+    add  x0, x0, x1, lsl #AP_STACK_SHIFT
     mov  sp, x0
     /* Containment: the kernel's real vectors, so a fault on this core reaches
        the kernel handler instead of looping. */
@@ -199,10 +211,9 @@ AP_SYSREGS:
 SMP_SECONDARY_ENTRY_PA:
     .dword aarch64_secondary_entry
 
-/* The secondary's kernel stack: a high VA in ordinary BSS (mapped via TTBR1),
-   like the primary's boot_stack. */
+/* The secondaries' kernel stacks: high VAs in ordinary BSS (mapped via TTBR1),
+   like the primary's boot_stack - one per core. */
 .section .bss
 .p2align 4
-ap_stack:
-    .space 16 * 1024
-ap_stack_top:
+ap_stacks:
+    .space (1 << AP_STACK_SHIFT) * AP_STACK_SLOTS

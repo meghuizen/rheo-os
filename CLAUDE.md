@@ -1705,18 +1705,33 @@ handlers at all and its first exception was a triple fault. Both RISC-V halves w
 observed **failing** when reverted. Safe by **partitioning, not locking**: distinct cell
 slots, address spaces, kernel stacks and pages, and the cell table read/written at
 disjoint indices - the multikernel answer (docs/SCHEDULING.md 1a), not a shortcut.
-**Honest scope:** two *partitioned* cells, not a scheduler - the primary picks which
-cell the secondary runs and waits; nothing places a runnable cell on whichever core is
-free, nothing migrates, only one secondary is started, and a **Linux** cell on a
-secondary is not attempted (the cell/capability/object tables and the Linux per-cell
-state are still written for one CPU - the audit in docs/SMP.md 10.2 is the gate).
+**And cells are now *placed*, not assigned.** `smp::start_all` brings up **every**
+secondary the firmware enumerates (each on its own stack indexed by its own hardware id,
+with a probe-the-next-id fallback where EL1 can enumerate nothing - ARM64), so **4 CPUs
+come online on all three ISAs**; `smp::place_cells` then publishes a set of runnable
+cells that **every core claims from whenever it is free** - work-conserving, balanced by
+claim rate, nobody assigned anything in advance (the GEMM block-queue reasoning applied
+to cells instead of rows). The proof queues **more cells than cores** (8 on 4, one
+deliberately long) and asserts every cell finished on some core carrying its own exit
+code, that more than one core claimed work with the counts summing to the queue, and
+that **some core claimed a second cell** - which a one-per-core hand-out cannot produce.
+Observed on all three ISAs: the core that took the long cell takes exactly 1 and the
+rest take 2-3 (reported, never asserted - TCG time-slices the vCPUs onto host threads).
+**Honest scope:** a claim runs to **completion** - no cross-core preemption, no
+migration of a running cell, no priority, and the per-CPU EEVDF+BORE queue still drives
+only the single-core `preempt` path. A **Linux** cell on a secondary is not attempted
+(the cell/capability/object tables and the Linux per-cell state are still written for
+one CPU - the audit in docs/SMP.md 10.2 is the gate). What makes the native path safe is
+that a claimed cell is still a *partitioned* cell - one core, one slot, one address
+space, one kernel stack - the claim simply made at run time instead of by hand.
 
 **Still honest about what is not wired:** the fixed VA map is still the map (S2'
 untouched), dispatch is proven for native cells and **off by default** except the
 `linuxnode` boot -
 enabling it for the *Linux* boots is what the `linuxbun` gate needs - `metrics`
-records nothing until a boot enables it, and no second core *schedules* anything (it
-runs a cell the primary hands it). The
+records nothing until a boot enables it, and the per-CPU EEVDF+BORE queue still drives
+only the single-core preempt path (multi-core placement is by claim, not by that
+queue). The
 exit gate is unchanged: `linuxbun` flipping from its accepted partial to `rheo:42`.
 
 **FlashAttention 2 and 3 run** (docs/TILES.md 13): the real exp softmax, filling
@@ -1801,8 +1816,9 @@ behind the `kernel/smp` cargo feature; the non-smp library is **byte-identical**
 (verified). Honest: this is bring-up, **not** preemptive multi-core scheduling - each
 secondary runs work the primary hands it and then parks, most of the kernel is not yet
 safe to run on two cores concurrently, the runtime stays single-CPU cooperative, and
-only **one** secondary is started (one dedicated stack per ISA). Since then a secondary
-also runs a **cell in user mode** - see above and docs/SMP.md 10.0. Still deferred: shared
+only **one** secondary is started (one dedicated stack per ISA). Both of those last two
+are superseded: a secondary now runs a **cell in user mode**, and `start_all` brings up
+every enumerable core on its own stack - see above and docs/SMP.md 10.0. Still deferred: shared
 `static mut` state made SMP-safe end to end, per-CPU stacks + a start-all loop, a
 per-CPU register instead of the small id->index table, ARM64 CPU *enumeration* (probing
 `PSCI_AFFINITY_INFO`), cross-CPU IPIs beyond bring-up, and the **x86-64 NIC RX
@@ -1947,7 +1963,9 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               over the probed HVC conduit on aarch64; then both cores draining
               one int8-GEMM work queue; then **two cells in user mode on two
               cores at once**, each in its own address space, witnessed by each
-              reading the other's progress mid-run - docs/SMP.md 10.0), shell-smoke, hwinfo, rng, runtime,
+              reading the other's progress mid-run; then **start-all + cell
+              placement** - 4 CPUs online, 8 runnable cells drained by whichever
+              core is free, the busiest claiming 3 - docs/SMP.md 10.0), shell-smoke, hwinfo, rng, runtime,
               posix, blockfs (live virtio-blk disk), elfrun (load a native
               ELF), posixrun (native program over the POSIX syscalls),
               libcrun (a program linked against rheo-libc), jsonrun (a

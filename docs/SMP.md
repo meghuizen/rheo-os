@@ -580,10 +580,12 @@ scheduler itself has not.
   yields. A wall-clock speedup would prove nothing under TCG, which time-slices the two
   vCPUs onto host threads; simultaneity is the available evidence and it is what is
   asserted.
-- **Two cells run in user mode on two cores at once** (the `smp` kernel, all three
-  ISAs) - section 10.0. Not a scheduler: the two cells are partitioned and the primary
-  places them. But a cell now genuinely executes at the unprivileged level on a core
-  that is not the boot CPU, which is the capability every later slice builds on.
+- **Cells run in user mode on secondary cores, and are placed on whichever core is
+  free** (the `smp` kernel, all three ISAs) - section 10.0. Every enumerable secondary
+  is started, two cells are proven running at the unprivileged level on two cores at the
+  same instant, and a queue of 8 runnable cells is drained by 4 cores that each claim
+  from it. Not yet the scheduler: a claim runs to completion, nothing migrates, and no
+  Linux cell is placed.
 
 ### 10.0 Cells run in user mode on a secondary core - built
 
@@ -648,13 +650,40 @@ they share is the cell table, which `run` reads and `finish` writes at *disjoint
 indices*. That is the multikernel answer this document commits to (SCHEDULING.md 1a)
 rather than a shortcut, and it is why no lock appears on this path.
 
-**Honest scope.** This is two *partitioned* cells, not a scheduler: the primary picks
-which cell the secondary runs, publishes it, and waits. Nothing yet places a runnable
-cell on whichever core is free, nothing migrates, and the audit in 10.2 is still the gate
-for that - the cell table, the capability and object tables, and the Linux personality's
-per-cell state are all still written on the assumption of one CPU. A **Linux** cell on a
-secondary is therefore not attempted; the cells here are native. Only one secondary is
-started, so only two cells can be placed.
+**Then placement: every core is started, and cells are claimed rather than assigned.**
+Handing one *named* cell to *the* secondary is a placement decision made by hand, which
+is the decision a scheduler is supposed to make. So `smp::start_all` brings up **every**
+secondary the firmware enumerates - each on its own stack, indexed by its own hardware id
+(hart id / MPIDR affinity / initial APIC id), with a bounded wait per core and a
+probe-the-next-id fallback where the firmware enumerates nothing from EL1 (ARM64, the
+same synthesis `bring_up_one` already used) - and `smp::place_cells` publishes a set of
+runnable cells that **every core claims from whenever it is free**. Nobody is assigned
+anything in advance. It is work-conserving (no core idles while the queue is non-empty)
+and self-balancing by claim rate rather than by prediction, which is the GEMM
+block-queue reasoning applied to cells instead of rows.
+
+The proof puts **more cells than cores** in the queue (8 on 4), with one deliberately
+long cell and seven short ones, and asserts three things: every cell finished on some
+core and says which cell it was (a distinct exit code - the only thing that ties a
+completed run back to a cell when the caller did not choose where it went); more than
+one core claimed work and the per-core counts sum to the queue (a run where one core
+took everything produces identical exit codes and teaches nothing, which is why
+correctness is not the placement evidence); and **some core claimed a second cell**,
+which a one-per-core hand-out cannot produce. Observed on all three ISAs with 4 CPUs
+online: the core that took the long cell takes exactly 1 and the rest take 2-3 - the
+ratio is reported, never asserted, because TCG time-slices the vCPUs onto host threads
+and the split is a property of that scheduling, not of ours.
+
+**Honest scope.** A claim runs to **completion**: there is no preemption across cores,
+no migration of a cell already running, and no priority - `place_cells` is placement and
+load-balancing, not the EEVDF+BORE queue driving multi-core dispatch (that queue is
+per-CPU and still only drives the single-core `preempt` path). The audit in 10.2 is the
+gate for the rest: the cell table, the capability and object tables, and the Linux
+personality's per-cell state are all still written on the assumption of one CPU, so a
+**Linux** cell on a secondary is not attempted - the cells here are native. What makes
+the native path safe is unchanged and is the reason it could land first: a claimed cell
+is still a *partitioned* cell (one core, one slot, one address space, one kernel stack),
+the claim simply being made at run time instead of by hand.
 
 ### 10.1 The measured motivation (not a wish)
 
@@ -714,9 +743,12 @@ is unchanged and stays the proof-of-correctness baseline.
 - **A per-CPU register**, replacing the `cpu_index()` id->index search: x86-64
   `GS_BASE` + `swapgs` at kernel entry, ARM64 `tpidr_el1`, RISC-V a per-hart `sscratch`
   slot. `this_cpu()` becomes a single register read.
-- **Start-all**: iterate the discovered CPU set - ACPI MADT on x86-64, `PSCI_AFFINITY_INFO`
-  enumeration on ARM64 (section 7 defers exactly this), the device-tree `cpus` node on
-  RISC-V - and bring each up with its own stack via the section 5-7 paths, unchanged.
+- **Start-all**: **done** (`smp::start_all`, section 10.0) - it iterates the discovered
+  CPU set and brings each up with its own stack via the section 5-7 paths, unchanged,
+  falling back to probing the next hardware ids where the firmware enumerates nothing
+  from EL1. Four CPUs come online on all three ISAs. What is *not* done is ARM64
+  `PSCI_AFFINITY_INFO` **enumeration** proper: the probe answers the same question by
+  asking, which is honest but does not populate the inventory.
 
 ### 10.4 The preemptive tick
 

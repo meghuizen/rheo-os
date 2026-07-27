@@ -62,6 +62,9 @@
    silently (the code is position-fixed - a disagreement lands the AP nowhere). */
 .set AP_BASE, 0x8000
 
+.equ AP_STACK_SHIFT, 14          /* 16 KiB per secondary stack */
+.equ AP_STACK_SLOTS, 8           /* power of two: the index is a mask */
+
 .section .boot.text, "ax"
 .code16
 .align 16
@@ -119,9 +122,19 @@ ap_pm32:
 
 .code64
 ap_lm64:
-    /* One dedicated secondary stack: this phase brings up exactly one AP
-       (docs/SMP.md), so a single stack cannot be shared by two of them. */
-    movabs $ap_stack_top, %rsp
+    /* One stack per core, indexed by this core's own initial APIC id (CPUID.1
+       EBX[31:24]) - the same value the KERNEL_CTX/GDT/TSS slot uses - so every AP
+       the primary starts has its own; a shared stack would have the second AP to
+       arrive overwrite the first's frames (docs/SMP.md 10.0). Masked, so an id
+       outside the array aliases slot 0; rsp is the *top* of slot n. */
+    mov $1, %eax
+    cpuid
+    shr $24, %ebx
+    and $(AP_STACK_SLOTS - 1), %ebx
+    inc %ebx
+    shl $AP_STACK_SHIFT, %ebx
+    movabs $ap_stacks, %rsp
+    add %rbx, %rsp
     /* Hand off to portable kernel code. `x86_secondary_main` reads this CPU's
        APIC id from the local APIC itself rather than trusting anything the
        primary passed - the identity comes from the hardware. */
@@ -175,11 +188,10 @@ AP_CR0:
 AP_TRAMPOLINE_BASE:
     .quad AP_BASE
 
-/* The secondary's kernel stack: a high VA in ordinary BSS, mapped supervisor in
-   every root (like the primary's boot_stack), so it is valid the instant the AP
-   is in long mode on the shared page tables. */
+/* The secondaries' kernel stacks: high VAs in ordinary BSS, mapped supervisor in
+   every root (like the primary's boot_stack), so they are valid the instant an AP
+   is in long mode on the shared page tables - one per core. */
 .section .bss
 .align 16
-ap_stack:
-    .space 16 * 1024
-ap_stack_top:
+ap_stacks:
+    .space (1 << AP_STACK_SHIFT) * AP_STACK_SLOTS

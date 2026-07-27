@@ -422,9 +422,17 @@ pub fn secondary_run(hw_id: u32) {
 fn secondary_work_loop() {
     let mut deadline = arch::timer_now_ns().wrapping_add(RV_TIMEOUT_NS);
     loop {
-        // A cell to run in **user mode** takes priority: it is the capability this
-        // core exists to demonstrate, and unlike a compute job it changes privilege
-        // level and address space (docs/SMP.md 10.0).
+        // A **queue of runnable cells** takes priority over everything: this is the
+        // placement path, where no core is told which cell to run - it claims one
+        // (docs/SMP.md 10.0).
+        if PLACE_COUNT.load(Ordering::Acquire) > 0 {
+            // SAFETY: `place_cells`' contract - present, native, listed once.
+            unsafe { drain_cells() };
+            deadline = arch::timer_now_ns().wrapping_add(RV_TIMEOUT_NS);
+            continue;
+        }
+        // A single named cell to run in **user mode**: the hand-placed path that
+        // came first, kept because it is what pairs two cells at one instant.
         let cell = USER_CELL.load(Ordering::Acquire);
         if cell != usize::MAX {
             USER_CELL.store(usize::MAX, Ordering::Release);
@@ -734,6 +742,140 @@ pub unsafe fn run_cells_on_both(own: usize, other: usize) -> (bool, bool, usize,
     )
 }
 
+// ------------------------------------------ placing runnable cells on free cores
+//
+// `run_cells_on_both` above hands *one named cell* to *the* secondary: the primary
+// decides who runs where. That is a placement decision made by hand, and it is the
+// thing a scheduler is supposed to make for you.
+//
+// This is the smallest honest step past it: **one shared queue of runnable cells,
+// and every core claims from it whenever it is free**. A core that finishes a short
+// cell comes back and takes the next one; a core stuck on a long cell takes no more.
+// Nobody is assigned anything in advance, so the per-core counts are a *result* -
+// exactly the reasoning the GEMM block queue already rests on, applied to cells
+// instead of to rows. It is work-conserving (no core idles while the queue is
+// non-empty) and self-balancing (by claim rate, not by prediction).
+//
+// It is **not** the full scheduler: there is no preemption across cores, no
+// migration of a cell already running, no priority - a claim runs to completion.
+// Those need the 10.2 audit; this needs only what 10.0 already established, because
+// a claimed cell is still a *partitioned* cell (one core, one slot, one address
+// space) - the claim is simply made at run time instead of at compile time.
+
+#[cfg(feature = "smp")]
+/// The most cells one placement round can hold. A fixed array; the kernel is
+/// allocation-free.
+pub const MAX_PLACED_CELLS: usize = 16;
+
+#[cfg(feature = "smp")]
+/// The runnable set for the current round, the claim cursor over it, and how many
+/// cells have finished.
+static PLACE_CELLS: SpinLock<[usize; MAX_PLACED_CELLS]> = SpinLock::new([0; MAX_PLACED_CELLS]);
+#[cfg(feature = "smp")]
+static PLACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp")]
+static PLACE_NEXT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp")]
+static PLACE_DONE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp")]
+/// Per-cell exit code, and which CPU ran it. Written by the core that ran the cell,
+/// at its own index - disjoint, so no lock.
+static PLACE_CODE: [AtomicUsize; MAX_PLACED_CELLS] =
+    [const { AtomicUsize::new(usize::MAX) }; MAX_PLACED_CELLS];
+#[cfg(feature = "smp")]
+static PLACE_CPU: [AtomicUsize; MAX_PLACED_CELLS] =
+    [const { AtomicUsize::new(usize::MAX) }; MAX_PLACED_CELLS];
+#[cfg(feature = "smp")]
+/// How many cells each CPU claimed - the load-sharing evidence.
+static PLACE_TAKEN: PerCpu<AtomicUsize> =
+    PerCpu::from_array([const { AtomicUsize::new(0) }; MAX_CPUS]);
+
+#[cfg(feature = "smp")]
+/// Claim and run cells until the queue is empty. Runs on **any** core.
+///
+/// # Safety
+/// Every queued cell must be installed, present and **native**, and no cell may
+/// appear twice (the claim gives one core exclusive ownership of a slot only if the
+/// slot appears once).
+unsafe fn drain_cells() {
+    let n = PLACE_COUNT.load(Ordering::Acquire);
+    let cpu = arch::cpu_index();
+    loop {
+        let k = PLACE_NEXT.fetch_add(1, Ordering::AcqRel);
+        if k >= n {
+            return;
+        }
+        let cell = PLACE_CELLS.lock()[k];
+        // The caller's contract holds here: a present native cell this core now owns
+        // exclusively, because the `fetch_add` handed index `k` to nobody else.
+        let code = code_of(crate::user::run(cell).1);
+        PLACE_CODE[k].store(code as usize, Ordering::Release);
+        PLACE_CPU[k].store(cpu, Ordering::Release);
+        PLACE_TAKEN.this().fetch_add(1, Ordering::AcqRel);
+        PLACE_DONE.fetch_add(1, Ordering::Release);
+    }
+}
+
+#[cfg(feature = "smp")]
+/// Publish `cells` as the runnable set and let **every** core - this one and every
+/// online secondary - claim from it until it is empty.
+///
+/// Returns `(all_finished, per-cell (exit code, cpu that ran it))` truncated to
+/// `cells.len()`. `all_finished` is false if the bound elapsed with work
+/// outstanding, in which case the caller must claim nothing.
+///
+/// # Safety
+/// As [`drain_cells`]: each entry installed, present, native, and listed once.
+pub unsafe fn place_cells(cells: &[usize], out: &mut [(u64, usize)]) -> bool {
+    let n = cells.len().min(MAX_PLACED_CELLS).min(out.len());
+    {
+        let mut q = PLACE_CELLS.lock();
+        q[..n].copy_from_slice(&cells[..n]);
+    }
+    for k in 0..MAX_PLACED_CELLS {
+        PLACE_CODE[k].store(usize::MAX, Ordering::Release);
+        PLACE_CPU[k].store(usize::MAX, Ordering::Release);
+    }
+    for c in 0..MAX_CPUS {
+        // SAFETY: between rounds; no core is draining.
+        unsafe { PLACE_TAKEN.get(c) }.store(0, Ordering::Release);
+    }
+    PLACE_DONE.store(0, Ordering::Release);
+    PLACE_NEXT.store(0, Ordering::Release);
+    // Last, and with release ordering: a secondary polls this, so publishing the
+    // count is what opens the queue. Setting it before the cursor was reset would
+    // let a secondary claim against the previous round's cursor.
+    PLACE_COUNT.store(n, Ordering::Release);
+
+    // This core is a worker too - it does not sit and wait while others work.
+    // SAFETY: the caller's contract.
+    unsafe { drain_cells() };
+
+    let deadline = arch::timer_now_ns().wrapping_add(RV_TIMEOUT_NS);
+    while PLACE_DONE.load(Ordering::Acquire) < n {
+        if arch::timer_now_ns() >= deadline {
+            PLACE_COUNT.store(0, Ordering::Release);
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    PLACE_COUNT.store(0, Ordering::Release);
+    for (k, slot) in out.iter_mut().enumerate().take(n) {
+        *slot = (
+            PLACE_CODE[k].load(Ordering::Acquire) as u64,
+            PLACE_CPU[k].load(Ordering::Acquire),
+        );
+    }
+    true
+}
+
+#[cfg(feature = "smp")]
+/// How many cells CPU `cpu` claimed in the last [`place_cells`] round.
+pub fn cells_taken(cpu: usize) -> usize {
+    // SAFETY: a plain atomic read of another CPU's counter, after the round ended.
+    unsafe { PLACE_TAKEN.get(cpu) }.load(Ordering::Acquire)
+}
+
 #[cfg(feature = "smp")]
 fn code_of(o: crate::user::Outcome) -> u64 {
     match o {
@@ -781,6 +923,74 @@ const WAIT_BUDGET: u64 = 200_000_000;
 pub fn init() {
     arch::smp_set_this_cpu(0);
     set_online(0, arch::boot_cpu_hw_id());
+}
+
+/// How many CPUs may be online at once.
+///
+/// Bounded by the smallest per-CPU array the ring-3 path needs: the per-core
+/// KERNEL_CTX / GDT / TSS / stack slots each ISA sizes at 8. Raising it means
+/// raising those together, which is why the number lives here rather than being
+/// implied in three assembly files.
+pub const MAX_SMP_CPUS: usize = 8;
+
+#[cfg(feature = "smp")]
+/// Start **every** secondary the firmware enumerates, each on its own stack, and
+/// return how many came online (bounded wait per core; a core that does not answer
+/// is skipped, not waited on forever).
+///
+/// This is what makes placement mean something: with one secondary, "the queue is
+/// drained by whichever core is free" has two participants and looks a lot like a
+/// split in half. Runs on the primary.
+pub fn start_all() -> usize {
+    let inv = crate::hw::inventory();
+    let boot = arch::boot_cpu_hw_id();
+    let mut started = 0;
+    let try_start = |hw: u32| -> bool {
+        if hw == boot || hw_online(hw) || online_count() >= MAX_SMP_CPUS {
+            return false;
+        }
+        let before = secondaries_up();
+        if arch::smp_start_secondary(hw).is_err() {
+            return false;
+        }
+        let mut budget = WAIT_BUDGET;
+        while budget > 0 && secondaries_up() == before {
+            core::hint::spin_loop();
+            budget -= 1;
+        }
+        secondaries_up() > before
+    };
+
+    for i in 0..inv.ncpus {
+        if try_start(inv.cpus[i].hw_id) {
+            started += 1;
+        }
+    }
+    // Where the firmware cannot enumerate secondaries from the kernel's exception
+    // level, the inventory holds only the boot CPU and the loop above starts nothing
+    // (ARM64: PSCI enumeration needs EL3 - docs/SMP.md 7). Probe the next ids instead,
+    // exactly as `bring_up_one` already synthesizes `boot + 1`: a *genuine* attempt
+    // whose answer is observed, stopping at the first id that does not answer so a
+    // machine with no more cores costs one refused call rather than a scan.
+    if inv.ncpus <= 1 {
+        for k in 1..MAX_SMP_CPUS as u32 {
+            let hw = boot.wrapping_add(k);
+            if hw_online(hw) {
+                continue; // already started (e.g. by `bring_up_one`) - not a refusal
+            }
+            if !try_start(hw) {
+                break;
+            }
+            started += 1;
+        }
+    }
+    started
+}
+
+#[cfg(feature = "smp")]
+/// Whether a CPU with this hardware id is already registered online.
+fn hw_online(hw: u32) -> bool {
+    CPUS.iter().any(|c| c.is_online() && c.hw_id() == hw)
 }
 
 #[cfg(feature = "smp")]

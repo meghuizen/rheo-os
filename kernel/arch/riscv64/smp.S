@@ -21,6 +21,9 @@
 # its physical value is published in SECONDARY_ENTRY_PA - a high .rodata word
 # holding an absolute (R_RISCV_64) relocation the primary reads to get the entry.
 
+.equ AP_STACK_SHIFT, 14          # 16 KiB per secondary stack
+.equ AP_STACK_SLOTS, 8           # power of two: the index is a mask
+
 .section .boot.text, "ax"
 .p2align 2
 .global secondary_entry
@@ -48,8 +51,16 @@ secondary_high:
 .option norelax
     la   gp, __global_pointer$
 .option pop
-    la   sp, secondary_stack_top   # dedicated secondary stack (high BSS)
-    # a0 still = hartid (untouched since SBI entry).
+    # One stack per hart, indexed by this hart's own id (a0, untouched since SBI
+    # entry) so every secondary the primary starts has its own - a shared stack
+    # would have the second hart to arrive overwrite the first's frames
+    # (docs/SMP.md 10.0). Masked, so a hart id outside the array aliases slot 0
+    # rather than running off the end; sp is the *top* of slot n, hence (n + 1).
+    la   sp, secondary_stacks
+    andi t1, a0, (AP_STACK_SLOTS - 1)
+    addi t1, t1, 1
+    slli t1, t1, AP_STACK_SHIFT
+    add  sp, sp, t1
     call rv_secondary_main
 1:
     wfi
@@ -64,9 +75,8 @@ secondary_high:
 SECONDARY_ENTRY_PA:
     .dword secondary_entry
 
-# Secondary stack: a high VA in ordinary BSS (mapped via l2[258]).
+# Secondary stacks: high VAs in ordinary BSS (mapped via l2[258]), one per hart.
 .section .bss
 .p2align 4
-secondary_stack:
-    .space 16 * 1024
-secondary_stack_top:
+secondary_stacks:
+    .space (1 << AP_STACK_SHIFT) * AP_STACK_SLOTS

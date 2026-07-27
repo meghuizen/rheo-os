@@ -479,6 +479,38 @@ pub extern "C" fn user_copair(params_va: usize) -> ! {
     loop {}
 }
 
+/// The **placed** cell: spin `iters` rounds, then exit with `workload` as the code.
+///
+/// Used where a set of cells is handed to *no particular core* and each is claimed by
+/// whichever one is free (docs/SMP.md 10.0). Distinct exit codes are what tie a
+/// finished run back to the cell that produced it, which matters when the placement,
+/// not the caller, decided where it ran. It touches no shared memory at all - the
+/// witness there is the claim record, not a page.
+#[unsafe(link_section = ".user.text")]
+#[unsafe(no_mangle)]
+pub extern "C" fn user_placed(params_va: usize) -> ! {
+    let p = params_va as *mut Params;
+    // SAFETY: the cell's own mapped Params page (its entry argument).
+    unsafe {
+        let code = (*p).workload;
+        let rounds = (*p).iters;
+        let mut i = 0u64;
+        let mut acc = 1u64;
+        while i < rounds {
+            let mut k = 0u64;
+            while k < SPIN_WORK {
+                acc = acc.wrapping_add(k ^ 0x5f).wrapping_mul(3);
+                k += 1;
+            }
+            (*p).ops = acc;
+            i += 1;
+        }
+        (*p).status = 1;
+        syscall(SYS_EXIT, code);
+    }
+    loop {}
+}
+
 /// The **scratch-register spinner** (x86-64 only): spin with known sentinels in the
 /// two registers `sysretq` consumes, and report whether they survived.
 ///

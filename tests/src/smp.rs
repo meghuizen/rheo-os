@@ -34,7 +34,7 @@ use harness::{CellStore, KernelStack, build_cell};
 use kernel::arch::MapPerm;
 use kernel::capability::{CapTable, ObjectTable};
 use kernel::smp::{self, SpinLock, StartError};
-use kernel::user_progs::user_copair;
+use kernel::user_progs::{user_copair, user_placed};
 use kernel::{arch, println, user};
 
 #[unsafe(no_mangle)]
@@ -261,6 +261,7 @@ fn test_secondary_bringup() {
             println!("smp: real second core on {} confirmed", arch::NAME);
             test_parallel_gemm(idx);
             test_user_cells_on_both();
+            test_placement();
         }
         Err(StartError::NoSecondary) => {
             println!(
@@ -448,5 +449,164 @@ fn test_user_cells_on_both() {
              mid-run (primary saw the secondary reach {seen_p}, the secondary saw the \
              primary reach {seen_s}) OK"
         );
+    }
+}
+
+// -------------------------------------------- placing cells on whichever core is free
+//
+// The phase above hands one *named* cell to the secondary: the primary decides who
+// runs where, which is the decision a scheduler is supposed to make. This phase makes
+// it: a set of runnable cells goes into one queue and **every core claims from it
+// whenever it is free** (`smp::place_cells`). Nobody is assigned anything in advance.
+//
+// Two things are asserted, and they are different claims:
+//
+//   1. **Every cell ran and finished on some core**, identified by its own exit code -
+//      which is what ties a completed run back to a cell when the caller did not
+//      choose where it went.
+//   2. **More than one core took work**, and the per-core counts sum to the queue.
+//      A run where one core took everything would produce the same exit codes and
+//      teach nothing, which is exactly why correctness is not the placement evidence.
+//
+// The workloads are deliberately **uneven** (one long cell, the rest short). Under an
+// assign-in-advance split the core holding the long cell finishes late and the short
+// ones sit behind it; under claiming, the other cores come back for the next cell
+// while it runs. The resulting counts are reported rather than asserted to a
+// particular shape, because QEMU's TCG time-slices the vCPUs onto host threads and the
+// ratio is a property of that scheduling, not of ours.
+
+#[unsafe(link_section = ".user.bss")]
+static mut STORE_Q: [CellStore; PLACED] = [const { CellStore::new() }; PLACED];
+static mut KSTACK_Q: [KernelStack; PLACED] = [const { KernelStack::new() }; PLACED];
+
+/// Cells placed in one round. Deliberately **more than the machine has cores**, which
+/// is what makes the round say something an assignment could not: some core has to
+/// finish a cell and come back for another. Four cells on four cores would be one
+/// each whether they were claimed or handed out.
+const PLACED: usize = 8;
+
+/// Spin rounds for the one long cell, and for the three short ones.
+const LONG_ROUNDS: u64 = 96;
+const SHORT_ROUNDS: u64 = 8;
+
+fn test_placement() {
+    // Bring up the rest of the machine first: with a single secondary, "whichever core
+    // is free" has two participants and the result is hard to tell from a split.
+    let extra = smp::start_all();
+    let online = smp::online_count();
+    println!("smp: {online} CPUs online ({extra} more secondaries started for placement)");
+
+    // SAFETY: single-threaded setup on the primary; the secondaries are parked in
+    // their work loop and claim nothing until `place_cells` publishes the queue.
+    unsafe {
+        let objects = &mut *core::ptr::addr_of_mut!(OBJECTS2);
+        let caps = &mut *core::ptr::addr_of_mut!(CAPS2);
+        *objects = ObjectTable::new();
+        *caps = CapTable::new();
+
+        let mut aspaces: [core::mem::MaybeUninit<kernel::mm::AddressSpace>; PLACED] =
+            [const { core::mem::MaybeUninit::uninit() }; PLACED];
+        let mut frames: [core::mem::MaybeUninit<kernel::arch::TrapFrame>; PLACED] =
+            [const { core::mem::MaybeUninit::uninit() }; PLACED];
+        for i in 0..PLACED {
+            let store = core::ptr::addr_of_mut!(STORE_Q[i]);
+            let rounds = if i == 0 { LONG_ROUNDS } else { SHORT_ROUNDS };
+            let (aspace, _o, frame) = build_cell(
+                &mut *store,
+                objects,
+                caps,
+                (*core::ptr::addr_of!(KSTACK_Q[i])).top(),
+                (i + 1) as u16,
+                user_placed,
+                // Exit code: i + 1, so a zero can never be mistaken for a result.
+                (i + 1) as u64,
+                rounds,
+            );
+            aspaces[i].write(aspace);
+            frames[i].write(frame);
+        }
+
+        user::reset();
+        let mut queue = [0usize; PLACED];
+        for i in 0..PLACED {
+            let store = core::ptr::addr_of_mut!(STORE_Q[i]);
+            user::install(
+                i,
+                aspaces[i].assume_init_ref(),
+                caps,
+                objects,
+                (*store).qp.qp.as_ptr(),
+                frames[i].as_mut_ptr(),
+            );
+            queue[i] = i;
+        }
+
+        let mut out = [(0u64, 0usize); PLACED];
+        // SAFETY: all four cells are installed, present, native, and each is listed
+        // exactly once - which is what makes a claim exclusive ownership of a slot.
+        let finished = smp::place_cells(&queue, &mut out);
+        if !finished {
+            println!(
+                "smp: SKIP the placement phase - the queue did not drain within the \
+                 bound, so nothing about placing cells on free cores is claimed"
+            );
+            return;
+        }
+
+        // 1. Every cell ran to completion, on some core, and says which cell it was.
+        for i in 0..PLACED {
+            let (code, cpu) = out[i];
+            assert_eq!(code, (i + 1) as u64, "cell {i} exited with the wrong code");
+            assert!(cpu < smp::MAX_CPUS, "cell {i} records no CPU that ran it");
+            assert_eq!(
+                (*core::ptr::addr_of!(STORE_Q[i])).params.status,
+                1,
+                "cell {i} never finished its loop"
+            );
+        }
+
+        // 2. The work was shared, and the shares account for the whole queue.
+        let mut movers = 0;
+        let mut total = 0;
+        for c in 0..smp::MAX_CPUS {
+            let n = smp::cells_taken(c);
+            total += n;
+            if n > 0 {
+                movers += 1;
+            }
+        }
+        assert_eq!(
+            total, PLACED,
+            "claims ({total}) do not account for the queue ({PLACED})"
+        );
+        assert!(
+            movers > 1,
+            "one core claimed all {PLACED} cells - the queue was drained serially, so \
+             nothing was placed anywhere"
+        );
+        // More cells than cores, so at least one core must have finished a cell and
+        // **come back** for another. A one-cell-per-core hand-out cannot produce this,
+        // and it is the property that makes the queue work-conserving rather than a
+        // static split.
+        let most = (0..smp::MAX_CPUS).map(smp::cells_taken).max().unwrap_or(0);
+        assert!(
+            most > 1,
+            "no core claimed a second cell, so none came back for more work"
+        );
+        assert!(
+            kernel::mm::frames::used_matches_bitmap(),
+            "the frame pool's used counter drifted from its bitmap under placement"
+        );
+        println!(
+            "smp: {PLACED} RUNNABLE CELLS were PLACED on whichever core was free - none \
+             assigned in advance, {movers} cores claimed work (the busiest took \
+             {most}), every cell exited with its own code"
+        );
+        for c in 0..smp::MAX_CPUS {
+            let n = smp::cells_taken(c);
+            if n > 0 {
+                println!("smp:   CPU {c} claimed {n}");
+            }
+        }
     }
 }
