@@ -50,6 +50,13 @@ pub struct LinuxState {
     fds: fd::FdTable,
     brk_start: usize,
     brk_cur: usize,
+    /// Stack pages actually mapped for this cell, from its image's
+    /// `PT_GNU_STACK` request (docs/ARCHITECTURE-DEBT.md 4.0). `RLIMIT_STACK`
+    /// reports this rather than the default constant, because glibc sizes
+    /// *thread* stacks from it - reporting more than is mapped hands every
+    /// thread a stack that faults, and reporting less than the main thread got
+    /// wastes it.
+    stack_pages: usize,
     /// What this cell has mapped, and with what protection
     /// (docs/ARCHITECTURE-DEBT.md 4, blocker 2). Per-cell synthesized state, no
     /// kernel object - the authority over the pages is still the cell's own
@@ -75,6 +82,7 @@ impl LinuxState {
             fds: fd::FdTable::new(),
             brk_start: 0,
             brk_cur: 0,
+            stack_pages: stack::LINUX_STACK_PAGES,
             vmas: vma::VmaList::new(),
             tid_addr: 0,
             robust_list: 0,
@@ -113,8 +121,14 @@ fn state(idx: usize) -> &'static mut LinuxState {
 /// Initialize the Linux state for cell `idx`: console fds 0/1/2, the heap
 /// base at the loaded image end, the mmap cursor at the per-cell region base.
 /// Called by the test kernel after `load::load_elf_linux`, before `run`.
-pub fn install_cell(idx: usize, image_end: usize) {
+pub fn install_cell(idx: usize, img: &crate::load::LinuxImage) {
     let st = state(idx);
+    // Takes the whole image rather than one field of it: the heap base and the
+    // stack request are both properties of the same load, and passing them as
+    // separate arguments is how a call site ends up supplying one and defaulting
+    // the other (docs/ARCHITECTURE-DEBT.md 4.0).
+    let image_end = img.image_end;
+    st.stack_pages = stack::stack_pages_for(img.stack_want);
     st.fds.init_console();
     st.fds.set_auxv(stack::last_auxv());
     st.cwd_len = 1;
@@ -171,8 +185,10 @@ pub(crate) fn dup_state(from: usize, to: usize) {
 /// marked `FD_CLOEXEC`, which are closed here - that is what close-on-exec means,
 /// and `execve` used to keep every descriptor regardless. The caller resets the
 /// signal dispositions separately.
-pub(crate) fn exec_reinit(cell: usize, image_end: usize) {
+pub(crate) fn exec_reinit(cell: usize, img: &crate::load::LinuxImage) {
     let st = state(cell);
+    let image_end = img.image_end;
+    st.stack_pages = stack::stack_pages_for(img.stack_want);
     let closed = st.fds.close_cloexec();
     if closed > 0 {
         crate::println!("linux: execve closed {closed} close-on-exec fd(s)");
@@ -447,8 +463,8 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
         nr::PRCTL => ret(sys_prctl(args[0])),
 
         // -- resource limits --
-        nr::PRLIMIT64 => ret(sys_prlimit64(args[1], args[2], args[3])),
-        nr::GETRLIMIT => ret(sys_getrlimit(args[0], args[1])),
+        nr::PRLIMIT64 => ret(sys_prlimit64(cur, args[1], args[2], args[3])),
+        nr::GETRLIMIT => ret(sys_getrlimit(cur, args[0], args[1])),
 
         // -- x86-64 thread pointer (ARM64/RISC-V set theirs in userspace) --
         nr::ARCH_PRCTL => sys_arch_prctl(cur, args[0], args[1]),
@@ -1366,15 +1382,16 @@ const RLIM_INFINITY: u64 = u64::MAX;
 /// STACK = the size of the stack actually mapped (glibc sizes thread stacks
 /// from it, so reporting more than is mapped would hand every thread a stack
 /// that faults), NOFILE = the fd table size, everything else unlimited.
-fn rlimit_for(resource: u64) -> RLimit {
+fn rlimit_for(cell: usize, resource: u64) -> RLimit {
     const RLIMIT_STACK: u64 = 3;
     const RLIMIT_NOFILE: u64 = 7;
-    /// The mapped initial-stack size - the one number, not a second guess at it.
-    const STACK_BYTES: u64 = (stack::LINUX_STACK_PAGES * crate::mm::frames::FRAME_SIZE) as u64;
+    // The stack size this cell actually got - read back, not a second guess at
+    // it, and not the default (an image with a bigger `PT_GNU_STACK` got more).
+    let stack_bytes = (state(cell).stack_pages * crate::mm::frames::FRAME_SIZE) as u64;
     match resource {
         RLIMIT_STACK => RLimit {
-            cur: STACK_BYTES,
-            max: STACK_BYTES,
+            cur: stack_bytes,
+            max: stack_bytes,
         },
         RLIMIT_NOFILE => RLimit {
             cur: fd::NFD as u64,
@@ -1389,19 +1406,19 @@ fn rlimit_for(resource: u64) -> RLimit {
 
 /// prlimit64(pid, resource, new, old): report the (fixed) limit into `old`;
 /// `new` is ignored (limits are not settable).
-fn sys_prlimit64(resource: u64, _new: u64, old: u64) -> i64 {
+fn sys_prlimit64(cur: usize, resource: u64, _new: u64, old: u64) -> i64 {
     if old != 0 {
         // SAFETY: `old` is a writable rlimit in the cell's memory.
-        unsafe { (old as *mut RLimit).write(rlimit_for(resource)) };
+        unsafe { (old as *mut RLimit).write(rlimit_for(cur, resource)) };
     }
     0
 }
 
 /// getrlimit(resource, old): report the (fixed) limit.
-fn sys_getrlimit(resource: u64, old: u64) -> i64 {
+fn sys_getrlimit(cur: usize, resource: u64, old: u64) -> i64 {
     if old != 0 {
         // SAFETY: `old` is a writable rlimit in the cell's memory.
-        unsafe { (old as *mut RLimit).write(rlimit_for(resource)) };
+        unsafe { (old as *mut RLimit).write(rlimit_for(cur, resource)) };
     }
     0
 }

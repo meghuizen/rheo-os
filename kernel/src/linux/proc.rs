@@ -376,7 +376,7 @@ pub fn execve(cur: usize, path_va: u64, argv_va: u64, envp_va: u64, frame: *mut 
 
     // Reset the cell's personality state for the new image: keep fds + cwd, new
     // heap/mmap/auxv, default signal handlers, single thread.
-    super::exec_reinit(cur, img.image_end);
+    super::exec_reinit(cur, &img);
     signal::exec_reset(cur);
 
     // Tear down the old image, install the new one, and resume at its entry.

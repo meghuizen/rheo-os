@@ -28,7 +28,48 @@ const USER_STACK_TOP: usize = 0x2_0000_0000;
 /// in a JIT). The whole stack is mapped **eagerly** at load, so this costs
 /// 8 MiB of frames per Linux cell up front; a guard-page + demand-grow stack is
 /// the proper fix and rides with demand paging (docs/LINUX-COMPAT.md).
+///
+/// This is the **default**, used when the image asks for nothing. An image that
+/// records a larger `PT_GNU_STACK` `p_memsz` gets that instead, up to
+/// [`LINUX_STACK_MAX_PAGES`] - see [`stack_pages_for`].
 pub const LINUX_STACK_PAGES: usize = 2048;
+
+/// Ceiling on an image's `PT_GNU_STACK` request: **64 MiB**.
+///
+/// A bound rather than blind obedience, because the stack is mapped eagerly and
+/// charged to the cell's frame budget: an image asking for 2 GiB would exhaust
+/// the pool at load with no diagnostic near the cause. 64 MiB is 8x the default
+/// and 5x the largest real request measured (the Claude Code binary's 12.8 MiB,
+/// docs/ARCHITECTURE-DEBT.md 4.0); a request above it is clamped **and logged**,
+/// so a program that genuinely needs more fails with the reason on the console
+/// rather than mysteriously.
+pub const LINUX_STACK_MAX_PAGES: usize = 16384;
+
+/// How many stack pages to map for an image that asked for `want` bytes via
+/// `PT_GNU_STACK` (0 = asked for nothing).
+///
+/// The loader used to ignore `PT_GNU_STACK` entirely and hand every Linux cell
+/// [`LINUX_STACK_PAGES`], so an image asking for more silently got less and
+/// overran - the failure landing far from its cause, in whatever function
+/// happened to be deep enough (docs/ARCHITECTURE-DEBT.md 4.0). Reading the
+/// header is the difference between a number that happens to fit today's
+/// binaries and a mechanism that fits tomorrow's.
+pub fn stack_pages_for(want: usize) -> usize {
+    if want == 0 {
+        return LINUX_STACK_PAGES;
+    }
+    let pages = want.div_ceil(FRAME_SIZE).max(LINUX_STACK_PAGES);
+    if pages > LINUX_STACK_MAX_PAGES {
+        crate::println!(
+            "linux: PT_GNU_STACK asks {} KiB, clamped to the {} KiB ceiling \
+             (stack is mapped eagerly and charged to the cell)",
+            want / 1024,
+            LINUX_STACK_MAX_PAGES * FRAME_SIZE / 1024
+        );
+        return LINUX_STACK_MAX_PAGES;
+    }
+    pages
+}
 
 // ELF auxiliary-vector types (Linux uapi/linux/auxvec.h).
 const AT_NULL: u64 = 0;
@@ -64,7 +105,9 @@ pub fn setup_stack(
 ) -> usize {
     // Map every stack page; remember the top page's frame for the write-in.
     let mut top_pa = 0usize;
-    let mut va = USER_STACK_TOP - LINUX_STACK_PAGES * FRAME_SIZE;
+    // Sized from the image's own `PT_GNU_STACK` request, not a fixed constant.
+    let pages = stack_pages_for(img.stack_want);
+    let mut va = USER_STACK_TOP - pages * FRAME_SIZE;
     while va < USER_STACK_TOP {
         let pa = frames::alloc().expect("initial process stack (bounded, at load)");
         aspace.map_user_frame(va, pa, MapPerm::UserRw);

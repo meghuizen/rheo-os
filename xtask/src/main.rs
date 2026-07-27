@@ -1162,56 +1162,67 @@ fn build_linux_fixtures(arch: Arch) -> bool {
     // Signal fixtures (L5) + process fixtures (L6): same static-glibc ET_EXEC
     // recipe as chello. `procdemo` (pipe2+fork+dup2+execve+wait4) and `cecho`
     // (its execve target) are the `linuxproc` proof (docs/LINUX-COMPAT.md L6).
-    for (src, bin) in [
-        ("sig_raise.c", "sig_raise"),
-        ("sig_segv.c", "sig_segv"),
-        ("sig_dfl.c", "sig_dfl"),
-        ("procdemo.c", "procdemo"),
-        ("cecho.c", "cecho"),
-        ("rsh.c", "rsh"),
+    /// Fixtures needing no extra link arguments (most of them).
+    const NO_EXTRA: &[&str] = &[];
+    for (src, bin, extra) in [
+        ("sig_raise.c", "sig_raise", NO_EXTRA),
+        ("sig_segv.c", "sig_segv", NO_EXTRA),
+        ("sig_dfl.c", "sig_dfl", NO_EXTRA),
+        ("procdemo.c", "procdemo", NO_EXTRA),
+        ("cecho.c", "cecho", NO_EXTRA),
+        ("rsh.c", "rsh", NO_EXTRA),
         // AF_UNIX (L8, docs/LINUX-COMPAT.md): socketpair+fork + bind/listen/
         // connect/accept, the `linuxunix` proof.
-        ("af_unix.c", "af_unix"),
+        ("af_unix.c", "af_unix", NO_EXTRA),
         // AF_INET/AF_INET6 loopback (L8-INET, docs/LINUX-COMPAT.md): TCP+UDP+epoll
         // over 127.0.0.1 and TCP over ::1, the `linuxinet` proof.
-        ("inet.c", "inet"),
+        ("inet.c", "inet", NO_EXTRA),
         // Remote INET over the NIC (rheo-net N4b, docs/NETSTACK.md N4b): a real
         // DNS round trip to SLIRP's resolver + a real remote TCP connect, the
         // `linuxnet` proof.
-        ("inetremote.c", "inetremote"),
+        ("inetremote.c", "inetremote", NO_EXTRA),
         // Name resolution through glibc's own resolver (docs/NETSTACK.md 18):
         // `getaddrinfo` over the seeded /etc/{nsswitch.conf,hosts,resolv.conf},
         // the second `linuxnet` phase.
-        ("resolve.c", "resolve"),
+        ("resolve.c", "resolve", NO_EXTRA),
         // `fcntl`'s honesty (docs/LINUX-COMPAT.md, the `fcntl` row): unimplemented
         // commands refused, O_NONBLOCK honoured, F_GETFL real, FD_CLOEXEC closed
         // across execve. Part of the `linuxproc` proof (it execve's itself).
-        ("fcntlx.c", "fcntlx"),
+        ("fcntlx.c", "fcntlx", NO_EXTRA),
         // Cross-process signalling + `/proc/self/exe` (docs/ARCHITECTURE-DEBT.md 4):
         // `kill` used to refuse any pid but our own and silently self-target on
         // pid 0/-1, and `readlinkat` was a hardcoded -ENOENT. Part of the
         // `linuxproc` proof (it execve's itself for the exe-path phase).
-        ("killx.c", "killx"),
+        ("killx.c", "killx", NO_EXTRA),
         // The mmap region is bounded and MAP_FIXED cannot replace the kernel's
         // rings (docs/ARCHITECTURE-DEBT.md 4, blocker 2): the cursor used to run
         // out of its region, through the queue and into ld.so, silently. Part of
         // the `linuxproc` proof.
-        ("mmapx.c", "mmapx"),
+        ("mmapx.c", "mmapx", NO_EXTRA),
         // `sched_yield` must cross processes, not only a cell's own contexts
         // (docs/ARCHITECTURE-DEBT.md 4): a single-threaded yielder had no ready
         // sibling context, so the call returned immediately and a forked child
         // could starve its parent. Part of the `linuxproc` proof.
-        ("yieldx.c", "yieldx"),
+        ("yieldx.c", "yieldx", NO_EXTRA),
         // A futex wait that must END BY ITSELF (docs/LINUX-COMPAT.md L4, the
         // `futex` row): `pthread_cond_timedwait` on a never-signalled condvar.
         // Part of the `linuxthreads` proof.
-        ("condwait.c", "condwait"),
+        ("condwait.c", "condwait", NO_EXTRA),
         // `poll`/`epoll_wait`/`nanosleep` truth + creation-time O_NONBLOCK
         // (docs/ARCHITECTURE-DEBT.md 2.4): the `linuxpoll` proof.
-        ("pollx.c", "pollx"),
+        ("pollx.c", "pollx", NO_EXTRA),
         // A wait that can never end: the scheduler's deadlock diagnostic, the
         // second `linuxpoll` phase.
-        ("polldead.c", "polldead"),
+        ("polldead.c", "polldead", NO_EXTRA),
+        // The loader must size the stack from **PT_GNU_STACK**, not a fixed
+        // constant (docs/ARCHITECTURE-DEBT.md 4.0, blocker 1). Linked with
+        // `-z stacksize` so its own header asks for more than the old 8 MiB
+        // default, then it touches that much stack. Part of `linuxproc`.
+        // 12 MiB of PT_GNU_STACK, above the loader's old fixed 8 MiB default.
+        // The spelling matters: GNU ld wants `stack-size`, lld wants `stacksize`,
+        // and ld *ignores* the one it does not know with a warning, not an error -
+        // so the wrong spelling links fine and produces a p_memsz of 0.
+        ("stackx.c", "stackx", &["-Wl,-z,stack-size=12582912"]),
     ] {
         let mut sc = Command::new(cc);
         sc.arg("-static").arg("-no-pie");
@@ -1220,6 +1231,11 @@ fn build_linux_fixtures(arch: Arch) -> bool {
             "-o",
             &format!("{out_dir}/{bin}"),
         ]);
+        // Per-fixture link arguments. Most need none; a fixture that has to
+        // *record something in its own ELF headers* (a PT_GNU_STACK size) can
+        // only do it at link time, and a one-off special case here would be the
+        // start of a second fixture-building path.
+        sc.args(extra.iter());
         if !matches!(sc.status().map(|s| s.success()), Ok(true)) {
             eprintln!(
                 "[xtask] signal fixture {bin} build failed for {}",

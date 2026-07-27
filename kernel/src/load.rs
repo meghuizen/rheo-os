@@ -159,6 +159,14 @@ pub struct LinuxImage {
     /// Highest mapped VA rounded up to a page: where the `brk` heap starts
     /// (docs/LINUX-COMPAT.md L2).
     pub image_end: usize,
+    /// Stack bytes the image asked for via `PT_GNU_STACK` `p_memsz`, or 0 if it
+    /// asked for nothing (docs/ARCHITECTURE-DEBT.md 4.0). `stack::setup_stack`
+    /// sizes the initial stack from this, clamped to
+    /// [`crate::linux::stack::LINUX_STACK_MAX_PAGES`].
+    ///
+    /// Read from the **main program**, not the interpreter: `ld.so` carries its
+    /// own `PT_GNU_STACK` and it is the program's requirement that matters.
+    pub stack_want: usize,
 }
 
 /// Load a Linux ELF (`ET_EXEC` or `ET_DYN`) into `aspace`, applying the
@@ -206,6 +214,7 @@ pub fn load_elf_linux(image: &[u8], aspace: &mut AddressSpace) -> Option<LinuxIm
         phnum: elf.phnum(),
         at_entry: main_entry,
         image_end,
+        stack_want: elf.stack_size().unwrap_or(0),
     })
 }
 
@@ -325,6 +334,7 @@ fn exec_elf_inner(
         phnum: elf.phnum(),
         at_entry: entry,
         image_end,
+        stack_want: elf.stack_size().unwrap_or(0),
     })
 }
 

@@ -128,7 +128,7 @@ fn run(image: &[u8], argv: &[&[u8]], envp: &[&[u8]]) -> Outcome {
         user::reset();
         user::install(0, &aspace, caps, objects, qp, addr_of_mut!(frame));
         user::set_personality(0, Personality::Linux);
-        linux::install_cell(0, img.image_end);
+        linux::install_cell(0, &img);
         user::run(0).1
     }
 }

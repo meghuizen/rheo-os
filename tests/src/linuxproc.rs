@@ -46,6 +46,7 @@ static FCNTLX: &[u8] = fixture::linux!("fcntlx");
 static KILLX: &[u8] = fixture::linux!("killx");
 static MMAPX: &[u8] = fixture::linux!("mmapx");
 static YIELDX: &[u8] = fixture::linux!("yieldx");
+static STACKX: &[u8] = fixture::linux!("stackx");
 static COREUTILS: &[u8] = fixture::linux!("cu/bin/coreutils");
 
 // -- stdout capture, wired to the Linux personality's stdout tap --
@@ -324,6 +325,35 @@ extern "C" fn kernel_main() -> ! {
         "linuxproc: sched_yield OK - a forked child and its parent alternate \
          round for round, so a yield reaches the next runnable process and not \
          only a sibling context"
+    );
+
+    // --- the stack is sized from the image, not from a constant
+    // (docs/ARCHITECTURE-DEBT.md 4.0, blocker 1). The loader ignored
+    // `PT_GNU_STACK` and gave every Linux cell the same 8 MiB, so a binary that
+    // recorded a larger request silently got less and overran - the fault landing
+    // wherever the recursion happened to be deep enough, far from the cause.
+    //
+    // The fixture is linked `-Wl,-z,stacksize=12582912` (12 MiB, see xtask), so
+    // its own header asks for more than the old default. Two things are asserted
+    // in one run because either alone can pass while lying: `RLIMIT_STACK`
+    // *reports* the larger size (glibc sizes thread stacks from that number), and
+    // the stack is genuinely *there* - 9280 KiB of it is touched in 64 KiB frames,
+    // which is above the old 8 MiB and inside the 12 MiB request.
+    let want_stack: &[u8] = b"stack: RLIMIT_STACK covers the PT_GNU_STACK request\n\
+        stack: touched 9280 KiB of stack in 145 frames\n\
+        stackx OK\n";
+    let (code, out) = run_capture(STACKX, &[b"stackx"]);
+    assert!(
+        out == want_stack,
+        "stackx: stdout mismatch\n  got:      {:?}\n  expected: {:?}",
+        core::str::from_utf8(out),
+        core::str::from_utf8(want_stack),
+    );
+    assert!(code == 0, "stackx: exit {code}, expected 0");
+    println!(
+        "linuxproc: PT_GNU_STACK OK - an image asking for 12 MiB of stack is \
+         given 12 MiB and told 12 MiB, and 9280 KiB of it is actually written \
+         through - past the old fixed 8 MiB default, which faulted here"
     );
 
     println!("linuxproc: PASS");

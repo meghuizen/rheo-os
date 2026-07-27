@@ -142,7 +142,7 @@ fn run_capture(image: &[u8], argv: &[&[u8]]) -> (Outcome, &'static [u8]) {
         user::reset();
         user::install(0, &aspace, caps, objects, qp, addr_of_mut!(frame));
         user::set_personality(0, Personality::Linux);
-        linux::install_cell(0, img.image_end);
+        linux::install_cell(0, &img);
         user::run(0).1
     };
     linux::set_stdout_tap(None);
