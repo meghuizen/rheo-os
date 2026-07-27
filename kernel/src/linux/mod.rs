@@ -964,6 +964,7 @@ fn sys_write(
 /// fd-passing is deferred; a non-empty control buffer is left untouched.
 fn sys_sendmsg(st: &mut LinuxState, fd: i64, msg_va: u64, write: bool) -> i64 {
     #[repr(C)]
+    #[derive(Copy, Clone)]
     struct MsgHdr {
         msg_name: u64,
         msg_namelen: u32,
@@ -977,8 +978,9 @@ fn sys_sendmsg(st: &mut LinuxState, fd: i64, msg_va: u64, write: bool) -> i64 {
     if msg_va == 0 {
         return -errno::EFAULT;
     }
-    // SAFETY: `msg_va` is a caller-provided `struct msghdr`.
-    let hdr = unsafe { &*(msg_va as *const MsgHdr) };
+    let Some(hdr) = crate::uaccess::read::<MsgHdr>(msg_va) else {
+        return -errno::EFAULT;
+    };
     sys_readv(st, fd, hdr.msg_iov, hdr.msg_iovlen, write)
 }
 
@@ -986,10 +988,12 @@ fn sys_sendmsg(st: &mut LinuxState, fd: i64, msg_va: u64, write: bool) -> i64 {
 /// common options (SO_ERROR etc.) so glibc's post-connect probe succeeds.
 fn sys_getsockopt(optval_va: u64, optlen_va: u64) -> i64 {
     if optval_va != 0 && optlen_va != 0 {
-        // SAFETY: caller-provided optlen (in) + optval buffer.
-        let len = unsafe { (optlen_va as *const u32).read() } as usize;
-        let n = len.min(4);
-        unsafe { core::ptr::write_bytes(optval_va as *mut u8, 0, n) };
+        let Some(len) = crate::uaccess::read::<u32>(optlen_va) else {
+            return -errno::EFAULT;
+        };
+        if !crate::uaccess::fill(optval_va, 0, (len as usize).min(4)) {
+            return -errno::EFAULT;
+        }
     }
     0
 }
@@ -1006,8 +1010,11 @@ fn sys_readv(st: &mut LinuxState, fd: i64, iov_va: u64, iovcnt: u64, write: bool
     }
     let mut total = 0i64;
     for i in 0..iovcnt as usize {
-        // SAFETY: trap context; the iovec array lies in the cell's memory.
-        let iov = unsafe { (iov_va as *const IoVec).add(i).read() };
+        let Some(iov) = crate::uaccess::read::<IoVec>(
+            iov_va + (i as u64) * core::mem::size_of::<IoVec>() as u64,
+        ) else {
+            return -errno::EFAULT;
+        };
         if iov.len == 0 {
             continue;
         }
@@ -1123,17 +1130,20 @@ fn sys_poll(cur: usize, st: &mut LinuxState, fds_va: u64, nfds: u64, timeout_ms:
 fn poll_probe(st: &LinuxState, fds_va: u64, nfds: usize) -> i64 {
     let mut ready = 0i64;
     for i in 0..nfds {
-        // SAFETY: the pollfd array was bounded to `nfds` 8-byte entries in the
-        // calling cell's user VA range at the dispatch point.
-        unsafe {
-            let fd = (fds_va as *const i32).add(i * 2).read();
-            let events = (fds_va as *const i16).add(i * 4 + 2).read();
+        // A `pollfd` is 8 bytes: `int fd; short events; short revents`, so the two
+        // shorts sit at offsets the ABI does not promise to align. Read and written
+        // through `uaccess`, which bounds the array, faults it in and un-shares it -
+        // the caller's set is often on a stack shared by a fork.
+        let base = fds_va + (i as u64) * 8;
+        {
+            let fd = crate::uaccess::read_unaligned::<i32>(base).unwrap_or(-1);
+            let events = crate::uaccess::read_unaligned::<i16>(base + 4).unwrap_or(0);
             let revents = if fd < 0 {
                 0
             } else {
                 poll_revents(&st.fds, fd as i64, events)
             };
-            (fds_va as *mut i16).add(i * 4 + 3).write(revents);
+            crate::uaccess::write_unaligned::<i16>(base + 6, revents);
             if revents != 0 {
                 ready += 1;
             }
@@ -1370,10 +1380,10 @@ fn sys_getcwd(st: &LinuxState, buf: u64, size: u64) -> i64 {
     if buf == 0 || (size as usize) < need {
         return -errno::ERANGE;
     }
-    // SAFETY: `buf` is a writable range of at least `need` bytes in the cell.
-    unsafe {
-        core::ptr::copy_nonoverlapping(st.cwd.as_ptr(), buf as *mut u8, st.cwd_len);
-        *(buf as *mut u8).add(st.cwd_len) = 0;
+    if !crate::uaccess::copy_out(buf, &st.cwd[..st.cwd_len])
+        || !crate::uaccess::write::<u8>(buf + st.cwd_len as u64, 0)
+    {
+        return -errno::EFAULT;
     }
     need as i64
 }
@@ -1385,8 +1395,9 @@ fn sys_chdir(st: &mut LinuxState, path_va: u64) -> i64 {
     if len == 0 {
         return -errno::ENOENT;
     }
-    // SAFETY: `path_va` is a readable C string in the cell (bounded above).
-    unsafe { core::ptr::copy_nonoverlapping(path_va as *const u8, st.cwd.as_mut_ptr(), len) };
+    if !crate::uaccess::copy_in(&mut st.cwd[..len], path_va) {
+        return -errno::EFAULT;
+    }
     st.cwd_len = len;
     0
 }
@@ -1405,12 +1416,13 @@ fn sys_uname(buf: u64) -> i64 {
         "",
     ];
     for (i, f) in fields.iter().enumerate() {
-        // SAFETY: `buf` points at a 6*65-byte utsname in the cell's memory.
-        unsafe {
-            let dst = (buf as *mut u8).add(i * FIELD);
-            core::ptr::write_bytes(dst, 0, FIELD);
-            let n = f.len().min(FIELD - 1);
-            core::ptr::copy_nonoverlapping(f.as_ptr(), dst, n);
+        let dst = buf + (i * FIELD) as u64;
+        // Zero the whole field first: `utsname` strings are fixed-width and a caller
+        // reads to the NUL, so a short name must not leave the tail of a previous one.
+        if !crate::uaccess::fill(dst, 0, FIELD)
+            || !crate::uaccess::copy_out(dst, &f.as_bytes()[..f.len().min(FIELD - 1)])
+        {
+            return -errno::EFAULT;
         }
     }
     0
@@ -1441,11 +1453,10 @@ fn sys_clock_gettime(clk_id: u64, ts_va: u64) -> i64 {
     let ns = cell_clock_ns(clk_id == CLOCK_REALTIME);
     let secs = ns / 1_000_000_000;
     let nsec = ns % 1_000_000_000;
-    // SAFETY: `ts_va` is a writable timespec (two i64) in the cell's memory.
-    unsafe {
-        let p = ts_va as *mut i64;
-        p.write(secs as i64);
-        p.add(1).write(nsec as i64);
+    if !crate::uaccess::write::<i64>(ts_va, secs as i64)
+        || !crate::uaccess::write::<i64>(ts_va + 8, nsec as i64)
+    {
+        return -errno::EFAULT;
     }
     0
 }
@@ -1453,8 +1464,11 @@ fn sys_clock_gettime(clk_id: u64, ts_va: u64) -> i64 {
 /// getrandom(buf, count, flags): fill from the cell's DRBG (docs/
 /// TIME-IDENTITY.md 4). Flags are ignored - the source never blocks.
 fn sys_getrandom(buf: u64, count: u64) -> i64 {
-    // SAFETY: `buf` is a writable range in the calling cell.
-    let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, count as usize) };
+    // SAFETY: `uaccess::slice` bounds it, faults it in and un-shares it; we are
+    // servicing this cell's synchronous trap.
+    let Some(dst) = (unsafe { crate::uaccess::slice(buf, count as usize) }) else {
+        return -errno::EFAULT;
+    };
     crate::rng::derive_cell_drbg().fill_bytes(dst);
     count as i64
 }
@@ -1676,8 +1690,9 @@ fn sys_arch_prctl(cur: usize, code: u64, addr: u64) -> Ctl {
             Ctl::Ret(0)
         }
         ARCH_GET_FS => {
-            // SAFETY: trap context; `addr` is a writable VA in the cell.
-            unsafe { (addr as *mut u64).write(crate::arch::user_fs_base()) };
+            if !crate::uaccess::write::<u64>(addr, crate::arch::user_fs_base()) {
+                return err(errno::EFAULT);
+            }
             Ctl::Ret(0)
         }
         _ => err(errno::EINVAL),

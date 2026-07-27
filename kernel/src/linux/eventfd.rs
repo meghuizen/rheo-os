@@ -156,25 +156,26 @@ pub fn read(ev: u8, buf_va: u64, count: u64) -> Result<ReadNb, i64> {
     if count < 8 {
         return Err(-crate::linux::errno::EINVAL);
     }
-    // The value is written into the cell, so bound the destination first
-    // (docs/ENGINEERING.md 12). Checked as a range rather than through
-    // `user_out::<u64>` because Linux does not require the buffer to be 8-aligned,
-    // and refusing an unaligned one with -EFAULT would be a bug of our own making.
-    if crate::user::user_buf_mut(buf_va, 8).is_none() {
-        return Err(-crate::linux::errno::EFAULT);
-    }
+    // Peek before taking: the write can still fail (an unmapped buffer, or one the
+    // cell has no writable mapping for), and draining a counter into a write that
+    // then fails would lose the wakeup the eventfd exists to carry.
     let e = &mut tbl()[ev as usize];
     if e.count == 0 {
         return Ok(ReadNb::WouldBlock);
     }
-    let val = if e.semaphore {
+    let val = if e.semaphore { 1 } else { e.count };
+    // Unaligned on purpose: Linux does not require an 8-aligned buffer here, and
+    // refusing one with -EFAULT would be a bug of our own making. `uaccess` bounds it,
+    // makes it present, and resolves copy-on-write before the store.
+    if !crate::uaccess::write_unaligned::<u64>(buf_va, val) {
+        return Err(-crate::linux::errno::EFAULT);
+    }
+    let e = &mut tbl()[ev as usize];
+    if e.semaphore {
         e.count -= 1;
-        1
     } else {
-        core::mem::take(&mut e.count)
-    };
-    // SAFETY: `buf_va` was range-checked writable above in the active cell.
-    unsafe { (buf_va as *mut u64).write_unaligned(val) };
+        e.count = 0;
+    }
     Ok(ReadNb::Done)
 }
 
@@ -188,12 +189,10 @@ pub fn write(ev: u8, buf_va: u64, count: u64) -> i64 {
     if count < 8 {
         return -EINVAL;
     }
-    if crate::user::user_buf(buf_va, 8).is_none() {
+    // Unaligned for the same reason as `read` above.
+    let Some(add) = crate::uaccess::read_unaligned::<u64>(buf_va) else {
         return -EFAULT;
-    }
-    // SAFETY: `[buf_va, buf_va+8)` was range-checked readable in the active cell;
-    // unaligned because Linux does not require an aligned buffer.
-    let add = unsafe { (buf_va as *const u64).read_unaligned() };
+    };
     if add == u64::MAX {
         return -EINVAL; // the one value a write may never carry
     }

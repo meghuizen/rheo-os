@@ -138,8 +138,16 @@ pub fn read(idx: usize, buf_va: u64, count: u64) -> ReadNb {
         };
     }
     let n = p.len.min(count as usize);
-    // SAFETY: `buf_va` is a writable range of `n` bytes in the active cell.
-    let buf = unsafe { core::slice::from_raw_parts_mut(buf_va as *mut u8, n) };
+    // Through `uaccess`, which bounds the destination, makes it present, and resolves
+    // copy-on-write before the store. This used to build a slice straight from the
+    // cell-supplied VA with no check of any kind - and a pipe read into a buffer the
+    // reader has not touched since a fork is exactly the shape that faults at a kernel
+    // PC (docs/ENGINEERING.md 11).
+    // SAFETY: we are servicing this cell's synchronous trap, so nothing else holds a
+    // reference to the range.
+    let Some(buf) = (unsafe { crate::uaccess::slice(buf_va, n) }) else {
+        return ReadNb::Done(-crate::linux::errno::EFAULT);
+    };
     for b in buf.iter_mut() {
         *b = p.buf[p.head];
         p.head = (p.head + 1) % PIPE_CAP;
@@ -170,7 +178,12 @@ pub fn write(idx: usize, buf_va: u64, count: u64) -> WriteNb {
         return WriteNb::WouldBlock;
     }
     let n = free.min(count as usize);
-    // SAFETY: `buf_va` is a readable range of `n` bytes in the active cell.
+    // Through `uaccess`, as the read side: bounded, present, and read only once it is.
+    if crate::uaccess::buf(buf_va, n).is_none() {
+        return WriteNb::Done(-crate::linux::errno::EFAULT);
+    }
+    // SAFETY: `uaccess::buf` validated `[buf_va, buf_va+n)` readable in the active
+    // cell, and we are servicing that cell's synchronous trap.
     let buf = unsafe { core::slice::from_raw_parts(buf_va as *const u8, n) };
     for &b in buf {
         let tail = (p.head + p.len) % PIPE_CAP;

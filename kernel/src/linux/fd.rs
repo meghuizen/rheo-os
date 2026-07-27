@@ -331,11 +331,12 @@ impl FdTable {
             self.flags[rd].nonblock = true;
             self.flags[wr].nonblock = true;
         }
-        // SAFETY: `pipefd_va` is a writable [i32; 2] in the calling cell.
-        unsafe {
-            let p = pipefd_va as *mut i32;
-            p.write(rd as i32);
-            p.add(1).write(wr as i32);
+        // Through `uaccess`: bounded, present, and copy-on-write resolved before the
+        // store (a fresh pipe's fd pair often lands on a stack shared by a fork).
+        if !crate::uaccess::write::<i32>(pipefd_va, rd as i32)
+            || !crate::uaccess::write::<i32>(pipefd_va + 4, wr as i32)
+        {
+            return -EFAULT;
         }
         0
     }
@@ -446,22 +447,26 @@ impl FdTable {
             FdKind::Console(_) => -EBADF,
             FdKind::Null => 0,
             FdKind::Zero => {
-                let buf =
-                    unsafe { core::slice::from_raw_parts_mut(buf_va as *mut u8, count as usize) };
-                buf.fill(0);
+                if !crate::uaccess::fill(buf_va, 0, count as usize) {
+                    return -EFAULT;
+                }
                 count as i64
             }
             FdKind::Urandom => {
-                let buf =
-                    unsafe { core::slice::from_raw_parts_mut(buf_va as *mut u8, count as usize) };
+                // SAFETY: `uaccess::slice` bounds, faults in and un-shares the range;
+                // we are servicing this cell's synchronous trap.
+                let Some(buf) = (unsafe { crate::uaccess::slice(buf_va, count as usize) }) else {
+                    return -EFAULT;
+                };
                 crate::rng::derive_cell_drbg().fill_bytes(buf);
                 count as i64
             }
             FdKind::ProcAuxv { pos } => {
                 let end = self.auxv_len;
                 let n = (end - pos.min(end)).min(count as usize);
-                let buf = unsafe { core::slice::from_raw_parts_mut(buf_va as *mut u8, n) };
-                buf.copy_from_slice(&self.auxv[pos..pos + n]);
+                if !crate::uaccess::copy_out(buf_va, &self.auxv[pos..pos + n]) {
+                    return -EFAULT;
+                }
                 self.fds[slot] = FdKind::ProcAuxv { pos: pos + n };
                 n as i64
             }
@@ -535,6 +540,10 @@ impl FdTable {
         match self.fds[slot] {
             FdKind::Console(0) => -EBADF,
             FdKind::Console(_) => {
+                if crate::uaccess::buf(buf_va, count as usize).is_none() {
+                    return -EFAULT;
+                }
+                // SAFETY: `uaccess::buf` validated the range readable in the active cell.
                 let buf =
                     unsafe { core::slice::from_raw_parts(buf_va as *const u8, count as usize) };
                 for &b in buf {
@@ -635,6 +644,11 @@ impl FdTable {
             // Relative-to-a-dirfd resolution is L3 (docs/LINUX-COMPAT.md).
             return -ENOSYS;
         }
+        if crate::uaccess::buf(path_va, path_len).is_none() {
+            return -EFAULT;
+        }
+        // SAFETY: `uaccess::buf` bounded and faulted in `[path_va, path_va+path_len)`
+        // in the active cell.
         let bytes = unsafe { core::slice::from_raw_parts(path_va as *const u8, path_len) };
         let name = &bytes[..bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len())];
 
@@ -1104,7 +1118,11 @@ impl FdTable {
             return 0; // end of directory
         }
         // Copy whole records from dir_off while they fit the caller's buffer.
-        let out = unsafe { core::slice::from_raw_parts_mut(buf_va as *mut u8, len as usize) };
+        // SAFETY: `uaccess::slice` bounds it, faults it in and un-shares it; we are
+        // servicing this cell's synchronous trap.
+        let Some(out) = (unsafe { crate::uaccess::slice(buf_va, len as usize) }) else {
+            return -EFAULT;
+        };
         let mut cur = dir_off;
         let mut oi = 0usize;
         while cur < total {
@@ -1286,13 +1304,16 @@ impl FdTable {
             return -EINVAL;
         };
         let (events, data) = if event_va != 0 {
-            // SAFETY: `event_va` is a caller-provided `struct epoll_event`.
-            unsafe {
-                let ev = (event_va as *const u32).read_unaligned();
-                let d = ((event_va + arch::linux_abi::EPOLL_EVENT_DATA_OFFSET as u64)
-                    as *const u64)
-                    .read_unaligned();
-                (ev, d)
+            // `data` sits at a per-ISA offset the ABI does not promise to align, so
+            // both fields are read unaligned - through `uaccess`, which bounds and
+            // faults in the `struct epoll_event` first.
+            let doff = arch::linux_abi::EPOLL_EVENT_DATA_OFFSET as u64;
+            match (
+                crate::uaccess::read_unaligned::<u32>(event_va),
+                crate::uaccess::read_unaligned::<u64>(event_va + doff),
+            ) {
+                (Some(ev), Some(d)) => (ev, d),
+                _ => return -EFAULT,
             }
         } else {
             (0, 0)
@@ -1328,11 +1349,10 @@ impl FdTable {
             }
             if re != 0 {
                 let base = events_va + out as u64 * size;
-                // SAFETY: `events_va` is a caller-provided array of `maxevents`
-                // `struct epoll_event`; `out < maxevents`.
-                unsafe {
-                    (base as *mut u32).write_unaligned(re);
-                    ((base + doff) as *mut u64).write_unaligned(data);
+                if !crate::uaccess::write_unaligned::<u32>(base, re)
+                    || !crate::uaccess::write_unaligned::<u64>(base + doff, data)
+                {
+                    return -EFAULT;
                 }
                 out += 1;
             }
@@ -1444,11 +1464,10 @@ impl FdTable {
         self.flags[s1].cloexec = ty & O_CLOEXEC != 0;
         self.flags[s0].nonblock = ty & O_NONBLOCK != 0;
         self.flags[s1].nonblock = ty & O_NONBLOCK != 0;
-        // SAFETY: `sv_va` is a writable [i32; 2] in the calling cell.
-        unsafe {
-            let p = sv_va as *mut i32;
-            p.write(s0 as i32);
-            p.add(1).write(s1 as i32);
+        if !crate::uaccess::write::<i32>(sv_va, s0 as i32)
+            || !crate::uaccess::write::<i32>(sv_va + 4, s1 as i32)
+        {
+            return -EFAULT;
         }
         0
     }
@@ -1912,7 +1931,10 @@ impl FdTable {
         };
         let (_, src_port) = inetsock::dgram_addr(ep);
         let n = (len as usize).min(inetsock::DGRAM_MAX);
-        // SAFETY: `buf` is a readable range of `n` bytes in the active cell.
+        if crate::uaccess::buf(buf, n).is_none() {
+            return -EFAULT;
+        }
+        // SAFETY: `uaccess::buf` validated the range readable in the active cell.
         let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, n) };
         match inetsock::send_dgram(dv6, dport, src_port, bytes) {
             // Nothing is bound at the destination, so no reader exists now or
@@ -1967,8 +1989,11 @@ impl FdTable {
         if !bound {
             return -EAGAIN; // never bound: nothing can have arrived
         }
-        // SAFETY: `buf` is a writable range of `len` bytes in the active cell.
-        let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
+        // SAFETY: as the other `uaccess::slice` sites - bounded, present, un-shared,
+        // and we are inside this cell's synchronous trap.
+        let Some(out) = (unsafe { crate::uaccess::slice(buf, len as usize) }) else {
+            return -EFAULT;
+        };
         match inetsock::recv_dgram(ep, out) {
             Some((src_port, n)) => {
                 if src_addr != 0 {
