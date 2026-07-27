@@ -677,7 +677,14 @@ fixup path.
     distinct inodes are sufficient for the dedup. Recorded as a scar in
     docs/ENGINEERING.md 11 ("a field left constant is a field that lies").
     `MAX_MAPPED_FILES` was raised to **64** alongside it, for the dozen-library
-    shape a production binary has.
+    shape a production binary has. A **four-library** proof rides the same phase:
+    `dcpp` (a dynamic C++ hello) links **libstdc++ + libgcc_s + libc + libm** and
+    runs C++ runtime init (static constructors, iostream setup, exception-unwind
+    tables) - the production shape a real application has - printing
+    `dcpp: hello from dynamic C++ (23)` + exit 23 on x86_64 and aarch64
+    (riscv64 skips-with-reason: no cross-g++ in the build environment). No new
+    kernel gap surfaced: the inode fix plus the existing loader scale from two
+    libraries to a real four-library C++ binary unchanged.
   - Accommodations, disclosed: a dynamic **Rust** `std` hello is additionally
     skewed (rustc's bundled std targets a newer glibc than the cross sysroot), so
     a version-consistent multi-lib fixture uses cross-gcc-built C. **MAP_SHARED of
@@ -984,11 +991,14 @@ The **L7 dynamic fixtures** (`tests/linux-fixtures/dhello.c` + `dmath.c`, the
 `ld-linux`. `dhello` links only `libc`; `dmath` (a `sqrt` program built
 `-fno-builtin -lm`) links `libm` **as well**, so ld.so must load two shared
 libraries and resolve one's versions against the other (the multi-library case,
-GOAL-DYN-MULTILIB). Their runtime dependencies (the dynamic linker + `libc.so.6`
-+ `libm.so.6`) are **not built** but **copied from the cross toolchain** at build
-time by xtask `build_dyn_fixture` into the gitignored fixture build dir (never
-committed), and the `linuxdyn` test seeds them into a ramfs `/lib` so ld.so
-resolves them:
+GOAL-DYN-MULTILIB); `dcpp` (a C++ hello built with g++) links **libstdc++ +
+libgcc_s + libc + libm** - four libraries plus C++ runtime init, the production
+shape. Their runtime dependencies (the dynamic linker + `libc.so.6` + `libm.so.6`
++ `libstdc++.so.6` + `libgcc_s.so.1`) are **not built** but **copied from the
+cross toolchain** at build time by xtask `build_dyn_fixture` into the gitignored
+fixture build dir (never committed), and the `linuxdyn` test seeds them into a
+ramfs `/lib` so ld.so resolves them. `dcpp` needs a cross-g++, absent for riscv64
+in this environment, so its phase skips-with-reason there:
 
 | ISA | dynamic C (gcc, PIE) | ld.so source (interp path) | libc.so.6 source |
 |---|---|---|---|

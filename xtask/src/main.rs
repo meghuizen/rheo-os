@@ -1089,6 +1089,37 @@ impl Arch {
         }
     }
 
+    /// The g++ that links a dynamic C++ binary for the four-library `dcpp` fixture.
+    /// If it is absent (no cross-g++ for an ISA), the C++ compile fails and the
+    /// fixture becomes a placeholder, so `linuxdyn`'s C++ phase skips-with-reason.
+    fn cxx(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "g++",
+            Arch::Aarch64 => "aarch64-linux-gnu-g++",
+            Arch::Riscv64 => "riscv64-linux-gnu-g++",
+        }
+    }
+
+    /// The toolchain C++ runtime libs `dcpp` links: `(libstdc++.so.6, libgcc_s.so.1)`.
+    /// Copied beside libc for the four-library dynamic fixture; a missing one makes
+    /// the C++ phase skip-with-reason for that ISA.
+    fn cpp_runtime_libs(self) -> (&'static str, &'static str) {
+        match self {
+            Arch::X86_64 => (
+                "/usr/lib/x86_64-linux-gnu/libstdc++.so.6",
+                "/lib/x86_64-linux-gnu/libgcc_s.so.1",
+            ),
+            Arch::Aarch64 => (
+                "/usr/aarch64-linux-gnu/lib/libstdc++.so.6",
+                "/usr/aarch64-linux-gnu/lib/libgcc_s.so.1",
+            ),
+            Arch::Riscv64 => (
+                "/usr/riscv64-linux-gnu/lib/libstdc++.so.6",
+                "/usr/riscv64-linux-gnu/lib/libgcc_s.so.1",
+            ),
+        }
+    }
+
     /// The toolchain runtime dynamic-linker + libc for the L7 dynamic fixture
     /// (docs/LINUX-COMPAT.md L7): `(ld.so source path, libc.so.6 source path)`.
     /// These live in the cross toolchain sysroots (host multiarch for x86-64)
@@ -1446,6 +1477,47 @@ fn build_dyn_fixture(arch: Arch, cc: &str, out_dir: &str) -> bool {
             arch.name()
         );
         let _ = std::fs::write(&dmath_dst, [0u8]);
+    }
+
+    // A third dynamic PIE - a C++ hello linking libstdc++ + libgcc_s + libc
+    // (+ libm) - the four-library production shape. Built with g++; a failure
+    // (e.g. no cross-g++ for this ISA) writes a placeholder so `linuxdyn` skips
+    // only the C++ phase.
+    let dcpp_dst = format!("{out_dir}/dcpp");
+    let mut cpp = Command::new(arch.cxx());
+    cpp.args(["tests/linux-fixtures/dcpp.cpp", "-O2", "-o", &dcpp_dst]);
+    let dcpp_ok = matches!(cpp.status().map(|s| s.success()), Ok(true));
+    if !dcpp_ok {
+        eprintln!(
+            "[xtask] dcpp (C++ four-library) fixture build failed for {} \
+             (no {}?); linuxdyn skips the C++ phase",
+            arch.name(),
+            arch.cxx()
+        );
+        let _ = std::fs::write(&dcpp_dst, [0u8]);
+    }
+    // Copy libstdc++ + libgcc_s beside libc, or placeholder → C++ phase skips.
+    let (libstdcpp_src, libgcc_src) = arch.cpp_runtime_libs();
+    let libstdcpp_dst = format!("{out_dir}/libstdc++.so.6");
+    let libgcc_dst = format!("{out_dir}/libgcc_s.so.1");
+    if dcpp_ok
+        && std::fs::copy(libstdcpp_src, &libstdcpp_dst).is_ok()
+        && std::fs::copy(libgcc_src, &libgcc_dst).is_ok()
+    {
+        println!(
+            "[xtask] copied C++ runtime ({libstdcpp_src}, {libgcc_src}) for {}",
+            arch.name()
+        );
+    } else {
+        if dcpp_ok {
+            eprintln!(
+                "[xtask] C++ runtime libs not found ({libstdcpp_src}); linuxdyn \
+                 skips the C++ phase for {}",
+                arch.name()
+            );
+        }
+        let _ = std::fs::write(&libstdcpp_dst, [0u8]);
+        let _ = std::fs::write(&libgcc_dst, [0u8]);
     }
 
     // Copy the real ld.so + libc.so.6 + libm.so.6 out of the toolchain, or
