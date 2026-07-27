@@ -449,10 +449,37 @@ Four blockers follow, and they are now facts rather than predictions:
    | `eventfd2` | 1 | No constant. **The epoll event loop's wakeup fd** - this one is load-bearing, not advisory |
    | `close_range` | 1 | No constant. glibc falls back to a `close` loop |
 
-4. **AVX-512 is in the binary.** QEMU 8.2 TCG exposes AVX2 but not AVX-512
-   (docs/TILES.md 4, measured there). Whether that is fatal depends on whether
-   those 857 instructions sit behind JSC's runtime CPU dispatch - which has not
-   been established and must not be assumed either way.
+4. ~~**AVX-512 is in the binary.**~~ **NOT A BLOCKER - measured and
+   eliminated.** The 857 EVEX instructions sit behind runtime CPU dispatch, and
+   the binary's actual floor is far lower than assumed.
+
+   The test: `qemu-user` (`qemu-x86_64`, installed for this) running
+   `claude --version` under a series of CPU models. Same binary, no
+   modification, exit status and output both checked.
+
+   | `-cpu` | ISA level | Result |
+   |---|---|---|
+   | `max` | everything TCG has (AVX2, no AVX-512) | `2.1.220 (Claude Code)` |
+   | `Skylake-Client` | AVX2, **no** AVX-512 | `2.1.220 (Claude Code)` |
+   | `Haswell` | AVX2, **no** AVX-512 | `2.1.220 (Claude Code)` |
+   | `IvyBridge` / `SandyBridge` | AVX, no AVX2 | `2.1.220 (Claude Code)` |
+   | `Westmere` / `Nehalem` | **SSE4.2**, no AVX | `2.1.220 (Claude Code)` |
+   | `qemu64` | SSE2 baseline | **SIGILL** |
+
+   So the **real floor is SSE4.2 (Nehalem)**, not the "AVX2 baseline" this
+   section used to assert - and not AVX-512 either. Corroborating static
+   evidence: the ELF carries **no** `GNU_PROPERTY_X86_ISA_1_NEEDED` note (the
+   linker recorded no required ISA level above baseline), and `.text` contains
+   **249 `cpuid`** and **23 `xgetbv`** sites, which is what runtime dispatch
+   looks like.
+
+   `xtask` already passes `-cpu max` for x86-64, which is several levels above
+   the floor. Nothing to do.
+
+   Worth keeping as method: this was the *cheapest* of the four blockers to
+   settle and it gated whether the other three were worth doing under emulation
+   at all, so it went first. Answering it needed one `apt-get install qemu-user`
+   and six runs - against an unbounded amount of speculation.
 
 **What is *not* a blocker, contrary to the earlier note here**: the 120 s test
 timeout is an `xtask` constant, not a property of the world, and a `--version`
