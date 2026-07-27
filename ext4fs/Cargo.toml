@@ -1,0 +1,18 @@
+[package]
+name = "ext4fs"
+version = "0.1.0"
+edition = "2024"
+
+# The disk ext4 filesystem for rheo-os: an adapter from the `ext4plus` crate
+# (Google's read-only ext4-view; no_std; sync mode) to the `posix::FileSystem`
+# trait, driven by a `posix::BlockSource`. It lives in its own crate so the
+# external dependencies stay OUT of the deliberately dependency-free `posix`
+# crate. The crate is named in docs/FILESYSTEMS.md per the repo's no-deps rule.
+
+[dependencies]
+posix = { path = "../posix" }
+# ext4plus in its no_std sync posture: `maybe-async` strips async, `spin`
+# replaces `async-lock`. Read-only ext4/ext2. Transitive deps (async-trait,
+# async-lock, event-listener, maybe-async, crc, bitflags, spin) are all
+# no_std-clean on the bare targets - named in docs/FILESYSTEMS.md.
+ext4plus = { version = "0.1.0-rc.2", default-features = false, features = ["sync"] }

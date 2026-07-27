@@ -11,6 +11,11 @@ edition = "2024"
 kernel = { path = "../kernel" }
 runtime = { path = "../runtime" }
 posix = { path = "../posix" }
+# The disk ext4 driver (docs/FILESYSTEMS.md): the `ext4plus` adapter, used by
+# the `blockfs`/`linuxdisk` kernels to mount a real ext4 image off a live disk
+# through the block cache. Its transitive deps are named in the doc (no-deps
+# rule).
+ext4fs = { path = "../ext4fs" }
 
 # rheo-net in its librheo-free **codec** posture (docs/NETSTACK.md N4b): the
 # `linuxnet` kernel registers a `svc::SocketOps` bridge whose datapath is the

@@ -149,9 +149,15 @@ unmeasured with an architectural note rather than a fabricated number.)
 A **POSIX + filesystem stack** (`posix/`, docs/FILESYSTEMS.md,
 POSIX-PERSONALITY.md) sits on a **VFS** translation layer (a `FileSystem`
 trait): a read-write **ramfs** (the working store), a read-only **ext4**
-driver that parses a real ext4 image (superblock, block-group descriptors,
-inodes, the extent tree, linear dirs - host-validated against a `mkfs.ext4`
-image), a mount table + path resolution (the per-session `/`), the **POSIX
+driver - the **`ext4plus`** crate (Google's read-only `ext4-view`), adapted to
+`posix::FileSystem` over a `posix::BlockSource` in the separate **`ext4fs`**
+crate so its deps stay out of the dependency-free `posix` (docs/FILESYSTEMS.md
+names the crate + its transitive deps per the no-deps rule; it **replaced** the
+original hand-rolled bounded parser, which was extent-depth-0 only, so a ~1.7 MB
+glibc `libc.so.6` now reads); driven in `sync` mode at the kernel-resident
+`svc::FileOps` seam, flipping to async when the FS becomes a service cell over
+the queue ABI (where NVMe's queues earn it) - a mount table + path resolution
+(the per-session `/`), the **POSIX
 fd surface** (`open/read/write/close/lseek/stat/getdents/mkdir/unlink` with
 errno), and a **`std::fs`-shaped facade** (`File`, `OpenOptions`,
 `read`/`write`/`read_to_string`, `read_dir`, `metadata`) so standard-library
@@ -1813,6 +1819,12 @@ net/          rheo-net: the greenfield network stack as portable userspace
 json/         rheo-json: a dependency-free, zero-copy JSON parser (scalar +
               SSE2 string-scan), no_std, host-tested + benchmarked
               (docs/JSON.md, comparison/json/)
+ext4fs/       the disk ext4 driver: an adapter from the `ext4plus` crate
+              (Google's read-only ext4-view; no_std; `sync` mode) to
+              posix::FileSystem over a posix::BlockSource - kept in its own crate
+              so ext4plus's deps stay out of the dependency-free posix. Replaced
+              the hand-rolled parser (docs/FILESYSTEMS.md names the crate + deps
+              per the no-deps rule). Used by the blockfs/posix test kernels.
 services/     system service cells        (future, phase 5)
 targets/      rheo-os custom target specs + the std port: rheo_os-*.json,
               patch-std.py (rust-src std patch: heap/stdio/args/env/fs arms),

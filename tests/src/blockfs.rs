@@ -18,10 +18,11 @@ use alloc::boxed::Box;
 use alloc::rc::Rc;
 use core::ptr::addr_of_mut;
 
+use ext4fs::Ext4Fs;
 use kernel::hw::block::{self, BlockCache};
 use kernel::hw::virtio_blk::{self, VirtioBlk};
 use kernel::{arch, println};
-use posix::{BlockSource, Errno, Ext4, fs, mount};
+use posix::{BlockSource, Errno, fs, mount};
 
 #[global_allocator]
 static HEAP: runtime::Heap = runtime::Heap::empty();
@@ -79,11 +80,12 @@ extern "C" fn kernel_main() -> ! {
 
     let fills_before = block::cache_fills();
 
-    // Full stack: block device -> block cache -> ext4 -> VFS -> std::fs facade.
+    // Full stack: block device -> block cache -> ext4plus (ext4fs) -> VFS ->
+    // std::fs facade.
     posix::reset();
     mount::mount(
         "/",
-        Rc::new(Ext4::new(Box::new(Cached(cache))).expect("parse ext4 from disk")),
+        Rc::new(Ext4Fs::new(Box::new(Cached(cache))).expect("mount ext4 from disk")),
     );
 
     let hello = fs::read_to_string("/hello.txt").expect("read hello");
