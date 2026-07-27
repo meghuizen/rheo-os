@@ -217,6 +217,15 @@ pub fn paging_unmap_frame(root: &mut PagingRoot, va: usize) -> Option<usize> {
 
 /// Rewrite the leaf permission bits at `va`, keeping the mapped frame. A no-op
 /// if `va` is unmapped. The caller flushes the TLB by re-activating the root.
+/// Whether `va` has a **live 4 KiB leaf** in `root` - see the riscv64 twin for why
+/// a demand-paging fault handler needs this before anything else.
+pub fn paging_mapped(root: &PagingRoot, va: usize) -> bool {
+    match leaf(root, va) {
+        Some((l3_pa, idx)) => table_mut(l3_pa)[idx] & VALID != 0,
+        None => false,
+    }
+}
+
 pub fn paging_protect(root: &mut PagingRoot, va: usize, perm: MapPerm) {
     if let Some((l3_pa, idx)) = leaf(root, va) {
         let l3 = table_mut(l3_pa);

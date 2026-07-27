@@ -590,6 +590,26 @@ impl FdTable {
     /// readable this way; other fd kinds return -EBADF (ld.so maps regular
     /// files only). A short read leaves the tail of `dst` untouched (mmap
     /// pre-zeroes its frames).
+    /// The VFS path behind `fd`, copied into `out`, returning its length - the
+    /// hook a **file-backed mapping** needs so it can open the file *again* and own
+    /// its own handle (`linux::filemap`). `ld.so` closes the fd right after `mmap`,
+    /// so a mapping that kept the caller's descriptor would reference a closed and
+    /// soon-reused one.
+    ///
+    /// `None` for anything that is not a VFS file: a mapping can only be backed by
+    /// something the VFS can re-open.
+    pub fn vfs_path(&self, fd: i64, out: &mut [u8]) -> Option<usize> {
+        let slot = usize_fd(fd)?;
+        match self.fds[slot] {
+            FdKind::Vfs { path, path_len, .. } => {
+                let n = (path_len as usize).min(out.len());
+                out[..n].copy_from_slice(&path[..n]);
+                Some(n)
+            }
+            _ => None,
+        }
+    }
+
     pub fn pread(&self, fd: i64, dst: u64, len: u64, offset: i64) -> i64 {
         let Some(slot) = usize_fd(fd) else {
             return -EBADF;

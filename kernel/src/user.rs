@@ -1860,6 +1860,19 @@ pub fn on_user_trap(
         // reporting 128+signo. A NATIVE cell fault is always terminal
         // (Outcome::Faulted) - signal delivery is behind the Linux branch only.
         if cells()[cur].personality == Personality::Linux {
+            // **Demand paging first** (docs/ARCHITECTURE-DEBT.md 4.0, blocker 2).
+            // A fault on a page that is mapped-but-not-yet-populated is not an
+            // error at all: fill it and re-execute the instruction. The frame is
+            // returned unchanged, which *is* the retry - the faulting PC was never
+            // advanced.
+            //
+            // It has to come before signal delivery, and only a *memory* fault can
+            // be a missing page: an illegal instruction or an FP exception is never
+            // one, and asking the VMA list about them would be answering a question
+            // it was not asked.
+            if cause == FaultCause::Segv && crate::linux::fill_fault(cur, fault_addr) {
+                return frame;
+            }
             return match crate::linux::deliver_fault(cur, cause, fault_addr, frame) {
                 crate::linux::FaultOutcome::Resume(f) => f,
                 // A default (uncaught) fatal fault ends the process. For the top

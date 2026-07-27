@@ -25,6 +25,7 @@ pub mod epoll;
 pub mod errno;
 pub mod eventfd;
 pub mod fd;
+pub mod filemap;
 pub mod inetsock;
 pub mod mem;
 pub mod pipe;
@@ -167,6 +168,15 @@ pub fn reset() {
     inetsock::reset();
     epoll::reset();
     eventfd::reset();
+    filemap::reset();
+}
+
+/// Try to fill a missing page for cell `cell` at `addr`, returning true if the
+/// faulting instruction should be **retried** (docs/ARCHITECTURE-DEBT.md 4.0,
+/// blocker 2). The one entry point `user::on_user_trap` calls, so the personality
+/// keeps its own state private.
+pub fn fill_fault(cell: usize, addr: usize) -> bool {
+    mem::fault(state(cell), addr)
 }
 
 /// Deep-copy cell `from`'s Linux state into cell `to` (the `fork` inheritance

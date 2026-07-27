@@ -9,6 +9,7 @@
 use crate::arch::{self, MapPerm};
 use crate::linux::LinuxState;
 use crate::linux::errno::*;
+use crate::linux::filemap;
 use crate::mm::frames::FRAME_SIZE;
 use crate::user;
 
@@ -222,11 +223,43 @@ pub fn mmap(
         b
     };
 
+    // A file-backed mapping needs its own VFS handle, opened before the record goes
+    // in: `ld.so` closes the caller's fd immediately after `mmap`, so keeping that
+    // descriptor would leave the mapping pointing at a closed - and soon reused -
+    // one (`linux::filemap`). Open first, so a failure refuses the call before the
+    // list has been touched.
+    let backing = if anon {
+        None
+    } else {
+        if fd < 0 {
+            return -EBADF;
+        }
+        let mut path = [0u8; 256];
+        let Some(n) = st.fds.vfs_path(fd, &mut path) else {
+            // Not a VFS file: there is nothing a fault could re-read.
+            return -EBADF;
+        };
+        match filemap::open(path.as_ptr() as u64, n as u64) {
+            Some(h) => Some(h),
+            None => {
+                crate::println!(
+                    "linux: mmap of a file refused - the mapped-file table is full \
+                     ({} entries) or the path could not be reopened",
+                    crate::linux::filemap::MAX_MAPPED_FILES
+                );
+                return -ENOMEM;
+            }
+        }
+    };
+
     // Record the mapping before touching pages, so a full table refuses the call
     // rather than leaving the list disagreeing with the page tables. `insert`
     // replaces whatever was recorded at `base`, which is what `MAP_FIXED` over an
     // `ld.so` reservation means.
-    if !st.vmas.insert(base, bytes, prot, flags) {
+    if !st
+        .vmas
+        .insert_backed(base, bytes, prot, flags, backing, offset)
+    {
         crate::println!(
             "linux: mmap of {bytes:#x} at {base:#x} refused - the per-cell VMA table \
              is full ({} records)",
@@ -251,53 +284,98 @@ pub fn mmap(
         }
         // PROT_NONE: leave it a bare reservation (no frames).
     } else {
-        // File-backed private mapping (L7).
-        if fd < 0 {
-            return -EBADF;
-        }
-        if !map_file(st, base, bytes, prot, fd, offset as i64) {
-            return -ENOMEM;
+        // **File-backed private mapping: demand-paged** (docs/ARCHITECTURE-DEBT.md
+        // 4.0, blocker 2). Nothing is read and no frame is allocated here - the
+        // record above is the whole mapping, and `fault` below fills each page from
+        // the file the first time it is touched.
+        //
+        // This used to read every page eagerly. That is not a size problem to be
+        // solved with a bigger pool: it is the wrong design at any size, because a
+        // mapping's *cost* should follow what the program touches rather than what
+        // it reserved. Measured on the binary this is aimed at, all three PT_LOADs
+        // have `filesz == memsz` - there is no bss - so the whole image is
+        // file-backed and this path is the one that decides whether it fits at all.
+        //
+        // MAP_FIXED over existing pages still has to drop them: ld.so overlays
+        // segments onto a reservation it already made, and leaving the old frames
+        // mapped would serve the previous mapping's bytes.
+        if fixed {
+            user::unmap_range(base, bytes);
         }
     }
     base as i64
 }
 
-/// Map `bytes` (page count) of a VFS file at `base`, one page at a time: unmap
-/// any page already there (MAP_FIXED overlay), allocate a fresh zeroed frame,
-/// read the file range for that page into it through the kernel linear map, and
-/// map it with `perm`. A short read (EOF) leaves the page tail zero
-/// (docs/LINUX-COMPAT.md L7).
-fn map_file(
-    st: &mut LinuxState,
-    base: usize,
-    bytes: usize,
-    prot: u64,
-    fd: i64,
-    offset: i64,
-) -> bool {
-    let perm = perm_from_prot(prot);
-    let pages = bytes / FRAME_SIZE;
-    for i in 0..pages {
-        let va = base + i * FRAME_SIZE;
-        // Reclaim any existing page at this VA (MAP_FIXED replaces it); this
-        // also uncharges it, and refuses a VA outside the cell's user range.
-        user::unmap_range(va, FRAME_SIZE);
-        // A file mapping is charged to the cell like an anonymous one; a
-        // refusal maps nothing further (docs/ENGINEERING.md 12).
-        let Some(pa) = user::alloc_user_frame() else {
-            return false;
-        };
-        let file_off = offset + (i * FRAME_SIZE) as i64;
-        // Read into the frame via the kernel high linear map (valid under any
-        // active cell root; the VFS handler runs in kernel context). The frame
-        // is not yet user-mapped, so this cannot alias user memory.
-        let kva = arch::phys_to_virt(pa) as u64;
-        st.fds.pread(fd, kva, FRAME_SIZE as u64, file_off);
-        user::with_current_aspace(|aspace| {
-            aspace.map_user_frame(va, pa, perm);
-        });
+/// Fill a missing page for a Linux cell, returning true if the instruction should
+/// be **retried** (docs/ARCHITECTURE-DEBT.md 4.0, blocker 2).
+///
+/// This is the demand-paging half of a resumable fault. The order of the checks is
+/// the whole correctness argument:
+///
+/// 1. **Is there a mapping here?** No record means the address was never mapped -
+///    a genuine SIGSEGV, and the commonest one (a null dereference).
+/// 2. **Is the page already present?** If it is, this fault was a *permission*
+///    refusal, not a missing page. Treating it as missing would repopulate and
+///    re-fault forever, with no diagnostic - so the page tables are consulted
+///    (`AddressSpace::is_mapped`) rather than guessed at from `FaultCause`, which
+///    carries no read/write bit.
+/// 3. **Does the mapping permit any access?** A `PROT_NONE` record is a *
+///    reservation* - glibc reserves large arenas that way and commits sub-ranges
+///    with `mprotect`. Populating one would hand out memory the program deliberately
+///    made inaccessible.
+///
+/// Only then is the page filled: from the mapping's file if it has one, else zeroed.
+/// The frame is charged to the cell exactly as an eager mapping was, so demand
+/// paging changes *when* a page is paid for, never *whether*.
+pub fn fault(st: &mut LinuxState, addr: usize) -> bool {
+    let page = addr & !(FRAME_SIZE - 1);
+    let Some(m) = st.vmas.find(page) else {
+        return false; // (1) nothing mapped here
+    };
+    // (2) present already => a permission fault, not a missing page.
+    if user::with_current_aspace(|aspace| aspace.is_mapped(page)) {
+        return false;
     }
+    // (3) a bare reservation stays inaccessible.
+    if m.prot & PROT_ANY == 0 {
+        return false;
+    }
+    let Some(pa) = user::alloc_user_frame() else {
+        // Out of frames is a refusal, not a panic (docs/ENGINEERING.md 12); the
+        // caller turns it into the SIGSEGV the program would get from a Linux OOM.
+        crate::println!("linux: page fault at {addr:#x} could not be filled - no frames");
+        return false;
+    };
+    // A file-backed page is read through the kernel's linear map *before* the frame
+    // is user-mapped, so the read cannot alias the cell's memory. A short read (past
+    // end of file) leaves the tail zero, which is what the frame already is.
+    if let Some((h, off)) = st.vmas.file_at(page) {
+        let kva = arch::phys_to_virt(pa) as u64;
+        filemap::read_at(h, kva, FRAME_SIZE as u64, off as i64);
+    }
+    user::with_current_aspace(|aspace| {
+        aspace.map_user_frame(page, pa, perm_from_prot(m.prot));
+    });
+    bump_faults();
     true
+}
+
+/// Pages filled by [`fault`] since boot - the witness that demand paging is what
+/// populated a mapping, rather than the eager path having done it earlier.
+static mut FAULTS: u64 = 0;
+
+fn bump_faults() {
+    // SAFETY: single CPU, synchronous trap.
+    unsafe {
+        let p = core::ptr::addr_of_mut!(FAULTS);
+        *p = (*p).wrapping_add(1);
+    }
+}
+
+/// How many pages demand paging has filled.
+pub fn faults() -> u64 {
+    // SAFETY: single CPU.
+    unsafe { *core::ptr::addr_of!(FAULTS) }
 }
 
 /// mremap(old_addr, old_size, new_size, flags, new_addr): resize a mapping.

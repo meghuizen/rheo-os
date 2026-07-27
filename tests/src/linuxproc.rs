@@ -48,6 +48,7 @@ static MMAPX: &[u8] = fixture::linux!("mmapx");
 static YIELDX: &[u8] = fixture::linux!("yieldx");
 static STACKX: &[u8] = fixture::linux!("stackx");
 static SYSX: &[u8] = fixture::linux!("sysx");
+static MMAPDP: &[u8] = fixture::linux!("mmapdp");
 static COREUTILS: &[u8] = fixture::linux!("cu/bin/coreutils");
 
 // -- stdout capture, wired to the Linux personality's stdout tap --
@@ -404,6 +405,55 @@ extern "C" fn kernel_main() -> ! {
          accepts the policy in force and refuses real-time with EPERM, \
          close_range closes exactly its range, and clone3/rseq are refused \
          deliberately rather than falling through the unknown-number path"
+    );
+
+    // --- a file mapping costs what is touched, not what is reserved
+    // (docs/ARCHITECTURE-DEBT.md 4.0, blocker 2). `mmap` of a file used to read
+    // every page into a fresh frame before returning. The kernel-side oracle is the
+    // one the program cannot fake: how many pages **demand paging** actually
+    // filled. The fixture maps 64 and touches 3, so the answer is 3.
+    //
+    // The re-read phase matters as much as the count: a handler that could not tell
+    // "the page is absent" from "the page is present and the access was refused"
+    // would repopulate on every touch, and the count would run away.
+    let faults_before = linux::mem::faults();
+    let files_before = linux::filemap::in_use();
+    let want_dp: &[u8] = b"dp: backing file written\n\
+        dp: mapped 64 pages, fd closed\n\
+        dp: pages 0, 37 and 63 read the right bytes\n\
+        dp: 100 rereads of a filled page cost nothing\n\
+        dp: writing a filled read-only page is SIGSEGV, not a refill\n\
+        dp: mprotect RW then a private write works\n\
+        mmapdp OK\n";
+    let (code, out) = run_capture(MMAPDP, &[b"mmapdp"]);
+    assert!(
+        out == want_dp,
+        "mmapdp: stdout mismatch\n  got:      {:?}\n  expected: {:?}",
+        core::str::from_utf8(out),
+        core::str::from_utf8(want_dp),
+    );
+    assert!(code == 0, "mmapdp: exit {code}, expected 0");
+    let filled = linux::mem::faults() - faults_before;
+    assert!(
+        filled == 4,
+        "mmapdp: demand paging filled {filled} pages, want exactly 4 (64 were \
+         mapped, 4 touched) - an eager mmap would be 64 and a handler that \
+         repopulated a present page would be far more"
+    );
+    // The mapping owned a VFS handle across the caller's `close(fd)` and gave it
+    // back at `munmap`: the registry is where it started.
+    assert!(
+        linux::filemap::in_use() == files_before,
+        "mmapdp: the mapped-file registry did not return to {files_before} entries \
+         ({} in use) - a mapping leaked its handle",
+        linux::filemap::in_use()
+    );
+    println!(
+        "linuxproc: demand paging OK - 64 file pages mapped, exactly {filled} filled \
+         by fault (an eager mmap read all 64), pages 0/37/63 carry their own file \
+         bytes so the offset arithmetic holds at the top of the mapping, 100 rereads \
+         of a filled page cost nothing, and the mapping outlived close(fd) then \
+         returned its handle"
     );
 
     println!("linuxproc: PASS");

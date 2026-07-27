@@ -66,6 +66,19 @@ impl AddressSpace {
         arch::paging_unmap_frame(&mut self.root, va)
     }
 
+    /// Whether one 4 KiB page at `va` has a live mapping.
+    ///
+    /// The question a **demand-paging fault handler** must answer before anything
+    /// else: is this "the page is not there" - populate it and retry the
+    /// instruction - or "the page is there and the access was refused" - a genuine
+    /// SIGSEGV? `arch::FaultCause` carries no read/write bit, so the page tables
+    /// are the source of truth, and getting it wrong is not a small error: a
+    /// permission fault treated as a missing page would be re-populated and
+    /// re-faulted forever, with no diagnostic.
+    pub fn is_mapped(&self, va: usize) -> bool {
+        arch::paging_mapped(&self.root, va)
+    }
+
     /// Change the permission of one 4 KiB user page at `va`, keeping its
     /// frame; a no-op if `va` is unmapped. The TLB is flushed by the next
     /// `activate()`.

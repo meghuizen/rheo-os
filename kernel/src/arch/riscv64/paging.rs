@@ -245,6 +245,20 @@ pub fn paging_unmap_frame(root: &mut PagingRoot, va: usize) -> Option<usize> {
 
 /// Rewrite the leaf permission bits at `va`, keeping the mapped frame. A no-op
 /// if `va` is unmapped. The caller flushes the TLB by re-activating the root.
+/// Whether `va` has a **live 4 KiB leaf** in `root` - the question a demand-paging
+/// fault handler has to answer before anything else: is this "the page is not
+/// there" (populate it and retry) or "the page is there and the access was
+/// refused" (a genuine SIGSEGV)? Without it a permission fault on a populated
+/// page would be re-populated and re-faulted forever.
+///
+/// Portable callers reach this through `mm::AddressSpace::is_mapped`.
+pub fn paging_mapped(root: &PagingRoot, va: usize) -> bool {
+    match leaf(root, va) {
+        Some((l0_pa, idx)) => table_mut(l0_pa)[idx] & PTE_V != 0,
+        None => false,
+    }
+}
+
 pub fn paging_protect(root: &mut PagingRoot, va: usize, perm: MapPerm) {
     if let Some((l0_pa, idx)) = leaf(root, va) {
         let l0 = table_mut(l0_pa);
