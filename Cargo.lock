@@ -275,6 +275,9 @@ dependencies = [
 [[package]]
 name = "kernel"
 version = "0.1.0"
+dependencies = [
+ "rheo-abi",
+]
 
 [[package]]
 name = "libc"
@@ -286,6 +289,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 name = "librheo"
 version = "0.1.0"
 dependencies = [
+ "rheo-abi",
  "runtime",
 ]
 
@@ -352,6 +356,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 
 [[package]]
+name = "rheo-abi"
+version = "0.1.0"
+
+[[package]]
 name = "rheo-json"
 version = "0.1.0"
 
@@ -359,6 +367,7 @@ version = "0.1.0"
 name = "rheo-libc"
 version = "0.1.0"
 dependencies = [
+ "rheo-abi",
  "rheo-json",
  "runtime",
 ]

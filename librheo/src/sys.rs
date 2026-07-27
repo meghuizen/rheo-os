@@ -8,91 +8,32 @@
 //! the first argument register.
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::Ordering;
 
-// ---- syscall numbers (keep in sync with kernel/src/abi.rs) ----
-
-/// Process the calling cell's queue pair; returns the number of entries
-/// completed. The doorbell.
-pub const SYS_DOORBELL: u64 = 1;
-/// Directed switch to the peer cell (`cur ^ 1`). On the single-CPU cooperative
-/// runtime this hands the CPU between the two ends of a cross-cell channel
-/// (docs/LIBRHEO.md Phase E): the producer submits then switches so the consumer
-/// runs, and vice-versa. Resumes the caller where it last switched.
-pub const SYS_SWITCH: u64 = 2;
-/// Monotonic cycle counter (see `cycles`).
-pub const SYS_CYCLES: u64 = 4;
-/// Next per-cell random u64 (the kernel DRBG; used once to seed librheo's own
-/// DRBG at startup - see `rng`).
-pub const SYS_RANDOM: u64 = 8;
-/// cpuinfo(out_va) -> 0; fills a `CpuFeatures` at `out_va` (see `cpu_features`).
-pub const SYS_CPUINFO: u64 = 17;
-/// mmap_anon(len) -> base VA of `len` zeroed RW bytes (0 fails).
-pub const SYS_MMAP: u64 = 21;
-/// exit_group(code): leave U-mode.
-pub const SYS_EXIT_GROUP: u64 = 22;
-/// write(fd, buf_va, len) -> bytes written or -errno.
-pub const SYS_WRITE_FD: u64 = 26;
-/// queue_info(out_va) -> 0 or u64::MAX. Fills a `QueueInfo` at `out_va`.
-pub const SYS_QUEUE_INFO: u64 = 31;
-/// grant(out_va, len, kind, flags) -> 0 or u64::MAX. Fills a `GrantInfo`.
-pub const SYS_GRANT: u64 = 32;
-/// commit(cap_id, offset, len) -> 0 or non-zero on error.
-pub const SYS_COMMIT: u64 = 33;
-/// decommit(cap_id, offset, len) -> 0 or non-zero on error.
-pub const SYS_DECOMMIT: u64 = 34;
-/// seal(cap_id) -> 0 or non-zero on error.
-pub const SYS_SEAL: u64 = 35;
-/// munmap(va, len) -> 0. Unmaps whole pages and frees their frames.
-pub const SYS_MUNMAP: u64 = 36;
-/// mmap_file(fd, offset, len, flags) -> base VA (0 fails).
-pub const SYS_MMAP_FILE: u64 = 37;
-/// engine_info(out_va) -> 0. Fills an `EngineInfo` (docs/LIBRHEO.md Phase C).
-pub const SYS_ENGINE_INFO: u64 = 38;
-/// reserve_admit(out_va, budget, period, deadline, mem_floor_pages) -> 0 |
-/// 1=BadParams | 2=Overcommit | 3=MemoryFloor. Fills a `ReserveInfo` on success.
-pub const SYS_RESERVE_ADMIT: u64 = 39;
-/// reserve_query() -> committed CPU utilization (parts-per-million).
-pub const SYS_RESERVE_QUERY: u64 = 40;
-/// reserve_release(cap_id) -> 0 | u64::MAX. Frees an admitted reservation.
-pub const SYS_RESERVE_RELEASE: u64 = 41;
-/// wait_input(buf_va, len) -> nbytes. Block until console input is available;
-/// copy up to `len` bytes to `buf` and return the count (0 = end of input).
-/// The OS's first block-and-wake (docs/LIBRHEO.md Phase D); `term` builds on it.
-pub const SYS_WAIT_INPUT: u64 = 42;
-/// connect_info(out_va) -> 0 or u64::MAX. Fills a `ChannelInfo` with the cell's
-/// cross-cell shared-channel end (docs/LIBRHEO.md Phase E); `ipc` builds on it.
-pub const SYS_CONNECT: u64 = 43;
-/// grant_share(grant_cap_id, out_va) -> 0 or u64::MAX. Delegate a sealed grant
-/// to the peer cell; fills a `ShareInfo` (peer VA + cap). Zero-copy buffer pass.
-pub const SYS_GRANT_SHARE: u64 = 44;
-/// spawn(path_va, path_len, argv_va, envp_va) -> child handle or u64::MAX. Load
-/// an ELF into a new native cell; gated by the cell-spawn capability (Phase F).
-pub const SYS_SPAWN: u64 = 45;
-/// wait(handle) -> the child's exit code, or u64::MAX. Blocks cooperatively.
-pub const SYS_WAIT: u64 = 46;
-/// arm_timer(deadline_ns, client) -> 0. Block until `deadline_ns` monotonic ns
-/// elapse. `client` names the kernel timer-arbiter slot that holds the deadline:
-/// [`TIMER_CLIENT_CELL_SLEEP`] or [`TIMER_CLIENT_PACER`].
-pub const SYS_ARM_TIMER: u64 = 47;
-/// [`SYS_ARM_TIMER`] argument 1: the cell-sleep slot (`time::sleep`/`timeout`).
-pub const TIMER_CLIENT_CELL_SLEEP: u64 = 0;
-/// [`SYS_ARM_TIMER`] argument 1: the **pacer** slot - a paced transport's
-/// send-release deadline, re-armed after every segment (docs/NETSTACK.md 21).
-pub const TIMER_CLIENT_PACER: u64 = 1;
-/// yield_cell() -> 0. Hand the CPU to the next runnable native cell (round-robin;
-/// falls back to the `cur^1` peer where there is no process tree). The N-cell
-/// generalisation of `SYS_SWITCH`, needed for service fan-out (docs/NETSTACK.md
-/// the service-cell section, rheo-net N4a).
-pub const SYS_YIELD: u64 = 49;
-/// wait_net(buf_va, len, timeout_ns) -> frame_len. Block until a received Ethernet
-/// frame is available; copy up to `len` bytes into `buf` and return the frame
-/// length (0 = gave up / timed out). `timeout_ns` 0 waits indefinitely. The network
-/// twin of [`SYS_WAIT_INPUT`] (docs/NETSTACK.md, the async-receive path / rheo-net
-/// N2d); `net::recv` builds on it.
-pub const SYS_WAIT_NET: u64 = 48;
-/// uptime() -> monotonic tick reading (SYS_UPTIME). `time` converts to ns.
-pub const SYS_UPTIME: u64 = 7;
+// ---- the ABI: one definition, re-exported ------------------------------------
+//
+// Syscall numbers, queue opcodes, status codes and every `repr(C)` result block
+// live in the `rheo-abi` crate - the same crate `kernel::abi` and
+// `kernel::queue` re-export - so this file cannot drift from the kernel
+// (docs/ARCHITECTURE-DEBT.md 3.1). It used to restate all of it by hand under a
+// "keep in sync" comment: geometry drift was caught by the version check, but a
+// field-meaning change or a moved syscall number was a wrong number with no
+// fault. `pub use` keeps every existing path (`sys::SYS_DOORBELL`,
+// `sys::SqEntry`, ...) working.
+pub use rheo_abi::{
+    BufReduceDesc, ChannelInfo, CpuFeatures, CqEntry, EngineInfo, FLAG_DUR_FLUSH, FLAG_DUR_FUA,
+    FLAG_INLINE, GrantInfo, GraphNode, INLINE_MAX, OP_CHAN_MSG, OP_CLOSE, OP_ECHO, OP_FSTAT,
+    OP_GPU_PRESENT, OP_GRAPH_SUBMIT, OP_NET_MAC, OP_NET_RX, OP_NET_TX, OP_NOP, OP_OPEN, OP_READ,
+    OP_WRITE, QUEUE_ABI_VERSION, QueueHeader, QueueInfo, ReserveInfo, SIMD_AVX2, SIMD_AVX512F,
+    SIMD_AVX512VNNI, SIMD_NEON, SIMD_SSE2, SPAWN_CHAN_SLOT, STATUS_BAD_HANDLE, STATUS_BAD_OPCODE,
+    STATUS_DENIED, STATUS_EXHAUSTED, STATUS_IO, STATUS_OK, STATUS_REVOKED, SYS_ARM_TIMER,
+    SYS_COMMIT, SYS_CONNECT, SYS_CPUINFO, SYS_CYCLES, SYS_DECOMMIT, SYS_DOORBELL, SYS_ENGINE_INFO,
+    SYS_EXIT_GROUP, SYS_GRANT, SYS_GRANT_SHARE, SYS_MMAP, SYS_MMAP_FILE, SYS_MUNMAP,
+    SYS_QUEUE_INFO, SYS_RANDOM, SYS_RESERVE_ADMIT, SYS_RESERVE_QUERY, SYS_RESERVE_RELEASE,
+    SYS_SEAL, SYS_SPAWN, SYS_SWITCH, SYS_UPTIME, SYS_WAIT, SYS_WAIT_INPUT, SYS_WAIT_NET,
+    SYS_WRITE_FD, SYS_YIELD, ShareInfo, SqEntry, TIMER_CLIENT_CELL_SLEEP, TIMER_CLIENT_PACER,
+    TileGemmDesc, spawn_chan_spec,
+};
 
 // ---- raw syscall stubs (from libc/src/sys.rs) ----
 
@@ -410,15 +351,6 @@ pub fn spawn(path_va: u64, path_len: u64, argv_va: u64, envp_va: u64) -> u64 {
     spawn_chan(path_va, path_len, argv_va, envp_va, 0)
 }
 
-/// `SYS_SPAWN` `chan_spec` flag: inherit the caller's channel slot named in bits
-/// 15:8 instead of slot 0 (kernel/src/abi.rs `SPAWN_CHAN_SLOT`).
-pub const SPAWN_CHAN_SLOT: u64 = 1 << 0;
-
-/// Build a `chan_spec` naming the caller's channel `slot`.
-pub const fn spawn_chan_spec(slot: usize) -> u64 {
-    SPAWN_CHAN_SLOT | ((slot as u64) << 8)
-}
-
 /// Spawn like [`spawn`], with `chan_spec` naming which of this cell's channel
 /// ends the child inherits (docs/NETSTACK.md the service-cell section, rheo-net
 /// N4a): 0 = slot 0 (the Phase J default), else [`spawn_chan_spec`]. The child
@@ -470,21 +402,6 @@ pub fn cpu_features() -> CpuFeatures {
     f
 }
 
-/// The `SYS_CPUINFO(out_va)` result block (kernel/src/abi.rs `CpuFeatures`).
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CpuFeatures {
-    pub features: u64,
-    pub simd: u64,
-    pub vendor: [u8; 16],
-}
-
-/// Portable SIMD-tier bits in `CpuFeatures::simd` (kernel/src/abi.rs).
-pub const SIMD_SSE2: u64 = 1 << 0;
-pub const SIMD_AVX2: u64 = 1 << 1;
-pub const SIMD_AVX512F: u64 = 1 << 2;
-pub const SIMD_AVX512VNNI: u64 = 1 << 3;
-pub const SIMD_NEON: u64 = 1 << 4;
 /// Block until at least one console input byte is available; copy up to `len`
 /// bytes into `buf` and return the count (0 = end of input). The kernel idles
 /// (WFI where the UART RX interrupt is wired, poll otherwise) while blocked.
@@ -513,202 +430,6 @@ pub fn queue_info() -> Option<QueueInfo> {
     let r = unsafe { syscall1(SYS_QUEUE_INFO, &mut info as *mut QueueInfo as u64) };
     if r == u64::MAX { None } else { Some(info) }
 }
-
-/// The `SYS_QUEUE_INFO` result block (kernel/src/abi.rs `QueueInfo`).
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct QueueInfo {
-    pub qp_va: u64,
-    pub cap_id: u64,
-}
-
-// ---- on-wire queue layout (keep in sync with kernel/src/queue/mod.rs) ----
-
-/// Submission opcodes.
-pub const OP_NOP: u8 = 0;
-pub const OP_ECHO: u8 = 1;
-/// Async I/O opcodes (docs/LIBRHEO.md Phase B). See `io` for the typed layer.
-pub const OP_OPEN: u8 = 2;
-pub const OP_READ: u8 = 3;
-pub const OP_WRITE: u8 = 4;
-pub const OP_CLOSE: u8 = 5;
-pub const OP_FSTAT: u8 = 6;
-/// Submit a userspace-built dependency graph to the CPU engine (docs/LIBRHEO.md
-/// Phase C). See `compute::GraphBuilder`.
-pub const OP_GRAPH_SUBMIT: u8 = 7;
-/// Raw-frame networking opcodes (docs/NETWORKING.md, LIBRHEO.md Phase G). See
-/// `net` for the typed async layer. `OP_NET_TX` sends one Ethernet frame,
-/// `OP_NET_RX` polls for one (result 0 = none), `OP_NET_MAC` reports the MAC.
-pub const OP_NET_TX: u8 = 8;
-pub const OP_NET_RX: u8 = 9;
-pub const OP_NET_MAC: u8 = 10;
-/// GPU 2D present (docs/LIBRHEO.md Phase H, docs/DISPLAY.md). See `display` for
-/// the typed layer. Payload `[buf_va u64@0][w u32@8][h u32@12]`: presents the
-/// cell's `w x h` RGBA framebuffer through the virtio-gpu driver (copy into the
-/// resource, transfer to host, flush to scanout); `result` = bytes presented.
-pub const OP_GPU_PRESENT: u8 = 11;
-/// Async cross-cell channel message (docs/LIBRHEO.md Phase J). Carried over a
-/// **shared** channel ring the kernel never processes (the two cells drive the
-/// SPSC rings directly), so this opcode is a convention between the two ends, not
-/// a `kernel_process` handler. `ipc::AsyncSender`/`AsyncReceiver` use it.
-pub const OP_CHAN_MSG: u8 = 12;
-/// `SqEntry.flags` bit: the op's data rides inline in the payload (IO.md 1).
-pub const FLAG_INLINE: u8 = 1 << 0;
-/// Durability-class flag bits (docs/IO.md). Advisory: the kernel ignores them
-/// today (no durable backend in QEMU); recorded on the op for honesty.
-pub const FLAG_DUR_FLUSH: u8 = 1 << 4;
-pub const FLAG_DUR_FUA: u8 = 1 << 5;
-/// Largest inline write payload (bytes after the `[fd u32][len u32]` header).
-pub const INLINE_MAX: usize = 16;
-/// Completion status codes.
-pub const STATUS_OK: u32 = 0;
-pub const STATUS_BAD_OPCODE: u32 = 1;
-pub const STATUS_DENIED: u32 = 2;
-pub const STATUS_REVOKED: u32 = 3;
-pub const STATUS_EXHAUSTED: u32 = 4;
-pub const STATUS_BAD_HANDLE: u32 = 5;
-pub const STATUS_IO: u32 = 6;
-
-/// The `SYS_GRANT` result block (kernel/src/abi.rs `GrantInfo`).
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct GrantInfo {
-    pub base: u64,
-    pub cap_id: u64,
-}
-
-/// The `SYS_CONNECT` result block (kernel/src/abi.rs `ChannelInfo`).
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct ChannelInfo {
-    pub chan_va: u64,
-    pub cap_id: u64,
-    /// 0 = initiator (client), 1 = acceptor (server).
-    pub role: u64,
-    /// How many channel slots this cell holds (docs/NETSTACK.md the service-cell
-    /// section, rheo-net N4a): 1 for a Phase E/J cell, N for a service cell.
-    pub count: u64,
-}
-
-/// The `SYS_GRANT_SHARE` result block (kernel/src/abi.rs `ShareInfo`).
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct ShareInfo {
-    pub peer_va: u64,
-    pub peer_cap_id: u64,
-}
-
-/// The `SYS_ENGINE_INFO` result block (kernel/src/abi.rs `EngineInfo`).
-/// `kind`: 0=CPU, 1=GPU; `vendor` is the PCI vendor ID for a device engine
-/// (0 for the CPU).
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct EngineInfo {
-    pub kind: u64,
-    pub measured_cost_ticks: u64,
-    pub preemption: u64,
-    pub vendor: u64,
-}
-
-/// The `SYS_RESERVE_ADMIT` success block (kernel/src/abi.rs `ReserveInfo`).
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct ReserveInfo {
-    pub handle: u64,
-    pub committed_ppm: u64,
-}
-
-/// One node of a userspace-built dependency graph (kernel/src/abi.rs
-/// `GraphNode`). `op`: 0=Const (value in `a`), 1=Add, 2=Mul, 3=Select. Each
-/// Add/Mul/Select input is an immediate (`*_is_node == 0`) or an earlier node's
-/// result (`*_is_node == 1`, node index in `a`/`b`).
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct GraphNode {
-    pub op: u32,
-    pub a_is_node: u32,
-    pub b_is_node: u32,
-    pub _pad: u32,
-    pub a: u64,
-    pub b: u64,
-}
-const _: () = assert!(core::mem::size_of::<GraphNode>() == 32);
-
-/// Graph-node op 4 (BufReduce) descriptor (kernel/src/abi.rs, docs/TILES.md
-/// 6): `node.a` = the cell VA of this struct; the engine returns the
-/// wrapping u64 sum. dtype: 0=I8, 1=U8, 2=I32.
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct BufReduceDesc {
-    pub va: u64,
-    pub elems: u64,
-    pub dtype: u32,
-    pub _pad: u32,
-}
-const _: () = assert!(core::mem::size_of::<BufReduceDesc>() == 24);
-
-/// Graph-node op 5 (TileGemm) descriptor (kernel/src/abi.rs, docs/TILES.md
-/// 6): the engine zeroes C, runs the int8->i32 GEMM whole, and returns the
-/// FNV-1a receipt of C's logical window. Strides in elements. Kernel caps:
-/// `1 <= m,n,k <= 256`, strides >= dims, dtypes exactly (I8=0, I32=2).
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct TileGemmDesc {
-    pub a_va: u64,
-    pub b_va: u64,
-    pub c_va: u64,
-    pub m: u32,
-    pub n: u32,
-    pub k: u32,
-    pub a_stride: u32,
-    pub b_stride: u32,
-    pub c_stride: u32,
-    pub dtype_in: u32,
-    pub dtype_acc: u32,
-}
-const _: () = assert!(core::mem::size_of::<TileGemmDesc>() == 56);
-
-/// A submission entry - 64 bytes, one cache line.
-#[repr(C, align(64))]
-#[derive(Copy, Clone)]
-pub struct SqEntry {
-    pub opcode: u8,
-    pub flags: u8,
-    pub engine_id: u16,
-    pub cap_id: u32,
-    pub flow_id: u128,
-    pub user_data: u64,
-    pub payload: [u8; 24],
-}
-const _: () = assert!(core::mem::size_of::<SqEntry>() == 64);
-
-/// A completion entry - 32 bytes.
-#[repr(C, align(32))]
-#[derive(Copy, Clone)]
-pub struct CqEntry {
-    pub flow_id: u128,
-    pub user_data: u64,
-    pub status: u32,
-    pub result: u32,
-}
-const _: () = assert!(core::mem::size_of::<CqEntry>() == 32);
-
-/// The shared ring header (kernel/src/queue/mod.rs `QueueHeader`).
-#[repr(C)]
-struct QueueHeader {
-    version: u32,
-    depth: u32,
-    sq_off: u32,
-    cq_off: u32,
-    sq_head: AtomicU32,
-    sq_tail: AtomicU32,
-    cq_head: AtomicU32,
-    cq_tail: AtomicU32,
-    _reserved: [u32; 8],
-}
-
-/// On-wire ABI version this build understands.
-pub const QUEUE_ABI_VERSION: u32 = 1;
 
 /// A queue-pair overlay bound to the cell's mapped ring region. Reads the
 /// header's `sq_off`/`cq_off` so it stays correct if the geometry moves within

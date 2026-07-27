@@ -14,6 +14,9 @@ edition = "2024"
 
 [dependencies]
 runtime = { path = "../runtime" }
+# The on-wire ABI, defined once (docs/ARCHITECTURE-DEBT.md 3.1) - the same crate
+# the kernel re-exports, so `librheo::sys` cannot drift from `kernel::abi`.
+rheo-abi = { path = "../abi" }
 
 # Feature gating (docs/LIBRHEO.md): `full` (the default) pulls every extended
 # module; an **embedded** cell builds `--no-default-features` to link only the

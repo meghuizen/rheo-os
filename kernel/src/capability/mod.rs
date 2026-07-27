@@ -88,6 +88,19 @@ impl Handle {
     }
 }
 
+/// The conversion `rheo_abi::SqEntry::new` uses to accept a `Handle` directly:
+/// a submission's `cap_id` field *is* the handle's 32-bit ABI form (the low 16
+/// bits the slot, the next 16 the generation's low bits, reconstructed against
+/// the table at check time; the IDL-generated ABI of BUILD-ORDER.md step 6 will
+/// own this packing). Defined here rather than in `rheo-abi` because that crate
+/// must not know about the capability table - it is the wire format, nothing
+/// more.
+impl From<Handle> for u32 {
+    fn from(h: Handle) -> u32 {
+        h.raw_low32()
+    }
+}
+
 /// What a capability points at. The full kernel object model is
 /// docs/ARCHITECTURE.md 3; only the kinds needed by current tests exist.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
