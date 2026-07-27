@@ -27,7 +27,8 @@ is driven in **`sync`** mode because the driver is kernel-resident behind
 virtio-blk read - `maybe-async` strips the futures, so async here would be
 poll-to-completion over blocking I/O with no overlap. The **async** posture is
 correct when the filesystem moves into a **service cell** over the queue ABI
-(the FUSE-over-queues end state, section 3), where a read parks a strand on an
+(the FUSE-over-queues end state, section 3; DRIVERS.md 3.1 designs the FUSE
+wire-protocol translation that realizes it), where a read parks a strand on an
 `OP_READ` completion - and where **NVMe's** submission/completion queues realize
 real queue-depth parallelism; the same crate flips to its default async mode
 there, and the `BlockSource`/`BlockDevice` seam plus `maybe-async`'s design are

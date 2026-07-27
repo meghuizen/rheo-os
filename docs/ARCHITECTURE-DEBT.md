@@ -268,7 +268,9 @@ and the undisciplined approach:
 the kernel. The remedy sat 20 lines above the defect, and is what landed: two
 more `svc` tables, `NicOps { tx, rx, mac }` and `DisplayOps { present }`, behind
 the new `Bridge<T>`. It composed rather than extended - the virtio drivers did
-not move, they register themselves.
+not move, they register themselves. The next step - the tables' implementations
+moving into driver cells reached over channels, "message-driven service later"
+made real - is owned by DRIVERS.md 4.4.
 
 ### 3.3 A hidden layering edge cargo cannot see (A)
 
