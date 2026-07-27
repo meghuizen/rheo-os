@@ -627,17 +627,31 @@ fn wake(cell: usize, uaddr: u64, max: u32) -> u32 {
 
 /// sched_yield: hand the CPU to the next ready context (if any), leaving the
 /// caller ready. Returns 0.
+///
+/// A sibling **context** of this cell wins first (that is the L4 thread
+/// scheduler). With no ready sibling the yield crosses to the next runnable
+/// **process** instead of returning immediately: a yield that keeps running is
+/// not a yield, and in a cooperative scheduler it left a forked child able to
+/// starve its parent (docs/ARCHITECTURE-DEBT.md 4,
+/// [`crate::linux::proc::yield_cell`]).
 pub fn sched_yield(cell: usize) -> Ctl {
     expire_timeouts(cell);
     let ci = cur_thread(cell);
-    match pick_next(cell, ci) {
+    // `pick_next` scans a full lap, so its last candidate is `ci` itself - the
+    // running context is `Ready`, "currently running or waiting for its turn".
+    // Every other caller reaches it with `ci` already `Blocked` or `Free`, so
+    // only a yield can pick itself, and picking itself made the whole call a
+    // no-op: `switch_to(cell, ci, ci)` saves and reloads one FP image and
+    // returns the same frame. That is what hid the missing cross-cell yield
+    // below - a single-threaded process never reached the `None` arm at all.
+    match pick_next(cell, ci).filter(|&next| next != ci) {
         Some(next) => {
             // The caller stays ready and returns 0 when resumed.
             let frame = threads(cell)[ci].frame;
             arch::set_syscall_ret(unsafe { &mut *frame }, 0);
             switch_to(cell, ci, next)
         }
-        None => Ctl::Ret(0),
+        None => crate::linux::proc::yield_cell(cell),
     }
 }
 

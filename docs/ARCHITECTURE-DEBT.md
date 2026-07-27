@@ -451,18 +451,44 @@ docs/LINUX-COMPAT.md for the semantics and the fixtures):
   `Zombie` with `wstatus 0x400` (exit 4 = "no signal arrived") *before* the parent
   reached its `kill`. That held across three child designs - a read on an inherited
   pipe, a read on a pipe the child created itself after the fork, and a bounded
-  `sched_yield` loop. The third is explained by the next entry; the first two are
-  not.
+  `sched_yield` loop. The third is explained by the next entry - and that entry is
+  now **closed**, so a bounded-`sched_yield` child is a viable design again and is
+  the cheapest way to re-open this. The first two are still unexplained.
 
   Recorded this way on purpose. The inference was published one step ahead of the
   evidence, which is the same mistake `ENGINEERING.md` §1 exists to catch when
   someone else makes it - a plausible mechanism is not a diagnosis. Whoever picks
   this up should start from the observation, not from the retracted cause.
-- **`sched_yield` does not yield across cells (B).** It reschedules among a cell's
-  own contexts (L4 threads), so a child looping `sched_yield()` runs to completion
-  before the parent is scheduled at all. A cooperative cross-cell scheduler needs
-  `sched_yield` to reach `proc::reschedule`, the way the native `SYS_YIELD` does
-  (docs/NETSTACK.md 17). (`poll`/`epoll_wait`/`nanosleep`,
+- ~~**`sched_yield` does not yield across cells (B).**~~ **CLOSED.** It rescheduled
+  among a cell's own contexts (L4 threads) only, so a child looping
+  `sched_yield()` ran to completion before the parent was scheduled at all - in a
+  cooperative scheduler a yield is one of the few preemption points, and this one
+  did nothing. `sched_yield` now falls through to `proc::yield_cell`, the same
+  cross-cell hand-off `wait4`/pipe-block/exit already use, with the caller left
+  **runnable** rather than blocked - what the native `SYS_YIELD` does
+  (docs/NETSTACK.md 17). The round-robin visits the caller last, so a yield by the
+  only runnable process is never a block and never a deadlock.
+
+  It was **two** defects stacked, and the first hid the second. `pick_next` scans
+  a full lap, so its last candidate is the caller itself - the running context is
+  `Ready` ("currently running, **or** waiting for its turn"). Every other caller
+  reaches it with the caller already `Blocked` or `Free`, so only a yield could
+  pick itself, and picking itself made the call a no-op: `switch_to(cell, ci, ci)`
+  saves and reloads one FP image and returns the same frame. A single-threaded
+  process therefore never reached the "no sibling ready" arm at all, which is why
+  adding the cross-cell fallback alone changed nothing. Both halves were observed
+  failing independently.
+
+  `yieldx.c` is the proof, and the witness is an ordering record neither side can
+  fake: parent and child run the **identical** loop - write one marker byte to a
+  shared pipe, yield, eight times - and a pipe is one cross-cell ring (L6), so the
+  byte order in the ring *is* the interleaving. `fork` returns into the parent
+  first, so the hand-computed oracle is `PCPCPCPCPCPCPCPC`; pre-fix the parent's
+  yields did nothing and it wrote all eight `P`s before blocking in `wait4`
+  (`PPPPPPPPCCCCCCCC`, observed). The two differ at the first transition.
+
+  This closes the third of the three child designs in the entry above; the two
+  pipe-based ones are still unexplained. (`poll`/`epoll_wait`/`nanosleep`,
   blocking stdin and creation-time `O_NONBLOCK` were this rung and are now closed -
   see §1. The DNS dependency turned out to be exactly as described: the resolver
   needed a `poll` that *waits*, because honouring `SOCK_NONBLOCK` removes the

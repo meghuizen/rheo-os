@@ -1197,6 +1197,11 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         // out of its region, through the queue and into ld.so, silently. Part of
         // the `linuxproc` proof.
         ("mmapx.c", "mmapx"),
+        // `sched_yield` must cross processes, not only a cell's own contexts
+        // (docs/ARCHITECTURE-DEBT.md 4): a single-threaded yielder had no ready
+        // sibling context, so the call returned immediately and a forked child
+        // could starve its parent. Part of the `linuxproc` proof.
+        ("yieldx.c", "yieldx"),
         // A futex wait that must END BY ITSELF (docs/LINUX-COMPAT.md L4, the
         // `futex` row): `pthread_cond_timedwait` on a never-signalled condvar.
         // Part of the `linuxthreads` proof.

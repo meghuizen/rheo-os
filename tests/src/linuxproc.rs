@@ -45,6 +45,7 @@ static RSH: &[u8] = fixture::linux!("rsh");
 static FCNTLX: &[u8] = fixture::linux!("fcntlx");
 static KILLX: &[u8] = fixture::linux!("killx");
 static MMAPX: &[u8] = fixture::linux!("mmapx");
+static YIELDX: &[u8] = fixture::linux!("yieldx");
 static COREUTILS: &[u8] = fixture::linux!("cu/bin/coreutils");
 
 // -- stdout capture, wired to the Linux personality's stdout tap --
@@ -271,6 +272,36 @@ extern "C" fn kernel_main() -> ! {
          over the cell's queue region is EINVAL, and W^X is honest - RWX is \
          EPERM rather than a success that silently drops EXEC, while the RW->RX \
          flip a JIT falls back to works"
+    );
+
+    // --- `sched_yield` crosses processes (docs/ARCHITECTURE-DEBT.md 4). The
+    // scheduler here is cooperative, so a yield is one of its few preemption
+    // points - and it only rescheduled among a cell's own L4 contexts. A
+    // single-threaded process had no ready sibling, so the call returned
+    // immediately: a forked child looping `sched_yield()` ran to completion
+    // before its parent was scheduled at all.
+    //
+    // The witness is an ordering record neither side can fake. Parent and child
+    // run the *identical* loop - write one marker byte to the same pipe, yield,
+    // eight times - and a pipe is one cross-cell ring (L6), so the byte order in
+    // the ring is the interleaving. `fork` returns into the parent first, so the
+    // oracle is "PC" x 8. Pre-fix the parent's yields did nothing, so it wrote
+    // all eight P's before blocking in wait4: "PPPPPPPPCCCCCCCC". The two differ
+    // at the first transition, which is what makes this discriminating.
+    let want_yield: &[u8] = b"yield: parent and child alternated PCPCPCPCPCPCPCPC\n\
+        yieldx OK\n";
+    let (code, out) = run_capture(YIELDX, &[b"yieldx"]);
+    assert!(
+        out == want_yield,
+        "yieldx: stdout mismatch\n  got:      {:?}\n  expected: {:?}",
+        core::str::from_utf8(out),
+        core::str::from_utf8(want_yield),
+    );
+    assert!(code == 0, "yieldx: exit {code}, expected 0");
+    println!(
+        "linuxproc: sched_yield OK - a forked child and its parent alternate \
+         round for round, so a yield reaches the next runnable process and not \
+         only a sibling context"
     );
 
     println!("linuxproc: PASS");

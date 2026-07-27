@@ -527,6 +527,30 @@ pub fn block_pipe_write(cur: usize, buf_va: u64, count: u64, idx: usize) -> Ctl 
 
 // ----------------------------------------------------------------- scheduler
 
+/// `sched_yield` across **processes**: leave `cur` runnable and hand the CPU to
+/// the next runnable cell, round-robin (docs/ARCHITECTURE-DEBT.md 4).
+///
+/// [`thread::sched_yield`] only ever rescheduled among a cell's own L4 contexts,
+/// so a forked child looping `sched_yield()` ran to completion before its parent
+/// was scheduled at all: this scheduler is cooperative, a yield is one of its few
+/// preemption points, and there the yield did nothing. Every other cross-cell
+/// hand-off here goes through [`reschedule`]; this is that hand-off with the
+/// caller left **runnable** instead of blocked - what the native `SYS_YIELD` does
+/// for native cells (docs/NETSTACK.md 17).
+///
+/// `reschedule`'s round-robin visits `cur` last, so a process that is the only
+/// runnable one is simply picked again: a yield is never a block, and never a
+/// deadlock.
+pub fn yield_cell(cur: usize) -> Ctl {
+    // Set the return value into the saved frame *before* the switch, so `cur`'s
+    // frame already carries the 0 it resumes with whichever cell runs next.
+    // `complete_block` cannot do it - a yield registers no block.
+    let frame = thread::current_frame(cur);
+    // SAFETY: `frame` is `cur`'s current-context saved state, in kernel memory.
+    unsafe { arch::set_syscall_ret(&mut *frame, 0) };
+    reschedule(cur)
+}
+
 /// Hand the CPU to the next runnable cell after `leaving` blocks or exits. Wakes
 /// any blocked cell whose condition is now satisfiable, then round-robins to a
 /// runnable cell and completes its pending block. Panics only on a true
