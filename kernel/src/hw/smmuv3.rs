@@ -86,7 +86,7 @@ fn w64(va: usize, off: usize, v: u64) {
 }
 
 fn table_frame() -> usize {
-    let pa = frames::alloc();
+    let pa = frames::alloc().expect("SMMUv3 table (boot, reserve held)");
     let va = arch::phys_to_virt(pa);
     unsafe { core::ptr::write_bytes(va as *mut u8, 0, frames::FRAME_SIZE) };
     pa

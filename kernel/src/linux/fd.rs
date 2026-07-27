@@ -305,10 +305,17 @@ impl FdTable {
     }
 
     /// read(fd, buf, count).
+    ///
+    /// `buf_va` is bound to the calling cell's user VA range here rather than
+    /// only at the syscall entry, because `readv`/`writev` reach this with a
+    /// **per-iovec** base the entry check never saw (docs/ENGINEERING.md 13).
     pub fn read(&mut self, fd: i64, buf_va: u64, count: u64) -> i64 {
         let Some(slot) = usize_fd(fd) else {
             return -EBADF;
         };
+        if crate::user::user_buf_mut(buf_va, count as usize).is_none() {
+            return -EFAULT;
+        }
         match self.fds[slot] {
             FdKind::Console(0) => {
                 // Non-blocking stdin: drain the serial RX FIFO (0 if empty).
@@ -387,11 +394,15 @@ impl FdTable {
         }
     }
 
-    /// write(fd, buf, count).
+    /// write(fd, buf, count). `buf_va` is bound to the calling cell's user VA
+    /// range (see [`Fds::read`] for why the check is here, not only at entry).
     pub fn write(&mut self, fd: i64, buf_va: u64, count: u64) -> i64 {
         let Some(slot) = usize_fd(fd) else {
             return -EBADF;
         };
+        if crate::user::user_buf(buf_va, count as usize).is_none() {
+            return -EFAULT;
+        }
         match self.fds[slot] {
             FdKind::Console(0) => -EBADF,
             FdKind::Console(_) => {
@@ -719,8 +730,12 @@ impl FdTable {
                 Stat::new(mode, native.size, 1, 1, 1000, 1000, 0, 4096, blocks, 0)
             }
         };
-        // SAFETY: `statbuf_va` is a writable VA in the calling cell.
-        unsafe { (statbuf_va as *mut Stat).write(st) };
+        let Some(out) = crate::user::user_out::<Stat>(statbuf_va) else {
+            return -EFAULT;
+        };
+        // SAFETY: `out` was validated non-null, `Stat`-aligned and inside the
+        // calling cell's user VA range; its address space is active.
+        unsafe { out.write(st) };
         0
     }
 

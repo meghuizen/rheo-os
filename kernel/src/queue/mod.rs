@@ -544,8 +544,24 @@ fn rd_u64(p: &[u8; 24], o: usize) -> u64 {
 }
 
 /// Execute one grant-checked submission and return `(status, result)`.
+///
+/// A submission's payload carries **cell-supplied addresses** (buffers, paths,
+/// descriptors), and the cell's address space is active while the kernel drains
+/// the ring - so each one is bound to that cell's user VA range before it is
+/// handed to a `svc::FileOps` handler or a device driver. A rejected address
+/// completes `STATUS_DENIED`: no dereference, no fault, no panic
+/// (docs/ENGINEERING.md 13).
 fn run_opcode(entry: &SqEntry) -> (u32, u32) {
     let p = &entry.payload;
+    // Validated cell buffer, or an early `STATUS_DENIED` completion.
+    macro_rules! ck {
+        ($e:expr) => {
+            match $e {
+                Some(v) => v,
+                None => return (STATUS_DENIED, 0),
+            }
+        };
+    }
     match entry.opcode {
         OP_NOP => (STATUS_OK, 0),
         OP_ECHO => (STATUS_OK, rd_u32(p, 0)),
@@ -553,6 +569,7 @@ fn run_opcode(entry: &SqEntry) -> (u32, u32) {
             let path_va = rd_u64(p, 0);
             let path_len = rd_u32(p, 8) as u64;
             let flags = rd_u32(p, 12) as u64;
+            ck!(crate::user::user_buf(path_va, path_len as usize));
             io_result(crate::svc::file_ops().map(|o| (o.open)(path_va, path_len, flags)))
         }
         OP_READ => {
@@ -560,6 +577,7 @@ fn run_opcode(entry: &SqEntry) -> (u32, u32) {
             let offset = rd_u64(p, 8);
             let len = rd_u32(p, 16) as u64;
             let fd = rd_u32(p, 20) as u64;
+            ck!(crate::user::user_buf_mut(buf_va, len as usize));
             io_result(crate::svc::file_ops().map(|o| {
                 (o.lseek)(fd, offset as i64, 0); // SEEK_SET (positional)
                 (o.read)(fd, buf_va, len)
@@ -579,6 +597,7 @@ fn run_opcode(entry: &SqEntry) -> (u32, u32) {
                 let offset = rd_u64(p, 8);
                 let len = rd_u32(p, 16) as u64;
                 let fd = rd_u32(p, 20) as u64;
+                ck!(crate::user::user_buf(buf_va, len as usize));
                 crate::svc::file_ops().map(|o| {
                     (o.lseek)(fd, offset as i64, 0);
                     (o.write)(fd, buf_va, len)
@@ -593,38 +612,48 @@ fn run_opcode(entry: &SqEntry) -> (u32, u32) {
         OP_FSTAT => {
             let statbuf_va = rd_u64(p, 0);
             let fd = rd_u32(p, 8) as u64;
+            ck!(crate::user::user_out::<crate::abi::Stat>(statbuf_va));
             io_result(crate::svc::file_ops().map(|o| (o.fstat)(fd, statbuf_va)))
         }
         OP_GRAPH_SUBMIT => {
             let nodes_va = rd_u64(p, 0);
             let count = rd_u32(p, 8);
             let results_va = rd_u64(p, 12);
-            // SAFETY: both VAs are the submitting cell's own mapped memory,
-            // reachable because its address space is active during the drain.
+            // `graph_submit` validates both arrays (and every descriptor VA
+            // inside them) against the submitting cell's user VA range itself,
+            // because only it knows each extent.
+            // SAFETY: the submitting cell's address space is active during the
+            // drain, which is this function's contract.
             crate::svc::graph_submit(nodes_va, count, results_va)
         }
         // Raw-frame networking (docs/NETWORKING.md, LIBRHEO.md Phase G): bridge
-        // to the virtio-net driver. The VAs are the cell's own mapped memory.
+        // to the virtio-net driver, which **DMA-reads** the transmit buffer - so
+        // an unvalidated VA here would hand kernel memory to a device.
         OP_NET_TX => {
             let buf_va = rd_u64(p, 0);
             let len = rd_u32(p, 8) as u64;
+            ck!(crate::user::user_buf(buf_va, len as usize));
             crate::hw::virtio_net::tx(buf_va, len)
         }
         OP_NET_RX => {
             let buf_va = rd_u64(p, 0);
             let len = rd_u32(p, 8) as u64;
+            ck!(crate::user::user_buf_mut(buf_va, len as usize));
             crate::hw::virtio_net::rx(buf_va, len)
         }
         OP_NET_MAC => {
             let buf_va = rd_u64(p, 0);
+            ck!(crate::user::user_buf_mut(buf_va, 6));
             crate::hw::virtio_net::mac(buf_va)
         }
         // GPU 2D present (docs/LIBRHEO.md Phase H): bridge to the virtio-gpu
-        // driver. The VA is the cell's own mapped framebuffer.
+        // driver, which copies `w*h*4` bytes out of the cell's framebuffer.
         OP_GPU_PRESENT => {
             let buf_va = rd_u64(p, 0);
             let w = rd_u32(p, 8);
             let h = rd_u32(p, 12);
+            let fb_len = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+            ck!(crate::user::user_buf(buf_va, fb_len));
             crate::hw::virtio_gpu::present(buf_va, w, h)
         }
         _ => (STATUS_BAD_OPCODE, 0),

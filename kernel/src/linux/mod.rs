@@ -201,6 +201,15 @@ pub(crate) fn ret(v: i64) -> Ctl {
 /// registers (already Linux-ordered by `arch::decode_syscall`); `frame` is the
 /// calling context's saved state (the parent for `clone`).
 pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -> Ctl {
+    // Every pointer argument below is an address the **cell** chose, and the
+    // kernel services this trap with the cell's root active, in which all of
+    // kernel RAM is mapped supervisor-RWX. So the whole Linux ABI surface is
+    // bounded here, at the single dispatch point, rather than at ~60 individual
+    // dereferences (docs/ENGINEERING.md 13). A rejected address is `-EFAULT`,
+    // exactly as Linux reports it.
+    if !ptr_args_ok(nr_val, args) {
+        return err(errno::EFAULT);
+    }
     let st = state(cur);
     match nr_val {
         // -- I/O over the fd table (pipe fds may block cross-cell, L6) --
@@ -400,6 +409,86 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
             crate::println!("linux: ENOSYS nr={other}");
             err(errno::ENOSYS)
         }
+    }
+}
+
+/// Bound every cell-supplied pointer argument of Linux syscall `nr_val`
+/// against the calling cell's user VA range (docs/ENGINEERING.md 13). `false`
+/// means the call is refused `-EFAULT` before any handler runs.
+///
+/// The table is deliberately in one place: the mapping from a syscall number to
+/// "which arguments are pointers, and how long" is ABI knowledge, and spreading
+/// it over the handlers is what let the whole surface go unchecked. Where the
+/// length is itself an argument it is used, so a bogus length is rejected too -
+/// that is what bounds `readv`'s and `poll`'s otherwise **unbounded**
+/// `iovcnt`/`nfds` array walks. Otherwise the minimum is one byte: the address
+/// bound is the security property, and guessing a struct size too large would
+/// reject a legitimate caller.
+///
+/// `nr::*` resolves per ISA (`arch::linux_abi`), so this stays portable.
+fn ptr_args_ok(nr_val: u64, args: &[u64; 6]) -> bool {
+    // Required (must be a valid user range) / optional (0 = "not supplied").
+    let rd = |i: usize, n: u64| crate::user::user_buf(args[i], n as usize).is_some();
+    let wr = |i: usize, n: u64| crate::user::user_buf_mut(args[i], n as usize).is_some();
+    let rd_opt = |i: usize, n: u64| args[i] == 0 || rd(i, n);
+    let wr_opt = |i: usize, n: u64| args[i] == 0 || wr(i, n);
+    match nr_val {
+        // -- fd I/O: the length is an argument, so use it --
+        nr::READ | nr::PREAD64 | nr::GETDENTS64 => wr(1, args[2]),
+        nr::WRITE => rd(1, args[2]),
+        // The iovec array itself; each entry's own base/len is checked by the
+        // per-entry `read`/`write` below it (fd.rs), which routes through the
+        // same helpers.
+        nr::READV | nr::WRITEV => rd(1, args[2].saturating_mul(16)),
+        nr::OPENAT | nr::FACCESSAT | nr::FACCESSAT2 => rd(1, 1),
+        nr::ACCESS | nr::CHDIR => rd(0, 1),
+        nr::FSTAT => wr(1, 1),
+        nr::NEWFSTATAT => rd(1, 1) && wr(2, 1),
+        nr::STATX => rd(1, 1) && wr(4, 1),
+        nr::IOCTL => wr_opt(2, 8), // only TIOCGWINSZ writes; others ignore it
+        nr::POLL | nr::PPOLL => args[1] == 0 || wr(0, args[1].saturating_mul(8)),
+        nr::GETCWD => wr(0, args[1]),
+
+        // -- threads / processes --
+        nr::FUTEX => rd(0, 4),
+        nr::CLONE => wr_opt(2, 4), // parent_tid; child_tid is validated on use
+        nr::EXECVE => rd(0, 1) && rd(1, 8) && rd_opt(2, 8),
+        nr::WAIT4 => wr_opt(1, 4),
+        nr::PIPE | nr::PIPE2 => wr(0, 8),
+        nr::SET_TID_ADDRESS | nr::SET_ROBUST_LIST => wr_opt(0, 4),
+
+        // -- sockets --
+        nr::SOCKETPAIR => wr(3, 8),
+        nr::BIND | nr::CONNECT => rd(1, 1),
+        nr::ACCEPT | nr::ACCEPT4 | nr::GETSOCKNAME | nr::GETPEERNAME => {
+            wr_opt(1, 1) && wr_opt(2, 4)
+        }
+        nr::SENDTO => rd(1, args[2]) && rd_opt(4, 1),
+        nr::RECVFROM => wr(1, args[2]) && wr_opt(4, 1),
+        nr::SENDMSG | nr::RECVMSG => rd(1, 1),
+        nr::EPOLL_CTL => rd_opt(3, 1),
+        nr::EPOLL_WAIT | nr::EPOLL_PWAIT => wr(1, 1),
+        nr::GETSOCKOPT => wr_opt(3, 1) && wr_opt(4, 4),
+
+        // -- identity / time / entropy / limits --
+        nr::UNAME => wr(0, 6 * 65), // struct utsname: six 65-byte fields
+        nr::CLOCK_GETTIME => wr(1, 16),
+        nr::GETRANDOM => wr(0, args[1]),
+        nr::SCHED_GETAFFINITY => wr(2, args[1]),
+        nr::PRLIMIT64 => rd_opt(2, 16) && wr_opt(3, 16),
+        nr::GETRLIMIT => wr(1, 16),
+
+        // -- signals --
+        nr::RT_SIGACTION => rd_opt(1, 1) && wr_opt(2, 1),
+        nr::RT_SIGPROCMASK => rd_opt(1, 8) && wr_opt(2, 8),
+        nr::SIGALTSTACK => rd_opt(0, 1) && wr_opt(1, 1),
+        nr::RT_SIGQUEUEINFO => rd(2, 1),
+
+        // Everything else takes no user pointer (or resolves one itself through
+        // the same helpers): brk/mmap/munmap/mprotect/mremap take VAs the memory
+        // code range-checks, arch_prctl(ARCH_SET_FS) takes a *value*, and the
+        // identity/recorded/ENOSYS calls take scalars.
+        _ => true,
     }
 }
 
@@ -733,8 +822,12 @@ fn sys_statx(st: &mut LinuxState, args: &[u64; 6]) -> i64 {
         stx_blocks: size.div_ceil(512),
         ..Default::default()
     };
-    // SAFETY: `args[4]` is a writable `struct statx` in the calling cell.
-    unsafe { (args[4] as *mut Statx).write(stx) };
+    let Some(out) = crate::user::user_out::<Statx>(args[4]) else {
+        return -errno::EFAULT;
+    };
+    // SAFETY: `out` was validated non-null, `Statx`-aligned and inside the
+    // calling cell's user VA range; its address space is active.
+    unsafe { out.write(stx) };
     0
 }
 

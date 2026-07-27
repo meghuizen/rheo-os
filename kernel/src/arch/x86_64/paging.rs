@@ -95,7 +95,7 @@ fn fill_high_pd(pd: &mut [u64; 512], phys_base: usize, carve: bool) {
     for (i, entry) in pd.iter_mut().enumerate() {
         let pa = phys_base + i * MIB2;
         if carve && pa == user_slot_pa {
-            let pt_pa = frames::alloc();
+            let pt_pa = frames::alloc().expect("page table (boot, reserve held)");
             *entry = addr_bits(pt_pa) | P | RW | US; // empty PT, filled by paging_map
         } else {
             // Supervisor 2 MiB page, executable (kernel code lives here).
@@ -110,10 +110,10 @@ fn fill_high_pd(pd: &mut [u64; 512], phys_base: usize, carve: bool) {
 /// the one `.user` slot delegated to a 4 KiB page table whose leaves carry the
 /// US bit.
 pub fn paging_new_root() -> PagingRoot {
-    let pml4_pa = frames::alloc();
-    let pdpt_pa = frames::alloc();
-    let pd_lo_pa = frames::alloc();
-    let pd_hi_pa = frames::alloc();
+    let pml4_pa = frames::alloc().expect("PML4 (boot, reserve held)");
+    let pdpt_pa = frames::alloc().expect("PDPT (boot, reserve held)");
+    let pd_lo_pa = frames::alloc().expect("low PD (boot, reserve held)");
+    let pd_hi_pa = frames::alloc().expect("high PD (boot, reserve held)");
     let pml4 = table_mut(pml4_pa);
     let pdpt = table_mut(pdpt_pa);
     // US on the upper tables lets the one carved `.user` leaf be user-
@@ -163,7 +163,7 @@ pub fn paging_map(root: &mut PagingRoot, va: usize, perm: MapPerm) {
 /// writable, user-accessible so the walk can descend) if the slot is empty.
 fn ensure_table(parent: &mut [u64; 512], idx: usize) -> usize {
     if parent[idx] & P == 0 {
-        let t = frames::alloc(); // zeroed
+        let t = frames::alloc().expect("page table (user reserve held)"); // zeroed
         parent[idx] = addr_bits(t) | P | RW | US;
     }
     next_table(parent[idx])

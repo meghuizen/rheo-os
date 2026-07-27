@@ -31,6 +31,167 @@ use crate::sched::{Admission, AdmitError, Reservation};
 const MMAP_BASE: usize = 0x3_0000_0000;
 static mut MMAP_NEXT: usize = MMAP_BASE;
 
+// ======================================================================
+// User-pointer validation (docs/ENGINEERING.md 13)
+// ======================================================================
+//
+// Every syscall out-parameter, every queue payload VA and every buffer a
+// personality handler is handed is an address the **cell** chose. The kernel
+// services the trap in S-mode/EL1/ring 0 *with the calling cell's root active*,
+// and every cell root maps all of kernel RAM supervisor-RWX (the linear map),
+// so dereferencing such an address unchecked is an arbitrary kernel read or
+// write with a cell-steerable value. Nothing here walks page tables: the check
+// is a null test, an alignment test, an overflow-checked add and one or two
+// compares - a few instructions on the syscall path, no per-call page-table
+// walk (the P1 grant check's budget, docs/ARCHITECTURE.md).
+
+/// Exclusive upper bound of a cell's low-half user VA range - the portable
+/// "below the kernel half" bound, `2^38` = 256 GiB.
+///
+/// Derivation: of the three ISAs, RISC-V **Sv39** has the narrowest user half -
+/// a 39-bit VA whose low (user) portion is `[0, 2^38)`, everything above being
+/// the sign-extended kernel half (docs/MEMORY.md). ARM64's TTBR0 (48-bit) and
+/// x86-64's 4-level user half (47-bit) are far larger, so `2^38` is the
+/// portable minimum and is *below* the kernel half on all three. Every VA the
+/// loader hands a cell lives far below it: image 1-4 GiB, stack 8 GiB
+/// ([`crate::load::USER_STACK_TOP`]), anon mmap 12 GiB ([`MMAP_BASE`]), queue
+/// 16 GiB ([`crate::load::USER_QUEUE_VA`]), file mmap 20 GiB
+/// ([`FILEMMAP_BASE`]), channels 24 GiB ([`crate::load::USER_CHANNEL_VA`]),
+/// grants 32 GiB ([`GRANT_BASE`]), and the Linux ELF interpreter 64 GiB
+/// ([`crate::load::LINUX_INTERP_BASE`]) - the highest, still 4x below.
+pub const USER_VA_MAX: u64 = 1 << 38;
+
+// The layout above is asserted at compile time, so moving a region without
+// revisiting this bound cannot compile.
+const _: () = assert!((crate::load::LINUX_INTERP_BASE as u64) < USER_VA_MAX);
+const _: () = assert!((GRANT_BASE as u64) < USER_VA_MAX);
+const _: () = assert!((crate::load::USER_CHANNEL_VA as u64) < USER_VA_MAX);
+const _: () = assert!((FILEMMAP_BASE as u64) < USER_VA_MAX);
+const _: () = assert!((crate::load::USER_QUEUE_VA as u64) < USER_VA_MAX);
+const _: () = assert!((MMAP_BASE as u64) < USER_VA_MAX);
+
+/// Whether `[va, va+len)` is an address range the kernel may **write** on this
+/// cell's behalf: non-null, no overflow, and either wholly inside the low-half
+/// user range (`< `[`USER_VA_MAX`]) or wholly inside the writable part of the
+/// shared `.user` window.
+///
+/// The window exception exists because the hand-written U-mode programs
+/// (`kernel/src/user_progs.rs` - the `lsh` shell, the benchmark workers, the
+/// isolation prober) run from the linker's 2 MiB `.user` span, which on
+/// riscv64 and x86-64 is linked *high*, beside the kernel (kernel/link/*.ld),
+/// yet is genuinely mapped U into every cell root. Only `[__user_data_start,
+/// __user_end)` - the per-cell `.user.data`/`.user.bss` pages - is accepted for
+/// a write: `.user.text`/`.user.rodata` are shared read-only by every cell, so
+/// letting the kernel write there on one cell's request would corrupt all of
+/// them.
+///
+/// An **empty** range (`len == 0`) is accepted whatever `va` is: nothing is
+/// dereferenced, and POSIX callers legitimately pass `read(fd, NULL, 0)`. This
+/// is the same rule as Linux's `access_ok`.
+#[inline]
+pub fn user_write_ok(va: u64, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if va == 0 {
+        return false;
+    }
+    let Some(end) = va.checked_add(len as u64) else {
+        return false;
+    };
+    if end <= USER_VA_MAX {
+        return true;
+    }
+    // Link-time constants, not memory loads; reached only for a `.user`-window
+    // cell, never on a loaded cell's hot path.
+    let data_start = crate::mm::user_rodata_range().1 as u64;
+    let window_end = crate::mm::user_window().1 as u64;
+    va >= data_start && end <= window_end
+}
+
+/// Whether `[va, va+len)` is an address range the kernel may **read** on this
+/// cell's behalf. As [`user_write_ok`], but the whole `.user` window is
+/// accepted (a U-mode program legitimately passes `.user.rodata` string
+/// constants to `SYS_DEBUG_WRITE`).
+#[inline]
+pub fn user_read_ok(va: u64, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if va == 0 {
+        return false;
+    }
+    let Some(end) = va.checked_add(len as u64) else {
+        return false;
+    };
+    if end <= USER_VA_MAX {
+        return true;
+    }
+    let (window_start, window_end) = crate::mm::user_window();
+    va >= window_start as u64 && end <= window_end as u64
+}
+
+/// Validate a cell-supplied out-parameter address for a `T`-sized, `T`-aligned
+/// **write**, returning the pointer to write through. `None` = refuse the
+/// syscall (never write, never panic).
+#[inline]
+pub fn user_out<T>(va: u64) -> Option<*mut T> {
+    if !va.is_multiple_of(core::mem::align_of::<T>() as u64) {
+        return None;
+    }
+    if !user_write_ok(va, core::mem::size_of::<T>()) {
+        return None;
+    }
+    Some(va as *mut T)
+}
+
+/// Validate a cell-supplied in-parameter address for a `T`-sized, `T`-aligned
+/// **read**.
+#[inline]
+pub fn user_in<T>(va: u64) -> Option<*const T> {
+    if !va.is_multiple_of(core::mem::align_of::<T>() as u64) {
+        return None;
+    }
+    if !user_read_ok(va, core::mem::size_of::<T>()) {
+        return None;
+    }
+    Some(va as *const T)
+}
+
+/// Validate a cell-supplied **readable** byte buffer of `len` bytes, returning
+/// the address unchanged. No alignment requirement (a byte buffer, or a
+/// structure read with `read_unaligned`).
+#[inline]
+pub fn user_buf(va: u64, len: usize) -> Option<u64> {
+    if user_read_ok(va, len) {
+        Some(va)
+    } else {
+        None
+    }
+}
+
+/// Validate a cell-supplied **writable** byte buffer of `len` bytes.
+#[inline]
+pub fn user_buf_mut(va: u64, len: usize) -> Option<u64> {
+    if user_write_ok(va, len) {
+        Some(va)
+    } else {
+        None
+    }
+}
+
+/// A validated writable byte slice over `[va, va+len)` in the calling cell.
+///
+/// # Safety
+/// The caller must be servicing that cell's synchronous trap (so the range is
+/// mapped and no other reference to it is live).
+#[inline]
+pub unsafe fn user_slice(va: u64, len: usize) -> Option<&'static mut [u8]> {
+    user_buf_mut(va, len)?;
+    // SAFETY: range validated above; the caller guarantees the trap context.
+    Some(unsafe { core::slice::from_raw_parts_mut(va as *mut u8, len) })
+}
+
 /// Why a cell's run ended.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Outcome {
@@ -319,6 +480,7 @@ pub fn reset() {
         *core::ptr::addr_of_mut!(CELL_GRANTS) = [[EMPTY_GRANT; MAX_GRANTS_PER_CELL]; MAX_CELLS];
         *core::ptr::addr_of_mut!(CELL_RES) = [[EMPTY_RES; MAX_RES_PER_CELL]; MAX_CELLS];
         *core::ptr::addr_of_mut!(CELL_ADMISSION) = [EMPTY_ADMISSION; MAX_CELLS];
+        *core::ptr::addr_of_mut!(CELL_FRAMES) = [0; MAX_CELLS];
     }
     crate::linux::reset();
     crate::nproc::reset();
@@ -352,41 +514,168 @@ pub fn with_current_aspace<R>(f: impl FnOnce(&mut AddressSpace) -> R) -> R {
     r
 }
 
+// ======================================================================
+// Per-cell frame budget (docs/ENGINEERING.md 13, docs/ARCHITECTURE.md 5)
+// ======================================================================
+//
+// `len` on `SYS_MMAP`/`SYS_COMMIT` (and the Linux `mmap`/`mprotect` path) is
+// **cell-supplied**, so without a ceiling one line of unprivileged cell code -
+// `mmap(1 << 40)` - drains a fixed 128 MiB pool. ARCHITECTURE.md 5 forbids an
+// OOM *killer*; an OOM *panic* is strictly worse. Two limits make exhaustion a
+// clean `-ENOMEM` refusal instead:
+//
+//  1. a **global reserve** (`frames::USER_RESERVE_FRAMES`, 8 MiB) that no
+//     cell-driven allocation may dip into, so the kernel's own allocations - the
+//     page tables a mapping needs, a driver ring, a `fork` copy - always succeed;
+//  2. a **per-cell budget** below, so one cell cannot starve its siblings even
+//     while the reserve is intact.
+//
+// Both are checked *before* any frame is taken, and a partial failure rolls back
+// what it took, so a refused syscall leaves the pool exactly as it found it.
+
+/// Frames one cell may hold at once through the cell-driven mapping paths:
+/// 24576 = 96 MiB of the 128 MiB pool. Sized so no existing workload changes
+/// behaviour (the heaviest, a glibc Linux cell with per-thread arenas, commits
+/// far less) while an absurd request is refused outright. It is a fairness cap,
+/// not the exhaustion guard - the global reserve above is that.
+pub const MAX_FRAMES_PER_CELL: usize = 24576;
+
+static mut CELL_FRAMES: [usize; MAX_CELLS] = [0; MAX_CELLS];
+
+/// Frames cell `idx` currently holds through the charged paths. A test asserts
+/// on this, so the accounting is observed rather than assumed
+/// (docs/ENGINEERING.md 1).
+pub fn cell_frames_charged(idx: usize) -> usize {
+    // SAFETY: single CPU, synchronous traps.
+    unsafe { (*core::ptr::addr_of!(CELL_FRAMES))[idx] }
+}
+
+/// Reserve `pages` against cell `cur`'s budget and the global pool, or `false`
+/// (nothing charged). Both checks happen before any allocation.
+fn charge_frames(cur: usize, pages: usize) -> bool {
+    // SAFETY: single CPU, synchronous traps.
+    let held = unsafe { &mut (*core::ptr::addr_of_mut!(CELL_FRAMES))[cur] };
+    let Some(want) = held.checked_add(pages) else {
+        return false;
+    };
+    if want > MAX_FRAMES_PER_CELL || pages > frames::user_available() {
+        return false;
+    }
+    *held = want;
+    true
+}
+
+/// Allocate one zeroed frame **charged to the current cell's budget**, or `None`
+/// if the budget or the pool (less the kernel reserve) cannot cover it. For a
+/// path that maps frames one at a time (the Linux personality's file-backed
+/// `mmap`); [`free_user_frame`] uncharges.
+pub fn alloc_user_frame() -> Option<usize> {
+    let cur = current_index();
+    if !charge_frames(cur, 1) {
+        return None;
+    }
+    match frames::alloc() {
+        Some(pa) => Some(pa),
+        None => {
+            uncharge_frames(cur, 1);
+            None
+        }
+    }
+}
+
+/// Return a frame taken with [`alloc_user_frame`] and uncharge it.
+pub fn free_user_frame(pa: usize) {
+    if frames::free_if_pool(pa) {
+        uncharge_frames(current_index(), 1);
+    }
+}
+
+/// Return `pages` to cell `cur`'s budget (a free, or a rolled-back charge).
+fn uncharge_frames(cur: usize, pages: usize) {
+    // SAFETY: single CPU, synchronous traps.
+    let held = unsafe { &mut (*core::ptr::addr_of_mut!(CELL_FRAMES))[cur] };
+    *held = held.saturating_sub(pages);
+}
+
 /// Map fresh zeroed frames for `[va, va+len)` in the current cell with `perm`.
 /// `va` and `len` need not be page-aligned; whole overlapping pages are mapped.
-pub fn map_anon_at(va: usize, len: usize, perm: MapPerm) {
+/// Returns `false` (having mapped nothing) when the range is outside the cell's
+/// user VA range or the cell's frame budget cannot cover it.
+pub fn map_anon_at(va: usize, len: usize, perm: MapPerm) -> bool {
     if len == 0 {
-        return;
+        return true;
     }
     let base = va & !(frames::FRAME_SIZE - 1);
-    let end = va + len;
-    with_current_aspace(|aspace| {
+    let Some(end) = va.checked_add(len) else {
+        return false;
+    };
+    if !user_write_ok(base as u64, end - base) {
+        return false;
+    }
+    let cur = current_index();
+    let pages = (end - base).div_ceil(frames::FRAME_SIZE);
+    if !charge_frames(cur, pages) {
+        return false;
+    }
+    let got = with_current_aspace(|aspace| {
         let mut a = base;
+        let mut n = 0;
         while a < end {
-            let pa = frames::alloc();
+            let Some(pa) = frames::alloc() else { break };
             aspace.map_user_frame(a, pa, perm);
             a += frames::FRAME_SIZE;
+            n += 1;
         }
+        n
     });
+    if got < pages {
+        // Exhausted mid-way despite the reserve: give back what we took, so a
+        // failed call leaves the pool as it found it.
+        unmap_range(base, got * frames::FRAME_SIZE);
+        uncharge_frames(cur, pages - got);
+        return false;
+    }
+    true
 }
 
 /// Unmap every whole page in `[va, va+len)` in the current cell and free the
-/// frames. Pages that were not mapped are skipped.
-pub fn unmap_range(va: usize, len: usize) {
+/// frames, returning how many frames were freed. Pages that were not mapped are
+/// skipped, and so is any page whose frame is **not one of the allocator's**
+/// (the shared `.user` window, an MMIO aperture) - handing such a page to
+/// `frames::free` would panic the kernel.
+///
+/// The range must lie inside the cell's user VA range; anything else unmaps
+/// nothing. That bound is what stops an unprivileged `munmap` of a kernel VA -
+/// or, on aarch64 where the `.user` window is linked low, of the shared U-mode
+/// code - from reaching the allocator at all. **Ownership** of the range is a
+/// separate, stronger check the native `SYS_MUNMAP` applies on top
+/// (docs/ENGINEERING.md 13).
+pub fn unmap_range(va: usize, len: usize) -> usize {
     if len == 0 {
-        return;
+        return 0;
     }
     let base = va & !(frames::FRAME_SIZE - 1);
-    let end = va + len;
-    with_current_aspace(|aspace| {
+    let Some(end) = va.checked_add(len) else {
+        return 0;
+    };
+    if !user_write_ok(base as u64, end - base) {
+        return 0;
+    }
+    let freed = with_current_aspace(|aspace| {
         let mut a = base;
+        let mut n = 0;
         while a < end {
-            if let Some(pa) = aspace.unmap(a) {
-                frames::free(pa);
+            if let Some(pa) = aspace.unmap(a)
+                && frames::free_if_pool(pa)
+            {
+                n += 1;
             }
             a += frames::FRAME_SIZE;
         }
+        n
     });
+    uncharge_frames(current_index(), freed);
+    freed
 }
 
 /// Commit every whole page in `[va, va+len)` in the current cell with `perm`:
@@ -396,22 +685,52 @@ pub fn unmap_range(va: usize, len: usize) {
 /// (docs/LINUX-COMPAT.md L4) - glibc reserves large `PROT_NONE` regions
 /// (per-thread malloc arenas, thread-stack guards) and commits sub-ranges as it
 /// grows, so eager backing on `mmap` would exhaust the frame pool.
-pub fn commit_range(va: usize, len: usize, perm: MapPerm) {
+/// Returns `false` (having committed nothing new) when the range is outside the
+/// cell's user VA range or its frame budget cannot cover the uncommitted pages.
+pub fn commit_range(va: usize, len: usize, perm: MapPerm) -> bool {
     if len == 0 {
-        return;
+        return true;
     }
     let base = va & !(frames::FRAME_SIZE - 1);
-    let end = va + len;
-    with_current_aspace(|aspace| {
+    let Some(end) = va.checked_add(len) else {
+        return false;
+    };
+    if !user_write_ok(base as u64, end - base) {
+        return false;
+    }
+    // Charge the whole span up front - the pessimistic case, every page fresh -
+    // then hand back what turned out to be already committed. A cell cannot
+    // commit more than its budget even if it asks page by page.
+    let cur = current_index();
+    let pages = (end - base).div_ceil(frames::FRAME_SIZE);
+    if !charge_frames(cur, pages) {
+        return false;
+    }
+    let (fresh, done) = with_current_aspace(|aspace| {
         let mut a = base;
+        let (mut fresh, mut done) = (0usize, 0usize);
         while a < end {
             // Unmap returns the existing frame (if any) so a reprotect keeps
             // the page's contents; otherwise allocate a fresh zeroed frame.
-            let pa = aspace.unmap(a).unwrap_or_else(frames::alloc);
+            let pa = match aspace.unmap(a) {
+                Some(pa) => pa,
+                None => match frames::alloc() {
+                    Some(pa) => {
+                        fresh += 1;
+                        pa
+                    }
+                    None => break,
+                },
+            };
             aspace.map_user_frame(a, pa, perm);
             a += frames::FRAME_SIZE;
+            done += 1;
         }
+        (fresh, done)
     });
+    // Only the newly-allocated pages stay charged.
+    uncharge_frames(cur, pages - fresh);
+    done == pages
 }
 
 /// Change the permission of every whole page in `[va, va+len)` in the current
@@ -434,8 +753,24 @@ pub fn protect_range(va: usize, len: usize, perm: MapPerm) {
 /// Back `len` bytes of fresh zeroed RW pages into the current cell and return
 /// the base VA (0 on empty request). A bump allocator over the anon region -
 /// the primitive the libc's malloc grows its heap with (docs/USERLAND.md M2).
+/// Returns 0 when the request is refused: an empty `len`, a `len` the cell's
+/// frame budget or the pool (less the kernel reserve) cannot cover, or a span
+/// that would run past the cell's user VA range. Refusing costs no frames
+/// (docs/ENGINEERING.md 13) - before this check, `SYS_MMAP(1 << 40)` from an
+/// unprivileged cell panicked the kernel with "frame pool exhausted".
 fn mmap_anon(cur: usize, len: usize) -> usize {
     if len == 0 {
+        return 0;
+    }
+    let pages = len.div_ceil(frames::FRAME_SIZE);
+    let base = unsafe { *core::ptr::addr_of!(MMAP_NEXT) };
+    let Some(top) = pages
+        .checked_mul(frames::FRAME_SIZE)
+        .and_then(|b| base.checked_add(b))
+    else {
+        return 0;
+    };
+    if !user_write_ok(base as u64, top - base) || !charge_frames(cur, pages) {
         return 0;
     }
     let cell = cells()[cur];
@@ -443,17 +778,23 @@ fn mmap_anon(cur: usize, len: usize) -> usize {
     // for the duration of the run, and adding not-present -> present leaf
     // entries to the active root is safe (re-activated below to publish them).
     let aspace = unsafe { &mut *(cell.aspace as *mut AddressSpace) };
-    let pages = len.div_ceil(frames::FRAME_SIZE);
-    let base = unsafe { *core::ptr::addr_of!(MMAP_NEXT) };
+    let mut got = 0;
     for i in 0..pages {
-        let pa = frames::alloc();
+        let Some(pa) = frames::alloc() else { break };
         aspace.map_user_frame(base + i * frames::FRAME_SIZE, pa, MapPerm::UserRw);
-    }
-    unsafe {
-        *core::ptr::addr_of_mut!(MMAP_NEXT) = base + pages * frames::FRAME_SIZE;
+        got += 1;
     }
     // Publish the new mappings on the active root (fence / tlbi / cr3 reload).
     aspace.activate();
+    if got < pages {
+        // Exhausted despite the reserve: roll the whole request back.
+        unmap_range(base, got * frames::FRAME_SIZE);
+        uncharge_frames(cur, pages - got);
+        return 0;
+    }
+    unsafe {
+        *core::ptr::addr_of_mut!(MMAP_NEXT) = top;
+    }
     base
 }
 
@@ -471,6 +812,11 @@ fn grant_create(cur: usize, out_va: u64, len: usize, kind: u64, _flags: u64) -> 
     if len == 0 || kind > 5 || kind == 4 {
         return u64::MAX; // empty / unknown kind / device-BAR (no backing)
     }
+    // Validate the out-parameter BEFORE minting anything: a refused call must
+    // consume no capability and no grant slot (docs/ENGINEERING.md 13).
+    let Some(out) = user_out::<GrantInfo>(out_va) else {
+        return u64::MAX;
+    };
     let bytes = page_up(len);
     let cell = cells()[cur];
     if cell.caps.is_null() || cell.objects.is_null() {
@@ -514,14 +860,81 @@ fn grant_create(cur: usize, out_va: u64, len: usize, kind: u64, _flags: u64) -> 
         sealed: false,
         cap_id,
     };
-    // SAFETY: `out_va` is a user VA in the running cell's active address space,
-    // sized for a `GrantInfo` (the cell passes its own stack slot).
+    // SAFETY: `out` was checked by `user_out` to be a non-null, `GrantInfo`-
+    // aligned address wholly inside this cell's user VA range, and the cell's
+    // address space is active for the duration of the trap.
     unsafe {
-        (out_va as *mut GrantInfo).write(GrantInfo {
+        out.write(GrantInfo {
             base: base as u64,
             cap_id: cap_id as u64,
         });
     }
+    0
+}
+
+/// `SYS_MUNMAP`: tear down `[va, va+len)` in the calling cell and return its
+/// frames, **only if the cell owns them**. Returns 0, or `u64::MAX` refused
+/// (nothing unmapped, nothing freed).
+///
+/// Three sets of frames reachable in a cell's address space are *not* its own,
+/// and freeing any of them is a cross-cell use-after-free plus a reachable
+/// "double free" kernel panic (docs/ENGINEERING.md 13):
+///
+///  - the **shared channel** ring, one region mapped RW into two cells
+///    (`nproc::spawn`, `load::map_channel_into`);
+///  - a **peer's shared sealed grant**, mapped RO by `SYS_GRANT_SHARE`, whose
+///    frames belong to the client that sealed them;
+///  - the cell's **own queue-pair region**, which the kernel still holds a raw
+///    `QueuePair` overlay onto.
+///
+/// So authority comes from the same place `SYS_COMMIT`/`DECOMMIT`/`SEAL` get it
+/// - [`grant_resolve`], i.e. a live MemoryGrant capability carrying MAP - for a
+/// typed grant, and from the cell's own bump regions otherwise. A peer's shared
+/// grant *does* have a slot in the peer's table, but its capability was minted
+/// READ-only, so `grant_resolve`'s MAP check refuses it: that is the existing
+/// pattern doing the work, extended rather than duplicated.
+fn sys_munmap(cur: usize, va: usize, len: usize) -> u64 {
+    if len == 0 {
+        return u64::MAX;
+    }
+    let base = va & !(frames::FRAME_SIZE - 1);
+    let Some(end) = va.checked_add(len) else {
+        return u64::MAX;
+    };
+
+    // (1) A typed memory grant of this cell, addressed by its reservation VA.
+    if base >= GRANT_BASE {
+        let slot = cell_grants(cur)
+            .iter()
+            .copied()
+            .find(|s| s.in_use && base >= s.base && end <= s.base + s.len);
+        let Some(slot) = slot else {
+            return u64::MAX; // no such reservation in this cell
+        };
+        if grant_resolve(cur, slot.cap_id).is_none() {
+            return u64::MAX; // revoked, exhausted, or (a peer's grant) no MAP
+        }
+        unmap_range(base, end - base);
+        // Releasing the whole reservation frees its slot, so a cell that churns
+        // typed grants does not leak the fixed per-cell slot table.
+        if base == slot.base {
+            release_grant_at(cur, base);
+        }
+        return 0;
+    }
+
+    // (2) The cell's own anonymous-mmap region, and (3) its file-mmap region -
+    // both bump allocators whose frames this cell alone holds. Everything else,
+    // notably the queue-pair region (16 GiB) and the shared channel slots
+    // (24 GiB), is refused.
+    let anon_top = unsafe { *core::ptr::addr_of!(MMAP_NEXT) };
+    let file_top = cells()[cur].filemmap_next;
+    let owned = (base >= MMAP_BASE && end <= anon_top)
+        || (base >= FILEMMAP_BASE && end <= file_top && FILEMMAP_BASE < file_top);
+    if !owned {
+        return u64::MAX;
+    }
+    unmap_range(base, end - base);
     0
 }
 
@@ -605,6 +1018,11 @@ fn grant_seal(cur: usize, cap_id: u32) -> u64 {
 /// 0 or `u64::MAX`.
 fn grant_share(cur: usize, cap_id: u32, out_va: u64) -> u64 {
     let peer = cur ^ 1;
+    // Validate the out-parameter before mapping anything into the peer: a
+    // refused call must leave both cells untouched (docs/ENGINEERING.md 13).
+    let Some(out) = user_out::<ShareInfo>(out_va) else {
+        return u64::MAX;
+    };
     let cell = cells()[cur];
     let peer_cell = cells()[peer];
     if cell.caps.is_null()
@@ -673,10 +1091,10 @@ fn grant_share(cur: usize, cap_id: u32, out_va: u64) -> u64 {
             cap_id: peer_cap,
         };
     }
-    // SAFETY: `out_va` is a user VA in the running (client) cell's active address
-    // space, sized for a `ShareInfo` (the cell passes its own stack slot).
+    // SAFETY: `out` was checked by `user_out` (non-null, aligned, inside the
+    // running client cell's user VA range); its address space is active.
     unsafe {
-        (out_va as *mut ShareInfo).write(ShareInfo {
+        out.write(ShareInfo {
             peer_va: peer_base as u64,
             peer_cap_id: peer_cap as u64,
         });
@@ -699,12 +1117,22 @@ fn mmap_file(cur: usize, fd: u64, offset: u64, len: usize) -> usize {
     };
     let bytes = page_up(len);
     let base = cells()[cur].filemmap_next;
-    cells()[cur].filemmap_next = base + bytes;
     let pages = bytes / frames::FRAME_SIZE;
-    with_current_aspace(|aspace| {
+    // `len` is cell-supplied here too: bound the span and charge the frames
+    // before mapping anything (docs/ENGINEERING.md 13).
+    let Some(top) = base.checked_add(bytes) else {
+        return 0;
+    };
+    if !user_write_ok(base as u64, bytes) || !charge_frames(cur, pages) {
+        return 0;
+    }
+    cells()[cur].filemmap_next = top;
+    let got = with_current_aspace(|aspace| {
+        let mut got = 0;
         for i in 0..pages {
             let va = base + i * frames::FRAME_SIZE;
-            let pa = frames::alloc(); // zeroed
+            let Some(pa) = frames::alloc() else { break };
+            got += 1;
             let file_off = offset as i64 + (i * frames::FRAME_SIZE) as i64;
             let want = (len - i * frames::FRAME_SIZE).min(frames::FRAME_SIZE);
             // Read into the frame through the kernel linear map (the frame is
@@ -716,7 +1144,13 @@ fn mmap_file(cur: usize, fd: u64, offset: u64, len: usize) -> usize {
             (ops.read)(fd, kva, want as u64);
             aspace.map_user_frame(va, pa, MapPerm::UserRo);
         }
+        got
     });
+    if got < pages {
+        unmap_range(base, got * frames::FRAME_SIZE);
+        uncharge_frames(cur, pages - got);
+        return 0;
+    }
     base
 }
 
@@ -739,6 +1173,12 @@ fn reserve_admit(
     if cell.caps.is_null() || cell.objects.is_null() {
         return 1; // no capability tables - treat as bad params
     }
+    // Validate the out-parameter before admitting anything: a refused call must
+    // not move the admission total (docs/ENGINEERING.md 13). A bad out-pointer
+    // is reported as BadParams (1) - it is exactly that.
+    let Some(out) = user_out::<ReserveInfo>(out_va) else {
+        return 1;
+    };
     // Advisory memory floor: the reservation is honored only if the pool can
     // currently cover it (QEMU has no bandwidth/IO backend, so CPU is the real
     // guarantee; the floor is a documented advisory check, not a hold).
@@ -781,10 +1221,10 @@ fn reserve_admit(
         cap_id,
     };
     let committed = cell_admission(cur).committed_ppm();
-    // SAFETY: `out_va` is a user VA in the running cell's active address space,
-    // sized for a `ReserveInfo` (the cell passes its own stack slot).
+    // SAFETY: `out` was checked by `user_out` (non-null, aligned, inside the
+    // running cell's user VA range); its address space is active.
     unsafe {
-        (out_va as *mut ReserveInfo).write(ReserveInfo {
+        out.write(ReserveInfo {
             handle: cap_id as u64,
             committed_ppm: committed,
         });
@@ -852,6 +1292,8 @@ pub unsafe fn install(
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
     };
     *cell_grants(idx) = [EMPTY_GRANT; MAX_GRANTS_PER_CELL];
+    // SAFETY: single CPU; a fresh cell starts with no frames charged.
+    unsafe { (*core::ptr::addr_of_mut!(CELL_FRAMES))[idx] = 0 };
     // Clean FP state, so the first cross-cell switch into this cell restores an
     // ABI-default FPU rather than a zeroed area (docs/LIBRHEO.md).
     // SAFETY: `cell_fp(idx)` is a valid, aligned `FP_AREA_LEN` area.
@@ -1052,6 +1494,8 @@ pub unsafe fn install_spawned(
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
     };
     *cell_grants(idx) = [EMPTY_GRANT; MAX_GRANTS_PER_CELL];
+    // SAFETY: single CPU; a fresh cell starts with no frames charged.
+    unsafe { (*core::ptr::addr_of_mut!(CELL_FRAMES))[idx] = 0 };
     // Clean FP state for the spawned child's first entry (see `install`).
     // SAFETY: `cell_fp(idx)` is a valid, aligned `FP_AREA_LEN` area.
     unsafe { arch::fp_area_init(cell_fp(idx)) };
@@ -1110,9 +1554,13 @@ pub unsafe fn install_forked(
 }
 
 /// Free cell slot `idx` (a reaped zombie). The slot becomes reusable by a
-/// future `fork`.
+/// future `fork`. Its frame charge is cleared: the reaper has already returned
+/// the frames (`AddressSpace::free_user_frames`), which bypasses the per-cell
+/// accounting because the cell is gone.
 pub fn free_cell(idx: usize) {
     cells()[idx] = EMPTY;
+    // SAFETY: single CPU, synchronous traps.
+    unsafe { (*core::ptr::addr_of_mut!(CELL_FRAMES))[idx] = 0 };
 }
 
 /// The trap dispatcher, called from each arch's U-mode trampoline. Returns
@@ -1181,19 +1629,22 @@ pub fn on_user_trap(
         }
         SYS_QUEUE_INFO => {
             let cell = cells()[cur];
-            let ret = if cell.qp_va == 0 {
-                u64::MAX
-            } else {
-                // SAFETY: `arg` is a user VA in the running cell's active
-                // address space, sized for a `QueueInfo` (16 bytes); the cell
-                // passes the address of its own stack slot.
-                unsafe {
-                    (arg as *mut QueueInfo).write(QueueInfo {
-                        qp_va: cell.qp_va,
-                        cap_id: cell.qp_cap_id as u64,
-                    });
+            let ret = match (cell.qp_va, user_out::<QueueInfo>(arg)) {
+                // SAFETY: `out` was checked by `user_out` (non-null, aligned,
+                // inside the running cell's user VA range) and the cell's
+                // address space is active for the trap.
+                (qp_va, Some(out)) if qp_va != 0 => {
+                    unsafe {
+                        out.write(QueueInfo {
+                            qp_va,
+                            cap_id: cell.qp_cap_id as u64,
+                        });
+                    }
+                    0
                 }
-                0
+                // No mapped queue, or a rejected out-parameter: refuse without
+                // writing (docs/ENGINEERING.md 13).
+                _ => u64::MAX,
             };
             arch::set_syscall_ret(unsafe { &mut *frame }, ret);
             frame
@@ -1211,21 +1662,22 @@ pub fn on_user_trap(
             } else {
                 EMPTY_CHAN
             };
-            let ret = if end.va == 0 {
-                u64::MAX
-            } else {
-                // SAFETY: `arg` is a user VA in the running cell's active address
-                // space, sized for a `ChannelInfo` (32 bytes); the cell passes
-                // its own stack slot.
-                unsafe {
-                    (arg as *mut ChannelInfo).write(ChannelInfo {
-                        chan_va: end.va,
-                        cap_id: end.cap_id as u64,
-                        role: end.role,
-                        count: cell_chan_count(cur) as u64,
-                    });
+            let ret = match user_out::<ChannelInfo>(arg) {
+                // SAFETY: `out` was checked by `user_out`; the cell's address
+                // space is active for the trap.
+                Some(out) if end.va != 0 => {
+                    unsafe {
+                        out.write(ChannelInfo {
+                            chan_va: end.va,
+                            cap_id: end.cap_id as u64,
+                            role: end.role,
+                            count: cell_chan_count(cur) as u64,
+                        });
+                    }
+                    0
                 }
-                0
+                // No such channel end, or a rejected out-parameter.
+                _ => u64::MAX,
             };
             arch::set_syscall_ret(unsafe { &mut *frame }, ret);
             frame
@@ -1324,14 +1776,11 @@ pub fn on_user_trap(
             arch::set_syscall_ret(unsafe { &mut *frame }, r);
             frame
         }
+        // Ownership-checked teardown: only frames the cell holds through a live
+        // MemoryGrant capability or its own bump regions (docs/ENGINEERING.md 13).
         SYS_MUNMAP => {
-            unmap_range(args[0] as usize, args[1] as usize);
-            // Release any grant slot whose reservation this munmap tore down,
-            // so a cell that allocates and drops many typed grants (e.g. a
-            // tile program churning TileBufs) does not leak the fixed
-            // per-cell slot table. Frames were already returned above.
-            release_grant_at(cur, args[0] as usize);
-            arch::set_syscall_ret(unsafe { &mut *frame }, 0);
+            let r = sys_munmap(cur, args[0] as usize, args[1] as usize);
+            arch::set_syscall_ret(unsafe { &mut *frame }, r);
             frame
         }
         SYS_MMAP_FILE => {

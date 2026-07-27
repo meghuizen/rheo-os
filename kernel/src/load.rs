@@ -38,7 +38,7 @@ pub fn map_queue(aspace: &mut AddressSpace) -> QueuePair {
     let pages = QueuePair::REGION_SIZE / FRAME_SIZE;
     let mut first_pa = 0usize;
     for i in 0..pages {
-        let pa = frames::alloc(); // zeroed
+        let pa = frames::alloc().expect("queue-pair region (bounded, at load)"); // zeroed
         if i == 0 {
             first_pa = pa;
         }
@@ -75,7 +75,7 @@ pub const CHANNEL_PAGES: usize = QueuePair::REGION_SIZE / FRAME_SIZE;
 pub fn alloc_channel() -> [usize; CHANNEL_PAGES] {
     let mut framelist = [0usize; CHANNEL_PAGES];
     for (i, slot) in framelist.iter_mut().enumerate() {
-        let pa = frames::alloc(); // zeroed
+        let pa = frames::alloc().expect("channel region (bounded, at load)"); // zeroed
         *slot = pa;
         if i == 0 {
             // SAFETY: `pa` is a freshly allocated frame reached through the
@@ -344,7 +344,7 @@ fn stream_segment(
     let perm = seg_perm(seg.flags);
     let mut va = va0;
     while va < mem_end {
-        let pa = frames::alloc(); // zeroed (bss/zero-fill already done)
+        let pa = frames::alloc().expect("ELF segment page (bounded by the image, at load)"); // zeroed (bss/zero-fill already done)
         let copy_lo = va.max(vaddr);
         let copy_hi = (va + FRAME_SIZE).min(vaddr + seg.filesz);
         if copy_lo < copy_hi {
@@ -391,7 +391,7 @@ pub fn setup_stack(aspace: &mut AddressSpace, args: &[&[u8]], envs: &[&[u8]]) ->
     let mut top_pa = 0usize;
     let mut va = USER_STACK_TOP - USER_STACK_PAGES * FRAME_SIZE;
     while va < USER_STACK_TOP {
-        let pa = frames::alloc();
+        let pa = frames::alloc().expect("initial stack page (bounded, at load)");
         aspace.map_user_frame(va, pa, MapPerm::UserRw);
         if va == USER_STACK_TOP - FRAME_SIZE {
             top_pa = pa;
@@ -482,7 +482,7 @@ fn map_segment(aspace: &mut AddressSpace, image: &[u8], seg: &Segment, bias: usi
 
     let mut va = va0;
     while va < mem_end {
-        let pa = frames::alloc(); // zeroed, so bss/zero-fill is already done
+        let pa = frames::alloc().expect("ELF segment page (bounded by the image, at load)"); // zeroed, so bss/zero-fill is already done
         // Copy the file bytes of this segment that fall in [va, va+FRAME_SIZE).
         let copy_lo = va.max(vaddr);
         let copy_hi = (va + FRAME_SIZE).min(vaddr + seg.filesz);

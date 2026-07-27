@@ -173,7 +173,7 @@ const _: () = assert!(core::mem::size_of::<VirtQueue>() <= 4096);
 /// linear map). `frames::alloc` zeroes the frame, so an overlaid `VirtQueue`
 /// starts all-zero (empty rings).
 fn alloc_frame_va() -> usize {
-    arch::phys_to_virt(crate::mm::frames::alloc())
+    arch::phys_to_virt(crate::mm::frames::alloc().expect("virtio-net ring (boot, reserve held)"))
 }
 
 unsafe fn r32(base: usize, off: usize) -> u32 {
@@ -873,14 +873,16 @@ pub fn mac_addr() -> Option<[u8; 6]> {
 /// `(STATUS_OK, 6)`.
 ///
 /// # Safety
-/// `buf_va` is the calling cell's mapped buffer; called only during its trap.
+/// `buf_va` must have been validated as 6 writable bytes in the calling cell
+/// (`queue::run_opcode` does this) and this must run during that cell's trap.
 pub fn mac(buf_va: u64) -> (u32, u32) {
     use crate::queue::{STATUS_IO, STATUS_OK};
     let Some(dev) = net_mut() else {
         return (STATUS_IO, 0);
     };
     let m = dev.mac();
-    // SAFETY: the cell passes a VA of at least 6 writable bytes in its memory.
+    // SAFETY: `buf_va` was range-checked for 6 writable bytes in this cell by
+    // the caller (`queue::run_opcode`), whose address space is active.
     unsafe {
         let dst = buf_va as *mut u8;
         for (i, &b) in m.iter().enumerate() {

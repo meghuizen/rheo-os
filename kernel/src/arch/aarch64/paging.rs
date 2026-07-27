@@ -77,7 +77,7 @@ fn l3_index(va: usize) -> usize {
 /// 2 MiB slot is pre-built as a level-3 table; the loader adds program/stack
 /// pages on demand via `paging_map_frame`.
 pub fn paging_new_root() -> PagingRoot {
-    let l0_pa = frames::alloc();
+    let l0_pa = frames::alloc().expect("root page table (boot, reserve held)");
     let l0 = table_mut(l0_pa);
     let slot = user_window_base() & !(MIB2 - 1);
     let l1 = table_mut(ensure_table(l0, l0_index(slot)));
@@ -112,7 +112,7 @@ pub fn paging_map(root: &mut PagingRoot, va: usize, perm: MapPerm) {
 /// (a table descriptor) if the slot is not yet valid.
 fn ensure_table(parent: &mut [u64; 512], idx: usize) -> usize {
     if parent[idx] & VALID == 0 {
-        let t = frames::alloc(); // zeroed
+        let t = frames::alloc().expect("page table (user reserve held)"); // zeroed
         parent[idx] = addr_bits(t) | TABLE | VALID;
     }
     next_table(parent[idx])

@@ -87,7 +87,8 @@ impl AddressSpace {
     pub fn fork_from(&self, asid: u16) -> AddressSpace {
         let mut child = AddressSpace::new(asid);
         arch::paging_for_each_user_leaf(&self.root, &mut |va, src_pa, perm| {
-            let dst_pa = frames::alloc();
+            let dst_pa =
+                frames::alloc().expect("fork page copy (bounded by the parent's charged frames)");
             // SAFETY: both frames are 4 KiB, reached through the kernel linear
             // map (identity on x86/riscv; the high map on aarch64); `dst_pa` is
             // freshly allocated and disjoint from `src_pa`.
@@ -162,7 +163,10 @@ impl AddressSpace {
     /// matters and are freed here.
     pub fn free_user_frames(&self) {
         arch::paging_for_each_user_leaf(&self.root, &mut |_va, pa, _perm| {
-            frames::free(pa);
+            // `free_if_pool`, not `free`: a cell root can legitimately reference
+            // a page this allocator does not own (the shared `.user` window is
+            // part of the kernel image), and `free` would panic on it.
+            frames::free_if_pool(pa);
         });
     }
 }

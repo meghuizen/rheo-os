@@ -59,7 +59,7 @@ pub fn setup_stack(
     let mut top_pa = 0usize;
     let mut va = USER_STACK_TOP - LINUX_STACK_PAGES * FRAME_SIZE;
     while va < USER_STACK_TOP {
-        let pa = frames::alloc();
+        let pa = frames::alloc().expect("initial process stack (bounded, at load)");
         aspace.map_user_frame(va, pa, MapPerm::UserRw);
         if va == USER_STACK_TOP - FRAME_SIZE {
             top_pa = pa;
@@ -73,7 +73,7 @@ pub fn setup_stack(
     // sa_restorer and returns an empty code slice, so nothing is mapped.
     let tramp = arch::sig_tramp_code();
     if !tramp.is_empty() {
-        let pa = frames::alloc();
+        let pa = frames::alloc().expect("initial process stack (bounded, at load)");
         aspace.map_user_frame(arch::SIGTRAMP_VA, pa, MapPerm::UserRx);
         // SAFETY: freshly allocated frame; written through the kernel linear map
         // within `tramp.len()` bytes (« FRAME_SIZE).

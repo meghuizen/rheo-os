@@ -88,7 +88,7 @@ fn table_mut(pa: usize) -> &'static mut [u64; 512] {
 /// superpages with the one `.user` slot delegated to a level-0 table where user
 /// pages carry the U bit.
 pub fn paging_new_root() -> PagingRoot {
-    let l2_pa = frames::alloc();
+    let l2_pa = frames::alloc().expect("root page table (boot, reserve held)");
     let l2 = table_mut(l2_pa);
 
     // High MMIO gigapage (0..1 GiB), supervisor R|W.
@@ -97,7 +97,7 @@ pub fn paging_new_root() -> PagingRoot {
 
     // High kernel RAM (2..3 GiB): level-1 table of 2 MiB supervisor superpages,
     // with the `.user` slot delegated to a per-cell level-0 table.
-    let l1_pa = frames::alloc();
+    let l1_pa = frames::alloc().expect("page table (boot, reserve held)");
     let l1 = table_mut(l1_pa);
     let user_slot_va = user_window_base() & !(MIB2 - 1);
     for (i, entry) in l1.iter_mut().enumerate() {
@@ -106,7 +106,7 @@ pub fn paging_new_root() -> PagingRoot {
         if va == user_slot_va {
             // Delegate this 2 MiB slot to a per-cell level-0 table; user pages
             // are added later by paging_map. Empty for now.
-            let l0_pa = frames::alloc();
+            let l0_pa = frames::alloc().expect("page table (boot, reserve held)");
             *entry = table_to_pte(l0_pa, PTE_V); // pointer PTE (no R/W/X)
         } else {
             *entry = table_to_pte(pa, PTE_V | PTE_R | PTE_W | PTE_X | PTE_G | PTE_A | PTE_D);
@@ -150,7 +150,7 @@ pub fn paging_map(root: &mut PagingRoot, va: usize, perm: MapPerm) {
 /// (a pointer PTE, no R/W/X) if the slot is not yet valid.
 fn ensure_table(parent: &mut [u64; 512], idx: usize) -> usize {
     if parent[idx] & PTE_V == 0 {
-        let t = frames::alloc(); // zeroed
+        let t = frames::alloc().expect("page table (user reserve held)"); // zeroed
         parent[idx] = table_to_pte(t, PTE_V);
     }
     pte_to_table(parent[idx])

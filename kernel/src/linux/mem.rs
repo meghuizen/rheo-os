@@ -9,7 +9,7 @@
 use crate::arch::{self, MapPerm};
 use crate::linux::LinuxState;
 use crate::linux::errno::*;
-use crate::mm::frames::{self, FRAME_SIZE};
+use crate::mm::frames::FRAME_SIZE;
 use crate::user;
 
 // mmap prot bits.
@@ -59,7 +59,12 @@ pub fn brk(st: &mut LinuxState, addr: u64) -> u64 {
     }
     let new = page_up(addr);
     if new > st.brk_cur {
-        user::map_anon_at(st.brk_cur, new - st.brk_cur, MapPerm::UserRw);
+        // A refused grow leaves the break where it was: glibc treats the
+        // returned break as authoritative and falls back to mmap
+        // (docs/ENGINEERING.md 13).
+        if !user::map_anon_at(st.brk_cur, new - st.brk_cur, MapPerm::UserRw) {
+            return st.brk_cur as u64;
+        }
     } else if new < st.brk_cur {
         user::unmap_range(new, st.brk_cur - new);
     }
@@ -117,8 +122,8 @@ pub fn mmap(
         if fixed {
             user::unmap_range(base, bytes);
         }
-        if prot & PROT_ANY != 0 {
-            user::map_anon_at(base, bytes, perm_from_prot(prot));
+        if prot & PROT_ANY != 0 && !user::map_anon_at(base, bytes, perm_from_prot(prot)) {
+            return -ENOMEM;
         }
         // PROT_NONE: leave it a bare reservation (no frames).
     } else {
@@ -126,7 +131,9 @@ pub fn mmap(
         if fd < 0 {
             return -EBADF;
         }
-        map_file(st, base, bytes, prot, fd, offset as i64);
+        if !map_file(st, base, bytes, prot, fd, offset as i64) {
+            return -ENOMEM;
+        }
     }
     base as i64
 }
@@ -136,18 +143,26 @@ pub fn mmap(
 /// read the file range for that page into it through the kernel linear map, and
 /// map it with `perm`. A short read (EOF) leaves the page tail zero
 /// (docs/LINUX-COMPAT.md L7).
-fn map_file(st: &mut LinuxState, base: usize, bytes: usize, prot: u64, fd: i64, offset: i64) {
+fn map_file(
+    st: &mut LinuxState,
+    base: usize,
+    bytes: usize,
+    prot: u64,
+    fd: i64,
+    offset: i64,
+) -> bool {
     let perm = perm_from_prot(prot);
     let pages = bytes / FRAME_SIZE;
     for i in 0..pages {
         let va = base + i * FRAME_SIZE;
-        // Reclaim any existing page at this VA (MAP_FIXED replaces it).
-        user::with_current_aspace(|aspace| {
-            if let Some(old) = aspace.unmap(va) {
-                frames::free(old);
-            }
-        });
-        let pa = frames::alloc(); // zeroed
+        // Reclaim any existing page at this VA (MAP_FIXED replaces it); this
+        // also uncharges it, and refuses a VA outside the cell's user range.
+        user::unmap_range(va, FRAME_SIZE);
+        // A file mapping is charged to the cell like an anonymous one; a
+        // refusal maps nothing further (docs/ENGINEERING.md 13).
+        let Some(pa) = user::alloc_user_frame() else {
+            return false;
+        };
         let file_off = offset + (i * FRAME_SIZE) as i64;
         // Read into the frame via the kernel high linear map (valid under any
         // active cell root; the VFS handler runs in kernel context). The frame
@@ -158,6 +173,7 @@ fn map_file(st: &mut LinuxState, base: usize, bytes: usize, prot: u64, fd: i64, 
             aspace.map_user_frame(va, pa, perm);
         });
     }
+    true
 }
 
 /// mremap(old_addr, old_size, new_size, flags, new_addr): resize a mapping.
@@ -185,7 +201,9 @@ pub fn mremap(st: &mut LinuxState, old_addr: u64, old_size: u64, new_size: u64, 
         return -ENOMEM;
     }
     let base = st.mmap_cursor;
-    user::map_anon_at(base, new_len, MapPerm::UserRw);
+    if !user::map_anon_at(base, new_len, MapPerm::UserRw) {
+        return -ENOMEM;
+    }
     st.mmap_cursor = base + new_len;
     // Copy the old contents; both ranges are mapped in the active cell root.
     // SAFETY: trap context, cell address space active; `old_len` bytes of the
@@ -211,7 +229,9 @@ pub fn mprotect(addr: u64, len: u64, prot: u64) -> i64 {
     if prot & PROT_ANY == 0 {
         user::unmap_range(addr as usize, len as usize);
     } else {
-        user::commit_range(addr as usize, len as usize, perm_from_prot(prot));
+        if !user::commit_range(addr as usize, len as usize, perm_from_prot(prot)) {
+            return -ENOMEM;
+        }
     }
     0
 }

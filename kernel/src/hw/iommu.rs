@@ -93,7 +93,7 @@ fn w64(va: usize, off: usize, v: u64) {
 
 /// Allocate a zeroed 4 KiB table frame; returns its physical address.
 fn table_frame() -> usize {
-    let pa = frames::alloc();
+    let pa = frames::alloc().expect("VT-d table (boot, reserve held)");
     let va = arch::phys_to_virt(pa);
     // SAFETY: a fresh frame, reachable through the linear map.
     unsafe { core::ptr::write_bytes(va as *mut u8, 0, frames::FRAME_SIZE) };

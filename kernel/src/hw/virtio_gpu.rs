@@ -235,7 +235,7 @@ impl GpuReport {
 /// Allocate one zeroed frame-pool frame and return its kernel VA (high-half
 /// linear map).
 fn alloc_frame_va() -> usize {
-    arch::phys_to_virt(crate::mm::frames::alloc())
+    arch::phys_to_virt(crate::mm::frames::alloc().expect("virtio-gpu ring (boot, reserve held)"))
 }
 
 unsafe fn r32(base: usize, off: usize) -> u32 {
@@ -853,7 +853,8 @@ pub fn present(buf_va: u64, w: u32, h: u32) -> (u32, u32) {
     };
     let len = (w as usize).saturating_mul(h as usize).saturating_mul(4);
     let n = len.min(FB_BYTES);
-    // SAFETY: the cell passes a VA of `len` readable bytes in its own memory.
+    // SAFETY: `buf_va` was range-checked for `len` readable bytes in the calling
+    // cell by `queue::run_opcode`, whose address space is active; `n <= len`.
     if unsafe { dev.present_frame(buf_va, n) } {
         (STATUS_OK, n as u32)
     } else {
