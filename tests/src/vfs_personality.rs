@@ -183,6 +183,7 @@ fn write_stat(statbuf_va: u64, m: &posix::Metadata) {
     let st = Stat {
         size: m.len,
         kind: kind_code(m.kind),
+        ino: m.node,
     };
     unsafe {
         (statbuf_va as *mut Stat).write(st);
@@ -213,6 +214,7 @@ fn p_fstat(fd: u64, statbuf_va: u64) -> i64 {
                 kind: FileType::Other,
                 len: 0,
                 mode: 0,
+                node: 0,
             },
         );
         return 0;

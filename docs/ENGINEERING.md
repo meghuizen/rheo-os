@@ -599,6 +599,24 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   it replaces. The fix loops in `Ext4Fs::read_at`. It surfaced only because the disk
   `execve` exercised the non-looping caller; a proof that runs the real caller, not just
   the convenient facade, is what caught it.
+- **A field left constant is a field that lies, and the lie can be invisible until a
+  second instance exists.** The `stat`/`fstat` block reported `st_ino = 1` (and
+  `st_dev = 0`) for **every** file, because the kernel/VFS bridge (`abi::Stat { size,
+  kind }`) carried no inode at all - the VFS `NodeId` was dropped. Every single-file
+  proof passed: a lone file's inode is never *compared* against another's. But glibc's
+  `ld.so` dedups shared libraries by `(st_dev, st_ino)`, so the first multi-library
+  dynamic binary (`dmath`, linking libm as well as libc) broke - ld.so opened libc,
+  `fstat`'d it, saw the same `(0, 1)` it had recorded for the already-loaded libm,
+  concluded "libc.so.6 is already loaded" (as libm), never mapped real libc, and then
+  failed `version 'GLIBC_2.34' not found` searching libm for a libc version. The
+  single-library `dhello` had proven "dynamic linking works" for a year without ever
+  exercising the collision. The lesson: a synthesized identity field (inode, pid, dev)
+  that is *hardcoded to a constant* is not "unimplemented, harmless" - it is a wrong
+  answer waiting for the first consumer that compares two of them, and the proof that
+  finds it must use **two distinct instances** (here two libraries), never one. The fix
+  plumbs the real `NodeId` from `posix::Metadata` through a widened `abi::Stat.ino` into
+  every Linux `st_ino`/`stx_ino`; the `linuxdyn` multi-library phase is the two-instance
+  proof, verified failing when the inode is reverted to a constant.
 
 ## 12. Never dereference an address the caller chose
 

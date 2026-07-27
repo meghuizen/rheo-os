@@ -1238,15 +1238,31 @@ fn sys_newfstatat(st: &mut LinuxState, args: &[u64; 6]) -> i64 {
     let Some(o) = crate::svc::file_ops() else {
         return -errno::ENOENT;
     };
-    let mut native = crate::abi::Stat { size: 0, kind: 0 };
+    let mut native = crate::abi::Stat {
+        size: 0,
+        kind: 0,
+        ino: 0,
+    };
     let r = (o.stat)(args[1], path_len as u64, &mut native as *mut _ as u64);
     if r < 0 {
         return r;
     }
     let mode = dirent::mode_for_kind(native.kind);
     let blocks = native.size.div_ceil(512);
-    let stat =
-        crate::arch::linux_abi::Stat::new(mode, native.size, 1, 1, 1000, 1000, 0, 4096, blocks, 0);
+    // `native.ino` is the VFS inode - distinct per file, which ld.so needs to tell
+    // two libraries apart (docs/LINUX-COMPAT.md).
+    let stat = crate::arch::linux_abi::Stat::new(
+        mode,
+        native.size,
+        native.ino,
+        1,
+        1000,
+        1000,
+        0,
+        4096,
+        blocks,
+        0,
+    );
     // SAFETY: statbuf is a writable VA in the calling cell.
     unsafe { (args[2] as *mut crate::arch::linux_abi::Stat).write(stat) };
     0
@@ -1301,7 +1317,7 @@ fn sys_statx(st: &mut LinuxState, args: &[u64; 6]) -> i64 {
     const AT_EMPTY_PATH: u64 = 0x1000;
     const STATX_BASIC_STATS: u32 = 0x0000_07ff;
     let path_len = strlen(args[1]);
-    let (mode, size) = if path_len == 0 && args[2] & AT_EMPTY_PATH != 0 {
+    let (mode, size, ino) = if path_len == 0 && args[2] & AT_EMPTY_PATH != 0 {
         match st.fds.mode_size(dirfd(args[0])) {
             Ok(v) => v,
             Err(e) => return e,
@@ -1310,12 +1326,16 @@ fn sys_statx(st: &mut LinuxState, args: &[u64; 6]) -> i64 {
         let Some(o) = crate::svc::file_ops() else {
             return -errno::ENOENT;
         };
-        let mut native = crate::abi::Stat { size: 0, kind: 0 };
+        let mut native = crate::abi::Stat {
+            size: 0,
+            kind: 0,
+            ino: 0,
+        };
         let r = (o.stat)(args[1], path_len as u64, &mut native as *mut _ as u64);
         if r < 0 {
             return r;
         }
-        (dirent::mode_for_kind(native.kind), native.size)
+        (dirent::mode_for_kind(native.kind), native.size, native.ino)
     };
     let stx = Statx {
         stx_mask: STATX_BASIC_STATS,
@@ -1324,7 +1344,7 @@ fn sys_statx(st: &mut LinuxState, args: &[u64; 6]) -> i64 {
         stx_uid: 1000,
         stx_gid: 1000,
         stx_mode: mode as u16,
-        stx_ino: 1,
+        stx_ino: ino,
         stx_size: size,
         stx_blocks: size.div_ceil(512),
         ..Default::default()
@@ -1370,7 +1390,11 @@ fn sys_faccessat(path_va: u64) -> i64 {
     let Some(o) = crate::svc::file_ops() else {
         return -errno::ENOENT;
     };
-    let mut native = crate::abi::Stat { size: 0, kind: 0 };
+    let mut native = crate::abi::Stat {
+        size: 0,
+        kind: 0,
+        ino: 0,
+    };
     let r = (o.stat)(
         path_va,
         strlen(path_va) as u64,

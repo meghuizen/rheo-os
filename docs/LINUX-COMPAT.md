@@ -658,23 +658,26 @@ fixup path.
     `libc.so.6` all stream off the disk on demand (447-590 block-cache fills per
     ISA, exact stdout + exit 12, all three ISAs), none resident whole. That is the
     shell-launches-a-dynamic-binary-off-disk shape the real target needs.
-  - **Open finding - multi-library resolution (GOAL-DYN-MULTILIB, task #169).**
-    Every proof above links exactly **one** shared library (`libc`). A binary that
-    links a **second** (`dmath`: a C `sqrt` program, so `libc` + `libm`) fails at
-    runtime: ld.so prints `libm.so.6: version 'GLIBC_2.34' not found (required by
-    dmath)` and `GLIBC_PRIVATE not found (required by libm.so.6)` - **even though**
-    the seeded `libc.so.6` demonstrably exports `GLIBC_2.34`/`GLIBC_PRIVATE`
-    (`readelf -V`) and the single-lib `dhello`, which also needs `GLIBC_2.34`,
-    resolves it against that same `libc`. So this is **not** a missing-version
-    fixture skew - ld.so's cross-object version resolution misbehaves once more
-    than one `DT_NEEDED` library is mapped (the error even names `libm` while
-    looking up a `libc`-provided version). ld.so *itself* runs and version-checks
-    correctly (the check firing is the linker working); the defect is in what the
-    personality gives it to resolve against for the 2nd file-backed library - the
-    next investigation (likely mmap ordering / the demand-paged file-backed read
-    of the 2nd `.so`, or the `DT_NEEDED` search list). A production binary links a
-    dozen libraries, so this gates the real target. `MAX_MAPPED_FILES` is already
-    raised to **64** for it.
+  - **Multi-library resolution is done** (GOAL-DYN-MULTILIB, task #169). A binary
+    that links a **second** shared library (`dmath`: a C `sqrt` program, so `libc`
+    + `libm`) now runs - `linuxdyn`'s multi-library phase asserts `dmath: sqrt16=4`
+    + exit 4 on all three ISAs. The defect was **not** in ld.so or in version
+    resolution: it was the `stat`/`fstat` block reporting `st_ino = 1` and
+    `st_dev = 0` for **every** file, because the kernel↔VFS bridge (`abi::Stat`)
+    carried no inode - the VFS `NodeId` was dropped. glibc's `ld.so` dedups shared
+    objects by `(st_dev, st_ino)`, so after mapping `libm` it opened `libc`,
+    `fstat`'d it, saw the same `(0, 1)`, concluded "libc.so.6 is already loaded"
+    (as the libm map), never mapped real `libc`, and then failed
+    `version 'GLIBC_2.34' not found` searching `libm` for a `libc` version - which
+    is exactly why the error named `libm` while looking up a `libc`-provided
+    version. Single-library `dhello` never hit it: one file's inode is never
+    *compared* against another's. The fix plumbs the real `NodeId` from
+    `posix::Metadata` through a widened `abi::Stat.ino` into every Linux
+    `st_ino`/`stx_ino` (`fstat`/`newfstatat`/`statx`); `st_dev` stays constant, so
+    distinct inodes are sufficient for the dedup. Recorded as a scar in
+    docs/ENGINEERING.md 11 ("a field left constant is a field that lies").
+    `MAX_MAPPED_FILES` was raised to **64** alongside it, for the dozen-library
+    shape a production binary has.
   - Accommodations, disclosed: a dynamic **Rust** `std` hello is additionally
     skewed (rustc's bundled std targets a newer glibc than the cross sysroot), so
     a version-consistent multi-lib fixture uses cross-gcc-built C. **MAP_SHARED of
@@ -975,13 +978,17 @@ socketpair+fork + bind/listen/connect/accept over AF_UNIX) and `inet.c` (the
 `linuxinet` proof - TCP + UDP + epoll over 127.0.0.1 and TCP over ::1, the
 loopback AF_INET/AF_INET6 surface).
 
-The **L7 dynamic fixture** (`tests/linux-fixtures/dhello.c`, the `linuxdyn`
-proof) is the one binary built **dynamically** - stock ET_DYN/PIE, no
-`-static`/`-no-pie` (gcc's default) - so its `PT_INTERP` names the real
-`ld-linux`. Its runtime dependencies (the dynamic linker + `libc.so.6`) are
-**not built** but **copied from the cross toolchain** at build time by xtask
-`build_dyn_fixture` into the gitignored fixture build dir (never committed), and
-the `linuxdyn` test seeds them into a ramfs `/lib` so ld.so resolves them:
+The **L7 dynamic fixtures** (`tests/linux-fixtures/dhello.c` + `dmath.c`, the
+`linuxdyn` proof) are built **dynamically** - stock ET_DYN/PIE, no
+`-static`/`-no-pie` (gcc's default) - so their `PT_INTERP` names the real
+`ld-linux`. `dhello` links only `libc`; `dmath` (a `sqrt` program built
+`-fno-builtin -lm`) links `libm` **as well**, so ld.so must load two shared
+libraries and resolve one's versions against the other (the multi-library case,
+GOAL-DYN-MULTILIB). Their runtime dependencies (the dynamic linker + `libc.so.6`
++ `libm.so.6`) are **not built** but **copied from the cross toolchain** at build
+time by xtask `build_dyn_fixture` into the gitignored fixture build dir (never
+committed), and the `linuxdyn` test seeds them into a ramfs `/lib` so ld.so
+resolves them:
 
 | ISA | dynamic C (gcc, PIE) | ld.so source (interp path) | libc.so.6 source |
 |---|---|---|---|
@@ -991,8 +998,11 @@ the `linuxdyn` test seeds them into a ramfs `/lib` so ld.so resolves them:
 
 If a runtime `.so` is missing for an ISA, that ISA's dynamic fixture is
 **skipped-with-reason** (a 1-byte placeholder is written; `linuxdyn` detects it
-and skips), keeping the static L2-L6 coverage. All three toolchains are present
-in the build/CI environment here, so **all three ISAs genuinely pass**. Note:
+and skips), keeping the static L2-L6 coverage. `libm.so.6` (beside `libc.so.6`
+in the same sysroot lib dir) gates only the **multi-library** phase the same way:
+missing → that phase skips, single-library coverage stays. All three toolchains
+are present in the build/CI environment here, so **all three ISAs genuinely
+pass**. Note:
 `rsh` (below) is a purpose-built shell, not dash/busybox - a full shell
 cross-build for three ISAs was out of budget; `rsh` is honest about what it
 exercises (the L6 process

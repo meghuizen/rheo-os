@@ -108,6 +108,7 @@ impl FileSystem for Ext4Fs {
             kind: map_type(m.file_type()),
             len: m.len(),
             mode: m.mode() & 0x0FFF,
+            node,
         })
     }
 

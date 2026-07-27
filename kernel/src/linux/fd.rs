@@ -999,14 +999,32 @@ impl FdTable {
                 };
                 // FileOps writes the native abi::Stat into a kernel temp
                 // (identity-mapped, writable there); convert to the Linux ABI.
-                let mut native = crate::abi::Stat { size: 0, kind: 0 };
+                let mut native = crate::abi::Stat {
+                    size: 0,
+                    kind: 0,
+                    ino: 0,
+                };
                 let r = (o.fstat)(vfs_fd as u64, &mut native as *mut _ as u64);
                 if r < 0 {
                     return r;
                 }
                 let mode = dirent::mode_for_kind(native.kind);
                 let blocks = native.size.div_ceil(512);
-                Stat::new(mode, native.size, 1, 1, 1000, 1000, 0, 4096, blocks, 0)
+                // `native.ino` is the VFS inode - distinct per file, which glibc's
+                // ld.so requires to tell two shared libraries apart (a shared inode
+                // makes it treat the second as already-loaded; docs/LINUX-COMPAT.md).
+                Stat::new(
+                    mode,
+                    native.size,
+                    native.ino,
+                    1,
+                    1000,
+                    1000,
+                    0,
+                    4096,
+                    blocks,
+                    0,
+                )
             }
         };
         let Some(out) = crate::user::user_out::<Stat>(statbuf_va) else {
@@ -1018,20 +1036,21 @@ impl FdTable {
         0
     }
 
-    /// The `(st_mode, size)` a `fstat`/`statx` would report for `fd`, without
+    /// The `(st_mode, size, ino)` a `fstat`/`statx` would report for `fd`, without
     /// writing a `struct stat`. Used by `statx` (docs/LINUX-COMPAT.md L3), which
-    /// has its own ABI-independent buffer layout.
-    pub fn mode_size(&mut self, fd: i64) -> Result<(u32, u64), i64> {
+    /// has its own ABI-independent buffer layout. `ino` is the VFS inode for a real
+    /// file (distinct per file, so statx agrees with fstat), 0 for anonymous fds.
+    pub fn mode_size(&mut self, fd: i64) -> Result<(u32, u64, u64), i64> {
         let Some(slot) = usize_fd(fd) else {
             return Err(-EBADF);
         };
         match self.fds[slot] {
             FdKind::Closed => Err(-EBADF),
             FdKind::Console(_) | FdKind::Null | FdKind::Zero | FdKind::Urandom => {
-                Ok((dirent::S_IFCHR | 0o620, 0))
+                Ok((dirent::S_IFCHR | 0o620, 0, 0))
             }
-            FdKind::ProcAuxv { .. } => Ok((dirent::S_IFREG | 0o444, self.auxv_len as u64)),
-            FdKind::Pipe { .. } => Ok((dirent::S_IFIFO | 0o600, 0)),
+            FdKind::ProcAuxv { .. } => Ok((dirent::S_IFREG | 0o444, self.auxv_len as u64, 0)),
+            FdKind::Pipe { .. } => Ok((dirent::S_IFIFO | 0o600, 0, 0)),
             FdKind::SockFresh
             | FdKind::SockListen { .. }
             | FdKind::SockConn { .. }
@@ -1041,18 +1060,22 @@ impl FdTable {
             | FdKind::InetDgram { .. }
             | FdKind::InetUdpRemote { .. }
             | FdKind::InetTcpRemote { .. }
-            | FdKind::Epoll { .. } => Ok((S_IFSOCK | 0o600, 0)),
-            FdKind::EventFd { .. } => Ok((dirent::S_IFREG | 0o600, 0)),
+            | FdKind::Epoll { .. } => Ok((S_IFSOCK | 0o600, 0, 0)),
+            FdKind::EventFd { .. } => Ok((dirent::S_IFREG | 0o600, 0, 0)),
             FdKind::Vfs { vfs_fd, .. } => {
                 let Some(o) = svc::file_ops() else {
                     return Err(-EBADF);
                 };
-                let mut native = crate::abi::Stat { size: 0, kind: 0 };
+                let mut native = crate::abi::Stat {
+                    size: 0,
+                    kind: 0,
+                    ino: 0,
+                };
                 let r = (o.fstat)(vfs_fd as u64, &mut native as *mut _ as u64);
                 if r < 0 {
                     return Err(r);
                 }
-                Ok((dirent::mode_for_kind(native.kind), native.size))
+                Ok((dirent::mode_for_kind(native.kind), native.size, native.ino))
             }
         }
     }

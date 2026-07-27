@@ -1425,10 +1425,36 @@ fn build_dyn_fixture(arch: Arch, cc: &str, out_dir: &str) -> bool {
         return false;
     }
 
-    // Copy the real ld.so + libc.so.6 out of the toolchain, or skip-with-reason.
+    // A second dynamic PIE that links a SECOND shared library (libm) besides
+    // libc, so `ld.so` must load two libraries and resolve versions across them
+    // (the multi-library case, GOAL-DYN-MULTILIB). `-fno-builtin` forces a real
+    // libm call rather than a compile-time constant fold. A build failure here is
+    // not fatal: a placeholder makes `linuxdyn` skip only the multi-library phase.
+    let dmath_dst = format!("{out_dir}/dmath");
+    let mut cm = Command::new(cc);
+    cm.args([
+        "tests/linux-fixtures/dmath.c",
+        "-fno-builtin",
+        "-o",
+        &dmath_dst,
+        "-lm",
+    ]);
+    if !matches!(cm.status().map(|s| s.success()), Ok(true)) {
+        eprintln!(
+            "[xtask] dmath (multi-library) fixture build failed for {}; \
+             linuxdyn skips the multi-library phase",
+            arch.name()
+        );
+        let _ = std::fs::write(&dmath_dst, [0u8]);
+    }
+
+    // Copy the real ld.so + libc.so.6 + libm.so.6 out of the toolchain, or
+    // skip-with-reason. libm lives beside libc in the same sysroot lib dir.
     let (ld_src, libc_src) = arch.dyn_runtime_libs();
+    let libm_src = libc_src.replace("libc.so.6", "libm.so.6");
     let ld_dst = format!("{out_dir}/ld.so");
     let libc_dst = format!("{out_dir}/libc.so.6");
+    let libm_dst = format!("{out_dir}/libm.so.6");
     let copied =
         std::fs::copy(ld_src, &ld_dst).is_ok() && std::fs::copy(libc_src, &libc_dst).is_ok();
     if copied {
@@ -1436,6 +1462,16 @@ fn build_dyn_fixture(arch: Arch, cc: &str, out_dir: &str) -> bool {
             "[xtask] copied dynamic runtime ({ld_src}, {libc_src}) for {}",
             arch.name()
         );
+        if std::fs::copy(&libm_src, &libm_dst).is_ok() {
+            println!("[xtask] copied {libm_src} for {}", arch.name());
+        } else {
+            eprintln!(
+                "[xtask] libm.so.6 not found ({libm_src}); linuxdyn skips the \
+                 multi-library phase for {}",
+                arch.name()
+            );
+            let _ = std::fs::write(&libm_dst, [0u8]);
+        }
     } else {
         eprintln!(
             "[xtask] SKIP dynamic fixture for {}: runtime ld.so/libc not found \
@@ -1445,6 +1481,7 @@ fn build_dyn_fixture(arch: Arch, cc: &str, out_dir: &str) -> bool {
         // 1-byte placeholders so the test still compiles + detects the skip.
         let _ = std::fs::write(&ld_dst, [0u8]);
         let _ = std::fs::write(&libc_dst, [0u8]);
+        let _ = std::fs::write(&libm_dst, [0u8]);
     }
     true
 }

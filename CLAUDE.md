@@ -374,14 +374,17 @@ straight off ext4 - the shape a shell launching Claude Code needs. This closes
 **L0-L7 Linux personality is complete** - unpatched static and dynamic glibc C,
 unpatched Rust `std`, and the real upstream uutils/coreutils all run as cells,
 kernel-resident like `svc.rs` and adding no kernel object (`MAX_MAPPED_FILES` is
-now **64**, headroom for a production binary's dozen-plus shared libraries). An
-**open finding** gates the next rung (GOAL-DYN-MULTILIB, #169): every dynamic
-proof so far links exactly one shared library (`libc`); a binary linking a
-*second* (`libc` + `libm`) fails ld.so cross-object version resolution even
-though the seeded `libc` exports the needed versions - not a fixture skew, a real
-multi-library resolution defect in the personality (ld.so itself runs and
-version-checks correctly), documented in docs/LINUX-COMPAT.md L7 as the next
-investigation before a production multi-lib binary can run.
+now **64**, headroom for a production binary's dozen-plus shared libraries).
+**Multi-library dynamic linking works** (GOAL-DYN-MULTILIB, #169): a binary
+linking a *second* shared library (`dmath`: `libc` + `libm`) now runs, proven by
+`linuxdyn`'s multi-library phase on all three ISAs. The defect was never in ld.so
+or version resolution - it was the `stat`/`fstat` block reporting `st_ino = 1` for
+**every** file (the kernel↔VFS bridge `abi::Stat` dropped the VFS `NodeId`), so
+glibc's ld.so, which dedups shared objects by `(st_dev, st_ino)`, treated the
+second library as an already-loaded copy of the first and never mapped it. The fix
+plumbs the real inode through `abi::Stat.ino` into every Linux `st_ino`/`stx_ino`;
+recorded as a scar in docs/ENGINEERING.md 11 ("a field left constant is a field
+that lies") and in docs/LINUX-COMPAT.md L7.
 **L8 has begun** (docs/LINUX-COMPAT.md L8, docs/NETSTACK.md rheo-net Phase N1d):
 **AF_UNIX (Unix domain) sockets** - `socket`/`socketpair`/`bind`/`listen`/
 `accept`/`connect`/`sendmsg`/`recvmsg` on SOCK_STREAM, sockets as per-cell fds
