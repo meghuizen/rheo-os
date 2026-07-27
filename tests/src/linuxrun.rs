@@ -150,11 +150,36 @@ fn captured() -> &'static [u8] {
 /// Load and run one Linux-personality cell, returning its outcome. Installs
 /// the per-cell Linux state (fd table, brk, mmap cursor) after load.
 fn run_linux(name: &str, image: &[u8], argv: &[&[u8]]) -> Outcome {
+    // Reset **before** loading: `user::reset` clears the mapped-file registry the
+    // loader registers the image in, so resetting afterwards leaves the cell's records
+    // naming a released entry and the whole image faults in as zeros
+    // (docs/ENGINEERING.md 11).
+    user::reset();
     let mut aspace = AddressSpace::new(1);
+    // The load's frame cost, measured. Loading used to copy every `PT_LOAD` page into
+    // a frame, so a program cost frames in proportion to its **size**; with the image
+    // demand-paged, the recorded segments cost nothing until a page is touched
+    // (docs/ARCHITECTURE-DEBT.md 4.0, blocker 2). Sampled around the load only - the
+    // stack is built after it and is still eager, which is a separate rung.
+    let (free_before, _) = kernel::mm::frames::stats();
     let img = load::load_elf_linux(image, &mut aspace).expect("load Linux ELF");
+    let (free_after, _) = kernel::mm::frames::stats();
+    let load_frames = free_before - free_after;
+    // Pages of the image the loader recorded rather than copied - the frames the old
+    // eager path would have allocated here and this one does not. A few frames are
+    // still spent per load on page tables, and any segment with a zero tail is still
+    // copied, so the assertion is "the recorded pages were not committed", stated as
+    // the strict inequality that the eager path cannot satisfy.
+    let recorded: usize = img.recorded().iter().map(|s| s.len / 4096).sum();
+    assert!(
+        recorded == 0 || load_frames < recorded,
+        "linuxrun: {name} recorded {recorded} demand-paged page(s) but the load still \
+         committed {load_frames} frame(s) - the image is being copied eagerly"
+    );
     let sp = linux_stack::setup_stack(&mut aspace, &img, argv, &[]);
     println!(
-        "linuxrun: loaded {name} ({} bytes), entry {:#x}, bias {:#x}, image_end {:#x}",
+        "linuxrun: loaded {name} ({} bytes), entry {:#x}, bias {:#x}, image_end {:#x}; \
+         {recorded} page(s) left to demand paging, load cost {load_frames} frame(s)",
         image.len(),
         img.entry,
         img.bias,
@@ -168,7 +193,6 @@ fn run_linux(name: &str, image: &[u8], argv: &[&[u8]]) -> Outcome {
         let objects = &mut *addr_of_mut!(OBJECTS);
         let caps = &mut *addr_of_mut!(CAPS);
         let qp = core::ptr::addr_of!(QP) as *const QueuePair;
-        user::reset();
         user::install(0, &aspace, caps, objects, qp, addr_of_mut!(frame));
         user::set_personality(0, Personality::Linux);
         linux::install_cell(0, &img);

@@ -115,6 +115,11 @@ fn captured() -> &'static [u8] {
 /// Run `image` (a dynamically-linked binary) with `argv`/`envp` under a fresh
 /// Linux cell, capturing stdout; returns (outcome, captured bytes).
 fn run(image: &[u8], argv: &[&[u8]], envp: &[&[u8]]) -> Outcome {
+    // Reset **before** loading: `user::reset` clears the mapped-file registry the
+    // loader registers the image in, so resetting afterwards leaves the cell's records
+    // naming a released entry and the whole image faults in as zeros
+    // (docs/ENGINEERING.md 11).
+    user::reset();
     let mut aspace = AddressSpace::new(1);
     let img = load::load_elf_linux(image, &mut aspace).expect("load dynamic Linux ELF");
     let sp = linux_stack::setup_stack(&mut aspace, &img, argv, envp);
@@ -125,7 +130,6 @@ fn run(image: &[u8], argv: &[&[u8]], envp: &[&[u8]]) -> Outcome {
         let objects = &mut *addr_of_mut!(OBJECTS);
         let caps = &mut *addr_of_mut!(CAPS);
         let qp = core::ptr::addr_of!(QP) as *const QueuePair;
-        user::reset();
         user::install(0, &aspace, caps, objects, qp, addr_of_mut!(frame));
         user::set_personality(0, Personality::Linux);
         linux::install_cell(0, &img);

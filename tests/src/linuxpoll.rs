@@ -129,6 +129,11 @@ fn run_capture(image: &[u8], argv: &[&[u8]]) -> (Outcome, &'static [u8]) {
         STDOUT_LEN = 0;
     }
     linux::set_stdout_tap(Some(tap));
+    // Reset **before** loading: `user::reset` clears the mapped-file registry the
+    // loader registers the image in, so resetting afterwards leaves the cell's records
+    // naming a released entry and the whole image faults in as zeros
+    // (docs/ENGINEERING.md 11).
+    user::reset();
     let mut aspace = AddressSpace::new(1);
     let img = load::load_elf_linux(image, &mut aspace).expect("load Linux ELF");
     let sp = linux_stack::setup_stack(&mut aspace, &img, argv, &[]);
@@ -139,7 +144,6 @@ fn run_capture(image: &[u8], argv: &[&[u8]]) -> (Outcome, &'static [u8]) {
         let objects = &mut *addr_of_mut!(OBJECTS);
         let caps = &mut *addr_of_mut!(CAPS);
         let qp = core::ptr::addr_of!(QP) as *const QueuePair;
-        user::reset();
         user::install(0, &aspace, caps, objects, qp, addr_of_mut!(frame));
         user::set_personality(0, Personality::Linux);
         linux::install_cell(0, &img);

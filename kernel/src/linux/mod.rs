@@ -147,6 +147,9 @@ pub fn install_cell(idx: usize, img: &crate::load::LinuxImage) {
     st.tid_addr = 0;
     st.robust_list = 0;
     st.initialized = true;
+    // ...and then the mappings for the segments the loader chose not to copy, which
+    // must come *after* the clear that would otherwise throw them away.
+    record_image_segments(idx, img);
     // Seed the multi-context thread table with context 0 (docs/LINUX-COMPAT.md
     // L4), reusing the cell's installed frame.
     thread::init_cell(idx);
@@ -196,6 +199,50 @@ pub(crate) fn dup_state(from: usize, to: usize) {
     // and the parent then faulted against a freed entry and got a zero page.
     state(to).fds.inherit_pipe_ends();
     state(to).vmas.inherit_files();
+}
+
+/// Turn the loader's recorded `PT_LOAD`s into file-backed VMA records, so their
+/// pages are filled by [`mem::fault`] on first touch instead of copied at load
+/// (docs/ARCHITECTURE-DEBT.md 4.0, blocker 2).
+///
+/// **Reference handoff:** the loader took one `filemap` reference per record, and
+/// `insert_backed` consumes exactly one per record, so this function releases nothing
+/// and leaks nothing. The one hazard worth a check is *ordering*: a `user::reset()`
+/// between the load and this call clears the registry, after which every page of the
+/// image would come back zeroed - which on RISC-V is an illegal instruction at the
+/// entry point and nothing more informative (docs/ENGINEERING.md 11). So the handle
+/// is tested for life, and a dead one is reported rather than mapped.
+fn record_image_segments(idx: usize, img: &crate::load::LinuxImage) {
+    let Some(store) = img.store else { return };
+    if !filemap::alive(store) {
+        crate::println!(
+            "linux: the loaded image's backing store was released before install - \
+             loading eagerly is the only safe answer, so this cell has {} unmapped \
+             segment(s). Reset before loading, not after.",
+            img.nsegs
+        );
+        return;
+    }
+    let st = state(idx);
+    for s in img.recorded() {
+        let backing = vma::Backing {
+            file: store,
+            off: s.off,
+            len: s.file_len,
+        };
+        // MAP_PRIVATE, no MAP_ANONYMOUS: a fault reads the file and a write is
+        // private to this cell, which is exactly what a loaded segment is.
+        if !st
+            .vmas
+            .insert_backed(s.base, s.len, s.prot, 0, Some(backing))
+        {
+            crate::println!(
+                "linux: no VMA record left for the image segment at {:#x} - its pages \
+                 will fault as unmapped",
+                s.base
+            );
+        }
+    }
 }
 
 /// Reset cell `cell`'s memory bookkeeping for a fresh `execve` image

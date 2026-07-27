@@ -37,14 +37,31 @@ use core::ptr::addr_of_mut;
 /// and keeps the kernel allocation-free.
 pub const MAX_MAPPED_FILES: usize = 8;
 
+/// Where a mapping's bytes come from.
+///
+/// Two kinds, because the two loaders differ in where the image already is. A
+/// program `mmap`s a **file**, and `ld.so` streams the interpreter from one, so
+/// those read through [`crate::svc::FileOps`]. But `load::load_elf_linux` is handed
+/// the image as a plain `&[u8]` that is already resident in kernel memory (a test
+/// kernel's `include_bytes!`, or any caller that has the bytes), and eagerly copying
+/// it into frames allocates a *second* copy of every page - which is exactly the cost
+/// demand paging is here to remove. So a resident image is a backing store too.
+#[derive(Copy, Clone)]
+enum Store {
+    /// A VFS handle this registry owns and closes.
+    Vfs(i64),
+    /// Bytes already resident in kernel memory: `(address, length)`. Nothing to
+    /// close, and nothing is copied until a page faults.
+    Mem(usize, usize),
+}
+
 #[derive(Copy, Clone)]
 struct MappedFile {
     used: bool,
     /// One reference per `Vma` that names this entry (so `fork` and a split
     /// `munmap` are both just counter changes).
     refs: u16,
-    /// The handle `FileOps::open` returned - the mapping's own, not the caller's.
-    vfs_fd: i64,
+    store: Store,
 }
 
 impl MappedFile {
@@ -52,7 +69,7 @@ impl MappedFile {
         MappedFile {
             used: false,
             refs: 0,
-            vfs_fd: -1,
+            store: Store::Vfs(-1),
         }
     }
 }
@@ -67,13 +84,21 @@ fn tbl() -> &'static mut [MappedFile; MAX_MAPPED_FILES] {
 /// Close every handle and clear the table (called from `linux::reset`).
 pub fn reset() {
     for e in tbl().iter_mut() {
-        if e.used
-            && e.vfs_fd >= 0
-            && let Some(o) = crate::svc::file_ops()
-        {
-            (o.close)(e.vfs_fd as u64);
+        if e.used {
+            release(e);
         }
         *e = MappedFile::new();
+    }
+}
+
+/// Give back whatever the store owns. Only a VFS handle owns anything; resident
+/// bytes belong to the caller that supplied them.
+fn release(e: &MappedFile) {
+    if let Store::Vfs(fd) = e.store
+        && fd >= 0
+        && let Some(o) = crate::svc::file_ops()
+    {
+        (o.close)(fd as u64);
     }
 }
 
@@ -96,9 +121,37 @@ pub fn open(path_va: u64, path_len: u64) -> Option<u8> {
     t[idx] = MappedFile {
         used: true,
         refs: 1,
-        vfs_fd: fd,
+        store: Store::Vfs(fd),
     };
     Some(idx as u8)
+}
+
+/// Register bytes already resident in kernel memory as a backing store - the
+/// `load::load_elf_linux` case, where the caller holds the whole image and eagerly
+/// copying it would allocate a second copy of every page.
+///
+/// # Safety
+/// `[addr, addr+len)` must be readable kernel memory that stays valid and unchanged
+/// for as long as any mapping references this entry. In practice that means a
+/// `'static` image (a `include_bytes!` blob, or a buffer the caller owns for the
+/// lifetime of the cell) - not a stack buffer.
+pub unsafe fn open_mem(addr: usize, len: usize) -> Option<u8> {
+    let t = tbl();
+    let idx = (0..MAX_MAPPED_FILES).find(|&i| !t[i].used)?;
+    t[idx] = MappedFile {
+        used: true,
+        refs: 1,
+        store: Store::Mem(addr, len),
+    };
+    Some(idx as u8)
+}
+
+/// Is entry `h` live? A caller that recorded a handle and then had it cleared out
+/// from under it (a `reset` between load and install) would otherwise present as a
+/// mapping full of zeros - which on RISC-V is an illegal instruction at the entry
+/// point and nothing more informative (docs/ENGINEERING.md 11).
+pub fn alive(h: u8) -> bool {
+    (h as usize) < MAX_MAPPED_FILES && tbl()[h as usize].used
 }
 
 /// A new `Vma` names entry `h` (a split `munmap`, or `fork`'s copy of the list).
@@ -117,11 +170,7 @@ pub fn close(h: u8) {
     }
     e.refs = e.refs.saturating_sub(1);
     if e.refs == 0 {
-        if e.vfs_fd >= 0
-            && let Some(o) = crate::svc::file_ops()
-        {
-            (o.close)(e.vfs_fd as u64);
-        }
+        release(e);
         *e = MappedFile::new();
     }
 }
@@ -134,20 +183,42 @@ pub fn close(h: u8) {
 /// cannot alias the cell's memory and cannot be steered by the cell.
 pub fn read_at(h: u8, dst_kva: u64, len: u64, off: i64) -> i64 {
     let e = tbl()[h as usize];
-    if !e.used || e.vfs_fd < 0 {
+    if !e.used || off < 0 {
         return -1;
     }
-    match crate::svc::file_ops() {
-        Some(o) => {
-            // `FileOps` has no pread, so seek then read - which is safe here
-            // because the handle is the *mapping's own*: nothing else shares its
-            // file position (the very reason it is not the caller's fd).
-            if (o.lseek)(e.vfs_fd as u64, off, 0) < 0 {
-                return -1;
+    match e.store {
+        Store::Vfs(fd) if fd >= 0 => match crate::svc::file_ops() {
+            Some(o) => {
+                // `FileOps` has no pread, so seek then read - which is safe here
+                // because the handle is the *mapping's own*: nothing else shares its
+                // file position (the very reason it is not the caller's fd).
+                if (o.lseek)(fd as u64, off, 0) < 0 {
+                    return -1;
+                }
+                (o.read)(fd as u64, dst_kva, len)
             }
-            (o.read)(e.vfs_fd as u64, dst_kva, len)
+            None => -1,
+        },
+        Store::Mem(addr, total) => {
+            // Past the end is a short read of zero, exactly as a file read is, so a
+            // partial last page needs no special case at either call site.
+            let off = off as usize;
+            let n = total.saturating_sub(off).min(len as usize);
+            if n > 0 {
+                // SAFETY: `[addr, addr+total)` is readable kernel memory for the
+                // entry's lifetime (`open_mem`'s contract) and `off+n <= total`;
+                // `dst_kva` is a freshly allocated frame through the linear map.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (addr + off) as *const u8,
+                        dst_kva as *mut u8,
+                        n,
+                    );
+                }
+            }
+            n as i64
         }
-        None => -1,
+        Store::Vfs(_) => -1,
     }
 }
 

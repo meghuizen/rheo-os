@@ -299,6 +299,11 @@ pub unsafe fn run_elf_cell(image: &[u8], what: &str) -> Outcome {
 /// # Safety
 /// As [`run_elf_cell`].
 pub unsafe fn run_linux_cell(image: &[u8], argv: &[&[u8]]) -> Outcome {
+    // Reset **before** loading, not after. `user::reset` clears the personality's
+    // mapped-file registry, and the loader registers the image in it - so resetting
+    // afterwards would leave the cell's records naming a released entry and every page
+    // of the image would fault in as zeros (docs/ENGINEERING.md 11).
+    user::reset();
     let mut aspace = AddressSpace::new(1);
     let img = load::load_elf_linux(image, &mut aspace).expect("load Linux ELF");
     let sp = linux::stack::setup_stack(&mut aspace, &img, argv, &[]);
@@ -310,7 +315,6 @@ pub unsafe fn run_linux_cell(image: &[u8], argv: &[&[u8]]) -> Outcome {
         let objects = &mut *addr_of_mut!(OBJECTS);
         let caps = &mut *addr_of_mut!(CAPS);
         let qp = core::ptr::addr_of!(QP) as *const QueuePair;
-        user::reset();
         user::install(0, &aspace, caps, objects, qp, addr_of_mut!(frame));
         user::set_personality(0, user::Personality::Linux);
         linux::install_cell(0, &img);

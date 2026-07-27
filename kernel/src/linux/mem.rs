@@ -256,10 +256,16 @@ pub fn mmap(
     // rather than leaving the list disagreeing with the page tables. `insert`
     // replaces whatever was recorded at `base`, which is what `MAP_FIXED` over an
     // `ld.so` reservation means.
-    if !st
-        .vmas
-        .insert_backed(base, bytes, prot, flags, backing, offset)
-    {
+    // A file mapping is backed for its whole length: a read past end of file
+    // short-reads, which leaves the rest of the frame zero - the same answer Linux
+    // gives. (An ELF *segment* is the case that is backed only part way; see
+    // `Vma::file_len`.)
+    let backing = backing.map(|h| crate::linux::vma::Backing {
+        file: h,
+        off: offset,
+        len: bytes,
+    });
+    if !st.vmas.insert_backed(base, bytes, prot, flags, backing) {
         crate::println!(
             "linux: mmap of {bytes:#x} at {base:#x} refused - the per-cell VMA table \
              is full ({} records)",
@@ -349,9 +355,12 @@ pub fn fault(st: &mut LinuxState, addr: usize) -> bool {
     // A file-backed page is read through the kernel's linear map *before* the frame
     // is user-mapped, so the read cannot alias the cell's memory. A short read (past
     // end of file) leaves the tail zero, which is what the frame already is.
-    if let Some((h, off)) = st.vmas.file_at(page) {
+    if let Some((h, off, avail)) = st.vmas.file_at(page) {
         let kva = arch::phys_to_virt(pa) as u64;
-        filemap::read_at(h, kva, FRAME_SIZE as u64, off as i64);
+        // `avail` bytes at most: an ELF segment's file content can end mid-page, and
+        // reading the whole page would serve the *next* segment's bytes in the tail
+        // instead of the zeros the program is entitled to.
+        filemap::read_at(h, kva, avail as u64, off as i64);
     }
     user::with_current_aspace(|aspace| {
         aspace.map_user_frame(page, pa, perm_from_prot(m.prot));

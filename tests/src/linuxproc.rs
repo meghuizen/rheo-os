@@ -417,6 +417,7 @@ extern "C" fn kernel_main() -> ! {
     // "the page is absent" from "the page is present and the access was refused"
     // would repopulate on every touch, and the count would run away.
     let faults_before = linux::mem::faults();
+    let mmap_faults_before = linux::mem::faults_mmap();
     let files_before = linux::filemap::in_use();
     let want_dp: &[u8] = b"dp: backing file written\n\
         dp: mapped 64 pages, fd closed\n\
@@ -434,12 +435,18 @@ extern "C" fn kernel_main() -> ! {
         core::str::from_utf8(want_dp),
     );
     assert!(code == 0, "mmapdp: exit {code}, expected 0");
-    let filled = linux::mem::faults() - faults_before;
+    // The oracle is the **mmap-region** count, not the total. The property being
+    // proven is "this 64-page file mapping cost 5 fills", and the total stops
+    // measuring that the moment anything else in the address space is demand-paged
+    // too - it would then also be counting the program's own text and data, which is
+    // a property of the loader, not of this mapping. Which region a page lies in is
+    // kernel layout, so the cell cannot fake it either way.
+    let filled = linux::mem::faults_mmap() - mmap_faults_before;
     assert!(
         filled == 5,
-        "mmapdp: demand paging filled {filled} pages, want exactly 5 (64 were \
-         mapped, 5 touched) - an eager mmap would be 64 and a handler that \
-         repopulated a present page would be far more"
+        "mmapdp: demand paging filled {filled} pages of the mmap region, want \
+         exactly 5 (64 were mapped, 5 touched) - an eager mmap would be 64 and a \
+         handler that repopulated a present page would be far more"
     );
     // The mapping owned a VFS handle across the caller's `close(fd)` and gave it
     // back at `munmap`: the registry is where it started.
@@ -448,6 +455,11 @@ extern "C" fn kernel_main() -> ! {
         "mmapdp: the mapped-file registry did not return to {files_before} entries \
          ({} in use) - a mapping leaked its handle",
         linux::filemap::in_use()
+    );
+    println!(
+        "linuxproc: mmapdp filled {filled} of 64 mapped pages in the mmap region, \
+         {} demand fills across the whole address space",
+        linux::mem::faults() - faults_before
     );
     println!(
         "linuxproc: demand paging OK - 64 file pages mapped, exactly {filled} filled \

@@ -38,6 +38,19 @@ use crate::mm::frames::FRAME_SIZE;
 /// 32 bytes each = 4 KiB per cell.
 pub const MAX_VMAS: usize = 128;
 
+/// Where a file-backed mapping's missing pages come from. One value rather than
+/// three parallel arguments, because the three are only ever meaningful together -
+/// a handle with the wrong offset or the wrong length serves the wrong bytes.
+#[derive(Copy, Clone)]
+pub struct Backing {
+    /// The [`filemap`] entry. The record created from this owns one reference to it.
+    pub file: u8,
+    /// File offset of the mapping's **first** page.
+    pub off: u64,
+    /// Bytes of file content from the mapping's base; see [`Vma::file_len`].
+    pub len: usize,
+}
+
 /// One mapping. `len == 0` marks a free slot - there is no separate occupancy
 /// bit to get out of step with the length.
 #[derive(Copy, Clone)]
@@ -58,14 +71,26 @@ pub struct Vma {
     /// **One live record holds exactly one `filemap` reference.** That is the whole
     /// refcount rule, and every operation below obeys it: a merge turns two records
     /// into one and drops a reference, a split turns one into two and adds one, a
-    /// full removal drops one, and `fork`'s `copy_from` adds one per record. Getting
-    /// it wrong closes a file another mapping still faults against, so it is stated
-    /// here rather than left to be inferred from the code.
+    /// full removal drops one, and `fork`'s `inherit_files` adds one per record.
+    /// Getting it wrong closes a file another mapping still faults against, so it is
+    /// stated here rather than left to be inferred from the code.
     pub file: Option<u8>,
     /// File offset of this mapping's **first** page. A split recomputes it for the
     /// piece above the hole; without that, the tail of a split file mapping would
     /// silently serve the wrong bytes.
     pub file_off: u64,
+    /// How many of this mapping's bytes, counted from [`Self::base`], come from the
+    /// file. Everything past that is **zero**, not "whatever is next in the file".
+    ///
+    /// It exists because an ELF segment's file content does not end on a page
+    /// boundary: `p_filesz` is a byte count, and the tail of its last page is
+    /// zero-fill. Without this the fault handler would read a whole page and serve
+    /// the *following* segment's bytes in that tail - not a crash, which is what
+    /// makes it worth a field rather than a comment.
+    ///
+    /// For a `mmap` of a file it is simply the mapping length: a read past end of
+    /// file already short-reads, leaving the rest of the frame zero.
+    pub file_len: usize,
 }
 
 impl Vma {
@@ -76,7 +101,14 @@ impl Vma {
         flags: 0,
         file: None,
         file_off: 0,
+        file_len: 0,
     };
+
+    /// Bytes of file content still available at `at` (>= `base`), i.e. how much of a
+    /// page starting there may be read from the file before zero-fill takes over.
+    fn avail_at(&self, at: usize) -> usize {
+        self.file_len.saturating_sub(at - self.base)
+    }
 
     fn end(&self) -> usize {
         self.base + self.len
@@ -119,13 +151,17 @@ impl VmaList {
             .copied()
     }
 
-    /// The file offset backing `addr`, if its mapping is file-backed - the second
-    /// half of the page-fault lookup (which file, and where in it).
-    pub fn file_at(&self, addr: usize) -> Option<(u8, u64)> {
+    /// The file backing `addr`, if any - the second half of the page-fault lookup:
+    /// **which** file, **where** in it, and **how many** bytes of this page come from
+    /// it (the rest are zero). Returns `None` for an anonymous mapping, and also once
+    /// the page lies wholly past the file content, because then there is nothing to
+    /// read and a zeroed frame is already the right answer.
+    pub fn file_at(&self, addr: usize) -> Option<(u8, u64, usize)> {
         let m = self.find(addr)?;
         let h = m.file?;
         let page = addr & !(FRAME_SIZE - 1);
-        Some((h, m.file_off + (page - m.base) as u64))
+        let avail = m.avail_at(page).min(FRAME_SIZE);
+        (avail > 0).then_some((h, m.file_off + (page - m.base) as u64, avail))
     }
 
     /// Add a backing-store reference for every live file-backed record - the **`fork`**
@@ -216,22 +252,25 @@ impl VmaList {
     /// merged into a neighbour - a real refusal the caller must report, not a
     /// silent drop that would leave the list disagreeing with the page tables.
     pub fn insert(&mut self, base: usize, bytes: usize, prot: u64, flags: u64) -> bool {
-        self.insert_backed(base, bytes, prot, flags, None, 0)
+        self.insert_backed(base, bytes, prot, flags, None)
     }
 
-    /// [`Self::insert`] for a **file-backed** mapping: `file`/`file_off` name where
-    /// a missing page's contents come from. The caller must hand over a `filemap`
-    /// reference for the new record (see [`Vma::file`]); a refusal here gives it
-    /// back, so a full table cannot leak the handle.
+    /// [`Self::insert`] for a mapping that may be **file-backed**: `backing` names
+    /// where a missing page's contents come from and how far they go. The caller must
+    /// hand over a `filemap` reference for the new record (see [`Vma::file`]); a
+    /// refusal here gives it back, so a full table cannot leak the handle.
     pub fn insert_backed(
         &mut self,
         base: usize,
         bytes: usize,
         prot: u64,
         flags: u64,
-        file: Option<u8>,
-        file_off: u64,
+        backing: Option<Backing>,
     ) -> bool {
+        let (file, file_off, file_len) = match backing {
+            Some(b) => (Some(b.file), b.off, b.len),
+            None => (None, 0, 0),
+        };
         if bytes == 0 {
             if let Some(h) = file {
                 filemap::close(h);
@@ -244,18 +283,22 @@ impl VmaList {
         // that maps many small ranges back to back would otherwise consume one
         // record each and hit the ceiling for no reason.
         // Merging two file-backed records is only sound when they name the same
-        // file AND their file ranges are genuinely contiguous - otherwise the merged
-        // record's single `file_off` would serve the wrong bytes for half of it.
-        // `ld.so` overlays segments at computed offsets, so non-contiguous
-        // neighbours in the same file are the normal case, not a corner one.
+        // file AND their file ranges are genuinely contiguous AND both are backed all
+        // the way to their end - otherwise the merged record's single `file_off` and
+        // `file_len` would serve the wrong bytes, or zeros, for half of it. `ld.so`
+        // overlays segments at computed offsets, so non-contiguous neighbours in the
+        // same file are the normal case, not a corner one; and an ELF segment ending
+        // mid-page is exactly a record that is not backed to its end.
         let end = base + bytes;
+        let whole = file.is_none() || file_len >= bytes;
         let joins_below = |m: &Vma| {
             m.len != 0
                 && m.end() == base
                 && m.prot == prot
                 && m.flags == flags
                 && m.file == file
-                && (file.is_none() || m.file_off + m.len as u64 == file_off)
+                && (file.is_none()
+                    || (whole && m.file_len >= m.len && m.file_off + m.len as u64 == file_off))
         };
         let joins_above = |m: &Vma| {
             m.len != 0
@@ -263,7 +306,8 @@ impl VmaList {
                 && m.prot == prot
                 && m.flags == flags
                 && m.file == file
-                && (file.is_none() || file_off + bytes as u64 == m.file_off)
+                && (file.is_none()
+                    || (whole && m.file_len >= m.len && file_off + bytes as u64 == m.file_off))
         };
         let before = self.v.iter().position(joins_below);
         let after = self.v.iter().position(joins_above);
@@ -274,11 +318,16 @@ impl VmaList {
             filemap::close(h);
         }
         match (before, after) {
+            // Every merge below only happens when all the parts are backed to their
+            // end (`whole` above), so the grown record is too: its `file_len` is
+            // simply its new length. Adding the pieces' `file_len`s instead would be
+            // the same number by a route a reader has to re-derive.
             (Some(b), Some(a)) => {
                 // Bridging a hole between two neighbours: extend the first over
                 // both and free the second - which also retires that record's
                 // reference.
                 self.v[b].len = self.v[a].end() - self.v[b].base;
+                self.v[b].file_len = if file.is_some() { self.v[b].len } else { 0 };
                 if let Some(h) = self.v[a].file {
                     filemap::close(h);
                 }
@@ -287,6 +336,7 @@ impl VmaList {
             }
             (Some(b), None) => {
                 self.v[b].len += bytes;
+                self.v[b].file_len = if file.is_some() { self.v[b].len } else { 0 };
                 true
             }
             (None, Some(a)) => {
@@ -294,6 +344,7 @@ impl VmaList {
                 self.v[a].base = base;
                 // The record now starts lower, so its file range starts earlier too.
                 self.v[a].file_off = file_off;
+                self.v[a].file_len = if file.is_some() { self.v[a].len } else { 0 };
                 true
             }
             (None, None) => match self.free_slot() {
@@ -305,6 +356,7 @@ impl VmaList {
                         flags,
                         file,
                         file_off,
+                        file_len,
                     };
                     true
                 }
@@ -343,6 +395,7 @@ impl VmaList {
                 // Hole strictly inside: keep the head, add the tail.
                 (true, true) => {
                     self.v[i].len = base - m.base;
+                    self.v[i].file_len = m.file_len.min(self.v[i].len);
                     match self.free_slot() {
                         Some(j) => {
                             // One record became two, so the tail takes its own
@@ -358,6 +411,7 @@ impl VmaList {
                                 flags: m.flags,
                                 file: m.file,
                                 file_off: m.file_off + (end - m.base) as u64,
+                                file_len: m.avail_at(end),
                             }
                         }
                         None => crate::println!(
@@ -369,12 +423,16 @@ impl VmaList {
                     }
                 }
                 // Trim the tail.
-                (true, false) => self.v[i].len = base - m.base,
+                (true, false) => {
+                    self.v[i].len = base - m.base;
+                    self.v[i].file_len = m.file_len.min(self.v[i].len);
+                }
                 // Trim the head: the surviving pages start further into the file.
                 (false, true) => {
                     self.v[i].base = end;
                     self.v[i].len = m.end() - end;
                     self.v[i].file_off = m.file_off + (end - m.base) as u64;
+                    self.v[i].file_len = m.avail_at(end);
                 }
                 // Fully covered: the record - and its reference - go.
                 (false, false) => {
@@ -401,11 +459,14 @@ impl VmaList {
         let end = base + bytes;
         let mut page = base;
         while page < end {
-            let (flags, file) = match self.find(page) {
-                Some(m) => (m.flags, m.file),
-                None => (0, None),
+            let (flags, file, avail) = match self.find(page) {
+                Some(m) => (m.flags, m.file, m.avail_at(page)),
+                None => (0, None, 0),
             };
-            let off = self.file_at(page).map(|(_, o)| o).unwrap_or(0);
+            let off = match self.find(page) {
+                Some(m) => m.file_off + (page - m.base) as u64,
+                None => 0,
+            };
             // Extend over as many following pages as share this record's flags and
             // backing, so the common case (one whole mapping) costs one insert.
             let mut run = FRAME_SIZE;
@@ -420,7 +481,14 @@ impl VmaList {
             if let Some(h) = file {
                 filemap::addref(h);
             }
-            self.insert_backed(page, run, prot, flags, file, off);
+            // The run may end before the file content does, so clamp: a reprotect
+            // must not extend how far a record claims to be backed.
+            let backing = file.map(|h| Backing {
+                file: h,
+                off,
+                len: avail.min(run),
+            });
+            self.insert_backed(page, run, prot, flags, backing);
             page += run;
         }
     }
