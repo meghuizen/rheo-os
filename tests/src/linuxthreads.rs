@@ -15,87 +15,23 @@
 #![no_std]
 #![no_main]
 
-use core::mem::MaybeUninit;
-use core::ptr::addr_of_mut;
-
-use kernel::capability::{CapTable, ObjectTable};
 use kernel::ktimer;
-use kernel::linux::{self, stack as linux_stack};
-use kernel::mm::AddressSpace;
-use kernel::queue::QueuePair;
-use kernel::user::{self, Outcome, Personality};
-use kernel::{arch, load, println};
+use kernel::linux::{self};
+use kernel::user::Outcome;
+use kernel::{arch, println};
+
+#[path = "fixture.rs"]
+mod fixture;
+#[path = "harness.rs"]
+mod harness;
 
 /// `include_bytes!` the static-glibc multi-threaded Rust fixture (L4), built by
 /// `xtask::build_linux_fixtures` for the ISA's `*-unknown-linux-gnu` target.
-macro_rules! rustthreads_bin {
-    () => {{
-        #[cfg(target_arch = "x86_64")]
-        {
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/linux-fixtures/rustthreads/target/x86_64-unknown-linux-gnu/release/rustthreads"
-            ))
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/linux-fixtures/rustthreads/target/aarch64-unknown-linux-gnu/release/rustthreads"
-            ))
-        }
-        #[cfg(target_arch = "riscv64")]
-        {
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/linux-fixtures/rustthreads/target/riscv64gc-unknown-linux-gnu/release/rustthreads"
-            ))
-        }
-    }};
-}
-
-static RUSTTHREADS: &[u8] = rustthreads_bin!();
+static RUSTTHREADS: &[u8] = fixture::linux_cargo!("rustthreads");
 
 /// The static-glibc `pthread_cond_timedwait` fixture (built by
 /// `xtask::build_linux_fixtures`), for the futex-timeout phase below.
-macro_rules! fixture {
-    ($name:literal) => {{
-        #[cfg(target_arch = "x86_64")]
-        {
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/linux-fixtures/build/x86_64/",
-                $name
-            ))
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/linux-fixtures/build/aarch64/",
-                $name
-            ))
-        }
-        #[cfg(target_arch = "riscv64")]
-        {
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/linux-fixtures/build/riscv64/",
-                $name
-            ))
-        }
-    }};
-}
-
-static CONDWAIT: &[u8] = fixture!("condwait");
-
-static mut OBJECTS: ObjectTable = ObjectTable::new();
-static mut CAPS: CapTable = CapTable::new();
-static mut QP: MaybeUninit<QueuePair> = MaybeUninit::uninit();
-
-#[repr(align(16))]
-struct KStack([u8; 64 * 1024]);
-static mut KSTACK: KStack = KStack([0; 64 * 1024]);
+static CONDWAIT: &[u8] = fixture::linux!("condwait");
 
 // -- stdout capture, wired to the Linux personality's stdout tap --
 const CAP_MAX: usize = 8 * 1024;
@@ -119,22 +55,8 @@ fn captured() -> &'static [u8] {
 }
 
 fn run(image: &[u8], argv: &[&[u8]]) -> Outcome {
-    let mut aspace = AddressSpace::new(1);
-    let img = load::load_elf_linux(image, &mut aspace).expect("load Linux ELF");
-    let sp = linux_stack::setup_stack(&mut aspace, &img, argv, &[]);
-    // SAFETY: single-threaded init; the statics outlive the synchronous run.
-    unsafe {
-        let kernel_sp = core::ptr::addr_of!(KSTACK.0) as usize + 64 * 1024;
-        let mut frame = arch::trapframe_new(img.entry, sp, 0, kernel_sp);
-        let objects = &mut *addr_of_mut!(OBJECTS);
-        let caps = &mut *addr_of_mut!(CAPS);
-        let qp = core::ptr::addr_of!(QP) as *const QueuePair;
-        user::reset();
-        user::install(0, &aspace, caps, objects, qp, addr_of_mut!(frame));
-        user::set_personality(0, Personality::Linux);
-        linux::install_cell(0, img.image_end);
-        user::run(0).1
-    }
+    // SAFETY: single-threaded init; the harness's statics outlive the run.
+    unsafe { harness::run_linux_cell(image, argv) }
 }
 
 #[unsafe(no_mangle)]

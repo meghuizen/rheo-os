@@ -341,7 +341,7 @@ Measured, not estimated.
 
 | Pattern | Duplication | Framework | Effort / risk |
 |---|---|---|---|
-| **Test-kernel boilerplate** | **~2,684 removable lines** across 26 kernels; 130 boilerplate : 28 unique per kernel (4.5:1; 11:1 for pure-net); the console `FileOps` 8-stub block copied **22 times verbatim**; 14 launch blocks differing by **2 lines**; **10** independent `macro_rules!` for the same per-ISA `include_bytes!`, two byte-identical *and on the same line number* | `console_personality::ops()` + `harness::run_elf_cell` + `elf!`/`heap!` macros | M / **LOW** (test-only; failures are loud) |
+| ~~**Test-kernel boilerplate**~~ **DONE (first pass)** | **~2,684 removable lines** across 26 kernels; the console `FileOps` 8-stub block copied **22 times verbatim**; 14 launch blocks differing by **2 lines**; **10** independent `macro_rules!` for the same per-ISA `include_bytes!` | `console_personality` (two honest variants) + `harness::run_elf_cell`/`run_linux_cell` + `fixture::cell!`/`linux!`/`linux_cargo!`. **-1,533 net lines** across 23 files, 22 kernels converted, every assertion unchanged. Remaining: the `heap!` macro and the `.user`-window kernels (`bench_core`/`isolation_hw`/`lsh`/`schedidle`/`security`/`shell_smoke`), whose launches are genuinely different | M / **LOW** (test-only; failures are loud) |
 | **The virtio trio** | **~860 of 2,391 lines (36%)**; 48 constants in >1 driver; `PciXport` 3x (net vs gpu diff to **zero lines**); 5 ring structs 3x; the reset sequence character-identical in **all six** places | `hw/virtio/`: `trait VirtioTransport`, `VirtQueue<N>` with `submit_chain(&[Seg])`, `negotiate()` | L / **S(gpu) → M(blk) → L(net)** |
 | **Fixed-slot registries** | 22 registries, ~1,080 lines; **12 fit one generic** (7 are literally the same 8 lines) | `Registry<T: Slot, N>` - **without** generations (the only site needing them stays bespoke) | M / MEDIUM (live kernel state; quiet failures) |
 | ~~**The `svc` bridge**~~ **DONE** | two structurally identical 17-line static/setter/getter triples; **31** hand-written null-check call sites in two idioms | `Bridge<T>` + `NicOps`/`DisplayOps` landed (`PersonalityOps` still later) | S / LOW |
@@ -382,8 +382,8 @@ cycles, `rheo-abi` removes the silent-corruption duplication (-943 lines),
 `svc::Bridge<T>` + `NicOps`/`DisplayOps` closes the §3.2 defect, and
 `TARGET-ARCHITECTURES.md` §4.1 states the `cfg` exemptions.
 
-**Then - leverage.** The test harness (largest line win, lowest risk, and it
-makes every later refactor cheaper to prove); gate `VirtualLink`;
+**Then - leverage.** ~~The test harness~~ **first pass DONE** (see §5: -1,533
+lines, 22 kernels, no assertion touched); next: gate `VirtualLink`;
 `rheo-tile-kernels`; the virtio core staged gpu → blk → net; the librheo lang-item
 split (deletes `net`'s posture split permanently); `Registry`; `Skip`; the `arch`
 traits; `Validated`/`Evidence`.

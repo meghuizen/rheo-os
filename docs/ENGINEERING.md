@@ -292,9 +292,23 @@ is which way the claim moves:
   result. Nothing is routed around, because there was no defect to route around:
   the kernel halts correctly on any deadline still in the future.
 
+It has now happened twice from the same cause, which is why it is a rule and not
+an anecdote. The second was a timer-arbiter proof: 40 back-to-back pacer
+deadlines had to land inside a 20 ms RTO to show that a continuously re-armed
+client cannot destroy another client's deadline. The per-release assertions were
+already written correctly - their author had reasoned explicitly that a loaded
+host can deschedule QEMU for milliseconds, so a release running *past* the RTO
+makes marking it due the correct answer - but a final `checked >= PACES / 2`
+guard reintroduced the dependency the per-release logic had just excused. Under a
+full matrix run only 10 of 40 landed inside the window. 40 releases are ~8 ms of
+guest time, so the deadlines are now 200 ms and 400 ms: a 15x margin, measured
+(13.46 ms observed), with every assertion unchanged.
+
 Before enlarging a stimulus, prove which of the two you are doing by naming the
 mechanism. If you cannot say *why* the old value was marginal, you are guessing,
-and the answer is the forbidden one.
+and the answer is the forbidden one. And check the *whole* proof: reasoning
+correctly about emulator timing in one assertion does not help if a summary guard
+three lines later quietly depends on it.
 
 **Required practice.**
 - Never tune a test to route around a behavioural defect. If a parameter must

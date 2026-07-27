@@ -1541,8 +1541,20 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               prefix sharing, the columnar reduce, soak + boundary + pipeline
               stress),
               bench-core, and the interactive
-              lsh bin (+ harness.rs, vfs_personality.rs, inet_personality.rs -
-              the N4b remote-INET datapath registered as svc::SocketOps);
+              lsh bin. Shared support, all #[path]-included (docs/
+              ARCHITECTURE-DEBT.md 5): harness.rs (the `.user`-window cell
+              builders **plus** run_elf_cell/run_linux_cell - one native launch
+              and one Linux launch, replacing 22 hand-written copies),
+              fixture.rs (cell!/linux!/linux_cargo! - the per-ISA
+              include_bytes! path, once, which is also what makes the
+              docs/TARGET-ARCHITECTURES.md 4.1 cfg exemption auditable),
+              console_personality.rs (the console-only FileOps: console_only
+              for ENOSYS-everywhere, console_and_empty_fs for the
+              ENOENT/EBADF shape - two variants because collapsing them would
+              change what a cell that *did* make a file call observes),
+              vfs_personality.rs (the real-file FileOps over the POSIX VFS),
+              inet_personality.rs (the N4b remote-INET datapath registered as
+              svc::SocketOps);
               fixtures/ holds the
               ext4 test image (+ gen-ext4.sh); linux-fixtures/ holds the
               built-from-source glibc test binaries (rusthello/ + rustthreads/
