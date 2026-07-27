@@ -1332,10 +1332,9 @@ That slice also introduced and fixed a regression the matrix caught -
 `exec_elf_from_vfs` is shared with the **native** `SYS_SPAWN`, which has no VMA list, so
 a lazy image left its child with an address space full of holes; the eager and lazy loads
 are now separate functions, the eager one keeping the old name so an unaware caller gets
-a correct image. Honest and named: `fork` is still an eager page copy rather than COW,
-the initial stack is mapped whole rather than growing on fault, a segment with a `.bss`
-tail is copied, and a **native** cell's image is eager (no VMA list to map records
-with) - all ride this same handler.
+a correct image. (`fork` is copy-on-write and the stack grows on fault - see the two
+paragraphs below; a segment with a `.bss` tail and a **native** cell's image stay eager,
+both riding this same handler.)
 
 **Copy-on-write `fork`** (docs/LINUX-COMPAT.md "Demand paging", docs/ARCHITECTURE-DEBT.md
 4.0 blocker 2) makes a fork **share** the parent's pages rather than copy them. It used
@@ -1367,6 +1366,18 @@ where a site cannot forget to resolve). Kernel *mechanism* (refcount, share, cow
 fault delivery) is kept separate from COW *policy* (personality code) so the policy can
 move behind a userspace process server later, the seL4 way; it is pre-resolution, not a
 fixup table, which SMP (task #27) will need.
+
+The **stack grows on fault** too (docs/LINUX-COMPAT.md, docs/ARCHITECTURE-DEBT.md 4.0
+blocker 2), which closes the last eager path in the Linux memory model - image, file
+`mmap`, `fork`, and stack are all lazy now. `setup_stack` maps only the top page (argv/
+envp/auxv) and `install_cell`/`exec_reinit` register the rest of the `PT_GNU_STACK`
+request as an anonymous RW reservation (`mem::reserve_stack`); a touch below the top page
+faults in through the same handler, a touch below the reservation is a SIGSEGV (the guard
+page from the bound, not a dedicated page). An image asking for 64 MiB of stack used to
+pay it before `main`; it now pays one page plus what it touches. `stackx` (linuxproc, all
+three ISAs) proves it: a 12 MiB request's 9280 KiB of writes appear as 2380 demand fills,
+59 when the eager mapping is restored. Still eager and named: a `.bss`-tail segment and a
+native cell's image, both riding this handler.
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus

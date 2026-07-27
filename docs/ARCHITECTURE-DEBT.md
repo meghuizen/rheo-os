@@ -587,9 +587,16 @@ so was its claim of 182 MiB of `.bss`, which measurement shows does not exist.
    COW *policy* (personality code) is kept visible so the policy can move behind a
    userspace process server later, the seL4 way.
 
-   **Still eager, and named:** a **guard-page + grow-on-fault stack** (the initial
-   stack is mapped whole), a segment with a `.bss` tail, and every **native** cell's
-   image. All ride this same handler.
+   **Done: the stack grows on fault.** `setup_stack` maps only the top page (argv/envp/
+   auxv) and registers the rest of the `PT_GNU_STACK` request as an anonymous RW
+   reservation; a touch below the top page faults in, a touch below the reservation is a
+   SIGSEGV (the guard page from the bound, not a dedicated page). `stackx` proves it -
+   a 12 MiB request's 9280 KiB of writes appear as 2380 demand fills, 59 when the eager
+   mapping is restored. That closes the last eager path: image, file `mmap`, `fork` and
+   stack are all lazy.
+
+   **Still eager, and named:** a segment with a `.bss` tail, and every **native** cell's
+   image. Both ride this same handler.
 
    **What remains before the real target can be attempted**, from measuring it: the
    275 MB binary cannot be `include_bytes!`d (a kernel image that large runs past the

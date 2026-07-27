@@ -357,9 +357,21 @@ three isolation properties (the child sees the parent's pre-fork values; neither
 writes reach the other), with the kernel's own `mm::fork_pages()`/`fork_frames()` as the
 oracle. Both halves observed failing when reverted.
 
-**Still eager, and named as such:** the initial stack (mapped whole rather than a guard
-page that grows on fault), a segment with a `.bss` tail, and every **native** cell's
-image (no VMA list to map records with). All ride the same handler;
+**The stack grows on fault.** `setup_stack` maps only its top page - the one the kernel
+writes argv/envp/auxv into - and `install_cell`/`exec_reinit` register the rest of the
+`PT_GNU_STACK` request as an anonymous read-write reservation (`mem::reserve_stack`). A
+touch below the top page faults a fresh zeroed frame in through the same handler; a touch
+below the *reservation* hits no VMA and is a SIGSEGV, so the guard page falls out of the
+bound rather than needing its own page. An image asking for a 64 MiB stack used to pay 64
+MiB before `main`; it now pays one page plus what it touches. Proven by `stackx`
+(linuxproc, all three ISAs): a 12 MiB request whose 9280 KiB of writes appear as 2380
+demand fills where an eager stack shows none (observed failing at 59 when the eager
+mapping is restored), with the RLIMIT_STACK and touch-through assertions unchanged.
+
+That closes the last eager path in the memory model: image, file `mmap`, `fork`, and the
+stack are all lazy. **Still eager, and named:** a segment with a `.bss` tail (copied
+whole because its file/zero boundary sits inside one record), and every **native** cell's
+image (no VMA list to map records with). Both ride the same handler;
 docs/ARCHITECTURE-DEBT.md 4.0 blocker 2 tracks them.
 
 ### Touching a cell's memory: the `uaccess` seam
