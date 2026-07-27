@@ -1866,6 +1866,11 @@ targets/      rheo-os custom target specs + the std port: rheo_os-*.json,
   without a written justification.
 - **No new dependencies casually.** xtask has zero dependencies and the
   kernel has none; keep it that way unless a doc names the crate.
+  docs/SUBSTRATE.md 11 formalizes this into tiers: Tier K
+  (kernel/abi/posix/xtask) stays zero-dep permanently; Tier S (librheo/net/
+  cells) may take named, pinned, vendored-or-hash-locked deps that build on
+  all three ISAs; Tier A (apps/fixtures) pins crates.io freely, built from
+  source by xtask.
 - **CI must stay green** on all three ISAs (.github/workflows/ci.yml). A
   panic in the kernel exits QEMU with a failure code, so CI catches it.
 

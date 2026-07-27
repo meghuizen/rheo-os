@@ -28,6 +28,10 @@ back. Here:
 
 ## 1a. The multicore model - multikernel, not a big lock
 
+(Implementation is owned by docs/SUBSTRATE.md stage S3, which also names
+the fair-class algorithm: EEVDF with BORE-style burstiness on top of the
+EDF reserved class.)
+
 A choice the design implied but never stated: **the kernel control plane is
 per-core (multikernel-style), not one shared kernel behind a big lock (SMP).**
 Each core runs its own kernel instance with its own scheduler state, its own

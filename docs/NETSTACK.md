@@ -257,7 +257,13 @@ kernels stay green.
   timer wheel; the socket/steering kernel object if earned; DDoS-isolation proof.
 - **N7 - WireGuard + IPsec + QUIC/HTTP3 + multicast/IGMP + ICMP polish** (core
   traceroute + TTL/hop-limit landed early in **N1e**, §9; N7 keeps IGMP/MLD, PMTU,
-  and the live ICMPv6 path).
+  and the live ICMPv6 path). QUIC additionally carries the field learnings
+  recorded in docs/SUBSTRATE.md 9: BBRv3's dual-scale bandwidth estimate +
+  0.85xBDP headroom as a `cc` refinement, pacing safe-zones validated against
+  jitter histograms (P95-P50), and an FEC phase (XOR one-loss-per-group, then
+  Reed-Solomon k-loss) gated on `fec_recovered > 0` under group-aligned loss
+  injection - never on a goodput delta. QUIC's per-connection RTO/PTO/pacing/
+  idle/key-update deadlines are what size SUBSTRATE.md's per-core timer wheel.
 - **N8 - Inline NIC TLS offload** (the keys-as-capabilities payoff): program
   session keys into a NIC TX/RX queue as a capability, encrypted zero-copy fetch
   removes Kafka's encryption cliff. Hardware-only, so the QEMU proof is the

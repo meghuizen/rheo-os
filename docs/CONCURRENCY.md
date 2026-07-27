@@ -15,7 +15,9 @@ Validated as light threads against Linux/Go/Python in comparison/threads/
 (~85 ns spawn+teardown, ~12 ns switch; ~1,200-1,600x faster than OS threads,
 ~8-17x faster than goroutines). Deferred: multiple vcores + granting, the
 preemption doorbell (section 4, needs the timer/IRQ path), stackful strands
-(section 2), priority-inheritance locks, and vcore-local storage.
+(section 2), priority-inheritance locks, and vcore-local storage. The
+multi-vcore build-out (per-core scheduler, work stealing, Linux threads as
+vcores) is owned by docs/SUBSTRATE.md pillar 3 / stage S3.
 
 Position: threads get light by splitting in two. The kernel schedules
 **vcores** (one kernel context each); the runtime inside a cell schedules

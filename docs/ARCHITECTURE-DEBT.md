@@ -1034,6 +1034,13 @@ lines, 22 kernels, no assertion touched); next: gate `VirtualLink`;
 split (deletes `net`'s posture split permanently); `Registry`; `Skip`; the `arch`
 traits; `Validated`/`Evidence`.
 
+**Then - the substrate.** docs/SUBSTRATE.md owns the structural end of the
+recurring "limit raise, not a design change" pattern this ledger keeps
+recording (§4.0 and the raised caps throughout): funded per-cell kernel
+metadata replacing the fixed `MAX_*` statics, the per-cell VA allocator
+replacing the magic-VA map, vcores/preemption (#27), hard-float std, the
+per-core timer wheel, and the workload gates - staged S1-S7 there.
+
 **Throughout.** Every step additive per `ENGINEERING.md` §8: the pre-existing
 proofs must pass **unedited**. If a proof needed editing, the step was not
 additive - find out why.

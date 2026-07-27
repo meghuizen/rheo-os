@@ -52,6 +52,13 @@ driver *protocols*; it imports driver *logic*.**
 
 Nothing below invents a mechanism these fragments do not already sketch.
 
+Driver cells are ordinary cells and therefore run on the substrate
+docs/SUBSTRATE.md re-founds: funded per-cell metadata (an LKL cell's fd/
+thread/timer counts would blow today's fixed caps), vcores for concurrency,
+per-vcore queues for the data plane, and the "interrupts are optional,
+report the mode truthfully" law for the D2 IRQ wait. D2's device capability
+trio and SUBSTRATE.md pillar 5's NVMe pass-through land as one capability.
+
 ---
 
 ## 3. The three lanes

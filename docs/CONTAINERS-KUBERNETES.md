@@ -10,6 +10,10 @@ primitives exist natively.
 
 ## 1. The container primitive
 
+(The substrate capacity to actually run this - cells and threads past the
+current fixed caps, per-bundle budgets, vcores, the CRI-shaped runtime - is
+owned by docs/SUBSTRATE.md pillar 8.)
+
 - A **cell** is the container: one address space, one capability set, its
   queues. No namespaces stack, no cgroups, no seccomp - isolation is not
   assembled from seven mechanisms; it is the native unit.
