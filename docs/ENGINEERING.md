@@ -407,8 +407,45 @@ of this document argues for.
 10. Probe every capability claim; record the validated value, not the requested
     one.
 11. Live paths additive, degrading with a printed reason; nothing synthesised.
-12. Full matrix green on all three ISAs; every pre-existing test still passing;
-    formatter and linter clean across the documented target set.
+12. Verification scaled to the change (see 13); every pre-existing test still
+    passing; formatter and linter clean across the documented target set.
+
+## 13. Verification costs what it costs - so spend it where it buys something
+
+**Rule.** Match the verification to the blast radius of the change. Measure the
+cost model before optimising it, and never run two tree-mutating agents at once.
+
+**The measured cost model** (this tree, this emulator): a **warm** no-op build is
+~3 s per ISA; a test kernel boots in **2-5 s** (`bench-core` is the outlier at
+~32 s). So the full matrix - 57 kernels x 3 ISAs - is **~10-12 minutes**, and the
+boots, not the build, dominate.
+
+**The case.** Runs were taking 40-70 minutes, and the cause was not the matrix.
+Two agents were mutating one working tree concurrently: they invalidated each
+other's build fingerprints (24 cargo invocations, several with different
+`RUSTFLAGS` against a shared `target/`), and they collided on the shared
+`target/qemu-<arch>-<bin>.log` filenames, producing **spurious failures** that
+forced kernel-by-kernel reruns with retries. One of them also had to fix a
+non-compiling tree it did not create, and once stashed the other's in-progress
+work. The serialised cost was several hours of wall clock for no additional
+assurance.
+
+**Required practice.**
+- **One tree-mutating worker at a time.** Read-only analysis may run in parallel;
+  anything that edits, builds, or boots may not.
+- Scale the matrix to the blast radius:
+  - a **kernel** change owes the **full matrix** - `.bss` motion has broken an
+    unrelated kernel before (11), so "unrelated" is not a safe assumption there;
+  - a change confined to a **userspace crate** (`net/`, `librheo/`, `json/`,
+    `posix/`) owes the kernels that embed it plus one canary from another family;
+  - a **docs-only** change owes formatter/linter, nothing more.
+- Iterate with `cargo xtask test --arch <isa> --bin <k1>,<k2>,...` - it boots only
+  those kernels. Reach for the full matrix to *confirm*, not to iterate.
+- CI is the backstop for cross-cutting regressions. A green subset plus CI beats
+  an hour of local matrix that a concurrent agent has already invalidated.
+- If a run is unexpectedly slow, **measure where the time goes** before changing
+  anything. The assumption that "the tests are slow" was wrong; the tests were
+  fine and the process around them was not.
 
 **Reporting it**
 13. State scope precisely: built / proven / partially proven / deferred, with

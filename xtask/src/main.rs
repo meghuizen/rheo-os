@@ -669,18 +669,30 @@ fn main() -> ExitCode {
         // calls (debug builds insert pointer-check panics that land in
         // unmapped kernel .text), and optimized path lengths are the
         // system's real numbers anyway.
-        // `--bin <kernel>` boots only that one (fast iteration on a single
-        // subsystem); without it the whole matrix runs.
+        // `--bin <kernel>[,<kernel>...]` boots only those (fast iteration on the
+        // kernels a change can actually affect); without it the whole matrix
+        // runs. A userspace-only change cannot affect an unrelated kernel, but a
+        // *kernel* change can - `.bss` motion once broke an unrelated kernel
+        // (docs/ENGINEERING.md 11), so kernel changes still owe the full matrix.
         "test" => {
             let kernels: Vec<&str> = match &bin_filter {
                 None => TEST_KERNELS.to_vec(),
-                Some(name) => {
-                    if !TEST_KERNELS.contains(&name.as_str()) {
-                        eprintln!("error: unknown test kernel '{name}'");
+                Some(list) => {
+                    let selected: Vec<&str> = list
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if selected.is_empty() {
+                        eprintln!("error: --bin needs at least one kernel name");
+                        return ExitCode::FAILURE;
+                    }
+                    if let Some(bad) = selected.iter().find(|n| !TEST_KERNELS.contains(n)) {
+                        eprintln!("error: unknown test kernel '{bad}'");
                         eprintln!("known: {}", TEST_KERNELS.join(", "));
                         return ExitCode::FAILURE;
                     }
-                    vec![name.as_str()]
+                    selected
                 }
             };
             arches.iter().all(|&a| {
@@ -713,7 +725,7 @@ fn main() -> ExitCode {
 fn print_usage() {
     eprintln!(
         "usage: cargo xtask <build|run|test|bench|std-patch> \
-         [--arch x86_64|aarch64|riscv64|all] [--bin <kernel>] [--release]"
+         [--arch x86_64|aarch64|riscv64|all] [--bin <kernel>[,<kernel>...]] [--release]"
     );
 }
 
