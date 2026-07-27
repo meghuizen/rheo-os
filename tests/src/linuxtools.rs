@@ -167,6 +167,14 @@ extern "C" fn kernel_main() -> ! {
     );
     check(&[b"coreutils", b"pwd"], 0, b"/\n");
 
+    // Scale evidence for demand paging, free: this kernel loads the unpatched upstream
+    // coreutils multicall - a ~4-4.7 MB binary - once per utility. An eager loader paid
+    // for its whole image every time (docs/ARCHITECTURE-DEBT.md 4.0, blocker 2).
+    println!(
+        "linuxtools: {} image page(s) left to demand paging across this run, {} copied",
+        kernel::load::recorded_pages(),
+        kernel::load::eager_pages()
+    );
     println!("linuxtools: PASS");
     arch::exit(arch::ExitCode::Success)
 }
