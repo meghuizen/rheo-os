@@ -1137,6 +1137,26 @@ fixup path.
     entire observable effect: it produces no core dumps. JSC marks the 128 GiB
     Gigacage `MADV_DONTDUMP`, which is the sane thing to do with mostly-untouched
     address space.
+  - **V8's JIT reaches baseline compilation and dies at one call.** Running `node`
+    *without* `--jitless` produces a V8 fatal whose native stack trace names the exact
+    site: `Runtime_BytecodeBudgetInterrupt_Ignition` ->
+    `BaselineBatchCompiler::CompileBatch` -> `Compiler::CompileBaseline` ->
+    `BaselineCompiler::Build` -> `Factory::CodeBuilder::BuildInternal` ->
+    `MemoryAllocator::AllocatePage` -> `SetPermissionsOnExecutableMemoryChunk` ->
+    `v8::base::OS::SetPermissions`, which fatals on `Check failed: 12 == errno`. So
+    V8 gets all the way through Ignition and into tiering up to Sparkplug before the
+    single `mprotect(PROT_WRITE|PROT_EXEC)` is refused - the claim "the one
+    `mprotect(RWX)` V8 would issue is refused" is now a cited trace rather than an
+    assertion. Two things follow. V8 *requires* `ENOMEM` from a failed
+    `SetPermissions` and fatals on anything else, so our `-EPERM` (the errno a
+    hardened Linux returns) produces a hard abort rather than V8's own graceful
+    path - and returning `ENOMEM` to steer a program down a nicer path would be
+    fabricating a reason, so it is not done. And unmodified Node 22 cannot use a
+    W->X flip or a dual mapping: `v8_enable_write_protect_code_memory` is a
+    **compile-time** option in this build, so JIT here needs either a rebuilt V8 or a
+    doctrine change to W^X (ARCHITECTURE.md 5), which is a decision the admission rule
+    in ARCHITECTURE.md 6 reserves and which docs/ARCHITECTURE-DEBT.md 4.0 already
+    flags as "deliberately not decided".
   - **The timer wheel's bulk re-file path skipped its trailing bucket expiry.** Taken
     when more than a level-0 revolution has elapsed with nothing serviced, it left an
     already-due timer to fire on the *next* service - after timers with later
@@ -1145,10 +1165,29 @@ fixup path.
     (observed failing while the host was building three ISAs) rather than as a bug. A
     transport would have applied a later RTO before an earlier one.
 
-  **Node completes fully - and now does so under preemption**, with 30 slices taken to
-  sibling contexts, exact stdout and exit 0. That is the more useful half of the
-  experiment: a preemption kernel that only ever preempts a purpose-built spinner has
-  not been tested by anything.
+  **Node completes fully under preemption - but only about seven runs in eight.** With
+  queue-driven dispatch enabled it repeatedly ran to its correct answer with 17-31
+  slices genuinely taken to sibling contexts mid-run, which was the useful half of the
+  experiment (a preemption kernel that only ever preempts a purpose-built spinner has
+  not been tested by anything). Then one run died with **SIGSEGV and no output at all**,
+  same binary, same kernel, same command. Four immediate re-runs passed.
+
+  That is a **residual state-save gap on the preemption path**, not a Node property, and
+  it is recorded here with its rate rather than filed as a flake. What is already ruled
+  out: the vector-register file (saved first on every preemption path, see above), the
+  general-purpose set (`common_trap`'s ring-3 capture is the same code the fault path
+  uses, and its stack offsets are shared with the exception stubs), and the resume
+  instruction (IRET, not SYSRET). What is not ruled out: a preemption landing inside
+  signal delivery or between the steps of `rt_sigreturn` - Node installs handlers, and
+  FP state across a handler is a documented L5 gap - and the x86-64 `IA32_FMASK`
+  question of whether a timer interrupt can land in ring 0 mid-syscall at a point the
+  ring-0 handler's assumptions do not cover.
+
+  The `linuxnode` boot is therefore **cooperative again** until the gap is found. An
+  occasional segfault in the suite is worse than a capability not exercised, because it
+  trains everyone to re-run a red test. The deterministic `preempt` kernel - two cells,
+  no syscalls, with the cooperative case asserted as its own negative control - remains
+  the proof that preemption works, and it does not depend on this.
 
 ## 6. Fixture build matrix (reproducibility)
 

@@ -504,10 +504,41 @@ presented as a rare load-dependent flake in `substrate` (observed failing while 
 was building three ISAs) rather than as a bug; a transport would have applied a later
 RTO before an earlier one.
 
-**Node, by contrast, now completes *under* preemption** - 30 slices taken to sibling
-contexts, exact stdout, exit 0. That is the more useful half of the experiment: a
-preemption kernel that only ever preempts a purpose-built spinner has not been tested by
-anything.
+**Node completes under preemption - but only ~7 runs in 8.** With dispatch enabled it
+repeatedly ran to its correct answer with 17-31 slices genuinely taken to sibling
+contexts mid-run; then one run died with **SIGSEGV and no output**, same binary, same
+kernel, same command, and four immediate re-runs passed. That is a residual state-save
+gap on the preemption path, not a Node property, and it is recorded with its rate rather
+than filed as a flake. Already ruled out: the vector-register file (saved first on every
+preemption path), the GPR set (`common_trap`'s ring-3 capture is the fault path's own
+code, sharing its stack offsets with the exception stubs), and the resume instruction
+(IRET, not SYSRET). Not ruled out: a preemption landing inside signal delivery or
+between the steps of `rt_sigreturn` (Node installs handlers, and FP across a handler is
+a documented L5 gap), and whether a timer interrupt can land in ring 0 mid-syscall at a
+point the ring-0 handler's assumptions do not cover. **The `linuxnode` boot is
+cooperative again** until it is found - an occasional segfault in the suite is worse
+than a capability not exercised, because it trains everyone to re-run a red test - and
+the deterministic `preempt` kernel, which carries its own negative control, remains the
+proof and does not depend on it.
+
+**V8's JIT reaches baseline compilation and dies at one named call.** Running `node`
+without `--jitless` fatals with a V8 native stack trace giving the exact site:
+`Runtime_BytecodeBudgetInterrupt_Ignition` -> `BaselineBatchCompiler::CompileBatch` ->
+`Compiler::CompileBaseline` -> `BaselineCompiler::Build` ->
+`Factory::CodeBuilder::BuildInternal` -> `MemoryAllocator::AllocatePage` ->
+`SetPermissionsOnExecutableMemoryChunk` -> `v8::base::OS::SetPermissions`, dying on
+`Check failed: 12 == errno`. So V8 gets through Ignition and into tiering up to
+Sparkplug before the single `mprotect(PROT_WRITE|PROT_EXEC)` is refused - the long-
+standing claim "the one `mprotect(RWX)` V8 would issue is refused" is now a cited trace
+rather than an assertion. V8 *requires* `ENOMEM` from a failed `SetPermissions` and
+fatals on anything else, so our `-EPERM` (the errno a hardened Linux returns) gives a
+hard abort instead of V8's own graceful path; returning `ENOMEM` to steer it somewhere
+nicer would be fabricating a reason, so it is not done. And unmodified Node 22 can use
+neither a W->X flip nor a dual mapping, because
+`v8_enable_write_protect_code_memory` is **compile-time** in this build - so JIT here
+needs a rebuilt V8 or a change to W^X, which ARCHITECTURE.md 6's admission rule
+reserves and docs/ARCHITECTURE-DEBT.md 4.0 already flags as "deliberately not
+decided".
 
 **timerfd is done** (docs/LINUX-COMPAT.md L8-TIMERFD, GOAL-TIMERFD):
 `timerfd_create`/`settime`/`gettime` - the **timer source of libuv**, and thus of
