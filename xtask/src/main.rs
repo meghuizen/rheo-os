@@ -766,6 +766,14 @@ fn build_userland(arch: Arch) -> bool {
         "rheo-libc",
         "-p",
         "rheo-net",
+        // The deterministic-proof support types (`tcp::VirtualLink`) live behind
+        // the non-default `proof` feature so a fault injector cannot reach a
+        // production posture, and above all cannot reach the librheo-free codec
+        // posture that links beside a *kernel* binary
+        // (docs/ARCHITECTURE-DEBT.md 3.5). The demo **cells** are exactly the
+        // proofs that drive it, so they are built with it on.
+        "--features",
+        "proof",
         "--release",
         "--target",
         arch.target(),
@@ -871,7 +879,7 @@ fn build_smoltcp_demo(arch: Arch) -> bool {
         "--bin",
         "netsmoltcp-demo",
         "--features",
-        "smoltcp",
+        "smoltcp,proof",
         "--release",
         "--target",
         arch.target(),
@@ -956,7 +964,7 @@ fn build_tls_demo(arch: Arch) -> bool {
         "--bin",
         "nettls-demo",
         "--features",
-        "tls",
+        "tls,proof",
         "--release",
         "--target",
         arch.target(),
@@ -997,7 +1005,7 @@ fn build_http_demo(arch: Arch) -> bool {
         "--bin",
         "nethttp-demo",
         "--features",
-        "tls",
+        "tls,proof",
         "--release",
         "--target",
         arch.target(),

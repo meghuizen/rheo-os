@@ -75,6 +75,14 @@ default = ["edge", "hosted"]
 # Turning it OFF (`--no-default-features`) yields the **codec** posture, which
 # links into a kernel binary (docs/NETSTACK.md N4b).
 hosted = ["dep:librheo"]
+# The **deterministic-proof** support types (docs/ARCHITECTURE-DEBT.md 3.5):
+# `tcp::VirtualLink`, the in-cell loopback that carries a segment to a peer
+# `Connection` and can be armed to **drop** one, which is what makes RTO recovery
+# provable with no live peer. It is fault injection, so it must not ship in a
+# production posture - and it especially must not ship in the librheo-free codec
+# posture, which links into *kernel* binaries for the N4b bridge. Off by default;
+# xtask enables it for the demo cells whose proofs drive it.
+proof = []
 # A tiny subset: raw frames + minimal UDP (future). Smallest datapath.
 embedded = []
 # General host / firewall / WAF: the full L2-L4 core (future TCP/TLS).

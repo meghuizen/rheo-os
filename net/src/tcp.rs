@@ -1305,6 +1305,12 @@ impl<C: CongestionControl> Connection<C> {
 /// §11): it carries an emitted segment to the peer's receive path, optionally
 /// **dropping** one chosen segment to prove RTO recovery. This is the loopback the
 /// deterministic proof drives - no NIC, no IP routing, fully in-cell.
+///
+/// Behind the non-default **`proof`** feature: it is a fault injector, and it used
+/// to compile into every posture including the librheo-free codec posture that
+/// links beside a kernel binary (docs/ARCHITECTURE-DEBT.md 3.5). A production
+/// build now cannot reach a "drop the next segment" switch at all.
+#[cfg(feature = "proof")]
 #[derive(Default)]
 pub struct VirtualLink {
     /// When set, drop the next data-bearing segment that crosses the link, once.
@@ -1313,6 +1319,7 @@ pub struct VirtualLink {
     dropped: u64,
 }
 
+#[cfg(feature = "proof")]
 impl VirtualLink {
     pub fn new() -> VirtualLink {
         VirtualLink::default()

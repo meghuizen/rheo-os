@@ -190,7 +190,7 @@ a bifurcated public API.
 items and is linked by both a kernel binary and a cell with no feature gymnastics
 at all. librheo did not follow the model its own dependency set.
 
-### 3.5 A fault-injection fixture ships in the library (A, small)
+### 3.5 A fault-injection fixture shipped in the library - **CLOSED** (see §1)
 
 `VirtualLink` (`net/src/tcp.rs:1304-1361`) is `pub`, carries a `drop_next_data`
 fault-injection flag, and there is **not one `cfg(test)` in the whole `net`
@@ -235,9 +235,17 @@ feature.
   not mapped in a cell), and per-target file paths in test kernels. Writing it
   down also separated a real defect from the noise: `iommu.rs`'s five sites are
   named there as a violation, not an exemption.
-- **Two `install_script` implementations in the kernel** with the same doc
-  comment (`input.rs:96`, `pty.rs:20-34`), each with its own `static mut SOURCE`
-  and `Source::Script` variant, consumers split between them. **(B)**
+- ~~**Two `install_script` implementations in the kernel**~~ **CLOSED (partly;
+  the rest is not de-duplication).** Both had the same doc comment
+  (`input.rs:96`, `pty.rs:20-34`), their own `static mut SOURCE`, their own
+  `Source::Script` cursor, and consumers split between them (three kernels on
+  `input`, one on `pty`). `input` now owns the single scripted source and exposes
+  `script_next_byte`/`scripted`; `pty::install_script` forwards to it.
+  **Deliberately not merged:** the two **live** paths differ in behaviour, not
+  spelling - `input`'s serial arm feeds the interrupt-driven RX ring that
+  `SYS_WAIT_INPUT` parks on, while `pty`'s polls and blocks inside the cooked
+  line read. Unifying those is a console-path change needing its own proof, and
+  calling it de-duplication would have hidden that.
 - **Object 5 implemented twice, and the shipped path ignores the memory kind.**
   `mm/grant.rs` is the typed implementation but is used **only by tests**; the
   path a cell reaches (`SYS_GRANT` -> `grant_create`, `user.rs:470-526`) uses a
@@ -342,10 +350,10 @@ Measured, not estimated.
 | Pattern | Duplication | Framework | Effort / risk |
 |---|---|---|---|
 | ~~**Test-kernel boilerplate**~~ **DONE (first pass)** | **~2,684 removable lines** across 26 kernels; the console `FileOps` 8-stub block copied **22 times verbatim**; 14 launch blocks differing by **2 lines**; **10** independent `macro_rules!` for the same per-ISA `include_bytes!` | `console_personality` (two honest variants) + `harness::run_elf_cell`/`run_linux_cell` + `fixture::cell!`/`linux!`/`linux_cargo!`. **-1,533 net lines** across 23 files, 22 kernels converted, every assertion unchanged. Remaining: the `heap!` macro and the `.user`-window kernels (`bench_core`/`isolation_hw`/`lsh`/`schedidle`/`security`/`shell_smoke`), whose launches are genuinely different | M / **LOW** (test-only; failures are loud) |
-| **The virtio trio** | **~860 of 2,391 lines (36%)**; 48 constants in >1 driver; `PciXport` 3x (net vs gpu diff to **zero lines**); 5 ring structs 3x; the reset sequence character-identical in **all six** places | `hw/virtio/`: `trait VirtioTransport`, `VirtQueue<N>` with `submit_chain(&[Seg])`, `negotiate()` | L / **S(gpu) → M(blk) → L(net)** |
+| **The virtio trio** - **NEXT** | **~860 of 2,424 lines (36%)** (net 921 / gpu 868 / blk 635, re-counted); 48 constants in >1 driver; `PciXport` net-vs-gpu re-diffed to **3 lines** - one field, `notify_off: [u32; 2]` vs `u32`, so it is one type parameterised by queue count (the register's earlier "zero lines" was optimistic, the substance holds); 5 ring structs 3x; the reset sequence character-identical in **all six** places | `hw/virtio/`: `trait VirtioTransport`, `VirtQueue<N>` with `submit_chain(&[Seg])`, `negotiate()` | L / **S(gpu) → M(blk) → L(net)**. Deliberately left for its own slice: it is live DMA driver code on three ISAs, so a half-converted trio shipped mid-slice is worse than a staged one |
 | **Fixed-slot registries** | 22 registries, ~1,080 lines; **12 fit one generic** (7 are literally the same 8 lines) | `Registry<T: Slot, N>` - **without** generations (the only site needing them stays bespoke) | M / MEDIUM (live kernel state; quiet failures) |
 | ~~**The `svc` bridge**~~ **DONE** | two structurally identical 17-line static/setter/getter triples; **31** hand-written null-check call sites in two idioms | `Bridge<T>` + `NicOps`/`DisplayOps` landed (`PersonalityOps` still later) | S / LOW |
-| **The proof harness** | `VirtualLink` defined once (good) but the **pump loop exists in 4 hand-written copies** (~131 lines) and there are **six** notions of "advance a controlled clock" | `net::proof` behind a non-default feature: `LogicalClock`, `VirtualLink`, one `pump()` | S-M / LOW |
+| **The proof harness** - *partly done* | `VirtualLink` defined once (good) but the **pump loop exists in 4 hand-written copies** (~131 lines) and there are **six** notions of "advance a controlled clock" | `VirtualLink` is now behind the non-default `proof` feature (§3.5). Still to do: move it into a `net::proof` module with `LogicalClock` and one `pump()` | S-M / LOW |
 | **The honesty pattern** | re-invented three times (`input`, `net_rx`, `ktimer`) - same accessor bodies, same `SAFETY` comment text; skip-with-reason is free-form prose at **19** sites with **three** different markers | `Validated<T>` + `Evidence`; a typed `Skip` enum | M / **MEDIUM** on `Evidence` (the counters *are* the proofs), LOW on `Skip` |
 
 ### The meta-observation

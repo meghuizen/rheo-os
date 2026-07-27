@@ -66,6 +66,18 @@ impl RxRing {
 }
 
 /// Where raw input bytes come from.
+///
+/// This is the **only** definition of a scripted keystroke source in the kernel:
+/// `pty`'s line discipline used to carry its own byte-for-byte copy - same enum,
+/// same `install_script`, its own `static mut SOURCE` and its own cursor - with
+/// consumers split between the two (docs/ARCHITECTURE-DEBT.md 3.6). It now reads
+/// the script through [`script_next_byte`].
+///
+/// Note what is deliberately *not* merged: each module keeps its own **live**
+/// path. `input`'s serial arm feeds the interrupt-driven RX ring that
+/// `SYS_WAIT_INPUT` parks on; `pty`'s polls and blocks inside the cooked line
+/// read. Those differ in behaviour, not just in spelling, so unifying them is a
+/// console-path change with its own proof, not a de-duplication.
 enum Source {
     /// Live serial console (`cargo xtask run`).
     Serial,
@@ -100,6 +112,34 @@ pub fn install_script(script: &'static [u8]) {
     unsafe {
         *addr_of_mut!(SOURCE) = Source::Script(script, 0);
     }
+}
+
+/// The next byte of the installed script, or `None` on a live-serial source or at
+/// end of script. The single reader of the scripted-input cursor; `pty`'s cooked
+/// line discipline calls this instead of keeping a second copy of it.
+pub fn script_next_byte() -> Option<u8> {
+    // SAFETY: single CPU, synchronous; SOURCE is written only by `reset` /
+    // `install_script`, both before any cell runs.
+    let src = unsafe { &mut *addr_of_mut!(SOURCE) };
+    match src {
+        Source::Serial => None,
+        Source::Script(data, pos) => {
+            if *pos >= data.len() {
+                None
+            } else {
+                let b = data[*pos];
+                *pos += 1;
+                Some(b)
+            }
+        }
+    }
+}
+
+/// Whether a script (rather than the live console) is installed - what lets a
+/// caller with its own live path tell the two apart.
+pub fn scripted() -> bool {
+    // SAFETY: as above.
+    matches!(unsafe { &*core::ptr::addr_of!(SOURCE) }, Source::Script(..))
 }
 
 /// Push a received byte into the RX ring - the UART RX interrupt handler's sink
