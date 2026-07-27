@@ -887,8 +887,8 @@ fn grant_create(cur: usize, out_va: u64, len: usize, kind: u64, _flags: u64) -> 
 ///  - the cell's **own queue-pair region**, which the kernel still holds a raw
 ///    `QueuePair` overlay onto.
 ///
-/// So authority comes from the same place `SYS_COMMIT`/`DECOMMIT`/`SEAL` get it
-/// - [`grant_resolve`], i.e. a live MemoryGrant capability carrying MAP - for a
+/// So authority comes from the same place `SYS_COMMIT`/`DECOMMIT`/`SEAL` get it -
+/// [`grant_resolve`], i.e. a live MemoryGrant capability carrying MAP - for a
 /// typed grant, and from the cell's own bump regions otherwise. A peer's shared
 /// grant *does* have a slot in the peer's table, but its capability was minted
 /// READ-only, so `grant_resolve`'s MAP check refuses it: that is the existing

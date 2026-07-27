@@ -479,10 +479,17 @@ pub fn doorbell_count() -> u64 {
 /// Discover the machine. QEMU's arm virt hands a bare ELF no firmware
 /// table - x0 arrives as 0 and no DTB is placed in guest RAM - so we use
 /// the fixed QEMU virt platform profile (hw/arm/virt.c) for memory and the
-/// PCIe ECAM window. CPU topology needs a firmware table too: PSCI is the
-/// only enumeration path and it is unusable from EL1 here (SMC traps with
-/// no EL3, HVC needs EL2), so ARM64 reports the boot CPU only. On x86 and
-/// RISC-V the full CPU count comes from ACPI / the device tree.
+/// PCIe ECAM window. **CPU topology needs a firmware table**, and there is
+/// none: on x86 the count comes from the ACPI MADT and on RISC-V from the
+/// device tree, but here neither exists, so ARM64 reports the boot CPU only.
+///
+/// This used to be attributed to PSCI being unusable from EL1, which
+/// docs/SMP.md 7 disproved - PSCI answers on the `hvc` conduit and starts a
+/// real secondary. PSCI is simply not an *enumeration* API (`CPU_ON` starts a
+/// CPU you already name). Probing `PSCI_AFFINITY_INFO` over candidate
+/// affinities would be a genuine enumeration path and is a documented
+/// follow-on; it is not done here because it would move the PSCI helper out of
+/// the `smp` cargo feature and change every kernel's inventory.
 pub fn discover(inv: &mut crate::hw::Inventory) {
     inv.firmware = crate::hw::Firmware::Builtin;
     // QEMU virt: RAM at 0x4000_0000. We map (and therefore report) the
@@ -501,74 +508,221 @@ pub fn discover(inv: &mut crate::hw::Inventory) {
 }
 
 // ------------------------------------------------------------------- SMP
-// docs/SMP.md, task #27. On this QEMU virt config the kernel runs at EL1 with
-// no EL2/EL3 (secure=off, virtualization=off), so PSCI is unusable from the
-// kernel: an `smc #0` (PSCI conduit) is UNDEFINED at EL1 with no EL3 to service
-// it and traps back into EL1. `smp_start_secondary` makes a **genuine** PSCI
-// `CPU_ON` attempt, but guards the SMC with a temporary exception vector so the
-// trap is observed and reported instead of killing the primary (which would hit
-// the fatal sync handler). Either way ARM64 skips-with-reason: a real secondary
-// bring-up needs an EL3 PSCI provider (firmware) this config does not have.
+// docs/SMP.md 7, task #27. **A real secondary core.** The kernel runs at EL1 with
+// no EL2/EL3 (QEMU `virt`, secure=off, virtualization=off), and this port used to
+// issue PSCI as `smc #0`, which with no EL3 to service it is UNDEFINED at EL1 and
+// traps straight back - recorded, correctly as far as it went, as "PSCI is
+// unusable here".
+//
+// That was a conclusion about the *instruction*, not about PSCI. QEMU's `virt`
+// implements PSCI itself and chooses the conduit from the machine configuration:
+// **HVC** for the plain machine, SMC when `virtualization=on` hands the guest an
+// EL2 of its own. The default configuration - the one this tree boots - answers
+// PSCI on HVC, the one conduit the port never tried. Bring-up now **probes** with
+// PSCI_VERSION over each conduit and uses whichever answers
+// (docs/ENGINEERING.md 1), then does a genuine `CPU_ON` into an MMU-on secondary
+// trampoline sharing the primary's page tables (`kernel/arch/aarch64/smp.S`).
+// Both conduits stay guarded, so a machine that answers on neither reports
+// skip-with-reason instead of dying.
 
-/// This CPU's index. ARM64 does not bring up secondaries here, so only the boot
-/// CPU ever asks - always CPU 0.
+/// MPIDR affinity 0 of each CPU, indexed by registry index; `u32::MAX` = unused.
+/// Filled by each CPU as it establishes its identity.
+#[cfg(feature = "smp")]
+static mut MPIDR_OF_CPU: [u32; crate::hw::MAX_CPUS] = [u32::MAX; crate::hw::MAX_CPUS];
+
+/// This CPU's MPIDR_EL1 affinity level 0 - a **read-only hardware id**, so a
+/// core's identity comes from the silicon rather than from what the primary told
+/// it.
+#[cfg(feature = "smp")]
+fn mpidr_aff0() -> u32 {
+    let mpidr: u64;
+    // SAFETY: reads MPIDR_EL1, a read-only id register available at EL1.
+    unsafe { asm!("mrs {0}, mpidr_el1", out(reg) mpidr, options(nomem, nostack)) };
+    (mpidr & 0xFF) as u32
+}
+
+/// This CPU's registry index, resolved from its **own** MPIDR against the table
+/// each CPU filled in [`smp_set_this_cpu`].
+///
+/// `tpidr_el1` - the register RISC-V's `tp` equivalent would be - is already the
+/// owner of the current `TrapFrame` pointer in `kernel/arch/aarch64/vectors.S`, so
+/// it is not free for a per-CPU index. A search over a tiny fixed table costs one
+/// system-register read and is on no hot path (only code that opted into SMP
+/// reaches `smp::this_cpu`). Falls back to 0 - the boot CPU - for a CPU that has
+/// not registered, which is exactly the pre-bring-up single-CPU answer.
 #[cfg(feature = "smp")]
 pub fn cpu_index() -> usize {
+    let me = mpidr_aff0();
+    // SAFETY: each CPU writes only its own slot, and the write happens-before the
+    // reads that matter (a secondary registers before marking itself online).
+    let table = unsafe { *core::ptr::addr_of!(MPIDR_OF_CPU) };
+    for (i, &id) in table.iter().enumerate() {
+        if id == me {
+            return i;
+        }
+    }
     0
 }
 
-/// No-op: no per-CPU identity register is established (single-core path).
+/// Record that the CPU running this call is registry index `index`, by writing its
+/// own MPIDR affinity into that slot. Runs on the CPU it describes.
 #[cfg(feature = "smp")]
-pub fn smp_set_this_cpu(_index: usize) {}
+pub fn smp_set_this_cpu(index: usize) {
+    let me = mpidr_aff0();
+    // SAFETY: single writer per slot; no other CPU reads it before the secondary
+    // signals itself up.
+    unsafe {
+        (*core::ptr::addr_of_mut!(MPIDR_OF_CPU))[index] = me;
+    }
+}
 
-/// The boot CPU's hardware id: MPIDR_EL1 affinity 0 (0 on this config).
+/// The boot CPU's hardware id: MPIDR_EL1 affinity 0, read from the hardware.
 #[cfg(feature = "smp")]
 pub fn boot_cpu_hw_id() -> u32 {
-    let mpidr: u64;
-    // SAFETY: reads MPIDR_EL1, a read-only id register available at EL1.
-    unsafe { asm!("mrs {0}, mpidr_el1", out(reg) mpidr) };
-    (mpidr & 0xFF) as u32
+    mpidr_aff0()
 }
 
 #[cfg(feature = "smp")]
 unsafe extern "C" {
-    /// Guarded PSCI `CPU_ON` (arch/aarch64/smp.S). Issues `smc #0` with the
-    /// function id in x0 and args in x1-x3, behind a temporary exception vector
-    /// that catches the EL1 trap. Returns the PSCI status, or the sentinel
-    /// `PSCI_TRAPPED` if the SMC trapped (no EL3 conduit).
-    fn psci_cpu_on_guarded(target: u64, entry: u64, ctx: u64) -> u64;
-    /// Physical (low LMA) entry the guarded attempt points a would-be secondary
-    /// at: the boot trampoline, which parks any non-boot core in a wfe loop.
-    static SMP_PARK_ENTRY_PA: u64;
+    /// Guarded PSCI call (arch/aarch64/smp.S): `conduit` 0 = `hvc #0`, 1 =
+    /// `smc #0`, behind a temporary exception vector that catches a trap. Returns
+    /// the PSCI return value, or [`PSCI_TRAPPED`] if the conduit trapped.
+    fn psci_call_guarded(conduit: u64, fnid: u64, a1: u64, a2: u64, a3: u64) -> u64;
+    /// Physical (low LMA) address of the MMU-on secondary entry trampoline.
+    static SMP_SECONDARY_ENTRY_PA: u64;
+    /// `.boot.bss` slots (identity low) where the primary publishes MAIR/TCR/SCTLR
+    /// for the secondary to adopt verbatim - see the header of smp.S.
+    static AP_SYSREGS: u64;
 }
 
-/// Sentinel returned by [`psci_cpu_on_guarded`] when the SMC trapped to EL1.
+/// Sentinel returned by [`psci_call_guarded`] when the conduit trapped to EL1.
 #[cfg(feature = "smp")]
 const PSCI_TRAPPED: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 
-/// Make a genuine PSCI `CPU_ON` attempt for `hw_id` and report the observed
-/// outcome (docs/SMP.md). Always returns Err on this config: the SMC either
-/// traps (no EL3) or, if QEMU emulates PSCI, a full ARM secondary bring-up (a
-/// shared-page-table MMU-on trampoline) is not implemented here.
+/// PSCI function ids (SMC Calling Convention / PSCI 1.1): `PSCI_VERSION` is the
+/// cheapest read-only call, which is what makes it a good conduit probe.
+#[cfg(feature = "smp")]
+const PSCI_VERSION: u64 = 0x8400_0000;
+#[cfg(feature = "smp")]
+const PSCI_CPU_ON: u64 = 0xC400_0003;
+
+/// The conduit that actually answered PSCI_VERSION, cached: 0 = HVC, 1 = SMC,
+/// [`u64::MAX`] = neither (probed once).
+#[cfg(feature = "smp")]
+static mut PSCI_CONDUIT: u64 = u64::MAX;
+#[cfg(feature = "smp")]
+static mut PSCI_PROBED: bool = false;
+/// The PSCI version the working conduit reported, for the bring-up report.
+#[cfg(feature = "smp")]
+static mut PSCI_VERSION_SEEN: u64 = 0;
+
+/// Find the PSCI conduit by **calling** it, not by assuming one. Tries HVC then
+/// SMC with `PSCI_VERSION`; a conduit counts as working only if it returns without
+/// trapping and reports a sane (non-zero, non-error) version. Cached.
+#[cfg(feature = "smp")]
+fn psci_conduit() -> Option<u64> {
+    // SAFETY: single CPU at bring-up; a plain static read.
+    if unsafe { *core::ptr::addr_of!(PSCI_PROBED) } {
+        // SAFETY: as above.
+        let c = unsafe { *core::ptr::addr_of!(PSCI_CONDUIT) };
+        return if c == u64::MAX { None } else { Some(c) };
+    }
+    let mut found = u64::MAX;
+    let mut version = 0;
+    for conduit in [0u64, 1u64] {
+        // SAFETY: the helper guards the call with its own exception vector, so a
+        // conduit that is UNDEFINED at EL1 returns the sentinel instead of
+        // faulting the kernel.
+        let v = unsafe { psci_call_guarded(conduit, PSCI_VERSION, 0, 0, 0) };
+        // A trapped conduit returns the sentinel; a serviced one returns
+        // major<<16|minor. Reject 0 and the negative error range.
+        if v != PSCI_TRAPPED && v != 0 && (v as i64) > 0 {
+            found = conduit;
+            version = v;
+            break;
+        }
+    }
+    // SAFETY: single CPU at bring-up.
+    unsafe {
+        *core::ptr::addr_of_mut!(PSCI_CONDUIT) = found;
+        *core::ptr::addr_of_mut!(PSCI_VERSION_SEEN) = version;
+        *core::ptr::addr_of_mut!(PSCI_PROBED) = true;
+    }
+    if found == u64::MAX { None } else { Some(found) }
+}
+
+/// Publish this (primary) CPU's MAIR/TCR/SCTLR for the secondary trampoline, so
+/// the secondary comes up in **exactly** the primary's translation regime rather
+/// than in a re-derived approximation of it (the same reasoning as the x86 AP's
+/// control registers, where a divergence cost a triple fault).
+#[cfg(feature = "smp")]
+fn publish_ap_sysregs() {
+    let (mair, tcr, sctlr): (u64, u64, u64);
+    // SAFETY: kernel context; reads of this CPU's own EL1 system registers.
+    unsafe {
+        asm!("mrs {0}, mair_el1", out(reg) mair, options(nomem, nostack));
+        asm!("mrs {0}, tcr_el1", out(reg) tcr, options(nomem, nostack));
+        asm!("mrs {0}, sctlr_el1", out(reg) sctlr, options(nomem, nostack));
+    }
+    // AP_SYSREGS is in `.boot.bss`, whose symbol address is its physical address;
+    // the kernel runs high, so it is written through the linear map.
+    // SAFETY: single CPU at bring-up; three aligned 8-byte writes to kernel BSS.
+    unsafe {
+        let base = phys_to_virt(core::ptr::addr_of!(AP_SYSREGS) as usize) as *mut u64;
+        base.write(mair);
+        base.add(1).write(tcr);
+        base.add(2).write(sctlr);
+    }
+}
+
+/// Start the secondary core with MPIDR affinity `hw_id` via PSCI `CPU_ON`, over
+/// whichever conduit the probe found. Returns `Ok(())` once PSCI accepted the
+/// call (the portable `smp::bring_up_one` then waits, bounded, for the core to run
+/// kernel code and mark itself online), or the observed reason it was refused.
 #[cfg(feature = "smp")]
 pub fn smp_start_secondary(hw_id: u32) -> Result<(), &'static str> {
-    let entry = unsafe { core::ptr::addr_of!(SMP_PARK_ENTRY_PA).read() };
-    // PSCI_CPU_ON (64-bit) function id 0xC4000003 is set inside the asm helper.
-    let status = unsafe { psci_cpu_on_guarded(hw_id as u64, entry, 0) };
+    let Some(conduit) = psci_conduit() else {
+        return Err(
+            "PSCI answered on neither conduit: hvc #0 and smc #0 both trapped to EL1 (no PSCI \
+             implementation and no EL2/EL3 firmware in this QEMU config)",
+        );
+    };
+    // Report what answered, not what the machine type implies: the conduit and the
+    // PSCI version the probe actually got back (docs/ENGINEERING.md 1).
+    // SAFETY: single CPU; set by the probe above.
+    let version = unsafe { *core::ptr::addr_of!(PSCI_VERSION_SEEN) };
+    crate::println!(
+        "aarch64: PSCI answered on {} - version {}.{} (probed, not assumed)",
+        if conduit == 0 { "hvc #0" } else { "smc #0" },
+        version >> 16,
+        version & 0xFFFF
+    );
+    publish_ap_sysregs();
+    // SAFETY: a read of a link-time constant in `.rodata`.
+    let entry = unsafe { *core::ptr::addr_of!(SMP_SECONDARY_ENTRY_PA) };
+    // SAFETY: guarded call; `entry` is the trampoline's own physical address.
+    let status = unsafe { psci_call_guarded(conduit, PSCI_CPU_ON, hw_id as u64, entry, 0) };
     match status {
-        PSCI_TRAPPED => {
-            Err("PSCI CPU_ON: smc #0 trapped to EL1 (no EL3 firmware in this QEMU config)")
-        }
-        0 => Err(
-            "PSCI CPU_ON accepted, but ARM shared-page-table secondary bring-up is not implemented",
-        ),
+        PSCI_TRAPPED => Err("PSCI CPU_ON trapped although PSCI_VERSION did not"),
+        0 => Ok(()), // SUCCESS
         s if s == (-1i64 as u64) => Err("PSCI CPU_ON returned NOT_SUPPORTED"),
         s if s == (-2i64 as u64) => Err("PSCI CPU_ON returned INVALID_PARAMETERS"),
         s if s == (-4i64 as u64) => {
             Err("PSCI CPU_ON returned ALREADY_ON (QEMU pre-started the core)")
         }
+        s if s == (-7i64 as u64) => Err("PSCI CPU_ON returned INVALID_ADDRESS"),
         _ => Err("PSCI CPU_ON returned an error status"),
     }
+}
+
+/// Where the secondary trampoline hands control to Rust, on the secondary core, at
+/// EL1 with the MMU on and the primary's page tables live. It hands the portable
+/// driver this core's hardware identity - read from its own MPIDR, not passed in -
+/// and returns to an asm `wfe` park.
+#[cfg(feature = "smp")]
+#[unsafe(no_mangle)]
+extern "C" fn aarch64_secondary_main() {
+    crate::smp::secondary_run(mpidr_aff0());
 }
 
 /// Feature names; bit i corresponds to index i in CpuReport.features.

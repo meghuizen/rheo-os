@@ -698,38 +698,335 @@ pub fn discover(inv: &mut crate::hw::Inventory) {
 }
 
 // ------------------------------------------------------------------- SMP
-// docs/SMP.md, task #27. x86-64 AP bring-up is **not implemented here** and is
-// honestly reported as blocked: an application processor starts in 16-bit
-// real mode and must be released with an INIT-SIPI-SIPI sequence pointing at a
-// trampoline placed below 1 MiB, which then switches to long mode and joins the
-// kernel. PVH boot hands us no low real-mode memory or firmware to stage that
-// trampoline, and building one cleanly is out of scope for this phase (it must
-// not destabilise the single-core boot every other kernel depends on). CPU
-// *detection* is done - ACPI MADT already counts the APs in the inventory - so
-// the honest deliverable is the count plus a documented blocker. `smp` skips x86
-// with this reason and still passes.
+// docs/SMP.md 6, task #27. **Real AP bring-up.** An application processor leaves
+// reset in 16-bit real mode and is released by an INIT-SIPI-SIPI sequence through
+// the local APIC's interrupt command register, with the SIPI's 8-bit vector
+// naming a page **below 1 MiB** to start executing at. Two things had to exist
+// first: a working ICR (the whole point of the xAPIC MMIO work above - the x2APIC
+// MSR block this port used is inert under QEMU TCG, so a SIPI written there went
+// nowhere), and a real-mode trampoline in low memory, which PVH boot gives no
+// firmware to stage, so the kernel stages it itself
+// (`kernel/arch/x86_64/smp.S`, copied to [`AP_TRAMPOLINE_PA`]).
+//
+// Everything here is `#[cfg(feature = "smp")]`, so the 55 kernels that never opt
+// in link an unchanged library - including the trampoline's assembly.
 
-/// This CPU's index. x86-64 does not bring up secondaries here, so only the boot
-/// processor ever asks - always CPU 0.
+#[cfg(feature = "smp")]
+global_asm!(
+    include_str!("../../../arch/x86_64/smp.S"),
+    options(att_syntax)
+);
+
+/// Physical page the AP trampoline is copied to and started at. Constraints: 4
+/// KiB aligned and **below 1 MiB** (a SIPI vector is 8 bits: the AP starts at
+/// `vector << 12`), in RAM, and clear of anything firmware left in low memory.
+/// 0x8000 sits above the real-mode IVT/BDA and below the PVH start-info and ACPI
+/// staging area; [`smp_start_secondary`] **verifies** all of that at runtime
+/// rather than assuming it.
+#[cfg(feature = "smp")]
+const AP_TRAMPOLINE_PA: usize = 0x8000;
+
+#[cfg(feature = "smp")]
+unsafe extern "C" {
+    /// First byte of the trampoline, in `.boot.text` (VMA == LMA, so its symbol
+    /// address is its physical address).
+    static ap_trampoline: u8;
+    static ap_trampoline_end: u8;
+    /// The base address the trampoline was **assembled for**, published by the
+    /// assembly so Rust can cross-check it against [`AP_TRAMPOLINE_PA`]. The
+    /// trampoline is position-fixed, so a silent disagreement between the two
+    /// constants would jump the AP into nowhere.
+    static AP_TRAMPOLINE_BASE: u64;
+    /// Slots in `.boot.bss` (identity low, so readable by the trampoline's
+    /// 32-bit stage with paging off) where the primary publishes its own control
+    /// registers for the AP to adopt verbatim - see the header of smp.S.
+    static AP_CR4: u64;
+    static AP_EFER: u64;
+    static AP_CR0: u64;
+}
+
+/// Publish this (primary) CPU's `CR4`, `EFER` and `CR0` for the AP trampoline, so
+/// the secondary comes up in **exactly** the primary's mode rather than in a
+/// hand-picked approximation of it.
+///
+/// This is not tidiness. The kernel's page tables carry NX on real entries - the
+/// APIC register window among them - and with `EFER.NXE` clear a set bit 63 is a
+/// **reserved-bit** page fault, so an AP that merely set `LME` triple-faulted on
+/// its first LAPIC read (observed, not theorised). Copying the control registers
+/// makes that whole class of divergence impossible rather than enumerable.
+#[cfg(feature = "smp")]
+fn publish_ap_mode() {
+    // SAFETY: kernel context; reads of this CPU's own control registers.
+    let (cr4, cr0) = unsafe {
+        let cr4: u64;
+        let cr0: u64;
+        asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+        asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack));
+        (cr4, cr0)
+    };
+    // SAFETY: kernel context; EFER is architectural.
+    let efer = unsafe { paging_rdmsr(0xC000_0080) };
+    // The three slots live in `.boot.bss`, whose symbol address is its physical
+    // address; the kernel runs high, so they are written through the linear map.
+    // SAFETY: single CPU at bring-up; three aligned 8-byte writes to kernel BSS.
+    unsafe {
+        let w = |sym: usize, v: u64| {
+            (phys_to_virt(sym) as *mut u64).write(v);
+        };
+        w(core::ptr::addr_of!(AP_CR4) as usize, cr4);
+        w(core::ptr::addr_of!(AP_EFER) as usize, efer);
+        w(core::ptr::addr_of!(AP_CR0) as usize, cr0);
+    }
+}
+
+/// LAPIC registers only AP bring-up needs (see the register table above).
+#[cfg(feature = "smp")]
+const LAPIC_ID: usize = 0x020;
+#[cfg(feature = "smp")]
+const LAPIC_ICR_LOW: usize = 0x300;
+#[cfg(feature = "smp")]
+const LAPIC_ICR_HIGH: usize = 0x310;
+
+/// This CPU's local APIC id, read **from the local APIC** - each CPU's own
+/// register file answers at the same address (QEMU maps the APIC page per-CPU, as
+/// real hardware does), so this is a genuine hardware identity and not something
+/// the primary told the secondary. In xAPIC the id is in bits 24-31.
+#[cfg(feature = "smp")]
+fn lapic_id() -> u32 {
+    match apic_mode() {
+        ApicMode::XApic => lapic_read(LAPIC_ID) >> 24,
+        ApicMode::X2Apic => lapic_read(LAPIC_ID),
+        ApicMode::None => 0,
+    }
+}
+
+/// Send an inter-processor interrupt to APIC id `dest`. `icr_low` carries the
+/// vector plus the delivery mode / level / trigger bits.
+///
+/// The ICR is the one register whose two access modes differ in shape: xAPIC has
+/// a 32-bit low/high pair where the **high half must be written first** (writing
+/// the low half is what issues the IPI), while x2APIC has a single 64-bit MSR.
+#[cfg(feature = "smp")]
+fn lapic_send_ipi(dest: u32, icr_low: u32) {
+    match apic_mode() {
+        // SAFETY: a validated x2APIC MSR write; the ICR is MSR 0x830, 64-bit.
+        ApicMode::X2Apic => unsafe {
+            paging_wrmsr(0x830, ((dest as u64) << 32) | icr_low as u64);
+        },
+        ApicMode::XApic => {
+            lapic_write(LAPIC_ICR_HIGH, dest << 24);
+            lapic_write(LAPIC_ICR_LOW, icr_low);
+        }
+        ApicMode::None => {}
+    }
+}
+
+/// Wait (bounded) for a sent IPI to be accepted: the ICR's Delivery Status bit
+/// (12) clears. x2APIC has no delivery-status bit (its MSR write is synchronous),
+/// so this only polls in xAPIC mode. Bounded by wall time, so a wedged APIC costs
+/// one short window instead of hanging the primary.
+#[cfg(feature = "smp")]
+fn lapic_ipi_wait() {
+    if apic_mode() != ApicMode::XApic {
+        return;
+    }
+    let t0 = cycles();
+    while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
+        if ticks_to_ns(cycles().wrapping_sub(t0)) > 10_000_000 {
+            return; // 10 ms; the caller's own bounded wait decides the outcome
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Busy-wait `ns` nanoseconds of TSC time. Used for the two delays the
+/// INIT-SIPI-SIPI sequence architecturally requires. Deliberately **not** the
+/// timer arbiter: bring-up runs before any deadline client exists, and touching
+/// `arch::timer_*` here would break the single-owner invariant
+/// (docs/ENGINEERING.md 3).
+#[cfg(feature = "smp")]
+fn delay_ns(ns: u64) {
+    let t0 = cycles();
+    while ticks_to_ns(cycles().wrapping_sub(t0)) < ns {
+        core::hint::spin_loop();
+    }
+}
+
+/// APIC id -> CPU registry index, filled by each CPU as it establishes its
+/// identity. `u32::MAX` = unused. Indexed by CPU index, so slot 0 is the boot
+/// CPU's APIC id.
+#[cfg(feature = "smp")]
+static mut APIC_ID_OF_CPU: [u32; crate::hw::MAX_CPUS] = [u32::MAX; crate::hw::MAX_CPUS];
+
+/// This CPU's registry index, resolved from its **own** local APIC id against the
+/// table each CPU filled in [`smp_set_this_cpu`].
+///
+/// x86-64 has no free general register to dedicate to a per-CPU pointer the way
+/// RISC-V has `tp`: `FS` carries a Linux cell's TLS base and `GS`/`KERNEL_GS_BASE`
+/// are reserved for the eventual `swapgs` per-CPU block, which is a change to the
+/// syscall entry path and does not belong in a bring-up phase. A search over a
+/// tiny fixed table is honest and costs a LAPIC read; it is on no hot path (the
+/// single-CPU kernels never call it, since `smp::this_cpu` is only reached from
+/// code that opted into SMP). Falls back to 0 - the boot CPU - if this CPU has not
+/// registered, which is exactly the pre-bring-up single-CPU answer.
 #[cfg(feature = "smp")]
 pub fn cpu_index() -> usize {
+    let me = lapic_id();
+    // SAFETY: single writer per slot (each CPU writes only its own), and the
+    // write happens-before the reads that matter (the secondary sets its slot
+    // before marking itself online).
+    let table = unsafe { *core::ptr::addr_of!(APIC_ID_OF_CPU) };
+    for (i, &id) in table.iter().enumerate() {
+        if id == me {
+            return i;
+        }
+    }
     0
 }
 
-/// No-op: no per-CPU identity register is established (single-core path).
+/// Record that the CPU running this call is registry index `index`, by writing
+/// its own APIC id into that slot. Runs on the CPU it describes.
 #[cfg(feature = "smp")]
-pub fn smp_set_this_cpu(_index: usize) {}
+pub fn smp_set_this_cpu(index: usize) {
+    let me = lapic_id();
+    // SAFETY: single CPU writes this slot, and no other CPU reads it before the
+    // secondary signals itself up.
+    unsafe {
+        (*core::ptr::addr_of_mut!(APIC_ID_OF_CPU))[index] = me;
+    }
+}
 
-/// The bootstrap processor's hardware id (APIC id 0 on this QEMU q35 config).
+/// The bootstrap processor's hardware id: its **local APIC id, read from the
+/// hardware** (it is 0 on this QEMU q35 config, but that is an observation, not
+/// an assumption). Requires the APIC to be up, so it brings it up.
 #[cfg(feature = "smp")]
 pub fn boot_cpu_hw_id() -> u32 {
-    0
+    lapic_probe();
+    lapic_id()
 }
 
-/// Report the x86-64 AP-bring-up blocker (docs/SMP.md). No AP is started.
+/// Whether the low page `[AP_TRAMPOLINE_PA, +4 KiB)` is safe to overwrite: RAM
+/// per the firmware memory map, and clear of the two structures firmware left in
+/// low memory that the kernel still reads - the PVH `hvm_start_info` block and
+/// the ACPI RSDP it points at. Returns the reason it is not, or `None`.
+///
+/// This is a check rather than a comment because the page is chosen by the kernel
+/// (PVH gives no low staging area to be handed one), and stamping a trampoline
+/// over firmware data would be a silent memory corruption, not a failed boot.
 #[cfg(feature = "smp")]
-pub fn smp_start_secondary(_hw_id: u32) -> Result<(), &'static str> {
-    Err("needs a 16-bit real-mode AP trampoline (INIT-SIPI-SIPI) below 1 MiB; not implemented")
+fn ap_page_conflict() -> Option<&'static str> {
+    let lo = AP_TRAMPOLINE_PA as u64;
+    let hi = lo + 4096;
+    let inv = crate::hw::inventory();
+    let mut in_ram = false;
+    for i in 0..inv.nmem {
+        let r = inv.mem[i];
+        if r.kind == crate::hw::MemKind::Ram && r.base <= lo && lo + 4096 <= r.base + r.len {
+            in_ram = true;
+        }
+    }
+    if !in_ram {
+        return Some("the chosen low trampoline page is not usable RAM in the firmware memory map");
+    }
+    let info = boot_firmware_ptr() as u64;
+    if info >= lo && info < hi {
+        return Some("the chosen low trampoline page holds the PVH hvm_start_info block");
+    }
+    // The RSDP address is the 5th u32 of hvm_start_info (magic, version, flags,
+    // nr_modules, modlist_paddr(8), cmdline_paddr(8), rsdp_paddr(8)); read it
+    // through the linear map rather than re-parsing ACPI.
+    if info != 0 {
+        // SAFETY: the PVH block QEMU wrote is in low RAM, reached through the
+        // kernel's linear map; `rsdp_paddr` is at offset 32 per the PVH ABI.
+        let rsdp = unsafe { ((phys_to_virt(info as usize) + 32) as *const u64).read() };
+        if rsdp >= lo && rsdp < hi {
+            return Some("the chosen low trampoline page holds the ACPI RSDP");
+        }
+    }
+    None
+}
+
+/// Start the application processor with APIC id `hw_id`: stage the real-mode
+/// trampoline in low memory, then release the AP with INIT-SIPI-SIPI. Returns
+/// `Ok(())` once the SIPI has been sent (the portable `smp::bring_up_one` then
+/// waits, bounded, for the AP to run kernel code and mark itself online), or a
+/// reason a start was not attempted.
+///
+/// Nothing here can hang: both delays and the ICR delivery-status poll are
+/// bounded by wall time, and a non-responsive AP surfaces as the caller's
+/// `StartError::Timeout` rather than a wedged primary.
+#[cfg(feature = "smp")]
+pub fn smp_start_secondary(hw_id: u32) -> Result<(), &'static str> {
+    lapic_probe();
+    if apic_mode() == ApicMode::None {
+        return Err("no usable local APIC (neither x2APIC nor the xAPIC MMIO page responded)");
+    }
+    // The trampoline is position-fixed: it was assembled for one base address,
+    // and jumping an AP at a different one would land it in nowhere. Cross-check
+    // the assembly's own view against ours before touching anything.
+    // SAFETY: a read of a link-time constant in `.rodata`.
+    let assembled_for = unsafe { *core::ptr::addr_of!(AP_TRAMPOLINE_BASE) };
+    if assembled_for != AP_TRAMPOLINE_PA as u64 {
+        return Err("AP trampoline base disagrees between smp.S and mod.rs");
+    }
+    if let Some(reason) = ap_page_conflict() {
+        return Err(reason);
+    }
+    publish_ap_mode();
+
+    // Copy the trampoline from `.boot.text` (identity low, so its symbol address
+    // is its physical address) to the chosen low page. Both ends are touched
+    // through the kernel's linear map, so this works whichever root is active.
+    let src_pa = core::ptr::addr_of!(ap_trampoline) as usize;
+    let end_pa = core::ptr::addr_of!(ap_trampoline_end) as usize;
+    let len = end_pa - src_pa;
+    if len == 0 || len > 4096 {
+        return Err("AP trampoline does not fit in one low page");
+    }
+    // SAFETY: `src` is the trampoline's own bytes and `dst` is the low page
+    // verified above to be RAM the firmware is not using; both are inside the
+    // kernel's linear map of physical 0-2 GiB and the regions do not overlap
+    // (the trampoline is linked at 1 MiB, the destination below it).
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            phys_to_virt(src_pa) as *const u8,
+            phys_to_virt(AP_TRAMPOLINE_PA) as *mut u8,
+            len,
+        );
+    }
+
+    // INIT-SIPI-SIPI (Intel MP spec / SDM 9.4.4). Delivery modes: INIT = 5,
+    // Start-Up = 6; bit 14 = level assert, bit 15 = level triggered.
+    const INIT_ASSERT: u32 = (1 << 15) | (1 << 14) | (5 << 8);
+    const INIT_DEASSERT: u32 = (1 << 15) | (5 << 8);
+    let sipi: u32 = (6 << 8) | (AP_TRAMPOLINE_PA >> 12) as u32;
+
+    lapic_send_ipi(hw_id, INIT_ASSERT);
+    lapic_ipi_wait();
+    delay_ns(10_000_000); // 10 ms, the spec's post-INIT wait
+    lapic_send_ipi(hw_id, INIT_DEASSERT);
+    lapic_ipi_wait();
+    for _ in 0..2 {
+        lapic_send_ipi(hw_id, sipi);
+        lapic_ipi_wait();
+        delay_ns(200_000); // 200 us between the two SIPIs
+    }
+    Ok(())
+}
+
+/// Where the AP trampoline hands control to Rust, on the secondary CPU, in long
+/// mode on the **primary's page tables** with its own stack. It hands the
+/// portable driver this CPU's hardware identity - read from its own local APIC,
+/// not passed in - and parks when that returns.
+#[cfg(feature = "smp")]
+#[unsafe(no_mangle)]
+extern "C" fn x86_secondary_main() -> ! {
+    crate::smp::secondary_run(lapic_id());
+    loop {
+        // SAFETY: kernel context on a parked secondary; interrupts are masked
+        // (the AP has never enabled them), so this halts until an NMI/INIT.
+        unsafe { asm!("cli; hlt", options(nomem, nostack)) };
+    }
 }
 
 /// Feature names; bit i corresponds to index i in CpuReport.features.
