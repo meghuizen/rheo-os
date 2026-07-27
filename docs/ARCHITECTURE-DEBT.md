@@ -274,18 +274,45 @@ Three blockers are **design decisions**, not unfinished work:
    **eagerly copied page-by-page into private frames**.
 
 **The stub class is the practical hazard**, because a stub that reports success
-puts the failure far from the cause: `poll`/`epoll_wait` **ignore fd kind** and
-echo back the requested mask, never blocking; `nanosleep` returns immediately;
-**`futex` timeouts are treated as infinite**, so `pthread_cond_timedwait` can
-hang forever; `fcntl` unknown commands **all return 0**; `F_SETFL` discards
-`O_NONBLOCK`; stdin `read` returns **0 = EOF** on an empty FIFO; `readlinkat` is
-hardcoded `-ENOENT`; cross-process `kill` does not exist and `kill(0)`/`kill(-1)`
-**silently self-target** - which matters because subprocess management is the
-application's core function.
+puts the failure far from the cause. The base of the ladder has now been cleared;
+what is left is named precisely.
 
-The cheapest large win is **DNS**: with no `/etc/resolv.conf`, glibc falls back to
-`127.0.0.1:53`, which is classified loopback and routed to a queue nothing
-listens on - and `sendto` **reports success anyway**.
+**Fixed** (each with a proof observed to fail without it - see
+docs/LINUX-COMPAT.md for the semantics and the fixtures):
+
+| Was | Now |
+|---|---|
+| **DNS**: no `/etc/resolv.conf` anywhere, so glibc fell back to `127.0.0.1:53`, classified loopback, routed to a queue nothing listens on - and `sendto` **reported success anyway** | `/etc/{nsswitch.conf,hosts,resolv.conf}` seeded into the `linuxnet`-class ramfs (nameserver `10.0.2.3`, non-loopback); a loopback datagram to a port with **no bound endpoint** returns `-ECONNREFUSED`. `resolve.c` asserts the refusal + a deterministic `/etc/hosts` answer, and reports a **live** `getaddrinfo` (resolves on all three ISAs) |
+| **`futex` timeouts treated as infinite**, so `pthread_cond_timedwait` hung forever | the timespec in arg 3 is read (relative for WAIT, absolute for WAIT_BITSET, CLOCK_REALTIME under `FUTEX_CLOCK_REALTIME`), compared in the **cell's own clock domain**, parked on through the timer arbiter's new `FutexWait` slot; elapsed → `-ETIMEDOUT`. An unsatisfiable wait reports `-EAGAIN` + one console line instead of 0 ("you were woken"). `condwait.c` hangs to the 120 s timeout without the fix |
+| **`fcntl` unknown commands all return 0**; `F_SETFL` discards `O_NONBLOCK`; `F_GETFL` returns a literal `O_RDWR`; `FD_CLOEXEC` untracked so `execve` kept every fd | locking → `-ENOLCK`, anything else unimplemented → `-EINVAL`; `O_NONBLOCK` **honoured** (would-block → `-EAGAIN`), `O_APPEND`/`O_ASYNC` **refused**; `F_GETFL` reports the real access mode; `FD_CLOEXEC` tracked and honoured by `execve`. `fcntlx.c` asserts all four |
+| **stdin `read` returns 0 = EOF** on an empty FIFO | still 0 when blocking (no cell may park on the console - documented), but `-EAGAIN` once `O_NONBLOCK` is set, which is the answer a caller can act on |
+| **Limits**: 128 MiB pool / 96 MiB per cell / 1 MiB stack, sized for a few-hundred-KiB fixture | 512 MiB / 384 MiB / 8 MiB, with `RLIMIT_STACK` derived from the one stack constant. A **limit raise, not a design change** - demand paging is still the real answer (blocker 3 above) |
+| `op_tcp_send` never pumped RX, so ACKs never reached the state machine, the send queue filled and `write` returned 0 → EAGAIN forever: **any body larger than the send window deadlocked** | the send path drains the NIC first. **Reasoned + code-reviewed, unproven** - it needs the deterministic TCP peer the data path needs, and none was invented |
+
+**Still open, and now measured rather than suspected:**
+
+- **`poll`/`epoll_wait`** are worse than "ignore fd kind": `poll` does not consult
+  readiness **at all** - every open fd is reported ready for whatever was asked,
+  a closed one `POLLNVAL`, and the timeout is ignored. Two things depend on that
+  accident: it is what lets glibc's resolver fall through to its **blocking**
+  `recvfrom` (so DNS works *because* of the bug), and it is why creation-time
+  `O_NONBLOCK`/`SOCK_NONBLOCK` is still dropped - honouring it would turn every
+  non-blocking program into a spin that fails. A `poll` that computes readiness
+  **and waits for its timeout** plus creation-time `O_NONBLOCK` must land
+  **together**. This is the next rung.
+- `nanosleep` returns immediately; `readlinkat` is hardcoded `-ENOENT`;
+  cross-process `kill` does not exist and `kill(0)`/`kill(-1)` **silently
+  self-target** - which matters because subprocess management is the
+  application's core function.
+
+One hazard learned while bounding the futex timeout, worth recording because it is
+a *new* instance of §12's rule rather than the old one: a cell-supplied argument
+that is a pointer **only for some commands** must be validated command-aware.
+Validating futex arg 3 unconditionally refused a legitimate `FUTEX_WAKE` with
+`-EFAULT` (it is a plain *count* there, and real callers reach the syscall with
+that register simply left dirty), which silently stopped every waiter from being
+woken. It surfaced as rayon-threaded `sort` producing **no output at all** on
+ARM64 while the other two ISAs passed - a one-ISA symptom of a portable mistake.
 
 A 13-rung ladder from here to the goal is in the task list, each rung a real
 binary with an assertable outcome. Two tooling facts shape it: rungs past a

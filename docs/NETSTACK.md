@@ -2023,10 +2023,27 @@ sibling of `vfs_personality.rs`):
   retransmits inside the budget, and SLIRP's **real reset** is turned by
   `tcp::Connection` into `ECONNREFUSED`; the deadline yields `ETIMEDOUT`. TCP **data
   transfer is implemented** (`tcp_send`/`tcp_recv` over the same `Connection`,
-  reached by `read`/`write` on the fd) but is **not proven in QEMU**: SLIRP offers no
-  TCP responder, so there is no deterministic network-free data round trip to assert.
-  It is therefore honestly **untested code** until a phase adds a responder (a
-  `guestfwd`ed listener, or the N4a service cell talking to a peer cell).
+  reached by `read`/`write` on the fd) but is **not proven**.
+  **Correcting the earlier wording**, which said "SLIRP offers no TCP responder": that
+  overstated the obstacle. SLIRP *does* proxy **outbound** TCP - it is the same
+  proxying that makes the live DNS above resolve real names for UDP - so a real remote
+  TCP data exchange is reachable in principle, and the gap is not the wire. What SLIRP
+  does not offer is a **deterministic peer**: there is no built-in TCP service to talk
+  to, and anything reachable through the proxy is a property of the host, not of this
+  code. So the honest statement is "no deterministic peer is arranged", and closing it
+  means arranging one - a host-side sink started by xtask and reached at
+  `10.0.2.2:<port>`, a `guestfwd`ed listener, or the N4a service cell talking to a
+  peer cell - as a live phase that degrades with a printed reason.
+- **One real defect on that path is fixed, reasoned but unproven.** `op_tcp_send`
+  never processed inbound segments. A TCP send queue is freed by the peer's ACKs, and
+  ACKs reach the state machine only through `on_wire_segment`, which nothing called on
+  the send path - so `snd_una` never advanced, the 32 KiB send queue filled,
+  `conn.write` accepted 0 and `write` returned 0 → `EAGAIN` **forever**: any request
+  body larger than the send window **deadlocked**. The send path now drains the NIC
+  (`pump_nonblocking`, where the ACKs are) before accepting data. Per
+  docs/ENGINEERING.md 7 this is **code-reviewed and reasoned, not proven** - it needs
+  exactly the deterministic peer the data path needs, and no peer was invented to
+  claim otherwise.
 
 ### The proof: the `linuxnet` test kernel
 
@@ -2051,6 +2068,36 @@ did arrive. It additionally asserts the receive genuinely parked
 (`net_rx::irq_count() > 0` and `did_idle()` on the interrupt-driven ISAs). With no
 netdev attached it skips-with-reason (loopback coverage lives in `linuxinet`).
 Observed on all three ISAs: `dns answers yes` + `tcp refused`, exit 0.
+
+A **second fixture** (`resolve.c`) then does what a real program does: it calls
+**`getaddrinfo`**. That did not work before, and the reason was configuration
+reported as success - there was no `/etc/resolv.conf` anywhere in the tree, so glibc
+fell back to its built-in nameserver `127.0.0.1:53`; the personality classifies that
+as **loopback** and routed the query to the in-kernel datagram queue where nothing
+listens, and the send **reported the datagram sent anyway**
+(docs/LINUX-COMPAT.md, the `sendto` row - it now returns `ECONNREFUSED` when nothing
+is bound at the destination). The kernel now seeds
+`/etc/{nsswitch.conf,hosts,resolv.conf}` into the ramfs
+(`vfs_personality::seed_resolver_files`, nameserver `10.0.2.3` - a **non-loopback**
+address, so the query rides the datapath proven above). The fixture asserts, in this
+order:
+
+1. **deterministic:** a loopback datagram to a port with no bound endpoint is
+   **refused** - the rejection that used to be a silent success;
+2. **deterministic:** `rheo.test` resolves to **10.9.8.7** out of the seeded
+   `/etc/hosts` - a closed-form answer, asserted exactly, so the `files` backend is
+   proven to have read the seeded configuration with no wire involved;
+3. **live, reported not asserted:** `getaddrinfo` of a real public name. The address
+   is a property of the host's resolver, so it is never printed or asserted - only one
+   line from a fixed pair (resolved / cleanly not). Observed resolving on all three
+   ISAs on this development host.
+
+Note what step 3 rests on, because it is a **defect standing in for a feature**:
+`poll` reports every open fd ready without consulting readiness at all, which is what
+lets glibc's resolver fall through to its **blocking** `recvfrom`. That is also why
+creation-time `SOCK_NONBLOCK` is still dropped rather than honoured - a `poll` that
+computes real readiness **and waits for its timeout** has to land first, and the two
+changes have to land together (docs/LINUX-COMPAT.md, the `poll` and `fcntl` rows).
 
 ### Invariants held
 

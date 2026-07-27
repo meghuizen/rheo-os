@@ -12,10 +12,17 @@
 //! what the L6 ring pair already provides (as it does for AF_UNIX SOCK_STREAM) -
 //! and UDP to an in-order **datagram queue**. So this module implements INET
 //! sockets over loopback deterministically and network-free, keying the address
-//! namespace by `(is_v6, port)`. **NIC-backed remote INET sockets** (driving the
-//! full `net::tcp` segment/RTO/congestion state machine over virtio-net) are a
-//! **later phase**, not this one; a non-loopback destination is refused
-//! (`ENETUNREACH`).
+//! namespace by `(is_v6, port)`.
+//!
+//! **This module is still loopback-only, but the personality is not.** The
+//! sentence that used to sit here - "a non-loopback destination is refused
+//! `ENETUNREACH`" - was true when it was written and stopped being true at
+//! rheo-net N4b: `linux::fd` now forwards every non-loopback operation to the
+//! registered `svc::SocketOps` bridge, which drives the full `net::tcp` /
+//! `net::udp` machinery over virtio-net from *outside* the kernel
+//! (docs/NETSTACK.md 18). `ENETUNREACH` is what remains when **no** bridge is
+//! registered, or for a non-loopback **IPv6** destination (the N4b datapath is
+//! IPv4). Nothing here changed; the routing decision moved one level up.
 //!
 //! ## What lives here
 //! Two per-personality synthesized registries (fixed statics, like the pipe /

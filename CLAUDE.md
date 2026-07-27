@@ -889,14 +889,71 @@ phase prints one line from a small fixed set so the transcript stays exact while
 nothing is fabricated, and the kernel also asserts the receive genuinely parked
 (`net_rx::irq_count() > 0` + `did_idle()`). Honest scope: **UDP remote is complete**;
 **TCP connect is real and proven** (SYN on the wire, RTO retransmit, RST -> refused,
-deadline -> `ETIMEDOUT`) while TCP **data transfer is implemented but unproven under
-QEMU** - SLIRP offers no TCP responder, so it is untested code until a phase adds one;
-**IPv6 remote** stays `-ENETUNREACH`; no remote **listener** (inbound needs NIC
+deadline -> `ETIMEDOUT`) while TCP **data transfer is implemented but unproven** -
+**correcting the earlier wording**, SLIRP *does* proxy outbound TCP (the same proxying
+that makes the live DNS below resolve real names), so the obstacle is not the wire but
+the absence of a **deterministic peer**; arranging one (a host-side sink at
+`10.0.2.2:<port>`, a `guestfwd`ed listener, or an N4a peer cell) is what closes it. One
+real defect on that path **is** fixed: `op_tcp_send` never pumped RX, so the peer's ACKs
+never reached the state machine, `snd_una` never advanced, the send queue filled and
+`write` returned 0 -> EAGAIN forever - any body larger than the send window
+**deadlocked**; the send path now drains the NIC first (reasoned + code-reviewed,
+**not proven**, per docs/ENGINEERING.md 7). Also honest: **IPv6 remote** stays
+`-ENETUNREACH`; no remote **listener** (inbound needs NIC
 steering grants); remote handles are not refcounted across `dup`/`fork`; fixed
 registries (4 UDP / 4 TCP / 4 ARP); one documented 2 s receive + 3 s connect bound (no
-`SO_RCVTIMEO`/`O_NONBLOCK`); no DHCP (the SLIRP identity 10.0.2.15/gw 10.0.2.2 is
+`SO_RCVTIMEO`; a descriptor made non-blocking with `fcntl(F_SETFL, O_NONBLOCK)` passes a
+zero deadline and reports `EAGAIN`); no DHCP (the SLIRP identity 10.0.2.15/gw 10.0.2.2 is
 fixed); and moving the datapath into the **N4a service cell** awaits N4a's deferred
 name-based rendezvous.
+
+**Name resolution + four Linux-personality stubs that reported success** (docs/
+LINUX-COMPAT.md, docs/NETSTACK.md 18). Hand-building a DNS packet proved the datapath
+but not what real programs do, which is call **`getaddrinfo`** - and that failed,
+because nothing in the tree provided `/etc/resolv.conf`, so glibc fell back to its
+built-in nameserver `127.0.0.1:53`, which the personality classifies as **loopback** and
+routed into the in-kernel datagram queue where nothing listens - and **the send reported
+success anyway**. Four fixes, each an `ENGINEERING.md` 7 violation of the same shape (a
+stub reporting success while doing nothing), each with a proof observed to fail without
+it: (1) the `linuxnet`-class kernels seed `/etc/{nsswitch.conf,hosts,resolv.conf}`
+(nameserver `10.0.2.3`, non-loopback) and a loopback datagram to a port with no bound
+endpoint now returns `-ECONNREFUSED` - the `resolve` fixture asserts that refusal, then
+`rheo.test` -> **10.9.8.7** out of the seeded `/etc/hosts` (deterministic, no wire), then
+reports a **live** `getaddrinfo` of a real public name (resolves on all three ISAs here;
+the address is never asserted). (2) **`futex` honours its timeout** - it was ignored
+entirely, so `pthread_cond_timedwait` hung; the timespec in arg 3 is now read
+(relative for `FUTEX_WAIT`, absolute for `FUTEX_WAIT_BITSET`, CLOCK_REALTIME when
+`FUTEX_CLOCK_REALTIME` is set), compared in the **cell's own clock domain**
+(`linux::cell_clock_ns`, the domain the program computed the deadline in), and parked on
+through the timer arbiter's new `FutexWait` slot - never `arch::timer_*` directly. A wait
+with no timeout and no runnable sibling can never be satisfied: it now reports `-EAGAIN`
+plus one console line instead of 0 ("you were woken"). The `condwait` fixture in
+`linuxthreads` times out twice on a never-signalled condvar; without the fix it hangs to
+the 120 s boot-test timeout (observed). Bounding the new pointer argument also caught a
+defect of its own making: validating futex arg 3 unconditionally refused a legitimate
+`FUTEX_WAKE` with `-EFAULT` (real callers leave that register dirty because it is a
+*count* there), which silently stopped every waiter waking - observed as rayon-threaded
+`sort` producing no output on ARM64 while the other two ISAs passed; the check is now
+command-aware. (3) **`fcntl` stops lying**: it ended in
+`_ => 0`, so every unimplemented command reported success - file locking now answers
+`-ENOLCK` (no lock manager) and anything else `-EINVAL`; `F_SETFL(O_NONBLOCK)` is
+**honoured** on every fd kind (a would-block read returns `-EAGAIN`, and an empty
+non-blocking console no longer answers 0 = end-of-input) while `O_APPEND`/`O_ASYNC` are
+**refused** rather than dropped; `F_GETFL` reports the real access mode;
+`FD_CLOEXEC` is tracked and **`execve` closes those descriptors** (it used to keep every
+fd). The `fcntlx` fixture in `linuxproc` asserts all four, including self-`execve`ing to
+check one fd is gone and another survived. (4) **Limits raised for the real target**:
+the frame pool 128 -> **512 MiB**, the per-cell budget 96 -> **384 MiB**, the global
+reserve 8 -> 16 MiB, the Linux stack 1 -> **8 MiB** (with `RLIMIT_STACK` now derived
+from the one constant, since glibc sizes thread stacks from it). QEMU gives 1 GiB and the
+pool base sits 64 MiB into RAM, so the headroom is deliberate - firmware puts blobs near
+the *top* of RAM (RISC-V `virt`'s DTB at ~`0xBFE0_0000`). This is a **limit raise, not a
+design change**; the proper fix is **demand paging**, a later rung. Found worse than
+described along the way: **`poll` does not compute readiness at all** - every open fd is
+reported ready and the timeout is ignored - which is simultaneously what lets glibc's
+resolver reach its blocking `recvfrom` and the reason creation-time
+`O_NONBLOCK`/`SOCK_NONBLOCK` still cannot be honoured; a waiting, readiness-computing
+`poll` is the next rung and the two must land together.
 
 **rheo-net N4c** (docs/NETSTACK.md 20) is **host configuration** - the two questions a
 host must answer before anything works, *who am I on this link* and *what time is it*.
@@ -1356,7 +1413,11 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               remote INET for unmodified Linux binaries - an unmodified
               static-glibc C binary does a real DNS round trip to SLIRP's
               resolver 10.0.2.3:53 and a real remote TCP connect over the NIC,
-              through the svc::SocketOps bridge + inet_personality.rs), nethttp
+              through the svc::SocketOps bridge + inet_personality.rs; plus the
+              `resolve` fixture: glibc's own getaddrinfo over the seeded
+              /etc/{nsswitch.conf,hosts,resolv.conf} - a loopback send with no
+              listener refused, /etc/hosts resolved deterministically, a live
+              public name reported), nethttp
               (rheo-net N5a: HTTP/1.1 + HTTP/2 - the zero-copy h1 codec with its
               22 request-smuggling rejections + the SWAR-vs-scalar scan oracle, an
               h1 client<->server exchange over the in-cell TCP VirtualLink
