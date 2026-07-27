@@ -541,11 +541,11 @@ pub fn with_current_aspace<R>(f: impl FnOnce(&mut AddressSpace) -> R) -> R {
 //
 // `len` on `SYS_MMAP`/`SYS_COMMIT` (and the Linux `mmap`/`mprotect` path) is
 // **cell-supplied**, so without a ceiling one line of unprivileged cell code -
-// `mmap(1 << 40)` - drains a fixed 128 MiB pool. ARCHITECTURE.md 5 forbids an
+// `mmap(1 << 40)` - drains the whole frame pool. ARCHITECTURE.md 5 forbids an
 // OOM *killer*; an OOM *panic* is strictly worse. Two limits make exhaustion a
 // clean `-ENOMEM` refusal instead:
 //
-//  1. a **global reserve** (`frames::USER_RESERVE_FRAMES`, 8 MiB) that no
+//  1. a **global reserve** (`frames::USER_RESERVE_FRAMES`, 16 MiB) that no
 //     cell-driven allocation may dip into, so the kernel's own allocations - the
 //     page tables a mapping needs, a driver ring, a `fork` copy - always succeed;
 //  2. a **per-cell budget** below, so one cell cannot starve its siblings even
@@ -555,11 +555,13 @@ pub fn with_current_aspace<R>(f: impl FnOnce(&mut AddressSpace) -> R) -> R {
 // what it took, so a refused syscall leaves the pool exactly as it found it.
 
 /// Frames one cell may hold at once through the cell-driven mapping paths:
-/// 24576 = 96 MiB of the 128 MiB pool. Sized so no existing workload changes
-/// behaviour (the heaviest, a glibc Linux cell with per-thread arenas, commits
-/// far less) while an absurd request is refused outright. It is a fairness cap,
-/// not the exhaustion guard - the global reserve above is that.
-pub const MAX_FRAMES_PER_CELL: usize = 24576;
+/// **98304 = 384 MiB** of the 512 MiB pool (`frames::POOL_FRAMES`). Raised in
+/// proportion to the pool, for the same reason: a ~100 MB binary plus glibc's
+/// per-thread arenas did not fit the previous 96 MiB. It is a fairness cap, not
+/// the exhaustion guard - the global reserve above is that - so it stays well
+/// under the pool, and a cell that takes its whole budget can no longer `fork`
+/// (the child's eager copy would need the same again, and is refused cleanly).
+pub const MAX_FRAMES_PER_CELL: usize = 98304;
 
 static mut CELL_FRAMES: [usize; MAX_CELLS] = [0; MAX_CELLS];
 

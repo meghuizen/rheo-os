@@ -8,11 +8,26 @@ use crate::arch;
 
 pub const FRAME_SIZE: usize = 4096;
 
-/// Pool size: 128 MiB = 32768 frames -> 4 KiB bitmap. Bumped for the Linux
-/// personality (docs/LINUX-COMPAT.md L2): a static-glibc cell's BSS + brk +
-/// mmap arenas dwarf the native programs'. QEMU runs `-m 1G`, and the pool
-/// fits inside the identity-mapped RAM window on all three ISAs.
-pub const POOL_FRAMES: usize = 32768;
+/// Pool size: **512 MiB = 131072 frames** -> a 16 KiB bitmap. QEMU runs `-m 1G`
+/// on every ISA and the pool base sits 64 MiB into RAM
+/// (`arch::FRAME_POOL_BASE`), so ~960 MiB is physically available and the pool
+/// fits inside the kernel's linear map on all three ISAs.
+///
+/// **This is a limit raise, not a design change.** It was 128 MiB, sized for
+/// static-glibc fixtures of a few hundred KiB. The binding target is a ~100 MB
+/// dynamically-linked binary, which exhausted a 128 MiB pool (and the 96 MiB
+/// per-cell budget) before reaching `main`. The *proper* fix is **demand
+/// paging** - a fault handler that commits a page when it is first touched, so
+/// an image's unreferenced pages cost nothing - which is a later rung of work
+/// (docs/LINUX-COMPAT.md, "Demand paging"). Until then the image is committed
+/// eagerly and the pool has to hold it.
+///
+/// Headroom, deliberately: the remaining ~450 MiB is not taken because firmware
+/// places blobs near the **top** of RAM - with `-m 1G` QEMU's RISC-V `virt` puts
+/// the device tree the kernel parses at ~`0xBFE0_0000`, i.e. 958 MiB in. A pool
+/// that reached it would overwrite the DTB. Raising this further means checking
+/// that first.
+pub const POOL_FRAMES: usize = 131072;
 
 static mut BITMAP: [u64; POOL_FRAMES / 64] = [0; POOL_FRAMES / 64];
 static mut NEXT_HINT: usize = 0;
@@ -48,10 +63,13 @@ pub fn init() {
 /// `SYS_MMAP`/`SYS_COMMIT` and the Linux `mmap`/`mprotect` path refuse once the
 /// free pool would drop below this, so a cell can never take the last frame out
 /// from under the kernel's own allocations - the page tables its mappings need,
-/// a driver ring, a `fork`'s copy. 2048 frames = 8 MiB, comfortably more than
-/// the intermediate page tables a single cell's whole budget can require
-/// (~48 leaf tables per 96 MiB, plus their parents).
-pub const USER_RESERVE_FRAMES: usize = 2048;
+/// a driver ring, a `fork`'s copy. 4096 frames = 16 MiB.
+///
+/// It scales with the per-cell budget because page-table frames are **not**
+/// charged to a cell: a 384 MiB mapping needs ~192 leaf tables plus their
+/// parents, and up to `MAX_CELLS` cells can hold mappings at once, so the
+/// reserve stays several times the worst-case page-table cost.
+pub const USER_RESERVE_FRAMES: usize = 4096;
 
 /// How many frames a **cell** may still be given: the free pool less the
 /// kernel's reserve. The number a user-driven allocation must check against
@@ -63,8 +81,8 @@ pub fn user_available() -> usize {
 
 /// Allocate one zeroed 4 KiB frame, or `None` when the pool is exhausted.
 ///
-/// Exhaustion is a **return value, not a panic**: the pool is a fixed 128 MiB
-/// and `len` on a cell's `SYS_MMAP` is cell-supplied, so "the pool ran out" is
+/// Exhaustion is a **return value, not a panic**: the pool is a fixed size
+/// ([`POOL_FRAMES`]) and `len` on a cell's `SYS_MMAP` is cell-supplied, so "the pool ran out" is
 /// a condition an unprivileged cell can drive at will and must therefore be
 /// refusable (ARCHITECTURE.md 5 forbids an OOM killer; an OOM *panic* is
 /// strictly worse). Kernel-internal callers that allocate a bounded, known

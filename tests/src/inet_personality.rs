@@ -605,6 +605,14 @@ fn op_tcp_send(h: u64, buf_va: u64, len: u64) -> i64 {
     }
     let (peer_ip, peer_mac) = (c.peer_ip, c.peer_mac);
     let n = len as usize;
+    // **Process inbound segments before accepting more data.** A TCP send queue is
+    // freed by the peer's ACKs, and ACKs only reach the state machine through
+    // `on_wire_segment` - which nothing called on this path. So `snd_una` never
+    // advanced, the send queue filled, `conn.write` accepted 0 and the write
+    // reported EAGAIN forever: any body larger than the send queue **deadlocked**.
+    // One drain of whatever the NIC already has is enough (it is where the ACKs
+    // are), and it costs nothing when the queue is empty.
+    pump_nonblocking();
     // SAFETY: `buf_va` is `n` readable bytes in the active cell.
     let data = unsafe { core::slice::from_raw_parts(buf_va as *const u8, n) };
     let accepted = match tcps()[idx].conn.as_mut() {

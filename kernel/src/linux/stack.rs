@@ -20,8 +20,15 @@ use crate::mm::frames::{self, FRAME_SIZE};
 /// Top of the initial user stack (matches load::USER_STACK_TOP): 8 GiB.
 const USER_STACK_TOP: usize = 0x2_0000_0000;
 /// Linux stacks are larger than the native 32 KiB - glibc probes and uses a
-/// meaningful stack early. 1 MiB (matches the RLIMIT_STACK we report).
-const LINUX_STACK_PAGES: usize = 256;
+/// meaningful stack early. **8 MiB**, the glibc/Linux default `RLIMIT_STACK`,
+/// and it must match the `RLIMIT_STACK` the personality reports
+/// (`linux::rlimit_for`) because glibc sizes *thread* stacks from that number.
+///
+/// It was 1 MiB, which real programs overrun (deep recursion, big stack frames
+/// in a JIT). The whole stack is mapped **eagerly** at load, so this costs
+/// 8 MiB of frames per Linux cell up front; a guard-page + demand-grow stack is
+/// the proper fix and rides with demand paging (docs/LINUX-COMPAT.md).
+pub const LINUX_STACK_PAGES: usize = 2048;
 
 // ELF auxiliary-vector types (Linux uapi/linux/auxvec.h).
 const AT_NULL: u64 = 0;
