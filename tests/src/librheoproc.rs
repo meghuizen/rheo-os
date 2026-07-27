@@ -239,6 +239,37 @@ extern "C" fn kernel_main() -> ! {
         }
     );
 
+    // A spawned child has its **own** capability table, so it did not inherit
+    // the orchestrator's cell-spawn authority (docs/ARCHITECTURE-DEBT.md 2.3).
+    // Before this, `install_spawned` copied the parent's `caps` pointer, so
+    // every descendant held everything the parent held - which made `abi.rs`'s
+    // "not minted into a spawned child by default" false and §8.2 property 4
+    // (disjoint capability sets) inapplicable to any parent/child pair.
+    //
+    // Each child tries to spawn `/bin/echo` - a path that exists and that the
+    // *parent* successfully spawns in this very scenario, so the refusal is
+    // about authority and not about the file.
+    // The oracle is self-normalising: every `/bin/child` run prints one line
+    // starting "child " and then exactly one verdict line, so **refusals must
+    // equal runs**. That does not have to know how many children this scenario
+    // spawns (the orchestrator also runs an 8-iteration spawn benchmark), and it
+    // still fails if even one child gets through.
+    let out = vfs_personality::captured_stdout();
+    let runs = count(out, b"child ");
+    let refused = count(out, b"no cell capability, spawn refused");
+    assert!(
+        count(out, b"SPAWNED WITHOUT AUTHORITY") == 0,
+        "a spawned child inherited cell-spawn authority"
+    );
+    assert!(
+        runs >= 3 && refused == runs,
+        "expected every spawned child to be refused a spawn: {runs} ran, {refused} refused"
+    );
+    println!(
+        "librheoproc: spawn authority is not inherited OK - all {runs} spawned \
+         children were refused a spawn of a path their parent spawns fine"
+    );
+
     // Idle-park proof: where the timer interrupt is wired, the orchestrator's
     // `time::sleep` must have genuinely idled at WFI (0% CPU, not a spin). In
     // the busy-wait build this is skipped (documented, honest).

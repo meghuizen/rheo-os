@@ -122,16 +122,49 @@ whose frames a cell already reached through `SYS_COMMIT`, revoke still removes
 the right to ask and leaves the bytes: the gap this section describes is exactly
 as wide as it was, and is now easier to hit, because a cell can trigger it.
 
-### 2.3 A spawned cell shares its parent's capability table (A + doc divergence)
+### 2.3 A spawned cell shares its parent's capability table - **CLOSED**
 
-`install_spawned` copies the parent's pointers verbatim
-(`kernel/src/user.rs:1041-1042`). Consequences: `abi.rs:313`'s claim that spawn
-authority is "not minted into a spawned child by default" is **false** - every
-descendant inherits it; and §8.2 property 4 (disjoint capability sets) is
-**inapplicable** to any parent/child pair, or to the whole service fan-out where
-four cells share one table. What actually isolates memory is the per-cell grant
-array plus the page tables - so in the shipped code the capability table is not
-the isolation boundary the design says it is.
+`install_spawned` copied the parent's pointers verbatim. Consequences:
+`abi.rs`'s claim that spawn authority is "not minted into a spawned child by
+default" was **false** - every descendant inherited it; and §8.2 property 4
+(disjoint capability sets) was **inapplicable** to any parent/child pair, or to
+the whole service fan-out where four cells shared one table. What actually
+isolated memory was the per-cell grant array plus the page tables - so in the
+shipped code the capability table was not the isolation boundary the design says
+it is.
+
+**Fixed.** A kernel-owned `CELL_CAPS[MAX_CELLS]` (fixed static, so the kernel
+stays allocation-free) backs every cell the *kernel* creates:
+
+- **`SYS_SPAWN`** gives the child an **empty** table. Whatever it legitimately
+  needs - its queue pair, an inherited channel - is minted into that table
+  explicitly by the spawn path. It is a list, not an inheritance, and the
+  parent's `ObjectKind::Cell` capability is simply not on it.
+- **`fork`** gives the child a **copy** of the parent's table, for the same
+  reason POSIX copies the descriptor table: the child holds what the parent held
+  *at the fork*, and neither can change the other's holdings afterwards. Epoch
+  revocation still reaches both, because that lives on the object.
+- The **object** table stays shared, on purpose: it is one per system
+  (`ARCHITECTURE.md` §3), the registry objects live in, not an authority.
+  Reaching an object still needs a capability in the calling cell's own table.
+- `free_cell` empties a reaped slot's table, so a reused slot cannot inherit a
+  dead cell's authority by accident.
+
+The mint had to move *after* `install_spawned` - the child's queue capability
+now has to land in a table that does not exist until the child is installed.
+
+**Proof**: `librheoproc`, on all three ISAs. Every spawned `/bin/child` tries to
+spawn `/bin/echo` - a path that exists and that its **parent** spawns
+successfully in the same scenario, so the refusal is about authority and not
+about the file. The oracle is self-normalising (refusals must equal child runs,
+so it does not have to know that the orchestrator also runs an 8-iteration spawn
+benchmark) and it fails if even one child gets through. Observed failing when
+reverted: restoring the shared pointer prints `SPAWNED WITHOUT AUTHORITY`
+eleven times. All five spawn/fork-heavy kernels - `librheoproc`, `librheopipe`,
+`netservice`, `librheowl`, `linuxproc` - pass **unedited**.
+
+This unblocks `SYS_CAP_DELEGATE` (§2.1's one remaining verb), §2.2, §2.6, and
+`docs/IDENTITY.md` ID2.
 
 ### 2.4 Kernel-blocking waits do not reschedule - **CLOSED** (see §1)
 
@@ -622,13 +655,12 @@ already made.
 Chosen by (correctness at risk) first, then (leverage ÷ risk).
 
 **Now - correctness.** ~~§2.4 the scheduler idle state~~, ~~§2.5 a system-wide
-admission ledger~~ and ~~§2.1's derive / revoke / inspect / drop surface~~ are
-**closed** (§1). Next, in this order because each unblocks the next: **§2.3
-per-child capability tables** (which also unblocks `delegate`, the one verb §2.1
-left out - with a shared table there is no other table to delegate into), then
-**§2.2 complete revocation** for memory grants (revoke invalidates capabilities
-today and unmaps nothing), then **§2.6 the ambient-authority sweep**, which needs
-both.
+admission ledger~~, ~~§2.1's derive / revoke / inspect / drop surface~~ and
+~~§2.3 per-child capability tables~~ are **closed** (§1). Next: **§2.2 complete
+revocation** for memory grants (revoke invalidates capabilities today and unmaps
+nothing, so §8.2 property 3 still holds vacuously), then **`SYS_CAP_DELEGATE`**
+(the one verb §2.1 left out, now that there is another table to delegate *into*),
+then **§2.6 the ambient-authority sweep**, which needs both.
 
 ~~**First week - four Small, near-zero-risk items closing three structural
 defects.**~~ **DONE** (all four; see §1): `kernel::boot::init` deletes the three

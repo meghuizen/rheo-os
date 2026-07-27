@@ -132,8 +132,10 @@ pub enum ObjectKind {
     /// A cell - a spawn/scheduling domain (docs/ARCHITECTURE.md 3 object 1). A
     /// capability of this kind carrying WRITE is the **cell-spawn authority**
     /// (`SYS_SPAWN`, docs/LIBRHEO.md Phase F): a cell without it cannot create
-    /// cells (no ambient authority). Held by an orchestrator/shell; not minted
-    /// into a spawned child by default.
+    /// cells (no ambient authority). Held by an orchestrator/shell; **not** in a
+    /// spawned child's table - which is now true rather than aspirational,
+    /// because a spawned child has its own table (docs/ARCHITECTURE-DEBT.md 2.3)
+    /// and this capability is not among the few things minted into it.
     Cell,
 }
 
@@ -504,6 +506,26 @@ impl CapTable {
         let i = self.slot_of_low32(objects, cap_id)?;
         self.slots[i].in_use = false;
         Ok(())
+    }
+
+    /// Replace this table's contents with a copy of `other`'s - the `fork`
+    /// inheritance step (docs/POSIX-PERSONALITY.md 2, docs/ARCHITECTURE-DEBT.md
+    /// 2.3).
+    ///
+    /// A **copy**, not a shared pointer, which is what makes the child's table
+    /// its own: the parent dropping or deriving afterwards does not change what
+    /// the child holds. Epoch revocation still reaches both, because that lives
+    /// on the *object*, not on the table - which is exactly the fork semantics
+    /// POSIX describes for descriptors (the table is copied, the thing behind it
+    /// is shared).
+    pub fn copy_from(&mut self, other: &CapTable) {
+        self.slots = other.slots;
+    }
+
+    /// Empty this table. Used when a cell slot is reused, so a new cell can
+    /// never inherit a dead one's capabilities by accident.
+    pub fn clear(&mut self) {
+        self.slots = [EMPTY_SLOT; MAX_CAPS_PER_CELL];
     }
 
     /// Count of live capabilities (used by tests).

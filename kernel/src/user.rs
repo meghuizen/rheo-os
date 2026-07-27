@@ -440,6 +440,54 @@ static mut CELLS: [RunCell; MAX_CELLS] = [EMPTY; MAX_CELLS];
 static mut CURRENT: usize = 0;
 static mut EXITED: usize = 0;
 
+/// A kernel-owned capability table per cell slot, for cells the **kernel**
+/// creates - a native `SYS_SPAWN` child or a Linux `fork` child
+/// (docs/ARCHITECTURE-DEBT.md 2.3).
+///
+/// Before this, `install_spawned`/`install_forked` copied the parent's `caps`
+/// *pointer*, so every descendant shared one table. Three things were wrong with
+/// that. `abi.rs`'s claim that spawn authority is "not minted into a spawned
+/// child by default" was false - every descendant inherited it. §8.2 property 4
+/// (disjoint capability sets) was inapplicable to any parent/child pair, and to
+/// a whole service fan-out where four cells shared one table. And what actually
+/// isolated memory was the per-cell grant array plus the page tables, so the
+/// capability table was not the isolation boundary the design says it is.
+///
+/// The **top** cell keeps the table its test kernel owns and passes to
+/// [`install`]; only kernel-created children come from here. Fixed-size, so the
+/// kernel stays allocation-free.
+static mut CELL_CAPS: [CapTable; MAX_CELLS] = [const { CapTable::new() }; MAX_CELLS];
+
+/// Cell `idx`'s slot in the kernel-owned table array. Distinct from
+/// [`cell_caps`], which reports whatever table is *installed* for the cell -
+/// for the top cell that is the one its test kernel owns.
+fn owned_caps(idx: usize) -> *mut CapTable {
+    // SAFETY: single CPU, synchronous traps; one cell runs at a time.
+    unsafe { core::ptr::addr_of_mut!((*core::ptr::addr_of_mut!(CELL_CAPS))[idx]) }
+}
+
+/// Create an object and mint a capability for it **into cell `idx`'s own
+/// table**, returning the 32-bit ABI id.
+///
+/// The spawn path needs this because the child's queue-pair and channel
+/// capabilities have to land in the child's table, not the parent's - which was
+/// automatic while the two were the same table and is the whole point now that
+/// they are not.
+pub fn mint_into(idx: usize, kind: ObjectKind, rights: u32) -> Option<u32> {
+    let cell = cells()[idx];
+    // SAFETY: single CPU; `objects` is installed `*const` but owned mutably by
+    // whoever created it, and creating an object needs `&mut`. `cell.caps` is
+    // this cell's table, uniquely owned for the trap.
+    unsafe {
+        let objects = &mut *(cell.objects as *mut ObjectTable);
+        let caps = &mut *cell.caps;
+        let obj = objects.create(kind).ok()?;
+        caps.mint(objects, obj, rights, BUDGET_UNLIMITED)
+            .ok()
+            .map(|h| h.raw_low32())
+    }
+}
+
 /// A native cell's saved U-mode FP/SIMD state, for a cross-cell switch
 /// (`SYS_SWITCH` / the `nproc` scheduler). Sized and aligned for the widest
 /// per-ISA save format. Kept **out** of `RunCell` on purpose: `RunCell` is
@@ -1643,9 +1691,9 @@ pub fn set_cell_aspace(idx: usize, aspace: *const AddressSpace) {
     cells()[idx].aspace = aspace;
 }
 
-/// The capability table pointer installed for cell `idx` (the native process
-/// scheduler's `SYS_SPAWN` mints the child's queue cap into the parent's shared
-/// bundle, docs/LIBRHEO.md Phase F).
+/// The capability table installed for cell `idx`. The top cell's is owned by
+/// whoever created it; a spawned or forked child's is the kernel-owned
+/// per-cell table (docs/ARCHITECTURE-DEBT.md 2.3).
 pub fn cell_caps(idx: usize) -> *mut CapTable {
     cells()[idx].caps
 }
@@ -1674,9 +1722,22 @@ pub unsafe fn install_spawned(
     qp_cap_id: u32,
 ) {
     let p = cells()[parent];
+    // The child gets its **own**, empty capability table - not the parent's
+    // (docs/ARCHITECTURE-DEBT.md 2.3). This is what makes `abi.rs`'s claim that
+    // spawn authority is "not minted into a spawned child by default" true: the
+    // parent's `ObjectKind::Cell` capability is simply not in here, so the child
+    // cannot spawn. Whatever the child legitimately needs - its queue pair, an
+    // inherited channel - is minted into this table explicitly by the spawn
+    // path, which is the point: it is a list, not an inheritance.
+    // SAFETY: single CPU; slot `idx` is free, so nothing else holds this table.
+    unsafe { (*owned_caps(idx)).clear() };
     cells()[idx] = RunCell {
         aspace,
-        caps: p.caps,
+        caps: owned_caps(idx),
+        // The **object** table is one per system (ARCHITECTURE.md 3) and is
+        // shared on purpose: it is the registry objects live in, not an
+        // authority. Reaching an object still needs a capability in this cell's
+        // own table.
         objects: p.objects,
         qp,
         frame,
@@ -1718,10 +1779,16 @@ pub fn switch_to_cell(idx: usize) {
     }
 }
 
-/// Install a **forked** child in slot `idx` sharing the parent's capability
-/// bundle (POSIX fork = clone-cell-within-capability-bundle, docs/POSIX-
-/// PERSONALITY.md 2). The address space and frame are kernel-owned by
-/// `crate::linux::proc`; personality is Linux.
+/// Install a **forked** child in slot `idx` with a **copy** of the parent's
+/// capability table (POSIX fork = clone-cell-within-capability-bundle,
+/// docs/POSIX-PERSONALITY.md 2, docs/ARCHITECTURE-DEBT.md 2.3). The address
+/// space and frame are kernel-owned by `crate::linux::proc`; personality is
+/// Linux.
+///
+/// A copy rather than the shared pointer this used to install, for the same
+/// reason POSIX copies the descriptor table: the child holds what the parent
+/// held *at the fork*, and neither can change the other's holdings afterwards.
+/// Epoch revocation still reaches both, because that lives on the object.
 ///
 /// # Safety
 /// `aspace`/`frame` must outlive the child's run; `parent` must be present.
@@ -1732,9 +1799,12 @@ pub unsafe fn install_forked(
     parent: usize,
 ) {
     let p = cells()[parent];
+    // SAFETY: single CPU; slot `idx` is free and `parent` is present, so the two
+    // tables are distinct and uniquely owned for the trap.
+    unsafe { (*owned_caps(idx)).copy_from(&*p.caps) };
     cells()[idx] = RunCell {
         aspace,
-        caps: p.caps,
+        caps: owned_caps(idx),
         objects: p.objects,
         qp: p.qp,
         frame,
@@ -1756,7 +1826,15 @@ pub unsafe fn install_forked(
 pub fn free_cell(idx: usize) {
     cells()[idx] = EMPTY;
     // SAFETY: single CPU, synchronous traps.
-    unsafe { (*core::ptr::addr_of_mut!(CELL_FRAMES))[idx] = 0 };
+    unsafe {
+        (*core::ptr::addr_of_mut!(CELL_FRAMES))[idx] = 0;
+        // Empty the slot's capability table too, so the next cell to land here
+        // cannot inherit a dead one's capabilities (docs/ARCHITECTURE-DEBT.md
+        // 2.3). Both install paths already overwrite it, but leaving a reaped
+        // cell's authority lying in a static until something happens to
+        // overwrite it is the kind of thing that becomes true by accident.
+        (*owned_caps(idx)).clear();
+    }
 }
 
 /// The trap dispatcher, called from each arch's U-mode trampoline. Returns

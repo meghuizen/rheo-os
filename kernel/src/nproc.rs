@@ -6,10 +6,11 @@
 //! Linux personality's `linux::proc` (docs/LINUX-COMPAT.md L6), which this
 //! mirrors for `Personality::Native` cells.
 //!
-//! A spawned child is a fresh native cell with its **own** address space and
-//! mapped queue pair (so it can run librheo's reactor), **sharing** the parent's
-//! capability bundle (like `fork`). Spawning is gated by a **cell-spawn
-//! capability** (an `ObjectKind::Cell` cap carrying WRITE): a cell without it
+//! A spawned child is a fresh native cell with its **own** address space, mapped
+//! queue pair (so it can run librheo's reactor) **and its own capability table**
+//! - it does not share the parent's (docs/ARCHITECTURE-DEBT.md 2.3), so it holds
+//! only what the spawn path explicitly mints into it. Spawning is gated by a
+//! **cell-spawn capability** (an `ObjectKind::Cell` cap carrying WRITE): a cell without it
 //! cannot create cells (no ambient authority). Scheduling generalizes the native
 //! cross-cell `SYS_SWITCH`: the parent that `SYS_WAIT`s blocks and hands the CPU
 //! to a runnable child; the child's exit makes it a zombie and reschedules,
@@ -19,7 +20,7 @@
 
 use crate::abi::{FAULT_EXIT, SPAWN_CHAN_SLOT};
 use crate::arch::{self, TrapFrame};
-use crate::capability::{BUDGET_UNLIMITED, ObjectKind, ObjectTable, READ, WRITE};
+use crate::capability::{ObjectKind, READ, WRITE};
 use crate::idle;
 use crate::ktimer::{self, TimerClient};
 use crate::load;
@@ -163,7 +164,7 @@ fn ensure_top(cell: usize) {
 /// `SYS_SPAWN(path_va, path_len, argv_va, envp_va, chan_spec)`: load the ELF at
 /// `path` from the VFS into a new native cell, build its initial stack from the
 /// caller's argv/envp, map it a queue pair + mint a queue capability into the
-/// shared bundle, and record the caller as parent. Returns the child's handle (its
+/// **child's own** capability table, and record the caller as parent. Returns the child's handle (its
 /// cell index) or `u64::MAX` on failure. Gated by the cell-spawn capability.
 ///
 /// `chan_spec` picks which of the caller's channel ends the child inherits: 0 =
@@ -238,23 +239,11 @@ pub fn spawn(
     // walking the raw SP).
     let sp = load::setup_stack(&mut child_aspace, &argv[..argc], &envp[..envc]);
 
-    // Map the child a queue-pair region + mint its queue capability into the
-    // shared bundle (so the child's ring is grant-checked at doorbell time).
+    // Map the child a queue-pair region. Its queue capability is minted **into
+    // the child's own table** after `install_spawned` publishes that table - a
+    // spawned cell no longer shares the parent's (docs/ARCHITECTURE-DEBT.md
+    // 2.3), so the mint has to happen where the child can reach it.
     let qp = load::map_queue(&mut child_aspace);
-    // SAFETY: single CPU; the shared object/cap tables are uniquely owned for the
-    // trap. `objects` is installed `*const` but owned mutably by the test kernel;
-    // recovered here to create the child's queue object.
-    let qp_cap_id = unsafe {
-        let objects = &mut *(objs_ptr as *mut ObjectTable);
-        let caps = &mut *caps_ptr;
-        let Ok(obj) = objects.create(ObjectKind::QueuePair) else {
-            return u64::MAX;
-        };
-        match caps.mint(objects, obj, READ | WRITE, BUDGET_UNLIMITED) {
-            Ok(h) => h.raw_low32(),
-            Err(_) => return u64::MAX,
-        }
-    };
 
     // Inherit one of the parent's cross-cell channels (docs/LIBRHEO.md Phase J;
     // the slot selector is docs/NETSTACK.md rheo-net N4a): map the same channel
@@ -289,20 +278,9 @@ pub fn spawn(
         if n == 0 {
             None
         } else {
-            // SAFETY: as the qp-cap mint above - the shared tables are uniquely
-            // owned for the trap.
-            let cap = unsafe {
-                let objects = &mut *(objs_ptr as *mut ObjectTable);
-                let caps = &mut *caps_ptr;
-                let Ok(obj) = objects.create(ObjectKind::QueuePair) else {
-                    return u64::MAX;
-                };
-                match caps.mint(objects, obj, READ | WRITE, BUDGET_UNLIMITED) {
-                    Ok(h) => h.raw_low32(),
-                    Err(_) => return u64::MAX,
-                }
-            };
-            Some((child_chan_va, cap, p_role ^ 1))
+            // The capability itself is minted into the child's table below,
+            // for the same reason as the queue's.
+            Some((child_chan_va, p_role ^ 1))
         }
     } else {
         None
@@ -324,6 +302,9 @@ pub fn spawn(
         )
     };
 
+    // Install first (with an empty capability table and no queue cap yet), then
+    // mint into the child's *own* table. Ordering matters now that the tables
+    // are separate: `mint_into` reaches the table through the installed cell.
     // SAFETY: pointers are kernel-owned statics that outlive the child's run.
     unsafe {
         user::install_spawned(
@@ -333,11 +314,24 @@ pub fn spawn(
             frame_ptr,
             cur,
             load::USER_QUEUE_VA as u64,
-            qp_cap_id,
+            0,
         );
     }
+    // The child's queue capability. Without it the child's very first doorbell
+    // fails its grant check, so a failure here has to unwind the whole spawn
+    // rather than hand back a cell that cannot use its ring.
+    let Some(qp_cap_id) = user::mint_into(child, ObjectKind::QueuePair, READ | WRITE) else {
+        user::free_cell(child);
+        return u64::MAX;
+    };
+    user::set_queue_info(child, load::USER_QUEUE_VA as u64, qp_cap_id);
+
     // Record the inherited channel so the child's `SYS_CONNECT` reports its end.
-    if let Some((va, cap, role)) = child_chan {
+    if let Some((va, role)) = child_chan {
+        let Some(cap) = user::mint_into(child, ObjectKind::QueuePair, READ | WRITE) else {
+            user::free_cell(child);
+            return u64::MAX;
+        };
         user::set_channel_info(child, va, cap, role);
     }
     procs()[child] = Proc {
