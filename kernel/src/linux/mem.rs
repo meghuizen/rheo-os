@@ -356,26 +356,44 @@ pub fn fault(st: &mut LinuxState, addr: usize) -> bool {
     user::with_current_aspace(|aspace| {
         aspace.map_user_frame(page, pa, perm_from_prot(m.prot));
     });
-    bump_faults();
+    bump_faults(page);
     true
 }
 
 /// Pages filled by [`fault`] since boot - the witness that demand paging is what
 /// populated a mapping, rather than the eager path having done it earlier.
 static mut FAULTS: u64 = 0;
+/// Of those, the ones inside the `mmap` region.
+///
+/// Split out because the total stops being a usable oracle as soon as anything else is
+/// demand-paged: a fixture proving "my 64-page mapping cost 4 pages" would otherwise
+/// be counting the program's own text and its syscall buffers too. Which region a page
+/// lies in is a property of the kernel's layout, so this stays evidence the cell
+/// cannot fake.
+static mut FAULTS_MMAP: u64 = 0;
 
-fn bump_faults() {
+fn bump_faults(page: usize) {
     // SAFETY: single CPU, synchronous trap.
     unsafe {
         let p = core::ptr::addr_of_mut!(FAULTS);
         *p = (*p).wrapping_add(1);
+        if (MMAP_BASE..MMAP_END).contains(&page) {
+            let m = core::ptr::addr_of_mut!(FAULTS_MMAP);
+            *m = (*m).wrapping_add(1);
+        }
     }
 }
 
-/// How many pages demand paging has filled.
+/// How many pages demand paging has filled, anywhere.
 pub fn faults() -> u64 {
     // SAFETY: single CPU.
     unsafe { *core::ptr::addr_of!(FAULTS) }
+}
+
+/// How many of them were in the `mmap` region.
+pub fn faults_mmap() -> u64 {
+    // SAFETY: single CPU.
+    unsafe { *core::ptr::addr_of!(FAULTS_MMAP) }
 }
 
 /// mremap(old_addr, old_size, new_size, flags, new_addr): resize a mapping.

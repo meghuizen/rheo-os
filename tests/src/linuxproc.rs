@@ -456,6 +456,19 @@ extern "C" fn kernel_main() -> ! {
          returned its handle"
     );
 
+    // The pre-fault path's cost, measured rather than assumed (docs/ENGINEERING.md 1).
+    // Presence is ensured only on the helpers that hand back something to
+    // dereference; putting it on the bare range checks instead cost a ~2,900x
+    // amplification, because `unmap_range` bounds a range with the same predicate and
+    // would materialise every page in it just before freeing it.
+    println!(
+        "linuxproc: kernel pre-faulted {} page(s) across this run ({} demand fills \
+         total, {} of them in the mmap region)",
+        kernel::user::prefaults(),
+        linux::mem::faults(),
+        linux::mem::faults_mmap()
+    );
+
     println!("linuxproc: PASS");
     arch::exit(arch::ExitCode::Success)
 }

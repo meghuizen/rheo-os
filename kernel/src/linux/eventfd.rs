@@ -160,7 +160,7 @@ pub fn read(ev: u8, buf_va: u64, count: u64) -> Result<ReadNb, i64> {
     // (docs/ENGINEERING.md 12). Checked as a range rather than through
     // `user_out::<u64>` because Linux does not require the buffer to be 8-aligned,
     // and refusing an unaligned one with -EFAULT would be a bug of our own making.
-    if !crate::user::user_write_ok(buf_va, 8) {
+    if crate::user::user_buf_mut(buf_va, 8).is_none() {
         return Err(-crate::linux::errno::EFAULT);
     }
     let e = &mut tbl()[ev as usize];
@@ -188,7 +188,7 @@ pub fn write(ev: u8, buf_va: u64, count: u64) -> i64 {
     if count < 8 {
         return -EINVAL;
     }
-    if !crate::user::user_read_ok(buf_va, 8) {
+    if crate::user::user_buf(buf_va, 8).is_none() {
         return -EFAULT;
     }
     // SAFETY: `[buf_va, buf_va+8)` was range-checked readable in the active cell;

@@ -100,6 +100,86 @@ const _: () = assert!((FILEMMAP_BASE as u64) < USER_VA_MAX);
 const _: () = assert!((crate::load::USER_QUEUE_VA as u64) < USER_VA_MAX);
 const _: () = assert!((MMAP_BASE as u64) < USER_VA_MAX);
 
+/// Pages the kernel has faulted in on a cell's behalf.
+static mut PREFAULTS: u64 = 0;
+
+/// How many pages [`ensure_present`] has filled since boot - the witness that the
+/// pre-fault path is what made a buffer usable, and the number to watch when judging
+/// its cost (docs/ENGINEERING.md 1).
+pub fn prefaults() -> u64 {
+    // SAFETY: single CPU, synchronous traps.
+    unsafe { *core::ptr::addr_of!(PREFAULTS) }
+}
+
+/// Make every page of `[va, va+len)` **present** in the calling cell, filling any
+/// that demand paging has not materialised yet. `false` if a page is not there and
+/// cannot be made so - the caller then refuses the syscall rather than touching it.
+///
+/// ## Why this exists
+///
+/// Demand paging (docs/ARCHITECTURE-DEBT.md 4.0, blocker 2) makes a page's presence
+/// lazy, and that turns **every kernel access to a user buffer into a fault site**. A
+/// user-mode fault is resumable here - the handler fills the page and the instruction
+/// re-executes - but a fault taken in *kernel* mode is not. A cell that hands `write`
+/// a pointer into a page it has never touched itself would take the kernel down,
+/// which is exactly why Linux has `copy_from_user` and a fixup table.
+///
+/// ## Why it is *here* and not in `user_read_ok`/`user_write_ok`
+///
+/// This distinction is load-bearing and was learned the expensive way. Putting the
+/// presence guard in the bare range checks looked equivalent and cost a **~2,900x**
+/// amplification: `unmap_range` calls `user_write_ok` purely to *bound* a range, so
+/// every `munmap` and every `MAP_FIXED` overlay materialised each page in the range
+/// immediately before freeing it - 11,516 of 11,520 demand fills in one test run came
+/// from the kernel, against 4 from the program.
+///
+/// So presence belongs on the helpers that hand back something to **dereference**
+/// (`user_out`, `user_in`, `user_buf`, `user_buf_mut`, `user_slice`,
+/// `user_read_span`), and the bare range checks stay pure predicates for callers that
+/// only need the bound. "Am I allowed to address this?" and "am I about to touch it?"
+/// are different questions.
+#[inline]
+fn ensure_present(va: u64, len: usize) -> bool {
+    present_prefix(va, len) == len
+}
+
+/// The number of leading bytes of `[va, va+len)` that are present after filling what
+/// can be filled. `len` means the whole range is usable.
+fn present_prefix(va: u64, len: usize) -> usize {
+    if len == 0 || va == 0 {
+        return 0;
+    }
+    let cur = unsafe { *core::ptr::addr_of!(CURRENT) };
+    // Native cells map eagerly: nothing to fill, and their cost stays exactly zero.
+    if !cell_present(cur) || cells()[cur].personality != Personality::Linux {
+        return len;
+    }
+    const PAGE: u64 = frames::FRAME_SIZE as u64;
+    let first = va & !(PAGE - 1);
+    let Some(last_byte) = va.checked_add(len as u64 - 1) else {
+        return 0;
+    };
+    let last = last_byte & !(PAGE - 1);
+    let mut page = first;
+    while page <= last {
+        // The common case by far: already there, one page-table probe.
+        if !with_current_aspace(|aspace| aspace.is_mapped(page as usize)) {
+            if !crate::linux::fill_fault(cur, page as usize) {
+                // Not fillable: report the prefix that is. A caller needing the whole
+                // range refuses; a bounded string scan simply stops here.
+                return page.saturating_sub(va) as usize;
+            }
+            // SAFETY: single CPU, synchronous trap.
+            unsafe {
+                let p = core::ptr::addr_of_mut!(PREFAULTS);
+                *p = (*p).wrapping_add(1);
+            }
+        }
+        page += PAGE;
+    }
+    len
+}
+
 /// Whether `[va, va+len)` is an address range the kernel may **write** on this
 /// cell's behalf: non-null, no overflow, and either wholly inside the low-half
 /// user range (`< `[`USER_VA_MAX`]) or wholly inside the writable part of the
@@ -172,6 +252,9 @@ pub fn user_out<T>(va: u64) -> Option<*mut T> {
     if !user_write_ok(va, core::mem::size_of::<T>()) {
         return None;
     }
+    if !ensure_present(va, core::mem::size_of::<T>()) {
+        return None;
+    }
     Some(va as *mut T)
 }
 
@@ -185,6 +268,9 @@ pub fn user_in<T>(va: u64) -> Option<*const T> {
     if !user_read_ok(va, core::mem::size_of::<T>()) {
         return None;
     }
+    if !ensure_present(va, core::mem::size_of::<T>()) {
+        return None;
+    }
     Some(va as *const T)
 }
 
@@ -193,7 +279,7 @@ pub fn user_in<T>(va: u64) -> Option<*const T> {
 /// structure read with `read_unaligned`).
 #[inline]
 pub fn user_buf(va: u64, len: usize) -> Option<u64> {
-    if user_read_ok(va, len) {
+    if user_read_ok(va, len) && ensure_present(va, len) {
         Some(va)
     } else {
         None
@@ -203,7 +289,7 @@ pub fn user_buf(va: u64, len: usize) -> Option<u64> {
 /// Validate a cell-supplied **writable** byte buffer of `len` bytes.
 #[inline]
 pub fn user_buf_mut(va: u64, len: usize) -> Option<u64> {
-    if user_write_ok(va, len) {
+    if user_write_ok(va, len) && ensure_present(va, len) {
         Some(va)
     } else {
         None
@@ -222,7 +308,10 @@ pub fn user_read_span(va: u64, max: usize) -> usize {
         return 0;
     }
     if va < USER_VA_MAX {
-        return ((USER_VA_MAX - va) as usize).min(max);
+        // Bound by the range, then by what is actually there: a scan must not walk
+        // into a page demand paging cannot fill.
+        let span = ((USER_VA_MAX - va) as usize).min(max);
+        return present_prefix(va, span);
     }
     let (window_start, window_end) = crate::mm::user_window();
     if va >= window_start as u64 && va < window_end as u64 {
