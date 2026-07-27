@@ -19,6 +19,8 @@
 //! admission math stay unchanged while the dispatch order is re-founded.
 
 pub mod bore;
+pub mod dispatch;
+pub mod preempt;
 pub mod vcore;
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]

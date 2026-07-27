@@ -469,6 +469,13 @@ pub fn reset() {
         *core::ptr::addr_of_mut!(CELL_FRAMES) = [0; MAX_CELLS];
     }
     crate::sched::reset_system();
+    // The ready queue holds funded frames and per-CPU state, so it is released here
+    // rather than left holding a previous run's vcores - the `linux::reset` /
+    // `thread::release` discipline (docs/SUBSTRATE.md pillar 1). Order matters: the
+    // seam's record names vcores, so it is cleared before the queue that holds them.
+    crate::sched::dispatch::reset();
+    crate::sched::preempt::reset();
+    crate::sched::reset_run_queue();
     crate::linux::reset();
     crate::nproc::reset();
 }
@@ -1410,6 +1417,11 @@ pub unsafe fn install(
     *cell_grants(idx) = [EMPTY_GRANT; MAX_GRANTS_PER_CELL];
     // SAFETY: single CPU; a fresh cell starts with no frames charged.
     unsafe { (*core::ptr::addr_of_mut!(CELL_FRAMES))[idx] = 0 };
+    // Give the cell a fair-class vcore on this CPU's ready queue, so the scheduler
+    // has something to order it by (docs/SUBSTRATE.md pillar 3). A top-level cell
+    // starts with a fresh burst score; a child inherits its parent's (see
+    // `install_spawned`/`install_forked`).
+    crate::sched::dispatch::track(idx, 0, None);
     // Clean FP state, so the first cross-cell switch into this cell restores an
     // ABI-default FPU rather than a zeroed area (docs/LIBRHEO.md).
     // SAFETY: `cell_fp(idx)` is a valid, aligned `FP_AREA_LEN` area.
@@ -1490,6 +1502,12 @@ pub fn run(idx: usize) -> (usize, Outcome) {
         // test kernel that runs several cells in sequence would otherwise hand
         // the next one whatever the last left in the vector registers.
         restore_native_fp(idx);
+        // The first entry into a cell does not go through either scheduler, so it is
+        // the one place a slice has to be armed explicitly (docs/SUBSTRATE.md pillar
+        // 3). Without this a boot's *first* cell would be the only one that could
+        // never be preempted - the exact shape of bug that makes a preemptive
+        // scheduler look like it works while one workload hangs.
+        crate::sched::dispatch::running(idx, 0);
         arch::enter_user_first(cell.frame);
     }
     // enter_user_first returns via return_to_kernel after an exit/fault.
@@ -1649,6 +1667,11 @@ pub unsafe fn install_spawned(
     *cell_grants(idx) = [EMPTY_GRANT; MAX_GRANTS_PER_CELL];
     // SAFETY: single CPU; a fresh cell starts with no frames charged.
     unsafe { (*core::ptr::addr_of_mut!(CELL_FRAMES))[idx] = 0 };
+    // The child inherits the parent's burst state rather than arriving with a fresh
+    // interactive weight it did not earn (docs/SUBSTRATE.md pillar 3, BORE's fork
+    // inheritance): a burst of short-lived children would otherwise each be treated
+    // as maximally interactive.
+    crate::sched::dispatch::track(idx, 0, Some(parent));
     // Clean FP state for the spawned child's first entry (see `install`).
     // SAFETY: `cell_fp(idx)` is a valid, aligned `FP_AREA_LEN` area.
     unsafe { arch::fp_area_init(cell_fp(idx)) };
@@ -1713,6 +1736,9 @@ pub unsafe fn install_forked(
         filemmap_next: FILEMMAP_BASE,
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
     };
+    // As `install_spawned`: a forked child inherits its parent's burst score
+    // (docs/SUBSTRATE.md pillar 3).
+    crate::sched::dispatch::track(idx, 0, Some(parent));
 }
 
 /// Free cell slot `idx` (a reaped zombie). The slot becomes reusable by a
@@ -1720,6 +1746,11 @@ pub unsafe fn install_forked(
 /// the frames (`AddressSpace::free_user_frames`), which bypasses the per-cell
 /// accounting because the cell is gone.
 pub fn free_cell(idx: usize) {
+    // The single choke point where a cell slot is handed back, so it is where the
+    // scheduler stops knowing about it. A run-queue entry naming a cell that no
+    // longer exists would be asked about that cell forever and never be runnable -
+    // a permanently blocked vcore holding a slot (docs/SUBSTRATE.md pillar 3).
+    crate::sched::dispatch::untrack(idx);
     cells()[idx] = EMPTY;
     // SAFETY: single CPU, synchronous traps.
     unsafe {
@@ -1731,6 +1762,72 @@ pub fn free_cell(idx: usize) {
         // overwrite it is the kind of thing that becomes true by accident.
         (*owned_caps(idx)).clear();
     }
+}
+
+/// A device or timer **interrupt** was taken while a cell was running in user mode.
+/// Returns the frame to resume - the interrupted one, unless a preemption is due.
+///
+/// This is the portable half of timer preemption (docs/SUBSTRATE.md pillar 3,
+/// `crate::sched::preempt`). Each ISA's user-trap entry already services the
+/// interrupt and resumes the cell at exactly the instruction it was interrupted at
+/// (the path rheo-net N2d added so a NIC frame arriving mid-cell is not read as a
+/// fault); it now asks here first, so the *decision* to switch lives in one portable
+/// place while the three arch entries keep only "service the device".
+///
+/// Called in ordinary kernel context on the way out of the trap, never from inside
+/// the interrupt handler - the handler does one store ([`crate::sched::preempt::note`])
+/// and returns. That split is what keeps the scheduler non-reentrant: an interrupt
+/// can land while the kernel holds a reference into a funded table, and invoking a
+/// scheduler from there would be a use of that table from two places at once.
+///
+/// Preemption prefers a **sibling context of the same cell** over another cell,
+/// because that is both the cheaper switch (one address space, one register file)
+/// and the case the evidence demanded: Bun's main thread waits for a worker context
+/// of the same cell to make progress (docs/LINUX-COMPAT.md, GOAL-BUN).
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn on_user_interrupt(frame: *mut TrapFrame) -> *mut TrapFrame {
+    if !crate::sched::preempt::take() {
+        return frame;
+    }
+    let cur = current_index();
+    if !cell_present(cur) {
+        return frame;
+    }
+    // Charge the interrupted cell for the slice it just ran and record the stop as
+    // **involuntary** - the distinction the burst score depends on, and the reason a
+    // compute-bound cell does not accumulate interactive weight by being preempted.
+    crate::sched::dispatch::preempted();
+    let resumed = match cells()[cur].personality {
+        // A Linux cell: try its own ready contexts first (this is the fix for "a
+        // spinning thread starves its siblings"), then other cells.
+        Personality::Linux => match crate::linux::thread::preempt_context(cur) {
+            Some(f) => {
+                crate::sched::preempt::took(true);
+                f
+            }
+            None => match crate::linux::proc::preempt_cell(cur) {
+                Some(f) => {
+                    crate::sched::preempt::took(false);
+                    f
+                }
+                None => frame,
+            },
+        },
+        // A native cell has one context, so the only move is to another cell.
+        Personality::Native => match crate::nproc::preempt_cell(cur) {
+            Some(f) => {
+                crate::sched::preempt::took(false);
+                f
+            }
+            None => frame,
+        },
+    };
+    // Whoever runs next gets a fresh slice. Re-arming here rather than at the switch
+    // sites keeps "every entry into a cell is under a slice" true of the preemption
+    // path as well as the syscall path.
+    let slice = crate::sched::dispatch::running(current_index(), 0);
+    crate::sched::preempt::arm(slice);
+    resumed
 }
 
 /// The trap dispatcher, called from each arch's U-mode trampoline. Returns

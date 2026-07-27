@@ -405,6 +405,32 @@ pub fn init_cell(cell: usize) {
     unsafe { (*addr_of_mut!(NEXT_TID))[cell] = 1001 };
 }
 
+/// Release cell `cell`'s context tables, uncharging its frames.
+///
+/// Called when a cell's slot is genuinely handed back (`wait4` reaping a zombie,
+/// or a `fork` that could not be funded) - **not** at `exit`, because a zombie's
+/// contexts are still the record of what exited and `wait4` reads its status
+/// afterwards.
+///
+/// Its absence was a real leak once the tables became funded: a slot's tables were
+/// only ever released by the between-runs `reset`, so every reaped child left its
+/// context frames charged until the next boot. On a single short-lived child that
+/// is invisible; on the `rsh` suite - twelve fork+exec pairs - or a Node process
+/// tree it is a monotonic drain on the pool, and the eventual symptom is an
+/// unrelated cell failing to get a frame (docs/SUBSTRATE.md pillar 1: exhaustion
+/// must be attributable, and a leak is the one condition that makes it not).
+pub fn release_cell(cell: usize) {
+    threads(cell).release();
+    // SAFETY: single CPU; the slot is being handed back and nothing is running in
+    // it, so no live pointer into these frames survives (a context's `frame`
+    // pointer is only dereferenced while its cell is present).
+    unsafe {
+        (*addr_of_mut!(FRAMES))[cell].release();
+        (*addr_of_mut!(FPAREAS))[cell].release();
+    }
+    set_cur_thread(cell, 0);
+}
+
 /// Clear every cell's thread table (called from `linux::reset`).
 pub fn reset() {
     // SAFETY: single CPU, between runs.
@@ -1115,6 +1141,49 @@ fn pick_next(cell: usize, from: usize) -> Option<usize> {
 
 /// Switch from context `from` to `to`: save `from`'s FP, load `to`'s FP and TLS
 /// base, and hand the trampoline `to`'s frame.
+/// **Preempt the running context** in favour of a ready sibling of the same cell,
+/// returning the frame to resume, or `None` when this cell has no other ready
+/// context (the caller then tries another cell).
+///
+/// This is the fix for the defect docs/LINUX-COMPAT.md L4 has disclosed since it
+/// landed - "a spinning thread starves its siblings until timer preemption (task
+/// #27)" - and, through it, for the measured `linuxbun` partial: **all 205 of Bun's
+/// syscalls came from its main thread and the worker it spawned never got the CPU**,
+/// because a cooperative scheduler only switches when the running context *blocks*
+/// and Bun's main thread requires the worker to progress concurrently first. Nothing
+/// was missing from the syscall surface; the CPU simply never moved.
+///
+/// Two things distinguish this from [`sched_yield`], and both matter:
+///
+/// 1. **No syscall return value is written.** A yielding context asked for the
+///    switch and is resumed with 0 in its return register. A *preempted* context was
+///    interrupted at an arbitrary instruction and must resume at exactly that
+///    instruction with every register intact - writing a return value would corrupt
+///    whatever the compiler had in that register. This is the same property the
+///    x86-64 fault-resume path had to be fixed for (`iret_resume` rather than
+///    `sysretq`, which consumes RCX/R11).
+/// 2. **The stop is recorded as involuntary**, by the caller, so the burst score
+///    does not credit a compute-bound context with an interactive weight it did not
+///    earn (docs/SUBSTRATE.md pillar 3).
+///
+/// The context the interrupt arrived in stays `Ready` - it is still runnable, it
+/// just is not running.
+pub fn preempt_context(cell: usize) -> Option<*mut TrapFrame> {
+    let ci = cur_thread(cell);
+    let next = pick_next(cell, ci).filter(|&n| n != ci)?;
+    let from_fp = fp_ptr(cell, ci);
+    // SAFETY: `ci`'s user FP registers are still live - the kernel is soft-float, so
+    // nothing between the interrupt and here touched them.
+    unsafe { arch::save_user_fp(from_fp) };
+    match resume(cell, next) {
+        Ctl::Switch(f) => Some(f),
+        // `resume` returns only `Ctl::Switch`; the other arms are unreachable, and
+        // saying so by falling back to "no sibling" keeps the caller correct if that
+        // ever changes rather than resuming an unrelated frame.
+        _ => None,
+    }
+}
+
 fn switch_to(cell: usize, from: usize, to: usize) -> Ctl {
     let from_fp = fp_ptr(cell, from);
     // SAFETY: `from`'s user FP registers are still live (kernel is soft-float).

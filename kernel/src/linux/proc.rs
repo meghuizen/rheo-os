@@ -310,26 +310,23 @@ pub fn is_fork(flags: u64) -> bool {
 /// Done after `dup_state` (which copies the VMA list) so the child has its own
 /// records to consult and edit.
 fn apply_fork_advice(parent: usize, child: usize) {
-    // Read the parent's advice, act on the child. Collect first: the child's list
-    // is mutated below, and the parent's is the authority for what was asked.
+    // The **parent's** records are the authority for what was asked, and the
+    // **child's** address space and list are what change - two different objects,
+    // which is what lets this iterate the one while mutating the other rather than
+    // copying the ranges into scratch first.
+    //
+    // It used to collect into two `[(usize, usize); MAX_VMAS]` arrays, which was a
+    // silent truncation waiting to happen (a marked range past the array's end was
+    // dropped with no diagnostic - a `MADV_WIPEONFORK` region that quietly kept its
+    // parent's random state, exactly the failure that bit is there to prevent). With
+    // the list funded there is no array dimension to size it against anyway.
     let parent_state = super::state(parent);
-    let mut wipe: [(usize, usize); vma::MAX_VMAS] = [(0, 0); vma::MAX_VMAS];
-    let mut nowipe = 0usize;
-    let mut drop_ranges: [(usize, usize); vma::MAX_VMAS] = [(0, 0); vma::MAX_VMAS];
-    let mut ndrop = 0usize;
-    for m in parent_state.vmas.with_advice(vma::ADV_WIPEONFORK) {
-        if nowipe < wipe.len() {
-            wipe[nowipe] = (m.base, m.len);
-            nowipe += 1;
-        }
-    }
-    for m in parent_state.vmas.with_advice(vma::ADV_DONTFORK) {
-        if ndrop < drop_ranges.len() {
-            drop_ranges[ndrop] = (m.base, m.len);
-            ndrop += 1;
-        }
-    }
-    if nowipe == 0 && ndrop == 0 {
+    let any = parent_state
+        .vmas
+        .with_advice(vma::ADV_WIPEONFORK | vma::ADV_DONTFORK)
+        .next()
+        .is_some();
+    if !any {
         return;
     }
 
@@ -339,13 +336,13 @@ fn apply_fork_advice(parent: usize, child: usize) {
     // SAFETY: the child was just installed; its address space pointer is valid and
     // nothing else is touching it (it has not run).
     let child_aspace = unsafe { &mut *user::cell_aspace_mut(child) };
-    for &(base, len) in wipe.iter().take(nowipe) {
-        child_aspace.free_user_range(base, len);
+    for m in parent_state.vmas.with_advice(vma::ADV_WIPEONFORK) {
+        child_aspace.free_user_range(m.base, m.len);
     }
     let child_state = super::state(child);
-    for &(base, len) in drop_ranges.iter().take(ndrop) {
-        child_aspace.free_user_range(base, len);
-        child_state.vmas.remove(base, len);
+    for m in parent_state.vmas.with_advice(vma::ADV_DONTFORK) {
+        child_aspace.free_user_range(m.base, m.len);
+        child_state.vmas.remove(m.base, m.len);
     }
 }
 
@@ -386,7 +383,20 @@ pub fn fork(cur: usize, parent_frame: *mut TrapFrame) -> i64 {
     // the fd table / brk / cwd / mmap bookkeeping and the signal dispositions.
     // SAFETY: pointers are kernel-owned statics that outlive the run.
     unsafe { user::install_forked(child, aspace_ptr, frame_ptr, cur) };
-    super::dup_state(cur, child);
+    // The child's personality state includes a **funded** VMA table, so copying it
+    // can genuinely fail on the child's frame budget. A half-copied table would
+    // leave the child faulting on mappings it believes it has, so the fork is undone
+    // and refused - the errno Linux uses when it cannot fund a new process.
+    if !super::dup_state(cur, child) {
+        // SAFETY: the child was installed above and has not run; this is the same
+        // teardown `process_exit` performs, before the slot is handed back.
+        unsafe { (*user::cell_aspace(child)).free_user_frames() };
+        procs()[child] = Proc::free();
+        thread::release_cell(child);
+        super::state(child).vmas.teardown();
+        user::free_cell(child);
+        return -EAGAIN;
+    }
     signal::fork_copy(cur, child);
     apply_fork_advice(cur, child);
 
@@ -596,6 +606,13 @@ fn reap(z: usize, wstatus_va: u64) -> u32 {
         }
     }
     procs()[z] = Proc::free();
+    // The slot is genuinely handed back here, so its funded per-cell tables go with
+    // it: the context tables (which `exit` deliberately kept, because a zombie's
+    // status is read after it) and the VMA table, whose records `process_exit`
+    // already dropped. Without this a reaped child's metadata frames stay charged to
+    // a cell that no longer exists (docs/SUBSTRATE.md pillar 1).
+    thread::release_cell(z);
+    super::state(z).vmas.teardown();
     user::free_cell(z);
     pid
 }
@@ -650,7 +667,12 @@ fn process_exit(cell: usize, status: u32, top_code: u64) -> Ctl {
     // overwrites a reused slot wholesale, so "happens to be reused" never releases it
     // at all. Clearing here is what makes the reference lifetime symmetric with
     // `vmas.inherit_files()` in `dup_state`: taken at fork, given back at exit.
-    super::state(cell).vmas.clear();
+    //
+    // `teardown` rather than `clear`, because the table's *own* frames are a
+    // resource too now that it is funded: this releases them and uncharges the dead
+    // cell, so the frame the exit reclaims includes the bookkeeping it caused
+    // (docs/SUBSTRATE.md pillar 1).
+    super::state(cell).vmas.teardown();
     procs()[cell].state = PState::Zombie;
     procs()[cell].wstatus = status;
     reschedule(cell)
@@ -725,10 +747,54 @@ pub fn yield_cell(cur: usize) -> Ctl {
 /// any blocked cell whose condition is now satisfiable, then round-robins to a
 /// runnable cell and completes its pending block. Panics only on a true
 /// deadlock (no runnable cell) - a scheduling bug, surfaced loudly rather than
+/// **Preempt** cell `cur` in favour of another runnable Linux cell, returning the
+/// frame to resume, or `None` when there is no other cell to run.
+///
+/// Called from [`crate::user::on_user_interrupt`] after `thread::preempt_context`
+/// found no ready sibling *within* `cur`. Three differences from [`reschedule`],
+/// each deliberate:
+///
+/// - `cur` **stays `Runnable`**. It did not block; it was taken off the CPU and is
+///   still competing. Marking it blocked would be a claim the scheduler then acts on
+///   by never running it again.
+/// - Nothing is charged here. `on_user_interrupt` already charged the slice and
+///   recorded the stop as involuntary before choosing where to go.
+/// - **Pending signals are not delivered on this path.** Delivery rewrites the
+///   target's saved frame and can conclude the target must die, which is a
+///   `Ctl::Exit` - a control flow the interrupt-return path cannot express, since it
+///   must hand back a frame to resume. So a signal that arrived while the target was
+///   off the CPU is delivered at its next *ordinary* resume, which happens at every
+///   syscall boundary. Nothing is lost, only deferred - and deferring is what keeps
+///   preemption from being able to end a process at an arbitrary instruction.
+pub(crate) fn preempt_cell(cur: usize) -> Option<*mut TrapFrame> {
+    thread::save_current_fp(cur);
+    for i in 0..MAX_CELLS {
+        if procs()[i].state == PState::Blocked && satisfiable(i) {
+            procs()[i].state = PState::Runnable;
+        }
+    }
+    let n = crate::sched::dispatch::pick_excluding_self(cur, MAX_CELLS, |i| {
+        user::cell_present(i) && procs()[i].state == PState::Runnable
+    })?;
+    let idx = first_satisfiable_context(n).unwrap_or_else(|| thread::current_context(n));
+    thread::set_current(n, idx);
+    user::switch_to_cell(n);
+    thread::restore_current(n);
+    complete_pblock(n, idx);
+    Some(thread::current_frame(n))
+}
+
 /// hung.
 fn reschedule(leaving: usize) -> Ctl {
     // Save the outgoing cell's live FP state (harmless if it is exiting).
     thread::save_current_fp(user::current_index());
+    // Charge the CPU time the leaving cell just used to its vcore and end its burst
+    // (docs/SUBSTRATE.md pillar 3, migration S3'). It reached here by parking on a
+    // wake source or exiting, so the relinquish is **voluntary** - which is exactly
+    // the transition BORE scores, and the reason it can be observed here rather
+    // than inferred: this kernel has no path from running to not-running that does
+    // not pass through a named call.
+    crate::sched::dispatch::relinquish();
 
     loop {
         // Wake blocked cells whose condition now holds.
@@ -738,9 +804,13 @@ fn reschedule(leaving: usize) -> Ctl {
             }
         }
 
-        let next = (1..=MAX_CELLS)
-            .map(|k| (leaving + k) % MAX_CELLS)
-            .find(|&i| user::cell_present(i) && procs()[i].state == PState::Runnable);
+        // The **order** comes from the EEVDF+BORE ready queue when it is enabled;
+        // the predicate below remains the sole authority on *whether* a cell may
+        // run. With dispatch disabled this is the pre-migration round-robin,
+        // expression for expression (docs/SUBSTRATE.md 15).
+        let next = crate::sched::dispatch::pick(leaving, MAX_CELLS, |i| {
+            user::cell_present(i) && procs()[i].state == PState::Runnable
+        });
         if let Some(n) = next {
             // Resume the context whose per-context block is satisfiable (a
             // multi-threaded cell can have several parked); a cell that only
@@ -750,6 +820,11 @@ fn reschedule(leaving: usize) -> Ctl {
             thread::set_current(n, idx);
             user::switch_to_cell(n);
             thread::restore_current(n);
+            // Record who is running, from which the next relinquish computes what to
+            // charge. The returned slice is what a preemption timer is armed with;
+            // it is armed by the trap-return path, which is the only place that
+            // knows the cell is about to actually execute.
+            crate::sched::dispatch::running(n, idx);
             complete_pblock(n, idx);
             // A signal another process sent while `n` was not running is
             // delivered *here* and nowhere else: delivery is a rewrite of the

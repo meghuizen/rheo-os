@@ -264,9 +264,11 @@ pub fn mmap(
             Some(h) => Some(h),
             None => {
                 crate::println!(
-                    "linux: mmap of a file refused - the mapped-file table is full \
-                     ({} entries) or the path could not be reopened",
-                    crate::linux::filemap::MAX_MAPPED_FILES
+                    "linux: mmap of a file refused - the mapped-file registry could \
+                     not be funded ({} of {} entries in use) or the path could not \
+                     be reopened",
+                    filemap::in_use(),
+                    filemap::slots()
                 );
                 return -ENOMEM;
             }
@@ -287,10 +289,16 @@ pub fn mmap(
         len: bytes,
     });
     if !st.vmas.insert_backed(base, bytes, prot, flags, backing) {
+        // The table grows on demand now (docs/SUBSTRATE.md pillar 1), so this is a
+        // *resource* refusal - the cell's frame budget, or the pool's metadata
+        // reserve - and the diagnostic reports the table's real size rather than a
+        // constant that no longer bounds anything.
         crate::println!(
-            "linux: mmap of {bytes:#x} at {base:#x} refused - the per-cell VMA table \
-             is full ({} records)",
-            crate::linux::vma::MAX_VMAS
+            "linux: mmap of {bytes:#x} at {base:#x} refused - no funded VMA slot \
+             ({} records live in {} slots, {} frames)",
+            st.vmas.count(),
+            st.vmas.slots(),
+            st.vmas.frames_held()
         );
         return -ENOMEM;
     }

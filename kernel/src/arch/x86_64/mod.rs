@@ -822,6 +822,14 @@ extern "C" fn x86_trap_handler(vector: u64, error_code: u64, rip: u64, _cs: u64)
         DOORBELLS.fetch_add(1, Ordering::Relaxed);
         return;
     }
+    // The LAPIC one-shot, taken in **ring 0** - the arbiter's own `timer_park`
+    // (`sti; hlt; cli`) is where that happens, and it is the pre-preemption
+    // behaviour unchanged: record the fire, EOI, resume. The arbiter observes the
+    // elapsed deadline itself when the halt returns.
+    if vector as usize == VEC_TIMER {
+        x86_timer_irq();
+        return;
+    }
     // Ring-3 faults are handled by `x86_fault_trap` (via the .Lfault_from_user
     // path in vectors.S), which builds the full TrapFrame the signal machinery
     // needs. Reaching here means a kernel-mode exception: fatal.
@@ -851,6 +859,17 @@ extern "C" fn x86_fault_trap(
     fault_addr: u64,
     frame: *mut TrapFrame,
 ) -> *mut TrapFrame {
+    // The LAPIC one-shot, taken in **ring 3**: an interrupt, not a fault. EOI it,
+    // record that a preemption slice elapsed, and let the portable scheduler decide
+    // whether the CPU moves (docs/SUBSTRATE.md pillar 3). Returning `frame`
+    // unchanged - which is what happens when nothing else is runnable - resumes the
+    // cell at exactly the interrupted instruction, because `common_trap` routes a
+    // ring-3 return through IRET.
+    if vector as usize == VEC_TIMER {
+        x86_timer_irq();
+        crate::sched::preempt::note();
+        return crate::user::on_user_interrupt(frame);
+    }
     crate::user::on_user_trap(
         super::TrapKind::Fault,
         fault_cause(vector),
@@ -1435,14 +1454,24 @@ pub fn trapframe_new(entry: usize, user_sp: usize, arg: usize, kernel_sp: usize)
         r14: 0,
         r15: 0,
         rip: entry as u64,
-        // Reserved bit 1 only; IF stays *clear*. The kernel has no interrupt
-        // handlers yet (the preemption doorbell is future work, CONCURRENCY.md
-        // 4) and under PVH there is no firmware to remap the 8259 PIC, so a
-        // legacy IRQ (the PIT's IRQ0) would arrive on vector 0x08 and be
-        // mistaken for a #DF. Cells are cooperative and trap-driven, so
-        // masking interrupts in U-mode is correct until real IRQ handling
-        // lands. The PIC is also masked at boot (see mask_legacy_pic).
-        rflags: 0x002,
+        // Reserved bit 1, plus IF (bit 9) **only when the scheduler needs to be able
+        // to take the CPU away from this cell** (docs/SUBSTRATE.md pillar 3).
+        //
+        // IF clear was right while every scheduler was cooperative, and for a reason
+        // beyond tidiness: under PVH there is no firmware to remap the 8259 PIC, so a
+        // legacy IRQ (the PIT's IRQ0) would arrive on vector 0x08 and be mistaken for
+        // a #DF. That hazard is handled - the PIC is masked at boot (`mask_legacy_pic`)
+        // and the LAPIC drives its own vectors - so the remaining consequence of a
+        // clear IF was simply that the preemption timer could not be delivered to a
+        // running cell, which is why nothing could stop one.
+        //
+        // Read at frame-construction time rather than flipped later, so a frame built
+        // for a cooperative boot keeps the pre-migration bits exactly.
+        rflags: if crate::sched::dispatch::enabled() {
+            0x202
+        } else {
+            0x002
+        },
         rsp: user_sp as u64,
         kernel_sp: kernel_sp as u64,
         _pad: 0,

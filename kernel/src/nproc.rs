@@ -581,9 +581,16 @@ fn ensure_tracked(cell: usize) {
 /// behaviour is unchanged. Returns `Sched::Ret(0)` when the caller is the only
 /// schedulable cell (yield to nobody = resume).
 pub fn yield_cell(cur: usize) -> Sched {
-    let Some(next) = (1..MAX_CELLS)
-        .map(|k| (cur + k) % MAX_CELLS)
-        .find(|&i| schedulable(i))
+    // A yield charges the CPU time used and ends the burst, but the caller **stays
+    // runnable** - it is still competing (docs/SUBSTRATE.md pillar 3). Marking it
+    // blocked here would withdraw its weight from the queue's total and make every
+    // sibling's virtual clock advance too fast.
+    crate::sched::dispatch::yielded();
+    // The order is the ready queue's when dispatch is enabled; `schedulable` stays
+    // the sole authority on who may run. Note the range: a yield deliberately
+    // excludes the caller (`1..MAX_CELLS`), so "yield to nobody" is `Ret(0)` rather
+    // than a self-switch.
+    let Some(next) = crate::sched::dispatch::pick_excluding_self(cur, MAX_CELLS, schedulable)
     else {
         return Sched::Ret(0);
     };
@@ -591,8 +598,31 @@ pub fn yield_cell(cur: usize) -> Sched {
     // hard-float cell's hand-off point (docs/LIBRHEO.md, docs/ENGINEERING.md 3),
     // and a service cell reaches it on every client round.
     user::switch_native_cell(cur, next);
+    crate::sched::dispatch::running(next, 0);
     complete_block(next);
     Sched::Switch(user::cell_frame(next))
+}
+
+/// **Preempt** native cell `cur` in favour of another runnable native cell,
+/// returning the frame to resume, or `None` when there is no other cell to run.
+///
+/// Called from [`crate::user::on_user_interrupt`]. A native cell has a single
+/// execution context, so unlike the Linux path there is no cheaper intra-cell move
+/// to try first - the only preemption available is to another cell.
+///
+/// `cur` stays runnable (it was taken off the CPU, it did not block), and the switch
+/// is [`user::switch_native_cell`] - **the** native cross-cell switch, which swaps
+/// the FP/SIMD register file as well as the address space. Using the bare
+/// `switch_to_cell` here would silently corrupt a hard-float cell's vector registers,
+/// which is the exact defect the `SYS_YIELD` scar records (docs/LIBRHEO.md, "FP/SIMD
+/// across the native cross-cell switch"): preemption is a **fourth** path into that
+/// invariant, and it holds here for the same structural reason the other three do.
+pub fn preempt_cell(cur: usize) -> Option<*mut TrapFrame> {
+    wake_satisfiable();
+    let next = crate::sched::dispatch::pick_excluding_self(cur, MAX_CELLS, schedulable)?;
+    user::switch_native_cell(cur, next);
+    complete_block(next);
+    Some(user::cell_frame(next))
 }
 
 /// Whether cell `i` can be resumed by a yield: present, native, and either a
@@ -662,12 +692,17 @@ fn process_exit(cell: usize, code: u64) -> *mut TrapFrame {
 /// runnable *and* no blocked cell has any source left is it a genuine deadlock, and
 /// that is reported (see [`report_deadlock`]) rather than panicked.
 fn reschedule(leaving: usize) -> *mut TrapFrame {
+    // The leaving cell blocked or exited: charge its CPU time and end its burst
+    // voluntarily (docs/SUBSTRATE.md pillar 3, migration S3').
+    crate::sched::dispatch::relinquish();
     loop {
         wake_satisfiable();
 
-        let next = (1..=MAX_CELLS)
-            .map(|k| (leaving + k) % MAX_CELLS)
-            .find(|&i| user::cell_present(i) && procs()[i].state == PState::Runnable);
+        // Order from the ready queue when enabled, the pre-migration round-robin
+        // when not; the predicate stays the authority on runnability.
+        let next = crate::sched::dispatch::pick(leaving, MAX_CELLS, |i| {
+            user::cell_present(i) && procs()[i].state == PState::Runnable
+        });
         if let Some(n) = next {
             if n != leaving {
                 // Save the outgoing cell's live FP/SIMD state (harmless if it is
@@ -675,6 +710,7 @@ fn reschedule(leaving: usize) -> *mut TrapFrame {
                 // Linux personality's `thread::save_current_fp`/`restore_current`.
                 user::switch_native_cell(leaving, n);
             }
+            crate::sched::dispatch::running(n, 0);
             complete_block(n);
             return user::cell_frame(n);
         }

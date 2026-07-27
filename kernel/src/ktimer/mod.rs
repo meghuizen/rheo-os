@@ -134,10 +134,21 @@ pub enum TimerClient {
     /// sleep, a receive deadline and the pacer are all also outstanding, and no
     /// client may cancel another's.
     FutexWait = 5,
+    /// The **scheduler's preemption slice** (docs/SUBSTRATE.md pillar 3,
+    /// `crate::sched::preempt`): "the running cell may have the CPU until here".
+    ///
+    /// Its own slot for the reason every other client has one - a cell running
+    /// under a slice can simultaneously have a sleep, a receive deadline, a futex
+    /// timeout and a pacing deadline outstanding, and the pre-N2h defect was
+    /// precisely that one client's cancel destroyed another's deadline. It is also
+    /// the *most* frequently re-armed client (once per entry into a cell), which is
+    /// what makes the arbiter's re-arm-the-nearest-remaining behaviour load-bearing
+    /// rather than incidental.
+    Preempt = 6,
 }
 
 /// Number of deadline slots (one per [`TimerClient`]).
-pub const CLIENTS: usize = 6;
+pub const CLIENTS: usize = 7;
 
 #[derive(Copy, Clone)]
 struct Slot {

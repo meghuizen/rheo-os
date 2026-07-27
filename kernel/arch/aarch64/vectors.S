@@ -42,7 +42,13 @@ vector_table:
     FATAL_SLOT 7                // current EL SPx: SError
 .p2align 7
     b el0_sync                  // lower EL AArch64: synchronous (user)
-    FATAL_SLOT 9                // lower EL AArch64: IRQ
+// Each slot is 128 bytes and only FATAL_SLOT aligns itself, so a bare branch needs
+// its own `.p2align 7`. Without it this instruction sits four bytes into slot 8 and
+// the EL0 IRQ lands in slot *10*'s handler - which is exactly what happened first
+// time, reported as "unexpected vector slot 10" with a stale ESR from the previous
+// SVC (docs/ENGINEERING.md 11: the diagnostic named a slot nothing had branched to).
+.p2align 7
+    b el0_irq                   // lower EL AArch64: IRQ (timer preemption)
     FATAL_SLOT 10               // lower EL AArch64: FIQ
     FATAL_SLOT 11               // lower EL AArch64: SError
     FATAL_SLOT 12               // lower EL AArch32: synchronous
@@ -118,6 +124,52 @@ fatal_trap:
     mrs x1, esr_el1
     mrs x2, elr_el1
     b aarch64_fatal_handler
+
+// EL0 IRQ entry (docs/SUBSTRATE.md pillar 3, timer preemption). A GICv3 interrupt
+// taken while a **cell** is running at EL0. This slot used to be FATAL_SLOT 9,
+// because cells ran with IRQ masked in their SPSR and so could not be interrupted at
+// all - which is precisely why nothing could take the CPU away from a compute-bound
+// cell.
+//
+// The frame capture is el0_sync's, register for register, and the exit is the shared
+// el0_resume. It has to be the full frame and not irq_current_spx's caller-saved
+// subset: an interrupted cell may be resumed *later*, after another cell has run, so
+// every callee-saved register has to be in the frame rather than on a kernel stack
+// that will have been reused. Returning the same frame pointer resumes the cell at
+// exactly the interrupted instruction, which is the case where no preemption is due.
+el0_irq:
+    msr tpidrro_el0, x0
+    mrs x0, tpidr_el1           // x0 = &frame
+    stp x1, x2, [x0, #8]
+    stp x3, x4, [x0, #24]
+    stp x5, x6, [x0, #40]
+    stp x7, x8, [x0, #56]
+    stp x9, x10, [x0, #72]
+    stp x11, x12, [x0, #88]
+    stp x13, x14, [x0, #104]
+    stp x15, x16, [x0, #120]
+    stp x17, x18, [x0, #136]
+    stp x19, x20, [x0, #152]
+    stp x21, x22, [x0, #168]
+    stp x23, x24, [x0, #184]
+    stp x25, x26, [x0, #200]
+    stp x27, x28, [x0, #216]
+    stp x29, x30, [x0, #232]
+    mrs x1, tpidrro_el0         // recover original x0
+    str x1, [x0, #0]
+    mrs x1, sp_el0
+    str x1, [x0, #TF_SP]
+    mrs x1, elr_el1
+    str x1, [x0, #TF_ELR]
+    mrs x1, spsr_el1
+    str x1, [x0, #TF_SPSR]
+    mrs x1, tpidr_el0
+    str x1, [x0, #TF_TPIDR]
+
+    ldr x1, [x0, #TF_KSP]
+    mov sp, x1
+    bl aarch64_user_irq         // x0 = &frame -> frame* to resume, in x0
+    b el0_resume
 
 // EL0 synchronous entry. TPIDR_EL1 = &TrapFrame. Stash x0 in TPIDRRO_EL0
 // (writable at EL1) so we have a scratch, save the full frame, switch to

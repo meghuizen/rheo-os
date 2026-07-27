@@ -359,6 +359,74 @@ pub extern "C" fn user_peer(params_va: usize) -> ! {
     loop {}
 }
 
+/// The **spinner** cell: the proof that timer preemption exists
+/// (docs/SUBSTRATE.md pillar 3).
+///
+/// It runs a bounded compute loop and **issues no syscall at all** until it is
+/// finished. `workload` is its marker byte, `iters` the number of spin rounds, and
+/// `ticks` the shared order-vector page. Each round appends its marker and then
+/// burns a fixed amount of arithmetic, so the loop is long enough for a slice to
+/// elapse inside it.
+///
+/// Why this is a proof rather than a demonstration: under **cooperative**
+/// scheduling a cell that never traps cannot be stopped, so two of these cells run
+/// strictly one after the other and the order vector is a run of one marker
+/// followed by a run of the other. An interleaved vector is therefore only
+/// producible if something took the CPU away mid-loop, and the only thing that can
+/// is the preemption timer. The `preempt` kernel asserts both halves - the
+/// uninterleaved control with dispatch off, and the interleave with it on - so the
+/// claim is bounded by its own negative case (docs/ENGINEERING.md 1).
+///
+/// `status` is set to 1 only after the loop completes, so a cell that never got the
+/// CPU back is distinguishable from one that finished.
+#[unsafe(link_section = ".user.text")]
+#[unsafe(no_mangle)]
+pub extern "C" fn user_spinner(params_va: usize) -> ! {
+    let p = params_va as *mut Params;
+    // SAFETY: the cell's own mapped Params page (its entry argument) and the shared
+    // order page mapped read-write into it.
+    unsafe {
+        let marker = (*p).workload as u8;
+        let rounds = (*p).iters;
+        let shared = (*p).ticks as *mut u8;
+        let mut i = 0u64;
+        let mut acc = 1u64;
+        while i < rounds {
+            order_append(shared, marker);
+            // Burn work with no call and no memory the kernel owns. Three
+            // constraints shape this loop, all from the `.user` window rule
+            // (docs/TARGET-ARCHITECTURES.md 4.1): `wrapping_*` so there is no
+            // overflow-panic path in kernel `.text`, the result stored so it is not
+            // dead code, and **only small immediates** - a 64-bit multiplier cannot
+            // be materialised inline on RISC-V, so LLVM puts it in a constant pool
+            // in kernel `.rodata`, which a cell has no mapping for. That was not a
+            // hypothetical: the first version of this loop used a 64-bit LCG
+            // multiplier and faulted at a high-half address before its first round.
+            let mut k = 0u64;
+            while k < SPIN_WORK {
+                acc = acc.wrapping_add(k ^ 0x5f).wrapping_mul(3);
+                k += 1;
+            }
+            (*p).ops = acc;
+            i += 1;
+        }
+        (*p).status = 1;
+        syscall(SYS_EXIT, 0);
+    }
+    loop {}
+}
+
+/// Arithmetic operations per spin round in [`user_spinner`].
+///
+/// Sized so the whole loop is **many** preemption slices long, not one or two. The
+/// first value tried (20,000) gave a 24-round loop about 2.7 ms of CPU against a
+/// 1 ms default slice - three slices for the entire run - and that was measurably
+/// flaky: whether an interleave appeared depended on how QEMU's TCG happened to be
+/// scheduled by the host. A proof whose outcome depends on host load is not a proof,
+/// so the work is an order of magnitude larger, giving tens of slices per run.
+/// Still far inside the 120 s boot budget.
+pub const SPIN_WORK: u64 = 200_000;
+
 // ------------------------------------------------------- security attacker
 //
 // The `security` test kernel's probes (docs/ENGINEERING.md 12). An

@@ -177,8 +177,30 @@ common_trap:
     iretq
 .endm
 
-IRQ_STUB timer_irq_stub, x86_timer_irq
 IRQ_STUB uart_irq_stub, x86_uart_irq
+
+/* The LAPIC one-shot vector, which - unlike the UART's - must be able to fire in
+ * ring 3 and take the CPU away from the running cell (docs/SUBSTRATE.md pillar 3,
+ * timer preemption). An IRQ_STUB cannot: it saves only the caller-saved registers
+ * onto the kernel stack and returns to whatever it interrupted, so there is no
+ * TrapFrame to switch away from.
+ *
+ * So the timer goes through `common_trap` instead, which already does exactly the
+ * right thing: it splits on the interrupted CS's RPL, captures the full ring-3
+ * register state into the current cell's TrapFrame, and resumes through IRET (never
+ * SYSRET - the interrupted instruction re-executes, and SYSRET consumes RCX/R11).
+ * Reusing it rather than writing a second frame-capture is deliberate: two copies of
+ * that 18-store sequence would be two places for an offset to drift.
+ *
+ * A dummy error code keeps the frame layout uniform with the exception stubs; the
+ * vector distinguishes it, and both Rust handlers recognise it (ring 0 -> EOI and
+ * resume, the arbiter's own halt path; ring 3 -> EOI, note the preemption, ask the
+ * portable scheduler for the frame to resume). */
+.global timer_irq_stub
+timer_irq_stub:
+    pushq $0                     /* dummy error code */
+    pushq $0x20                  /* VEC_TIMER */
+    jmp common_trap
 
 /* The LAPIC spurious vector requires no EOI and does no work: just return. */
 .global spurious_irq_stub

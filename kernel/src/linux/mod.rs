@@ -144,7 +144,12 @@ pub fn install_cell(idx: usize, img: &crate::load::LinuxImage) {
     // address space, so a stale record would make first fit refuse a span that is
     // actually free - and would give a page-fault lookup an answer about memory
     // that no longer exists (docs/ARCHITECTURE-DEBT.md 4, blocker 2).
-    st.vmas.clear();
+    //
+    // `reinit` rather than `clear` because the VMA table is funded: it hands the
+    // previous occupant's frames back and re-charges future growth to *this* cell,
+    // which is what makes an exhaustion refusal name the right owner
+    // (docs/SUBSTRATE.md pillar 1).
+    st.vmas.reinit(crate::mm::kmeta::Owner::cell(idx));
     st.tid_addr = 0;
     st.robust_list = 0;
     st.initialized = true;
@@ -167,6 +172,12 @@ pub fn install_cell(idx: usize, img: &crate::load::LinuxImage) {
 /// Clear all per-cell Linux state (called from `user::reset`).
 pub fn reset() {
     for i in 0..MAX_CELLS {
+        // The VMA table holds frames, and overwriting its descriptor with a fresh
+        // `LinuxState` would strand them: nothing owns a `Funded`'s frames but the
+        // descriptor that names them, and there is no drop glue to notice
+        // (docs/SUBSTRATE.md pillar 1). So release before overwriting - and if a
+        // new funded table joins `LinuxState`, it releases here too.
+        state(i).vmas.teardown();
         *state(i) = LinuxState::new();
     }
     thread::reset();
@@ -192,20 +203,45 @@ pub fn fill_fault(cell: usize, addr: usize) -> bool {
 /// Deep-copy cell `from`'s Linux state into cell `to` (the `fork` inheritance
 /// step, docs/LINUX-COMPAT.md L6): the child gets the parent's fd table, cwd,
 /// brk/mmap bookkeeping, and auxv, then references the same pipes.
-pub(crate) fn dup_state(from: usize, to: usize) {
+/// Returns false when the child's state could not be funded - a `fork` the caller
+/// must refuse rather than complete with a child whose mapping table is a
+/// truncated copy of its parent's.
+pub(crate) fn dup_state(from: usize, to: usize) -> bool {
+    // The child's own funded tables are released first: this slot may be a
+    // previous cell's, and the raw copy below would otherwise overwrite the
+    // descriptors that name those frames and strand them.
+    state(to).vmas.teardown();
     // SAFETY: single CPU, synchronous; `from != to`; both indices are in range.
     unsafe {
         let base = addr_of_mut!(LINUX_STATE) as *mut LinuxState;
         core::ptr::copy_nonoverlapping(base.add(from), base.add(to), 1);
     }
+    // **A funded table cannot be raw-copied.** The copy above duplicated the VMA
+    // table's *descriptor*, so at this instant parent and child name one shared
+    // directory frame - every mapping the child made would appear in the parent,
+    // and whichever exited first would free frames the other still reads. So the
+    // aliased descriptor is overwritten with an empty table of the child's own
+    // (a plain assignment: there is no drop glue, so this drops the alias without
+    // touching the parent's frames) and the records are copied explicitly.
+    state(to).vmas = vma::VmaList::new();
+    state(to).vmas.reinit(crate::mm::kmeta::Owner::cell(to));
+    let from_vmas = &state(from).vmas as *const vma::VmaList;
+    // SAFETY: `from != to`, so these are distinct elements of LINUX_STATE; the
+    // copy reads the parent's table and writes only the child's.
+    if !state(to).vmas.copy_from(unsafe { &*from_vmas }) {
+        crate::println!("linux: fork refused - no frame budget for the child's VMA table");
+        state(to).vmas.teardown();
+        return false;
+    }
     // Every refcounted thing the fork now shares needs a reference added here, because
-    // the copy above is a raw `copy_nonoverlapping` that touches no counter. Pipes were
+    // neither the raw copy nor `copy_from` touches a counter. Pipes were
     // always handled; the **backing stores** behind file mappings were not, and the
     // consequence lands on the *parent*: the child's records named entries it held no
     // reference to, the child's exit released one per record and drove the count to zero,
     // and the parent then faulted against a freed entry and got a zero page.
     state(to).fds.inherit_pipe_ends();
     state(to).vmas.inherit_files();
+    true
 }
 
 /// Turn the loader's recorded `PT_LOAD`s into file-backed VMA records, so their
@@ -273,7 +309,7 @@ pub(crate) fn exec_reinit(cell: usize, img: &crate::load::LinuxImage) {
     // address space, so a stale record would make first fit refuse a span that is
     // actually free - and would give a page-fault lookup an answer about memory
     // that no longer exists (docs/ARCHITECTURE-DEBT.md 4, blocker 2).
-    st.vmas.clear();
+    st.vmas.reinit(crate::mm::kmeta::Owner::cell(cell));
     st.tid_addr = 0;
     st.robust_list = 0;
     st.initialized = true;

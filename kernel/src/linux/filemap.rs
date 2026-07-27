@@ -22,27 +22,49 @@
 //! adds a reference to the same handle instead of re-opening (re-opening could
 //! fail, and a `fork` that half-succeeds is worse than one that does not).
 //!
+//! ## Funded, not fixed
+//!
+//! The table's storage is frames from the pool (docs/SUBSTRATE.md pillar 1), so it
+//! grows with demand. It is charged to [`Owner::KERNEL`] rather than to a cell,
+//! and that is a deliberate accounting choice rather than an omission: an entry is
+//! **shared** - a parent opens it, `fork` gives the child a reference, and either
+//! may be the one that drops the last one - so attributing the frames to whichever
+//! cell happened to grow the table would bill a cell for storage that outlives it
+//! and mis-attribute the release. Registry entries are small and their count is
+//! bounded by the mappings alive across the machine, which is the kernel's own
+//! bookkeeping.
+//!
 //! ## Scope (honest)
 //! - **`MAP_PRIVATE` only**, which is what `ld.so` and every mapping in this tree
 //!   use. A private mapping's page is a *copy*, so a write after the fill is not
 //!   reflected back to the file - correct for PRIVATE, and `MAP_SHARED` of a file
 //!   is refused elsewhere rather than modelled here.
-//! - The registry is small ([`MAX_MAPPED_FILES`]). A program mapping more distinct
-//!   files than that gets a clean refusal from `mmap`, not a wrong mapping.
 
-use core::ptr::addr_of_mut;
+use crate::mm::kmeta::{Funded, Owner};
 
-/// Distinct files that may be mapped at once, across all cells. A dynamically
-/// linked program maps its own image plus `ld.so` plus every shared library it
-/// pulls in - a C or Rust hello is 3-4 (image + ld.so + libc + libgcc_s), but a
-/// **production** binary links a dozen or more (libstdc++, libm, libpthread,
-/// libdl, libssl, ...), which is the shape the real target (an unmodified
-/// dynamically-linked application) needs. 64 is headroom for that, still a small
-/// fixed static array (the kernel stays allocation-free). A program mapping more
-/// than this gets a clean `mmap` refusal, never a wrong mapping. This is a
-/// limit-raise, not a design change (docs/LINUX-COMPAT.md), like the frame-pool
-/// and object-table raises before it.
-pub const MAX_MAPPED_FILES: usize = 64;
+/// A registry handle: the index of a [`MappedFile`] entry.
+///
+/// `u16`, not `u8`. The width was the *real* ceiling once the table itself could
+/// grow: 256 entries is reachable by a process tree where each member maps a
+/// dozen files (a container running a Node app is exactly that), and a handle that
+/// silently wraps would point a mapping at **another file's** bytes - the worst
+/// available failure mode, since it is neither a fault nor a refusal. Widening it
+/// is what makes the growth below mean anything.
+pub type Handle = u16;
+
+/// Entries the registry starts with room for. **Not a ceiling** - the table is
+/// [`Funded`] and doubles on demand.
+///
+/// A dynamically linked program maps its own image plus `ld.so` plus every shared
+/// library it pulls in: a C or Rust hello is 3-4, a production binary a dozen or
+/// more (libstdc++, libm, libssl, ...), and a process *tree* multiplies that by its
+/// members. 64 covers the single-program case without a growth.
+pub const INITIAL_MAPPED_FILES: usize = 64;
+
+/// A hard sanity ceiling on registry entries, well inside what [`Handle`] can
+/// address. As elsewhere, the meaningful refusal is the pool's metadata reserve;
+/// this only keeps a leak bounded by something nameable.
+pub const MAPPED_FILE_CEILING: usize = 8192;
 
 /// Where a mapping's bytes come from.
 ///
@@ -81,21 +103,53 @@ impl MappedFile {
     }
 }
 
-static mut TBL: [MappedFile; MAX_MAPPED_FILES] = [const { MappedFile::new() }; MAX_MAPPED_FILES];
+static mut TBL: Funded<MappedFile> = Funded::new();
 
-fn tbl() -> &'static mut [MappedFile; MAX_MAPPED_FILES] {
+fn tbl() -> &'static mut Funded<MappedFile> {
     // SAFETY: single CPU, synchronous traps; one cell runs at a time.
-    unsafe { &mut *addr_of_mut!(TBL) }
+    unsafe { &mut *core::ptr::addr_of_mut!(TBL) }
 }
 
-/// Close every handle and clear the table (called from `linux::reset`).
+/// Close every handle and release the table's frames (called from `linux::reset`).
 pub fn reset() {
-    for e in tbl().iter_mut() {
-        if e.used {
-            release(e);
+    let t = tbl();
+    for i in 0..t.capacity() {
+        if let Some(e) = t.get(i)
+            && e.used
+        {
+            release(&e);
         }
-        *e = MappedFile::new();
     }
+    t.release();
+}
+
+/// A slot for a new entry, growing the table when every existing one is used.
+fn free_slot() -> Option<usize> {
+    let t = tbl();
+    let cap = t.capacity();
+    for i in 0..cap {
+        if t.get(i).is_some_and(|e| !e.used) {
+            return Some(i);
+        }
+    }
+    let want = if cap == 0 {
+        INITIAL_MAPPED_FILES
+    } else {
+        (cap * 2).min(MAPPED_FILE_CEILING)
+    };
+    if want <= cap {
+        return None;
+    }
+    t.set_owner(Owner::KERNEL);
+    if !t.reserve(want) {
+        return None;
+    }
+    // A grown frame is zeroed, and `MappedFile::new()`'s `used` is false, so the
+    // first new slot reads as free without initialising it. The `store` field is
+    // the one place that matters: `Store::Vfs(-1)` is *not* all-zero, so the slot
+    // is written in full by `open`/`open_mem` before anything reads it - which they
+    // do, and which is why `used` is the only field consulted here.
+    Some(cap)
 }
 
 /// Give back whatever the store owns. Only a VFS handle owns anything; resident
@@ -114,10 +168,11 @@ fn release(e: &MappedFile) {
 /// `path_va`/`path_len` name the path in **kernel** memory (the caller has already
 /// copied it out of the cell), because the cell's address space is not active when
 /// a fault later refills a page - and the same handle must serve then.
-pub fn open(path_va: u64, path_len: u64) -> Option<u8> {
+pub fn open(path_va: u64, path_len: u64) -> Option<Handle> {
     let ops = crate::svc::file_ops()?;
-    let t = tbl();
-    let idx = (0..MAX_MAPPED_FILES).find(|&i| !t[i].used)?;
+    // The slot is taken before the open, so a table that cannot grow refuses
+    // without leaving a descriptor open that nothing owns.
+    let idx = free_slot()?;
     // O_RDONLY: a MAP_PRIVATE mapping never writes back, so read access is all the
     // authority the mapping needs - asking for more would be authority we do not
     // use (ARCHITECTURE.md 5).
@@ -125,12 +180,15 @@ pub fn open(path_va: u64, path_len: u64) -> Option<u8> {
     if fd < 0 {
         return None;
     }
-    t[idx] = MappedFile {
-        used: true,
-        refs: 1,
-        store: Store::Vfs(fd),
-    };
-    Some(idx as u8)
+    tbl().set(
+        idx,
+        MappedFile {
+            used: true,
+            refs: 1,
+            store: Store::Vfs(fd),
+        },
+    );
+    Some(idx as Handle)
 }
 
 /// Register bytes already resident in kernel memory as a backing store - the
@@ -142,43 +200,52 @@ pub fn open(path_va: u64, path_len: u64) -> Option<u8> {
 /// for as long as any mapping references this entry. In practice that means a
 /// `'static` image (a `include_bytes!` blob, or a buffer the caller owns for the
 /// lifetime of the cell) - not a stack buffer.
-pub unsafe fn open_mem(addr: usize, len: usize) -> Option<u8> {
-    let t = tbl();
-    let idx = (0..MAX_MAPPED_FILES).find(|&i| !t[i].used)?;
-    t[idx] = MappedFile {
-        used: true,
-        refs: 1,
-        store: Store::Mem(addr, len),
-    };
-    Some(idx as u8)
+pub unsafe fn open_mem(addr: usize, len: usize) -> Option<Handle> {
+    let idx = free_slot()?;
+    tbl().set(
+        idx,
+        MappedFile {
+            used: true,
+            refs: 1,
+            store: Store::Mem(addr, len),
+        },
+    );
+    Some(idx as Handle)
 }
 
 /// Is entry `h` live? A caller that recorded a handle and then had it cleared out
 /// from under it (a `reset` between load and install) would otherwise present as a
 /// mapping full of zeros - which on RISC-V is an illegal instruction at the entry
 /// point and nothing more informative (docs/ENGINEERING.md 11).
-pub fn alive(h: u8) -> bool {
-    (h as usize) < MAX_MAPPED_FILES && tbl()[h as usize].used
+pub fn alive(h: Handle) -> bool {
+    tbl().get(h as usize).is_some_and(|e| e.used)
 }
 
 /// A new `Vma` names entry `h` (a split `munmap`, or `fork`'s copy of the list).
-pub fn addref(h: u8) {
-    let e = &mut tbl()[h as usize];
-    if e.used {
+pub fn addref(h: Handle) {
+    if let Some(e) = tbl().get_mut(h as usize)
+        && e.used
+    {
         e.refs = e.refs.saturating_add(1);
     }
 }
 
 /// Drop a reference; close the file and free the slot at zero.
-pub fn close(h: u8) {
-    let e = &mut tbl()[h as usize];
+pub fn close(h: Handle) {
+    let t = tbl();
+    let Some(e) = t.get_mut(h as usize) else {
+        return;
+    };
     if !e.used {
         return;
     }
     e.refs = e.refs.saturating_sub(1);
     if e.refs == 0 {
-        release(e);
+        // Copied out before `release`, which calls back into `svc::FileOps` and must
+        // not hold a borrow of the table across it.
+        let dead = *e;
         *e = MappedFile::new();
+        release(&dead);
     }
 }
 
@@ -188,8 +255,10 @@ pub fn close(h: u8) {
 /// The destination is a kernel VA on purpose: a fault fills a freshly allocated
 /// frame through the kernel's linear map *before* it is user-mapped, so the read
 /// cannot alias the cell's memory and cannot be steered by the cell.
-pub fn read_at(h: u8, dst_kva: u64, len: u64, off: i64) -> i64 {
-    let e = tbl()[h as usize];
+pub fn read_at(h: Handle, dst_kva: u64, len: u64, off: i64) -> i64 {
+    let Some(e) = tbl().get(h as usize) else {
+        return -1;
+    };
     if !e.used || off < 0 {
         return -1;
     }
@@ -232,5 +301,19 @@ pub fn read_at(h: u8, dst_kva: u64, len: u64, off: i64) -> i64 {
 /// How many registry slots are in use - the witness a test asserts against, so
 /// "the mapping owns a handle and gives it back" is observed rather than assumed.
 pub fn in_use() -> usize {
-    tbl().iter().filter(|e| e.used).count()
+    let t = tbl();
+    (0..t.capacity())
+        .filter(|&i| t.get(i).is_some_and(|e| e.used))
+        .count()
+}
+
+/// Slots currently addressable without growth, and frames held - the witnesses a
+/// proof asserts growth and release against.
+pub fn slots() -> usize {
+    tbl().capacity()
+}
+
+/// Frames the registry holds, directory included.
+pub fn frames_held() -> usize {
+    tbl().frames_held()
 }

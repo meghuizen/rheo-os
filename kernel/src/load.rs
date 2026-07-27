@@ -162,7 +162,7 @@ pub struct ImageSeg {
     ///
     /// This record owns one reference to it; `linux::install_cell` hands that
     /// reference to the VMA record it creates.
-    pub file: u8,
+    pub file: crate::linux::filemap::Handle,
     /// File offset corresponding to `base`.
     pub off: u64,
     /// Bytes of file content from `base`; past it the pages are zero.
@@ -360,7 +360,7 @@ struct SegRecorder {
     /// [`Self::finish`] gives back. Records take their own on top, so a store with no
     /// records is released and one with records survives - without either path having
     /// to count.
-    stores: [Option<u8>; MAX_STORES],
+    stores: [Option<crate::linux::filemap::Handle>; MAX_STORES],
     nstores: usize,
     segs: [ImageSeg; MAX_IMAGE_SEGS],
     nsegs: usize,
@@ -379,7 +379,7 @@ impl SegRecorder {
     /// Start recording against `store` (from `filemap::open`/`open_mem`), taking over
     /// its reference. `None` - the registry was full, or there is no file server - makes
     /// every following `record` decline, so the caller loads eagerly.
-    fn begin(&mut self, store: Option<u8>) {
+    fn begin(&mut self, store: Option<crate::linux::filemap::Handle>) {
         if self.nstores == MAX_STORES {
             // Cannot happen with two callers, but releasing beats leaking silently.
             if let Some(h) = store {
@@ -392,7 +392,7 @@ impl SegRecorder {
     }
 
     /// The store `record` is currently filling for.
-    fn current(&self) -> Option<u8> {
+    fn current(&self) -> Option<crate::linux::filemap::Handle> {
         self.stores[self.nstores.checked_sub(1)?]
     }
 

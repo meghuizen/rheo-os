@@ -25,18 +25,43 @@
 //! authority over the pages is still the cell's own address space and its frame
 //! budget; this is bookkeeping about what the personality asked for.
 //!
-//! Fixed-capacity, so the kernel stays allocation-free. Adjacent mappings with
-//! identical protection and flags are **merged**, which is what keeps a program
-//! that maps many small ranges from exhausting the table.
+//! The table is **funded, not fixed** (docs/SUBSTRATE.md pillar 1): its storage
+//! is frames charged to the owning cell, so it grows past any workload's appetite
+//! and what refuses a mapping is the cell's own frame budget rather than a global
+//! array dimension. Adjacent mappings with identical protection and flags are
+//! still **merged**, which keeps the common case cheap - a program that maps many
+//! small ranges back to back costs one record, not one per call.
+//!
+//! Why that matters here specifically: `MAX_VMAS = 128` was measured to be the
+//! wrong shape for the target workloads. V8 reserves a pointer-compression cage
+//! plus code ranges, JSC reserves its Gigacage, and glibc's malloc adds a 64 MiB
+//! arena *per thread* - each of those is one or more records, and a program with
+//! a dozen threads and a JIT is already past a hundred before it runs a line of
+//! its own code. A full table did not fail cleanly either: `remove` printed a
+//! diagnostic and **dropped the tail of a split mapping**, leaving the page-fault
+//! handler with no record for pages that were genuinely reserved.
 
 use crate::linux::filemap;
 use crate::mm::frames::FRAME_SIZE;
+use crate::mm::kmeta::{Funded, Owner};
 
-/// Records per cell. A dynamically linked glibc program needs roughly a dozen
-/// (the program's segments, `ld.so`'s, `libc.so.6`'s, the stack, and glibc's
-/// per-thread arenas); 128 leaves room for a program that maps aggressively, at
-/// 32 bytes each = 4 KiB per cell.
-pub const MAX_VMAS: usize = 128;
+/// Records a cell's table starts with room for. **Not a ceiling** - the table is
+/// [`Funded`] and doubles on demand.
+///
+/// A dynamically linked glibc program needs roughly a dozen (the program's
+/// segments, `ld.so`'s, `libc.so.6`'s, the stack, and glibc's per-thread arenas),
+/// so 128 covers the ordinary case without a second growth; a JIT-bearing runtime
+/// grows past it and pays for the frames it causes.
+pub const INITIAL_VMAS: usize = 128;
+
+/// A hard sanity ceiling on records per cell.
+///
+/// Deliberately **not** the mechanism that limits anything in practice: a cell
+/// exhausts its frame budget long before this, and that refusal is the meaningful
+/// one because it names an owner. This exists only so a runaway `mmap` loop is
+/// bounded by something nameable, in the shape of Linux's `vm.max_map_count`
+/// (whose default is 65530).
+pub const VMA_CEILING: usize = 65536;
 
 /// Where a file-backed mapping's missing pages come from. One value rather than
 /// three parallel arguments, because the three are only ever meaningful together -
@@ -44,7 +69,7 @@ pub const MAX_VMAS: usize = 128;
 #[derive(Copy, Clone)]
 pub struct Backing {
     /// The [`filemap`] entry. The record created from this owns one reference to it.
-    pub file: u8,
+    pub file: filemap::Handle,
     /// File offset of the mapping's **first** page.
     pub off: u64,
     /// Bytes of file content from the mapping's base; see [`Vma::file_len`].
@@ -74,7 +99,7 @@ pub struct Vma {
     /// full removal drops one, and `fork`'s `inherit_files` adds one per record.
     /// Getting it wrong closes a file another mapping still faults against, so it is
     /// stated here rather than left to be inferred from the code.
-    pub file: Option<u8>,
+    pub file: Option<filemap::Handle>,
     /// File offset of this mapping's **first** page. A split recomputes it for the
     /// piece above the hole; without that, the tail of a split file mapping would
     /// silently serve the wrong bytes.
@@ -115,7 +140,11 @@ pub const ADV_DONTFORK: u16 = 1 << 0;
 pub const ADV_WIPEONFORK: u16 = 1 << 1;
 
 impl Vma {
-    const EMPTY: Vma = Vma {
+    /// The free-slot value, and - because it is all-zero-bytes in every field
+    /// (`Option<Handle>::None` included) - exactly what a freshly allocated
+    /// [`Funded`] frame already contains. That is load-bearing: growth does not
+    /// have to initialise the new slots, so a grow-then-use path cannot forget to.
+    pub(crate) const EMPTY: Vma = Vma {
         base: 0,
         len: 0,
         prot: 0,
@@ -142,40 +171,123 @@ impl Vma {
     }
 }
 
-/// A cell's mapping table.
+/// A cell's mapping table: a [`Funded`] array of records, charged to the cell.
 pub struct VmaList {
-    v: [Vma; MAX_VMAS],
+    v: Funded<Vma>,
 }
 
 impl VmaList {
+    /// An empty list holding no frames. `const`, so it still lives in the
+    /// `static mut` per-cell `LinuxState` array; only the *contents* stopped being
+    /// fixed. The first [`Self::insert`] grows it.
     pub const fn new() -> VmaList {
-        VmaList {
-            v: [Vma::EMPTY; MAX_VMAS],
-        }
+        VmaList { v: Funded::new() }
     }
 
-    /// Drop every record, releasing one `filemap` reference per file-backed one.
+    /// Point this list's frame charges at `owner`, then start empty.
+    ///
+    /// The one initialisation entry point, used by `install_cell` and
+    /// `exec_reinit`: it closes every backing-store reference, hands the frames
+    /// back, and re-owns the table - in that order, because [`Funded::set_owner`]
+    /// only takes effect while no frames are held (charging a release to the wrong
+    /// owner would corrupt the ledger).
+    pub fn reinit(&mut self, owner: Owner) {
+        self.teardown();
+        self.v.set_owner(owner);
+    }
+
+    /// Drop every record and release the frames, retiring one `filemap` reference
+    /// per file-backed record. Idempotent - a teardown path may call it
+    /// unconditionally.
+    pub fn teardown(&mut self) {
+        self.close_all();
+        self.v.release();
+    }
+
+    /// Drop every record, releasing one `filemap` reference per file-backed one,
+    /// **keeping** the frames for the records about to replace them.
     pub fn clear(&mut self) {
-        for m in self.v.iter() {
-            if m.len != 0
+        self.close_all();
+        self.v.fill(Vma::EMPTY);
+    }
+
+    fn close_all(&mut self) {
+        for i in 0..self.v.capacity() {
+            if let Some(m) = self.v.get(i)
+                && m.len != 0
                 && let Some(h) = m.file
             {
                 filemap::close(h);
             }
         }
-        self.v = [Vma::EMPTY; MAX_VMAS];
     }
 
-    fn live(&self) -> impl Iterator<Item = &Vma> {
-        self.v.iter().filter(|m| m.len != 0)
+    /// Slots currently addressable without growth, and frames held - diagnostics
+    /// and the witness the `substrate`/`mmapdp` proofs assert against.
+    pub fn slots(&self) -> usize {
+        self.v.capacity()
+    }
+
+    /// Frames this list holds, directory included.
+    pub fn frames_held(&self) -> usize {
+        self.v.frames_held()
+    }
+
+    /// Copy `src`'s records into this list - the **`fork`** step
+    /// (docs/LINUX-COMPAT.md L6).
+    ///
+    /// A [`Funded`] table cannot be duplicated by the raw `copy_nonoverlapping`
+    /// that clones the rest of a `LinuxState`: that copies the table's
+    /// *descriptor*, so parent and child would address one shared directory frame
+    /// and every child mapping would appear in the parent. So the records are
+    /// copied explicitly here, and `linux::dup_state` overwrites the aliased
+    /// descriptor before calling this.
+    ///
+    /// References are **not** taken here; the caller follows with
+    /// [`Self::inherit_files`], keeping the addref adjacent to the other
+    /// fork-inherited refcounts rather than hidden inside a copy helper.
+    ///
+    /// Returns false when the child's frame budget cannot fund a table this size,
+    /// which is a `fork` the caller must refuse - a partially copied list would
+    /// leave the child faulting on mappings it believes it has.
+    pub fn copy_from(&mut self, src: &VmaList) -> bool {
+        let n = src.v.capacity();
+        if n > 0 && !self.v.reserve(n) {
+            return false;
+        }
+        for i in 0..n {
+            if let Some(m) = src.v.get(i) {
+                self.v.set(i, m);
+            }
+        }
+        true
+    }
+
+    /// Every live record, by value.
+    ///
+    /// Yields `Vma` rather than `&Vma`: a funded element's address is stable, but
+    /// handing out references would borrow the table for the iterator's whole life
+    /// and block the mutating walks below. The record is 7 words, so a copy is
+    /// cheaper than the borrow discipline would be.
+    fn live(&self) -> impl Iterator<Item = Vma> + '_ {
+        (0..self.v.capacity()).filter_map(move |i| match self.v.get(i) {
+            Some(m) if m.len != 0 => Some(m),
+            _ => None,
+        })
+    }
+
+    /// The index of the first live record satisfying `pred`.
+    fn position(&self, pred: impl Fn(&Vma) -> bool) -> Option<usize> {
+        (0..self.v.capacity()).find(|&i| match self.v.get_ref(i) {
+            Some(m) => m.len != 0 && pred(m),
+            None => false,
+        })
     }
 
     /// The mapping containing `addr`, if any. **This is the page-fault lookup**;
     /// everything else here exists to keep it correct.
     pub fn find(&self, addr: usize) -> Option<Vma> {
-        self.live()
-            .find(|m| addr >= m.base && addr < m.end())
-            .copied()
+        self.live().find(|m| addr >= m.base && addr < m.end())
     }
 
     /// The file backing `addr`, if any - the second half of the page-fault lookup:
@@ -183,7 +295,7 @@ impl VmaList {
     /// it (the rest are zero). Returns `None` for an anonymous mapping, and also once
     /// the page lies wholly past the file content, because then there is nothing to
     /// read and a zeroed frame is already the right answer.
-    pub fn file_at(&self, addr: usize) -> Option<(u8, u64, usize)> {
+    pub fn file_at(&self, addr: usize) -> Option<(filemap::Handle, u64, usize)> {
         let m = self.find(addr)?;
         let h = m.file?;
         let page = addr & !(FRAME_SIZE - 1);
@@ -194,11 +306,9 @@ impl VmaList {
     /// Add a backing-store reference for every live file-backed record - the **`fork`**
     /// step, and the exact twin of `fd::inherit_pipe_ends`.
     ///
-    /// `linux::dup_state` copies a whole `LinuxState` with one raw
-    /// `copy_nonoverlapping`, which duplicates these records while touching no
-    /// refcount, so the addref cannot live inside a per-list copy helper - there is no
-    /// per-list copy. (One used to exist here and nothing called it: two ways to
-    /// inherit a VMA list, only one of them reachable. It is gone.)
+    /// [`Self::copy_from`] duplicates the records while touching no refcount, so the
+    /// addref lives here, called by `linux::dup_state` beside the other fork-inherited
+    /// refcounts rather than hidden inside the copy.
     ///
     /// Without this call the child's records name entries it holds no reference to, the
     /// child's exit releases one per record and drives the count to zero, and the
@@ -208,10 +318,8 @@ impl VmaList {
     /// Every refcounted thing a fork shares needs a reference added here; the calls are
     /// kept adjacent in `dup_state` so that reads as a list rather than a habit.
     pub fn inherit_files(&self) {
-        for m in self.v.iter() {
-            if m.len != 0
-                && let Some(h) = m.file
-            {
+        for m in self.live() {
+            if let Some(h) = m.file {
                 filemap::addref(h);
             }
         }
@@ -225,10 +333,14 @@ impl VmaList {
     /// The lowest free span of `bytes` in `[lo, hi)` that does not overlap any
     /// live mapping - **first fit**, which is what makes a freed span reusable.
     ///
-    /// Walks the sorted list of live mappings and returns the first gap that
-    /// fits. O(n^2) in the record count, which at 128 records is nothing next to
-    /// the page mapping the caller is about to do; a sorted list or a tree is a
-    /// later optimisation, and doing it now would be optimising the wrong thing.
+    /// Walks the live mappings and returns the first gap that fits. O(n^2) in the
+    /// record count, which at the ordinary hundred-odd records is nothing next to
+    /// the page mapping the caller is about to do. Now that the table grows, that
+    /// cost grows too: a cell with thousands of mappings pays a quadratic scan per
+    /// `mmap`, so a sorted list or an interval tree is the named follow-on - and the
+    /// reason it is a follow-on rather than part of this change is that a placement
+    /// index is a different piece of work from a table that funds itself, and mixing
+    /// them would make neither reviewable.
     pub fn find_free(&self, lo: usize, hi: usize, bytes: usize) -> Option<usize> {
         let mut candidate = lo;
         loop {
@@ -262,8 +374,31 @@ impl VmaList {
         self.live().any(|m| m.base < end && m.end() > base)
     }
 
+    /// A slot that can hold a new record, **growing the table** when every existing
+    /// slot is live.
+    ///
+    /// `None` is now a genuine resource refusal - the cell's frame budget or the
+    /// pool's metadata reserve - rather than "the array dimension was reached", which
+    /// is the whole point of the change. Growth doubles, so a program that maps in a
+    /// loop pays a logarithmic number of growths rather than one per mapping.
     fn free_slot(&mut self) -> Option<usize> {
-        self.v.iter().position(|m| m.len == 0)
+        let cap = self.v.capacity();
+        for i in 0..cap {
+            if self.v.get(i).is_some_and(|m| m.len == 0) {
+                return Some(i);
+            }
+        }
+        let want = if cap == 0 {
+            INITIAL_VMAS
+        } else {
+            (cap * 2).min(VMA_CEILING)
+        };
+        if want <= cap || !self.v.reserve(want) {
+            return None;
+        }
+        // A grown frame is zeroed, and `Vma::EMPTY` is all-zero, so the first new
+        // slot is already free without initialising anything.
+        Some(cap)
     }
 
     /// Record `[base, base+bytes)` with `prot`/`flags`, **replacing** whatever
@@ -336,8 +471,8 @@ impl VmaList {
                 && (file.is_none()
                     || (whole && m.file_len >= m.len && file_off + bytes as u64 == m.file_off))
         };
-        let before = self.v.iter().position(joins_below);
-        let after = self.v.iter().position(joins_above);
+        let before = self.position(joins_below);
+        let after = self.position(joins_above);
         // A merge turns N records into fewer, so the incoming reference is surplus.
         if (before.is_some() || after.is_some())
             && let Some(h) = file
@@ -353,30 +488,44 @@ impl VmaList {
                 // Bridging a hole between two neighbours: extend the first over
                 // both and free the second - which also retires that record's
                 // reference.
-                self.v[b].len = self.v[a].end() - self.v[b].base;
-                self.v[b].file_len = if file.is_some() { self.v[b].len } else { 0 };
-                if let Some(h) = self.v[a].file {
-                    filemap::close(h);
+                // `b` and `a` came from `position`, so both are within capacity;
+                // the `if let` is how that is stated without an unreachable panic
+                // path (and without a `return false` that would drop the incoming
+                // reference already retired just above).
+                if let (Some(lo), Some(hi)) = (self.v.get(b), self.v.get(a)) {
+                    let grown = hi.end() - lo.base;
+                    if let Some(m) = self.v.get_mut(b) {
+                        m.len = grown;
+                        m.file_len = if file.is_some() { grown } else { 0 };
+                    }
+                    if let Some(h) = hi.file {
+                        filemap::close(h);
+                    }
+                    self.v.set(a, Vma::EMPTY);
                 }
-                self.v[a] = Vma::EMPTY;
                 true
             }
             (Some(b), None) => {
-                self.v[b].len += bytes;
-                self.v[b].file_len = if file.is_some() { self.v[b].len } else { 0 };
+                if let Some(m) = self.v.get_mut(b) {
+                    m.len += bytes;
+                    m.file_len = if file.is_some() { m.len } else { 0 };
+                }
                 true
             }
             (None, Some(a)) => {
-                self.v[a].len += bytes;
-                self.v[a].base = base;
-                // The record now starts lower, so its file range starts earlier too.
-                self.v[a].file_off = file_off;
-                self.v[a].file_len = if file.is_some() { self.v[a].len } else { 0 };
+                if let Some(m) = self.v.get_mut(a) {
+                    m.len += bytes;
+                    m.base = base;
+                    // The record now starts lower, so its file range starts earlier too.
+                    m.file_off = file_off;
+                    m.file_len = if file.is_some() { m.len } else { 0 };
+                }
                 true
             }
             (None, None) => match self.free_slot() {
-                Some(i) => {
-                    self.v[i] = Vma {
+                Some(i) => self.v.set(
+                    i,
+                    Vma {
                         base,
                         len: bytes,
                         prot,
@@ -386,9 +535,8 @@ impl VmaList {
                         file_len,
                         // A fresh mapping starts with no advice; `madvise` sets it.
                         advice: 0,
-                    };
-                    true
-                }
+                    },
+                ),
                 None => {
                     // Refused: hand the reference back rather than leak the handle.
                     if let Some(h) = file {
@@ -414,8 +562,13 @@ impl VmaList {
             return;
         }
         let end = base + bytes;
-        for i in 0..MAX_VMAS {
-            let m = self.v[i];
+        // The bound is read once: `free_slot` below may grow the table, and the
+        // slots it adds are empty, so a record can never be missed by not
+        // re-reading the capacity - while re-reading it would rescan the tail of a
+        // freshly doubled table on every split.
+        let cap = self.v.capacity();
+        for i in 0..cap {
+            let Some(m) = self.v.get(i) else { continue };
             if m.len == 0 || m.base >= end || m.end() <= base {
                 continue;
             }
@@ -423,8 +576,11 @@ impl VmaList {
             match (below, above) {
                 // Hole strictly inside: keep the head, add the tail.
                 (true, true) => {
-                    self.v[i].len = base - m.base;
-                    self.v[i].file_len = m.file_len.min(self.v[i].len);
+                    let head = base - m.base;
+                    if let Some(h) = self.v.get_mut(i) {
+                        h.len = head;
+                        h.file_len = m.file_len.min(head);
+                    }
                     match self.free_slot() {
                         Some(j) => {
                             // One record became two, so the tail takes its own
@@ -433,25 +589,32 @@ impl VmaList {
                             if let Some(h) = m.file {
                                 filemap::addref(h);
                             }
-                            self.v[j] = Vma {
-                                base: end,
-                                len: m.end() - end,
-                                prot: m.prot,
-                                flags: m.flags,
-                                file: m.file,
-                                file_off: m.file_off + (end - m.base) as u64,
-                                file_len: m.avail_at(end),
-                                // The advice belongs to the *range*, so both
-                                // halves of a split keep it - otherwise a
-                                // WIPEONFORK region silently loses the property
-                                // above the hole, which is precisely the kind of
-                                // partial guarantee that is worse than none.
-                                advice: m.advice,
-                            }
+                            self.v.set(
+                                j,
+                                Vma {
+                                    base: end,
+                                    len: m.end() - end,
+                                    prot: m.prot,
+                                    flags: m.flags,
+                                    file: m.file,
+                                    file_off: m.file_off + (end - m.base) as u64,
+                                    file_len: m.avail_at(end),
+                                    // The advice belongs to the *range*, so both
+                                    // halves of a split keep it - otherwise a
+                                    // WIPEONFORK region silently loses the property
+                                    // above the hole, which is precisely the kind of
+                                    // partial guarantee that is worse than none.
+                                    advice: m.advice,
+                                },
+                            );
                         }
+                        // No longer "the array was full": the table grows, so this
+                        // is the cell's frame budget or the metadata reserve
+                        // refusing, and the diagnostic says which resource ran out
+                        // rather than naming a constant.
                         None => crate::println!(
-                            "linux: VMA table full - the {:#x}..{:#x} tail of a split \
-                             mapping is unmapped but no longer recorded",
+                            "linux: no funded VMA slot (frame budget) - the {:#x}..{:#x} \
+                             tail of a split mapping is unmapped but no longer recorded",
                             end,
                             m.end()
                         ),
@@ -459,22 +622,32 @@ impl VmaList {
                 }
                 // Trim the tail.
                 (true, false) => {
-                    self.v[i].len = base - m.base;
-                    self.v[i].file_len = m.file_len.min(self.v[i].len);
+                    let head = base - m.base;
+                    if let Some(h) = self.v.get_mut(i) {
+                        h.len = head;
+                        h.file_len = m.file_len.min(head);
+                    }
                 }
                 // Trim the head: the surviving pages start further into the file.
                 (false, true) => {
-                    self.v[i].base = end;
-                    self.v[i].len = m.end() - end;
-                    self.v[i].file_off = m.file_off + (end - m.base) as u64;
-                    self.v[i].file_len = m.avail_at(end);
+                    let (nlen, noff, nflen) = (
+                        m.end() - end,
+                        m.file_off + (end - m.base) as u64,
+                        m.avail_at(end),
+                    );
+                    if let Some(h) = self.v.get_mut(i) {
+                        h.base = end;
+                        h.len = nlen;
+                        h.file_off = noff;
+                        h.file_len = nflen;
+                    }
                 }
                 // Fully covered: the record - and its reference - go.
                 (false, false) => {
                     if let Some(h) = m.file {
                         filemap::close(h);
                     }
-                    self.v[i] = Vma::EMPTY;
+                    self.v.set(i, Vma::EMPTY);
                 }
             }
         }
@@ -506,13 +679,15 @@ impl VmaList {
             return;
         }
         let end = base.saturating_add(bytes);
-        for m in self.v.iter_mut() {
-            if m.len == 0 {
-                continue;
-            }
-            let m_end = m.base + m.len;
-            if base < m_end && m.base < end {
-                m.advice = (m.advice | set) & !clear;
+        for i in 0..self.v.capacity() {
+            if let Some(m) = self.v.get_mut(i) {
+                if m.len == 0 {
+                    continue;
+                }
+                let m_end = m.base + m.len;
+                if base < m_end && m.base < end {
+                    m.advice = (m.advice | set) & !clear;
+                }
             }
         }
     }
@@ -530,14 +705,12 @@ impl VmaList {
     /// child, and by `madvise` to walk what it is about to change.
     pub fn overlapping(&self, base: usize, bytes: usize) -> impl Iterator<Item = Vma> + '_ {
         let end = base.saturating_add(bytes);
-        self.live()
-            .filter(move |m| base < m.end() && m.base < end)
-            .copied()
+        self.live().filter(move |m| base < m.end() && m.base < end)
     }
 
     /// Every live record carrying `bit`.
     pub fn with_advice(&self, bit: u16) -> impl Iterator<Item = Vma> + '_ {
-        self.live().filter(move |m| m.advice & bit != 0).copied()
+        self.live().filter(move |m| m.advice & bit != 0)
     }
 
     pub fn set_prot(&mut self, base: usize, bytes: usize, prot: u64) {

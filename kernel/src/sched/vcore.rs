@@ -272,13 +272,22 @@ impl RunQueue {
         self.vcores.set_owner(owner);
     }
 
-    /// Release all storage and return to empty.
+    /// Release all storage and return to empty, counters included.
+    ///
+    /// The counters are cleared here rather than kept, because this is the
+    /// between-runs teardown and a proof that asserts "N dispatches" must be
+    /// asserting about *its* run. A queue that carried a previous boot's totals would
+    /// make every such assertion depend on test ordering.
     pub fn release(&mut self) {
         self.vcores.release();
         self.high_water = 0;
         self.vtime = 0;
         self.total_weight = 0;
         self.current = None;
+        self.dispatches = 0;
+        self.preemptions = 0;
+        self.voluntary_yields = 0;
+        self.eligibility_defers = 0;
     }
 
     /// `(dispatches, preemptions, voluntary yields, eligibility defers)`.
@@ -392,6 +401,63 @@ impl RunQueue {
         Ok(id)
     }
 
+    /// The vcore representing cell `cell`'s context `context`, if this queue holds
+    /// one. The reverse of [`Vcore::cell`]/[`Vcore::context`], so a caller that
+    /// knows a cell can find its scheduling entity without keeping a second table
+    /// (which would be one more thing to keep in step).
+    pub fn find(&self, cell: u16, context: u16) -> Option<VcoreId> {
+        self.iter()
+            .find(|(_, v)| v.live && v.cell == cell && v.context == context)
+            .map(|(id, _)| id)
+    }
+
+    /// Any live vcore belonging to cell `cell`, for a caller tearing the cell down.
+    ///
+    /// A `RunQueue` method rather than a `live` accessor on [`Vcore`], because
+    /// liveness is the queue's own bookkeeping: a caller that could ask a `Vcore`
+    /// whether it is live would be holding a copy of a slot that may already have
+    /// been reused, and the answer would be about the copy.
+    pub fn any_of_cell(&self, cell: u16) -> Option<VcoreId> {
+        self.iter()
+            .find(|(_, v)| v.live && v.cell == cell)
+            .map(|(id, _)| id)
+    }
+
+    /// Bring every live vcore's runnable flag into agreement with `ready`, which
+    /// answers "is this (cell, context) runnable?" from whatever holds the real
+    /// authority.
+    ///
+    /// This exists because the queue is being adopted **beside** an existing
+    /// scheduler rather than under it (docs/SUBSTRATE.md 15). The authority on
+    /// runnability stays where it already is - the Linux personality's `PState` and
+    /// the native process table's - and the queue supplies the *order*. Reconciling
+    /// at the pick means the two can never disagree about who is eligible to run,
+    /// which is the failure a second copy of the state would produce: a queue that
+    /// picks a cell the personality considers blocked resumes a cell with an
+    /// unsatisfied wait, and nothing would report it.
+    ///
+    /// A vcore the caller now considers blocked is recorded as having relinquished
+    /// **voluntarily**, because in this kernel it did: every block reached here is a
+    /// cell parking at a syscall boundary. An involuntary stop is recorded by the
+    /// preemption path, which says so explicitly.
+    pub fn sync_runnable<F: Fn(u16, u16) -> bool>(&mut self, now_ns: u64, ready: F) {
+        for i in 0..self.high_water {
+            let Some(v) = self.vcores.get(i) else {
+                continue;
+            };
+            if !v.live {
+                continue;
+            }
+            let want = ready(v.cell, v.context);
+            let id = VcoreId(i as u32);
+            if want && !v.runnable {
+                let _ = self.wake(id, now_ns);
+            } else if !want && v.runnable {
+                let _ = self.block(id, true);
+            }
+        }
+    }
+
     fn free_index(&mut self) -> Option<usize> {
         for i in 0..self.high_water {
             if !self.vcores.get(i).map(|v| v.live).unwrap_or(false) {
@@ -480,6 +546,53 @@ impl RunQueue {
         }
         self.set(id, v);
         Ok(())
+    }
+
+    /// End a vcore's burst without blocking it: it gave up the CPU **voluntarily**
+    /// but stays runnable (`SYS_YIELD`, `sched_yield`).
+    ///
+    /// Separate from [`RunQueue::block`] because the two are genuinely different
+    /// transitions and collapsing them was tempting enough to be worth naming: a
+    /// yielding vcore is still competing for the CPU, so marking it blocked would
+    /// remove its weight from `total_weight` and make the queue's virtual clock
+    /// advance too fast for everyone else - unfairness with no visible cause.
+    pub fn relinquished(&mut self, id: VcoreId) {
+        let Some(mut v) = self.get(id) else { return };
+        let w = v.weight().max(1);
+        v.burst.relinquish();
+        let new_w = v.weight().max(1);
+        if new_w != w && v.runnable {
+            self.total_weight = self.total_weight.saturating_sub(w).saturating_add(new_w);
+        }
+        v.refresh_deadline();
+        if self.current == Some(id) {
+            self.current = None;
+        }
+        self.set(id, v);
+        self.voluntary_yields = self.voluntary_yields.wrapping_add(1);
+    }
+
+    /// The vcore was taken off the CPU by preemption: still runnable, and its burst
+    /// did **not** end voluntarily.
+    ///
+    /// The distinction is the whole point of the burst score. A compute-bound vcore
+    /// that is preempted has not finished its burst, so recording the stop as a
+    /// voluntary yield would hand it the interactive weight an event-driven vcore
+    /// earns by actually waiting - which is the one thing BORE exists to tell apart.
+    pub fn was_preempted(&mut self, id: VcoreId) {
+        let Some(mut v) = self.get(id) else { return };
+        let w = v.weight().max(1);
+        v.burst.preempted();
+        let new_w = v.weight().max(1);
+        if new_w != w && v.runnable {
+            self.total_weight = self.total_weight.saturating_sub(w).saturating_add(new_w);
+        }
+        v.refresh_deadline();
+        if self.current == Some(id) {
+            self.current = None;
+        }
+        self.set(id, v);
+        self.preemptions = self.preemptions.wrapping_add(1);
     }
 
     /// Charge `delta_ns` of CPU time to a vcore, advancing both its virtual

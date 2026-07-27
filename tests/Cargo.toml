@@ -176,6 +176,10 @@ name = "schedidle"
 path = "src/schedidle.rs"
 
 [[bin]]
+name = "preempt"
+path = "src/preempt.rs"
+
+[[bin]]
 name = "linuxpoll"
 path = "src/linuxpoll.rs"
 

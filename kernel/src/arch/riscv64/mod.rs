@@ -1023,10 +1023,21 @@ extern "C" fn riscv_user_trap(scause: u64, stval: u64, frame: *mut TrapFrame) ->
             SCAUSE_S_EXT => handle_ext_irq(),
             // Disarm the timer (pushing stimecmp out clears STIP); the kernel-side
             // arbiter (`ktimer::service`) observes the elapsed deadline itself.
-            SCAUSE_S_TIMER => unsafe { asm!("csrw 0x14d, {0}", in(reg) u64::MAX) },
+            SCAUSE_S_TIMER => {
+                unsafe { asm!("csrw 0x14d, {0}", in(reg) u64::MAX) };
+                // The one deadline a cell can be *taken off the CPU* by
+                // (docs/SUBSTRATE.md pillar 3). The handler only records it; the
+                // portable hook below decides whether the CPU actually moves, in
+                // ordinary kernel context rather than inside the handler.
+                crate::sched::preempt::note();
+            }
             _ => {}
         }
-        return frame;
+        // Ask the portable scheduler for the frame to resume. With no preemption
+        // pending this returns `frame` unchanged, which is the pre-existing
+        // behaviour exactly: service the device and resume the cell at the
+        // instruction it was interrupted at.
+        return crate::user::on_user_interrupt(frame);
     }
     let kind = if scause == SCAUSE_ECALL_U {
         // Resume after the 4-byte ecall.

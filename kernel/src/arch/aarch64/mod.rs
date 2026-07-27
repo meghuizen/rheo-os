@@ -308,6 +308,37 @@ pub fn enable_timer_irq() {
 /// the PL011 into the ring, or mask the fired timer), then EOI via ICC_EOIR1_EL1.
 #[unsafe(no_mangle)]
 extern "C" fn aarch64_irq_handler() {
+    service_irq();
+}
+
+/// Called from vectors.S when a GICv3 interrupt is taken while a **cell** is running
+/// at EL0 (docs/SUBSTRATE.md pillar 3, timer preemption).
+///
+/// Services the interrupt exactly as the EL1 path does, then asks the portable
+/// scheduler for the frame to resume. With no preemption pending that is `frame`
+/// unchanged, so the cell resumes at the instruction it was interrupted at.
+#[unsafe(no_mangle)]
+extern "C" fn aarch64_user_irq(frame: *mut TrapFrame) -> *mut TrapFrame {
+    if service_irq() == Serviced::Timer {
+        // Recorded, not acted on here: the handler is the wrong context to run a
+        // scheduler from. The portable hook below decides whether the CPU moves.
+        crate::sched::preempt::note();
+    }
+    crate::user::on_user_interrupt(frame)
+}
+
+/// What the interrupt was, so an EL0 entry can tell a preemption slice from a device.
+#[derive(PartialEq, Eq)]
+enum Serviced {
+    Timer,
+    Other,
+}
+
+/// Acknowledge, service and EOI one GICv3 interrupt. Shared by the EL1 (`wfi` idle)
+/// and EL0 (running cell) entries, because the *servicing* is identical - only what
+/// the caller does afterwards differs.
+fn service_irq() -> Serviced {
+    let mut what = Serviced::Other;
     // SAFETY: kernel context; ICC system-register + MMIO access.
     unsafe {
         let intid: u64;
@@ -328,6 +359,7 @@ extern "C" fn aarch64_irq_handler() {
         } else if id == TIMER_INTID {
             // Mask the timer output so it stops asserting; the arbiter re-arms.
             asm!("msr cntv_ctl_el0, {0}", in(reg) 0b11u64); // ENABLE | IMASK
+            what = Serviced::Timer;
         } else if *core::ptr::addr_of!(NET_IRQ_ENABLED) && id == *core::ptr::addr_of!(NET_INTID) {
             // The NIC's receive line (docs/NETSTACK.md, rheo-net N2d): acknowledge
             // the device (its line drops) + record the arrival. The frame stays in
@@ -338,6 +370,7 @@ extern "C" fn aarch64_irq_handler() {
             asm!("msr S3_0_C12_C12_1, {0}", in(reg) intid); // ICC_EOIR1_EL1
         }
     }
+    what
 }
 
 /// Halt until an enabled GIC interrupt fires (a genuine 0%-CPU park). `wfi` wakes
@@ -897,11 +930,24 @@ pub fn trapframe_new(entry: usize, user_sp: usize, arg: usize, kernel_sp: usize)
         regs,
         sp_el0: user_sp as u64,
         elr: entry as u64,
-        // EL0t with IRQ masked (SPSR.I, bit 7): cells are cooperative and take no
-        // interrupts at EL0; the kernel services the UART/timer IRQs in its own
-        // `wfi` idle path (docs/LIBRHEO.md Phase D/F). Harmless where no interrupt
-        // is enabled.
-        spsr: 1 << 7,
+        // EL0t. IRQ (SPSR.I, bit 7) is masked unless the scheduler needs to be
+        // able to take the CPU away from this cell.
+        //
+        // Masked was right while every scheduler was cooperative: cells took no
+        // interrupts at EL0 and the kernel serviced the UART/timer IRQs in its own
+        // `wfi` idle path (docs/LIBRHEO.md Phase D/F). It is also *why* nothing could
+        // stop a compute-bound cell - the preemption timer physically could not be
+        // delivered. With queue-driven dispatch enabled the mask comes off and the
+        // EL0 IRQ vector slot (`el0_irq`, previously a fatal slot) handles it
+        // (docs/SUBSTRATE.md pillar 3).
+        //
+        // Read at frame-construction time rather than flipped later, because a frame
+        // built for a cooperative boot must keep the pre-migration bits exactly.
+        spsr: if crate::sched::dispatch::enabled() {
+            0
+        } else {
+            1 << 7
+        },
         kernel_sp: kernel_sp as u64,
         tpidr_el0: 0,
     }
