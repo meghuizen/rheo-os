@@ -122,6 +122,28 @@ fn run(image: &[u8], argv: &[&[u8]], envp: &[&[u8]]) -> Outcome {
     user::reset();
     let mut aspace = AddressSpace::new(1);
     let img = load::load_elf_linux(image, &mut aspace).expect("load dynamic Linux ELF");
+    // Both files must be demand-paged, not just the program. A dynamically linked
+    // binary is the program plus its **interpreter**, and the interpreter comes from
+    // the VFS rather than from a kernel buffer - a different loader path, so it needs
+    // its own evidence. The oracle is the address: `ld.so` is loaded at
+    // `LINUX_INTERP_BASE`, which nothing else occupies.
+    let interp_segs = img
+        .recorded()
+        .iter()
+        .filter(|s| s.base >= load::LINUX_INTERP_BASE)
+        .count();
+    let prog_segs = img.nsegs - interp_segs;
+    assert!(
+        prog_segs > 0 && interp_segs > 0,
+        "linuxdyn: {prog_segs} program + {interp_segs} interpreter segment(s) recorded \
+         - both files must be demand-paged"
+    );
+    println!(
+        "linuxdyn: {prog_segs} program + {interp_segs} ld.so segment(s) left to demand \
+         paging ({} image pages recorded, {} copied since boot)",
+        load::recorded_pages(),
+        load::eager_pages()
+    );
     let sp = linux_stack::setup_stack(&mut aspace, &img, argv, envp);
     // SAFETY: single-threaded init; the statics outlive the synchronous run.
     unsafe {

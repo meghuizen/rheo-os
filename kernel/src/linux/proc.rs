@@ -378,7 +378,8 @@ pub fn execve(cur: usize, path_va: u64, argv_va: u64, envp_va: u64, frame: *mut 
     // `open` works regardless of which address space is active.
     let path_kva = addr_of_mut!(EXEC_PATH) as u64;
     let mut new_aspace = AddressSpace::new((cur as u16) + 48);
-    let Some(img) = load::exec_elf_from_vfs(ops, path_kva, path_len as u64, &mut new_aspace) else {
+    let Some(img) = load::exec_elf_from_vfs_demand(ops, path_kva, path_len as u64, &mut new_aspace)
+    else {
         return err(ENOENT);
     };
     // Record what this cell is now running, so `readlinkat("/proc/self/exe")` has

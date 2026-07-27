@@ -22,6 +22,7 @@ use alloc::rc::Rc;
 use core::ptr::addr_of_mut;
 
 use kernel::linux::{self};
+use kernel::load;
 use kernel::svc;
 use kernel::user::Outcome;
 use kernel::{arch, println};
@@ -121,8 +122,23 @@ extern "C" fn kernel_main() -> ! {
         STDOUT_LEN = 0;
     }
     linux::set_stdout_tap(Some(tap));
+    // `execve` loads its image from the VFS deep inside a syscall, where a test can
+    // measure nothing directly - so the loader counts what it records and what it
+    // copies, and the ratio across this phase is the witness. `procdemo` execve's
+    // `/bin/cecho`, so a lazy exec records most of that image's pages.
+    let rec_before = load::recorded_pages();
+    let eager_before = load::eager_pages();
     let outcome = run(PROCDEMO, &[b"procdemo"]);
     linux::set_stdout_tap(None);
+    let (rec, eager) = (
+        load::recorded_pages() - rec_before,
+        load::eager_pages() - eager_before,
+    );
+    assert!(
+        rec > eager,
+        "linuxproc: this phase recorded {rec} image page(s) and copied {eager} - an \
+         execve that streamed its image eagerly would be the other way round"
+    );
 
     let want_out = b"child said: hi there\nchild exit: 0\n";
     match outcome {
@@ -138,7 +154,10 @@ extern "C" fn kernel_main() -> ! {
         }
         Outcome::Faulted(addr) => panic!("procdemo: faulted at {addr:#x}"),
     }
-    println!("linuxproc: procdemo OK (fork+execve+wait4+pipe2)");
+    println!(
+        "linuxproc: procdemo OK (fork+execve+wait4+pipe2); the two loads left {rec} \
+         image page(s) to demand paging and copied {eager}"
+    );
 
     // --- P11 gate (docs/POSIX-PERSONALITY.md 5): a shell running a coreutils
     // suite. `rsh` (a minimal static-glibc shell) forks/execve's the unpatched

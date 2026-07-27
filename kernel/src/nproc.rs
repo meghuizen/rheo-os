@@ -227,10 +227,19 @@ pub fn spawn(
     // load; librheo binaries are ET_EXEC so bias 0). The path is a kernel VA.
     let path_kva = addr_of_mut!(SPAWN_PATH) as u64;
     let mut child_aspace = AddressSpace::new((child as u16) + 64);
+    // The **eager** loader, deliberately: a native cell has no VMA list, so there is
+    // nothing here to turn a recorded segment into a mapping. Demand paging is a Linux
+    // personality feature (`load::exec_elf_from_vfs_demand`), and a native child given
+    // a lazy image gets an address space full of holes with no diagnostic - which is
+    // what happened when the two shared one function (docs/ENGINEERING.md 11).
     let Some(img) = load::exec_elf_from_vfs(ops, path_kva, path_len as u64, &mut child_aspace)
     else {
         return u64::MAX;
     };
+    debug_assert!(
+        img.nsegs == 0,
+        "native spawn cannot map demand-paged segments"
+    );
     let entry = img.entry;
 
     // Build the native SysV initial stack (argc/argv/envp). Its SP points at

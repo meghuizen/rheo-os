@@ -213,20 +213,18 @@ pub(crate) fn dup_state(from: usize, to: usize) {
 /// entry point and nothing more informative (docs/ENGINEERING.md 11). So the handle
 /// is tested for life, and a dead one is reported rather than mapped.
 fn record_image_segments(idx: usize, img: &crate::load::LinuxImage) {
-    let Some(store) = img.store else { return };
-    if !filemap::alive(store) {
-        crate::println!(
-            "linux: the loaded image's backing store was released before install - \
-             loading eagerly is the only safe answer, so this cell has {} unmapped \
-             segment(s). Reset before loading, not after.",
-            img.nsegs
-        );
-        return;
-    }
     let st = state(idx);
     for s in img.recorded() {
+        if !filemap::alive(s.file) {
+            crate::println!(
+                "linux: the backing store for the image segment at {:#x} was released \
+                 before install, so it has no mapping. Reset before loading, not after.",
+                s.base
+            );
+            continue;
+        }
         let backing = vma::Backing {
-            file: store,
+            file: s.file,
             off: s.off,
             len: s.file_len,
         };
@@ -272,6 +270,11 @@ pub(crate) fn exec_reinit(cell: usize, img: &crate::load::LinuxImage) {
     st.tid_addr = 0;
     st.robust_list = 0;
     st.initialized = true;
+    // ...then the new image's demand-paged segments, after the clear, exactly as
+    // `install_cell` does. Leaving this out is not a crash: the `execve`d program
+    // simply has no mapping for the pages the loader recorded, and dies at its entry
+    // point - which is why the two call sites are worth reading side by side.
+    record_image_segments(cell, img);
 }
 
 // ------------------------------------------------------------- stdout tap

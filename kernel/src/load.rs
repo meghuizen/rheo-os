@@ -14,6 +14,7 @@ use crate::elf::{self, Elf, PF_W, PF_X, Segment};
 use crate::mm::AddressSpace;
 use crate::mm::frames::{self, FRAME_SIZE};
 use crate::queue::QueuePair;
+use core::ptr::addr_of_mut;
 
 /// Top of the initial user stack (docs/USERLAND.md): 8 GiB, free in every
 /// cell root. The stack grows down from here.
@@ -155,6 +156,13 @@ pub struct ImageSeg {
     pub len: usize,
     /// mmap-style prot bits (the personality's vocabulary, not `MapPerm`).
     pub prot: u64,
+    /// The [`crate::linux::filemap`] entry this segment's bytes come from. Per
+    /// segment, not per image, because a dynamically linked program is **two** files:
+    /// the program and its interpreter.
+    ///
+    /// This record owns one reference to it; `linux::install_cell` hands that
+    /// reference to the VMA record it creates.
+    pub file: u8,
     /// File offset corresponding to `base`.
     pub off: u64,
     /// Bytes of file content from `base`; past it the pages are zero.
@@ -166,6 +174,7 @@ impl ImageSeg {
         base: 0,
         len: 0,
         prot: 0,
+        file: 0,
         off: 0,
         file_len: 0,
     };
@@ -218,14 +227,12 @@ pub struct LinuxImage {
     /// Read from the **main program**, not the interpreter: `ld.so` carries its
     /// own `PT_GNU_STACK` and it is the program's requirement that matters.
     pub stack_want: usize,
-    /// Segments left for demand paging, with the [`crate::linux::filemap`] handle they
-    /// all read through. `None` means the whole image was copied eagerly, which is
-    /// still the answer for every non-Linux loader and for a streamed `execve`.
+    /// Segments left for demand paging. Empty means the whole image was copied
+    /// eagerly, which is still the answer for every non-Linux loader.
     ///
-    /// The loader holds **one** reference to `store`; `linux::install_cell` takes one
-    /// per record it inserts and gives the loader's back. A caller that loads an image
-    /// and never installs it must release it itself.
-    pub store: Option<u8>,
+    /// Each record owns one `filemap` reference; `linux::install_cell` passes it
+    /// straight to the VMA record, so it releases nothing and leaks nothing. A caller
+    /// that loads an image and never installs it must release them itself.
     pub segs: [ImageSeg; MAX_IMAGE_SEGS],
     pub nsegs: usize,
 }
@@ -257,9 +264,8 @@ pub fn load_elf_linux(image: &[u8], aspace: &mut AddressSpace) -> Option<LinuxIm
     // SAFETY: `image` must outlive the cell. Every caller passes a `'static` blob
     // (a test kernel's `include_bytes!`); this is the one constraint `open_mem`
     // documents and the reason it is unsafe.
-    let mut rec = SegRecorder::new(unsafe {
-        crate::linux::filemap::open_mem(image.as_ptr() as usize, image.len())
-    });
+    let mut rec = SegRecorder::new();
+    rec.begin(unsafe { crate::linux::filemap::open_mem(image.as_ptr() as usize, image.len()) });
     let mut image_end = 0usize;
     elf.for_each_load(|seg| {
         let end = seg.vaddr as usize + bias + seg.memsz;
@@ -284,11 +290,12 @@ pub fn load_elf_linux(image: &[u8], aspace: &mut AddressSpace) -> Option<LinuxIm
     // program's entry. No kernel relocation processing (ld.so self-relocates).
     let (entry, at_base) = match elf.interp() {
         Some((off, filesz)) => {
-            let interp_entry = load_interp(image, off, filesz, aspace)?;
+            let interp_entry = load_interp(image, off, filesz, aspace, &mut rec)?;
             (interp_entry, LINUX_INTERP_BASE)
         }
         None => (main_entry, bias),
     };
+    rec.finish();
 
     Some(LinuxImage {
         entry,
@@ -299,11 +306,40 @@ pub fn load_elf_linux(image: &[u8], aspace: &mut AddressSpace) -> Option<LinuxIm
         at_entry: main_entry,
         image_end,
         stack_want: elf.stack_size().unwrap_or(0),
-        store: rec.finish(),
         segs: rec.segs,
         nsegs: rec.nsegs,
     })
 }
+
+/// Image pages left to demand paging since boot, and image pages copied into frames at
+/// load. Together they are the witness that a load is lazy - and the *ratio* is what
+/// makes it a witness rather than a claim, because `execve` and the ELF interpreter are
+/// loaded deep inside a syscall where a test can measure nothing directly
+/// (docs/ARCHITECTURE-DEBT.md 4.0, blocker 2).
+static mut RECORDED_PAGES: u64 = 0;
+static mut EAGER_PAGES: u64 = 0;
+
+fn bump(counter: *mut u64, bytes: usize) {
+    // SAFETY: single CPU, synchronous; loads never run concurrently.
+    unsafe { *counter = (*counter).wrapping_add((bytes / FRAME_SIZE) as u64) };
+}
+
+/// Pages of ELF image left for the fault handler to fill, since boot.
+pub fn recorded_pages() -> u64 {
+    // SAFETY: single CPU.
+    unsafe { *core::ptr::addr_of!(RECORDED_PAGES) }
+}
+
+/// Pages of ELF image copied into frames at load time, since boot.
+pub fn eager_pages() -> u64 {
+    // SAFETY: single CPU.
+    unsafe { *core::ptr::addr_of!(EAGER_PAGES) }
+}
+
+/// A loader records against one file at a time, and a dynamically linked program is
+/// two: the program and its interpreter. Two is the ceiling because a *third* file is
+/// something `ld.so` maps itself, through `mmap`, which is already demand-paged.
+const MAX_STORES: usize = 2;
 
 /// Collects the `PT_LOAD`s a loader chose not to copy.
 ///
@@ -320,26 +356,51 @@ pub fn load_elf_linux(image: &[u8], aspace: &mut AddressSpace) -> Option<LinuxIm
 ///    file offset. Every real toolchain emits segments this way; a hand-built ELF
 ///    that does not is copied instead of mapped wrong.
 struct SegRecorder {
-    store: Option<u8>,
+    /// The stores this recorder opened, each holding **one** reference of its own that
+    /// [`Self::finish`] gives back. Records take their own on top, so a store with no
+    /// records is released and one with records survives - without either path having
+    /// to count.
+    stores: [Option<u8>; MAX_STORES],
+    nstores: usize,
     segs: [ImageSeg; MAX_IMAGE_SEGS],
     nsegs: usize,
-    /// References handed out to records, so `finish` can settle the loader's own.
-    taken: usize,
 }
 
 impl SegRecorder {
-    fn new(store: Option<u8>) -> SegRecorder {
+    fn new() -> SegRecorder {
         SegRecorder {
-            store,
+            stores: [None; MAX_STORES],
+            nstores: 0,
             segs: [ImageSeg::EMPTY; MAX_IMAGE_SEGS],
             nsegs: 0,
-            taken: 0,
         }
+    }
+
+    /// Start recording against `store` (from `filemap::open`/`open_mem`), taking over
+    /// its reference. `None` - the registry was full, or there is no file server - makes
+    /// every following `record` decline, so the caller loads eagerly.
+    fn begin(&mut self, store: Option<u8>) {
+        if self.nstores == MAX_STORES {
+            // Cannot happen with two callers, but releasing beats leaking silently.
+            if let Some(h) = store {
+                crate::linux::filemap::close(h);
+            }
+            return;
+        }
+        self.stores[self.nstores] = store;
+        self.nstores += 1;
+    }
+
+    /// The store `record` is currently filling for.
+    fn current(&self) -> Option<u8> {
+        self.stores[self.nstores.checked_sub(1)?]
     }
 
     /// Record `seg`, or return false to tell the caller to copy it eagerly.
     fn record(&mut self, seg: &Segment, bias: usize) -> bool {
-        let Some(_) = self.store else { return false };
+        let Some(store) = self.current() else {
+            return false;
+        };
         if self.nsegs == MAX_IMAGE_SEGS {
             crate::println!(
                 "linux: {MAX_IMAGE_SEGS} image segments already recorded - the rest \
@@ -371,30 +432,24 @@ impl SegRecorder {
             base,
             len: (page_off + seg.memsz + FRAME_SIZE - 1) & !(FRAME_SIZE - 1),
             prot: prot_from_pf(seg.flags),
+            file: store,
             off: (seg.offset - page_off) as u64,
             file_len: page_off + seg.filesz,
         };
         self.nsegs += 1;
-        self.taken += 1;
+        bump(addr_of_mut!(RECORDED_PAGES), self.segs[self.nsegs - 1].len);
+        // This record's own reference, on top of the one `begin` took over.
+        crate::linux::filemap::addref(store);
         true
     }
 
-    /// Settle the reference count and report the handle, or `None` if nothing was
-    /// recorded (in which case the store is released - a registry slot held for zero
-    /// mappings is a leak, and a small fixed registry notices).
-    fn finish(&self) -> Option<u8> {
-        let h = self.store?;
-        if self.taken == 0 {
-            crate::linux::filemap::close(h);
-            return None;
+    /// Give back the reference each `begin` took over. A store with records survives on
+    /// theirs; a store with none is released here, because a registry slot held for zero
+    /// mappings is a leak and the registry is small enough to notice.
+    fn finish(&self) {
+        for h in self.stores.iter().flatten() {
+            crate::linux::filemap::close(*h);
         }
-        // The loader holds one reference; `install_cell` needs one per record. Take
-        // the extras here, so the handoff is "install_cell consumes them all and
-        // releases nothing" rather than a count it has to compute.
-        for _ in 1..self.taken {
-            crate::linux::filemap::addref(h);
-        }
-        Some(h)
     }
 }
 
@@ -409,6 +464,7 @@ fn load_interp(
     off: usize,
     filesz: usize,
     aspace: &mut AddressSpace,
+    rec: &mut SegRecorder,
 ) -> Option<usize> {
     let ops = crate::svc::file_ops()?;
     // The path is NUL-terminated inside the segment; trim at the NUL.
@@ -420,7 +476,11 @@ fn load_interp(
         return None;
     }
     let fd = fd as u64;
-    let r = stream_elf_at(ops, fd, LINUX_INTERP_BASE, aspace);
+    // The interpreter is the recorder's **second** file, with its own handle - the
+    // mapping's, not this `fd`, which is closed below. `path_va` points into `image`,
+    // i.e. kernel memory, which is what `filemap::open` requires.
+    rec.begin(crate::linux::filemap::open(path_va, path_len as u64));
+    let r = stream_elf_at(ops, fd, LINUX_INTERP_BASE, aspace, rec);
     (ops.close)(fd);
     r
 }
@@ -429,11 +489,15 @@ fn load_interp(
 /// `bias`, reading each segment page-by-page from the VFS (docs/LINUX-COMPAT.md
 /// L7). Returns the biased entry point. Shared by the interpreter loader and
 /// the `execve` streaming path.
+///
+/// `rec` must already be `begin`-ed on a store for **this** file; segments it declines
+/// are streamed into frames as before.
 fn stream_elf_at(
     ops: &crate::svc::FileOps,
     fd: u64,
     bias: usize,
     aspace: &mut AddressSpace,
+    rec: &mut SegRecorder,
 ) -> Option<usize> {
     let mut hdr = [0u8; HDR_BUF];
     (ops.lseek)(fd, 0, 0);
@@ -442,7 +506,13 @@ fn stream_elf_at(
         return None;
     }
     let elf = Elf::parse(&hdr[..n as usize])?;
-    elf.for_each_load_streamed(|seg| stream_segment(ops, fd, seg, bias, aspace))?;
+    elf.for_each_load_streamed(|seg| {
+        if rec.record(seg, bias) {
+            Some(())
+        } else {
+            stream_segment(ops, fd, seg, bias, aspace)
+        }
+    })?;
     Some(elf.entry() as usize + bias)
 }
 
@@ -453,18 +523,61 @@ fn stream_elf_at(
 /// page-by-page directly into its destination frame (through the kernel linear
 /// map). `open`/`read`/`lseek`/`close` are the registered `svc::FileOps` VFS
 /// handlers. Returns the `LinuxImage` (auxv facts) or None on any error.
+/// Every page is committed here, so the returned image has **no** recorded segments
+/// and the caller needs no page-fault handler. This is the variant a **native** cell's
+/// `SYS_SPAWN` uses: native cells have no VMA list and nothing to map records with, so
+/// a demand-paged image would leave the child with an address space full of holes.
+///
+/// [`exec_elf_from_vfs_demand`] is the lazy twin, for the Linux personality only.
 pub fn exec_elf_from_vfs(
     ops: &crate::svc::FileOps,
     path_va: u64,
     path_len: u64,
     aspace: &mut AddressSpace,
 ) -> Option<LinuxImage> {
+    // An empty recorder declines every segment, so `exec_elf_inner` streams them all.
+    exec_from_vfs(ops, path_va, path_len, aspace, false)
+}
+
+/// [`exec_elf_from_vfs`] with the image **demand-paged** (docs/ARCHITECTURE-DEBT.md
+/// 4.0, blocker 2): the segments it can leave to the page-fault handler come back in
+/// `LinuxImage::recorded()`.
+///
+/// **The caller must map them.** `linux::exec_reinit` does, via
+/// `record_image_segments`. A caller that ignores them gets a child with no pages for
+/// its own code and no diagnostic - which is exactly what happened when this and the
+/// eager path were one function and the native `SYS_SPAWN` inherited the laziness.
+///
+/// `path_va`/`path_len` must name the path in **kernel** memory (both callers copy it
+/// out of the cell first), because the mapping opens its own long-lived handle over it
+/// - the `fd` here is closed on return.
+pub fn exec_elf_from_vfs_demand(
+    ops: &crate::svc::FileOps,
+    path_va: u64,
+    path_len: u64,
+    aspace: &mut AddressSpace,
+) -> Option<LinuxImage> {
+    exec_from_vfs(ops, path_va, path_len, aspace, true)
+}
+
+fn exec_from_vfs(
+    ops: &crate::svc::FileOps,
+    path_va: u64,
+    path_len: u64,
+    aspace: &mut AddressSpace,
+    demand: bool,
+) -> Option<LinuxImage> {
     let fd = (ops.open)(path_va, path_len, 0);
     if fd < 0 {
         return None;
     }
     let fd = fd as u64;
-    let r = exec_elf_inner(ops, fd, aspace);
+    let mut rec = SegRecorder::new();
+    if demand {
+        rec.begin(crate::linux::filemap::open(path_va, path_len));
+    }
+    let r = exec_elf_inner(ops, fd, aspace, &mut rec);
+    rec.finish();
     (ops.close)(fd);
     r
 }
@@ -477,6 +590,7 @@ fn exec_elf_inner(
     ops: &crate::svc::FileOps,
     fd: u64,
     aspace: &mut AddressSpace,
+    rec: &mut SegRecorder,
 ) -> Option<LinuxImage> {
     // Read the header region (ELF header + phdr table) into a kernel buffer.
     let mut hdr = [0u8; HDR_BUF];
@@ -498,7 +612,11 @@ fn exec_elf_inner(
         if end > image_end {
             image_end = end;
         }
-        stream_segment(ops, fd, seg, bias, aspace)
+        if rec.record(seg, bias) {
+            Some(())
+        } else {
+            stream_segment(ops, fd, seg, bias, aspace)
+        }
     })?;
     let image_end = (image_end + FRAME_SIZE - 1) & !(FRAME_SIZE - 1);
     let phdr = elf.phdr_vaddr().map(|v| v as usize + bias).unwrap_or(0);
@@ -515,14 +633,8 @@ fn exec_elf_inner(
         at_entry: entry,
         image_end,
         stack_want: elf.stack_size().unwrap_or(0),
-        // `execve` stays **eager**, and deliberately: the streamed path reads from a
-        // VFS handle this function closes on return, so recording segments against it
-        // would name a closed file. Demand-paging it means giving the mapping its own
-        // handle, which is the `filemap::open` path and a separate slice
-        // (docs/ARCHITECTURE-DEBT.md 4.0). Nothing is recorded, so nothing is claimed.
-        store: None,
-        segs: [ImageSeg::EMPTY; MAX_IMAGE_SEGS],
-        nsegs: 0,
+        segs: rec.segs,
+        nsegs: rec.nsegs,
     })
 }
 
@@ -540,6 +652,7 @@ fn stream_segment(
     let va0 = vaddr & !(FRAME_SIZE - 1);
     let mem_end = vaddr.checked_add(seg.memsz)?;
     let perm = seg_perm(seg.flags);
+    bump(addr_of_mut!(EAGER_PAGES), mem_end - va0);
     let mut va = va0;
     while va < mem_end {
         let pa = frames::alloc().expect("ELF segment page (bounded by the image, at load)"); // zeroed (bss/zero-fill already done)
@@ -678,6 +791,7 @@ fn map_segment(aspace: &mut AddressSpace, image: &[u8], seg: &Segment, bias: usi
     let mem_end = vaddr.checked_add(seg.memsz)?;
     let perm = seg_perm(seg.flags);
 
+    bump(addr_of_mut!(EAGER_PAGES), mem_end - va0);
     let mut va = va0;
     while va < mem_end {
         let pa = frames::alloc().expect("ELF segment page (bounded by the image, at load)"); // zeroed, so bss/zero-fill is already done
