@@ -35,13 +35,13 @@
 mod harness;
 
 use harness::{CellStore, KernelStack, build_cell};
-use kernel::capability::{CapTable, ObjectTable};
+use kernel::capability::{CapTable, DELEGATE, ObjectKind, ObjectTable, READ, REVOKE, WRITE};
 use kernel::mm::frames;
 use kernel::queue::STATUS_OK;
 use kernel::user::{self, Outcome};
 use kernel::user_progs::{
     user_attack_mmap, user_attack_mmap_roundtrip, user_attack_munmap, user_attack_munmap_queue,
-    user_attack_out,
+    user_attack_out, user_cap_probe,
 };
 use kernel::{arch, println};
 
@@ -361,6 +361,82 @@ extern "C" fn kernel_main() -> ! {
         );
     }
     println!("security: F3 channel / loaded-queue / unreserved-grant munmap refused OK");
+
+    // ---- F4: the capability surface is reachable, and it enforces ---------
+    //
+    // `ARCHITECTURE.md` 3 has named mint/delegate/revoke from the first draft,
+    // but none of them was reachable from a cell: `derive_subset`, `delegate`
+    // and `revoke_epoch` had **zero production callers**, so object 2's claim
+    // to be "the security model, the audit log, and the metering system" rested
+    // on a primitive only a test had ever called, and `abi.rs`'s promise that
+    // "an epoch revoke kills the peer's copy too" was unreachable code
+    // (docs/ARCHITECTURE-DEBT.md 2.1).
+    //
+    // The cell does eight things and reports a bitmask. Six of them it could in
+    // principle fake by lying about its own syscall returns - which is why the
+    // *kernel-side* assertions below are the ones that matter: the object's
+    // epoch is read from the kernel's own table, which the cell has no mapping
+    // for and no verb that reports it.
+    let probe_cap = unsafe {
+        let objects = &mut *core::ptr::addr_of_mut!(OBJECTS);
+        let caps = &mut *core::ptr::addr_of_mut!(CAPS);
+        let obj = objects.create(ObjectKind::MemoryGrant).unwrap();
+        let h = caps
+            .mint(objects, obj, READ | WRITE | DELEGATE | REVOKE, u64::MAX)
+            .unwrap();
+        (obj, h.raw_low32())
+    };
+    // A second object, untouched by the probe. Its capability must survive the
+    // revoke, or "revocation is per-object" would be an untested claim and a
+    // revoke that nuked the table would pass just as well.
+    let bystander = unsafe {
+        let objects = &mut *core::ptr::addr_of_mut!(OBJECTS);
+        let caps = &mut *core::ptr::addr_of_mut!(CAPS);
+        let obj = objects.create(ObjectKind::QueuePair).unwrap();
+        (obj, caps.mint(objects, obj, READ, u64::MAX).unwrap())
+    };
+    let epoch_before = unsafe { (*core::ptr::addr_of!(OBJECTS)).epoch_of(probe_cap.0) };
+
+    let r = attack(user_cap_probe, probe_cap.1 as u64);
+    assert_exited(&r, "cap probe");
+    assert_eq!(
+        r.status, 0xFF,
+        "F4: capability probe reported {:#x}, expected all eight checks (0xFF). \
+         Bits: 0 parent rights, 1 derive, 2 child rights, 3 widen refused, \
+         4 child cannot revoke, 5 parent can, 6 revoke killed the child, \
+         7 drop then double-drop refused",
+        r.status
+    );
+    assert_eq!(
+        r.ops, READ as u64,
+        "F4: the derived child carries {:#x}, expected exactly READ",
+        r.ops
+    );
+
+    // The unfakeable half. The cell said it revoked; the kernel's own object
+    // table says whether it did.
+    let objects = unsafe { &*core::ptr::addr_of!(OBJECTS) };
+    assert!(
+        objects.epoch_of(probe_cap.0) > epoch_before,
+        "F4: the object's epoch did not move, so nothing was actually revoked"
+    );
+    let caps = unsafe { &*core::ptr::addr_of!(CAPS) };
+    assert!(
+        caps.inspect_low32(objects, probe_cap.1).is_err(),
+        "F4: the kernel's own copy of the revoked capability is still live"
+    );
+    assert!(
+        caps.inspect_low32(objects, bystander.1.raw_low32()).is_ok(),
+        "F4: revoking one object invalidated a capability to a different one"
+    );
+    println!(
+        "security: F4 capability surface OK - a cell derives a narrowed \
+         capability, is refused a widening, cannot revoke without the right, \
+         and its revoke kills the derived copy too (epoch {} -> {}), while a \
+         capability to another object is untouched",
+        epoch_before,
+        objects.epoch_of(probe_cap.0)
+    );
 
     println!("security: PASS");
     arch::exit(arch::ExitCode::Success)

@@ -20,16 +20,14 @@
 
 pub mod typed;
 
-/// Rights bits (docs/KERNEL-RUST.md 2).
-pub const READ: u32 = 1 << 0;
-pub const WRITE: u32 = 1 << 1;
-pub const EXECUTE: u32 = 1 << 2;
-pub const DELEGATE: u32 = 1 << 3;
-pub const MAP: u32 = 1 << 4;
-
-/// "No budget metering" sentinel. A finite budget is decremented by every
-/// successful grant check and exhausts to `Exhausted`.
-pub const BUDGET_UNLIMITED: u64 = u64::MAX;
+// Rights bits and the budget sentinel (docs/KERNEL-RUST.md 2). Defined once in
+// `rheo-abi` and re-exported under the kernel's short names, because a **cell**
+// names them too now that `SYS_CAP_DERIVE` exists - restating them here would
+// be the divergence class that crate deletes (docs/ARCHITECTURE-DEBT.md 3.1).
+pub use rheo_abi::{
+    BUDGET_UNLIMITED, RIGHT_ALL as ALL, RIGHT_DELEGATE as DELEGATE, RIGHT_EXECUTE as EXECUTE,
+    RIGHT_MAP as MAP, RIGHT_READ as READ, RIGHT_REVOKE as REVOKE, RIGHT_WRITE as WRITE,
+};
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum CapError {
@@ -75,8 +73,20 @@ impl Handle {
 
     /// For the unforgeability test only: a handle value picked by an
     /// attacker rather than returned by the kernel.
+    ///
+    /// Also the constructor the capability syscalls use on a cell-supplied
+    /// handle, and that is exactly right: "forge" is what a cell does with
+    /// every handle it passes, and the table's slot/generation/epoch checks are
+    /// what make a forged one useless.
     pub fn forge(raw: u64) -> Handle {
         Handle(raw)
+    }
+
+    /// The full 64-bit handle a cell holds and passes back. Unlike
+    /// [`Handle::raw_low32`] the generation is not truncated, so this is the
+    /// form `SYS_CAP_DERIVE` returns.
+    pub fn raw(self) -> u64 {
+        self.0
     }
 
     /// The 32-bit ABI form carried in a queue entry's `cap_id` field:
@@ -125,6 +135,22 @@ pub enum ObjectKind {
     /// cells (no ambient authority). Held by an orchestrator/shell; not minted
     /// into a spawned child by default.
     Cell,
+}
+
+impl ObjectKind {
+    /// The stable ABI number a cell sees in [`rheo_abi::CapInfo::kind`]. Not
+    /// the Rust discriminant: this crosses the ABI, so reordering the enum must
+    /// not change what a cell reads.
+    pub fn abi_code(self) -> u32 {
+        match self {
+            ObjectKind::MemoryGrant => rheo_abi::CAP_KIND_MEMORY_GRANT,
+            ObjectKind::QueuePair => rheo_abi::CAP_KIND_QUEUE_PAIR,
+            ObjectKind::File => rheo_abi::CAP_KIND_FILE,
+            ObjectKind::Stream => rheo_abi::CAP_KIND_STREAM,
+            ObjectKind::Reservation => rheo_abi::CAP_KIND_RESERVATION,
+            ObjectKind::Cell => rheo_abi::CAP_KIND_CELL,
+        }
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -180,6 +206,13 @@ impl ObjectTable {
 
     pub fn kind(&self, object: ObjectId) -> ObjectKind {
         self.objects[object.0 as usize].kind
+    }
+
+    /// The object's current epoch, for a caller that wants to observe a revoke
+    /// having happened rather than infer it from a failing check
+    /// (docs/ENGINEERING.md 1).
+    pub fn epoch_of(&self, object: ObjectId) -> u32 {
+        self.objects[object.0 as usize].epoch
     }
 
     #[inline(always)]
@@ -379,6 +412,98 @@ impl CapTable {
         {
             self.slots[index].in_use = false;
         }
+    }
+
+    // -------------------------------------------------------------------
+    // The 32-bit ABI form (docs/ARCHITECTURE-DEBT.md 2.1)
+    // -------------------------------------------------------------------
+    //
+    // A `Handle` is the kernel's 64-bit form; `Handle::raw_low32` is the form
+    // that crosses the ABI, and it is the *only* form a cell ever receives -
+    // `SYS_QUEUE_INFO`, `SYS_GRANT`, `SYS_CONNECT` and every queue entry use
+    // it. So the capability verbs take it too. Making them take the 64-bit
+    // form instead would have been a quiet trap: the two are numerically equal
+    // while a slot's generation stays below 2^16, so it would work in every
+    // test and start failing after 65536 reuses of one slot.
+
+    /// Resolve the 32-bit ABI form to a live slot, spending no budget.
+    ///
+    /// Checks the same three things `grant_check_low32` does - the slot is in
+    /// use, the truncated generation matches, the object's epoch has not
+    /// moved. Nothing else: those three are exactly what establishes that this
+    /// handle still names that object.
+    fn slot_of_low32(&self, objects: &ObjectTable, cap_id: u32) -> Result<usize, CapError> {
+        let index = (cap_id & 0xFFFF) as usize;
+        if index >= MAX_CAPS_PER_CELL {
+            return Err(CapError::BadHandle);
+        }
+        let slot = &self.slots[index];
+        if !slot.in_use || slot.generation as u32 & 0xFFFF != cap_id >> 16 {
+            return Err(CapError::BadHandle);
+        }
+        if slot.epoch != objects.epoch(ObjectId(slot.object)) {
+            return Err(CapError::Revoked);
+        }
+        Ok(index)
+    }
+
+    /// What a capability carries, **without spending budget**.
+    ///
+    /// Deliberately not `grant_check(handle, 0)`: that decrements a finite
+    /// budget, so introspecting a metered capability would consume it - looking
+    /// at a capability would change it. Returns `(object, rights, budget)`; a
+    /// revoked or stale handle is an error, so a cell can use this to *observe*
+    /// a revoke rather than infer it from a later failure
+    /// (docs/ENGINEERING.md 1).
+    pub fn inspect_low32(
+        &self,
+        objects: &ObjectTable,
+        cap_id: u32,
+    ) -> Result<(ObjectId, u32, u64), CapError> {
+        let i = self.slot_of_low32(objects, cap_id)?;
+        let s = &self.slots[i];
+        Ok((ObjectId(s.object), s.rights, s.budget))
+    }
+
+    /// [`CapTable::derive_subset`] on the 32-bit ABI form, returning the same
+    /// form. Widening is refused exactly as it is there - the subset test runs
+    /// against the parent's *stored* rights, never against anything the caller
+    /// supplied.
+    ///
+    /// Unlike `derive_subset` this does not spend a budget unit of the parent:
+    /// a metered capability meters *uses of the object*, and deriving reaches
+    /// the object no more than inspecting does.
+    pub fn derive_subset_low32(
+        &mut self,
+        objects: &ObjectTable,
+        parent: u32,
+        rights: u32,
+        budget: u64,
+    ) -> Result<u32, CapError> {
+        let i = self.slot_of_low32(objects, parent)?;
+        let (parent_rights, object) = (self.slots[i].rights, ObjectId(self.slots[i].object));
+        if rights & parent_rights != rights {
+            return Err(CapError::WidenAttempt);
+        }
+        // A derivation may narrow the budget but never exceed the parent's
+        // remaining one - otherwise metering would be escapable by deriving.
+        let parent_budget = self.slots[i].budget;
+        if parent_budget != BUDGET_UNLIMITED
+            && (budget == BUDGET_UNLIMITED || budget > parent_budget)
+        {
+            return Err(CapError::WidenAttempt);
+        }
+        self.mint_derived(objects, object, rights, budget)
+            .map(|h| h.raw_low32())
+    }
+
+    /// Release the 32-bit ABI form from this table. Reports whether it named a
+    /// live capability, so a double drop is visible rather than a silent
+    /// success (docs/ENGINEERING.md 7).
+    pub fn free_low32(&mut self, objects: &ObjectTable, cap_id: u32) -> Result<(), CapError> {
+        let i = self.slot_of_low32(objects, cap_id)?;
+        self.slots[i].in_use = false;
+        Ok(())
     }
 
     /// Count of live capabilities (used by tests).

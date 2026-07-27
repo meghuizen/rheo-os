@@ -296,9 +296,99 @@ pub const SYS_WAIT_NET: u64 = 48;
 /// not parallelism (SMP is task #27).
 pub const SYS_YIELD: u64 = 49;
 
+// -------------------------------------------------------------------------
+// The capability verbs (docs/ARCHITECTURE.md 3 "mint/delegate/revoke
+// capability", docs/ARCHITECTURE-DEBT.md 2.1)
+// -------------------------------------------------------------------------
+//
+// Object 2 is described as "simultaneously the security model, the audit log,
+// and the metering system", and `ARCHITECTURE.md` 3's verb set has named
+// mint/delegate/revoke from the start - but none of them was reachable from a
+// cell, so `derive_subset`/`delegate`/`revoke_epoch` had **zero production
+// callers** and every kernel-side mint passed `BUDGET_UNLIMITED`. A cell could
+// not narrow a capability before passing it on, and the promise that "an epoch
+// revoke kills the peer's copy too" was unreachable code.
+//
+// These four verbs implement verbs the design already admitted; they are not a
+// section 6 extension. They are also the hard prerequisite for the identity
+// model (docs/IDENTITY.md 9): "root holds a maximal bundle" and "dropping
+// privileges revokes" are claims, not mechanisms, without them.
+
+/// Derive a **narrower** capability from one this cell holds, into this cell's
+/// own table: `(handle, rights, budget, out_va) -> 0 | -errno`.
+///
+/// `rights` must be a subset of the parent's - widening is refused, which is
+/// the monotonic-attenuation invariant of ARCHITECTURE.md 8.2 made reachable
+/// rather than merely tested. `budget` may be [`BUDGET_UNLIMITED`] or any
+/// finite count; a finite budget is decremented by every successful grant check
+/// and exhausts. Writes a `u64` handle to `out_va`.
+pub const SYS_CAP_DERIVE: u64 = 50;
+
+/// Revoke every outstanding capability to a capability's object, in **every**
+/// cell, by bumping the object epoch: `(handle) -> 0 | -errno`.
+///
+/// Requires [`RIGHT_REVOKE`] on the handle, so revocation is itself an
+/// authority that can be withheld when a capability is delegated. O(1) - no
+/// table is walked; a stale epoch fails the next grant check.
+pub const SYS_CAP_REVOKE: u64 = 51;
+
+/// Report what a handle actually carries: `(handle, out_va) -> 0 | -errno`,
+/// writing a [`CapInfo`].
+///
+/// Introspection is what lets a cell *prove* an attenuation happened rather
+/// than assume it, which is the difference between this being a mechanism and
+/// being decoration (docs/ENGINEERING.md 1).
+pub const SYS_CAP_INFO: u64 = 52;
+
+/// Release a capability from this cell's table: `(handle) -> 0 | -errno`.
+///
+/// The object is untouched; only this cell's reference goes away. Dropping the
+/// last handle does not destroy the object - object reclamation is separate and
+/// still future work (docs/TILES.md 12).
+pub const SYS_CAP_DROP: u64 = 53;
+
 // =========================================================================
 // ABI constants that are not syscall numbers
 // =========================================================================
+
+// -------------------------------------------------------------------------
+// Capability rights (docs/KERNEL-RUST.md 2)
+// -------------------------------------------------------------------------
+//
+// Defined here because both sides name them: the kernel checks them and, since
+// [`SYS_CAP_DERIVE`], a **cell** chooses them. They were previously written out
+// twice by hand - `kernel::capability` and `runtime::rights` - which is the
+// duplication class this crate exists to delete (docs/ARCHITECTURE-DEBT.md 3.1).
+
+/// Read the object's contents.
+pub const RIGHT_READ: u32 = 1 << 0;
+/// Modify the object's contents.
+pub const RIGHT_WRITE: u32 = 1 << 1;
+/// Execute from the object.
+pub const RIGHT_EXECUTE: u32 = 1 << 2;
+/// Hand this capability to another cell. Without it a capability is
+/// cell-local, which is what makes "give it away" a decision rather than a
+/// default.
+pub const RIGHT_DELEGATE: u32 = 1 << 3;
+/// Map the object into an address space.
+pub const RIGHT_MAP: u32 = 1 << 4;
+/// Revoke the object's epoch, killing **every** outstanding capability to it,
+/// including copies held by other cells ([`SYS_CAP_REVOKE`]).
+///
+/// A separate right rather than an implied property of holding the capability:
+/// delegating read access to a buffer must not hand over the power to
+/// invalidate it for everyone. Minted to a creator, withheld from a derivation
+/// unless asked for and already held.
+pub const RIGHT_REVOKE: u32 = 1 << 5;
+
+/// Every defined right. Not "whatever the creator happened to get" - a named
+/// set, so a widening check has something exact to compare against.
+pub const RIGHT_ALL: u32 =
+    RIGHT_READ | RIGHT_WRITE | RIGHT_EXECUTE | RIGHT_DELEGATE | RIGHT_MAP | RIGHT_REVOKE;
+
+/// "No budget metering" sentinel. A finite budget is decremented by every
+/// successful grant check and exhausts.
+pub const BUDGET_UNLIMITED: u64 = u64::MAX;
 
 /// [`SYS_ARM_TIMER`] argument 1: hold the deadline in the cell-sleep slot (the
 /// default, and the only behaviour before rheo-net N2e).
@@ -603,6 +693,38 @@ pub struct QueueInfo {
     /// 32-bit ABI id of the cell's QueuePair capability (`Handle::raw_low32`).
     pub cap_id: u64,
 }
+
+/// The [`SYS_CAP_INFO`] result block: what a handle actually carries.
+///
+/// `kind` is the [`ObjectKind`](../kernel/capability/enum.ObjectKind.html)
+/// discriminant as a small integer; the constants are `CAP_KIND_*` below. A
+/// cell reads this to *check* an attenuation rather than assume it.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CapInfo {
+    /// The object this capability names. Two handles with the same `object`
+    /// reach the same thing, which is how a cell can tell a derivation from an
+    /// unrelated capability.
+    pub object: u32,
+    /// `CAP_KIND_*`.
+    pub kind: u32,
+    /// The rights actually stored, which is the point: a derivation that asked
+    /// for more than the parent held was refused, so what comes back here is
+    /// what the kernel will enforce.
+    pub rights: u32,
+    pub _pad: u32,
+    /// Remaining uses, or [`BUDGET_UNLIMITED`].
+    pub budget: u64,
+}
+
+/// [`CapInfo::kind`] values. Stable numbers rather than the Rust enum's
+/// layout, because this crosses the ABI.
+pub const CAP_KIND_MEMORY_GRANT: u32 = 0;
+pub const CAP_KIND_QUEUE_PAIR: u32 = 1;
+pub const CAP_KIND_FILE: u32 = 2;
+pub const CAP_KIND_STREAM: u32 = 3;
+pub const CAP_KIND_RESERVATION: u32 = 4;
+pub const CAP_KIND_CELL: u32 = 5;
 
 /// The [`SYS_GRANT`] result block.
 #[repr(C)]

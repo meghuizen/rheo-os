@@ -15,11 +15,15 @@
 #![allow(clippy::empty_loop)]
 
 use crate::abi::{
-    Params, SHELL_BUF, SYS_ARM_TIMER, SYS_CAPS, SYS_CPUINFO, SYS_CYCLES, SYS_DOORBELL,
-    SYS_EVENT_COUNT, SYS_EVENT_EMIT, SYS_EXIT, SYS_GRAPH, SYS_LEASE, SYS_LSPCI, SYS_MEMINFO,
-    SYS_MMAP, SYS_MUNMAP, SYS_NUMA, SYS_PS, SYS_QUEUE_INFO, SYS_RANDOM, SYS_READLINE, SYS_RESERVE,
-    SYS_SWITCH, SYS_UPTIME, SYS_WAIT_INPUT, SYS_WAIT_NET, SYS_WRITE, SYS_YIELD, ShellIo,
-    WORKLOAD_CROSSCELL, WORKLOAD_ROUNDTRIP, WORKLOAD_SYSCALL,
+    Params, SHELL_BUF, SYS_ARM_TIMER, SYS_CAP_DERIVE, SYS_CAP_DROP, SYS_CAP_INFO, SYS_CAP_REVOKE,
+    SYS_CAPS, SYS_CPUINFO, SYS_CYCLES, SYS_DOORBELL, SYS_EVENT_COUNT, SYS_EVENT_EMIT, SYS_EXIT,
+    SYS_GRAPH, SYS_LEASE, SYS_LSPCI, SYS_MEMINFO, SYS_MMAP, SYS_MUNMAP, SYS_NUMA, SYS_PS,
+    SYS_QUEUE_INFO, SYS_RANDOM, SYS_READLINE, SYS_RESERVE, SYS_SWITCH, SYS_UPTIME, SYS_WAIT_INPUT,
+    SYS_WAIT_NET, SYS_WRITE, SYS_YIELD, ShellIo, WORKLOAD_CROSSCELL, WORKLOAD_ROUNDTRIP,
+    WORKLOAD_SYSCALL,
+};
+use crate::capability::{
+    DELEGATE as RIGHT_DELEGATE, READ as RIGHT_READ, REVOKE as RIGHT_REVOKE, WRITE as RIGHT_WRITE,
 };
 use crate::queue::{OP_NOP, QueuePair};
 
@@ -381,6 +385,127 @@ pub extern "C" fn user_attack_out(params_va: usize) -> ! {
     unsafe {
         let out = (*p).iters;
         (*p).status = syscall(SYS_QUEUE_INFO, out);
+        syscall(SYS_EXIT, 0);
+    }
+    loop {}
+}
+
+/// The capability-surface probe (docs/ARCHITECTURE-DEBT.md 2.1): an
+/// **unprivileged** cell derives, inspects, revokes and drops capabilities in
+/// its own table, and reports which of seven checks held.
+///
+/// `Params.iters` carries the 32-bit id of a capability the kernel minted into
+/// this cell with `READ|WRITE|DELEGATE|REVOKE`. On return: `status` is a bitmask
+/// of the checks that passed (all seven = `0x7F`), `ticks` is the derived
+/// child's id, `ops` the rights the kernel reported for that child.
+///
+/// The sequence is straight-line - each step's result feeds one bit - so it
+/// compiles to compares and branches, never the dense jump table a
+/// `match`-on-integer would put in kernel `.rodata` that this cell cannot read.
+#[unsafe(link_section = ".user.text")]
+#[unsafe(no_mangle)]
+pub extern "C" fn user_cap_probe(params_va: usize) -> ! {
+    let p = params_va as *mut Params;
+    // A `CapInfo` is object:u32, kind:u32, rights:u32, pad:u32, budget:u64 -
+    // read as three words so no struct literal (and no `memset` call into
+    // kernel `.text`, which is not mapped here) is needed.
+    let mut info: [u64; 3] = [0, 0, 0];
+    let mut child: u32 = 0;
+    // SAFETY: the cell's own mapped Params page and two stack locals, all
+    // inside this cell's user VA range - which is exactly what `user_out`
+    // requires of an out-parameter.
+    unsafe {
+        let info_va = info.as_mut_ptr() as u64;
+        let child_va = &mut child as *mut u32 as u64;
+        let parent = (*p).iters;
+        let mut ok: u64 = 0;
+
+        // 1. The parent reports the rights the kernel actually stored. Without
+        //    this the rest proves nothing: every later comparison is against a
+        //    number the cell would otherwise be assuming.
+        if syscall4(SYS_CAP_INFO, parent, info_va, 0, 0) == 0 {
+            let rights = info[1] & 0xFFFF_FFFF;
+            if rights == (RIGHT_READ | RIGHT_WRITE | RIGHT_DELEGATE | RIGHT_REVOKE) as u64 {
+                ok |= 1 << 0;
+            }
+        }
+
+        // 2. Deriving a narrower capability succeeds.
+        if syscall4(
+            SYS_CAP_DERIVE,
+            parent,
+            RIGHT_READ as u64,
+            u64::MAX,
+            child_va,
+        ) == 0
+        {
+            ok |= 1 << 1;
+        }
+        let kid = child as u64;
+
+        // 3. The child carries exactly READ - and names the *same object*, so
+        //    it is an attenuation of this capability and not some unrelated one.
+        if syscall4(SYS_CAP_INFO, kid, info_va, 0, 0) == 0 {
+            (*p).ops = info[1] & 0xFFFF_FFFF;
+            if (info[1] & 0xFFFF_FFFF) == RIGHT_READ as u64 {
+                ok |= 1 << 2;
+            }
+        }
+
+        // 8. Drop releases a capability, and a *second* drop of the same one is
+        //    refused rather than quietly succeeding - a double free that
+        //    reported 0 would hide a real bug in whatever did it.
+        let mut spare: u32 = 0;
+        let spare_va = &mut spare as *mut u32 as u64;
+        if syscall4(
+            SYS_CAP_DERIVE,
+            parent,
+            RIGHT_READ as u64,
+            u64::MAX,
+            spare_va,
+        ) == 0
+        {
+            let s = spare as u64;
+            if syscall4(SYS_CAP_DROP, s, 0, 0, 0) == 0 && syscall4(SYS_CAP_DROP, s, 0, 0, 0) != 0 {
+                ok |= 1 << 7;
+            }
+        }
+
+        // 4. Widening is refused. The subset test runs against the parent's
+        //    stored rights, so there is nothing the cell can pass to defeat it
+        //    (ARCHITECTURE.md 8.2, monotonic attenuation).
+        if syscall4(
+            SYS_CAP_DERIVE,
+            kid,
+            (RIGHT_READ | RIGHT_WRITE) as u64,
+            u64::MAX,
+            child_va,
+        ) != 0
+        {
+            ok |= 1 << 3;
+        }
+
+        // 5. The child cannot revoke: REVOKE is its own right and was not
+        //    derived. Handing someone read access must not hand them the power
+        //    to invalidate the object for everyone.
+        if syscall4(SYS_CAP_REVOKE, kid, 0, 0, 0) != 0 {
+            ok |= 1 << 4;
+        }
+
+        // 6. The parent can.
+        if syscall4(SYS_CAP_REVOKE, parent, 0, 0, 0) == 0 {
+            ok |= 1 << 5;
+        }
+
+        // 7. And the revoke killed the *derived* capability too, which is the
+        //    whole promise of epoch revocation - one increment, every
+        //    outstanding capability to that object, no table walked.
+        if syscall4(SYS_CAP_INFO, kid, info_va, 0, 0) != 0 {
+            ok |= 1 << 6;
+        }
+
+        (*p).ticks = kid;
+        (*p).status = ok;
         syscall(SYS_EXIT, 0);
     }
     loop {}

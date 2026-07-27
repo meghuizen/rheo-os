@@ -5,7 +5,14 @@ edition = "2024"
 
 # The strand runtime (docs/BUILD-ORDER.md step 7, docs/CONCURRENCY.md): the
 # userspace library a cell links against for native async and the heap that
-# backs `alloc`. Dependency-free and `no_std + alloc`; the OS binding (the
-# queue-pair reactor) is injected by the caller via complete(token).
+# backs `alloc`. `no_std + alloc`; the OS binding (the queue-pair reactor) is
+# injected by the caller via complete(token).
+#
+# No external dependencies. The one path dependency is `rheo-abi`, the tree's
+# own ABI leaf (no_std, zero deps, no lang items) - the rights bits in
+# `rights.rs` are the *same* bits the kernel checks, and since SYS_CAP_DERIVE a
+# cell chooses them, so restating them here is the divergence class rheo-abi
+# exists to delete (docs/ARCHITECTURE-DEBT.md 3.1).
 
 [dependencies]
+rheo-abi = { path = "../abi" }

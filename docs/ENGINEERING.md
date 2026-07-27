@@ -324,6 +324,24 @@ three lines later quietly depends on it.
 
 Specific traps this codebase has hit, kept here so they are not re-learned.
 
+- **Two encodings of the same thing that are *usually* equal.** A `Handle` is
+  `(generation << 16) | slot`; its 32-bit ABI form is
+  `((generation & 0xFFFF) << 16) | slot`. Those are the **same number** while a
+  slot's generation stays below 2^16 - which it does in every test, every
+  fixture, and every boot. A capability verb written against the 64-bit form
+  would therefore have accepted the 32-bit form a cell actually holds, worked
+  perfectly, and begun failing after 65536 reuses of one slot. The fix was not
+  to convert carefully at each call site but to **delete the choice**: the verbs
+  take the form the rest of the ABI already uses, and the wide form never
+  crosses the boundary. When two encodings agree on all reachable inputs, that
+  is not safety - it is a test that cannot fail.
+- **A read must not be a write.** `grant_check` decrements a metered
+  capability's budget, so the obvious way to answer "what does this handle
+  carry?" - `grant_check(h, 0)` - *consumes* the thing being inspected. Any
+  accessor built on an enforcement path inherits that path's side effects; give
+  the read-only question its own function (`inspect_low32`) rather than passing
+  a zero to the enforcing one.
+
 - **Layout sensitivity is a real bug class.** A `static` stack used as the
   syscall dispatch stack had alignment 1. `SYSCALL` does not adjust `RSP` (unlike
   a hardware trap, which the CPU aligns), so correctness depended on where the

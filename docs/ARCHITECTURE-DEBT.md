@@ -43,24 +43,65 @@ every conclusion that touched it is a suspect.
 
 ## 2. Critical and high - correctness and enforcement
 
-### 2.1 The capability model has no userspace surface (A + B)
+### 2.1 The capability model has no userspace surface - **CLOSED for derive / revoke / inspect / drop**
 
-`ARCHITECTURE.md` §3 names *mint / delegate / revoke*. None of the 49 syscalls is
-a delegate, derive-subset, or revoke. `revoke_epoch`
-(`kernel/src/capability/mod.rs:164`), `derive_subset` (`:325`) and `delegate`
-(`:343`) have **zero production callers** - every caller is a test. Every
-kernel-side mint passes `BUDGET_UNLIMITED`.
+`ARCHITECTURE.md` §3 named *mint / delegate / revoke* from the first draft, and
+none of the 49 syscalls was any of them. `revoke_epoch`, `derive_subset` and
+`delegate` had **zero production callers** - every caller was a test - so object
+2's claim to be "simultaneously the security model, the audit log, and the
+metering system" rested on a primitive nothing but a test had ever called, and
+`abi.rs`'s promise that "an epoch revoke kills the peer's copy too" was
+unreachable code.
 
-So object 2's claim to be "simultaneously the security model, the audit log, and
-the metering system" is a **tested primitive with no production use**, and
-`abi.rs:402`'s promise that "an epoch revoke kills the peer's copy too" is
-unreachable. A cell cannot narrow a capability before passing it on.
+**Fixed.** Four verbs, implementing verbs the design had already admitted (so no
+§6 pass was needed, and no object was added):
 
-This is also the **hard prerequisite for the identity model** (docs/IDENTITY.md):
-"root holds a maximal capability bundle" and "dropping privileges revokes" are
-claims, not mechanisms, until `derive_subset`/`delegate`/`revoke` are reachable
-from a cell. Same for §2.3 - a login session that inherits its parent's
-capability table is not a session.
+| Verb | Does |
+|---|---|
+| `SYS_CAP_DERIVE` (50) | Narrow rights and/or budget into a child capability in the caller's own table. Widening is refused - the subset test runs against the parent's *stored* rights, so there is nothing a caller can pass to defeat it |
+| `SYS_CAP_REVOKE` (51) | Bump the object's epoch: every outstanding capability to it dies, in every cell, O(1) |
+| `SYS_CAP_INFO` (52) | Report object / kind / rights / budget - so a cell can **check** an attenuation instead of assuming it |
+| `SYS_CAP_DROP` (53) | Release one capability from this table |
+
+Three design points worth keeping:
+
+1. **`REVOKE` is its own right** (`rheo-abi::RIGHT_REVOKE`), minted to an
+   object's creator and withheld from a derivation unless asked for and already
+   held. Handing a peer read access to a buffer must not also hand it the power
+   to invalidate that buffer for everyone. This is the bit the proof's most
+   discriminating phase turns on.
+2. **The verbs take the 32-bit ABI `cap_id`**, not the kernel's 64-bit `Handle`
+   - the form every other part of the ABI already uses, and the only form a cell
+   ever receives. Taking the 64-bit form would have been a quiet trap: the two
+   are numerically equal while a slot's generation stays below 2^16, so it would
+   have worked in every test and started failing after 65536 reuses of one slot.
+3. **Neither `SYS_CAP_INFO` nor a derivation spends budget.** `grant_check`
+   decrements, so introspecting a metered capability through it would consume
+   the thing being looked at. A derivation may narrow a budget but never exceed
+   the parent's, or metering would be escapable by deriving.
+
+The rights bits moved into `rheo-abi` at the same time - they were written out
+by hand in both `kernel::capability` and `runtime::rights`, which was tolerable
+while only the kernel named them and is not now that a cell chooses them (§3.1).
+
+**Proof**: `security`'s F4 phase, on all three ISAs. A real unprivileged U-mode
+cell runs eight checks and reports a bitmask; the kernel then asserts what the
+cell cannot fake - the object's **epoch actually moved** in the kernel's own
+table (which the cell has no mapping for and no verb that reports it), the
+kernel's own copy of the revoked capability is dead, and a capability to a
+*different* object is untouched. Both new enforcement points were observed
+failing when reverted independently: dropping the `REVOKE` requirement gives
+`0xCF` (bit 4, "the child could revoke"), dropping the widening check gives
+`0xF7` (bit 3).
+
+**Still open in this section**: `delegate` - moving a capability to *another
+cell's* table - has no verb yet. It is the one that needs §2.3 first, because
+with a shared capability table there is no other table to delegate into.
+
+This section is also the **hard prerequisite for the identity model**
+(docs/IDENTITY.md 9): "root holds a maximal capability bundle" and "dropping
+privileges revokes" are claims, not mechanisms, without these verbs. That half
+is now real; the per-child-table half (§2.3) is not.
 
 ### 2.2 Revocation is vacuous for memory grants (A)
 
@@ -73,6 +114,13 @@ capability check stands between the peer and the bytes.
 The machinery to fix it exists (`AddressSpace::unmap`,
 `paging_for_each_user_leaf`); property 3 also needs restating to mean what the
 design needs.
+
+**Unchanged by §2.1.** `SYS_CAP_REVOKE` makes epoch revocation *reachable*, and
+the `security` F4 phase proves it kills every **capability** to the object -
+including one derived from it. It does not unmap a single page. So for a grant
+whose frames a cell already reached through `SYS_COMMIT`, revoke still removes
+the right to ask and leaves the bytes: the gap this section describes is exactly
+as wide as it was, and is now easier to hit, because a cell can trigger it.
 
 ### 2.3 A spawned cell shares its parent's capability table (A + doc divergence)
 
@@ -573,9 +621,14 @@ already made.
 
 Chosen by (correctness at risk) first, then (leverage ÷ risk).
 
-**Now - correctness.** ~~§2.4 the scheduler idle state~~ and ~~§2.5 a system-wide
-admission ledger~~ are **closed** (§1). Next: §2.1-2.3 the capability surface,
-complete revocation, per-child tables; §2.6 the ambient-authority sweep.
+**Now - correctness.** ~~§2.4 the scheduler idle state~~, ~~§2.5 a system-wide
+admission ledger~~ and ~~§2.1's derive / revoke / inspect / drop surface~~ are
+**closed** (§1). Next, in this order because each unblocks the next: **§2.3
+per-child capability tables** (which also unblocks `delegate`, the one verb §2.1
+left out - with a shared table there is no other table to delegate into), then
+**§2.2 complete revocation** for memory grants (revoke invalidates capabilities
+today and unmaps nothing), then **§2.6 the ambient-authority sweep**, which needs
+both.
 
 ~~**First week - four Small, near-zero-risk items closing three structural
 defects.**~~ **DONE** (all four; see §1): `kernel::boot::init` deletes the three

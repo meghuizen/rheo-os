@@ -388,6 +388,9 @@ dependencies = [
 [[package]]
 name = "runtime"
 version = "0.1.0"
+dependencies = [
+ "rheo-abi",
+]
 
 [[package]]
 name = "rustc_version"

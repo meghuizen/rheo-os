@@ -9,11 +9,15 @@
 
 use core::marker::PhantomData;
 
-pub const READ: u32 = 1 << 0;
-pub const WRITE: u32 = 1 << 1;
-pub const EXECUTE: u32 = 1 << 2;
-pub const DELEGATE: u32 = 1 << 3;
-pub const MAP: u32 = 1 << 4;
+// The bits themselves come from `rheo-abi`, which is where the kernel gets them
+// too. They were written out here by hand until `SYS_CAP_DERIVE` made a cell
+// *choose* rights rather than merely describe them - at which point two
+// hand-kept copies of the same numbers is the divergence class that crate
+// exists to delete (docs/ARCHITECTURE-DEBT.md 3.1).
+pub use rheo_abi::{
+    RIGHT_DELEGATE as DELEGATE, RIGHT_EXECUTE as EXECUTE, RIGHT_MAP as MAP, RIGHT_READ as READ,
+    RIGHT_REVOKE as REVOKE, RIGHT_WRITE as WRITE,
+};
 
 /// A zero-size witness of a rights bitmask.
 #[derive(Copy, Clone, Debug)]
@@ -42,6 +46,9 @@ impl<const A: u32, const B: u32> SubsetOf<Rights<B>> for Rights<A> where
 pub type ReadOnly = Rights<{ READ }>;
 pub type ReadWrite = Rights<{ READ | WRITE }>;
 pub type Executable = Rights<{ READ | EXECUTE }>;
+/// Every **access** right. Deliberately not [`REVOKE`]: revocation invalidates
+/// the object for every other holder too, so it is not something a convenience
+/// alias should hand out. Ask for it by name.
 pub type Full = Rights<{ READ | WRITE | EXECUTE | DELEGATE | MAP }>;
 
 /// A typed handle to a kernel object. The rights live in `R`; the runtime

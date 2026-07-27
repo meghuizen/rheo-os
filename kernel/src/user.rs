@@ -12,15 +12,16 @@
 //! synchronous, so there is no concurrent access to guard against.
 
 use crate::abi::{
-    ChannelInfo, GrantInfo, MAX_CELL_CHANNELS, QueueInfo, ReserveInfo, SYS_ARM_TIMER, SYS_COMMIT,
-    SYS_CONNECT, SYS_CYCLES, SYS_DECOMMIT, SYS_DOORBELL, SYS_EXIT, SYS_EXIT_GROUP, SYS_GRANT,
-    SYS_GRANT_SHARE, SYS_MMAP, SYS_MMAP_FILE, SYS_MUNMAP, SYS_QUEUE_INFO, SYS_RESERVE_ADMIT,
-    SYS_RESERVE_QUERY, SYS_RESERVE_RELEASE, SYS_SEAL, SYS_SPAWN, SYS_SWITCH, SYS_WAIT,
-    SYS_WAIT_INPUT, SYS_WAIT_NET, SYS_YIELD, ShareInfo,
+    CapInfo, ChannelInfo, GrantInfo, MAX_CELL_CHANNELS, QueueInfo, ReserveInfo, SYS_ARM_TIMER,
+    SYS_CAP_DERIVE, SYS_CAP_DROP, SYS_CAP_INFO, SYS_CAP_REVOKE, SYS_COMMIT, SYS_CONNECT,
+    SYS_CYCLES, SYS_DECOMMIT, SYS_DOORBELL, SYS_EXIT, SYS_EXIT_GROUP, SYS_GRANT, SYS_GRANT_SHARE,
+    SYS_MMAP, SYS_MMAP_FILE, SYS_MUNMAP, SYS_QUEUE_INFO, SYS_RESERVE_ADMIT, SYS_RESERVE_QUERY,
+    SYS_RESERVE_RELEASE, SYS_SEAL, SYS_SPAWN, SYS_SWITCH, SYS_WAIT, SYS_WAIT_INPUT, SYS_WAIT_NET,
+    SYS_YIELD, ShareInfo,
 };
 use crate::arch::{self, FaultCause, MapPerm, TrapFrame, TrapKind};
 use crate::capability::{
-    BUDGET_UNLIMITED, CapTable, DELEGATE, MAP, ObjectKind, ObjectTable, READ, WRITE,
+    self, BUDGET_UNLIMITED, CapError, CapTable, DELEGATE, MAP, ObjectKind, ObjectTable, READ, WRITE,
 };
 use crate::mm::{AddressSpace, frames};
 use crate::queue::{self, QueuePair};
@@ -30,6 +31,35 @@ use crate::sched::{Admission, AdmitError, Reservation};
 /// above the image (1-4 GiB) and stack (8 GiB), free in every cell root.
 const MMAP_BASE: usize = 0x3_0000_0000;
 static mut MMAP_NEXT: usize = MMAP_BASE;
+
+// Errno values the capability verbs report. Small local constants rather than a
+// dependency on `linux::errno`: these are the *native* ABI, and the native
+// surface must not be defined by the compatibility personality.
+const EPERM: u32 = 1;
+const EFAULT: u32 = 14;
+const EINVAL: u32 = 22;
+const ENOENT: u32 = 2;
+const ENOSPC: u32 = 28;
+
+/// Map a capability-layer error onto the errno a cell sees.
+///
+/// Each one is distinguishable on purpose. A cell that asked to widen a
+/// capability and a cell that passed a stale handle have made *different*
+/// mistakes, and collapsing them to one code is what turns a debuggable
+/// refusal into a mystery (docs/ENGINEERING.md 7).
+fn cap_errno(e: CapError) -> u32 {
+    match e {
+        // A handle that names no live slot, or whose generation does not match.
+        CapError::BadHandle => ENOENT,
+        // The right was not held - including a widening attempt, which is the
+        // monotonic-attenuation invariant refusing (ARCHITECTURE.md 8.2).
+        CapError::InsufficientRights | CapError::WidenAttempt | CapError::NotDelegatable => EPERM,
+        // The object's epoch moved: someone revoked it.
+        CapError::Revoked => EINVAL,
+        // A finite budget ran out, or a table/object table is full.
+        CapError::Exhausted | CapError::TableFull | CapError::TooManyObjects => ENOSPC,
+    }
+}
 
 // ======================================================================
 // User-pointer validation (docs/ENGINEERING.md 12)
@@ -948,10 +978,15 @@ fn grant_create(cur: usize, out_va: u64, len: usize, kind: u64, _flags: u64) -> 
         let Ok(obj) = objects.create(ObjectKind::MemoryGrant) else {
             return u64::MAX;
         };
+        // The **creator** gets REVOKE as well (docs/ARCHITECTURE-DEBT.md 2.1):
+        // it made the object, so invalidating it for every holder is its call.
+        // A derivation does not inherit it unless it asks and the parent has
+        // it, which is what stops `SYS_GRANT_SHARE`ing a buffer read-only from
+        // also handing over the power to pull it out from under everyone.
         match caps.mint(
             objects,
             obj,
-            READ | WRITE | MAP | DELEGATE,
+            READ | WRITE | MAP | DELEGATE | capability::REVOKE,
             BUDGET_UNLIMITED,
         ) {
             Ok(h) => h.raw_low32(),
@@ -1810,6 +1845,107 @@ pub fn on_user_trap(
             arch::set_syscall_ret(unsafe { &mut *frame }, ret);
             frame
         }
+        // ---- the capability verbs (docs/ARCHITECTURE-DEBT.md 2.1) ----------
+        //
+        // `ARCHITECTURE.md` 3 has named mint/delegate/revoke since the first
+        // draft, but none was reachable from a cell: `derive_subset`,
+        // `delegate` and `revoke_epoch` had zero production callers, so object
+        // 2's claim to be "the security model, the audit log, and the metering
+        // system" rested on a primitive nothing but a test had ever called.
+        // These four make it reachable. They add no object and no verb the
+        // design had not already admitted.
+        SYS_CAP_DERIVE => {
+            let cell = cells()[cur];
+            let (parent, rights, budget) = (arg as u32, args[1] as u32, args[2]);
+            // SAFETY: the cell's tables were validated at install time and its
+            // address space is active for the trap.
+            let caps = unsafe { &mut *cell.caps };
+            let objects = unsafe { &*cell.objects };
+            let ret = match user_out::<u32>(args[3]) {
+                None => -(EFAULT as i64),
+                // A right this build does not define cannot be granted -
+                // otherwise a bit that means nothing today would be derivable
+                // today and mean something else tomorrow.
+                Some(_) if rights & !capability::ALL != 0 => -(EINVAL as i64),
+                Some(out) => match caps.derive_subset_low32(objects, parent, rights, budget) {
+                    // SAFETY: `out` was checked by `user_out` (non-null,
+                    // aligned, inside this cell's user VA range).
+                    Ok(child) => {
+                        unsafe { out.write(child) };
+                        0
+                    }
+                    Err(e) => -(cap_errno(e) as i64),
+                },
+            };
+            arch::set_syscall_ret(unsafe { &mut *frame }, ret as u64);
+            frame
+        }
+        SYS_CAP_REVOKE => {
+            let cell = cells()[cur];
+            // SAFETY: tables validated at install time; address space active.
+            // `objects` is installed as `*const`; the owning test kernel holds
+            // it as a mutable static, and bumping an epoch needs `&mut`.
+            let caps = unsafe { &*cell.caps };
+            let objects = unsafe { &mut *(cell.objects as *mut ObjectTable) };
+            // REVOKE is its own right, not something holding the capability
+            // implies: delegating read access to a buffer must not also hand
+            // over the power to pull it out from under every other holder.
+            // `inspect_low32` rather than a grant check, so the rights test
+            // does not spend a metered capability's budget.
+            let ret = match caps.inspect_low32(objects, arg as u32) {
+                Ok((object, rights, _)) if rights & capability::REVOKE != 0 => {
+                    objects.revoke_epoch(object);
+                    0
+                }
+                Ok(_) => -(EPERM as i64),
+                Err(e) => -(cap_errno(e) as i64),
+            };
+            arch::set_syscall_ret(unsafe { &mut *frame }, ret as u64);
+            frame
+        }
+        SYS_CAP_INFO => {
+            let cell = cells()[cur];
+            // SAFETY: tables validated at install time; address space active.
+            let caps = unsafe { &*cell.caps };
+            let objects = unsafe { &*cell.objects };
+            let ret = match (
+                user_out::<CapInfo>(args[1]),
+                caps.inspect_low32(objects, arg as u32),
+            ) {
+                (None, _) => -(EFAULT as i64),
+                (Some(out), Ok((object, rights, budget))) => {
+                    // SAFETY: `out` was checked by `user_out`.
+                    unsafe {
+                        out.write(CapInfo {
+                            object: object.0,
+                            kind: objects.kind(object).abi_code(),
+                            rights,
+                            _pad: 0,
+                            budget,
+                        });
+                    }
+                    0
+                }
+                (Some(_), Err(e)) => -(cap_errno(e) as i64),
+            };
+            arch::set_syscall_ret(unsafe { &mut *frame }, ret as u64);
+            frame
+        }
+        SYS_CAP_DROP => {
+            let cell = cells()[cur];
+            // SAFETY: tables validated at install time; address space active.
+            let caps = unsafe { &mut *cell.caps };
+            let objects = unsafe { &*cell.objects };
+            // Reports whether anything was actually released, so a double drop
+            // is visible instead of a silent success (docs/ENGINEERING.md 7).
+            let ret = match caps.free_low32(objects, arg as u32) {
+                Ok(()) => 0,
+                Err(e) => -(cap_errno(e) as i64),
+            };
+            arch::set_syscall_ret(unsafe { &mut *frame }, ret as u64);
+            frame
+        }
+
         // Cross-cell connect: report this cell's shared-channel end for the
         // requested slot (docs/LIBRHEO.md Phase E; multi-slot fan-out is
         // docs/NETSTACK.md rheo-net N4a). Each end is one ring region shared with
