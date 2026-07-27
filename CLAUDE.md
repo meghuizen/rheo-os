@@ -1275,9 +1275,9 @@ observed failing without the fix.
 
 **Demand paging** (docs/LINUX-COMPAT.md "Demand paging",
 docs/ARCHITECTURE-DEBT.md 4.0 blocker 2) makes a **file-backed `MAP_PRIVATE` `mmap`
-cost what the program touches, not what it reserved**. `mmap` used to read every page
-into a fresh frame before returning - not a size problem to answer with a bigger pool,
-the wrong design at any size. A **resumable user page fault** now fills a page on first
+and the ELF image itself cost what the program touches, not what it reserved**. Both
+used to read every page into a fresh frame before returning - not a size problem to
+answer with a bigger pool, the wrong design at any size. A **resumable user page fault** now fills a page on first
 touch: `on_user_trap` calls `linux::fill_fault` *before* the L5 fault-to-signal branch,
 and `linux::mem::fault` asks three questions in order - is anything mapped here (no
 record = a genuine SIGSEGV), **is the page already present** (then this was a
@@ -1307,10 +1307,22 @@ mapped, exactly **5** filled, each carrying its own per-page byte so the offset
 arithmetic holds at the top of the mapping; 100 rereads free; a write to a *filled*
 read-only page still SIGSEGV; a page still filling from the file after a forked sharer
 exited; the registry back where it started) and by `linuxdyn`, where `ld.so` maps a real
-1.5-2.1 MB `libc`. Honest and named: the **ELF image itself** is still streamed eagerly
-at load time (for an `ET_EXEC`-with-`PT_INTERP` binary that is where a large image's
-cost lands), `fork` is still an eager page copy rather than COW, and the initial stack
-is mapped whole rather than growing on fault - all three ride this same handler.
+1.5-2.1 MB `libc`. **The ELF image is demand-paged too**: `load::load_elf_linux`
+**records** the `PT_LOAD`s the fault handler can fill (`load::SegRecorder`) and copies
+only the ones it cannot, printing which segment and why each time - the two conditions
+being `p_filesz == p_memsz` (a `.bss` tail inside one record produced a null
+dereference in a static Rust binary) and `p_offset` congruent to `p_vaddr` mod the page
+size (paging fills whole pages). Because the image is already resident in kernel memory
+rather than in a file, `filemap` carries a second store kind, and because a segment's
+content ends mid-page, `Vma::file_len` says how far a record is backed - past it the
+pages are zeros, not the next segment's bytes. `user::reset` must run **before** the
+load, since it clears the registry the loader registers the image in (the old order
+zeroed every page - an illegal instruction at the entry point; `filemap::alive` now
+says so). Measured on riscv64: `rusthello`'s 201 image pages cost **16** frames at load
+instead of 201, and `linuxrun` asserts that inequality on all three ISAs. Honest and
+named: `fork` is still an eager page copy rather than COW, the initial stack is mapped
+whole rather than growing on fault, and **`execve` stays eager** because it streams from
+a VFS handle it closes on return - all three ride this same handler.
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus

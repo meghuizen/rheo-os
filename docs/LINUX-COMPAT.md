@@ -245,7 +245,8 @@ correctness argument:
    (glibc reserves large arenas that way and commits sub-ranges with `mprotect`);
    populating one hands out memory the program deliberately made inaccessible.
 
-**What is demand-paged today: file-backed `MAP_PRIVATE` `mmap`.** The mapping owns a
+**What is demand-paged today: file-backed `MAP_PRIVATE` `mmap`, and the ELF image
+itself.** The mapping owns a
 VFS handle in `linux::filemap` rather than remembering the caller's fd, because
 `ld.so` closes the fd immediately after `mmap` - on Linux a mapping references the
 *file*. That registry is global, fixed-size and refcounted (the `pipe`/`epoll`/
@@ -254,6 +255,44 @@ taken at `fork` (`VmaList::inherit_files` beside `fds::inherit_pipe_ends`) and g
 back at exit and at `munmap`. Both halves matter - without the `fork` addref a
 child's exit frees an entry the *parent* still maps, and the parent's next untouched
 page reads zeros with no fault and no log.
+
+**The image.** `load::load_elf_linux` used to copy every `PT_LOAD` page into a fresh
+frame, so a program cost frames in proportion to its size - and since the image is
+already resident in kernel memory, that was a *second* copy of the whole program.
+For an `ET_EXEC` binary with a `PT_INTERP` the kernel loads the main program itself,
+so this path (not `mmap`) is where a large image's memory lands. It now **records**
+the segments it can leave to the fault handler, in a `load::SegRecorder`, and copies
+only the ones it cannot. Two conditions must hold, and each was found by a segment
+that broke without it:
+
+- **`p_filesz == p_memsz`.** A segment with a `.bss` tail is part file and part zero
+  inside one record, and getting that boundary wrong produced a null dereference in
+  a static Rust binary. The honest scope is: whole-file segments are demand-paged,
+  the rest copied. Static glibc has exactly one such segment, tens of KiB.
+- **`p_offset` congruent to `p_vaddr` mod the page size.** Paging fills whole pages,
+  so the page holding a VA must line up with a page-aligned file offset. Every real
+  toolchain emits this; a hand-built ELF that does not is copied.
+
+Each refusal prints which segment and why, so "loaded eagerly" is never silent.
+Because the bytes come from kernel memory rather than a file, `filemap` gained a
+second store kind (`Store::Mem`), and because a segment's content ends mid-page,
+`Vma::file_len` says how far a record is backed - past it the pages are zero, not
+"whatever is next in the file".
+
+**`user::reset` must run before the load, not after.** It clears the registry the
+loader registers the image in, so the old order left the records naming a released
+entry and every page came back zeroed - which on RISC-V is an illegal instruction at
+the entry point and nothing more informative. `filemap::alive` now makes a
+recurrence say so rather than hand out blank memory.
+
+**`execve` stays eager**, said rather than implied: it streams from a VFS handle it
+closes on return, so recording against that handle would name a closed file. Giving
+the mapping its own handle is the `filemap::open` path and a separate slice.
+
+Measured on riscv64: `rusthello`'s 201 image pages cost **16 frames** at load
+(the one eager zero-tail segment plus page tables) instead of 201. `linuxrun`
+asserts that inequality on all three ISAs, so "the recorded pages were not
+committed" is checked rather than believed.
 
 **Two things the kernel had to gain for this to be safe.** A cell hands the kernel
 pointers into its own memory, and with presence lazy the *kernel* becomes a reader of
@@ -276,12 +315,11 @@ filled read-only page still SIGSEGV, a page still filling from the file after a 
 sharer exited, and the registry back where it started. Plus `linuxdyn`, where `ld.so`
 maps a real 1.5-2.1 MB `libc` and an unmodified dynamic glibc binary runs.
 
-**Still eager, and named as such:** the ELF image itself (`load::load_elf_linux`
-streams every `PT_LOAD` into a frame at load time - for an `ET_EXEC`-with-`PT_INTERP`
-binary that is where a large image's cost lands), `fork` (an eager copy of every
-committed page, not COW), and the initial stack (mapped whole rather than a guard page
-that grows on fault). All three ride the same handler and are the next rungs;
-docs/ARCHITECTURE-DEBT.md 4.0 blocker 2 tracks them.
+**Still eager, and named as such:** `fork` (an eager copy of every committed page,
+not COW), the initial stack (mapped whole rather than a guard page that grows on
+fault), `execve`'s streamed image, and a segment with a `.bss` tail. All ride the
+same handler and are the next rungs; docs/ARCHITECTURE-DEBT.md 4.0 blocker 2 tracks
+them.
 
 ## 5. Milestones
 

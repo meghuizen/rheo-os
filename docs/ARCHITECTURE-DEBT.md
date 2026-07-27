@@ -455,7 +455,9 @@ so was its claim of 182 MiB of `.bss`, which measurement shows does not exist.
    Each half was observed failing when reverted alone: with the mapping reverted
    the run prints **nothing at all**, because the fault eats glibc's buffered
    stdout - which is exactly why the original defect was hard to attribute.
-2. **Eager paging.** *Partly closed - `mmap` is done, the ELF image is not.*
+2. **Eager paging.** *Closed for the two paths a large image travels: file-backed
+   `mmap` and the ELF image itself. `fork`, the initial stack and `execve` remain
+   eager and are named below.*
 
    The framing this section used to carry was wrong, and worth correcting rather
    than quietly rewriting: 262 MiB is **unremarkable for modern software**, and the
@@ -516,33 +518,45 @@ so was its claim of 182 MiB of `.bss`, which measurement shows does not exist.
    immediately before freeing it. Moving it to the helpers that hand back something to
    **dereference** brings it to **0** kernel pre-faults, measured every run.
 
-   With that in place, demand-paging the ELF image **works for the cases that were
-   measured to matter**: `linuxrun` and `linuxdyn` pass with unmodified static and
-   *dynamically linked* glibc running from demand-paged images.
+   **Done: the ELF image.** `load::load_elf_linux` now **records** the `PT_LOAD`s the
+   fault handler can fill (a `load::SegRecorder`) and copies only the ones it cannot,
+   printing which segment and why each time it declines. Two conditions, each found by
+   a segment that broke without it: `p_filesz == p_memsz` (a `.bss` tail inside one
+   record produced a null dereference in a static Rust binary), and `p_offset`
+   congruent to `p_vaddr` mod the page size (paging fills whole pages). Because the
+   bytes are already resident in kernel memory rather than in a file, `filemap` gained
+   a second store kind; because a segment's content ends mid-page, `Vma::file_len` says
+   how far a record is backed, so the tail of its last page is zeros rather than the
+   next segment's bytes. Measured on riscv64: `rusthello`'s 201 image pages cost **16**
+   frames at load instead of 201, and `linuxrun` asserts that inequality on all three
+   ISAs. `linuxdyn` passes, so `ld.so` relocates a demand-paged program.
 
-   Four failures were found on that path and **three are fixed and verified**: a
-   reset-ordering hazard (a `user::reset()` after loading cleared the registry, so every
-   page came back zero - an illegal instruction at the entry point); a segment with a
-   `.bss` tail in one record (now demand-paged only when `filesz == memsz`, which is the
-   measured target's shape, and a bss tail is tens of KiB); and the real blocker - the
-   fork refcount above, which turned out to be a live defect on its own and is
-   **shipped separately, with its own proof**, rather than waiting on the image work.
-   With it, `procdemo` and the whole fork/execve/pipe chain pass.
+   Four failures were found on that path and **all four are now closed**:
 
-   The fourth is open and is why it is not merged: with the image demand-paged,
-   `mmapdp`'s mmap-region fill count rises from 4 to **61** for a 64-page mapping with 4
-   pages touched. 61 is close enough to the whole mapping to look like a real sweep
-   rather than glibc noise, and that count *is* the asserted property - so it gets
-   explained, not tuned around.
+   1. **Reset ordering.** `user::reset()` after loading cleared the registry, so every
+      page came back zero - an illegal instruction at the entry point and nothing more
+      informative. Reset now runs before the load in the harness and the three test
+      kernels that load directly, and `filemap::alive` makes a recurrence print
+      "reset before loading, not after" instead of handing out blank memory.
+   2. **A `.bss` tail** in one record - scoped out by the `filesz == memsz` rule above.
+   3. **The fork refcount**, which turned out to be a live defect independent of this
+      work and is **shipped separately with its own proof** rather than parked behind
+      it (see the paragraph above).
+   4. **The 4 -> 61 fill count**, which was the **oracle**, not the handler. The
+      assertion read `mem::faults()` - the total across the whole address space - and
+      once the image is lazy that total legitimately includes the program's own text
+      and data (61 on riscv64, 68 on x86-64, 67 on aarch64: the pages the eager path
+      used to allocate up front). `faults_mmap()` exists precisely for this and its
+      doc comment says so. The assertion now reads the region count - 5, hand-computed
+      from the fixture's touches - and prints the total beside it. The lesson is
+      recorded in ENGINEERING.md 11: a metric that was a valid oracle can stop being
+      one when the system around it changes, and the failure looks like a regression.
 
-   **Still open:** the ELF image itself. `load::load_elf_linux` streams every
-   `PT_LOAD` page into a frame at load time, and for an `ET_EXEC`-with-`PT_INTERP`
-   binary like this one the *kernel* loads the main program - so that path, not
-   `mmap`, is where the 262 MiB currently lands. Mapping those segments as
-   file-backed VMAs and letting the same fault handler fill them is the next rung,
-   and it is now a small change rather than a new mechanism. **COW `fork`** (still
-   an eager copy of every committed page) and a **guard-page + grow-on-fault
-   stack** ride the same handler.
+   **Still eager, and named:** **COW `fork`** (still an eager copy of every committed
+   page), a **guard-page + grow-on-fault stack** (the initial stack is mapped whole),
+   and **`execve`**, which streams from a VFS handle it closes on return - so recording
+   against that handle would name a closed file, and giving the mapping its own handle
+   is the `filemap::open` path. All three ride this same handler.
 3. ~~**Seven syscalls the personality does not dispatch**~~ **CLOSED.** Measured
    from the real startup trace rather than guessed, and all seven now dispatched:
 

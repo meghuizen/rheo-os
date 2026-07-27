@@ -540,6 +540,16 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   nothing called it, because the real fork path is the bulk copy above. It looked
   like the feature was present. Delete the unreachable one rather than leaving a
   reader to guess which is live.
+- **A metric can stop being an oracle without changing.** `mmapdp` asserted that a
+  64-page file mapping cost 4 demand fills, reading the *total* fill count. Correct
+  while a file `mmap` was the only demand-paged thing in the address space. The moment
+  the ELF image became lazy too, the same number was 61 - and it looked exactly like a
+  regression: a count close to the whole mapping, in the one assertion that guards
+  against a sweep. It was the program's own text and data, and the region-scoped
+  counter that answers the actual question already existed, with a doc comment saying
+  why. Three attempts were reverted before the arithmetic was checked. When a proof
+  fails after an unrelated change, ask what the number now includes before asking what
+  broke.
 
 ## 12. Never dereference an address the caller chose
 
