@@ -609,21 +609,30 @@ so was its claim of 182 MiB of `.bss`, which measurement shows does not exist.
    that merely slurped a small ext4 off the disk and loaded from it would combine two
    proven things and add nothing.
 
-   (b) The binary's bytes cannot all reside in **RAM at once** - and this is the open
-   one, easy to miss. `posix::Ext4` is pure over an in-RAM `&[u8]` (and `blockfs`
-   slurps the whole disk with `Vec::leak`), so mounting a 275 MB image means 275 MB
-   resident *regardless of demand paging* - demand paging makes the **cell's** pages
-   lazy, not the **source**. Closing (b) needs a **block-cached ext4**: a `BlockSource`
-   seam read through a fixed LRU of 4 KiB blocks over `hw::block::BlockDevice`, and an
-   ext4 driver that copies the bytes it needs out of a cache block rather than
-   returning `&[u8]` borrows into a whole image. That is a whole-driver refactor, sized
-   in #167, and it is the honest next rung - not another load-from-disk proof.
+   (b) The binary's bytes cannot all reside in **RAM at once** - it was the open one,
+   easy to miss, and it is **now closed** (#167). It used to be true that `posix::Ext4`
+   was pure over an in-RAM `&[u8]` (and `blockfs` slurped the whole disk with
+   `Vec::leak`), so mounting a 275 MB image meant 275 MB resident *regardless of demand
+   paging* - demand paging makes the **cell's** pages lazy, not the **source**. The fix
+   is a **block-cached ext4**: `posix::BlockSource` (byte-addressed `read_at` into a
+   caller buffer) is the seam; `kernel::hw::block::BlockCache<D>` is a fixed,
+   allocation-free LRU of `LINE`-byte lines (`CAPACITY = LINE*LINES`) over a
+   `BlockDevice`; and `Ext4` reads every field/extent/directory through the source
+   rather than borrowing a whole-image slice. `blockfs` now mounts the live disk through
+   the cache and asserts the streaming property directly: the 7800-byte multi-block file
+   reads correctly through an **8 KiB** cache over a **512 KiB** disk (`CAPACITY <
+   disk`), with `block::cache_fills() > 0` proving the bytes came from the device on
+   demand, not a preload. An in-RAM `&[u8]` is still one `BlockSource` (the `posix`
+   kernel's path, unchanged), so both the resident and the streaming source are proven.
 
-   Cost to measure when it lands, not assume: a fault becomes an ext4 extent walk plus
-   at most one block read if uncached; the registry ceiling (`MAX_MAPPED_FILES` 8) sits
-   right at main + `ld.so` + 5 libs; and the streaming `execve` path does not yet load
-   a `PT_INTERP` interpreter (only the from-slice `load_elf_linux` does), which a
-   dynamic binary from disk needs.
+   What (b) does **not** yet do, and is named: the streaming path proven here is the
+   **mount + read** path (`blockfs`), not yet an `execve` *from* a streamed mount - the
+   streaming `execve` path does not load a `PT_INTERP` interpreter (only the from-slice
+   `load_elf_linux` does), which a dynamic binary from disk needs; and the registry
+   ceiling (`MAX_MAPPED_FILES` 8) sits right at main + `ld.so` + 5 libs. Cost, measured
+   not assumed: a `read_at` for a 2-4 byte field is one LRU lookup, and a miss is one
+   `LINE/SECTOR`-sector device read; a data read copies straight from the covering
+   line. Wiring the streamed mount into the demand-paged loader is the next rung.
 3. ~~**Seven syscalls the personality does not dispatch**~~ **CLOSED.** Measured
    from the real startup trace rather than guessed, and all seven now dispatched:
 

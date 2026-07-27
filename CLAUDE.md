@@ -171,12 +171,22 @@ to be assigned or mapped - which matters because PVH boot has no firmware to
 program BARs. Since the kernel moved to the high half (docs/MEMORY.md) PA no
 longer equals VA, so the driver hands the device **physical** addresses for
 the virtqueue via `virt_to_phys` (the queue lives in the kernel's own RAM,
-reached through its linear map). The `blockfs` test kernel discovers the device, reads a real ext4
-image off the *live disk* (attached by QEMU with `-drive`), mounts it, and
-reads files through `std::fs` - on **all three ISAs**. At the `BlockDevice`
-seam existing Rust FS drivers (redoxfs, fatfs, a read/write ext4 crate) can
-be dropped in rather than hand-written - gated by the no-deps rule (a doc
-must name any crate).
+reached through its linear map). The `blockfs` test kernel discovers the device,
+mounts a real ext4 image off the *live disk* (attached by QEMU with `-drive`),
+and reads files through `std::fs` - on **all three ISAs** - and it now
+**streams**: the ext4 driver reads through a `posix::BlockSource`
+(byte-addressed `read_at`), and `blockfs` mounts the disk behind a bounded,
+allocation-free LRU `kernel::hw::block::BlockCache` (`CAPACITY = LINE*LINES`)
+rather than slurping the whole disk into RAM. The proof asserts the streaming
+property directly: the 7800-byte multi-block file reads correctly through an
+**8 KiB** cache over a **512 KiB** disk (`CAPACITY < disk`), with
+`block::cache_fills() > 0` proving the bytes came off the device on demand -
+so a filesystem no longer needs the whole image resident (the "binary need not
+reside whole in RAM" rung, docs/ARCHITECTURE-DEBT.md 4.0 blocker 2). An in-RAM
+`&[u8]` is still one `BlockSource` (the `posix` kernel's path, unchanged). At
+the `BlockDevice` seam existing Rust FS drivers (redoxfs, fatfs, a read/write
+ext4 crate) can be dropped in rather than hand-written - gated by the no-deps
+rule (a doc must name any crate).
 
 A **native-userland** path is being built out so real Rust/C/C++ apps
 (eventually the uutils/coreutils) run as cells, recompiled for a rheo-os

@@ -6,8 +6,10 @@
 //!   plugs into.
 //! - `ramfs`: a read-write in-memory filesystem (the working store).
 //! - `ext4`: a read-only driver for a real ext4 image (Tier-1 legacy disk
-//!   interchange, FILESYSTEMS.md 1). No block driver yet, so the image is a
-//!   RAM buffer (`include_bytes!` in the OS); the parsing is the real work.
+//!   interchange, FILESYSTEMS.md 1). It reads through a `BlockSource`
+//!   (byte-addressed random access): an in-RAM `&[u8]` (`include_bytes!` in the
+//!   OS), or a bounded block cache over a live device so an image far larger
+//!   than RAM streams rather than residing whole in memory.
 //! - `mount`: the per-session `/` - a mount table + path resolution.
 //! - `sys`: the POSIX file syscall surface (fd table, open/read/write/...).
 //! - `fs`: a `std::fs`-shaped facade, so standard-library file code runs here.
@@ -28,7 +30,7 @@ pub mod ramfs;
 pub mod sys;
 pub mod vfs;
 
-pub use ext4::Ext4;
+pub use ext4::{BlockSource, Ext4};
 pub use ramfs::RamFs;
 pub use vfs::{DirEntry, Errno, FileSystem, FileType, Metadata, NodeId};
 

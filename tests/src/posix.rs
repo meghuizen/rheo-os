@@ -10,6 +10,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -42,7 +43,7 @@ extern "C" fn kernel_main() -> ! {
     mount::mount("/", Rc::new(RamFs::new()));
     mount::mount(
         "/mnt",
-        Rc::new(Ext4::new(EXT4_IMG).expect("parse ext4 image")),
+        Rc::new(Ext4::new(Box::new(EXT4_IMG)).expect("parse ext4 image")),
     );
 
     test_ramfs_rw();
