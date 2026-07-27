@@ -341,6 +341,21 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   accessor built on an enforcement path inherits that path's side effects; give
   the read-only question its own function (`inspect_low32`) rather than passing
   a zero to the enforcing one.
+- **An optimisation added at the same time as the feature can silently delete
+  it.** The `mmap` bump cursor was replaced with first fit over a VMA list, whose
+  whole point is that a freed span becomes reusable - and the same commit kept
+  the old cursor as a "hint" for the search to start from, so that an
+  allocation-heavy program would not rescan the low end of the region. A search
+  that starts past every live mapping can never find a hole behind one, so the
+  feature was present, documented, and did nothing. Two lessons, and the second
+  is the load-bearing one:
+  - Land the mechanism and the optimisation in **separate steps**, so the proof
+    runs against the mechanism alone at least once.
+  - **Assert the property, not the success.** The fixture asked for a specific
+    *address* and got a different one, which is what caught it. Had it asserted
+    only that the second `mmap` succeeded, it would have passed with the feature
+    inert - and there is no amount of code review that reliably catches a
+    correct-looking cache in front of a correct-looking search.
 
 - **Layout sensitivity is a real bug class.** A `static` stack used as the
   syscall dispatch stack had alignment 1. `SYSCALL` does not adjust `RSP` (unlike

@@ -32,6 +32,7 @@ pub mod signal;
 pub mod stack;
 pub mod thread;
 pub mod unixsock;
+pub mod vma;
 
 pub use signal::{FaultOutcome, deliver_fault};
 
@@ -49,7 +50,11 @@ pub struct LinuxState {
     fds: fd::FdTable,
     brk_start: usize,
     brk_cur: usize,
-    mmap_cursor: usize,
+    /// What this cell has mapped, and with what protection
+    /// (docs/ARCHITECTURE-DEBT.md 4, blocker 2). Per-cell synthesized state, no
+    /// kernel object - the authority over the pages is still the cell's own
+    /// address space and frame budget.
+    pub vmas: vma::VmaList,
     tid_addr: u64,
     robust_list: u64,
     /// The cell's current working directory (getcwd/chdir; AT_FDCWD base).
@@ -70,7 +75,7 @@ impl LinuxState {
             fds: fd::FdTable::new(),
             brk_start: 0,
             brk_cur: 0,
-            mmap_cursor: 0,
+            vmas: vma::VmaList::new(),
             tid_addr: 0,
             robust_list: 0,
             cwd: [0; CWD_MAX],
@@ -118,7 +123,11 @@ pub fn install_cell(idx: usize, image_end: usize) {
         (image_end + crate::mm::frames::FRAME_SIZE - 1) & !(crate::mm::frames::FRAME_SIZE - 1);
     st.brk_start = brk;
     st.brk_cur = brk;
-    st.mmap_cursor = mem::mmap_base();
+    // A fresh image has none of the old one's mappings. `execve` replaces the
+    // address space, so a stale record would make first fit refuse a span that is
+    // actually free - and would give a page-fault lookup an answer about memory
+    // that no longer exists (docs/ARCHITECTURE-DEBT.md 4, blocker 2).
+    st.vmas.clear();
     st.tid_addr = 0;
     st.robust_list = 0;
     st.initialized = true;
@@ -173,7 +182,11 @@ pub(crate) fn exec_reinit(cell: usize, image_end: usize) {
         (image_end + crate::mm::frames::FRAME_SIZE - 1) & !(crate::mm::frames::FRAME_SIZE - 1);
     st.brk_start = brk;
     st.brk_cur = brk;
-    st.mmap_cursor = mem::mmap_base();
+    // A fresh image has none of the old one's mappings. `execve` replaces the
+    // address space, so a stale record would make first fit refuse a span that is
+    // actually free - and would give a page-fault lookup an answer about memory
+    // that no longer exists (docs/ARCHITECTURE-DEBT.md 4, blocker 2).
+    st.vmas.clear();
     st.tid_addr = 0;
     st.robust_list = 0;
     st.initialized = true;
@@ -309,8 +322,8 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
             args[5],
         )),
         nr::MREMAP => ret(mem::mremap(st, args[0], args[1], args[2], args[3])),
-        nr::MUNMAP => ret(mem::munmap(args[0], args[1])),
-        nr::MPROTECT => ret(mem::mprotect(args[0], args[1], args[2])),
+        nr::MUNMAP => ret(mem::munmap(state(cur), args[0], args[1])),
+        nr::MPROTECT => ret(mem::mprotect(state(cur), args[0], args[1], args[2])),
         nr::MADVISE => Ctl::Ret(0), // advisory by specification
 
         // -- threads (multi-context cell, docs/LINUX-COMPAT.md L4) --

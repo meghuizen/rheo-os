@@ -77,7 +77,7 @@ fn page_up(x: usize) -> usize {
     (x + FRAME_SIZE - 1) & !(FRAME_SIZE - 1)
 }
 
-/// The initial value for `LinuxState::mmap_cursor`.
+/// The base of the per-cell mmap region, for callers that need to name it.
 pub const fn mmap_base() -> usize {
     MMAP_BASE
 }
@@ -187,7 +187,7 @@ pub fn mmap(
 
     let base = if fixed {
         let b = (addr as usize) & !(FRAME_SIZE - 1);
-        // A caller-chosen address is the one case the bump cursor cannot protect
+        // A caller-chosen address is the one case placement cannot protect
         // against: refuse the kernel-owned rings rather than let the cell replace
         // their frames (docs/ARCHITECTURE-DEBT.md 4).
         if let Some(what) = reserved_overlap(b, bytes) {
@@ -196,25 +196,44 @@ pub fn mmap(
         }
         b
     } else {
-        let b = st.mmap_cursor;
-        // Bounded (docs/ARCHITECTURE-DEBT.md 4, blocker 2): the cursor used to run
-        // forward without limit, through the queue region, the channel regions and
-        // then ld.so. `-ENOMEM` is an answer glibc acts on; silently aliasing the
-        // dynamic linker is not.
-        let Some(next) = b.checked_add(bytes) else {
-            return -ENOMEM;
-        };
-        if next > MMAP_END {
+        // **First fit over the VMA list**, from the bottom of the region every
+        // time (docs/ARCHITECTURE-DEBT.md 4, blocker 2). The old bump cursor only
+        // moved forward, so a program that mapped and unmapped in a loop walked it
+        // to the region's end and then failed with the whole region free behind it
+        // - for a long-running process the normal outcome, not a corner case.
+        //
+        // Scanning from the bottom is not an oversight. The first version of this
+        // kept the cursor as a *hint* to start from, on the reasoning that an
+        // allocation-heavy program should not rescan the low end on every call -
+        // and that silently restored the exact behaviour being removed, because a
+        // search that starts past every existing mapping can never find a hole
+        // behind it. The fixture caught it (it asked for the freed address and got
+        // a fresh one). An optimisation that defeats the property it decorates is
+        // not an optimisation; if the scan ever measures as hot, the answer is a
+        // sorted list, not a cursor (docs/ENGINEERING.md 11).
+        let Some(b) = st.vmas.find_free(MMAP_BASE, MMAP_END, bytes) else {
             crate::println!(
-                "linux: mmap of {bytes:#x} refused - the {:#x}..{MMAP_END:#x} mmap \
-                 region is exhausted at {b:#x}",
-                MMAP_BASE
+                "linux: mmap of {bytes:#x} refused - no free span in the \
+                 {MMAP_BASE:#x}..{MMAP_END:#x} mmap region ({} mappings live)",
+                st.vmas.count()
             );
             return -ENOMEM;
-        }
-        st.mmap_cursor = next;
+        };
         b
     };
+
+    // Record the mapping before touching pages, so a full table refuses the call
+    // rather than leaving the list disagreeing with the page tables. `insert`
+    // replaces whatever was recorded at `base`, which is what `MAP_FIXED` over an
+    // `ld.so` reservation means.
+    if !st.vmas.insert(base, bytes, prot, flags) {
+        crate::println!(
+            "linux: mmap of {bytes:#x} at {base:#x} refused - the per-cell VMA table \
+             is full ({} records)",
+            crate::linux::vma::MAX_VMAS
+        );
+        return -ENOMEM;
+    }
 
     if anon {
         // Anonymous mmap always yields ZEROED memory. When MAP_FIXED overlays
@@ -298,6 +317,7 @@ pub fn mremap(st: &mut LinuxState, old_addr: u64, old_size: u64, new_size: u64, 
     if new_len <= old_len {
         if new_len < old_len {
             user::unmap_range(old_addr + new_len, old_len - new_len);
+            st.vmas.remove(old_addr + new_len, old_len - new_len);
         }
         return old_addr as i64;
     }
@@ -305,23 +325,24 @@ pub fn mremap(st: &mut LinuxState, old_addr: u64, old_size: u64, new_size: u64, 
     if flags & MREMAP_MAYMOVE == 0 {
         return -ENOMEM;
     }
-    // Same bound as `mmap`: the cursor is shared, so an unbounded `mremap` would
-    // walk into the queue region and ld.so exactly as an unbounded `mmap` did
-    // (docs/ARCHITECTURE-DEBT.md 4, blocker 2).
-    let base = st.mmap_cursor;
-    let Some(next) = base.checked_add(new_len) else {
+    // Placed by the same first fit as `mmap`, over the same VMA list, so a grow
+    // can land in a span something else freed (docs/ARCHITECTURE-DEBT.md 4,
+    // blocker 2). The old range is still recorded here, so first fit will not
+    // pick it - the copy below reads from it.
+    let Some(base) = st.vmas.find_free(MMAP_BASE, MMAP_END, new_len) else {
+        crate::println!("linux: mremap of {new_len:#x} refused - no free span in the mmap region");
         return -ENOMEM;
     };
-    if next > MMAP_END {
-        crate::println!(
-            "linux: mremap of {new_len:#x} refused - the mmap region is exhausted at {base:#x}"
-        );
+    if !st
+        .vmas
+        .insert(base, new_len, PROT_READ | PROT_WRITE, MAP_ANONYMOUS)
+    {
         return -ENOMEM;
     }
     if !user::map_anon_at(base, new_len, MapPerm::UserRw) {
+        st.vmas.remove(base, new_len);
         return -ENOMEM;
     }
-    st.mmap_cursor = next;
     // Copy the old contents; both ranges are mapped in the active cell root.
     // SAFETY: trap context, cell address space active; `old_len` bytes of the
     // source are mapped and `new_len >= old_len` bytes of the destination are.
@@ -329,12 +350,21 @@ pub fn mremap(st: &mut LinuxState, old_addr: u64, old_size: u64, new_size: u64, 
         core::ptr::copy_nonoverlapping(old_addr as *const u8, base as *mut u8, old_len);
     }
     user::unmap_range(old_addr, old_len);
+    st.vmas.remove(old_addr, old_len);
     base as i64
 }
 
-/// munmap(addr, len): unmap the pages and return their frames to the pool.
-pub fn munmap(addr: u64, len: u64) -> i64 {
-    user::unmap_range(addr as usize, len as usize);
+/// munmap(addr, len): unmap the pages, return their frames to the pool, and
+/// punch the range out of the VMA list so the span becomes reusable.
+///
+/// The list update is what makes a freed span *findable* again by first fit
+/// (docs/ARCHITECTURE-DEBT.md 4, blocker 2). A partial unmap in the middle of a
+/// mapping splits its record in two, so nothing is left claiming to own a hole.
+pub fn munmap(st: &mut LinuxState, addr: u64, len: u64) -> i64 {
+    let base = (addr as usize) & !(FRAME_SIZE - 1);
+    let bytes = page_up(len as usize);
+    user::unmap_range(base, bytes);
+    st.vmas.remove(base, bytes);
     0
 }
 
@@ -342,16 +372,21 @@ pub fn munmap(addr: u64, len: u64) -> i64 {
 /// (uncommitted) range accessible commits fresh frames for it (the glibc
 /// arena/stack growth path, docs/LINUX-COMPAT.md L4); PROT_NONE decommits the
 /// range, returning its frames to the pool.
-pub fn mprotect(addr: u64, len: u64, prot: u64) -> i64 {
+pub fn mprotect(st: &mut LinuxState, addr: u64, len: u64, prot: u64) -> i64 {
     if wx_refused(prot, "mprotect") {
         return -EPERM;
     }
+    let base = (addr as usize) & !(FRAME_SIZE - 1);
+    let bytes = page_up(len as usize);
     if prot & PROT_ANY == 0 {
-        user::unmap_range(addr as usize, len as usize);
-    } else {
-        if !user::commit_range(addr as usize, len as usize, perm_from_prot(prot)) {
-            return -ENOMEM;
-        }
+        user::unmap_range(base, bytes);
+    } else if !user::commit_range(base, bytes, perm_from_prot(prot)) {
+        return -ENOMEM;
     }
+    // The pages keep their record either way - PROT_NONE is still a *reservation*
+    // this cell owns, which is exactly why `mprotect`ing it back to RW must find
+    // it and not have first fit hand the span to something else. Only `munmap`
+    // releases a span.
+    st.vmas.set_prot(base, bytes, prot);
     0
 }

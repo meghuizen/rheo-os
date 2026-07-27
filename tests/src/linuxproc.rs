@@ -277,6 +277,8 @@ extern "C" fn kernel_main() -> ! {
         mmap: MAP_FIXED over the queue region EINVAL\n\
         wx: mmap PROT_WRITE|PROT_EXEC EPERM\n\
         wx: RW->RX flip works, mprotect to RWX EPERM\n\
+        vma: freed span reused at the same address, and writable\n\
+        vma: partial unmap split the mapping, both ends intact, hole reused\n\
         mmapx OK\n";
     let (code, out) = run_capture(MMAPX, &[b"mmapx"]);
     assert!(

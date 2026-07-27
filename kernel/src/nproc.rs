@@ -6,12 +6,12 @@
 //! Linux personality's `linux::proc` (docs/LINUX-COMPAT.md L6), which this
 //! mirrors for `Personality::Native` cells.
 //!
-//! A spawned child is a fresh native cell with its **own** address space, mapped
-//! queue pair (so it can run librheo's reactor) **and its own capability table**
-//! - it does not share the parent's (docs/ARCHITECTURE-DEBT.md 2.3), so it holds
-//! only what the spawn path explicitly mints into it. Spawning is gated by a
-//! **cell-spawn capability** (an `ObjectKind::Cell` cap carrying WRITE): a cell without it
-//! cannot create cells (no ambient authority). Scheduling generalizes the native
+//! A spawned child is a fresh native cell with its **own** address space, its own
+//! mapped queue pair (so it can run librheo's reactor), and **its own capability
+//! table**: it does not share the parent's (docs/ARCHITECTURE-DEBT.md 2.3), so it
+//! holds only what the spawn path explicitly mints into it. Spawning is gated by
+//! a **cell-spawn capability** (an `ObjectKind::Cell` cap carrying WRITE): a cell
+//! without it cannot create cells (no ambient authority). Scheduling generalizes the native
 //! cross-cell `SYS_SWITCH`: the parent that `SYS_WAIT`s blocks and hands the CPU
 //! to a runnable child; the child's exit makes it a zombie and reschedules,
 //! waking the parent whose wait is now satisfiable. Cooperative, single CPU: a

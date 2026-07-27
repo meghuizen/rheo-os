@@ -443,13 +443,36 @@ Three blockers are **design decisions**, not unfinished work:
    it (L7). Proven by `mmapx.c` in `linuxproc` on all three ISAs, observed failing
    reverted (*"oversized reservation was accepted"*).
 
-   **Still open, and still needed for Claude Code:** a real VMA list - per-mapping
-   records with permissions, first-fit placement, reuse of freed spans, and the
-   region lookup a **page fault handler** needs to know what to fault in and with
-   what protection. The bound makes the failure mode correct; it does not make
-   placement correct, and it does not enable demand paging (blocker 3). The user VA
-   ceiling is **256 GiB on every ISA** (`user.rs:62`, Sv39's user half applied
-   uniformly).
+   **The VMA list is now done too.** `kernel/src/linux/vma.rs` keeps one record
+   per mapping (base / len / prot / flags) in a fixed 128-entry per-cell array -
+   per-cell synthesized state, **no kernel object**, like the fd table and the
+   process tree. Placement is **first fit over that list**, so a freed span is
+   reusable; `munmap` and `mprotect` split records at the edges, so a partial
+   unmap in the middle of a mapping produces the two pieces that survive instead
+   of one record claiming to own a hole; adjacent records with identical
+   protection merge, which keeps a program that maps many small ranges from
+   exhausting the table; `fork` copies the list (the child's address space is a
+   copy, so its map of it must be too) and `execve` clears it.
+
+   `mmapx.c` asserts the two properties a bump cursor **cannot** have, and both
+   assertions are on an *address*, which is the only kind that can tell the two
+   designs apart: a freed middle span is handed back at **the same address** and
+   is writable, and a partial unmap leaves both ends intact with the hole
+   reusable. Observed failing when reverted to a search that starts above every
+   live mapping - `got 0x300041000, freed 0x300021000`.
+
+   That revert is worth recording as a **hazard, not just a control**: the first
+   version of this kept the old cursor as a "hint" for first fit to start from,
+   on the reasoning that an allocation-heavy program should not rescan the low
+   end of the region. That silently restored the exact behaviour being removed,
+   because a search starting past every mapping can never find a hole behind
+   one. The feature was present, well-commented, and did nothing. What caught it
+   was the fixture asking for a specific address rather than for success.
+
+   **Still open for Claude Code**: demand paging (blocker 3), which is what this
+   list was the prerequisite for - the fault handler's "which region is this, and
+   with what protection?" is a `VmaList::find` call. The user VA ceiling is
+   **256 GiB on every ISA** (`user.rs`, Sv39's user half applied uniformly).
 3. **No resumable page fault.** (The missing *idle state* was the other half of
    this and is now closed - §2.4.) `on_user_trap` still maps every user fault to a
    signal or termination, so nothing is demand-paged and nothing grows on fault -
@@ -612,10 +635,36 @@ that register simply left dirty), which silently stopped every waiter from being
 woken. It surfaced as rayon-threaded `sort` producing **no output at all** on
 ARM64 while the other two ISAs passed - a one-ISA symptom of a portable mistake.
 
-A 13-rung ladder from here to the goal is in the task list, each rung a real
-binary with an assertable outcome. Two tooling facts shape it: rungs past a
-"hello" will not fit the 120 s test timeout under TCG, and nothing in the tree
-uses KVM - a KVM-accelerated lane is a prerequisite, not an optimisation.
+### 4.1 The tooling constraint, measured
+
+Rungs past a "hello" will not fit the 120 s test timeout under TCG, and nothing
+in the tree uses KVM. That made "a KVM-accelerated lane" a named prerequisite.
+
+**Measured, and it is not available here.** The development container is itself a
+hypervisor guest with **no nested virtualisation exposed**: `/proc/cpuinfo`
+reports the `hypervisor` flag and **zero** `vmx`/`svm` flags, and `/dev/kvm` does
+not exist. QEMU 8.2 lists `kvm` among its accelerators, which is a property of
+the binary, not of the machine - `-accel kvm` cannot open the device. So a KVM
+lane can be *written* here but never *run* here, and writing a lane whose only
+proof is on someone else's hardware is a claim, not a capability.
+
+The consequence for the plan is specific, and it is better than it looks:
+
+- The ladder's **large-binary** rungs (unpatched Bun, ~100 MB, AVX2) are blocked
+  on hardware this container does not have. That is an honest external
+  dependency, recorded here rather than worked around.
+- The ladder's **mechanism** rungs are not blocked at all. Demand paging does
+  not need a 100 MB binary to prove - it needs a fault, a fill and a resume, and
+  a fixture that touches one unmapped page proves it exactly as well as a fixture
+  that touches 25,000. Same for a real VMA list, first-fit placement, span reuse,
+  and `MAP_NORESERVE`.
+
+So the order changes: **build the mechanisms and prove them small**, and let the
+large-binary rungs wait for hardware. That is also the right order on merit -
+eagerly copying a ~100 MB image page-by-page into private frames is the thing
+demand paging exists to delete, so proving demand paging first means the
+large-binary rung is a *measurement* when it finally runs, not a debugging
+session.
 
 ## 5. Duplication that has earned a framework
 

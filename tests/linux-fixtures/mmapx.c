@@ -122,6 +122,81 @@ int main(void) {
   }
   puts("wx: RW->RX flip works, mprotect to RWX EPERM");
 
+  /* 6. A freed span is REUSED. This is the property a bump cursor cannot have:
+   *    it only moves forward, so a program that maps and unmaps in a loop walks
+   *    to the region's end and then fails with the whole region free behind it.
+   *    Map three, free the middle one, map its size again: first fit must hand
+   *    back the hole's address, which is an *address* assertion, not a success
+   *    code - the only kind that can tell the two designs apart. */
+  const size_t span = 64 * 1024;
+  char *a = mmap(NULL, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
+                 -1, 0);
+  char *b = mmap(NULL, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
+                 -1, 0);
+  char *c = mmap(NULL, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
+                 -1, 0);
+  if (a == MAP_FAILED || b == MAP_FAILED || c == MAP_FAILED) {
+    puts("vma: three-span setup failed");
+    return 1;
+  }
+  /* Not assumed to be contiguous or ordered - only that they are distinct and
+   * that freeing the middle one leaves a hole big enough for one more. */
+  if (munmap(b, span) != 0) {
+    puts("vma: munmap of the middle span failed");
+    return 1;
+  }
+  char *reused = mmap(NULL, span, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (reused == MAP_FAILED) {
+    puts("vma: remap after free failed");
+    return 1;
+  }
+  if (reused != b) {
+    printf("vma: freed span not reused (got %p, freed %p)\n", (void *)reused,
+           (void *)b);
+    return 1;
+  }
+  /* Genuinely usable memory, not just an address: a stale page-table entry from
+   * the old mapping would read back the old byte. */
+  memset(reused, 0x5A, span);
+  if ((unsigned char)reused[0] != 0x5A ||
+      (unsigned char)reused[span - 1] != 0x5A) {
+    puts("vma: reused span is not writable");
+    return 1;
+  }
+  puts("vma: freed span reused at the same address, and writable");
+
+  /* 7. A partial unmap in the middle of one mapping leaves the two ends alive.
+   *    A bump cursor has no record to split, so it cannot answer this at all;
+   *    the failure it produces is a mapping that claims to own a hole. Assert
+   *    both ends still read back, and that the hole is genuinely gone by mapping
+   *    exactly into it. */
+  const size_t page = 4096;
+  char *three = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (three == MAP_FAILED) {
+    puts("vma: split setup failed");
+    return 1;
+  }
+  memset(three, 0x11, 3 * page);
+  if (munmap(three + page, page) != 0) {
+    puts("vma: partial munmap failed");
+    return 1;
+  }
+  if ((unsigned char)three[0] != 0x11 ||
+      (unsigned char)three[2 * page] != 0x11) {
+    puts("vma: partial munmap damaged the surviving ends");
+    return 1;
+  }
+  char *hole = mmap(NULL, page, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (hole != three + page) {
+    printf("vma: middle hole not reused (got %p, want %p)\n", (void *)hole,
+           (void *)(three + page));
+    return 1;
+  }
+  puts("vma: partial unmap split the mapping, both ends intact, hole reused");
+
   puts("mmapx OK");
   return 0;
 }
