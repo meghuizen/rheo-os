@@ -56,6 +56,12 @@ the metering system" is a **tested primitive with no production use**, and
 `abi.rs:402`'s promise that "an epoch revoke kills the peer's copy too" is
 unreachable. A cell cannot narrow a capability before passing it on.
 
+This is also the **hard prerequisite for the identity model** (docs/IDENTITY.md):
+"root holds a maximal capability bundle" and "dropping privileges revokes" are
+claims, not mechanisms, until `derive_subset`/`delegate`/`revoke` are reachable
+from a cell. Same for §2.3 - a login session that inherits its parent's
+capability table is not a session.
+
 ### 2.2 Revocation is vacuous for memory grants (A)
 
 `revoke_epoch` bumps `Object::epoch`, which makes future *grant checks* fail. But
@@ -560,6 +566,17 @@ defects.**~~ **DONE** (all four; see §1): `kernel::boot::init` deletes the thre
 cycles, `rheo-abi` removes the silent-corruption duplication (-943 lines),
 `svc::Bridge<T>` + `NicOps`/`DisplayOps` closes the §3.2 defect, and
 `TARGET-ARCHITECTURES.md` §4.1 states the `cfg` exemptions.
+
+**Then - identity** (docs/IDENTITY.md, phases ID0-ID6). This is a **new
+initiative**, not an audit finding, and it lands here because §2.1/§2.3/§2.6 are
+its hard prerequisites - it is the first consumer that makes them load-bearing
+rather than latent. There is currently **no permission check anywhere in the
+tree** and `getuid` returns a hardcoded `1000`, so a program that drops
+privileges believes it did and did not. ID1 (boot flags) is independent and can
+go any time; ID2 (the kernel principal) needs §2.1; ID4 (`rwx` in the file
+server) needs §2.1 + §2.6; ID5 (`identityd`) and ID6 (boot modes) come last.
+**No new kernel object and no new verb** - a principal fails §6 test 2 and
+`attest` already exists.
 
 **Then - leverage.** ~~The test harness~~ **first pass DONE** (see §5: -1,533
 lines, 22 kernels, no assertion touched); next: gate `VirtualLink`;

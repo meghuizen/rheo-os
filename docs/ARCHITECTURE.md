@@ -190,8 +190,10 @@ here.
 The complete set. Ten objects, roughly three dozen operations. The governance
 rule in section 6 keeps this list closed.
 
-1. **Cell** - address space + capability set + queues. Cell *groups* add
-   co-placement and a shared lease (the pod replacement), nothing more.
+1. **Cell** - address space + capability set + queues, plus an immutable
+   **principal** the kernel derives at creation (image measurement + parent)
+   and reports but never decides from. Cell *groups* add co-placement and a
+   shared lease (the pod replacement), nothing more.
 2. **Capability** - unforgeable, typed, delegatable, epoch-revocable,
    budget-metered. Becomes a signed cryptographic token when it crosses hosts.
    It is simultaneously the security model, the audit log, and the metering
@@ -234,6 +236,15 @@ authority (the cells share one capability bundle). They pass section 6 on the sa
 grounds as the address-space switch they wrap: a cell cannot switch its own page
 tables, and the CPU is shared hardware. Preemptive multi-core scheduling (SMP,
 task #27) is still ahead of the design here.
+
+**Identity is deliberately not an object.** A cell's principal fails §6 test 2 -
+it arbitrates no shared hardware - so it is a field on object 1, and reporting
+it is the existing **`attest`** verb rather than a new one. POSIX users, groups
+and `rwx` are then a userspace projection: the credential is per-cell
+synthesized state in the personality, and mode bits are checked by the file
+server, which is outside the kernel by doctrine 5. The kernel makes no access
+decision from an identity; `grant_check` is untouched. Full model in
+docs/IDENTITY.md.
 
 Everything else in this document is **composition** of these by cells.
 
