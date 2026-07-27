@@ -423,6 +423,7 @@ extern "C" fn kernel_main() -> ! {
         dp: pages 0, 37 and 63 read the right bytes\n\
         dp: 100 rereads of a filled page cost nothing\n\
         dp: writing a filled read-only page is SIGSEGV, not a refill\n\
+        dp: a page still faults from the file after a forked sharer exited\n\
         dp: mprotect RW then a private write works\n\
         mmapdp OK\n";
     let (code, out) = run_capture(MMAPDP, &[b"mmapdp"]);
@@ -435,9 +436,9 @@ extern "C" fn kernel_main() -> ! {
     assert!(code == 0, "mmapdp: exit {code}, expected 0");
     let filled = linux::mem::faults() - faults_before;
     assert!(
-        filled == 4,
-        "mmapdp: demand paging filled {filled} pages, want exactly 4 (64 were \
-         mapped, 4 touched) - an eager mmap would be 64 and a handler that \
+        filled == 5,
+        "mmapdp: demand paging filled {filled} pages, want exactly 5 (64 were \
+         mapped, 5 touched) - an eager mmap would be 64 and a handler that \
          repopulated a present page would be far more"
     );
     // The mapping owned a VFS handle across the caller's `close(fd)` and gave it
@@ -452,8 +453,9 @@ extern "C" fn kernel_main() -> ! {
         "linuxproc: demand paging OK - 64 file pages mapped, exactly {filled} filled \
          by fault (an eager mmap read all 64), pages 0/37/63 carry their own file \
          bytes so the offset arithmetic holds at the top of the mapping, 100 rereads \
-         of a filled page cost nothing, and the mapping outlived close(fd) then \
-         returned its handle"
+         of a filled page cost nothing, a page still fills from the file after a \
+         forked sharer exited (the fork takes a backing-store reference and the exit \
+         gives it back), and the mapping outlived close(fd) then returned its handle"
     );
 
     // The pre-fault path's cost, measured rather than assumed (docs/ENGINEERING.md 1).

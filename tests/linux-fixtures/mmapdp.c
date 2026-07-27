@@ -122,7 +122,27 @@ int main(void) {
   }
   puts("dp: writing a filled read-only page is SIGSEGV, not a refill");
 
-  /* 6. And the W->X-style flip a caller is entitled to still works. */
+  /* 6. The mapping must still work now that a process sharing it has exited.
+   *
+   *    `fork` duplicates the mapping records, and the kernel counts references to
+   *    the file behind them. If the fork did not add a reference for the child, the
+   *    child's exit gives back one the child never took, the count reaches zero, the
+   *    file is closed - and the loser is THIS process, which did nothing wrong. The
+   *    damage shows up only on the next page it has not touched yet, so read one:
+   *    page 20, untouched by every phase above.
+   *
+   *    A closed backing store does not fault; it fills the page with zeros. So the
+   *    symptom of the bug is a plausible-looking read that returns 0x00, which is
+   *    why the file is filled with per-page bytes and this checks the byte. */
+  unsigned char after_child = m[20u * PAGE + 3];
+  if (after_child != page_byte(20)) {
+    printf("dp: page 20 reads %02x after a sharer exited, want %02x\n", after_child,
+           page_byte(20));
+    return 1;
+  }
+  puts("dp: a page still faults from the file after a forked sharer exited");
+
+  /* 7. And the W->X-style flip a caller is entitled to still works. */
   if (mprotect(m, PAGE, PROT_READ | PROT_WRITE) != 0) {
     puts("dp: mprotect to RW failed");
     return 1;

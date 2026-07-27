@@ -188,7 +188,14 @@ pub(crate) fn dup_state(from: usize, to: usize) {
         let base = addr_of_mut!(LINUX_STATE) as *mut LinuxState;
         core::ptr::copy_nonoverlapping(base.add(from), base.add(to), 1);
     }
+    // Every refcounted thing the fork now shares needs a reference added here, because
+    // the copy above is a raw `copy_nonoverlapping` that touches no counter. Pipes were
+    // always handled; the **backing stores** behind file mappings were not, and the
+    // consequence lands on the *parent*: the child's records named entries it held no
+    // reference to, the child's exit released one per record and drove the count to zero,
+    // and the parent then faulted against a freed entry and got a zero page.
     state(to).fds.inherit_pipe_ends();
+    state(to).vmas.inherit_files();
 }
 
 /// Reset cell `cell`'s memory bookkeeping for a fresh `execve` image

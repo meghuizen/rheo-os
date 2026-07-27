@@ -107,26 +107,6 @@ impl VmaList {
         self.v = [Vma::EMPTY; MAX_VMAS];
     }
 
-    /// Copy `other`'s records - the `fork` step. A forked child's address space
-    /// is a copy of the parent's, so its map of that space must be too.
-    /// Copy `other`'s records - the `fork` step. A forked child's address space
-    /// is a copy of the parent's, so its map of that space must be too.
-    ///
-    /// Each copied file-backed record takes its **own** reference rather than
-    /// re-opening the path: a re-open can fail, and a `fork` that half-succeeds is
-    /// worse than one that does not.
-    pub fn copy_from(&mut self, other: &VmaList) {
-        self.clear();
-        self.v = other.v;
-        for m in self.v.iter() {
-            if m.len != 0
-                && let Some(h) = m.file
-            {
-                filemap::addref(h);
-            }
-        }
-    }
-
     fn live(&self) -> impl Iterator<Item = &Vma> {
         self.v.iter().filter(|m| m.len != 0)
     }
@@ -146,6 +126,32 @@ impl VmaList {
         let h = m.file?;
         let page = addr & !(FRAME_SIZE - 1);
         Some((h, m.file_off + (page - m.base) as u64))
+    }
+
+    /// Add a backing-store reference for every live file-backed record - the **`fork`**
+    /// step, and the exact twin of `fd::inherit_pipe_ends`.
+    ///
+    /// `linux::dup_state` copies a whole `LinuxState` with one raw
+    /// `copy_nonoverlapping`, which duplicates these records while touching no
+    /// refcount, so the addref cannot live inside a per-list copy helper - there is no
+    /// per-list copy. (One used to exist here and nothing called it: two ways to
+    /// inherit a VMA list, only one of them reachable. It is gone.)
+    ///
+    /// Without this call the child's records name entries it holds no reference to, the
+    /// child's exit releases one per record and drives the count to zero, and the
+    /// **parent** then faults against a freed entry and gets a zero page - in the
+    /// process that did nothing wrong, long after the fork.
+    ///
+    /// Every refcounted thing a fork shares needs a reference added here; the calls are
+    /// kept adjacent in `dup_state` so that reads as a list rather than a habit.
+    pub fn inherit_files(&self) {
+        for m in self.v.iter() {
+            if m.len != 0
+                && let Some(h) = m.file
+            {
+                filemap::addref(h);
+            }
+        }
     }
 
     /// Live record count (for tests and diagnostics).

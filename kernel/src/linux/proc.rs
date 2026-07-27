@@ -568,6 +568,13 @@ fn process_exit(cell: usize, status: u32, top_code: u64) -> Ctl {
     // SAFETY: `cell`'s address space pointer is valid; it is torn down here and
     // never reactivated.
     unsafe { (*user::cell_aspace(cell)).free_user_frames() };
+    // Its *records* are resources too: a file-backed mapping holds a reference to a
+    // `filemap` backing store, and dropping the frames without dropping the records
+    // leaks that reference until the slot happens to be reused - and `dup_state`
+    // overwrites a reused slot wholesale, so "happens to be reused" never releases it
+    // at all. Clearing here is what makes the reference lifetime symmetric with
+    // `vmas.inherit_files()` in `dup_state`: taken at fork, given back at exit.
+    super::state(cell).vmas.clear();
     procs()[cell].state = PState::Zombie;
     procs()[cell].wstatus = status;
     procs()[cell].block = Block::None;
