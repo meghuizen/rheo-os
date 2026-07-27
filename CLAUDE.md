@@ -373,9 +373,10 @@ straight off ext4 - the shape a shell launching Claude Code needs. This closes
 "unmodified Linux binaries run" for the common dynamic case; the whole
 **L0-L7 Linux personality is complete** - unpatched static and dynamic glibc C,
 unpatched Rust `std`, and the real upstream uutils/coreutils all run as cells,
-kernel-resident like `svc.rs` and adding no kernel object (raising
-`MAX_MAPPED_FILES` for a binary that maps > 8 files, and a dynamic
-Rust/uutils-0.9.x fixture, are the documented next steps).
+kernel-resident like `svc.rs` and adding no kernel object (`MAX_MAPPED_FILES` is
+now **64**, headroom for a production binary's dozen-plus shared libraries; a
+dynamic Rust std / uutils-0.9.x fixture exercising many libs is the documented
+next proof).
 **L8 has begun** (docs/LINUX-COMPAT.md L8, docs/NETSTACK.md rheo-net Phase N1d):
 **AF_UNIX (Unix domain) sockets** - `socket`/`socketpair`/`bind`/`listen`/
 `accept`/`connect`/`sendmsg`/`recvmsg` on SOCK_STREAM, sockets as per-cell fds

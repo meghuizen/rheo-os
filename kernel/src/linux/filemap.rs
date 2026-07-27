@@ -33,9 +33,16 @@
 use core::ptr::addr_of_mut;
 
 /// Distinct files that may be mapped at once, across all cells. A dynamically
-/// linked program maps its own image plus `ld.so` plus `libc.so.6`; 8 leaves room
-/// and keeps the kernel allocation-free.
-pub const MAX_MAPPED_FILES: usize = 8;
+/// linked program maps its own image plus `ld.so` plus every shared library it
+/// pulls in - a C or Rust hello is 3-4 (image + ld.so + libc + libgcc_s), but a
+/// **production** binary links a dozen or more (libstdc++, libm, libpthread,
+/// libdl, libssl, ...), which is the shape the real target (an unmodified
+/// dynamically-linked application) needs. 64 is headroom for that, still a small
+/// fixed static array (the kernel stays allocation-free). A program mapping more
+/// than this gets a clean `mmap` refusal, never a wrong mapping. This is a
+/// limit-raise, not a design change (docs/LINUX-COMPAT.md), like the frame-pool
+/// and object-table raises before it.
+pub const MAX_MAPPED_FILES: usize = 64;
 
 /// Where a mapping's bytes come from.
 ///

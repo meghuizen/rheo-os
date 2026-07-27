@@ -637,9 +637,9 @@ so was its claim of 182 MiB of `.bss`, which measurement shows does not exist.
    program, its `ld.so` interpreter and `libc.so.6` all stream off the disk on demand
    through the 8 KiB block cache (447-590 cache fills, exact stdout + exit 12), none
    resident whole. That is a dynamically-linked glibc binary running unmodified,
-   `execve`d straight off ext4 - the shape a shell launching Claude Code needs. Still
-   named: the `MAX_MAPPED_FILES` 8 ceiling sits right at main + `ld.so` + 5 libs (raise
-   when a real binary needs more). Cost,
+   `execve`d straight off ext4 - the shape a shell launching Claude Code needs.
+   `MAX_MAPPED_FILES` was raised 8 -> 64 (a documented limit-raise), headroom for a
+   production binary's dozen-plus shared libraries. Cost,
    measured not assumed: a `read_at` for a 2-4 byte field is one LRU lookup, a miss is
    one `LINE/SECTOR`-sector device read, and a data read copies straight from the
    covering line. Composing the streamed mount with the demand-paged loader is the next

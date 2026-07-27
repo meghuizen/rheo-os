@@ -660,8 +660,9 @@ fixup path.
     shell-launches-a-dynamic-binary-off-disk shape the real target needs.
   - Accommodations, disclosed: a dynamic **Rust** `std` hello is not built (it
     additionally needs `libgcc_s.so.1`/`libm.so.6` seeded); the C hello is the L7
-    proof. `MAX_MAPPED_FILES` (8) must be raised for a binary that maps more than a
-    handful of files. **MAP_SHARED of a file** stays unmodeled (ld.so uses
+    proof. `MAX_MAPPED_FILES` is now **64** (raised from 8), headroom for a
+    production binary's dozen-plus shared libraries - a documented limit-raise,
+    not a design change. **MAP_SHARED of a file** stays unmodeled (ld.so uses
     PRIVATE).
 
 - **L8 [done]** - **AF_UNIX (Unix domain) sockets** - the first slice of the
