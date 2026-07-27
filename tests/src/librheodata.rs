@@ -109,6 +109,7 @@ fn bf_fstat(fd: u64, statbuf_va: u64) -> i64 {
     let st = Stat {
         size: unsafe { BLOB_SIZE } as u64,
         kind: 0,
+        ino: 1,
     };
     unsafe {
         (statbuf_va as *mut Stat).write(st);

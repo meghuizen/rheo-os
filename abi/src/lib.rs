@@ -853,9 +853,18 @@ const _: () = assert!(core::mem::size_of::<GraphNode>() == 32);
 /// targets/std-rheo/fs.rs, which is outside this workspace and so cannot depend
 /// on this crate - the one remaining hand-kept copy, named here on purpose).
 /// `kind`: 0 regular, 1 dir, 2 symlink, 3 other.
+///
+/// `ino` is the filesystem's inode number (the VFS `NodeId`), distinct per file.
+/// It is load-bearing, not decorative: glibc's `ld.so` dedups shared libraries by
+/// `(st_dev, st_ino)`, so two different libraries reporting the same inode make the
+/// loader treat the second as already-loaded and never map it - which broke every
+/// multi-library dynamic binary until this field carried a real value
+/// (docs/LINUX-COMPAT.md, docs/ENGINEERING.md 11).
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct Stat {
     pub size: u64,
     pub kind: u64,
+    pub ino: u64,
 }
+const _: () = assert!(core::mem::size_of::<Stat>() == 24);

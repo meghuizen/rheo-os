@@ -167,8 +167,10 @@ impl File {
 
     /// `fstat`: returns the file size in bytes.
     pub async fn size(&self) -> Result<u64, u32> {
-        // The kernel writes a `Stat { size u64, kind u64 }` at the buffer VA.
-        let mut st = [0u64; 2];
+        // The kernel writes an `abi::Stat { size u64, kind u64, ino u64 }` at the
+        // buffer VA (24 bytes) - the buffer must hold all three or the kernel's
+        // validated write overruns it.
+        let mut st = [0u64; 3];
         let mut a = [0u8; 24];
         put_u64(&mut a, 0, st.as_mut_ptr() as u64);
         put_u32(&mut a, 8, self.fd);

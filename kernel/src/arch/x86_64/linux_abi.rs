@@ -88,7 +88,12 @@ pub mod nr {
     pub const GETDENTS64: u64 = 217;
     pub const SET_TID_ADDRESS: u64 = 218;
     pub const CLOCK_GETTIME: u64 = 228;
+    pub const CLOCK_GETRES: u64 = 229;
     pub const CLOCK_NANOSLEEP: u64 = 230;
+    /// time(tloc) - the legacy whole-second wall clock. x86-64 keeps this number;
+    /// the asm-generic tables dropped it (glibc uses clock_gettime there). V8/libuv
+    /// call it, so refusing it stalls Node (docs/LINUX-COMPAT.md).
+    pub const TIME: u64 = 201;
     pub const EXIT_GROUP: u64 = 231;
     pub const TGKILL: u64 = 234;
     pub const OPENAT: u64 = 257;
@@ -110,6 +115,13 @@ pub mod nr {
     pub const STATX: u64 = 332;
     pub const RSEQ: u64 = 334;
     pub const CLONE3: u64 = 435;
+    /// io_uring - the async-IO submission mechanism (numbers shared with the
+    /// asm-generic table, added after the split). rheo-net's async path is the
+    /// queue-pair reactor, not io_uring; refused ENOSYS so libuv falls back to
+    /// epoll+threadpool (docs/LINUX-COMPAT.md). Node/libuv probes `setup` first.
+    pub const IO_URING_SETUP: u64 = 425;
+    pub const IO_URING_ENTER: u64 = 426;
+    pub const IO_URING_REGISTER: u64 = 427;
     pub const FACCESSAT2: u64 = 439;
 
     // Measured from the real Claude Code startup trace
@@ -120,12 +132,26 @@ pub mod nr {
     /// (docs/ENGINEERING.md 11).
     pub const OPEN: u64 = 2;
     pub const SYSINFO: u64 = 99;
+    /// gettimeofday(tv, tz) - the legacy wall-clock read. libuv's
+    /// `uv_gettimeofday` calls it directly (not `clock_gettime`) and *asserts* it
+    /// returns 0, so an unimplemented number aborts Node at startup
+    /// (docs/LINUX-COMPAT.md). x86-64 legacy number.
+    pub const GETTIMEOFDAY: u64 = 96;
     pub const SCHED_SETSCHEDULER: u64 = 144;
     pub const SCHED_GETSCHEDULER: u64 = 145;
     pub const SCHED_GET_PRIORITY_MAX: u64 = 146;
     pub const SCHED_GET_PRIORITY_MIN: u64 = 147;
     pub const EVENTFD2: u64 = 290;
     pub const CLOSE_RANGE: u64 = 436;
+
+    // capget: a non-root process's capability query (docs/LINUX-COMPAT.md). Node
+    // probes it at startup. x86-64 legacy number.
+    pub const CAPGET: u64 = 125;
+
+    // timerfd (docs/LINUX-COMPAT.md L8-TIMERFD). x86-64 legacy numbers.
+    pub const TIMERFD_CREATE: u64 = 283;
+    pub const TIMERFD_SETTIME: u64 = 286;
+    pub const TIMERFD_GETTIME: u64 = 287;
 
     // epoll (docs/LINUX-COMPAT.md L8-INET). x86-64 legacy numbers.
     pub const EPOLL_CREATE: u64 = 213;

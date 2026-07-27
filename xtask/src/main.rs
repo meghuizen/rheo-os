@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 59] = [
+const TEST_KERNELS: [&str; 61] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -53,6 +53,8 @@ const TEST_KERNELS: [&str; 59] = [
     "linuxsig",
     "linuxproc",
     "linuxdyn",
+    "linuxnode",
+    "linuxbun",
     "librheoproc",
     "librheonet",
     "netwait",
@@ -130,6 +132,32 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
         ("linuxdyn", Arch::X86_64) => &[
             "-drive",
             "file=tests/linux-fixtures/build/x86_64/dyn-disk.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-pci,drive=blk0,disable-legacy=on",
+        ],
+        // linuxnode (GOAL-NODE): the real x86-64 `node` binary + its glibc/libstdc++
+        // shared-library set on a live virtio-blk disk, streamed + `execve`d off ext4
+        // (the linuxdyn disk path at production scale, ~124 MB). x86-64 only - there
+        // is no arm64/riscv64 node build here, so those ISAs get no drive, and the
+        // test skips-with-reason (`virtio_blk::probe()` returns None). The image is
+        // built by `build_node_disk_fixture` (gitignored); a placeholder when
+        // /opt/node22 or mkfs.ext4 is absent makes the test skip on x86-64 too, so CI
+        // (no node binary) stays green.
+        ("linuxnode", Arch::X86_64) => &[
+            "-drive",
+            "file=tests/linux-fixtures/build/x86_64/node-disk.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-pci,drive=blk0,disable-legacy=on",
+        ],
+        // linuxbun (GOAL-BUN): the real x86-64 `bun` binary + its glibc set on a
+        // live virtio-blk disk, streamed + `execve`d off ext4 (the linuxnode shape,
+        // JavaScriptCore instead of V8). x86-64 only; arm/riscv get no drive and the
+        // test skips-with-reason. Image built by `build_bun_disk_fixture`
+        // (gitignored); a placeholder when /root/.bun is absent (CI) makes the test
+        // skip, so CI stays green.
+        ("linuxbun", Arch::X86_64) => &[
+            "-drive",
+            "file=tests/linux-fixtures/build/x86_64/bun-disk.img,if=none,id=blk0,format=raw",
             "-device",
             "virtio-blk-pci,drive=blk0,disable-legacy=on",
         ],
@@ -1089,6 +1117,37 @@ impl Arch {
         }
     }
 
+    /// The g++ that links a dynamic C++ binary for the four-library `dcpp` fixture.
+    /// If it is absent (no cross-g++ for an ISA), the C++ compile fails and the
+    /// fixture becomes a placeholder, so `linuxdyn`'s C++ phase skips-with-reason.
+    fn cxx(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "g++",
+            Arch::Aarch64 => "aarch64-linux-gnu-g++",
+            Arch::Riscv64 => "riscv64-linux-gnu-g++",
+        }
+    }
+
+    /// The toolchain C++ runtime libs `dcpp` links: `(libstdc++.so.6, libgcc_s.so.1)`.
+    /// Copied beside libc for the four-library dynamic fixture; a missing one makes
+    /// the C++ phase skip-with-reason for that ISA.
+    fn cpp_runtime_libs(self) -> (&'static str, &'static str) {
+        match self {
+            Arch::X86_64 => (
+                "/usr/lib/x86_64-linux-gnu/libstdc++.so.6",
+                "/lib/x86_64-linux-gnu/libgcc_s.so.1",
+            ),
+            Arch::Aarch64 => (
+                "/usr/aarch64-linux-gnu/lib/libstdc++.so.6",
+                "/usr/aarch64-linux-gnu/lib/libgcc_s.so.1",
+            ),
+            Arch::Riscv64 => (
+                "/usr/riscv64-linux-gnu/lib/libstdc++.so.6",
+                "/usr/riscv64-linux-gnu/lib/libgcc_s.so.1",
+            ),
+        }
+    }
+
     /// The toolchain runtime dynamic-linker + libc for the L7 dynamic fixture
     /// (docs/LINUX-COMPAT.md L7): `(ld.so source path, libc.so.6 source path)`.
     /// These live in the cross toolchain sysroots (host multiarch for x86-64)
@@ -1181,6 +1240,29 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         return false;
     }
 
+    // A real JavaScript engine (pure-Rust `boa`), same static-glibc recipe - the
+    // on-goal proxy for Node/Claude Code: a language runtime (parser + bytecode VM
+    // + heap + GC) run unmodified under the Linux personality (docs/LINUX-COMPAT.md,
+    // the `linuxjs` fixture in `linuxrun`). ~10 MB, so it also exercises the
+    // demand-paged loader at scale.
+    let mut js = Command::new("cargo");
+    js.args([
+        "build",
+        "--manifest-path",
+        "tests/linux-fixtures/jsdemo/Cargo.toml",
+        "--release",
+        "--target",
+        arch.linux_gnu_target(),
+    ]);
+    js.env("RUSTFLAGS", &rustflags);
+    if !matches!(js.status().map(|s| s.success()), Ok(true)) {
+        eprintln!(
+            "[xtask] boa JS-engine fixture build failed for {}",
+            arch.name()
+        );
+        return false;
+    }
+
     // C hello: gcc -static -no-pie, stock ET_EXEC base (no relink).
     let out_dir = format!("tests/linux-fixtures/build/{}", arch.name());
     if let Err(e) = std::fs::create_dir_all(&out_dir) {
@@ -1254,6 +1336,14 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         // A wait that can never end: the scheduler's deadlock diagnostic, the
         // second `linuxpoll` phase.
         ("polldead.c", "polldead", NO_EXTRA),
+        // timerfd - the libuv event-loop timer source (docs/LINUX-COMPAT.md
+        // L8-TIMERFD): a blocking read parks on the deadline, and epoll_wait wakes
+        // on expiry. The third `linuxpoll` phase.
+        ("timerx.c", "timerx", NO_EXTRA),
+        // The libuv event-loop core: one epoll set multiplexing a periodic timerfd,
+        // an eventfd, and a pipe at once - proving the three wake sources compose
+        // (docs/LINUX-COMPAT.md L8-TIMERFD). The fourth `linuxpoll` phase.
+        ("uvloop.c", "uvloop", NO_EXTRA),
         // The loader must size the stack from **PT_GNU_STACK**, not a fixed
         // constant (docs/ARCHITECTURE-DEBT.md 4.0, blocker 1). Linked with
         // `-z stacksize` so its own header asks for more than the old 8 MiB
@@ -1292,6 +1382,8 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         return false;
     }
     build_dyn_disk_fixture(arch, &out_dir);
+    build_node_disk_fixture(arch, &out_dir);
+    build_bun_disk_fixture(arch, &out_dir);
 
     build_coreutils_fixture(arch)
 }
@@ -1403,6 +1495,149 @@ fn build_dyn_disk_fixture(arch: Arch, out_dir: &str) {
     );
 }
 
+/// Build the `linuxnode` fixture (GOAL-NODE): the real x86-64 `node` binary
+/// (~124 MB) + its glibc + libstdc++ shared-library set on an ext4 image, streamed
+/// off a live virtio-blk disk by the `linuxnode` test. Thin caller of
+/// [`build_runtime_disk_fixture`].
+fn build_node_disk_fixture(arch: Arch, out_dir: &str) {
+    build_runtime_disk_fixture(
+        arch,
+        out_dir,
+        "linuxnode",
+        "node-disk.img",
+        "/opt/node22/bin/node",
+        "node",
+        &[
+            "libc.so.6",
+            "libm.so.6",
+            "libdl.so.2",
+            "libpthread.so.0",
+            "libstdc++.so.6",
+            "libgcc_s.so.1",
+        ],
+    );
+}
+
+/// Build the `linuxbun` fixture (GOAL-BUN): the real x86-64 `bun` binary (~99 MB,
+/// JavaScriptCore) + its glibc set on an ext4 image, streamed off a live
+/// virtio-blk disk by the `linuxbun` test. Thin caller of
+/// [`build_runtime_disk_fixture`] (bun needs no libstdc++/libgcc_s).
+fn build_bun_disk_fixture(arch: Arch, out_dir: &str) {
+    build_runtime_disk_fixture(
+        arch,
+        out_dir,
+        "linuxbun",
+        "bun-disk.img",
+        "/root/.bun/bin/bun",
+        "bun",
+        &["libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0"],
+    );
+}
+
+/// Build a **disk-streamed language-runtime** ext4 fixture (GOAL-NODE / GOAL-BUN,
+/// docs/LINUX-COMPAT.md): a real ext4 image holding a real x86-64 dynamic binary at
+/// `/bin/<dst>`, its `ld-linux-x86-64.so.2` at the PT_INTERP path, and its host
+/// glibc `.so` set under `/lib` - so the matching test mounts it off a live
+/// virtio-blk disk (`ext4fs`/`ext4plus` + the block cache) and `execve`s the binary
+/// straight from ext4, streamed demand-paged, none resident whole. The image is
+/// gitignored (a ~100 MB binary is never committed).
+///
+/// **x86-64 only.** The binaries are x86-64 ELFs; for arm64/riscv64 no image is
+/// written and no `-drive` is attached, so the test skips-with-reason. On x86-64,
+/// if the binary is absent (e.g. CI), any host glibc `.so` cannot be found, or
+/// `mkfs.ext4`/`debugfs` are missing, a small placeholder image is written so
+/// QEMU's `-drive` still has a file and the test detects a non-ext4 disk and skips
+/// - CI stays green. Never fails the build.
+fn build_runtime_disk_fixture(
+    arch: Arch,
+    out_dir: &str,
+    test: &str,
+    img_name: &str,
+    binary: &str,
+    dst: &str,
+    libs: &[&str],
+) {
+    if arch != Arch::X86_64 {
+        return; // x86-64 binaries only; no drive attached elsewhere, test skips
+    }
+    let img = format!("{out_dir}/{img_name}");
+    let placeholder = |img: &str| {
+        let _ = std::fs::write(img, vec![0u8; 64 * 1024]);
+    };
+
+    // The interpreter goes at its PT_INTERP path; the DT_NEEDED libraries under
+    // /lib, found via LD_LIBRARY_PATH=/lib:/lib64.
+    const INTERP_SRC: &str = "/lib64/ld-linux-x86-64.so.2";
+    const LIBDIR: &str = "/lib/x86_64-linux-gnu";
+
+    let exists = |p: &str| std::path::Path::new(p).exists();
+    if !exists(binary)
+        || !exists(INTERP_SRC)
+        || libs.iter().any(|l| !exists(&format!("{LIBDIR}/{l}")))
+    {
+        eprintln!(
+            "[xtask] SKIP {test} image for x86_64: {binary} or host glibc not present \
+             ({test} will skip - CI/other hosts unaffected)"
+        );
+        placeholder(&img);
+        return;
+    }
+    if !(have_tool("mkfs.ext4") && have_tool("debugfs")) {
+        eprintln!("[xtask] SKIP {test} image for x86_64: mkfs.ext4/debugfs not installed");
+        placeholder(&img);
+        return;
+    }
+
+    // A 200 MiB ext4 (same driver-parseable flags as the linuxdisk image, 1 KiB
+    // blocks) holds a ~124 MB binary + ~10 MB of libraries with slack.
+    let _ = std::fs::remove_file(&img);
+    let ok = matches!(
+        Command::new("dd")
+            .args([
+                "if=/dev/zero",
+                &format!("of={img}"),
+                "bs=1024",
+                "count=204800"
+            ])
+            .output()
+            .map(|o| o.status.success()),
+        Ok(true)
+    ) && matches!(
+        Command::new("mkfs.ext4")
+            .args([
+                "-q",
+                "-b",
+                "1024",
+                "-O",
+                "^has_journal,^metadata_csum,^64bit,^resize_inode,^dir_index,extent",
+                "-F",
+                &img,
+            ])
+            .output()
+            .map(|o| o.status.success()),
+        Ok(true)
+    );
+    if !ok {
+        placeholder(&img);
+        return;
+    }
+
+    let debugfs = |cmd: &str| {
+        let _ = Command::new("debugfs")
+            .args(["-w", "-R", cmd, &img])
+            .output();
+    };
+    debugfs("mkdir /bin");
+    debugfs("mkdir /lib");
+    debugfs("mkdir /lib64");
+    debugfs(&format!("write {binary} bin/{dst}"));
+    debugfs(&format!("write {INTERP_SRC} lib64/ld-linux-x86-64.so.2"));
+    for l in libs {
+        debugfs(&format!("write {LIBDIR}/{l} lib/{l}"));
+    }
+    println!("[xtask] built {test} ext4 image for x86_64 ({img}; real {dst} + glibc set)");
+}
+
 /// Build the L7 **dynamically-linked** glibc fixture (docs/LINUX-COMPAT.md L7):
 /// a stock ET_DYN/PIE C hello (no `-static`/`-no-pie`) plus the toolchain's real
 /// `ld-linux` + `libc.so.6`, copied into the gitignored build dir so the
@@ -1425,10 +1660,77 @@ fn build_dyn_fixture(arch: Arch, cc: &str, out_dir: &str) -> bool {
         return false;
     }
 
-    // Copy the real ld.so + libc.so.6 out of the toolchain, or skip-with-reason.
+    // A second dynamic PIE that links a SECOND shared library (libm) besides
+    // libc, so `ld.so` must load two libraries and resolve versions across them
+    // (the multi-library case, GOAL-DYN-MULTILIB). `-fno-builtin` forces a real
+    // libm call rather than a compile-time constant fold. A build failure here is
+    // not fatal: a placeholder makes `linuxdyn` skip only the multi-library phase.
+    let dmath_dst = format!("{out_dir}/dmath");
+    let mut cm = Command::new(cc);
+    cm.args([
+        "tests/linux-fixtures/dmath.c",
+        "-fno-builtin",
+        "-o",
+        &dmath_dst,
+        "-lm",
+    ]);
+    if !matches!(cm.status().map(|s| s.success()), Ok(true)) {
+        eprintln!(
+            "[xtask] dmath (multi-library) fixture build failed for {}; \
+             linuxdyn skips the multi-library phase",
+            arch.name()
+        );
+        let _ = std::fs::write(&dmath_dst, [0u8]);
+    }
+
+    // A third dynamic PIE - a C++ hello linking libstdc++ + libgcc_s + libc
+    // (+ libm) - the four-library production shape. Built with g++; a failure
+    // (e.g. no cross-g++ for this ISA) writes a placeholder so `linuxdyn` skips
+    // only the C++ phase.
+    let dcpp_dst = format!("{out_dir}/dcpp");
+    let mut cpp = Command::new(arch.cxx());
+    cpp.args(["tests/linux-fixtures/dcpp.cpp", "-O2", "-o", &dcpp_dst]);
+    let dcpp_ok = matches!(cpp.status().map(|s| s.success()), Ok(true));
+    if !dcpp_ok {
+        eprintln!(
+            "[xtask] dcpp (C++ four-library) fixture build failed for {} \
+             (no {}?); linuxdyn skips the C++ phase",
+            arch.name(),
+            arch.cxx()
+        );
+        let _ = std::fs::write(&dcpp_dst, [0u8]);
+    }
+    // Copy libstdc++ + libgcc_s beside libc, or placeholder → C++ phase skips.
+    let (libstdcpp_src, libgcc_src) = arch.cpp_runtime_libs();
+    let libstdcpp_dst = format!("{out_dir}/libstdc++.so.6");
+    let libgcc_dst = format!("{out_dir}/libgcc_s.so.1");
+    if dcpp_ok
+        && std::fs::copy(libstdcpp_src, &libstdcpp_dst).is_ok()
+        && std::fs::copy(libgcc_src, &libgcc_dst).is_ok()
+    {
+        println!(
+            "[xtask] copied C++ runtime ({libstdcpp_src}, {libgcc_src}) for {}",
+            arch.name()
+        );
+    } else {
+        if dcpp_ok {
+            eprintln!(
+                "[xtask] C++ runtime libs not found ({libstdcpp_src}); linuxdyn \
+                 skips the C++ phase for {}",
+                arch.name()
+            );
+        }
+        let _ = std::fs::write(&libstdcpp_dst, [0u8]);
+        let _ = std::fs::write(&libgcc_dst, [0u8]);
+    }
+
+    // Copy the real ld.so + libc.so.6 + libm.so.6 out of the toolchain, or
+    // skip-with-reason. libm lives beside libc in the same sysroot lib dir.
     let (ld_src, libc_src) = arch.dyn_runtime_libs();
+    let libm_src = libc_src.replace("libc.so.6", "libm.so.6");
     let ld_dst = format!("{out_dir}/ld.so");
     let libc_dst = format!("{out_dir}/libc.so.6");
+    let libm_dst = format!("{out_dir}/libm.so.6");
     let copied =
         std::fs::copy(ld_src, &ld_dst).is_ok() && std::fs::copy(libc_src, &libc_dst).is_ok();
     if copied {
@@ -1436,6 +1738,16 @@ fn build_dyn_fixture(arch: Arch, cc: &str, out_dir: &str) -> bool {
             "[xtask] copied dynamic runtime ({ld_src}, {libc_src}) for {}",
             arch.name()
         );
+        if std::fs::copy(&libm_src, &libm_dst).is_ok() {
+            println!("[xtask] copied {libm_src} for {}", arch.name());
+        } else {
+            eprintln!(
+                "[xtask] libm.so.6 not found ({libm_src}); linuxdyn skips the \
+                 multi-library phase for {}",
+                arch.name()
+            );
+            let _ = std::fs::write(&libm_dst, [0u8]);
+        }
     } else {
         eprintln!(
             "[xtask] SKIP dynamic fixture for {}: runtime ld.so/libc not found \
@@ -1445,6 +1757,7 @@ fn build_dyn_fixture(arch: Arch, cc: &str, out_dir: &str) -> bool {
         // 1-byte placeholders so the test still compiles + detects the skip.
         let _ = std::fs::write(&ld_dst, [0u8]);
         let _ = std::fs::write(&libc_dst, [0u8]);
+        let _ = std::fs::write(&libm_dst, [0u8]);
     }
     true
 }

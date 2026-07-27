@@ -80,6 +80,9 @@ fn path_bytes(path: &Path) -> &[u8] {
 struct RawStat {
     size: u64,
     kind: u64,
+    // The inode (VFS NodeId). Unused by this facade today, but the kernel writes
+    // it, so the buffer must hold it or the validated write overruns RawStat.
+    ino: u64,
 }
 
 fn raw_stat_path(path: &Path) -> io::Result<RawStat> {

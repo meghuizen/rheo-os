@@ -134,6 +134,9 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 | getuid / geteuid / getgid / getegid | full | 1000 (no root, SECURITY-IDENTITY) |
 | uname | full | sysname "Linux", release "6.6.0-rheo", machine per ISA |
 | clock_gettime | partial | MONOTONIC via `arch::ticks_to_ns`; REALTIME = fixed epoch + monotonic (unsynced, disclosed) |
+| gettimeofday | full | The legacy wall-clock read, same REALTIME domain as `clock_gettime`, reported as seconds + microseconds. `tz` (obsolete) ignored; a NULL `tv` is a no-op success. **libuv calls this directly and *asserts* it returns 0** (`uv_gettimeofday` → `GetCurrentTimeInMicroseconds`), so an unimplemented number aborts Node at startup - it was the first gap the real `node` binary hit (docs/LINUX-COMPAT.md, the real-Node section) |
+| clock_getres | full | The clock's resolution. This OS's clock derives from the cycle counter (`arch::ticks_to_ns`), so it is nanosecond-granular: reports `{0 s, 1 ns}` for any `clk_id` (all clocks share the one source). A NULL `res` is success (a clock-existence probe). V8 reads it at init |
+| time (x86-64) | full | The legacy whole-second wall clock, same REALTIME domain. Returns the seconds; writes `*tloc` too if non-NULL. x86-64 only - asm-generic glibc uses `clock_gettime` (an unreachable sentinel on those tables). V8/libuv call it |
 | clock_nanosleep / nanosleep | full for the blocking case | **A real sleep** (docs/ARCHITECTURE-DEBT.md 2.4); it used to return 0 immediately. The deadline is computed and compared in the **cell's own clock domain** (`cell_clock_ns` - the domain the program's own `clock_gettime` reports), parked on as a `proc::Block::Timer`, so a sibling process runs while one sleeps. `clock_nanosleep`'s `TIMER_ABSTIME` is honoured; a deadline already in the past returns 0 at once. `rem` is **never written**, because no signal is delivered to a parked process, so the sleep cannot be interrupted - stated rather than implied. Note that glibc routes `nanosleep` through `clock_nanosleep` on every ISA here, so the latter is the number that matters (fixing only the former would be invisible - observed) |
 | getrandom | full | fills from the cell's DRBG; flags ignored (never blocks) |
 | sched_yield | full | switches to the next ready context of this cell (L4); with no ready sibling it crosses to the next runnable **process** (`proc::yield_cell`, the `SYS_YIELD` hand-off), so a yield is a real preemption point and not a no-op. Returns 0. Only when the caller is the sole runnable process is it picked again |
@@ -151,12 +154,16 @@ Everything not listed logs `linux: ENOSYS nr=<n>` and returns -ENOSYS.
 | tgkill / tkill / rt_sigqueueinfo | partial | self-targeting only (own pid 1000 / own tids): `raise`/`abort` paths. A signal to a *non-running* sibling **context** is recorded pending, not force-delivered - no fixture needs it. Non-self tgid `-ESRCH` |
 | rt_sigtimedwait | partial | never blocks; returns -EAGAIN so callers loop/bail rather than hang (no fixture waits in it) (L5) |
 | mremap | full | shrink unmaps the tail in place; grow requires MREMAP_MAYMOVE (map a fresh region, copy, free the old); else -ENOMEM. glibc's large-block `realloc` needs it (the malloc-copy-free fallback otherwise leaks frames) |
-| rseq / clone3 | ENOSYS | glibc has documented fallbacks (rseq→unregistered, clone3→clone); verified via the ENOSYS logger that glibc/rust fall back to `clone`, so clone3 stays ENOSYS. Both are now **dispatched** to that refusal rather than falling through the unknown-number path, so the log no longer says `ENOSYS nr=435` as if the number were unrecognised (docs/ARCHITECTURE-DEBT.md 4.0) |
+| clone3 | full | Decodes `struct clone_args` (>= `CLONE_ARGS_SIZE_VER0` = 64 bytes) and routes to the **same** thread/process path as legacy `clone` - the one shape difference being that `stack`+`stack_size` name the base and length, so the child SP is `stack + stack_size`. `size` is checked before the pointer is dereferenced (size 0 -> EINVAL), then each field reads through `uaccess` (EFAULT if unreadable), matching Linux. glibc's `pthread_create` falls back to `clone` on ENOSYS, but a runtime that issues `clone3` **directly** with no fallback (Bun's JavaScriptCore/Zig threading) gets a hard thread-spawn failure from ENOSYS - which is why this is now implemented rather than refused (GOAL-BUN) |
+| rseq | ENOSYS | glibc's fallback is "no restartable sequences", so ENOSYS is the correct answer and a success would mislead. **Dispatched** to the refusal rather than falling through the unknown-number path, so the log no longer says `ENOSYS nr=<n>` as if the number were unrecognised (docs/ARCHITECTURE-DEBT.md 4.0) |
+| io_uring_setup / _enter / _register | ENOSYS, deliberately | The async-IO submission mechanism. This OS's async path is the queue-pair reactor, not io_uring, so refusing it is a design statement, not a gap. Node 22's libuv probes `io_uring_setup` at startup and falls back to epoll+threadpool on ENOSYS (observed in the real `node` trace: `io_uring_setup` then epoll_create1/epoll_ctl/epoll_pwait). **Dispatched** to the refusal rather than falling through the unknown-number path, the clone3/rseq class. Numbers 425/426/427 are shared across the x86-64 and asm-generic tables (added after the split) |
 | open (x86-64 legacy) | full | Routed to `openat` with `AT_FDCWD` - the same call. It had been missing, and glibc issues `open` in preference to `openat` on x86-64, so every `open` was refused on **that ISA and nowhere else** (docs/ENGINEERING.md 11, the two-numbers hazard). An unreachable sentinel on the asm-generic tables |
 | eventfd2 | full for the wakeup contract | A 64-bit counter as a per-cell fd over a per-personality registry (`linux::eventfd`), **no kernel object** - the counter lives in the registry, not the descriptor, so `dup`/`fork` share it. Write adds (refusing `u64::MAX` and refusing to overflow), read drains, `EFD_SEMAPHORE` yields 1 and decrements, a zero counter is **not** readable (so poll/epoll report it unready and a blocking read parks under the pipe's runnable-peer rule), sub-8-byte transfers are `-EINVAL`, an unknown flag bit is `-EINVAL` rather than dropped. Scope: a **sibling context** writing it does not wake a context parked on it, which is the L4 cell-level block limitation, not an eventfd one |
+| timerfd_create / settime / gettime | full for the event-loop use | A timer as a per-cell fd over a per-personality registry (`linux::timerfd`), **no kernel object** - the armed deadline is an ordinary cell-clock wait, the same kind `nanosleep` parks on. One-shot and periodic; `TFD_TIMER_ABSTIME`, `CLOCK_MONOTONIC`/`CLOCK_REALTIME`; an all-zero `it_value` disarms. `read` returns the expiration count and consumes it (a periodic timer advances to its next future expiry); a blocking read on a not-yet-expired timer **parks on the deadline** (the scheduler idles on the timer, no runnable-peer needed, unlike an eventfd), a non-blocking one is `-EAGAIN`. `POLLIN` once expired, never `POLLOUT` - so an epoll loop wakes when the timer fires (the libuv timer source). `write` is `-EINVAL`. Scope: the cell-level block limit (L4) and no `TFD_TIMER_CANCEL_ON_SET` (the cell clock does not step) |
 | sysinfo | partial, honestly | `uptime` from the cell's own clock domain, `totalram`/`freeram` from the frame pool, `procs` from the live process count, `mem_unit` 1. `sharedram`/`bufferram`/`totalhigh`/`freehigh`/swap/`loads` are **0 because they are 0** - no page cache, no highmem, no swap, no load average is computed. Bun sizes its heap from these, so a placeholder would be worse than a refusal |
 | sched_setscheduler / getscheduler / get_priority_{max,min} | partial, honestly | One class exists: `SCHED_OTHER`, cooperative round-robin. Setting it at priority 0 succeeds *because it is already in force*; `SCHED_FIFO`/`RR`/`BATCH`/`IDLE` are refused `-EPERM` (the unprivileged-Linux errno every caller handles) rather than accepted and dropped - a real-time guarantee this scheduler cannot keep must not be reported as granted. `getscheduler` reports `SCHED_OTHER`; the priority range is 0..0 |
 | close_range | full | Closes every open descriptor in the inclusive range, skipping already-closed slots as Linux does. `CLOSE_RANGE_CLOEXEC` marks instead of closing; `CLOSE_RANGE_UNSHARE` is refused `-EINVAL` (this personality has no fd table shared separately from the address space) rather than ignored |
+| capget | full for the query, honestly empty | The identity-class answer for a non-root process (the same class as `getuid`/`getgid`): our synthesized identity is unprivileged (uid 1000, no capabilities), so every capability mask - effective/permitted/inheritable - is reported **0**, not a stub claiming capabilities the process does not have. The version-probe protocol is honoured: an unknown version writes the supported version (`_LINUX_CAPABILITY_VERSION_3`) back into the header and returns `-EINVAL`; a NULL data pointer is a probe that succeeds without filling; V1 fills one `cap_user_data_t`, V2/V3 fill two (64-bit caps). Node probes it nine times at startup - it was the only syscall the real `node --version` trace issued that the personality did not dispatch. `capset` is not offered (an unprivileged process cannot raise capabilities) |
 | fork / vfork | full | clone-cell-within-capability-bundle (docs/POSIX-PERSONALITY.md 2): a new `user` cell in the parent's bundle, the parent's committed pages **eager-copied** (COW deferred + documented), `LinuxState`/fd table/cwd/signal dispositions deep-copied, a child pid synthesized; child returns 0, parent returns the pid. Only the calling thread is duplicated (POSIX). Reached via `clone` without `CLONE_VM` on every ISA (glibc's `fork`), or the x86-64 `fork`/`vfork` numbers. Over the `MAX_CELLS` (16) cap → -EAGAIN. `vfork` is treated as `fork` (eager copy, no COW share - safe, just less lazy) (`kernel/src/linux/proc.rs`) |
 | execve | full | replaces the calling cell's image with one **streamed** from the VFS (`load::exec_elf_from_vfs`: only the ELF header + phdrs are buffered; each `PT_LOAD` segment is read page-by-page straight into its destination frame, so the kernel holds no whole-image buffer). Keeps the same cell/pid, cwd, and fd table **except descriptors marked FD_CLOEXEC, which are closed** (it used to keep every fd regardless); resets signal handlers to default and starts single-threaded. ET_EXEC + static-PIE ET_DYN, stock base |
 | wait4 / waitpid | full | the parent blocks cooperatively (switching to a runnable child) until a child exits, then reaps: WIFEXITED/WEXITSTATUS for a normal exit, WIFSIGNALED for a signal-killed child; frees the child cell + its frames. `pid > 0` waits for that child, `pid <= 0` for any; WNOHANG honored; -ECHILD with no children. SIGCHLD is not queued to a handler (the parent reaps directly; documented) |
@@ -191,7 +198,10 @@ Same windows as native loaded cells (docs/USERLAND.md): image at 4 GiB
 (`ET_EXEC` at its linked address; `ET_DYN` gets load bias 0x1_0000_0000),
 stack top at 8 GiB (a Linux cell's stack is sized from its own `PT_GNU_STACK`
 `p_memsz`, at least 8 MiB and at most 64 MiB - see below), anonymous mmap region at
-12 GiB, `brk` heap starting at the image end. The initial stack carries the
+**80..252 GiB** (raised from a 4 GiB window boxed below the queue region, so a
+`MAP_NORESERVE` reservation as large as JavaScriptCore's **128 GiB** Gigacage fits -
+demand-filled, costing frames only for the pages actually touched; GOAL-BUN), `brk`
+heap starting at the image end. The initial stack carries the
 System V block **plus the ELF auxiliary vector** (L1): AT_PHDR/PHENT/PHNUM,
 AT_PAGESZ, AT_BASE, AT_FLAGS, AT_ENTRY, AT_UID/EUID/GID/EGID, AT_SECURE,
 AT_RANDOM (16 DRBG bytes), AT_HWCAP, AT_CLKTCK, AT_PLATFORM, AT_EXECFN,
@@ -500,8 +510,12 @@ fixup path.
   - **Priority inheritance is a TODO**: futex wake is plain FIFO. CONCURRENCY.md
     mandates PI for RT-reservation mutexes; no reservation-holding threads exist
     in the suite, so this is deferred with a code TODO.
-  - **`clone3` stays ENOSYS**: verified via the logger that glibc/rust fall back
-    to `clone`.
+  - **`clone3` is implemented** (GOAL-BUN): it decodes `struct clone_args` and
+    routes to the same context-creation path as legacy `clone`. glibc's
+    `pthread_create` would fall back to `clone` on ENOSYS, but Bun's
+    JavaScriptCore/Zig threading issues `clone3` **directly** with no fallback, so
+    ENOSYS there is a hard thread-spawn failure. `rseq` stays ENOSYS (glibc's
+    fallback is "no restartable sequences").
   - **Futex timeouts are honored** (they were not at L4, which is what made
     `pthread_cond_timedwait` hang) - see the `futex` row in the status table for
     the clock domains and the deadline path. Proof: `condwait.c` in the
@@ -658,12 +672,37 @@ fixup path.
     `libc.so.6` all stream off the disk on demand (447-590 block-cache fills per
     ISA, exact stdout + exit 12, all three ISAs), none resident whole. That is the
     shell-launches-a-dynamic-binary-off-disk shape the real target needs.
-  - Accommodations, disclosed: a dynamic **Rust** `std` hello is not built (it
-    additionally needs `libgcc_s.so.1`/`libm.so.6` seeded); the C hello is the L7
-    proof. `MAX_MAPPED_FILES` is now **64** (raised from 8), headroom for a
-    production binary's dozen-plus shared libraries - a documented limit-raise,
-    not a design change. **MAP_SHARED of a file** stays unmodeled (ld.so uses
-    PRIVATE).
+  - **Multi-library resolution is done** (GOAL-DYN-MULTILIB, task #169). A binary
+    that links a **second** shared library (`dmath`: a C `sqrt` program, so `libc`
+    + `libm`) now runs - `linuxdyn`'s multi-library phase asserts `dmath: sqrt16=4`
+    + exit 4 on all three ISAs. The defect was **not** in ld.so or in version
+    resolution: it was the `stat`/`fstat` block reporting `st_ino = 1` and
+    `st_dev = 0` for **every** file, because the kernel↔VFS bridge (`abi::Stat`)
+    carried no inode - the VFS `NodeId` was dropped. glibc's `ld.so` dedups shared
+    objects by `(st_dev, st_ino)`, so after mapping `libm` it opened `libc`,
+    `fstat`'d it, saw the same `(0, 1)`, concluded "libc.so.6 is already loaded"
+    (as the libm map), never mapped real `libc`, and then failed
+    `version 'GLIBC_2.34' not found` searching `libm` for a `libc` version - which
+    is exactly why the error named `libm` while looking up a `libc`-provided
+    version. Single-library `dhello` never hit it: one file's inode is never
+    *compared* against another's. The fix plumbs the real `NodeId` from
+    `posix::Metadata` through a widened `abi::Stat.ino` into every Linux
+    `st_ino`/`stx_ino` (`fstat`/`newfstatat`/`statx`); `st_dev` stays constant, so
+    distinct inodes are sufficient for the dedup. Recorded as a scar in
+    docs/ENGINEERING.md 11 ("a field left constant is a field that lies").
+    `MAX_MAPPED_FILES` was raised to **64** alongside it, for the dozen-library
+    shape a production binary has. A **four-library** proof rides the same phase:
+    `dcpp` (a dynamic C++ hello) links **libstdc++ + libgcc_s + libc + libm** and
+    runs C++ runtime init (static constructors, iostream setup, exception-unwind
+    tables) - the production shape a real application has - printing
+    `dcpp: hello from dynamic C++ (23)` + exit 23 on x86_64 and aarch64
+    (riscv64 skips-with-reason: no cross-g++ in the build environment). No new
+    kernel gap surfaced: the inode fix plus the existing loader scale from two
+    libraries to a real four-library C++ binary unchanged.
+  - Accommodations, disclosed: a dynamic **Rust** `std` hello is additionally
+    skewed (rustc's bundled std targets a newer glibc than the cross sysroot), so
+    a version-consistent multi-lib fixture uses cross-gcc-built C. **MAP_SHARED of
+    a file** stays unmodeled (ld.so uses PRIVATE).
 
 - **L8 [done]** - **AF_UNIX (Unix domain) sockets** - the first slice of the
   socket surface (docs/NETSTACK.md rheo-net Phase N1d). Like every prior
@@ -918,6 +957,150 @@ fixup path.
   cell-level block limitation (task #27), not an eventfd-specific one. Within one
   context, and across processes, the semantics are exact.
 
+- **L8-TIMERFD [done]** - **`timerfd_create`/`settime`/`gettime`**, the timer
+  source of libuv, and thus of Node.js and much of the async/JS world
+  (GOAL-TIMERFD). An event loop arms a timerfd for its nearest deadline, adds it
+  to its epoll set, and `epoll_wait` returns when it fires; without timerfd a
+  program loses its timer wakeup, not merely a convenience.
+
+  **No kernel object**, the eventfd pattern exactly: a timerfd is a per-cell fd
+  (`fd::FdKind::TimerFd`) indexing a per-personality registry
+  (`kernel/src/linux/timerfd.rs`), and its expiry is an ordinary **cell-clock
+  deadline** - the same wait `nanosleep` (`proc::Block::Timer`) parks on and the
+  same the scheduler already halts for through the timer arbiter's `CellSleep`
+  slice. So timerfd composes the existing time machinery: it adds no new wake
+  source and does not touch the deadline arithmetic. The armed deadline lives in
+  the **registry**, not the descriptor, so `dup`/`fork` alias one timer (the
+  eventfd reasoning).
+
+  Blocking reuses the sleep machinery: `proc::Block::TimerFdRead`, judged by
+  `satisfiable` from kernel state (the registry + the cell clock), completed by
+  `complete_block` writing the expiration count, classified `idle::TIMER`. Unlike
+  an eventfd read, a blocking timerfd read needs **no runnable peer** - the wake
+  source is the clock, so a single-threaded program parks correctly and the
+  scheduler idles on the timer, exactly as `nanosleep` does. For epoll, the
+  timerfd's per-fd source is `idle::TIMER` and its readiness is "expired", so the
+  existing poll/epoll idle path (timer slices that re-check readiness) wakes the
+  loop with no change to that path.
+
+  A one-shot fires once; a periodic timer's `read` returns the elapsed count and
+  advances its deadline to the next future tick. `write` is `-EINVAL` (a timerfd
+  is not writable). Proven by the `timerx` fixture in `linuxpoll` on all three
+  ISAs: a blocking read parks on a 20 ms one-shot and returns exactly one
+  expiration, then epoll_wait wakes on a second one-shot, and the disarmed timer
+  reads zero.
+
+  *Scope (honest):* the L4 cell-level block limit (a sibling context does not
+  independently wait), and no `TFD_TIMER_CANCEL_ON_SET` - the cell clock does not
+  step, so there is nothing to cancel on.
+
+- **A real JavaScript engine runs [done]** (GOAL-JS). The `jsdemo` fixture is a
+  pure-Rust JavaScript engine - the **`boa_engine`** crate (crates.io, pinned in
+  `tests/linux-fixtures/jsdemo/Cargo.lock`) - built static-glibc for each ISA and
+  run unmodified under the Linux personality by `linuxrun`. It is the on-goal
+  proxy for Node.js/Claude Code: a complete language runtime (lexer, parser,
+  bytecode compiler, register VM, heap, garbage collector) exercising the L2-L8
+  syscall surface and the demand-paged loader at scale (~9.5 MB image, ~1580
+  demand-paged pages, ~18 frames committed at load). It evaluates real JavaScript
+  - a function, `Array.prototype.reduce`, an arrow-function closure, string
+  concatenation - and prints `js: rheo:42` (exit 0) on **all three ISAs**. This is
+  not V8 and not Node's libuv loop; it is a genuine JS interpreter executing on
+  the OS, the strongest evidence to date that the personality carries a real
+  language runtime, and the honest step short of Node itself (whose V8 + libuv +
+  ~100 MB binary is the remaining distance).
+
+- **The syscall surface for real Node is closed; the remaining distance is V8's
+  JIT, not the syscalls** (measured, not guessed). An `strace` of the real
+  `node` binary (v22, dynamic, 124 MB) evaluating JavaScript (`node -e
+  'console.log(40+2)'`) issues 49 distinct syscalls; every one is now dispatched
+  or **deliberately** refused. `node --version` (the loader + startup path)
+  issues only syscalls the personality already handled once `capget` landed - it
+  was the single call falling through the unknown-number log. Real JS execution
+  adds `io_uring_setup`/`_enter` (refused ENOSYS, libuv falls back to
+  epoll+threadpool - the trace shows exactly that fallback), `clone3` (refused,
+  glibc falls back to `clone`), and `epoll_pwait` (already dispatched, shares the
+  `epoll_wait` arm). **The one thing the personality's doctrine refuses is V8's
+  JIT code space**: the trace contains a single `mprotect(..., PROT_READ |
+  PROT_WRITE | PROT_EXEC)` - V8's writable-executable code region - which the W^X
+  invariant (docs/ARCHITECTURE.md 5, enforced structurally in
+  `kernel/src/linux/mem.rs`) refuses with `-EPERM`. Every other `PROT_EXEC`
+  mapping in the trace is a file-backed `PROT_READ|PROT_EXEC` shared-library
+  segment (legitimate W^X). So the honest path to Node on this OS is V8's
+  **`--jitless`** mode (the Ignition bytecode interpreter, no executable
+  allocation - the same interpreter shape `boa` already proves runs), *not*
+  relaxing W^X. The remaining engineering is mechanical, not doctrinal: stream
+  the ~124 MB binary + its shared-library set off a live ext4 disk (the
+  `linuxdyn` disk path, demand-paged) and confirm V8 initialises within the
+  QEMU-TCG boot budget. A W^X-clean JIT (write-then-flip RW→RX code space, or a
+  MAP_JIT-style dual mapping) is the follow-on that would let V8 optimise rather
+  than only interpret.
+
+- **The real Node.js binary runs unmodified on the OS and prints its answer**
+  (GOAL-NODE [done], task #174, the `linuxnode` test). The actual
+  `/opt/node22/bin/node` (v22, dynamic, 124 MB, shipping V8 + libuv) streams off a
+  live ext4 disk over virtio-blk-pci (`ext4fs`/`ext4plus` + the block cache,
+  ~15,000 block-cache fills - none of the binary or its libraries resident whole),
+  its `ld-linux-x86-64.so.2` links all **seven** shared libraries (glibc +
+  libstdc++ + libgcc_s), V8 initialises, libuv runs its event loop, it evaluates
+  `console.log("rheo:"+(40+2))`, prints exactly `rheo:42`, and **exits 0** - on
+  x86-64 (arm64/riscv64 have no node build and skip-with-reason). It runs
+  `--jitless` so V8's Ignition interpreter needs no writable-executable code page
+  (W^X, ARCHITECTURE.md 5, the one `mprotect(RWX)` V8 would issue is refused;
+  host-verified that `--jitless` avoids it). This is the production JavaScript
+  runtime Claude Code runs on, executing unmodified. Reaching it took two things,
+  both measured by running the real binary and seeing exactly where it stopped:
+  four legacy calls (`gettimeofday` - which libuv *asserts* on -, `clock_getres`,
+  `time`, and io_uring refused deliberately), and **per-context blocking** (below),
+  which was the real blocker - not a missing syscall.
+
+- **Per-context blocking** (docs/LINUX-COMPAT.md L4, the scheduler change that made
+  Node run). A cell holds up to 8 execution contexts (threads); before this, a
+  proc-level blocking syscall (`epoll_wait`/`poll`/`nanosleep`/pipe/eventfd/
+  console/`wait4`) parked the **whole cell**, freezing every sibling thread - fine
+  for a single-threaded program, fatal for an event loop: Node's main thread blocks
+  on `epoll_wait` for an eventfd a V8 worker must write, and parking the cell froze
+  the worker, so the scheduler reported a genuine `DEADLOCK`. Now the block
+  condition lives **per context** (`thread.rs` `pblock`, judged and completed by
+  `proc.rs`): when a context blocks, the scheduler runs a `Ready` **sibling**
+  context first, then a sibling that is **already satisfiable** (Node's teardown:
+  main writes the eventfd, then futex-waits for the worker parked on it - the
+  worker is resumed and `FUTEX_WAKE`s main), and only parks the whole cell (the
+  pre-existing cross-cell path) when every context is blocked with no sibling
+  runnable or satisfiable. A **single-context** cell has no sibling and falls
+  straight to that cross-cell park - byte-for-byte the old behaviour, which is why
+  the entire existing Linux suite (threads/futex/poll/signals/processes) stays
+  green. The futex path integrates with it: a futex WAIT with no `Ready` sibling
+  resumes a satisfiable proc-blocked sibling rather than spinning `EAGAIN`. Still
+  cooperative and single-CPU (a compute-bound thread starves siblings until timer
+  preemption, #27); one context per cell may block on `poll` at a time (the copied
+  `pollset` is per-cell - `epoll`, which Node uses, has no such limit).
+
+- **The real Bun binary loads and initialises to the concurrency frontier**
+  (GOAL-BUN, task #175, the `linuxbun` test - a **partial** pass). The actual
+  `/root/.bun/bin/bun` (v1.3, dynamic, 99 MB, JavaScriptCore + a Zig runtime)
+  streams off a live ext4 disk over virtio-blk-pci (~3,500 block-cache fills, none
+  resident whole), its `ld-linux` links the whole library set, and JSC initialises
+  **including its 128 GiB Gigacage** (a single `MAP_NORESERVE` reservation the
+  kernel now demand-fills - the mmap window was raised to 80..252 GiB for it, and a
+  failed eager commit no longer leaks a phantom VMA), spawns a worker thread via
+  **`clone3`** (now implemented), and sets up its libuv event loop. It runs
+  `BUN_JSC_useJIT=0` (host-verified to issue zero RWX mappings, the JSC equivalent
+  of `--jitless`). Then it `abort()`s (SIGABRT) **before evaluating** - and the
+  cause is measured, not guessed: **every one of its 205 syscalls came from the
+  main thread; the worker it spawned never got the CPU**. Our scheduler is
+  cooperative single-CPU (it switches to a sibling only when the current context
+  blocks), and Bun's main thread requires the worker to have made progress
+  *concurrently* before it ever blocks. That is the **preemptive-SMP frontier**
+  (task #132), not a missing syscall or a memory bug - the entire load path
+  (streaming, demand paging, 7-library dynamic linking, the 128 GiB Gigacage,
+  `clone3`, the event loop) works. The `linuxbun` harness accepts this specific,
+  tightly-bounded partial (exit 134 **and** empty output); when #132 lands, Bun
+  should print `rheo:42` and exit 0, and the strict branch takes over. x86-64 only
+  (no arm64/riscv64 bun build). Node completes fully because its thread coordination
+  happens to align with blocking points (per-context blocking above); Bun's does
+  not - the honest difference between "syscall-driven concurrency" and "requires
+  true parallelism".
+
 ## 6. Fixture build matrix (reproducibility)
 
 All Linux test binaries are built **from source** by xtask/CI - no binaries
@@ -960,13 +1143,20 @@ socketpair+fork + bind/listen/connect/accept over AF_UNIX) and `inet.c` (the
 `linuxinet` proof - TCP + UDP + epoll over 127.0.0.1 and TCP over ::1, the
 loopback AF_INET/AF_INET6 surface).
 
-The **L7 dynamic fixture** (`tests/linux-fixtures/dhello.c`, the `linuxdyn`
-proof) is the one binary built **dynamically** - stock ET_DYN/PIE, no
-`-static`/`-no-pie` (gcc's default) - so its `PT_INTERP` names the real
-`ld-linux`. Its runtime dependencies (the dynamic linker + `libc.so.6`) are
-**not built** but **copied from the cross toolchain** at build time by xtask
-`build_dyn_fixture` into the gitignored fixture build dir (never committed), and
-the `linuxdyn` test seeds them into a ramfs `/lib` so ld.so resolves them:
+The **L7 dynamic fixtures** (`tests/linux-fixtures/dhello.c` + `dmath.c`, the
+`linuxdyn` proof) are built **dynamically** - stock ET_DYN/PIE, no
+`-static`/`-no-pie` (gcc's default) - so their `PT_INTERP` names the real
+`ld-linux`. `dhello` links only `libc`; `dmath` (a `sqrt` program built
+`-fno-builtin -lm`) links `libm` **as well**, so ld.so must load two shared
+libraries and resolve one's versions against the other (the multi-library case,
+GOAL-DYN-MULTILIB); `dcpp` (a C++ hello built with g++) links **libstdc++ +
+libgcc_s + libc + libm** - four libraries plus C++ runtime init, the production
+shape. Their runtime dependencies (the dynamic linker + `libc.so.6` + `libm.so.6`
++ `libstdc++.so.6` + `libgcc_s.so.1`) are **not built** but **copied from the
+cross toolchain** at build time by xtask `build_dyn_fixture` into the gitignored
+fixture build dir (never committed), and the `linuxdyn` test seeds them into a
+ramfs `/lib` so ld.so resolves them. `dcpp` needs a cross-g++, absent for riscv64
+in this environment, so its phase skips-with-reason there:
 
 | ISA | dynamic C (gcc, PIE) | ld.so source (interp path) | libc.so.6 source |
 |---|---|---|---|
@@ -976,8 +1166,11 @@ the `linuxdyn` test seeds them into a ramfs `/lib` so ld.so resolves them:
 
 If a runtime `.so` is missing for an ISA, that ISA's dynamic fixture is
 **skipped-with-reason** (a 1-byte placeholder is written; `linuxdyn` detects it
-and skips), keeping the static L2-L6 coverage. All three toolchains are present
-in the build/CI environment here, so **all three ISAs genuinely pass**. Note:
+and skips), keeping the static L2-L6 coverage. `libm.so.6` (beside `libc.so.6`
+in the same sysroot lib dir) gates only the **multi-library** phase the same way:
+missing → that phase skips, single-library coverage stays. All three toolchains
+are present in the build/CI environment here, so **all three ISAs genuinely
+pass**. Note:
 `rsh` (below) is a purpose-built shell, not dash/busybox - a full shell
 cross-build for three ISAs was out of budget; `rsh` is honest about what it
 exercises (the L6 process

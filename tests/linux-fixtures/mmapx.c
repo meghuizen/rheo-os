@@ -1,13 +1,13 @@
 /* mmapx - the mmap region is bounded, and MAP_FIXED cannot replace the kernel's
  * own rings (docs/ARCHITECTURE-DEBT.md 4, blocker 2).
  *
- * `mmap` is a forward bump cursor with no accounting. It used to run without a
- * limit, so a long enough run of allocations walked out of the 12 GiB mmap region,
- * through the cell's queue-pair region at 16 GiB, its channel regions at 24 GiB,
- * and into the ELF interpreter at 64 GiB - where `ld.so` and `libc.so.6` live. A
- * program would be handed addresses aliasing its own dynamic linker, with no
- * error. Against a ~100 MB binary that is not a remote possibility: 4 GiB of
- * mappings is enough to reach the queue.
+ * `mmap` is placed by a first-fit search over the per-cell VMA list, bounded to a
+ * dedicated window (kernel/src/linux/mem.rs: 80..252 GiB, above every fixed region
+ * - the image, stack, queue-pair, channels and ELF interpreter all sit below it).
+ * The bound is what stops a long run of allocations from walking into the kernel's
+ * own rings or the dynamic linker and handing a program addresses that alias them.
+ * A request larger than the whole window is refused with ENOMEM rather than placed
+ * past the window's end.
  *
  * Both phases print one line from a fixed set so the transcript stays exact.
  */
@@ -18,10 +18,13 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-/* The region is 12..16 GiB, so one 8 GiB request cannot fit and the reservation
- * must be refused. PROT_NONE keeps it a bare reservation - no frames are touched,
- * so this tests the *placement* bound and not the frame budget. */
-#define TOO_BIG (8ULL * 1024 * 1024 * 1024)
+/* The window is 80..252 GiB (172 GiB), so one 200 GiB request cannot fit and the
+ * reservation must be refused. PROT_NONE keeps it a bare reservation - no frames
+ * are touched, so this tests the *placement* bound and not the frame budget.
+ * (A `MAP_NORESERVE` mapping that *does* fit the window is now demand-filled rather
+ * than eagerly committed - the JSC-Gigacage path, GOAL-BUN - which is why the size
+ * here must exceed the window, not merely the frame budget.) */
+#define TOO_BIG (200ULL * 1024 * 1024 * 1024)
 
 /* The cell's queue-pair region (kernel/src/load.rs USER_QUEUE_VA). A program has
  * no business mapping here; the point is that it is refused rather than allowed to

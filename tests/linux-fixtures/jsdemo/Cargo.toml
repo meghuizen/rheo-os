@@ -1,0 +1,20 @@
+# Standalone crate (its own workspace), built by xtask for a *-unknown-linux-gnu
+# target - a real JavaScript engine (pure-Rust `boa`) run under the Linux
+# personality, the on-goal proxy for Node/Claude Code (docs/LINUX-COMPAT.md).
+[workspace]
+
+[package]
+name = "jsdemo"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "jsdemo"
+path = "src/main.rs"
+
+[dependencies]
+boa_engine = { version = "0.20", default-features = false }
+
+[profile.release]
+panic = "abort"
+opt-level = 2

@@ -23,6 +23,8 @@
 #include <sys/eventfd.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 /* A path the harness seeds for this fixture, used only as something openable. */
@@ -211,23 +213,111 @@ int main(void) {
   close(c);
   puts("close_range: closed the range and nothing beyond it");
 
-  /* 7. clone3 and rseq are refused - deliberately, which is different from
-   *    falling through the unknown-number path. glibc's own fallbacks are `clone`
-   *    for clone3 and "no restartable sequences" for rseq, so ENOSYS is the
-   *    correct answer and a program that got a *success* would be misled.
+  /* 7. clone3 is now *implemented* (GOAL-BUN: Bun's JavaScriptCore issues clone3
+   *    directly, with no glibc clone fallback, so refusing it is a hard failure).
+   *    It decodes `struct clone_args` and routes to the same thread/process path as
+   *    legacy `clone`. Probed here with a null cl_args + size 0, which a working
+   *    clone3 rejects with EINVAL (a too-small struct) - NOT ENOSYS. So the honest
+   *    assertion flipped: EINVAL proves the number is known *and handled*, where
+   *    ENOSYS would now be the regression.
    *
-   *    Called raw: glibc has no wrapper for either. clone3 is passed a null
-   *    cl_args, which a working implementation would reject too - the point is
-   *    that the number is *known* and answered ENOSYS. */
-  if (syscall(SYS_clone3, NULL, 0ul) != -1 || errno != ENOSYS) {
-    puts("clone3: not refused with ENOSYS");
+   *    rseq stays refused ENOSYS deliberately - glibc's fallback is "no restartable
+   *    sequences", so ENOSYS is the correct answer and a success would mislead. */
+  if (syscall(SYS_clone3, NULL, 0ul) != -1 || errno != EINVAL) {
+    puts("clone3: not implemented (want EINVAL for a null cl_args)");
     return 1;
   }
   if (syscall(SYS_rseq, NULL, 0u, 0u, 0u) != -1 || errno != ENOSYS) {
     puts("rseq: not refused with ENOSYS");
     return 1;
   }
-  puts("clone3/rseq: refused ENOSYS deliberately");
+  puts("clone3: implemented (EINVAL on bad args); rseq: refused ENOSYS");
+
+  /* 8. capget - a non-root process's capability query (Node.js probes it nine
+   *    times at startup). The honest answer for our unprivileged identity (uid
+   *    1000, no caps) is empty capability sets, not a stub that claims caps the
+   *    process does not have. The kernel also answers the version-probe protocol:
+   *    an unknown version returns EINVAL with the supported version written back. */
+  {
+    struct {
+      uint32_t version;
+      int pid;
+    } hdr;
+    struct {
+      uint32_t eff, perm, inh;
+    } data[2];
+    hdr.version = 0x20080522; /* _LINUX_CAPABILITY_VERSION_3 */
+    hdr.pid = 0;
+    memset(data, 0xff, sizeof data);
+    if (syscall(SYS_capget, &hdr, data) != 0) {
+      puts("capget: v3 query failed");
+      return 1;
+    }
+    if (data[0].eff | data[0].perm | data[0].inh | data[1].eff | data[1].perm |
+        data[1].inh) {
+      puts("capget: non-empty capabilities");
+      return 1;
+    }
+    hdr.version = 0xdeadbeef;
+    if (syscall(SYS_capget, &hdr, (void *)0) != -1 || errno != EINVAL) {
+      puts("capget: unknown version not refused");
+      return 1;
+    }
+    if (hdr.version != 0x20080522) {
+      puts("capget: version probe not answered");
+      return 1;
+    }
+    puts("capget: empty caps, version probe answered");
+  }
+
+  /* 9. io_uring - refused ENOSYS deliberately, the clone3/rseq class. Node 22's
+   *    libuv probes io_uring_setup at startup and falls back to epoll+threadpool
+   *    when it is ENOSYS (observed in the real `node` trace); our async path is
+   *    the queue-pair reactor, not io_uring, so the refusal is a design
+   *    statement. The number is *known* and answered ENOSYS - not the
+   *    unknown-number log. (A real Linux would answer EINVAL for 0 entries; this
+   *    fixture only ever runs under the rheo-os personality.) */
+  if (syscall(SYS_io_uring_setup, 0u, (void *)0) != -1 || errno != ENOSYS) {
+    puts("io_uring: not refused with ENOSYS");
+    return 1;
+  }
+  puts("io_uring: refused ENOSYS deliberately");
+
+  /* 10. The legacy clock reads the real `node` binary calls at startup (V8 +
+   *     libuv): gettimeofday, clock_getres, and (x86-64 only) time. libuv's
+   *     uv_gettimeofday *asserts* gettimeofday returns 0, so a stub that refused
+   *     it aborted Node (docs/LINUX-COMPAT.md). Assert each returns success with a
+   *     plausible, monotone-consistent value - never the exact figure. */
+  {
+    struct timeval tv1 = {0, 0}, tv2 = {0, 0};
+    if (gettimeofday(&tv1, NULL) != 0 || tv1.tv_sec <= 0 || tv1.tv_usec < 0 ||
+        tv1.tv_usec >= 1000000) {
+      puts("gettimeofday: implausible");
+      return 1;
+    }
+    struct timespec res = {-1, -1};
+    if (clock_getres(CLOCK_MONOTONIC, &res) != 0 || res.tv_sec != 0 ||
+        res.tv_nsec <= 0) {
+      puts("clock_getres: implausible");
+      return 1;
+    }
+    /* gettimeofday must not run backwards on a second read. */
+    if (gettimeofday(&tv2, NULL) != 0 || tv2.tv_sec < tv1.tv_sec) {
+      puts("gettimeofday: went backwards");
+      return 1;
+    }
+#ifdef SYS_time
+    time_t t = (time_t)syscall(SYS_time, NULL);
+    time_t tstore = 0;
+    if (t <= 0 || (time_t)syscall(SYS_time, &tstore) <= 0 || tstore < t) {
+      puts("time: implausible");
+      return 1;
+    }
+    puts("clocks: gettimeofday + clock_getres + time OK");
+#else
+    puts("clocks: gettimeofday + clock_getres OK (no legacy time on this ABI)");
+#endif
+  }
 
   puts("sysx OK");
   return 0;

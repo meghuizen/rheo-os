@@ -599,6 +599,74 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   it replaces. The fix loops in `Ext4Fs::read_at`. It surfaced only because the disk
   `execve` exercised the non-looping caller; a proof that runs the real caller, not just
   the convenient facade, is what caught it.
+- **A field left constant is a field that lies, and the lie can be invisible until a
+  second instance exists.** The `stat`/`fstat` block reported `st_ino = 1` (and
+  `st_dev = 0`) for **every** file, because the kernel/VFS bridge (`abi::Stat { size,
+  kind }`) carried no inode at all - the VFS `NodeId` was dropped. Every single-file
+  proof passed: a lone file's inode is never *compared* against another's. But glibc's
+  `ld.so` dedups shared libraries by `(st_dev, st_ino)`, so the first multi-library
+  dynamic binary (`dmath`, linking libm as well as libc) broke - ld.so opened libc,
+  `fstat`'d it, saw the same `(0, 1)` it had recorded for the already-loaded libm,
+  concluded "libc.so.6 is already loaded" (as libm), never mapped real libc, and then
+  failed `version 'GLIBC_2.34' not found` searching libm for a libc version. The
+  single-library `dhello` had proven "dynamic linking works" for a year without ever
+  exercising the collision. The lesson: a synthesized identity field (inode, pid, dev)
+  that is *hardcoded to a constant* is not "unimplemented, harmless" - it is a wrong
+  answer waiting for the first consumer that compares two of them, and the proof that
+  finds it must use **two distinct instances** (here two libraries), never one. The fix
+  plumbs the real `NodeId` from `posix::Metadata` through a widened `abi::Stat.ino` into
+  every Linux `st_ino`/`stx_ino`; the `linuxdyn` multi-library phase is the two-instance
+  proof, verified failing when the inode is reverted to a constant.
+- **A mechanism-witness assertion must gate on what is load-invariant, not on which of
+  several correct paths happened to run.** `linuxthreads`'s `condwait` phase asserted
+  that a `pthread_cond_timedwait` timeout registered a deadline with the kernel timer
+  arbiter (`registrations(FutexWait) > 0`). True in isolation and in a lightly-loaded
+  matrix; wrongly **red** under a heavier parallel matrix (task #162), because a futex
+  whose deadline is *already elapsed* when the syscall runs returns `-ETIMEDOUT`
+  immediately without ever arming the arbiter - a second, equally correct path - and
+  under load the cell clock routinely passes a short deadline before the syscall is
+  serviced. The assertion conflated "the timeout was honoured against a real deadline"
+  (the property) with "a future deadline was registered" (one of two ways to honour it).
+  Measured, the split is wild and timing-dependent: x86_64 registered 75, aarch64 86,
+  riscv64 registered 0 and took the immediate path once - all the *same* run's two
+  waits. The lesson: when an assertion witnesses a mechanism that has more than one
+  correct realization, gate on the **invariant floor of their sum** (`registrations +
+  immediate_timeouts >= 1`, the first wait always reaching the kernel deadline path) and
+  report the split as a diagnostic - never require a particular branch that timing can
+  legitimately steer away from. The behavioural proof (exact transcript + exit 0 +
+  `deadlock_waits() == 0`) is what actually excludes the ignored-timeout bug; the counter
+  is the bonus witness, and a bonus witness must not be stricter than the invariant.
+- **A partial success must roll back the bookkeeping it already did.** `mmap`'s eager
+  path inserted the VMA record *first* (so a full table refuses before touching pages),
+  then committed frames - and on a commit failure it returned `-ENOMEM` without removing
+  the record. The span was then owned by a mapping that does not exist, lost until the
+  cell exited. It stayed invisible because every mapping small enough to commit also
+  succeeds; it took JavaScriptCore's 128 GiB reservation - which *cannot* be eagerly
+  committed - to expose it, and the symptom was not the failed call but the *next* dozen
+  mmaps landing at wrong addresses (the leaked span pushed first-fit past it). When a
+  call does bookkeeping then an action that can fail, the failure path owns the undo -
+  and the proof to write is not "the big call failed" but "the state after it is what it
+  was before" (here: the freed span is found again by the next allocation).
+- **"Refused deliberately" is only honest while every caller has a fallback.** `clone3`
+  returned `ENOSYS` on the reasoning that glibc's `pthread_create` falls back to legacy
+  `clone` - true, and verified, for glibc. It is false for a runtime that issues
+  `clone3` *directly* with no fallback (Bun's JavaScriptCore/Zig threading), where
+  `ENOSYS` is a hard thread-spawn failure and the process aborts. A refusal justified by
+  one caller's documented fallback is not a refusal justified for all callers; when a
+  second caller appears that the justification did not cover, the honest move is to
+  implement the call, not to widen the excuse. (The same shape as the two-numbers hazard:
+  a claim that holds for the inputs you tested is not a claim that holds.)
+- **Diagnose a stopping point by measurement, not by its most plausible symptom.** Bun's
+  `abort()` had many plausible causes - the Gigacage alignment, `sysinfo` sizing, a
+  missing syscall, a CPU-count of zero - and each looked likely in turn. None was it.
+  Logging the *current thread id* against every syscall settled it in one run: all 205
+  came from the main thread, so the worker it spawned via `clone3` never ran, and the
+  blocker is the cooperative single-CPU scheduler (preemptive SMP, #132), not anything
+  in the load path. `observe-never-infer` (section 1) applies to a program's stopping
+  point exactly as it does to a capability: a test that accepts the partial must name the
+  cause it *measured*, so "loaded to the concurrency frontier" is evidence, not a guess -
+  and the acceptance is bounded to that exact signature (exit 134 **and** empty output)
+  so a different failure still fails loudly.
 
 ## 12. Never dereference an address the caller chose
 

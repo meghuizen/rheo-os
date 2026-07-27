@@ -15,6 +15,7 @@ use crate::linux::errno::*;
 use crate::linux::eventfd;
 use crate::linux::inetsock::{self, AF_INET, AF_INET6};
 use crate::linux::pipe;
+use crate::linux::timerfd;
 use crate::linux::unixsock::{self, AF_UNIX, NAME_MAX, SOCK_DGRAM, SOCK_STREAM, SOCK_TYPE_MASK};
 use crate::svc;
 
@@ -156,6 +157,13 @@ enum FdKind {
     /// that silently stop waking each other.
     EventFd {
         ev: u8,
+    },
+    /// A `timerfd` (docs/LINUX-COMPAT.md L8-TIMERFD): `tf` indexes the
+    /// per-personality registry (`linux::timerfd`). The armed deadline lives in the
+    /// registry for the same reason an eventfd's counter does - `dup`/`fork` alias
+    /// one object, and a per-descriptor deadline would give two that disagree.
+    TimerFd {
+        tf: u8,
     },
 }
 
@@ -370,6 +378,7 @@ impl FdTable {
                 } => inetsock::addref_dgram(ep),
                 FdKind::Epoll { ep } => epoll::addref(ep),
                 FdKind::EventFd { ev } => eventfd::addref(ev),
+                FdKind::TimerFd { tf } => timerfd::addref(tf),
                 _ => {}
             }
         }
@@ -520,6 +529,14 @@ impl FdTable {
                 Ok(eventfd::ReadNb::WouldBlock) => -EAGAIN,
                 Err(e) => e,
             },
+            // A timerfd read returns the expiration count. Non-blocking here like an
+            // eventfd: the parking path is `mod::sys_read`, which intercepts a
+            // not-yet-expired timerfd before reaching this table.
+            FdKind::TimerFd { tf } => match timerfd::read(tf, buf_va, count) {
+                Ok(timerfd::ReadNb::Done) => 8,
+                Ok(timerfd::ReadNb::WouldBlock) => -EAGAIN,
+                Err(e) => e,
+            },
             FdKind::Vfs { vfs_fd, .. } => match svc::file_ops() {
                 Some(o) => (o.read)(vfs_fd as u64, buf_va, count),
                 None => -EBADF,
@@ -583,6 +600,8 @@ impl FdTable {
             | FdKind::InetUdpRemote { .. } => -ENOTCONN,
             FdKind::Epoll { .. } => -EINVAL,
             FdKind::EventFd { ev } => eventfd::write(ev, buf_va, count),
+            // A timerfd is not writable (Linux fs/timerfd.c returns -EINVAL).
+            FdKind::TimerFd { .. } => -EINVAL,
             FdKind::Vfs { vfs_fd, .. } => match svc::file_ops() {
                 Some(o) => (o.write)(vfs_fd as u64, buf_va, count),
                 None => -EBADF,
@@ -744,6 +763,7 @@ impl FdTable {
             }
             FdKind::Epoll { ep } => epoll::close(ep),
             FdKind::EventFd { ev } => eventfd::close(ev),
+            FdKind::TimerFd { tf } => timerfd::close(tf),
             _ => {}
         }
         self.fds[slot] = FdKind::Closed;
@@ -809,6 +829,7 @@ impl FdTable {
             } => inetsock::addref_dgram(ep),
             FdKind::Epoll { ep } => epoll::addref(ep),
             FdKind::EventFd { ev } => eventfd::addref(ev),
+            FdKind::TimerFd { tf } => timerfd::addref(tf),
             _ => {}
         }
     }
@@ -940,7 +961,8 @@ impl FdTable {
             | FdKind::InetUdpRemote { .. }
             | FdKind::InetTcpRemote { .. }
             | FdKind::Epoll { .. }
-            | FdKind::EventFd { .. } => -ESPIPE,
+            | FdKind::EventFd { .. }
+            | FdKind::TimerFd { .. } => -ESPIPE,
             FdKind::Closed => -EBADF,
         }
     }
@@ -993,20 +1015,42 @@ impl FdTable {
             FdKind::EventFd { .. } => {
                 Stat::new(dirent::S_IFREG | 0o600, 0, 1, 1, 1000, 1000, 0, 4096, 0, 0)
             }
+            // A timerfd is likewise an anonymous inode: a regular file of size 0.
+            FdKind::TimerFd { .. } => {
+                Stat::new(dirent::S_IFREG | 0o600, 0, 1, 1, 1000, 1000, 0, 4096, 0, 0)
+            }
             FdKind::Vfs { vfs_fd, .. } => {
                 let Some(o) = svc::file_ops() else {
                     return -EBADF;
                 };
                 // FileOps writes the native abi::Stat into a kernel temp
                 // (identity-mapped, writable there); convert to the Linux ABI.
-                let mut native = crate::abi::Stat { size: 0, kind: 0 };
+                let mut native = crate::abi::Stat {
+                    size: 0,
+                    kind: 0,
+                    ino: 0,
+                };
                 let r = (o.fstat)(vfs_fd as u64, &mut native as *mut _ as u64);
                 if r < 0 {
                     return r;
                 }
                 let mode = dirent::mode_for_kind(native.kind);
                 let blocks = native.size.div_ceil(512);
-                Stat::new(mode, native.size, 1, 1, 1000, 1000, 0, 4096, blocks, 0)
+                // `native.ino` is the VFS inode - distinct per file, which glibc's
+                // ld.so requires to tell two shared libraries apart (a shared inode
+                // makes it treat the second as already-loaded; docs/LINUX-COMPAT.md).
+                Stat::new(
+                    mode,
+                    native.size,
+                    native.ino,
+                    1,
+                    1000,
+                    1000,
+                    0,
+                    4096,
+                    blocks,
+                    0,
+                )
             }
         };
         let Some(out) = crate::user::user_out::<Stat>(statbuf_va) else {
@@ -1018,20 +1062,21 @@ impl FdTable {
         0
     }
 
-    /// The `(st_mode, size)` a `fstat`/`statx` would report for `fd`, without
+    /// The `(st_mode, size, ino)` a `fstat`/`statx` would report for `fd`, without
     /// writing a `struct stat`. Used by `statx` (docs/LINUX-COMPAT.md L3), which
-    /// has its own ABI-independent buffer layout.
-    pub fn mode_size(&mut self, fd: i64) -> Result<(u32, u64), i64> {
+    /// has its own ABI-independent buffer layout. `ino` is the VFS inode for a real
+    /// file (distinct per file, so statx agrees with fstat), 0 for anonymous fds.
+    pub fn mode_size(&mut self, fd: i64) -> Result<(u32, u64, u64), i64> {
         let Some(slot) = usize_fd(fd) else {
             return Err(-EBADF);
         };
         match self.fds[slot] {
             FdKind::Closed => Err(-EBADF),
             FdKind::Console(_) | FdKind::Null | FdKind::Zero | FdKind::Urandom => {
-                Ok((dirent::S_IFCHR | 0o620, 0))
+                Ok((dirent::S_IFCHR | 0o620, 0, 0))
             }
-            FdKind::ProcAuxv { .. } => Ok((dirent::S_IFREG | 0o444, self.auxv_len as u64)),
-            FdKind::Pipe { .. } => Ok((dirent::S_IFIFO | 0o600, 0)),
+            FdKind::ProcAuxv { .. } => Ok((dirent::S_IFREG | 0o444, self.auxv_len as u64, 0)),
+            FdKind::Pipe { .. } => Ok((dirent::S_IFIFO | 0o600, 0, 0)),
             FdKind::SockFresh
             | FdKind::SockListen { .. }
             | FdKind::SockConn { .. }
@@ -1041,18 +1086,22 @@ impl FdTable {
             | FdKind::InetDgram { .. }
             | FdKind::InetUdpRemote { .. }
             | FdKind::InetTcpRemote { .. }
-            | FdKind::Epoll { .. } => Ok((S_IFSOCK | 0o600, 0)),
-            FdKind::EventFd { .. } => Ok((dirent::S_IFREG | 0o600, 0)),
+            | FdKind::Epoll { .. } => Ok((S_IFSOCK | 0o600, 0, 0)),
+            FdKind::EventFd { .. } | FdKind::TimerFd { .. } => Ok((dirent::S_IFREG | 0o600, 0, 0)),
             FdKind::Vfs { vfs_fd, .. } => {
                 let Some(o) = svc::file_ops() else {
                     return Err(-EBADF);
                 };
-                let mut native = crate::abi::Stat { size: 0, kind: 0 };
+                let mut native = crate::abi::Stat {
+                    size: 0,
+                    kind: 0,
+                    ino: 0,
+                };
                 let r = (o.fstat)(vfs_fd as u64, &mut native as *mut _ as u64);
                 if r < 0 {
                     return Err(r);
                 }
-                Ok((dirent::mode_for_kind(native.kind), native.size))
+                Ok((dirent::mode_for_kind(native.kind), native.size, native.ino))
             }
         }
     }
@@ -1244,6 +1293,35 @@ impl FdTable {
         slot as i64
     }
 
+    /// timerfd_create(clockid, flags): a disarmed timer descriptor
+    /// (docs/LINUX-COMPAT.md L8-TIMERFD). `TFD_CLOEXEC`/`TFD_NONBLOCK` are the
+    /// descriptor flags, like an eventfd's; an unsupported clock is `-EINVAL`.
+    pub fn timerfd_create(&mut self, clockid: u64, flags: u64) -> i64 {
+        use timerfd::{TFD_CLOEXEC, TFD_NONBLOCK};
+        if flags & !(TFD_CLOEXEC | TFD_NONBLOCK) != 0 {
+            return -EINVAL;
+        }
+        let Some(tf) = timerfd::create(clockid) else {
+            // A full table is -ENFILE; an unsupported clock is -EINVAL. `create`
+            // folds both into `None`, but only a bad clock is a caller error - the
+            // table being full is the system's. Distinguish by re-checking the clock.
+            return if clockid == timerfd::CLOCK_MONOTONIC || clockid == timerfd::CLOCK_REALTIME {
+                -ENFILE
+            } else {
+                -EINVAL
+            };
+        };
+        let Some(slot) = self.free_slot(3) else {
+            timerfd::close(tf);
+            return -EMFILE;
+        };
+        self.fds[slot] = FdKind::TimerFd { tf };
+        self.flags[slot] = FdFlags::new(ACC_RDWR);
+        self.flags[slot].cloexec = flags & TFD_CLOEXEC != 0;
+        self.flags[slot].nonblock = flags & TFD_NONBLOCK != 0;
+        slot as i64
+    }
+
     /// `close_range(first, last, flags)`: close every open descriptor in the
     /// inclusive range (docs/ARCHITECTURE-DEBT.md 4.0, blocker 3).
     ///
@@ -1289,6 +1367,17 @@ impl FdTable {
         let slot = usize_fd(fd)?;
         match self.fds[slot] {
             FdKind::EventFd { ev } => Some(ev),
+            _ => None,
+        }
+    }
+
+    /// The registry index behind `fd` if it is a timerfd - the `sys_read` hook that
+    /// intercepts a blocking read on a not-yet-expired timer, mirroring
+    /// [`Self::eventfd_of`].
+    pub fn timerfd_of(&self, fd: i64) -> Option<u8> {
+        let slot = usize_fd(fd)?;
+        match self.fds[slot] {
+            FdKind::TimerFd { tf } => Some(tf),
             _ => None,
         }
     }
@@ -1425,6 +1514,9 @@ impl FdTable {
             // it (a sibling context writing it does not park the cell at all), so
             // the wake source is a peer, exactly as for a pipe.
             | FdKind::EventFd { .. } => idle::PEER,
+            // A timerfd changes readiness only when its deadline passes - a cell-clock
+            // deadline, honoured by the scheduler's timer slices (docs/NETSTACK.md 16).
+            FdKind::TimerFd { .. } => idle::TIMER,
             FdKind::InetUdpRemote { .. } | FdKind::InetTcpRemote { .. } => idle::NET,
             FdKind::Console(0) => idle::CONSOLE,
             // An epoll fd's own readiness is the union of what it watches; asking
@@ -2121,6 +2213,8 @@ impl FdTable {
             // The whole point of an eventfd: readable exactly when the counter is
             // non-zero, which is what an epoll loop parks on to be woken.
             FdKind::EventFd { ev } => eventfd::readable(ev),
+            // A timerfd is readable once it has expired - what an epoll loop parks on.
+            FdKind::TimerFd { tf } => timerfd::readable(tf),
             _ => false,
         }
     }

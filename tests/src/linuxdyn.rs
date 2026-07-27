@@ -77,6 +77,19 @@ macro_rules! fixture {
 static DHELLO: &[u8] = fixture!("dhello");
 static LD_SO: &[u8] = fixture!("ld.so");
 static LIBC: &[u8] = fixture!("libc.so.6");
+/// The **multi-library** fixtures (GOAL-DYN-MULTILIB): `dmath` links libm as well
+/// as libc, so `ld.so` must load two shared libraries and resolve one's versions
+/// against the other. A 1-byte placeholder means the toolchain libm was
+/// unavailable at build time; the multi-library phase then skips-with-reason.
+static DMATH: &[u8] = fixture!("dmath");
+static LIBM: &[u8] = fixture!("libm.so.6");
+/// The **four-library** fixtures: a dynamic C++ hello (`dcpp`) links libstdc++ +
+/// libgcc_s + libc (+ libm transitively). Placeholders mean the toolchain g++ or
+/// the C++ runtime libs were unavailable at build time (e.g. no cross-g++ for an
+/// ISA); the C++ phase then skips-with-reason.
+static DCPP: &[u8] = fixture!("dcpp");
+static LIBSTDCPP: &[u8] = fixture!("libstdc++.so.6");
+static LIBGCC: &[u8] = fixture!("libgcc_s.so.1");
 
 /// The dynamic-linker path named in each ISA's `PT_INTERP` (verified with
 /// `readelf -p .interp`). ld.so's `libc.so.6` is found via `LD_LIBRARY_PATH`.
@@ -267,6 +280,21 @@ extern "C" fn kernel_main() -> ! {
     }
     println!("linuxdyn: dhello OK (PT_INTERP + ld.so + fd-backed mmap)");
 
+    // Multi-library phase (GOAL-DYN-MULTILIB): `dmath` links libm **and** libc, so
+    // ld.so must load two shared libraries and resolve one's version references
+    // against the other. This exercises what a single-library `dhello` cannot:
+    // ld.so dedups shared objects by `(st_dev, st_ino)`, so if the VFS reports the
+    // same inode for two different files, ld.so treats the second as already-loaded
+    // and never maps it - which broke every multi-library binary until the stat
+    // block carried a real inode (docs/LINUX-COMPAT.md, docs/ENGINEERING.md 11).
+    multilib_phase();
+
+    // Four-library phase: a dynamic C++ hello links libstdc++ + libgcc_s + libc
+    // (+ libm), and runs C++ runtime init (static constructors, iostream setup,
+    // exception-unwind tables) - the production shape a real application has, well
+    // beyond `dmath`'s two libraries.
+    cpp_phase();
+
     // Phase 2: the same dynamic binary via the **streaming `execve`** path -
     // program + interpreter both streamed from the VFS and demand-paged, the way a
     // shell launching a dynamic program does. Proves the streaming loader handles
@@ -316,6 +344,87 @@ impl BlockSource for Cached {
     fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<(), Errno> {
         self.0.read_at(off, buf).map_err(|_| Errno::Io)
     }
+}
+
+/// Run `dmath` (linked against libm as well as libc) and assert its exact output
+/// and exit code - the multi-library dynamic-linking proof. Skips-with-reason if
+/// the toolchain libm or dmath was unavailable at build time (placeholder).
+fn multilib_phase() {
+    if LIBM.len() < 4096 || DMATH.len() < 4096 {
+        println!(
+            "linuxdyn: SKIP multi-library phase on {} - libm.so.6/dmath not \
+             available at build time (single-library coverage unaffected)",
+            arch::NAME
+        );
+        return;
+    }
+    fs::write("/lib/libm.so.6", LIBM).expect("seed libm.so.6");
+    unsafe {
+        STDOUT_LEN = 0;
+    }
+    linux::set_stdout_tap(Some(tap));
+    let outcome = run(DMATH, &[b"dmath"], &[b"LD_LIBRARY_PATH=/lib", b"PATH=/bin"]);
+    linux::set_stdout_tap(None);
+    let want = b"dmath: sqrt16=4\n";
+    match outcome {
+        Outcome::Exited(code) => {
+            let got = captured();
+            assert!(
+                got == want,
+                "dmath: stdout mismatch\n  got:      {:?}\n  expected: {:?}",
+                core::str::from_utf8(got),
+                core::str::from_utf8(want),
+            );
+            assert!(code == 4, "dmath: exit {code}, expected 4 (sqrt(16))");
+        }
+        Outcome::Faulted(addr) => panic!("dmath: faulted at {addr:#x}"),
+    }
+    println!(
+        "linuxdyn: dmath OK (multi-library: ld.so loaded libc AND libm, distinct \
+         inodes, cross-object version resolution)"
+    );
+}
+
+/// Run `dcpp` (a dynamic C++ hello linking libstdc++ + libgcc_s + libc + libm)
+/// and assert its exact output and exit code - the four-library, C++-runtime
+/// proof. Skips-with-reason if the toolchain g++/C++ runtime libs were
+/// unavailable at build time (e.g. no cross-g++ for this ISA).
+fn cpp_phase() {
+    if DCPP.len() < 4096 || LIBSTDCPP.len() < 4096 || LIBGCC.len() < 4096 {
+        println!(
+            "linuxdyn: SKIP C++ phase on {} - g++/libstdc++/libgcc_s not available \
+             at build time (single- and multi-library coverage unaffected)",
+            arch::NAME
+        );
+        return;
+    }
+    fs::write("/lib/libm.so.6", LIBM).ok();
+    fs::write("/lib/libstdc++.so.6", LIBSTDCPP).expect("seed libstdc++.so.6");
+    fs::write("/lib/libgcc_s.so.1", LIBGCC).expect("seed libgcc_s.so.1");
+    unsafe {
+        STDOUT_LEN = 0;
+    }
+    linux::set_stdout_tap(Some(tap));
+    let outcome = run(DCPP, &[b"dcpp"], &[b"LD_LIBRARY_PATH=/lib", b"PATH=/bin"]);
+    linux::set_stdout_tap(None);
+    let want = b"dcpp: hello from dynamic C++ (23)\n";
+    match outcome {
+        Outcome::Exited(code) => {
+            let got = captured();
+            assert!(
+                got == want,
+                "dcpp: stdout mismatch\n  got:      {:?}\n  expected: {:?}",
+                core::str::from_utf8(got),
+                core::str::from_utf8(want),
+            );
+            assert!(code == 23, "dcpp: exit {code}, expected 23");
+        }
+        Outcome::Faulted(addr) => panic!("dcpp: faulted at {addr:#x}"),
+    }
+    println!(
+        "linuxdyn: dcpp OK (four-library: libstdc++ + libgcc_s + libc + libm, \
+         C++ runtime init)"
+    );
 }
 
 fn disk_phase(want_out: &[u8]) {

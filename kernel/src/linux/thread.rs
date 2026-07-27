@@ -28,6 +28,7 @@ use crate::arch::{self, TrapFrame};
 use crate::ktimer::{self, TimerClient};
 use crate::linux::Ctl;
 use crate::linux::errno::*;
+use crate::linux::proc::Block;
 use crate::user::{self, MAX_CELLS};
 use core::ptr::addr_of_mut;
 
@@ -86,6 +87,13 @@ struct Thread {
     /// comparing it against a different counter would make the same "50 ms" mean
     /// something different per ISA (docs/ENGINEERING.md 11).
     fut_deadline: u64,
+    /// This context's **proc-level** block condition (`epoll_wait`/`poll`/
+    /// `nanosleep`/pipe/eventfd/console/wait4) when `state == Blocked` for a
+    /// non-futex reason - `Block::None` otherwise (per-context blocking,
+    /// docs/LINUX-COMPAT.md L4). Distinct from a futex wait (`fut_addr`): a
+    /// context is `Blocked` for exactly one of the two reasons at a time. The
+    /// scheduler (`proc.rs`) judges its satisfiability and completes it.
+    pblock: Block,
     fp: FpArea,
 }
 
@@ -99,6 +107,7 @@ impl Thread {
             fs_base: 0,
             fut_addr: 0,
             fut_deadline: 0,
+            pblock: Block::None,
             fp: FpArea::new(),
         }
     }
@@ -163,7 +172,10 @@ pub fn init_cell(cell: usize) {
 /// Clear every cell's thread table (called from `linux::reset`).
 pub fn reset() {
     // SAFETY: single CPU, between runs.
-    unsafe { *addr_of_mut!(DEADLOCK_WAITS) = 0 };
+    unsafe {
+        *addr_of_mut!(DEADLOCK_WAITS) = 0;
+        *addr_of_mut!(IMMEDIATE_TIMEOUTS) = 0;
+    }
     for cell in 0..MAX_CELLS {
         for th in threads(cell).iter_mut() {
             *th = Thread::new();
@@ -175,6 +187,107 @@ pub fn reset() {
 /// The tid of the currently running context (`gettid`).
 pub fn current_tid(cell: usize) -> u32 {
     threads(cell)[cur_thread(cell)].tid
+}
+
+// ---- per-context proc-level blocking (docs/LINUX-COMPAT.md L4) ----
+//
+// A context can block on a proc-level condition (`epoll_wait`/`poll`/`nanosleep`/
+// pipe/eventfd/console/wait4) while a *sibling* context of the same cell keeps
+// running - which is what an event-loop program needs: Node's main thread blocks
+// on `epoll_wait` for an eventfd a V8 worker thread must write. The condition
+// itself lives here per-context; `proc.rs` judges its satisfiability and completes
+// it (it owns the fd tables). The futex wait (`fut_addr`) is the other, separate
+// reason a context is `Blocked`.
+
+/// Record the current context's proc-level block condition and mark it `Blocked`.
+pub(crate) fn set_current_pblock(cell: usize, b: Block) {
+    let ci = cur_thread(cell);
+    threads(cell)[ci].pblock = b;
+    threads(cell)[ci].state = TState::Blocked;
+}
+
+/// A `Ready` sibling context to run instead of parking the whole cell (round-robin
+/// from the current context), or `None` if the current context is the only ready
+/// one - exactly the futex scheduler's `pick_next`.
+pub(crate) fn pick_ready_sibling(cell: usize) -> Option<usize> {
+    pick_next(cell, cur_thread(cell))
+}
+
+/// Switch from the current (now-blocked) context to ready sibling `to`, saving the
+/// caller's FP and loading `to`'s. The cell stays runnable; `Ctl::Switch` resumes
+/// on `to`'s frame.
+pub(crate) fn switch_current_to(cell: usize, to: usize) -> Ctl {
+    switch_to(cell, cur_thread(cell), to)
+}
+
+/// Context `idx`'s proc-level block condition (`Block::None` if it is not blocked
+/// on one - e.g. free, running, or futex-blocked).
+pub(crate) fn pblock_of(cell: usize, idx: usize) -> Block {
+    threads(cell)[idx].pblock
+}
+
+/// True if context `idx` is live and parked on a proc-level condition (not free,
+/// not running, not a futex wait) - a candidate for the scheduler to wake.
+pub(crate) fn is_pblocked(cell: usize, idx: usize) -> bool {
+    let th = &threads(cell)[idx];
+    th.state == TState::Blocked && !matches!(th.pblock, Block::None)
+}
+
+/// Make proc-blocked context `idx` current for an **intra-cell** resume (a sibling
+/// wrote the fd it waited on), saving the outgoing context's FP and loading `idx`'s.
+/// Leaves `idx`'s `pblock`/`state` for [`complete_pblock`] to finish. Returns its
+/// frame for `Ctl::Switch`.
+pub(crate) fn resume_pblocked(cell: usize, idx: usize) -> *mut TrapFrame {
+    let from = cur_thread(cell);
+    if from != idx {
+        let from_fp = threads(cell)[from].fp.0.as_mut_ptr();
+        // SAFETY: `from`'s user FP registers are still live (kernel is soft-float).
+        unsafe { arch::save_user_fp(from_fp) };
+        let (to_fp, to_fs) = {
+            let th = &threads(cell)[idx];
+            (th.fp.0.as_ptr(), th.fs_base)
+        };
+        // SAFETY: `idx`'s FP image was saved when it switched away.
+        unsafe { arch::restore_user_fp(to_fp) };
+        arch::set_user_fs_base(to_fs);
+    }
+    set_cur_thread(cell, idx);
+    threads(cell)[idx].frame
+}
+
+/// Set the current context (for the **cross-cell** resume path in `proc.rs`, before
+/// `restore_current` reloads its FP).
+pub(crate) fn set_current(cell: usize, idx: usize) {
+    set_cur_thread(cell, idx);
+}
+
+/// Finish resuming proc-blocked context `idx`: clear its `pblock` and mark it
+/// `Ready`. The block's syscall return is written by `proc.rs` into `idx`'s frame.
+pub(crate) fn clear_pblock_ready(cell: usize, idx: usize) {
+    threads(cell)[idx].pblock = Block::None;
+    threads(cell)[idx].state = TState::Ready;
+}
+
+/// Diagnostic: print each live context's state for the deadlock reporter, so a
+/// multi-threaded deadlock says which contexts exist and what each waits on
+/// (docs/ARCHITECTURE-DEBT.md 2.4).
+pub fn dump_contexts(cell: usize) {
+    let cur = cur_thread(cell);
+    for i in 0..MAX_THREADS {
+        let th = &threads(cell)[i];
+        let s = match th.state {
+            TState::Free => continue,
+            TState::Ready => "ready",
+            TState::Blocked => "blocked-on-futex",
+        };
+        crate::println!(
+            "linux:     ctx {i}{} tid {} {s} fut={:#x} deadline={}",
+            if i == cur { " (current)" } else { "" },
+            th.tid,
+            th.fut_addr,
+            th.fut_deadline,
+        );
+    }
 }
 
 /// The index of the currently running context (for the signal module's
@@ -405,7 +518,17 @@ pub fn futex(cell: usize, uaddr: u64, op: u64, val: u32, timeout_va: u64) -> Ctl
             let deadline = match wait_deadline(cmd, op, timeout_va) {
                 Deadline::None => 0,
                 Deadline::At(d) => d,
-                Deadline::Passed => return Ctl::Ret((-ETIMEDOUT) as u64),
+                Deadline::Passed => {
+                    // Deadline already elapsed: honour the timeout immediately. This
+                    // registers no arbiter deadline, so it is counted separately as
+                    // evidence the timeout was honoured this way (task #162).
+                    // SAFETY: single CPU, synchronous trap.
+                    unsafe {
+                        let p = addr_of_mut!(IMMEDIATE_TIMEOUTS);
+                        *p = (*p).wrapping_add(1);
+                    }
+                    return Ctl::Ret((-ETIMEDOUT) as u64);
+                }
             };
             let ci = cur_thread(cell);
             threads(cell)[ci].state = TState::Blocked;
@@ -414,8 +537,16 @@ pub fn futex(cell: usize, uaddr: u64, op: u64, val: u32, timeout_va: u64) -> Ctl
             match next_runnable_or_wait(cell) {
                 Some(next) => switch_to(cell, ci, next),
                 None => {
-                    // Nothing else can run and no deadline can arrive, so this wait
-                    // can never be satisfied from inside the cell: it is a deadlock.
+                    // No `Ready` sibling and no futex deadline. A sibling parked on a
+                    // proc-level condition may be satisfiable *right now* (Node's
+                    // teardown: main wrote the eventfd, then futex-waits for the
+                    // worker parked on it). Resume that sibling; it will `FUTEX_WAKE`
+                    // this context. `ci` stays `Blocked` on its futex word.
+                    if let Some(ctl) = crate::linux::proc::resume_satisfiable_sibling(cell) {
+                        return ctl;
+                    }
+                    // No runnable sibling and none satisfiable, no deadline: this wait
+                    // can never be satisfied from inside the cell - a deadlock.
                     // There is no futex errno for that, and every real caller
                     // (glibc's low-level locks, Rust's parker) ignores the return
                     // and re-reads the word - so the survivable answer is still
@@ -597,6 +728,23 @@ pub fn deadlock_waits() -> u64 {
 }
 
 static mut DEADLOCK_WAITS: u64 = 0;
+
+/// Futex waits whose deadline was **already in the past** when the syscall ran, so
+/// `-ETIMEDOUT` was returned immediately without ever parking on the timer arbiter
+/// ([`futex`]'s `Deadline::Passed` fast path).
+///
+/// This is a genuine, correct honouring of the timeout - not the ignored-timeout
+/// bug - but it registers no arbiter deadline, so a test asserting "the timeout was
+/// honoured by a real deadline mechanism" must accept **either** this counter or the
+/// arbiter's `FutexWait` registrations. It is reachable whenever the cell's clock
+/// advances past a short deadline before the futex syscall is serviced, which under
+/// heavy parallel test load is routine (docs/ENGINEERING.md 1, task #162).
+pub fn immediate_timeouts() -> u64 {
+    // SAFETY: single CPU.
+    unsafe { *addr_of_mut!(IMMEDIATE_TIMEOUTS) }
+}
+
+static mut IMMEDIATE_TIMEOUTS: u64 = 0;
 
 /// Move up to `max` contexts parked on `uaddr` back to ready, setting each one's
 /// futex return value to 0. Returns the number woken.

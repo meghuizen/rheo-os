@@ -374,9 +374,17 @@ straight off ext4 - the shape a shell launching Claude Code needs. This closes
 **L0-L7 Linux personality is complete** - unpatched static and dynamic glibc C,
 unpatched Rust `std`, and the real upstream uutils/coreutils all run as cells,
 kernel-resident like `svc.rs` and adding no kernel object (`MAX_MAPPED_FILES` is
-now **64**, headroom for a production binary's dozen-plus shared libraries; a
-dynamic Rust std / uutils-0.9.x fixture exercising many libs is the documented
-next proof).
+now **64**, headroom for a production binary's dozen-plus shared libraries).
+**Multi-library dynamic linking works** (GOAL-DYN-MULTILIB, #169): a binary
+linking a *second* shared library (`dmath`: `libc` + `libm`) now runs, proven by
+`linuxdyn`'s multi-library phase on all three ISAs. The defect was never in ld.so
+or version resolution - it was the `stat`/`fstat` block reporting `st_ino = 1` for
+**every** file (the kernel↔VFS bridge `abi::Stat` dropped the VFS `NodeId`), so
+glibc's ld.so, which dedups shared objects by `(st_dev, st_ino)`, treated the
+second library as an already-loaded copy of the first and never mapped it. The fix
+plumbs the real inode through `abi::Stat.ino` into every Linux `st_ino`/`stx_ino`;
+recorded as a scar in docs/ENGINEERING.md 11 ("a field left constant is a field
+that lies") and in docs/LINUX-COMPAT.md L7.
 **L8 has begun** (docs/LINUX-COMPAT.md L8, docs/NETSTACK.md rheo-net Phase N1d):
 **AF_UNIX (Unix domain) sockets** - `socket`/`socketpair`/`bind`/`listen`/
 `accept`/`connect`/`sendmsg`/`recvmsg` on SOCK_STREAM, sockets as per-cell fds
@@ -410,6 +418,83 @@ its range; and **`clone3`/`rseq`** refused *deliberately* instead of falling
 through the unknown-number log. The `sysx` fixture in `linuxproc` proves it on
 **all three ISAs**, asserting each refusal *as* a refusal, with four narrow
 reverts each observed failing.
+
+**The real Node.js binary runs unmodified on the OS** (GOAL-NODE,
+docs/LINUX-COMPAT.md, the `linuxnode` test): the actual `/opt/node22/bin/node`
+(v22, dynamic, 124 MB, V8 + libuv) streams off a live ext4 disk over
+virtio-blk-pci (`ext4fs`/`ext4plus` + block cache, ~15k fills, none resident
+whole), `ld-linux` links all **seven** shared libraries (glibc + libstdc++ +
+libgcc_s), V8 initialises, libuv runs its event loop, and it evaluates
+`console.log("rheo:"+(40+2))`, prints exactly `rheo:42`, and **exits 0** on
+x86-64 (arm/riscv have no node build and skip). It runs `--jitless` so V8's
+Ignition interpreter needs no writable-executable code page (W^X is structural,
+ARCHITECTURE.md 5 - the one `mprotect(RWX)` V8 would issue is refused). This is
+the production JavaScript runtime Claude Code runs on, executing unmodified via
+the Linux personality + POSIX translation. It needed four measured legacy calls
+(`gettimeofday` - which libuv *asserts* on -, `clock_getres`, `time`; io_uring
+refused deliberately) and, the real blocker, **per-context blocking**: a cell's
+proc-level block (`epoll_wait`/`poll`/`nanosleep`/pipe/eventfd/console/`wait4`)
+now lives **per execution context** (`thread.rs` `pblock`, judged + completed by
+`proc.rs`) rather than parking the whole cell - so Node's main thread can block on
+`epoll_wait` for an eventfd a V8 worker must write while the worker keeps running
+(before, the whole cell parked and the scheduler correctly reported a deadlock).
+When a context blocks the scheduler runs a `Ready` sibling first, then an
+already-satisfiable sibling (Node's teardown: main writes the eventfd then
+futex-waits for the worker parked on it, which is resumed and `FUTEX_WAKE`s main),
+and only parks the whole cell (the pre-existing cross-cell path) when every
+context is blocked - a single-context cell falls straight to that path,
+byte-for-byte the old behaviour, which is why the whole Linux suite stays green.
+Still cooperative + single-CPU (#27); one `poll` waiter per cell (the copied
+pollset is per-cell; `epoll`, which Node uses, is unlimited).
+
+**The real Bun binary loads to the concurrency frontier** (GOAL-BUN,
+docs/LINUX-COMPAT.md, the `linuxbun` test - a **partial**): the actual
+`/root/.bun/bin/bun` (v1.3, dynamic, 99 MB, JavaScriptCore + a Zig runtime) streams
+off a live ext4 disk (~3,500 fills), dynamically links its whole library set, and
+JSC initialises **including its 128 GiB Gigacage** - a single `MAP_NORESERVE`
+reservation the kernel now demand-fills (the Linux mmap window was raised to
+80..252 GiB for it, and a failed eager commit no longer leaks a phantom VMA), spawns
+a worker via **`clone3`** (now implemented: it decodes `struct clone_args` and routes
+to the same context-creation path as `clone`), and sets up its libuv event loop
+(`BUN_JSC_useJIT=0`, host-verified zero RWX). It then `abort()`s **before evaluating**,
+and the cause is measured not guessed: **all 205 of its syscalls came from the main
+thread; the worker it spawned never got the CPU** - the cooperative single-CPU
+scheduler switches to a sibling only when the current context blocks, and Bun's main
+requires the worker to progress *concurrently* first. That is the preemptive-SMP
+frontier (#132), not a missing syscall - the whole load path works. `linuxbun` accepts
+the bounded partial (exit 134 + no output); when #132 lands Bun should print `rheo:42`.
+Node completes fully because its coordination aligns with blocking points; Bun's needs
+true parallelism.
+
+**timerfd is done** (docs/LINUX-COMPAT.md L8-TIMERFD, GOAL-TIMERFD):
+`timerfd_create`/`settime`/`gettime` - the **timer source of libuv**, and thus of
+Node.js and the async/JS world. A per-cell fd over a per-personality registry
+(`kernel/src/linux/timerfd.rs`) - **no new kernel object**, the `eventfd`/`epoll`
+precedent - whose expiry is an ordinary **cell-clock deadline**, the same wait
+`nanosleep` (`proc::Block::Timer`) parks on and the same the scheduler already
+halts for through the timer arbiter's `CellSleep` slice, so it composes the
+existing time machinery and touches no deadline arithmetic. A blocking read parks
+on the deadline (no runnable-peer needed - the clock is the wake source, unlike an
+eventfd), and for epoll the timerfd's per-fd source is `idle::TIMER` and its
+readiness is "expired", so the existing poll/epoll timer-slice idle path wakes the
+loop unchanged. One-shot + periodic; `read` returns and consumes the expiration
+count; `write` is `-EINVAL`. The `timerx` fixture in `linuxpoll` proves it on
+**all three ISAs**: a blocking read parks on a 20 ms one-shot (exactly one
+expiration), epoll_wait wakes on a second, and the disarmed timer reads zero.
+
+**A real JavaScript engine runs on the OS** (GOAL-JS, docs/LINUX-COMPAT.md): the
+`jsdemo` fixture is the pure-Rust **`boa_engine`** crate (pinned in
+`tests/linux-fixtures/jsdemo/Cargo.lock`) - a complete JS runtime (lexer, parser,
+bytecode compiler, register VM, heap, GC) built static-glibc and run **unmodified**
+under the Linux personality by `linuxrun` on **all three ISAs**. It evaluates real
+JavaScript (a function, `Array.reduce`, an arrow closure, string concat) and prints
+`js: rheo:42` (exit 0), exercising the L2-L8 syscall surface and demand-paging a
+~9.5 MB image (~1580 pages recorded, ~18 frames at load - the loader scales). This
+is the on-goal proxy for Node/Claude Code: a genuine language runtime executing on
+rheo-os. It is **not** V8/libuv/Node itself (that ~100 MB binary is the remaining
+distance) - stated plainly, not overclaimed. The `libuv` event-loop core (epoll
+multiplexing timerfd + eventfd + pipe) is separately proven by `uvloop` in
+`linuxpoll`.
 
 **librheo** (`librheo/`, docs/LIBRHEO.md) is the greenfield **native userspace
 foundation library** - the role a libc plays, rebuilt for this kernel:

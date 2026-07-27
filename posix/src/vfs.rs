@@ -27,6 +27,11 @@ pub struct Metadata {
     pub kind: FileType,
     pub len: u64,
     pub mode: u16,
+    /// The filesystem's inode number for this node (an ext4 inode, a ramfs slab
+    /// index). Distinct per file, so a stat consumer can tell two files apart -
+    /// which glibc's `ld.so` requires to avoid treating two different shared
+    /// libraries as the same file (docs/LINUX-COMPAT.md).
+    pub node: NodeId,
 }
 
 pub struct DirEntry {

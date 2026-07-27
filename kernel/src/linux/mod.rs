@@ -33,6 +33,7 @@ pub mod proc;
 pub mod signal;
 pub mod stack;
 pub mod thread;
+pub mod timerfd;
 pub mod unixsock;
 pub mod vma;
 
@@ -176,6 +177,7 @@ pub fn reset() {
     inetsock::reset();
     epoll::reset();
     eventfd::reset();
+    timerfd::reset();
     filemap::reset();
 }
 
@@ -538,6 +540,9 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
 
         // -- time / entropy / scheduling --
         nr::CLOCK_GETTIME => ret(sys_clock_gettime(args[0], args[1])),
+        nr::GETTIMEOFDAY => ret(sys_gettimeofday(args[0])),
+        nr::CLOCK_GETRES => ret(sys_clock_getres(args[1])),
+        nr::TIME => ret(sys_time(args[0])),
         // nanosleep(req, rem) / clock_nanosleep(clk, flags, req, rem): a real sleep
         // (docs/ARCHITECTURE-DEBT.md 2.4).
         nr::NANOSLEEP => sys_nanosleep(cur, false, 0, args[0]),
@@ -561,13 +566,35 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
         }
         nr::SYSINFO => ret(sys_sysinfo(args[0])),
         nr::EVENTFD2 => ret(st.fds.eventfd_create(args[0], args[1])),
+        // timerfd (docs/LINUX-COMPAT.md L8-TIMERFD): the libuv event-loop timer
+        // source. A per-cell fd over the timerfd registry; a deadline is an
+        // ordinary cell-clock wait, epoll-pollable.
+        nr::TIMERFD_CREATE => ret(st.fds.timerfd_create(args[0], args[1])),
+        nr::TIMERFD_SETTIME => ret(sys_timerfd_settime(st, args[0], args[1], args[2], args[3])),
+        nr::TIMERFD_GETTIME => ret(sys_timerfd_gettime(st, args[0], args[1])),
+        // capget: a non-root process's capability query (Node probes it 9x at
+        // startup). Our identity is unprivileged, so every capability mask is 0.
+        nr::CAPGET => ret(sys_capget(args[0], args[1])),
         nr::CLOSE_RANGE => ret(st.fds.close_range(args[0], args[1], args[2])),
+        // clone3(clone_args*, size): the modern thread/process creation call.
+        // glibc's `pthread_create` tries `clone3` and falls back to `clone` on
+        // ENOSYS - but a runtime that issues `clone3` *directly* (Bun's JSC/Zig
+        // threading does, never the legacy `clone`) gets no fallback, so ENOSYS
+        // there is a hard thread-spawn failure and the process aborts. It is the
+        // same operation as `clone` with a struct-shaped argument, so decode the
+        // struct and route to the identical path (docs/LINUX-COMPAT.md, GOAL-BUN).
+        nr::CLONE3 => sys_clone3(cur, frame, args[0], args[1]),
         // Defined-but-never-dispatched before, so these logged `ENOSYS nr=<n>` as if
         // the number were unknown. They are known, and refusing them is the
-        // *correct* answer - glibc's documented fallbacks are `clone` for `clone3`
-        // and "no restartable sequences" for `rseq` - so say so deliberately
-        // instead of by accident (docs/ARCHITECTURE-DEBT.md 4.0, blocker 3).
-        nr::CLONE3 | nr::RSEQ => err(errno::ENOSYS),
+        // *correct* answer - glibc's documented fallback for `rseq` is "no
+        // restartable sequences" - so say so deliberately instead of by accident
+        // (docs/ARCHITECTURE-DEBT.md 4.0, blocker 3). io_uring joins it: Node/libuv
+        // probes it and falls back to epoll+threadpool on ENOSYS - our async path is
+        // the queue-pair reactor, not io_uring, so this refusal is a design
+        // statement, not a gap (docs/LINUX-COMPAT.md).
+        nr::RSEQ | nr::IO_URING_SETUP | nr::IO_URING_ENTER | nr::IO_URING_REGISTER => {
+            err(errno::ENOSYS)
+        }
 
         // -- resource limits --
         nr::PRLIMIT64 => ret(sys_prlimit64(cur, args[1], args[2], args[3])),
@@ -752,6 +779,11 @@ fn ptr_args_ok(nr_val: u64, args: &[u64; 6]) -> bool {
             rd(0, 4) && (!takes_timespec || rd_opt(3, 16))
         }
         nr::CLONE => wr_opt(2, 4), // parent_tid; child_tid is validated on use
+        // clone3's `struct clone_args` is NOT bounded here: like Linux, `sys_clone3`
+        // checks the `size` argument *first* (size 0 -> EINVAL) before dereferencing
+        // the pointer, and then reads each field through `uaccess` (EFAULT if
+        // unreadable). Bounding arg 0 here would turn the legitimate size-0 probe
+        // into EFAULT before the size check could run.
         nr::EXECVE => rd(0, 1) && rd(1, 8) && rd_opt(2, 8),
         nr::WAIT4 => wr_opt(1, 4),
         nr::PIPE | nr::PIPE2 => wr(0, 8),
@@ -883,6 +915,24 @@ fn sys_read(cur: usize, st: &mut LinuxState, fd: i64, buf: u64, count: u64) -> C
                     proc::block_eventfd_read(cur, buf, count, ev)
                 } else {
                     err(errno::EAGAIN)
+                }
+            }
+            Err(e) => ret(e),
+        };
+    }
+    // A timerfd read returns the expiration count; an unexpired timer parks on its
+    // **deadline** (docs/LINUX-COMPAT.md L8-TIMERFD). Unlike an eventfd, the wake
+    // source is the cell clock, not a peer, so a single-threaded program blocks
+    // correctly with no runnable sibling - the scheduler idles on the timer, exactly
+    // as `nanosleep` does.
+    if let Some(tf) = st.fds.timerfd_of(fd) {
+        return match timerfd::read(tf, buf, count) {
+            Ok(timerfd::ReadNb::Done) => ret(8),
+            Ok(timerfd::ReadNb::WouldBlock) => {
+                if nb {
+                    err(errno::EAGAIN)
+                } else {
+                    proc::block_timerfd_read(cur, buf, count, tf)
                 }
             }
             Err(e) => ret(e),
@@ -1226,6 +1276,107 @@ fn sys_nanosleep(cur: usize, absolute_arg: bool, flags: u64, req_va: u64) -> Ctl
     proc::block_timer(cur, deadline)
 }
 
+/// Read a `struct itimerspec` (it_interval then it_value, two `timespec`s = 32
+/// bytes) from cell VA `va`, returning `(interval_ns, value_ns)`; `None` on a bad
+/// timespec or an unreadable buffer. Resolved through `uaccess`, so it is bounds-
+/// and presence-checked (the `_ => true` ptr row applies, like `nanosleep`).
+fn read_itimerspec(va: u64) -> Option<(u64, u64)> {
+    let isec = crate::uaccess::read_unaligned::<i64>(va)?;
+    let insec = crate::uaccess::read_unaligned::<i64>(va + 8)?;
+    let vsec = crate::uaccess::read_unaligned::<i64>(va + 16)?;
+    let vnsec = crate::uaccess::read_unaligned::<i64>(va + 24)?;
+    if isec < 0
+        || !(0..1_000_000_000).contains(&insec)
+        || vsec < 0
+        || !(0..1_000_000_000).contains(&vnsec)
+    {
+        return None;
+    }
+    let interval = (isec as u64).saturating_mul(1_000_000_000) + insec as u64;
+    let value = (vsec as u64).saturating_mul(1_000_000_000) + vnsec as u64;
+    Some((interval, value))
+}
+
+/// Write a `struct itimerspec` to cell VA `va`; false on an unwritable buffer.
+fn write_itimerspec(va: u64, interval_ns: u64, value_ns: u64) -> bool {
+    let split = |ns: u64| ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64);
+    let (isec, insec) = split(interval_ns);
+    let (vsec, vnsec) = split(value_ns);
+    crate::uaccess::write_unaligned::<i64>(va, isec)
+        && crate::uaccess::write_unaligned::<i64>(va + 8, insec)
+        && crate::uaccess::write_unaligned::<i64>(va + 16, vsec)
+        && crate::uaccess::write_unaligned::<i64>(va + 24, vnsec)
+}
+
+/// timerfd_settime(fd, flags, new, old): arm/disarm the timer; `old` (if non-null)
+/// receives the prior setting (docs/LINUX-COMPAT.md L8-TIMERFD).
+fn sys_timerfd_settime(st: &mut LinuxState, fd: u64, flags: u64, new_va: u64, old_va: u64) -> i64 {
+    let Some(tf) = st.fds.timerfd_of(fd as i64) else {
+        return -errno::EINVAL;
+    };
+    let Some((interval_ns, value_ns)) = read_itimerspec(new_va) else {
+        return -errno::EFAULT;
+    };
+    let abstime = flags & timerfd::TFD_TIMER_ABSTIME != 0;
+    let prev = timerfd::settime(tf, abstime, value_ns, interval_ns);
+    if old_va != 0 && !write_itimerspec(old_va, prev.interval_ns, prev.value_ns) {
+        return -errno::EFAULT;
+    }
+    0
+}
+
+/// capget(hdrp, datap): a non-root process's capability sets - all empty
+/// (docs/LINUX-COMPAT.md). glibc/Node probe the supported version: an unknown
+/// version makes the kernel write its preferred one back and return `-EINVAL`; a
+/// known version with a data pointer fills the cap masks. Our identity is
+/// unprivileged (uid 1000, no capabilities), so every mask is 0 - the honest
+/// answer, not a stub claiming capabilities the process does not have. Version 1
+/// has one `cap_user_data_t`, versions 2/3 have two (64-bit caps).
+fn sys_capget(hdr_va: u64, data_va: u64) -> i64 {
+    const V1: u32 = 0x1998_0330;
+    const V2: u32 = 0x2007_1026;
+    const V3: u32 = 0x2008_0522;
+    if hdr_va == 0 {
+        return -errno::EFAULT;
+    }
+    let Some(version) = crate::uaccess::read_unaligned::<u32>(hdr_va) else {
+        return -errno::EFAULT;
+    };
+    let entries: u64 = match version {
+        V1 => 1,
+        V2 | V3 => 2,
+        _ => {
+            // Probe protocol: report the version we support, then -EINVAL.
+            crate::uaccess::write_unaligned::<u32>(hdr_va, V3);
+            return -errno::EINVAL;
+        }
+    };
+    // A NULL data pointer is a version probe: succeed without filling.
+    if data_va != 0 {
+        // Each `cap_user_data_t` is { effective, permitted, inheritable } = 3 u32.
+        for i in 0..entries {
+            for k in 0..3u64 {
+                if !crate::uaccess::write_unaligned::<u32>(data_va + i * 12 + k * 4, 0) {
+                    return -errno::EFAULT;
+                }
+            }
+        }
+    }
+    0
+}
+
+/// timerfd_gettime(fd, cur): the time until the next expiry + the period.
+fn sys_timerfd_gettime(st: &mut LinuxState, fd: u64, cur_va: u64) -> i64 {
+    let Some(tf) = st.fds.timerfd_of(fd as i64) else {
+        return -errno::EINVAL;
+    };
+    let it = timerfd::gettime(tf);
+    if !write_itimerspec(cur_va, it.interval_ns, it.value_ns) {
+        return -errno::EFAULT;
+    }
+    0
+}
+
 /// newfstatat(dirfd, path, statbuf, flags). AT_EMPTY_PATH (0x1000) with an
 /// empty path degenerates to fstat(dirfd); otherwise an absolute path is
 /// stat'd through the VFS.
@@ -1238,15 +1389,31 @@ fn sys_newfstatat(st: &mut LinuxState, args: &[u64; 6]) -> i64 {
     let Some(o) = crate::svc::file_ops() else {
         return -errno::ENOENT;
     };
-    let mut native = crate::abi::Stat { size: 0, kind: 0 };
+    let mut native = crate::abi::Stat {
+        size: 0,
+        kind: 0,
+        ino: 0,
+    };
     let r = (o.stat)(args[1], path_len as u64, &mut native as *mut _ as u64);
     if r < 0 {
         return r;
     }
     let mode = dirent::mode_for_kind(native.kind);
     let blocks = native.size.div_ceil(512);
-    let stat =
-        crate::arch::linux_abi::Stat::new(mode, native.size, 1, 1, 1000, 1000, 0, 4096, blocks, 0);
+    // `native.ino` is the VFS inode - distinct per file, which ld.so needs to tell
+    // two libraries apart (docs/LINUX-COMPAT.md).
+    let stat = crate::arch::linux_abi::Stat::new(
+        mode,
+        native.size,
+        native.ino,
+        1,
+        1000,
+        1000,
+        0,
+        4096,
+        blocks,
+        0,
+    );
     // SAFETY: statbuf is a writable VA in the calling cell.
     unsafe { (args[2] as *mut crate::arch::linux_abi::Stat).write(stat) };
     0
@@ -1301,7 +1468,7 @@ fn sys_statx(st: &mut LinuxState, args: &[u64; 6]) -> i64 {
     const AT_EMPTY_PATH: u64 = 0x1000;
     const STATX_BASIC_STATS: u32 = 0x0000_07ff;
     let path_len = strlen(args[1]);
-    let (mode, size) = if path_len == 0 && args[2] & AT_EMPTY_PATH != 0 {
+    let (mode, size, ino) = if path_len == 0 && args[2] & AT_EMPTY_PATH != 0 {
         match st.fds.mode_size(dirfd(args[0])) {
             Ok(v) => v,
             Err(e) => return e,
@@ -1310,12 +1477,16 @@ fn sys_statx(st: &mut LinuxState, args: &[u64; 6]) -> i64 {
         let Some(o) = crate::svc::file_ops() else {
             return -errno::ENOENT;
         };
-        let mut native = crate::abi::Stat { size: 0, kind: 0 };
+        let mut native = crate::abi::Stat {
+            size: 0,
+            kind: 0,
+            ino: 0,
+        };
         let r = (o.stat)(args[1], path_len as u64, &mut native as *mut _ as u64);
         if r < 0 {
             return r;
         }
-        (dirent::mode_for_kind(native.kind), native.size)
+        (dirent::mode_for_kind(native.kind), native.size, native.ino)
     };
     let stx = Statx {
         stx_mask: STATX_BASIC_STATS,
@@ -1324,7 +1495,7 @@ fn sys_statx(st: &mut LinuxState, args: &[u64; 6]) -> i64 {
         stx_uid: 1000,
         stx_gid: 1000,
         stx_mode: mode as u16,
-        stx_ino: 1,
+        stx_ino: ino,
         stx_size: size,
         stx_blocks: size.div_ceil(512),
         ..Default::default()
@@ -1370,7 +1541,11 @@ fn sys_faccessat(path_va: u64) -> i64 {
     let Some(o) = crate::svc::file_ops() else {
         return -errno::ENOENT;
     };
-    let mut native = crate::abi::Stat { size: 0, kind: 0 };
+    let mut native = crate::abi::Stat {
+        size: 0,
+        kind: 0,
+        ino: 0,
+    };
     let r = (o.stat)(
         path_va,
         strlen(path_va) as u64,
@@ -1468,6 +1643,49 @@ fn sys_clock_gettime(clk_id: u64, ts_va: u64) -> i64 {
     0
 }
 
+/// gettimeofday(tv, tz): the legacy wall-clock read, from the same REALTIME
+/// domain as `clock_gettime` (`cell_clock_ns(true)`), reported as seconds +
+/// **micro**seconds. `tz` (the obsolete timezone) is ignored. libuv calls this
+/// directly and asserts it returns 0, so it must succeed (docs/LINUX-COMPAT.md).
+fn sys_gettimeofday(tv_va: u64) -> i64 {
+    if tv_va == 0 {
+        return 0; // a NULL tv is a no-op success (only tz was wanted)
+    }
+    let ns = cell_clock_ns(true);
+    let secs = (ns / 1_000_000_000) as i64;
+    let usec = (ns % 1_000_000_000 / 1_000) as i64;
+    if !crate::uaccess::write::<i64>(tv_va, secs) || !crate::uaccess::write::<i64>(tv_va + 8, usec)
+    {
+        return -errno::EFAULT;
+    }
+    0
+}
+
+/// clock_getres(clk_id, res): the clock's resolution. This OS's clock is derived
+/// from the cycle counter via `arch::ticks_to_ns`, so it is nanosecond-granular;
+/// report `{0 s, 1 ns}`. `clk_id` is not validated (every clock shares the one
+/// source). A NULL `res` is success (glibc/V8 probe the clock's existence).
+fn sys_clock_getres(res_va: u64) -> i64 {
+    if res_va == 0 {
+        return 0;
+    }
+    if !crate::uaccess::write::<i64>(res_va, 0) || !crate::uaccess::write::<i64>(res_va + 8, 1) {
+        return -errno::EFAULT;
+    }
+    0
+}
+
+/// time(tloc): whole-second REALTIME wall clock (the same domain as
+/// `gettimeofday`/`clock_gettime`). Returns the seconds; if `tloc` is non-NULL it
+/// is also written there. x86-64 only (asm-generic glibc uses `clock_gettime`).
+fn sys_time(tloc_va: u64) -> i64 {
+    let secs = (cell_clock_ns(true) / 1_000_000_000) as i64;
+    if tloc_va != 0 && !crate::uaccess::write::<i64>(tloc_va, secs) {
+        return -errno::EFAULT;
+    }
+    secs
+}
+
 /// getrandom(buf, count, flags): fill from the cell's DRBG (docs/
 /// TIME-IDENTITY.md 4). Flags are ignored - the source never blocks.
 fn sys_getrandom(buf: u64, count: u64) -> i64 {
@@ -1510,6 +1728,59 @@ const SCHED_OTHER: u64 = 0;
 /// answer is the same `-EPERM` an unprivileged Linux process gets, which every
 /// caller already handles, rather than a success that changes nothing. An unknown
 /// policy number is `-EINVAL`.
+/// clone3(cl_args, size): decode `struct clone_args` and route to the same
+/// thread/process creation path as legacy `clone` (docs/LINUX-COMPAT.md, GOAL-BUN).
+///
+/// The struct (uapi/linux/sched.h) is a run of `__aligned_u64` fields; only the
+/// first version (`CLONE_ARGS_SIZE_VER0` = 64 bytes, through `tls`) is required, so
+/// fields past `size` read as 0. The one shape difference from `clone`: `stack` is
+/// the **lowest** byte of the child stack and `stack_size` its length, where legacy
+/// `clone` passes the stack *top* directly - so the child SP is `stack + stack_size`
+/// (and `stack == 0` means "share the caller's stack", the fork shape).
+fn sys_clone3(cell: usize, frame: *mut TrapFrame, args_va: u64, size: u64) -> Ctl {
+    // Field offsets within `struct clone_args`.
+    const F_FLAGS: u64 = 0;
+    const F_CHILD_TID: u64 = 16;
+    const F_PARENT_TID: u64 = 24;
+    const F_STACK: u64 = 40;
+    const F_STACK_SIZE: u64 = 48;
+    const F_TLS: u64 = 56;
+    const VER0: u64 = 64;
+    if args_va == 0 || size < VER0 {
+        return err(errno::EINVAL);
+    }
+    // Each field is bounds-checked + faulted-in through `uaccess`; a missing one
+    // refuses the call rather than reading kernel memory.
+    let rd = |off: u64| crate::uaccess::read_unaligned::<u64>(args_va + off);
+    let (Some(flags), Some(child_tid), Some(parent_tid), Some(stack), Some(stack_size), Some(tls)) = (
+        rd(F_FLAGS),
+        rd(F_CHILD_TID),
+        rd(F_PARENT_TID),
+        rd(F_STACK),
+        rd(F_STACK_SIZE),
+        rd(F_TLS),
+    ) else {
+        return err(errno::EFAULT);
+    };
+    if proc::is_fork(flags) {
+        // A `clone3` without CLONE_VM is a new process (Bun uses CLONE_VM threads,
+        // but keep the fork path complete). `stack == 0` shares the caller's stack.
+        ret(proc::fork(cell, frame))
+    } else {
+        // clone3 gives the stack base + length; the SP starts at the top.
+        let child_stack = stack.saturating_add(stack_size);
+        ret(thread::clone(
+            cell,
+            frame,
+            flags,
+            child_stack,
+            parent_tid,
+            child_tid,
+            tls,
+        ))
+    }
+}
+
 fn sys_sched_setscheduler(policy: u64, param_va: u64) -> i64 {
     const SCHED_FIFO: u64 = 1;
     const SCHED_RR: u64 = 2;

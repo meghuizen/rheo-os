@@ -86,6 +86,35 @@ macro_rules! glibc_rust {
     }};
 }
 
+/// `include_bytes!` the static-glibc **JavaScript engine** fixture (`boa`), built
+/// by `xtask::build_linux_fixtures` - a real language runtime, the on-goal proxy
+/// for Node/Claude Code (docs/LINUX-COMPAT.md).
+macro_rules! glibc_js {
+    () => {{
+        #[cfg(target_arch = "x86_64")]
+        {
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/linux-fixtures/jsdemo/target/x86_64-unknown-linux-gnu/release/jsdemo"
+            ))
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/linux-fixtures/jsdemo/target/aarch64-unknown-linux-gnu/release/jsdemo"
+            ))
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/linux-fixtures/jsdemo/target/riscv64gc-unknown-linux-gnu/release/jsdemo"
+            ))
+        }
+    }};
+}
+
 /// `include_bytes!` the static-glibc C fixture (L2).
 macro_rules! glibc_c {
     () => {{
@@ -116,6 +145,7 @@ macro_rules! glibc_c {
 static LINUXHELLO: &[u8] = bare_fixture!("linuxhello");
 static LINUXAUXV: &[u8] = bare_fixture!("linuxauxv");
 static RUSTHELLO: &[u8] = glibc_rust!();
+static JSDEMO: &[u8] = glibc_js!();
 static CHELLO: &[u8] = glibc_c!();
 
 static mut OBJECTS: ObjectTable = ObjectTable::new();
@@ -252,6 +282,13 @@ extern "C" fn kernel_main() -> ! {
         b"rust glibc: squares sum 30\n",
     );
     expect_stdout("chello", CHELLO, &[b"chello"], 9, b"hello from glibc C\n");
+
+    // A real JavaScript engine (pure-Rust `boa`, ~10 MB) running unmodified - the
+    // on-goal proxy for Node/Claude Code. It evaluates real JS (a function, an
+    // array `reduce`, a closure, string concat) and prints the result, exercising
+    // the engine's parser, bytecode VM, heap and GC over the personality's syscall
+    // surface and the demand-paged loader at scale (docs/LINUX-COMPAT.md).
+    expect_stdout("jsdemo", JSDEMO, &[b"jsdemo"], 0, b"js: rheo:42\n");
 
     println!("linuxrun: PASS");
     arch::exit(arch::ExitCode::Success)

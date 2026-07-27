@@ -100,6 +100,7 @@ impl FileSystem for RamFs {
             } else {
                 0o644
             },
+            node,
         })
     }
 
