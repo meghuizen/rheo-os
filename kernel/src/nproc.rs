@@ -471,9 +471,12 @@ pub unsafe fn block_console(cur: usize, buf_va: u64, len: usize) -> Option<*mut 
     if len == 0 || !can_reschedule(cur) {
         return None;
     }
-    // SAFETY: the caller range-checked `[buf_va, buf_va+len)` in the active cell.
-    if crate::input::has_data() && unsafe { crate::input::drain(buf_va, len) } > 0 {
-        return None; // data was already there: `wait_input` returns it directly
+    // Bytes are already buffered: let `wait_input` return them directly rather than
+    // parking. Deliberately a *peek* (`has_data`) and not a drain - draining here and
+    // then letting `wait_input` drain again would write the first bytes to the
+    // caller's buffer and immediately overwrite them with the next ones.
+    if crate::input::has_data() {
+        return None;
     }
     ensure_tracked(cur);
     park(cur, Block::Console { buf_va, len })
@@ -737,10 +740,8 @@ fn refresh_deadlines() {
                     *s = deadline_ns;
                 }
             }
-            Block::Net { deadline_ns, .. } if deadline_ns != 0 => {
-                if deadline_ns < net_nearest {
-                    net_nearest = deadline_ns;
-                }
+            Block::Net { deadline_ns, .. } if deadline_ns != 0 && deadline_ns < net_nearest => {
+                net_nearest = deadline_ns;
             }
             _ => {}
         }

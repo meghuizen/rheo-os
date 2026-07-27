@@ -12,13 +12,11 @@ use crate::event::{self, EventStream};
 use crate::graph::{Graph, Input};
 use crate::lease::Lease;
 use crate::rng::{self, Drbg};
-use crate::sched::Admission;
 use crate::time;
 use crate::{mm, pty, user};
 
 static mut DRBG: Drbg = Drbg::ZERO;
 static mut EVENTS: EventStream = EventStream::new();
-static mut ADMISSION: Admission = Admission::new();
 static mut ENGINE: Engine = Engine::cpu();
 static mut READY: bool = false;
 
@@ -66,10 +64,22 @@ pub fn handle(nr: u64, args: &[u64; 6]) -> Option<u64> {
         }
         SYS_EVENT_COUNT => Some(((events().buffered() as u64) << 32) | events().total()),
         SYS_GRAPH => Some(run_demo_graph(arg)),
+        // The **legacy** reserve verb (the `lsh` `reserve` builtin). It admits
+        // against the machine-wide ledger (docs/ARCHITECTURE-DEBT.md 2.5) - it used
+        // to keep a *second, private* global controller for the same object, so the
+        // two disagreed about how much of the CPU was committed.
+        //
+        // Honest scope, because it matters: this verb has **no release**. It
+        // discards its `Reservation` handle, so its utilisation is charged for the
+        // life of the boot and only ever grows. That is exactly why `lsh`'s second
+        // `reserve 8 10` is refused after `reserve 3 10` succeeded - the demo relies
+        // on the accumulation. It is a cumulative *probe*, not a managed
+        // reservation; `SYS_RESERVE_ADMIT`/`RELEASE` (object 7) is the real surface
+        // and is capability-gated and releasable.
         SYS_RESERVE => {
             let budget = arg >> 32;
             let period = arg & 0xFFFF_FFFF;
-            let admission = unsafe { &mut *core::ptr::addr_of_mut!(ADMISSION) };
+            let admission = crate::sched::system();
             match admission.admit(budget, period, period) {
                 Ok(_) => Some(admission.committed_ppm()),
                 Err(_) => Some(u64::MAX),
@@ -319,6 +329,14 @@ pub struct SocketOps {
     /// Receive up to `len` bytes into `buf_va`, blocking up to `timeout_ns`.
     /// Returns bytes (0 = peer closed) or `-errno`.
     pub tcp_recv: fn(h: u64, buf_va: u64, len: u64, timeout_ns: u64) -> i64,
+    /// Whether bytes are already queued for `h`, or the peer has closed - the
+    /// `poll`/`epoll` readiness probe (docs/ARCHITECTURE-DEBT.md 2.4). Its absence
+    /// **was** the Linux personality's hardcoded `pollin_ready => true` for a remote
+    /// TCP socket: with no way to ask, the only answer that let a poll-then-read
+    /// caller reach the blocking `tcp_recv` was to claim readable always. Like
+    /// [`SocketOps::udp_pending`] this pumps the receive path first, so it reports
+    /// what has actually arrived.
+    pub tcp_pending: fn(h: u64) -> bool,
     /// Close a connected handle (sends a FIN, releases the slot).
     pub tcp_close: fn(h: u64),
 }

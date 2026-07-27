@@ -49,6 +49,59 @@ enum Block {
         count: u64,
         idx: usize,
     },
+    /// `nanosleep`/`clock_nanosleep`: parked until `deadline_ns` in the **cell's own
+    /// clock domain** (`linux::cell_clock_ns`) - the domain the program's own
+    /// `clock_gettime` reports, so a sleep of N ns is N ns *as the program measures
+    /// it* (docs/ENGINEERING.md 11: clock domains are not interchangeable).
+    Timer {
+        deadline_ns: u64,
+    },
+    /// `read` on an empty console (stdin). Parked until a byte is buffered or input
+    /// ends (docs/ARCHITECTURE-DEBT.md 2.4 - it used to answer 0, i.e. "end of
+    /// input", which is a lie to every reader).
+    Console {
+        buf_va: u64,
+        count: u64,
+    },
+    /// `poll`/`ppoll`: parked until one of the descriptors in the cell's copied poll
+    /// set is ready, or `deadline_ns` (cell clock domain; 0 = indefinite) passes.
+    Poll {
+        fds_va: u64,
+        nfds: usize,
+        deadline_ns: u64,
+        sources: crate::idle::Sources,
+    },
+    /// `epoll_wait`/`epoll_pwait`: as `Poll`, over the epoll instance's own watch
+    /// list (which already lives in kernel state, so nothing is copied).
+    Epoll {
+        epfd: i64,
+        events_va: u64,
+        maxevents: usize,
+        deadline_ns: u64,
+        sources: crate::idle::Sources,
+    },
+}
+
+/// Descriptors a single `poll` call may block on. A larger set keeps the
+/// pre-existing non-blocking probe (documented): the array lives in the **cell's**
+/// address space, which is not active while the scheduler judges satisfiability, so
+/// the request has to be copied into kernel state - and the kernel is
+/// allocation-free, so that copy is a fixed array.
+pub const POLL_MAX: usize = 64;
+
+/// One copied `pollfd` request (the `revents` field is recomputed at completion).
+#[derive(Copy, Clone)]
+struct PollReq {
+    fd: i32,
+    events: i16,
+}
+
+static mut POLLSET: [[PollReq; POLL_MAX]; MAX_CELLS] =
+    [[PollReq { fd: -1, events: 0 }; POLL_MAX]; MAX_CELLS];
+
+fn pollset(cell: usize) -> &'static mut [PollReq; POLL_MAX] {
+    // SAFETY: single CPU, synchronous traps; one cell runs at a time.
+    unsafe { &mut (*addr_of_mut!(POLLSET))[cell] }
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -477,24 +530,119 @@ fn reschedule(leaving: usize) -> Ctl {
     // Save the outgoing cell's live FP state (harmless if it is exiting).
     thread::save_current_fp(user::current_index());
 
-    // Wake blocked cells whose condition now holds.
-    for i in 0..MAX_CELLS {
-        if procs()[i].state == PState::Blocked && satisfiable(i) {
-            procs()[i].state = PState::Runnable;
+    loop {
+        // Wake blocked cells whose condition now holds.
+        for i in 0..MAX_CELLS {
+            if procs()[i].state == PState::Blocked && satisfiable(i) {
+                procs()[i].state = PState::Runnable;
+            }
+        }
+
+        let next = (1..=MAX_CELLS)
+            .map(|k| (leaving + k) % MAX_CELLS)
+            .find(|&i| user::cell_present(i) && procs()[i].state == PState::Runnable);
+        if let Some(n) = next {
+            user::switch_to_cell(n);
+            thread::restore_current(n);
+            complete_block(n);
+            return Ctl::Switch(thread::current_frame(n));
+        }
+
+        // Nothing runnable. Idle on whatever the blocked cells are waiting for
+        // instead of panicking (docs/ARCHITECTURE-DEBT.md 2.4): "every process is
+        // waiting for the outside world" is a server's normal steady state, and
+        // before this it was not an expressible one - which is what made a process
+        // blocked awaiting a network reply, by definition the only runnable thing,
+        // impossible.
+        let src = blocked_sources();
+        if src & crate::idle::WAITABLE == 0 {
+            return report_deadlock(src);
+        }
+        // A cell-clock deadline cannot be armed on the hardware one-shot directly -
+        // they are different counters on RISC-V - so an outstanding one is honoured
+        // by bounded slices, each followed by a re-read of the cell clock. Exactly
+        // the futex-timeout pattern (docs/LINUX-COMPAT.md, the `futex` row).
+        if src & crate::idle::TIMER != 0 {
+            crate::ktimer::register(crate::ktimer::TimerClient::CellSleep, SLEEP_SLICE_NS);
+        }
+        crate::idle::wait(src);
+        if src & crate::idle::TIMER != 0 {
+            crate::ktimer::cancel(crate::ktimer::TimerClient::CellSleep);
         }
     }
+}
 
-    let next = (1..=MAX_CELLS)
-        .map(|k| (leaving + k) % MAX_CELLS)
-        .find(|&i| user::cell_present(i) && procs()[i].state == PState::Runnable);
-    let Some(n) = next else {
-        panic!("linux: no runnable cell (process scheduler deadlock)");
-    };
+/// How long the scheduler halts before re-reading the cell clock for an outstanding
+/// `nanosleep`/`poll` deadline. 1 ms: long enough that the halt is worth taking,
+/// short enough that the overshoot past a deadline stays small. Same constant and
+/// same reasoning as the futex timeout's park slice.
+const SLEEP_SLICE_NS: u64 = 1_000_000;
 
-    user::switch_to_cell(n);
-    thread::restore_current(n);
-    complete_block(n);
-    Ctl::Switch(thread::current_frame(n))
+/// The union of wake sources every blocked cell is waiting on ([`crate::idle`]).
+fn blocked_sources() -> crate::idle::Sources {
+    let mut src = 0;
+    for i in 0..MAX_CELLS {
+        if procs()[i].state == PState::Blocked {
+            src |= sources_of(i);
+        }
+    }
+    src
+}
+
+/// The wake sources cell `i`'s current block can be satisfied by.
+fn sources_of(i: usize) -> crate::idle::Sources {
+    use crate::idle;
+    match procs()[i].block {
+        Block::None => 0,
+        // A pipe/socket ring or a child exit is another *process*'s doing.
+        Block::Wait { .. } | Block::PipeRead { .. } | Block::PipeWrite { .. } => idle::PEER,
+        Block::Timer { .. } => idle::TIMER,
+        Block::Console { .. } => idle::CONSOLE,
+        // Computed when the block was registered, from the descriptors it watches.
+        Block::Poll { sources, .. } | Block::Epoll { sources, .. } => sources,
+    }
+}
+
+/// The union of wake sources the Linux process scheduler is blocked on - the
+/// classifier its idle/deadlock decision is made from, exposed so a test can assert
+/// it directly (docs/ENGINEERING.md 1).
+pub fn wake_sources() -> crate::idle::Sources {
+    blocked_sources()
+}
+
+/// Nothing runnable and no blocked process has a wake source left: a genuine
+/// deadlock. Name each blocked process and what it waits on, then end the run with
+/// [`crate::abi::DEADLOCK_EXIT`] - a diagnostic instead of a kernel stack trace that
+/// mentions no process (docs/ARCHITECTURE-DEBT.md 2.4).
+fn report_deadlock(src: crate::idle::Sources) -> Ctl {
+    crate::println!(
+        "linux: DEADLOCK - no runnable process, no wake source (waiting on {})",
+        crate::idle::describe(src)
+    );
+    for i in 0..MAX_CELLS {
+        if procs()[i].state == PState::Blocked {
+            crate::println!(
+                "linux:   pid {} (cell {i}) blocked on {}",
+                procs()[i].pid,
+                block_name(i)
+            );
+        }
+    }
+    Ctl::Exit(crate::abi::DEADLOCK_EXIT)
+}
+
+/// The name of cell `i`'s block, for the deadlock diagnostic.
+fn block_name(i: usize) -> &'static str {
+    match procs()[i].block {
+        Block::None => "nothing",
+        Block::Wait { .. } => "wait4 (child exit)",
+        Block::PipeRead { .. } => "read (empty pipe/socket)",
+        Block::PipeWrite { .. } => "write (full pipe/socket)",
+        Block::Timer { .. } => "nanosleep (deadline)",
+        Block::Console { .. } => "read (console)",
+        Block::Poll { .. } => "poll (fd readiness)",
+        Block::Epoll { .. } => "epoll_wait (fd readiness)",
+    }
 }
 
 /// Whether blocked cell `i`'s wait condition is now satisfiable.
@@ -503,8 +651,42 @@ fn satisfiable(i: usize) -> bool {
         Block::Wait { want, .. } => find_zombie_child(i, want).is_some() || !has_child(i, want),
         Block::PipeRead { idx, .. } => pipe::has_data(idx) || pipe::writers(idx) == 0,
         Block::PipeWrite { idx, .. } => pipe::has_space(idx) || pipe::readers(idx) == 0,
+        Block::Timer { deadline_ns } => super::cell_clock_ns(false) >= deadline_ns,
+        Block::Console { .. } => crate::input::has_data() || crate::input::at_eof(),
+        Block::Poll {
+            nfds, deadline_ns, ..
+        } => {
+            poll_ready_count(i, nfds) > 0
+                || (deadline_ns != 0 && super::cell_clock_ns(false) >= deadline_ns)
+        }
+        Block::Epoll {
+            epfd, deadline_ns, ..
+        } => {
+            super::state(i).fds.epoll_ready(epfd) > 0
+                || (deadline_ns != 0 && super::cell_clock_ns(false) >= deadline_ns)
+        }
         Block::None => false,
     }
+}
+
+/// How many of cell `i`'s copied poll requests are ready right now. Computed
+/// entirely from **kernel** state - the copied request array plus the cell's own fd
+/// table - because the cell's address space is not active while the scheduler judges
+/// this. Readiness for a remote (NIC-backed) socket pumps the datapath, which is
+/// what lets a `poll` on a DNS socket become ready when the reply lands.
+fn poll_ready_count(i: usize, nfds: usize) -> usize {
+    let set = pollset(i);
+    let st = super::state(i);
+    let mut ready = 0;
+    for r in set.iter().take(nfds.min(POLL_MAX)) {
+        if r.fd < 0 {
+            continue;
+        }
+        if super::poll_revents(&st.fds, r.fd as i64, r.events) != 0 {
+            ready += 1;
+        }
+    }
+    ready
 }
 
 /// Apply a woken cell's pending syscall (its address space is now active) and
@@ -528,7 +710,154 @@ fn complete_block(n: usize) {
             pipe::WriteNb::WouldBlock => 0,
             pipe::WriteNb::Epipe => -EPIPE,
         },
+        // A completed sleep returns 0 (the `rem` out-parameter is only written on an
+        // interruption, and no signal can interrupt a sleep here - documented).
+        Block::Timer { .. } => 0,
+        // SAFETY: `buf_va`/`count` were bounded against **this** cell's user VA
+        // range when the block was registered, and `n`'s address space is active
+        // again here (`switch_to_cell` above).
+        Block::Console { buf_va, count } => unsafe {
+            crate::input::drain(buf_va, count as usize) as i64
+        },
+        Block::Poll { fds_va, nfds, .. } => write_poll_result(n, fds_va, nfds),
+        Block::Epoll {
+            epfd,
+            events_va,
+            maxevents,
+            ..
+        } => super::state(n).fds.epoll_wait(epfd, events_va, maxevents),
     };
     // SAFETY: `frame` is `n`'s current-context saved state.
     unsafe { arch::set_syscall_ret(&mut *frame, r as u64) };
+}
+
+/// Recompute `revents` for cell `n`'s copied poll set and write it back into the
+/// caller's `pollfd` array (its address space is active), returning the ready count.
+/// A timeout that expired with nothing ready writes all-zero `revents` and returns
+/// 0, exactly as `poll(2)` specifies.
+fn write_poll_result(n: usize, fds_va: u64, nfds: usize) -> i64 {
+    let set = *pollset(n);
+    let st = super::state(n);
+    let mut ready = 0i64;
+    for (k, r) in set.iter().take(nfds.min(POLL_MAX)).enumerate() {
+        let revents = if r.fd < 0 {
+            0
+        } else {
+            super::poll_revents(&st.fds, r.fd as i64, r.events)
+        };
+        // SAFETY: the array was bounded to `nfds` entries in this cell's user VA
+        // range when the block was registered, and that space is active again.
+        unsafe {
+            let p = (fds_va as *mut i16).add(k * 4 + 3);
+            p.write(revents);
+        }
+        if revents != 0 {
+            ready += 1;
+        }
+    }
+    ready
+}
+
+// ------------------------------------------------- the four Linux blocking waits
+//
+// docs/ARCHITECTURE-DEBT.md 2.4. Each registers its condition and hands the CPU on;
+// `complete_block` finishes the syscall with the caller's address space active.
+// `None` means "do not park" - the caller keeps its pre-existing behaviour, which is
+// what makes each of these additive.
+
+/// Park `cur` until `deadline_ns` (cell clock domain) - `nanosleep`.
+pub fn block_timer(cur: usize, deadline_ns: u64) -> Ctl {
+    procs()[cur].state = PState::Blocked;
+    procs()[cur].block = Block::Timer { deadline_ns };
+    reschedule(cur)
+}
+
+/// Park `cur` on an empty console read - blocking `stdin`.
+pub fn block_console(cur: usize, buf_va: u64, count: u64) -> Ctl {
+    procs()[cur].state = PState::Blocked;
+    procs()[cur].block = Block::Console { buf_va, count };
+    reschedule(cur)
+}
+
+/// Copy `cur`'s `poll` request set into kernel state and park on it. `None` if the
+/// set is larger than [`POLL_MAX`] (the caller then keeps the non-blocking probe) or
+/// if no watched descriptor has any wake source at all - parking on that could never
+/// end, so the caller answers immediately instead (a wedge refused, not created).
+///
+/// # Safety
+/// `[fds_va, fds_va + nfds*8)` must be a `pollfd` array bounded to `cur`'s user VA
+/// range (the Linux dispatch does that for every `poll`, docs/ENGINEERING.md 12).
+pub unsafe fn block_poll(cur: usize, fds_va: u64, nfds: usize, deadline_ns: u64) -> Option<Ctl> {
+    if nfds > POLL_MAX {
+        return None;
+    }
+    let set = pollset(cur);
+    for (k, slot) in set.iter_mut().enumerate().take(nfds) {
+        // SAFETY: the array was bounded to `nfds` 8-byte entries in the active cell.
+        unsafe {
+            let p = (fds_va as *const i32).add(k * 2);
+            *slot = PollReq {
+                fd: p.read(),
+                events: (fds_va as *const i16).add(k * 4 + 2).read(),
+            };
+        }
+    }
+    let sources = poll_sources(cur, nfds, deadline_ns);
+    if sources & (crate::idle::WAITABLE | crate::idle::PEER) == 0 {
+        return None;
+    }
+    procs()[cur].state = PState::Blocked;
+    procs()[cur].block = Block::Poll {
+        fds_va,
+        nfds,
+        deadline_ns,
+        sources,
+    };
+    Some(reschedule(cur))
+}
+
+/// Park `cur` on an epoll instance. `None` when no watched descriptor has a wake
+/// source (as [`block_poll`]).
+pub fn block_epoll(
+    cur: usize,
+    epfd: i64,
+    events_va: u64,
+    maxevents: usize,
+    deadline_ns: u64,
+) -> Option<Ctl> {
+    let sources = super::state(cur).fds.epoll_sources(epfd)
+        | if deadline_ns != 0 {
+            crate::idle::TIMER
+        } else {
+            0
+        };
+    if sources & (crate::idle::WAITABLE | crate::idle::PEER) == 0 {
+        return None;
+    }
+    procs()[cur].state = PState::Blocked;
+    procs()[cur].block = Block::Epoll {
+        epfd,
+        events_va,
+        maxevents,
+        deadline_ns,
+        sources,
+    };
+    Some(reschedule(cur))
+}
+
+/// The wake sources cell `cur`'s copied poll set can be woken by.
+fn poll_sources(cur: usize, nfds: usize, deadline_ns: u64) -> crate::idle::Sources {
+    let set = pollset(cur);
+    let st = super::state(cur);
+    let mut src = if deadline_ns != 0 {
+        crate::idle::TIMER
+    } else {
+        0
+    };
+    for r in set.iter().take(nfds.min(POLL_MAX)) {
+        if r.fd >= 0 {
+            src |= st.fds.fd_sources(r.fd as i64);
+        }
+    }
+    src
 }

@@ -285,10 +285,9 @@ impl FdTable {
 
     /// pipe2(pipefd[2], flags): allocate a global cross-cell pipe and write the
     /// read and write fds (two `int`s) into `pipefd` (docs/LINUX-COMPAT.md L6).
-    /// `O_CLOEXEC` in `flags` is **honoured** (both ends are closed by `execve`);
-    /// `O_NONBLOCK` at creation is accepted and not honoured - see
-    /// [`FdTable::fcntl`] for why creation-time non-blocking is a separate,
-    /// named deferral from `fcntl(F_SETFL, O_NONBLOCK)`, which is honoured.
+    /// `O_CLOEXEC` and `O_NONBLOCK` in `flags` are both **honoured** on both ends
+    /// (docs/ARCHITECTURE-DEBT.md 2.4 - creation-time non-blocking used to be a named
+    /// deferral, blocked on `poll` computing real readiness).
     pub fn pipe2(&mut self, pipefd_va: u64, flags: u64) -> i64 {
         let Some(idx) = pipe::alloc() else {
             return -ENFILE;
@@ -317,6 +316,11 @@ impl FdTable {
         if flags & O_CLOEXEC != 0 {
             self.flags[rd].cloexec = true;
             self.flags[wr].cloexec = true;
+        }
+        // Creation-time O_NONBLOCK, honoured on both ends (see `set_open_flags`).
+        if flags & O_NONBLOCK != 0 {
+            self.flags[rd].nonblock = true;
+            self.flags[wr].nonblock = true;
         }
         // SAFETY: `pipefd_va` is a writable [i32; 2] in the calling cell.
         unsafe {
@@ -381,6 +385,12 @@ impl FdTable {
         usize_fd(fd).is_some_and(|s| matches!(self.fds[s], FdKind::Console(_)))
     }
 
+    /// True if `fd` is the **console input** descriptor - the one read that can
+    /// block on console input (docs/ARCHITECTURE-DEBT.md 2.4).
+    pub fn is_console_in(&self, fd: i64) -> bool {
+        usize_fd(fd).is_some_and(|s| matches!(self.fds[s], FdKind::Console(0)))
+    }
+
     /// True if `fd` refers to an open descriptor (used by `poll` to distinguish
     /// a valid fd from a closed one).
     pub fn is_open(&self, fd: i64) -> bool {
@@ -400,27 +410,26 @@ impl FdTable {
             return -EFAULT;
         }
         match self.fds[slot] {
+            // stdin. Bytes come from the kernel's console **RX ring**
+            // (`crate::input`), which is the same buffer the UART RX interrupt fills
+            // and the same one the scheduler drains when a parked reader wakes - so a
+            // blocking and a non-blocking read cannot disagree about what has
+            // arrived. `sys_read` decides *whether* to park before reaching here
+            // (docs/ARCHITECTURE-DEBT.md 2.4); this is the non-blocking drain.
+            //
+            // Before that, this read went straight to the UART FIFO and answered 0 on
+            // an empty console - "end of input", which was a lie to every reader.
             FdKind::Console(0) => {
-                // Non-blocking stdin: drain the serial RX FIFO (0 if empty).
-                let buf =
-                    unsafe { core::slice::from_raw_parts_mut(buf_va as *mut u8, count as usize) };
-                let mut n = 0;
-                while n < buf.len() {
-                    match arch::serial_read_byte() {
-                        Some(b) => {
-                            buf[n] = b;
-                            n += 1;
-                        }
-                        None => break,
+                // SAFETY: `[buf_va, buf_va+count)` was range-checked above and the
+                // calling cell's address space is active.
+                let n = unsafe { crate::input::drain(buf_va, count as usize) };
+                if n == 0 && count > 0 {
+                    if self.flags[slot].nonblock {
+                        return -EAGAIN;
                     }
-                }
-                // With O_NONBLOCK set, an empty FIFO is -EAGAIN, which is what
-                // Linux reports; without it the cell still must not park, so 0 is
-                // returned and the caller reads it as end-of-input (a documented
-                // limitation - the blocking console path is `SYS_WAIT_INPUT`, a
-                // native-cell primitive).
-                if n == 0 && count > 0 && self.flags[slot].nonblock {
-                    return -EAGAIN;
+                    // Reached only when the caller was allowed to see end of input
+                    // (`sys_read` parks otherwise).
+                    return 0;
                 }
                 n as i64
             }
@@ -625,14 +634,23 @@ impl FdTable {
         slot as i64
     }
 
-    /// Record the access mode and `O_CLOEXEC` an `openat` was given. Other status
-    /// bits (`O_APPEND`, `O_NONBLOCK`, ...) are **not** recorded here: they are
-    /// not honoured at open time (see [`FdTable::fcntl`]), and recording a flag
-    /// that changes no behaviour is exactly the shape of claim this personality
-    /// does not make (docs/ENGINEERING.md 7).
+    /// Record the access mode, `O_CLOEXEC` and `O_NONBLOCK` an `openat` was given.
+    ///
+    /// **Creation-time `O_NONBLOCK` is now honoured** (docs/ARCHITECTURE-DEBT.md
+    /// 2.4). It could not be before, and the reason is worth recording because it was
+    /// not laziness: `poll` reported every descriptor ready for whatever was asked,
+    /// so a program that opened a descriptor non-blocking, polled it, and then read it
+    /// would have been told "ready", read `-EAGAIN`, and spun forever. Honouring the
+    /// flag was only safe once `poll` computed real readiness - which is why the two
+    /// landed in the same slice.
+    ///
+    /// `O_APPEND`/`O_ASYNC` are still **refused** by `fcntl` rather than silently
+    /// accepted here (docs/ENGINEERING.md 7); a `VFS` open with them is a no-op
+    /// because the VFS has no append mode, which the honesty table states.
     fn set_open_flags(&mut self, slot: usize, flags: u64) {
         self.flags[slot] = FdFlags::new((flags & O_ACCMODE) as u8);
         self.flags[slot].cloexec = flags & O_CLOEXEC != 0;
+        self.flags[slot].nonblock = flags & O_NONBLOCK != 0;
     }
 
     /// close(fd).
@@ -762,14 +780,17 @@ impl FdTable {
     /// `O_ASYNC` are **refused** (`-EINVAL`) rather than accepted-and-dropped: this
     /// personality does not reposition on write and delivers no SIGIO.
     ///
-    /// Named deferral: `O_NONBLOCK`/`SOCK_NONBLOCK` given at **creation**
-    /// (`open`/`socket`/`accept4`/`pipe2`) is still accepted and not honoured. It
-    /// cannot be honoured before `poll` waits: `poll` currently reports every open
-    /// descriptor ready without consulting readiness at all, so a non-blocking
-    /// program's poll-then-read loop would spin and fail instead of blocking once.
-    /// glibc's resolver is exactly such a program (it creates its UDP socket with
-    /// `SOCK_NONBLOCK`), and it works today *because* the flag is dropped. Closing
-    /// this needs a waiting `poll`, which is its own slice of work.
+    /// **Creation-time** `O_NONBLOCK`/`SOCK_NONBLOCK` (`open`/`socket`/`socketpair`/
+    /// `accept4`/`pipe2`) is now honoured too (docs/ARCHITECTURE-DEBT.md 2.4). It
+    /// could not be before, and the reason is the interesting part: `poll` reported
+    /// every open descriptor ready without consulting readiness at all, so a
+    /// non-blocking program's poll-then-read loop would be told "ready", read
+    /// `-EAGAIN`, and spin. glibc's resolver is exactly such a program - it creates
+    /// its UDP socket with `SOCK_NONBLOCK` - and DNS worked *because* the flag was
+    /// dropped and its `recvfrom` therefore blocked. Honouring the flag is only
+    /// correct alongside a `poll` that computes real readiness **and waits** for it,
+    /// which is why both landed in one slice: the resolver now blocks in `poll` until
+    /// the reply is on the socket, then its non-blocking `recvfrom` succeeds.
     pub fn fcntl(&mut self, fd: i64, cmd: u64, arg: u64) -> i64 {
         const F_DUPFD: u64 = 0;
         const F_GETFD: u64 = 1;
@@ -1075,8 +1096,8 @@ impl FdTable {
 
     /// socket(domain, type, protocol): an unbound socket. AF_UNIX stream (L8) or
     /// an AF_INET/AF_INET6 loopback stream/datagram socket (L8-INET).
-    /// `SOCK_CLOEXEC` in the type's high bits is **honoured**; `SOCK_NONBLOCK` is
-    /// accepted and not honoured (the named deferral in [`FdTable::fcntl`]).
+    /// `SOCK_CLOEXEC` and `SOCK_NONBLOCK` (== `O_NONBLOCK`) in the type's high bits
+    /// are both **honoured** (docs/ARCHITECTURE-DEBT.md 2.4).
     pub fn socket(&mut self, domain: u64, ty: u64) -> i64 {
         match domain {
             AF_UNIX => {
@@ -1089,6 +1110,7 @@ impl FdTable {
                 self.fds[slot] = FdKind::SockFresh;
                 self.flags[slot] = FdFlags::new(ACC_RDWR);
                 self.flags[slot].cloexec = ty & O_CLOEXEC != 0;
+                self.flags[slot].nonblock = ty & O_NONBLOCK != 0;
                 slot as i64
             }
             AF_INET | AF_INET6 => {
@@ -1108,6 +1130,7 @@ impl FdTable {
                 };
                 self.flags[slot] = FdFlags::new(ACC_RDWR);
                 self.flags[slot].cloexec = ty & O_CLOEXEC != 0;
+                self.flags[slot].nonblock = ty & O_NONBLOCK != 0;
                 slot as i64
             }
             _ => -EAFNOSUPPORT,
@@ -1195,6 +1218,77 @@ impl FdTable {
         out as i64
     }
 
+    /// How many of instance `epfd`'s watched fds are ready right now. The
+    /// satisfiability test for a **blocking** `epoll_wait`
+    /// (docs/ARCHITECTURE-DEBT.md 2.4): computed from kernel state only, so the
+    /// scheduler can ask it while another cell's address space is active.
+    pub fn epoll_ready(&self, epfd: i64) -> usize {
+        let Some(slot) = usize_fd(epfd) else {
+            return 0;
+        };
+        let FdKind::Epoll { ep } = self.fds[slot] else {
+            return 0;
+        };
+        let mut snap = [(0i32, 0u32, 0u64); epoll::MAX_WATCH];
+        let n = epoll::snapshot(ep, &mut snap);
+        snap[..n]
+            .iter()
+            .filter(|&&(wfd, wevents, _)| {
+                (wevents & epoll::EPOLLIN != 0 && self.pollin_ready(wfd as i64))
+                    || (wevents & epoll::EPOLLOUT != 0 && self.pollout_ready(wfd as i64))
+            })
+            .count()
+    }
+
+    /// The union of wake sources instance `epfd`'s watched fds can be woken by, so
+    /// the scheduler knows what to idle on (docs/ARCHITECTURE-DEBT.md 2.4). Empty
+    /// means nothing could ever make this set ready, and `epoll_wait` must not park.
+    pub fn epoll_sources(&self, epfd: i64) -> crate::idle::Sources {
+        let Some(slot) = usize_fd(epfd) else {
+            return 0;
+        };
+        let FdKind::Epoll { ep } = self.fds[slot] else {
+            return 0;
+        };
+        let mut snap = [(0i32, 0u32, 0u64); epoll::MAX_WATCH];
+        let n = epoll::snapshot(ep, &mut snap);
+        snap[..n]
+            .iter()
+            .fold(0, |acc, &(wfd, _, _)| acc | self.fd_sources(wfd as i64))
+    }
+
+    /// What can make descriptor `fd` change readiness (docs/ARCHITECTURE-DEBT.md
+    /// 2.4). This is the per-`FdKind` answer to "if a cell blocks on this, what wakes
+    /// it?", and it is what keeps a blocking `poll`/`epoll_wait` from parking on a
+    /// condition nothing can produce.
+    ///
+    /// A **remote** (NIC-backed) socket is woken by the network; a pipe or a
+    /// loopback socket by another *process*; the console by console input. Everything
+    /// whose readiness is constant (a regular file, `/dev/null`, a closed fd) has no
+    /// source at all - it is either already ready or never will be, and in both cases
+    /// parking is wrong.
+    pub fn fd_sources(&self, fd: i64) -> crate::idle::Sources {
+        use crate::idle;
+        let Some(slot) = usize_fd(fd) else {
+            return 0;
+        };
+        match self.fds[slot] {
+            FdKind::Pipe { .. }
+            | FdKind::SockConn { .. }
+            | FdKind::InetConn { .. }
+            | FdKind::SockListen { .. }
+            | FdKind::InetListen { .. }
+            | FdKind::InetDgram { .. } => idle::PEER,
+            FdKind::InetUdpRemote { .. } | FdKind::InetTcpRemote { .. } => idle::NET,
+            FdKind::Console(0) => idle::CONSOLE,
+            // An epoll fd's own readiness is the union of what it watches; asking
+            // recursively would need a depth bound, and nesting epolls is outside
+            // this personality's scope (docs/LINUX-COMPAT.md L8-INET).
+            FdKind::Epoll { .. } => 0,
+            _ => 0,
+        }
+    }
+
     /// socketpair(domain, type, protocol, sv): two connected AF_UNIX sockets
     /// backed by two direction rings (L8). Writes the fd pair into `sv_va`.
     /// `SOCK_CLOEXEC` is honoured on both ends.
@@ -1222,6 +1316,8 @@ impl FdTable {
         self.flags[s1] = FdFlags::new(ACC_RDWR);
         self.flags[s0].cloexec = ty & O_CLOEXEC != 0;
         self.flags[s1].cloexec = ty & O_CLOEXEC != 0;
+        self.flags[s0].nonblock = ty & O_NONBLOCK != 0;
+        self.flags[s1].nonblock = ty & O_NONBLOCK != 0;
         // SAFETY: `sv_va` is a writable [i32; 2] in the calling cell.
         unsafe {
             let p = sv_va as *mut i32;
@@ -1461,8 +1557,8 @@ impl FdTable {
     /// fd. Non-blocking: `-EAGAIN` if the backlog is empty (the cooperative
     /// single-process proof connects before accepting; a blocking cross-cell
     /// accept server is a later refinement, docs/LINUX-COMPAT.md L8).
-    /// `SOCK_CLOEXEC` in `flags` is honoured; `SOCK_NONBLOCK` is the named
-    /// deferral in [`FdTable::fcntl`].
+    /// `SOCK_CLOEXEC` and `SOCK_NONBLOCK` in `flags` are both honoured
+    /// (docs/ARCHITECTURE-DEBT.md 2.4).
     pub fn accept(&mut self, fd: i64, addr_va: u64, addrlen_va: u64, flags: u64) -> i64 {
         let Some(slot) = usize_fd(fd) else {
             return -EBADF;
@@ -1485,6 +1581,7 @@ impl FdTable {
             };
             self.flags[nslot] = FdFlags::new(ACC_RDWR);
             self.flags[nslot].cloexec = flags & O_CLOEXEC != 0;
+            self.flags[nslot].nonblock = flags & O_NONBLOCK != 0;
             write_inaddr(addr_va, addrlen_va, v6, client_port);
             return nslot as i64;
         }
@@ -1501,6 +1598,7 @@ impl FdTable {
         self.fds[nslot] = FdKind::SockConn { rx, tx };
         self.flags[nslot] = FdFlags::new(ACC_RDWR);
         self.flags[nslot].cloexec = flags & O_CLOEXEC != 0;
+        self.flags[nslot].nonblock = flags & O_NONBLOCK != 0;
         // The connecting peer is unnamed (no bind): report just the family.
         if addr_va != 0 && addrlen_va != 0 {
             // SAFETY: caller-provided sockaddr + socklen_t out-params.
@@ -1846,20 +1944,29 @@ impl FdTable {
             FdKind::InetDgram {
                 ep, bound: true, ..
             } => inetsock::dgram_has_data(ep),
-            // Remote sockets (rheo-net N4b): UDP readiness is a question for the
-            // bridge; a connected remote TCP socket is reported readable so a
-            // poll-then-read caller reaches the blocking `tcp_recv` (there is no
-            // non-blocking readiness probe on the N4b datapath - documented).
+            // Remote sockets (rheo-net N4b): readiness is a question for the bridge,
+            // and both answers **pump the datapath** first - which is what makes a
+            // blocking `poll` on a DNS socket become ready when the reply lands
+            // (docs/ARCHITECTURE-DEBT.md 2.4). `tcp_pending` used to be missing from
+            // `svc::SocketOps` entirely, and a hardcoded `true` here *was* that
+            // absence: a poll on a remote TCP socket always claimed readable.
             FdKind::InetUdpRemote { ep, .. } => {
                 svc::socket_ops().is_some_and(|o| (o.udp_pending)(ep as u64))
             }
-            FdKind::InetTcpRemote { .. } => true,
-            FdKind::Console(0)
-            | FdKind::Vfs { .. }
+            FdKind::InetTcpRemote { h, .. } => {
+                svc::socket_ops().is_some_and(|o| (o.tcp_pending)(h as u64))
+            }
+            // Console input is readable when a byte is buffered, or at end of input
+            // (EOF is a readable condition - a reader must be able to see it).
+            FdKind::Console(0) => crate::input::has_data() || crate::input::at_eof(),
+            FdKind::Vfs { .. }
             | FdKind::Null
             | FdKind::Zero
             | FdKind::Urandom
             | FdKind::ProcAuxv { .. } => true,
+            // An epoll fd is readable when one of its watches is - which is what
+            // makes `poll`ing an epoll fd work at all.
+            FdKind::Epoll { .. } => self.epoll_ready(fd) > 0,
             _ => false,
         }
     }

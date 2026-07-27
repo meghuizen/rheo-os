@@ -367,12 +367,17 @@ struct ResSlot {
     in_use: bool,
     /// The admitted reservation (carries the util to free on release).
     res: Reservation,
+    /// The same admission charged to the **system-wide** ledger
+    /// (docs/ARCHITECTURE-DEBT.md 2.5), kept so a release frees both. Charging one
+    /// and forgetting the other is how a ledger drifts, so they are stored together.
+    sys_res: Reservation,
     cap_id: u32,
 }
 
 const EMPTY_RES: ResSlot = ResSlot {
     in_use: false,
     res: Reservation::ZERO,
+    sys_res: Reservation::ZERO,
     cap_id: 0,
 };
 
@@ -503,6 +508,7 @@ pub fn reset() {
         *core::ptr::addr_of_mut!(CELL_ADMISSION) = [EMPTY_ADMISSION; MAX_CELLS];
         *core::ptr::addr_of_mut!(CELL_FRAMES) = [0; MAX_CELLS];
     }
+    crate::sched::reset_system();
     crate::linux::reset();
     crate::nproc::reset();
 }
@@ -1217,10 +1223,26 @@ fn reserve_admit(
     if cell_res(cur).iter().all(|s| s.in_use) {
         return 1;
     }
-    let res = match cell_admission(cur).admit(budget, period, deadline) {
+    // Charge the **machine** first, then the cell (docs/ARCHITECTURE-DEBT.md 2.5).
+    // Both must accept: the per-cell controller is what makes a cell's own set
+    // schedulable, the system ledger is what stops N cells each admitting 90% of one
+    // CPU - which used to all succeed, because nothing above the per-cell controller
+    // existed. On either refusal nothing is left charged.
+    let sys_res = match crate::sched::system().admit(budget, period, deadline) {
         Ok(r) => r,
         Err(AdmitError::BadParams) => return 1,
         Err(AdmitError::Overcommit) => return 2,
+    };
+    let res = match cell_admission(cur).admit(budget, period, deadline) {
+        Ok(r) => r,
+        Err(AdmitError::BadParams) => {
+            crate::sched::system().release(&sys_res);
+            return 1;
+        }
+        Err(AdmitError::Overcommit) => {
+            crate::sched::system().release(&sys_res);
+            return 2;
+        }
     };
     // Mint a Reservation capability (READ) so query/release are capability-gated,
     // mirroring the grant path. SAFETY: single CPU, synchronous trap; the cell's
@@ -1231,12 +1253,14 @@ fn reserve_admit(
         let caps = &mut *cell.caps;
         let Ok(obj) = objects.create(ObjectKind::Reservation) else {
             cell_admission(cur).release(&res);
+            crate::sched::system().release(&sys_res);
             return 1;
         };
         match caps.mint(objects, obj, READ, BUDGET_UNLIMITED) {
             Ok(h) => h.raw_low32(),
             Err(_) => {
                 cell_admission(cur).release(&res);
+                crate::sched::system().release(&sys_res);
                 return 1;
             }
         }
@@ -1245,6 +1269,7 @@ fn reserve_admit(
     *slot = ResSlot {
         in_use: true,
         res,
+        sys_res,
         cap_id,
     };
     let committed = cell_admission(cur).committed_ppm();
@@ -1284,8 +1309,10 @@ fn reserve_release(cur: usize, cap_id: u32) -> u64 {
         return u64::MAX;
     };
     let res = slot.res;
+    let sys_res = slot.sys_res;
     slot.in_use = false;
     cell_admission(cur).release(&res);
+    crate::sched::system().release(&sys_res);
     0
 }
 

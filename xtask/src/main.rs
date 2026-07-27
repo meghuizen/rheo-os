@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 58] = [
+const TEST_KERNELS: [&str; 59] = [
     "kernel",
     "cap-invariants",
     "queue-pipeline",
@@ -57,6 +57,7 @@ const TEST_KERNELS: [&str; 58] = [
     "librheonet",
     "netwait",
     "schedidle",
+    "linuxpoll",
     "librheogpu",
     "librheoipc",
     "librheopipe",
@@ -1182,6 +1183,12 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         // `futex` row): `pthread_cond_timedwait` on a never-signalled condvar.
         // Part of the `linuxthreads` proof.
         ("condwait.c", "condwait"),
+        // `poll`/`epoll_wait`/`nanosleep` truth + creation-time O_NONBLOCK
+        // (docs/ARCHITECTURE-DEBT.md 2.4): the `linuxpoll` proof.
+        ("pollx.c", "pollx"),
+        // A wait that can never end: the scheduler's deadlock diagnostic, the
+        // second `linuxpoll` phase.
+        ("polldead.c", "polldead"),
     ] {
         let mut sc = Command::new(cc);
         sc.arg("-static").arg("-no-pie");

@@ -163,6 +163,10 @@ name = "schedidle"
 path = "src/schedidle.rs"
 
 [[bin]]
+name = "linuxpoll"
+path = "src/linuxpoll.rs"
+
+[[bin]]
 name = "librheogpu"
 path = "src/librheogpu.rs"
 

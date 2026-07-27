@@ -213,6 +213,7 @@ pub fn ops() -> SocketOps {
         tcp_connect: op_tcp_connect,
         tcp_send: op_tcp_send,
         tcp_recv: op_tcp_recv,
+        tcp_pending: op_tcp_pending,
         tcp_close: op_tcp_close,
     }
 }
@@ -675,6 +676,34 @@ fn op_tcp_recv(h: u64, buf_va: u64, len: u64, timeout_ns: u64) -> i64 {
     }
     drain_tcp_tx(idx, peer_ip, peer_mac);
     n as i64
+}
+
+/// `poll`/`epoll` readiness for a connected remote TCP socket
+/// (docs/ARCHITECTURE-DEBT.md 2.4). Pumps the receive path first (so it reports what
+/// has actually arrived, not what arrived last time someone asked), then answers
+/// "readable" for queued bytes **or** a closed peer - EOF is a readable condition.
+/// Before this existed the personality had no way to ask, and hardcoded `true`.
+fn op_tcp_pending(h: u64) -> bool {
+    let idx = h as usize;
+    let Some(c) = tcps().get(idx) else {
+        return false;
+    };
+    if c.conn.is_none() {
+        return false;
+    }
+    let (peer_ip, peer_mac) = (c.peer_ip, c.peer_mac);
+    pump_nonblocking();
+    drain_tcp_tx(idx, peer_ip, peer_mac);
+    match tcps()[idx].conn.as_ref() {
+        Some(conn) => {
+            conn.recv_available() > 0
+                || matches!(
+                    conn.state(),
+                    State::Closed | State::CloseWait | State::TimeWait | State::LastAck
+                )
+        }
+        None => false,
+    }
 }
 
 fn op_tcp_close(h: u64) {

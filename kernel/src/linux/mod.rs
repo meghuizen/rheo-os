@@ -246,7 +246,14 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
         // etc. The path is arg0 (no dirfd), docs/LINUX-COMPAT.md L7.
         nr::ACCESS => ret(sys_faccessat(args[0])),
         nr::READLINKAT => err(errno::ENOENT), // no symlinks in the VFS; /proc/self/exe unused
-        nr::POLL | nr::PPOLL => ret(sys_poll(st, args[0], args[1])),
+        // poll/ppoll: real readiness + a real wait (docs/ARCHITECTURE-DEBT.md 2.4).
+        // `poll`'s timeout is an `int` of milliseconds in arg 2; `ppoll`'s is a
+        // `struct timespec *` in arg 2 (NULL = wait indefinitely).
+        nr::POLL => sys_poll(cur, st, args[0], args[1], args[2] as i32 as i64),
+        nr::PPOLL => {
+            let t = ppoll_timeout_ms(args[2]);
+            sys_poll(cur, st, args[0], args[1], t)
+        }
 
         // -- working directory (docs/LINUX-COMPAT.md L3) --
         nr::GETCWD => ret(sys_getcwd(st, args[0], args[1])),
@@ -349,9 +356,14 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
         nr::EPOLL_CTL => ret(st
             .fds
             .epoll_ctl(args[0] as i64, args[1], args[2] as i64, args[3])),
-        nr::EPOLL_WAIT | nr::EPOLL_PWAIT => {
-            ret(st.fds.epoll_wait(args[0] as i64, args[1], args[2] as usize))
-        }
+        nr::EPOLL_WAIT | nr::EPOLL_PWAIT => sys_epoll_wait(
+            cur,
+            st,
+            args[0] as i64,
+            args[1],
+            args[2] as usize,
+            args[3] as i32 as i64,
+        ),
         // sendmsg/recvmsg: gather/scatter over msg_iov (non-blocking; the fixture
         // uses read/write). SCM_RIGHTS ancillary data is deferred (L8).
         nr::SENDMSG => ret(sys_sendmsg(st, args[0] as i64, args[1], true)),
@@ -376,7 +388,10 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
 
         // -- time / entropy / scheduling --
         nr::CLOCK_GETTIME => ret(sys_clock_gettime(args[0], args[1])),
-        nr::CLOCK_NANOSLEEP | nr::NANOSLEEP => Ctl::Ret(0), // return immediately
+        // nanosleep(req, rem) / clock_nanosleep(clk, flags, req, rem): a real sleep
+        // (docs/ARCHITECTURE-DEBT.md 2.4).
+        nr::NANOSLEEP => sys_nanosleep(cur, false, 0, args[0]),
+        nr::CLOCK_NANOSLEEP => sys_nanosleep(cur, true, args[1], args[2]),
         nr::GETRANDOM => ret(sys_getrandom(args[0], args[1])),
         nr::SCHED_YIELD => thread::sched_yield(cur),
         nr::SCHED_GETAFFINITY => ret(sys_sched_getaffinity(args[1], args[2])),
@@ -459,7 +474,9 @@ fn ptr_args_ok(nr_val: u64, args: &[u64; 6]) -> bool {
         nr::NEWFSTATAT => rd(1, 1) && wr(2, 1),
         nr::STATX => rd(1, 1) && wr(4, 1),
         nr::IOCTL => wr_opt(2, 8), // only TIOCGWINSZ writes; others ignore it
-        nr::POLL | nr::PPOLL => args[1] == 0 || wr(0, args[1].saturating_mul(8)),
+        nr::POLL => args[1] == 0 || wr(0, args[1].saturating_mul(8)),
+        // ppoll's arg 2 is a `struct timespec *`, not a millisecond count.
+        nr::PPOLL => (args[1] == 0 || wr(0, args[1].saturating_mul(8))) && rd_opt(2, 16),
         nr::GETCWD => wr(0, args[1]),
 
         // -- threads / processes --
@@ -500,6 +517,10 @@ fn ptr_args_ok(nr_val: u64, args: &[u64; 6]) -> bool {
         // -- identity / time / entropy / limits --
         nr::UNAME => wr(0, 6 * 65), // struct utsname: six 65-byte fields
         nr::CLOCK_GETTIME => wr(1, 16),
+        // nanosleep(req, rem) / clock_nanosleep(clk, flags, req, rem): the requested
+        // deadline is read, `rem` is never written (nothing interrupts the sleep).
+        nr::NANOSLEEP => rd(0, 16),
+        nr::CLOCK_NANOSLEEP => rd(2, 16),
         nr::GETRANDOM => wr(0, args[1]),
         nr::SCHED_GETAFFINITY => wr(2, args[1]),
         nr::PRLIMIT64 => rd_opt(2, 16) && wr_opt(3, 16),
@@ -591,6 +612,21 @@ fn sys_read(cur: usize, st: &mut LinuxState, fd: i64, buf: u64, count: u64) -> C
                 }
             }
         };
+    }
+    // **Blocking stdin** (docs/ARCHITECTURE-DEBT.md 2.4). An empty console used to
+    // answer 0, which every reader reads as *end of input* - a lie, and the one that
+    // matters most because it is indistinguishable from a real EOF. A blocking
+    // descriptor now parks until a byte arrives or input genuinely ends; a
+    // non-blocking one keeps reporting `-EAGAIN`, which is an answer a caller can act
+    // on. `count == 0` is still an immediate 0 (POSIX).
+    if st.fds.is_console_in(fd) && count > 0 && !crate::input::has_data() {
+        if nb {
+            return err(errno::EAGAIN);
+        }
+        if !crate::input::at_eof() {
+            return proc::block_console(cur, buf, count);
+        }
+        return ret(0); // input really has ended
     }
     ret(st.fds.read(fd, buf, count))
 }
@@ -723,40 +759,186 @@ fn sys_readv(st: &mut LinuxState, fd: i64, iov_va: u64, iovcnt: u64, write: bool
     total
 }
 
-/// poll/ppoll: non-blocking readiness check. The cell must never park, so
-/// this returns immediately. For each pollfd a valid descriptor reports the
-/// requested IN/OUT events as ready (console/regular fds are always ready
-/// here); a closed descriptor reports POLLNVAL. Used by glibc/Rust startup to
-/// verify the standard fds (`sanitize_standard_fds`), which is why answering
-/// it matters - an ENOSYS here makes Rust std `abort` before `main`.
-fn sys_poll(st: &mut LinuxState, fds_va: u64, nfds: u64) -> i64 {
-    const POLLIN: i16 = 0x001;
-    const POLLOUT: i16 = 0x004;
-    const POLLNVAL: i16 = 0x020;
-    #[repr(C)]
-    struct PollFd {
-        fd: i32,
-        events: i16,
-        revents: i16,
+const POLLIN: i16 = 0x001;
+const POLLOUT: i16 = 0x004;
+const POLLNVAL: i16 = 0x020;
+
+/// `ppoll`'s timeout is a `struct timespec *` where `poll`'s is an `int` of
+/// milliseconds; NULL means wait indefinitely. Converted to the same millisecond
+/// form so one implementation serves both. A sub-millisecond timespec rounds **up**
+/// to 1 ms rather than down to 0, because 0 means "do not wait at all".
+fn ppoll_timeout_ms(ts_va: u64) -> i64 {
+    if ts_va == 0 {
+        return -1;
     }
+    // SAFETY: a `struct timespec` (two 64-bit words), bounded against the calling
+    // cell's user VA range at the dispatch point.
+    let (secs, nsecs) = unsafe {
+        let p = ts_va as *const i64;
+        (p.read(), p.add(1).read())
+    };
+    if secs < 0 || nsecs < 0 {
+        return 0;
+    }
+    let ms = secs.saturating_mul(1_000) + nsecs / 1_000_000;
+    if ms == 0 && nsecs > 0 { 1 } else { ms }
+}
+
+/// The `revents` descriptor `fd` should report for a request of `events`
+/// (docs/ARCHITECTURE-DEBT.md 2.4). **The single definition of poll readiness**, used
+/// by `poll`/`ppoll` and by the scheduler's satisfiability test for a parked poll -
+/// which is why it takes the fd table rather than reading `LinuxState`: the scheduler
+/// asks it about a cell whose address space is not active.
+///
+/// A closed descriptor is `POLLNVAL`; otherwise the requested `POLLIN`/`POLLOUT` bits
+/// are answered from the per-`FdKind` readiness in `linux::fd`. `POLLERR`/`POLLHUP`/
+/// `POLLPRI` are not reported (a documented scope, matching epoll's `EPOLLIN|EPOLLOUT`
+/// surface); a hung-up pipe or a closed socket peer shows up as `POLLIN` readable,
+/// which is what a reader then acts on by reading 0.
+pub(crate) fn poll_revents(fds: &fd::FdTable, fd: i64, events: i16) -> i16 {
+    if !fds.is_open(fd) {
+        return POLLNVAL;
+    }
+    let mut r = 0;
+    if events & POLLIN != 0 && fds.pollin_ready(fd) {
+        r |= POLLIN;
+    }
+    if events & POLLOUT != 0 && fds.pollout_ready(fd) {
+        r |= POLLOUT;
+    }
+    r
+}
+
+/// poll/ppoll(fds, nfds, timeout): **real readiness, and a real wait**
+/// (docs/ARCHITECTURE-DEBT.md 2.4).
+///
+/// What this used to be, precisely: readiness was never consulted at all. Every open
+/// descriptor was reported ready for whatever was asked, a closed one `POLLNVAL`, and
+/// the timeout was ignored - so `poll` was a no-op that always said yes. Two things
+/// depended on that accident: glibc's resolver saw "ready", fell through to its
+/// **blocking** `recvfrom`, and DNS worked *because* of the bug; and creation-time
+/// `O_NONBLOCK` could not be honoured, since a non-blocking program would have
+/// spun on a lie. Both are fixed together, which is why they land together.
+///
+/// Now: `revents` comes from [`poll_revents`]; `timeout` is honoured. A `timeout` of
+/// 0 stays a pure probe, a negative one waits indefinitely, and a positive one is a
+/// deadline in the **cell's own clock domain** - the domain the program's
+/// `clock_gettime` reports. Waiting is a `proc::Block::Poll` registration, so the
+/// caller leaves the CPU and the scheduler idles on whatever the watched descriptors
+/// can be woken by (a NIC frame for a remote socket - which is exactly how the
+/// resolver's reply now arrives - console input, another process, or the deadline).
+///
+/// It still answers immediately, with the readiness computed now, when nothing could
+/// change: nothing is ready but no watched descriptor has a wake source, or the set
+/// is bigger than [`proc::POLL_MAX`]. Parking on those would be a wedge.
+fn sys_poll(cur: usize, st: &mut LinuxState, fds_va: u64, nfds: u64, timeout_ms: i64) -> Ctl {
+    let n = nfds as usize;
+    let ready = poll_probe(st, fds_va, n);
+    if ready > 0 || timeout_ms == 0 {
+        return ret(ready);
+    }
+    let deadline_ns = if timeout_ms < 0 {
+        0 // indefinite
+    } else {
+        cell_clock_ns(false).saturating_add((timeout_ms as u64).saturating_mul(1_000_000))
+    };
+    // SAFETY: `[fds_va, fds_va + nfds*8)` was bounded against this cell's user VA
+    // range at the dispatch point (`ptr_args_ok`'s POLL row uses `nfds` itself).
+    match unsafe { proc::block_poll(cur, fds_va, n, deadline_ns) } {
+        Some(ctl) => ctl,
+        None => ret(0), // nothing ready and nothing could change it
+    }
+}
+
+/// Compute and write `revents` for every entry, returning the ready count. The
+/// non-blocking probe, and the answer a `timeout == 0` poll gets.
+fn poll_probe(st: &LinuxState, fds_va: u64, nfds: usize) -> i64 {
     let mut ready = 0i64;
-    for i in 0..nfds as usize {
-        // SAFETY: the pollfd array lies in the calling cell's memory.
-        let p = unsafe { &mut *(fds_va as *mut PollFd).add(i) };
-        if p.fd < 0 {
-            p.revents = 0;
-            continue;
-        }
-        p.revents = if st.fds.is_open(p.fd as i64) {
-            p.events & (POLLIN | POLLOUT)
-        } else {
-            POLLNVAL
-        };
-        if p.revents != 0 {
-            ready += 1;
+    for i in 0..nfds {
+        // SAFETY: the pollfd array was bounded to `nfds` 8-byte entries in the
+        // calling cell's user VA range at the dispatch point.
+        unsafe {
+            let fd = (fds_va as *const i32).add(i * 2).read();
+            let events = (fds_va as *const i16).add(i * 4 + 2).read();
+            let revents = if fd < 0 {
+                0
+            } else {
+                poll_revents(&st.fds, fd as i64, events)
+            };
+            (fds_va as *mut i16).add(i * 4 + 3).write(revents);
+            if revents != 0 {
+                ready += 1;
+            }
         }
     }
     ready
+}
+
+/// epoll_wait/epoll_pwait(epfd, events, maxevents, timeout): as [`sys_poll`], over an
+/// epoll instance's watch list. Level-triggered; the timeout is honoured and a wait
+/// with nothing ready genuinely parks (docs/ARCHITECTURE-DEBT.md 2.4 - it used to
+/// return 0 at once, which turned every epoll loop into a spin).
+fn sys_epoll_wait(
+    cur: usize,
+    st: &mut LinuxState,
+    epfd: i64,
+    events_va: u64,
+    maxevents: usize,
+    timeout_ms: i64,
+) -> Ctl {
+    let r = st.fds.epoll_wait(epfd, events_va, maxevents);
+    if r != 0 || timeout_ms == 0 {
+        return ret(r);
+    }
+    let deadline_ns = if timeout_ms < 0 {
+        0
+    } else {
+        cell_clock_ns(false).saturating_add((timeout_ms as u64).saturating_mul(1_000_000))
+    };
+    match proc::block_epoll(cur, epfd, events_va, maxevents, deadline_ns) {
+        Some(ctl) => ctl,
+        None => ret(0),
+    }
+}
+
+/// nanosleep/clock_nanosleep(..., req, rem): sleep for the requested duration
+/// (docs/ARCHITECTURE-DEBT.md 2.4). It used to return 0 immediately - a sleep that
+/// never slept, the same class of lie as the futex timeout that was treated as
+/// infinite.
+///
+/// The deadline is computed and compared in the **cell's own clock domain**
+/// (`cell_clock_ns`), so a `nanosleep` of N ns is N ns as measured by the program's
+/// own `clock_gettime` (docs/ENGINEERING.md 11). `clock_nanosleep`'s `TIMER_ABSTIME`
+/// flag is honoured; an already-passed deadline returns 0 at once. `rem` is never
+/// written, because nothing can interrupt the sleep here (no signal is delivered to a
+/// parked process) - stated rather than implied.
+fn sys_nanosleep(cur: usize, absolute_arg: bool, flags: u64, req_va: u64) -> Ctl {
+    /// `clock_nanosleep`'s TIMER_ABSTIME.
+    const TIMER_ABSTIME: u64 = 1;
+    if req_va == 0 {
+        return err(errno::EFAULT);
+    }
+    // SAFETY: a `struct timespec` (two 64-bit words), bounded against the calling
+    // cell's user VA range at the dispatch point.
+    let (secs, nsecs) = unsafe {
+        let p = req_va as *const i64;
+        (p.read(), p.add(1).read())
+    };
+    if secs < 0 || !(0..1_000_000_000).contains(&nsecs) {
+        return err(errno::EINVAL);
+    }
+    let want = (secs as u64).saturating_mul(1_000_000_000) + nsecs as u64;
+    let now = cell_clock_ns(false);
+    let absolute = absolute_arg && flags & TIMER_ABSTIME != 0;
+    let deadline = if absolute {
+        want
+    } else {
+        now.saturating_add(want)
+    };
+    if deadline <= now {
+        return Ctl::Ret(0);
+    }
+    proc::block_timer(cur, deadline)
 }
 
 /// newfstatat(dirfd, path, statbuf, flags). AT_EMPTY_PATH (0x1000) with an

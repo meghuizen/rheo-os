@@ -42,9 +42,14 @@
 //!    arrive would wedge), so this phase asserts the **refusal to park** rather than
 //!    an interleave, and says so: the frame-arrival wake is proven by `netwait`.
 //! 4. **the deadlock classifier** - the exact decision the run loop makes:
-//!    `nproc::wake_sources()` is `TIMER` while a cell sleeps and `0` once nothing is
-//!    blocked, and `0` is the state that now prints a diagnostic naming each blocked
-//!    cell instead of panicking.
+//!    `nproc::wake_sources()` is `0` once nothing is blocked, and a mask with no
+//!    waitable bit is the state that now prints a diagnostic naming each blocked cell
+//!    instead of panicking. (`linuxpoll` reaches the terminal branch itself, with a
+//!    process whose `poll` nothing can ever satisfy.)
+//! 5. **the system-wide admission ledger** (docs/ARCHITECTURE-DEBT.md 2.5) - a second
+//!    90% reservation is refused as over-commit, while each *cell's* own controller
+//!    would have accepted it. That gap was the defect: sixteen cells at 90% each all
+//!    succeeded.
 
 #![no_std]
 #![no_main]
@@ -55,6 +60,7 @@ mod harness;
 use harness::{CellStore, KernelStack, build_cell};
 use kernel::arch::MapPerm;
 use kernel::capability::{CapTable, ObjectTable};
+use kernel::sched::{self, Admission};
 use kernel::user::{self, Outcome};
 use kernel::user_progs::{
     BLOCK_CONSOLE, BLOCK_NET, BLOCK_TIMER, ORDER_IO_OFF, user_blocker, user_peer,
@@ -73,6 +79,12 @@ static mut SHARED: Shared = Shared([0; 4096]);
 static mut KSTACK: KernelStack = KernelStack::new();
 static mut OBJECTS: ObjectTable = ObjectTable::new();
 static mut CAPS: CapTable = CapTable::new();
+
+// A peer-only wait is not waitable: that pair *is* the deadlock condition the run
+// loop tests, and it is a structural property of the masks, so it is asserted at
+// compile time rather than pretended to be a runtime observation.
+const _: () = assert!(idle::PEER & idle::WAITABLE == 0);
+const _: () = assert!(idle::WAITABLE & idle::TIMER != 0);
 
 /// Rounds the peer cell runs while the blocker is parked.
 const ROUNDS: u64 = 8;
@@ -346,10 +358,61 @@ extern "C" fn kernel_main() -> ! {
     assert_eq!(idle::describe(idle::CONSOLE), "console");
     assert_eq!(idle::describe(idle::PEER), "peer");
     assert_eq!(idle::describe(idle::TIMER | idle::NET), "several");
-    // A peer-only wait is not waitable: that is the deadlock condition.
-    assert_eq!(idle::PEER & idle::WAITABLE, 0);
-    assert!(idle::WAITABLE & idle::TIMER != 0);
     println!("schedidle: deadlock classifier: peer-only waits are not waitable OK");
+
+    // ---- phase 5: the system-wide admission ledger (ARCHITECTURE-DEBT.md 2.5) ----
+    //
+    // Admission used to be tested only against the *calling cell's* controller, so
+    // sixteen cells each admitting 90% all succeeded - 1440% of one CPU admitted,
+    // nothing refused. The hand-computed oracle: a budget of 9 in a period of 10 is
+    // 900,000 ppm, so the first fits (900,000 <= 1,000,000) and a second cannot
+    // (1,800,000 > 1,000,000) - while each cell's *own* controller, being empty,
+    // would accept it, which is precisely the over-commit that used to slip through.
+    sched::reset_system();
+    let mut cell_a = Admission::new();
+    let mut cell_b = Admission::new();
+    let a_sys = sched::system()
+        .admit(9, 10, 10)
+        .expect("first 90% must be admitted");
+    let a_own = cell_a
+        .admit(9, 10, 10)
+        .expect("cell A's own controller admits it");
+    assert_eq!(a_sys.util_ppm(), 900_000, "90% of a period is 900,000 ppm");
+    assert_eq!(sched::system().committed_ppm(), 900_000);
+    // Cell B's own controller accepts - it knows nothing of cell A. The machine's
+    // does not. That gap *was* the defect.
+    assert!(
+        cell_b.admit(9, 10, 10).is_ok(),
+        "a fresh per-cell controller must still accept 90% - the per-cell check is \
+         not what refuses over-commit"
+    );
+    assert!(
+        matches!(
+            sched::system().admit(9, 10, 10),
+            Err(sched::AdmitError::Overcommit)
+        ),
+        "the system ledger must refuse a second 90% (it committed {} ppm)",
+        sched::system().committed_ppm()
+    );
+    assert_eq!(
+        sched::system().committed_ppm(),
+        900_000,
+        "a refused admission must leave the ledger unchanged"
+    );
+    // And a release gives the capacity back, so the ledger does not leak.
+    cell_a.release(&a_own);
+    sched::system().release(&a_sys);
+    assert_eq!(sched::system().committed_ppm(), 0);
+    assert!(
+        sched::system().admit(9, 10, 10).is_ok(),
+        "released capacity must be reusable"
+    );
+    sched::reset_system();
+    println!(
+        "schedidle: system admission ledger: 90% admitted, a second 90% REFUSED as \
+         over-commit (each cell's own controller would have accepted both), and a \
+         release returns the capacity OK"
+    );
 
     println!("schedidle: PASS");
     arch::exit(arch::ExitCode::Success)
