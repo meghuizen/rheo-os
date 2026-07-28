@@ -992,6 +992,44 @@ kernel.
 - **S5 - per-vcore queues + NVMe/NIC pass-through** (with DRIVERS.md D2).
   Proof: an iommu-contained storage cell drives its own NVMe queues off a
   live disk; per-vcore submission never crosses cores (counter-asserted).
+
+  **Landed: the NVMe driver** (`kernel/src/hw/nvme.rs`, the `nvmefs` kernel,
+  all three ISAs). This is the prerequisite the rest of S5 stands on, and it
+  is worth saying why NVMe rather than more virtio-blk: virtio-blk is a
+  paravirtual transport with one queue and a hypervisor behind it, while
+  NVMe is what real storage presents - **paired submission and completion
+  queues in host memory, a doorbell, out-of-order completion, one queue pair
+  per core**. That last property *is* S5, and it is the same shape as this
+  OS's own queue ABI, so the adaptation is a mapping rather than a
+  translation layer.
+
+  Bring-up is NVMe 1.4 section 7.6.1 (disable, publish `AQA`/`ASQ`/`ACQ`,
+  enable, `IDENTIFY` namespace 1, `SET FEATURES` number-of-queues, create the
+  I/O completion queue then the submission queue that names it), with reads
+  and writes as `NVM READ`/`NVM WRITE`. It is also the tree's first device
+  that **needs a BAR**: unlike virtio-pci, which this kernel drives through
+  the `VIRTIO_PCI_CAP_PCI_CFG` config tunnel precisely to avoid one, NVMe's
+  register file *is* BAR0 - so `nvmefs` calls `hw::assign_pci_bars()` and
+  maps the window, on machines where no firmware has done it.
+
+  `nvmefs` is deliberately `blockfs` with the transport swapped, because that
+  is the claim: `BlockDevice` is a seam, a second transport costs a driver
+  and nothing above it changes a word. The same ext4 image, the same two
+  files, the same byte-exact assertions, the same bounded cache proving the
+  bytes streamed. It adds a **write round trip** - the read path alone would
+  have left `NVM WRITE` reasoned-about rather than proven - taken on the last
+  sector through a fresh handle (the cache would have answered from the line
+  it just filled and proven nothing about the device), writing a pattern,
+  reading it back, then restoring the original and reading *that* back, so
+  the device has to return two different things for one sector in order. The
+  drive is attached `snapshot=on`, so the writes genuinely reach QEMU's block
+  layer while the committed fixture is untouched.
+
+  **Not done, and it is the larger half:** one I/O queue pair, polled, no
+  MSI-X, no per-core queue, and no IOMMU-contained storage *cell*. Transfers
+  bounce through a single page-aligned frame one page at a time, so `PRP1`
+  addresses every command and no PRP list is built - correct, and the simple
+  form on purpose, since a PRP list buys throughput TCG cannot show.
 - **S6 - NUMA pools + core classes.** Placement proven in QEMU
   (chosen-node assertions), P/E and latency measured at the lab.
 - **S7 - workload gates.** Real Node.js already runs to completion

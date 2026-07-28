@@ -1,5 +1,5 @@
 //! The block-device abstraction (docs/FILESYSTEMS.md 1). A `BlockDevice` is
-//! the seam between a storage transport (virtio-blk today; NVMe later) and a
+//! the seam between a storage transport (virtio-blk and NVMe today) and a
 //! filesystem: a filesystem reads/writes 512-byte sectors and does not care
 //! what is underneath. This is the interface that lets an on-disk filesystem
 //! (ours, or an existing Rust driver dropped in behind it) talk to a real

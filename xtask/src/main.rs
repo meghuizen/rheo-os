@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 64] = [
+const TEST_KERNELS: [&str; 65] = [
     "kernel",
     "substrate",
     "cap-invariants",
@@ -37,6 +37,7 @@ const TEST_KERNELS: [&str; 64] = [
     "runtime",
     "posix",
     "blockfs",
+    "nvmefs",
     "elfrun",
     "posixrun",
     "libcrun",
@@ -109,6 +110,23 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "file=tests/fixtures/ext4.img,if=none,id=blk0,format=raw",
             "-device",
             "virtio-blk-pci,drive=blk0,disable-legacy=on",
+        ],
+        // nvmefs (docs/SUBSTRATE.md S5): the same ext4 fixture behind a real NVMe
+        // controller instead of virtio-blk. NVMe is a PCIe endpoint on every
+        // machine here - the riscv/arm `virt` machines have a PCIe host bridge
+        // (the same one `gpuhw` puts a root port on), and q35 obviously does - so
+        // unlike virtio there is one device line for all three ISAs. `logical_block
+        // _size` is left at QEMU's 512 default, which is what the driver requires
+        // and refuses to guess around.
+        ("nvmefs", _) => &[
+            "-drive",
+            // `snapshot=on`: the write round-trip below is a real device write, and
+            // the committed fixture must not be a casualty of running the test.
+            // QEMU keeps the writes in a throwaway overlay, so reads see them
+            // within the run and the file on disk is untouched.
+            "file=tests/fixtures/ext4.img,if=none,id=nvm0,format=raw,snapshot=on",
+            "-device",
+            "nvme,drive=nvm0,serial=rheonvme0",
         ],
         // linuxdyn phase 3 (GOAL-DISK-2b): a per-ISA ext4 image built by
         // `build_dyn_disk_fixture` (gitignored), holding a dynamic glibc binary +

@@ -84,6 +84,10 @@ name = "blockfs"
 path = "src/blockfs.rs"
 
 [[bin]]
+name = "nvmefs"
+path = "src/nvmefs.rs"
+
+[[bin]]
 name = "elfrun"
 path = "src/elfrun.rs"
 

@@ -21,6 +21,7 @@ pub mod block;
 pub mod fdt;
 pub mod gpu;
 pub mod iommu;
+pub mod nvme;
 pub mod pci;
 pub mod smmuv3;
 pub mod virtio_blk;

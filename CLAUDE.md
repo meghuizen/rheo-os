@@ -181,6 +181,30 @@ file code runs natively. The `posix` test kernel exercises ramfs rw, ext4 ro
 (incl. a multi-block file), the errno surface, and the std facade on all
 three ISAs.
 
+**NVMe runs** (docs/SUBSTRATE.md S5, the `nvmefs` kernel, all three ISAs): a
+hand-written NVMe 1.4 driver (`kernel/src/hw/nvme.rs`) brings up a real controller
+over PCIe - disable, publish the admin queue pair (`AQA`/`ASQ`/`ACQ`), enable,
+`IDENTIFY` namespace 1, `SET FEATURES` number-of-queues, create the I/O completion
+queue then the submission queue that names it - and serves `NVM READ`/`NVM WRITE`
+behind the same `BlockDevice` seam virtio-blk uses. Why NVMe rather than more
+virtio-blk: virtio-blk is paravirtual, one queue, a hypervisor behind it; NVMe is
+what real storage presents - **paired submission/completion queues in host memory,
+a doorbell, out-of-order completion, one queue pair per core** - and that last
+property is the rest of S5 and the same shape as this OS's own queue ABI. It is
+also the first device here that **needs a BAR**: virtio-pci is driven through the
+`VIRTIO_PCI_CAP_PCI_CFG` config tunnel precisely to avoid one, while NVMe's
+register file *is* BAR0, so `nvmefs` calls `hw::assign_pci_bars()` and maps the
+window. The test is deliberately `blockfs` with the transport swapped - same ext4
+image, same two files, same byte-exact assertions, same bounded cache proving the
+bytes streamed - because that is the claim being made about the seam; plus a
+**write round trip** (last sector, fresh handle so the cache cannot answer it,
+pattern written and read back, then the original restored and read back, so the
+device must return two different things for one sector in order) on a drive
+attached `snapshot=on` so the committed fixture is untouched. Honest: one I/O queue
+pair, polled, no MSI-X, no per-core queue, no IOMMU-contained storage cell, and
+transfers bounce through one page-aligned frame a page at a time so `PRP1`
+addresses every command and no PRP list is built.
+
 A **live-disk block stack** closes the loop from storage transport to
 filesystem: a **`BlockDevice` trait** (`kernel/src/hw/block.rs`, 512-byte
 sectors, transport-agnostic) and a **virtio-blk driver**
@@ -2112,7 +2136,7 @@ kernel/       the no_std kernel library + boot demo bin
               into the same slot later - docs/NETSTACK.md 18,
               docs/ARCHITECTURE-DEBT.md 3.2), hw (ACPI/FDT/PCIe
               discovery + the machine Inventory; block BlockDevice trait +
-              virtio_blk driver; virtio_net raw-frame NIC driver -
+              virtio_blk + **nvme** drivers; virtio_net raw-frame NIC driver -
               docs/NETWORKING.md; virtio_gpu 2D display driver -
               docs/DISPLAY.md), elf + load (ELF loader for native
               programs), user run loop (with per-cell syscall
@@ -2159,7 +2183,10 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               permutation, 63 I/O ops outstanding at one instant with one
               park+wake each, and 256-way mutex contention with never more than
               one holder - each with an observed negative control),
-              posix, blockfs (live virtio-blk disk), elfrun (load a native
+              posix, blockfs (live virtio-blk disk), nvmefs (the same ext4 image
+              behind a **real NVMe controller** - PCIe BAR0 mapped, admin + one I/O
+              queue pair brought up, files read through the identical VFS, plus a
+              write round trip on the last sector), elfrun (load a native
               ELF), posixrun (native program over the POSIX syscalls),
               libcrun (a program linked against rheo-libc), jsonrun (a
               program parsing JSON with rheo-json on-OS), stdrun (a real-std
