@@ -164,8 +164,12 @@ aarch64_secondary_entry:
 .section .text
 .p2align 2
 aarch64_secondary_high:
-    adrp x0, ap_stack_top
-    add  x0, x0, :lo12:ap_stack_top
+    /* Load this secondary's stack from `secondary_sp`, set by the primary before
+       each CPU_ON (start-all is sequential, so no race on the shared word -
+       docs/SMP.md 10). */
+    adrp x0, secondary_sp
+    add  x0, x0, :lo12:secondary_sp
+    ldr  x0, [x0]
     mov  sp, x0
     /* Containment: the kernel's real vectors, so a fault on this core reaches
        the kernel handler instead of looping. */
@@ -199,10 +203,26 @@ AP_SYSREGS:
 SMP_SECONDARY_ENTRY_PA:
     .dword aarch64_secondary_entry
 
-/* The secondary's kernel stack: a high VA in ordinary BSS (mapped via TTBR1),
-   like the primary's boot_stack. */
+/* The stack pointer the next secondary loads, set by the primary before each
+   CPU_ON (sequential bring-up - see aarch64_secondary_high). A high .bss word,
+   mapped via TTBR1 into the shared kernel root. */
+.section .bss
+.p2align 3
+.global secondary_sp
+secondary_sp:
+    .space 8
+
+/* Two secondary kernel stacks: high VAs in ordinary BSS (mapped via TTBR1), like
+   the primary's boot_stack. Two, so a second secondary brought up while the first
+   is still parked on its own stack does not share it (docs/SMP.md 10). Each top is
+   exported so the primary can hand it to `secondary_sp`. */
 .section .bss
 .p2align 4
 ap_stack:
     .space 16 * 1024
+.global ap_stack_top
 ap_stack_top:
+ap_stack2:
+    .space 16 * 1024
+.global ap_stack2_top
+ap_stack2_top:
