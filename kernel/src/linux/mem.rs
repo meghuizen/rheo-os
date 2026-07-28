@@ -70,31 +70,18 @@ const _: () = assert!(MMAP_END as u64 <= crate::user::USER_VA_MAX);
 // Above every fixed region, so the window and the queue/channel/interp cannot alias.
 const _: () = assert!(MMAP_BASE as u64 > crate::load::LINUX_INTERP_BASE as u64);
 
-/// Spans a cell's `mmap` must never place a mapping over, because something else
-/// already owns them. Checked for `MAP_FIXED` (a caller-chosen address), which the
-/// bump cursor cannot protect against.
+/// Spans a cell's `mmap` must never place a mapping over, because the kernel owns
+/// them. Checked for `MAP_FIXED` (a caller-chosen address), which placement cannot
+/// protect against on its own.
 ///
-/// The ELF interpreter's span is deliberately **not** here: `ld.so` legitimately
-/// maps within its own region, and refusing that would break every dynamically
-/// linked binary (docs/LINUX-COMPAT.md L7). The queue and channel regions are
-/// kernel-owned rings mapped into the cell; a program targeting one is either
-/// confused or hostile, and either way must be refused rather than allowed to
-/// replace the kernel's frames.
+/// Delegated to the cell's **recorded** layout (`user::kernel_owned_overlap`)
+/// rather than restated here as constants. The refusals are the same two today - a
+/// Linux cell holds nothing else kernel-owned - so this is a change of authority,
+/// not of behaviour: one place decides what the kernel owns, and it decides from a
+/// record instead of from a copy of `load.rs`'s constants that has to be kept in
+/// step by hand.
 fn reserved_overlap(base: usize, bytes: usize) -> Option<&'static str> {
-    let end = base.saturating_add(bytes);
-    let hits = |s: usize, n: usize| base < s + n && s < end;
-    if hits(
-        crate::load::USER_QUEUE_VA,
-        crate::queue::QueuePair::REGION_SIZE,
-    ) {
-        return Some("the cell's queue-pair region");
-    }
-    let chan = crate::load::channel_slot_va(0);
-    let chan_span = crate::abi::MAX_CELL_CHANNELS * crate::queue::QueuePair::REGION_SIZE;
-    if hits(chan, chan_span) {
-        return Some("the cell's cross-cell channel region");
-    }
-    None
+    crate::user::kernel_owned_overlap(crate::user::current_cell(), base, bytes)
 }
 
 fn page_up(x: usize) -> usize {

@@ -35,6 +35,9 @@
  * replace the kernel's frames. */
 #define QUEUE_VA 0x400000000ULL
 
+/* The cell's cross-cell channel region (kernel/src/load.rs USER_CHANNEL_VA). */
+#define CHANNEL_VA 0x600000000ULL
+
 int main(void) {
   /* 1. A modest anonymous mapping still works - the bound is a bound, not a
    *    break. Write and read it back so it is genuinely usable memory. */
@@ -107,6 +110,21 @@ int main(void) {
     return 1;
   }
   puts("mmap: MAP_FIXED over the queue region EINVAL");
+
+  /* 3b. And over the cross-cell CHANNEL region, which sits at a different fixed
+   *     address. Both are refused by one rule now - the kernel owns the VA, asked
+   *     of the cell's recorded layout rather than of a hand-written list of spans
+   *     (kernel/src/user.rs kernel_owned_overlap) - and both are asserted here
+   *     because that is what makes the rule's coverage visible from outside: a
+   *     regression that dropped one kind would still pass with only the other
+   *     checked. */
+  void *chan = mmap((void *)CHANNEL_VA, 4096, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+  if (chan != MAP_FAILED || errno != EINVAL) {
+    puts("mmap: MAP_FIXED over the channel region was not refused");
+    return 1;
+  }
+  puts("mmap: MAP_FIXED over the channel region EINVAL");
 
   /* 4. W^X is structural, and now honest. `mmap(PROT_WRITE|PROT_EXEC)` used to
    *    return success and silently drop EXEC - so a JIT that maps its code pool

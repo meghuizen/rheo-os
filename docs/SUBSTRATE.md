@@ -272,6 +272,30 @@ a global first-fit would allocate straight through them. Recording those at load
 is what removes the windows, and it is the last step of pillar 2's address
 work.
 
+**And the record is now the authority on what the kernel owns.** A caller-chosen
+`MAP_FIXED` is the one request placement cannot protect against - the cell names
+the address - so it is checked against a list of spans the kernel holds. That
+list was a second copy of `load.rs`'s constants living in `linux/mem.rs`, kept in
+step by hand; it now asks the cell's recorded layout
+(`user::kernel_owned_overlap`). Two details are the substance rather than the
+move itself. It is an **allow-list over `RegionKind` with no `_` arm**: a
+deny-list answers today's question and defaults a *new* kernel-owned kind to
+permitted, silently, at whatever commit adds it, whereas this form defaults it to
+refused and makes adding a variant a compile error. And the record had to be
+**complete before it could be the authority** - the first attempt broke
+`linuxproc` immediately, because a Linux cell never maps a queue ring and so
+never recorded one, so delegating to the record *lost* a check that the constants
+had. The kernel-owned windows are reserved in `user::install` for every cell now,
+mapped or not, which is also the truthful statement about them: those addresses
+are the kernel's whether or not anything is there yet.
+
+Honest about what this bought: the refusals are the same two, because the only
+caller is the Linux `MAP_FIXED` path and a Linux cell holds no typed grant and no
+device BAR. What changed is the rule and where it lives, not the behaviour.
+`mmapx` asserts both spans rather than one, so a regression that dropped a kind
+cannot hide behind the other; the channel half was observed failing with its
+record removed.
+
 **And the user half is each ISA's own now, not the narrowest one's.**
 `USER_VA_MAX` was `2^38` on all three because RISC-V Sv39 has the smallest user
 half and one portable number is simpler than three. It was the wrong number in
@@ -897,9 +921,13 @@ kernel.
   cell can take goes from 128 GiB to 64 TiB on x86-64 and 128 TiB on ARM64
   (riscv64 keeps its Sv39 128 GiB), with `unmap_range` taught to skip an absent
   gigapage in one step - without which a terabyte-wide reservation is a hang, not
-  a slow unmap. **Not yet:** the loader's own placements (image, interpreter,
-  stack, `.user` window) are still constants and unrecorded, which is why
-  `reserve_in` is windowed rather than a whole-space `reserve`.
+  a slow unmap. The record is also the **authority** now: the `MAP_FIXED`
+  kernel-owned check asks the cell's layout rather than a second copy of
+  `load.rs`'s constants, as an allow-list over `RegionKind` with no `_` arm so a
+  new kernel-owned kind defaults to refused. **Not yet:** the loader's own
+  placements (image, interpreter, stack, `.user` window) are still constants and
+  unrecorded, which is why `reserve_in` is windowed rather than a whole-space
+  `reserve`.
 - **S3' - dispatch through `RunQueue`.** The cooperative scheduler's pick
   becomes the queue's pick; every relinquish and preemption charges the burst;
   `metrics` is enabled at boot. Then preemption, then a second core - the SMP.md

@@ -75,6 +75,53 @@ fn cell_va(idx: usize) -> &'static mut crate::mm::vaspace::VaSpace {
     unsafe { &mut (*core::ptr::addr_of_mut!(CELL_VA))[idx] }
 }
 
+/// Whether `[base, base+len)` in cell `idx` overlaps a region the **kernel** owns,
+/// and which one - the question a caller-chosen `MAP_FIXED` has to be asked.
+///
+/// Asked of the cell's recorded layout rather than answered from a list of
+/// constants. The constants were the previous answer, and restating spans that are
+/// already recorded is the inference `mm/vaspace.rs`'s own header rules out: the
+/// list goes stale the moment a region moves, and it is one edit away from being
+/// short an entry.
+///
+/// Written as an **allow-list over `RegionKind` with no `_` arm**, which is the part
+/// that matters. A deny-list ("refuse queue and channel") answers today's question
+/// and defaults a *new* kernel-owned kind to permitted - silently, at whatever
+/// commit adds it. This form defaults it to refused and makes adding a variant a
+/// compile error, so the decision is forced where the knowledge is.
+///
+/// The cell's *own* regions - its image, its interpreter, its stack, its anonymous
+/// and file mappings - are permitted: `ld.so` legitimately `MAP_FIXED`es over its
+/// own reservations, and refusing that would break every dynamically linked binary
+/// (docs/LINUX-COMPAT.md L7).
+///
+/// Honest about reach: the only caller is the Linux `mmap`'s `MAP_FIXED` path, and a
+/// Linux cell holds no typed grant and no device BAR (both are native verbs), so
+/// today this refuses exactly the two spans the constant list refused. What changed
+/// is the *rule*, not the set of refusals - said plainly rather than sold as a new
+/// capability (docs/ENGINEERING.md 7).
+pub fn kernel_owned_overlap(idx: usize, base: usize, len: usize) -> Option<&'static str> {
+    use crate::mm::vaspace::RegionKind;
+    let end = base.saturating_add(len);
+    cell_va(idx)
+        .iter()
+        .filter(|r| base < r.end() && r.base < end)
+        .find_map(|r| match r.kind {
+            // The cell's own mappings: a caller may replace these.
+            RegionKind::Image
+            | RegionKind::Interp
+            | RegionKind::Stack
+            | RegionKind::Anon
+            | RegionKind::File => None,
+            // The kernel's: it holds frames, a raw overlay, or a peer's view here.
+            RegionKind::Queue => Some("the cell's queue-pair region"),
+            RegionKind::Channel => Some("the cell's cross-cell channel region"),
+            RegionKind::Grant => Some("a typed memory grant of the cell"),
+            RegionKind::Fixed => Some("a kernel-placed fixed mapping"),
+            RegionKind::DeviceBar => Some("a device BAR window"),
+        })
+}
+
 /// Record a region a cell has been given, ignoring a refusal.
 ///
 /// Best-effort on purpose. A `.user`-window cell's code and stack are linked beside the
@@ -1662,6 +1709,30 @@ pub unsafe fn install(
     // A fresh cell starts with an empty recorded layout. `clear`, not `init`: the
     // table's frames are a boot cost this slot reuses (see `init_layouts`).
     cell_va(idx).clear();
+    // **Reserve the kernel-owned windows for every cell, mapped or not.** The queue
+    // ring and the cross-cell channel slots live at fixed addresses the kernel may
+    // map into this cell at any time, so those VAs are *reserved* whether or not
+    // anything is there yet - and a caller-chosen `MAP_FIXED` over them must be
+    // refused either way (`kernel_owned_overlap`).
+    //
+    // Recorded here rather than only where the ring is actually mapped, because a
+    // Linux cell never maps one: leaving it unrecorded made the record *look*
+    // complete while quietly permitting a `MAP_FIXED` at 16 GiB in exactly the
+    // cells that run unmodified binaries. Caught by `mmapx`, which asserts that
+    // refusal.
+    record_region(
+        idx,
+        crate::load::USER_QUEUE_VA,
+        QueuePair::REGION_SIZE,
+        crate::mm::vaspace::RegionKind::Queue,
+    );
+    record_region(
+        idx,
+        crate::load::channel_slot_va(0),
+        MAX_CELL_CHANNELS * QueuePair::REGION_SIZE,
+        crate::mm::vaspace::RegionKind::Channel,
+    );
+
     // SAFETY: single CPU; a fresh cell starts with no frames charged.
     unsafe { (*core::ptr::addr_of_mut!(CELL_FRAMES))[idx] = 0 };
     // Give the cell a fair-class vcore on this CPU's ready queue, so the scheduler

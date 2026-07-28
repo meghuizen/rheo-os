@@ -2002,7 +2002,23 @@ fail, observed), with records handed back on a whole-region unmap so a churning 
 cannot exhaust its table. That needed the S1' lesson a second time: a first attempt let
 each cell's table grow lazily, so its first frame landed inside the per-operation
 frame-cost oracles and broke `security`; the tables are funded **once at boot**
-(`user::init_layouts`), the same answer S1' gave for the mapped-file registry. What
+(`user::init_layouts`), the same answer S1' gave for the mapped-file registry.
+**And the record is the authority on what the kernel owns**: a caller-chosen
+`MAP_FIXED` is the one request placement cannot protect against, so it is checked
+against the spans the kernel holds - and that check was a second copy of `load.rs`'s
+constants in `linux/mem.rs`, kept in step by hand. It asks the cell's recorded layout
+now (`user::kernel_owned_overlap`), as an **allow-list over `RegionKind` with no `_`
+arm**, because a deny-list answers today's question and defaults a *new* kernel-owned
+kind to permitted, silently, at whatever commit adds it. The record had to be
+**complete before it could be the authority**: the first attempt broke `linuxproc` at
+once, since a Linux cell never maps a queue ring and so never recorded one, so
+delegating *lost* a check the constants had - the kernel-owned windows are reserved in
+`user::install` for every cell now, mapped or not, which is the truthful statement
+about them (those VAs are the kernel's whether or not anything is there yet). Honest:
+the refusals are the same two, because the only caller is the Linux `MAP_FIXED` path
+and a Linux cell holds no typed grant and no device BAR - the rule changed, not the
+behaviour; `mmapx` asserts both spans so a dropped kind cannot hide behind the other,
+with the channel half observed failing when its record is removed.
 **And placement is now an allocation**: the four regions a cell asks for at run time - a
 typed grant, a file mapping, an anonymous `mmap`, and the read-only copy `SYS_GRANT_SHARE`
 places in the *peer* - are each a `VaSpace::reserve_in` (first-fit inside the region's

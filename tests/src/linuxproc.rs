@@ -319,6 +319,7 @@ extern "C" fn kernel_main() -> ! {
         "mmap: small anonymous mapping usable\n\
          mmap: reservations fit to {fit_gib} GiB, then ENOMEM\n\
          mmap: MAP_FIXED over the queue region EINVAL\n\
+         mmap: MAP_FIXED over the channel region EINVAL\n\
          wx: mmap PROT_WRITE|PROT_EXEC EPERM\n\
          wx: RW->RX flip works, mprotect to RWX EPERM\n\
          vma: freed span reused at the same address, and writable\n\
@@ -338,8 +339,10 @@ extern "C" fn kernel_main() -> ! {
         "linuxproc: mmap bound OK - an ordinary mapping works, reservations fit to \
          {fit_gib} GiB - bounded by this ISA's own user half rather than by the \
          narrowest one - and the next is ENOMEM instead of running into ld.so, \
-         MAP_FIXED over the cell's queue \
-         region is EINVAL, and W^X is honest - RWX is EPERM rather than a success \
+         MAP_FIXED over a region the kernel owns - the cell's queue pair, its \
+         cross-cell channels - is EINVAL because the check asks the cell's own \
+         recorded layout rather than a hand-written list of spans, and W^X is \
+         honest - RWX is EPERM rather than a success \
          that silently drops EXEC, while the RW->RX flip a JIT falls back to works"
     );
 
