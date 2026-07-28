@@ -582,9 +582,37 @@ something false: every range cleared, `alloc_on` degenerating to `alloc`, the re
 printed. Neither is reachable on QEMU's contiguous two-node layout, which is exactly
 why they are worth writing down - the proof cannot catch them.
 
+**And a cell's memory is co-located with the cell.** Placement is only worth having
+if a cell's memory ends up in one place, so a cell now carries a **home node**,
+stamped by the kernel at `install` - round-robin across the nodes the pool holds, so a
+multi-cell workload spreads bandwidth instead of piling on node 0. Three things follow
+it: its **kernel metadata** (page tables, capability tables, the VA record - `kmeta`
+allocates on the owner's node, and holds the owner->node map itself so `mm` never
+reaches up into `user`), its **typed grants** (a `SYS_GRANT` that names no node
+resolves to the cell's own - "no preference" means "the kernel decides" and the kernel
+decides locality, which is also Linux's default policy), and **every page it commits**
+(`commit_range`, i.e. anonymous `mmap`, the Linux heap and stack, demand-page fills,
+COW copies - the bulk of a cell's memory, so leaving this one anywhere would make the
+property false of almost all of it). A spawned child and a forked child inherit the
+parent's node; for `fork` that is not a preference but a fact, since COW starts the
+child out mapping frames the parent already placed.
+
+Proven in the same kernel, at the `kmeta` seam that every table growth passes
+through: two owners given *different* nodes, and every funded frame of each - directory
+and data - asserted on its owner's node, checked twice over, against `node_of` and
+against the launch-derived boundary (`node_of` is built from the same ranges
+`alloc_on` places against, so on its own it would only show the allocator is
+self-consistent). Observed failing - "owner 6 asked for node 1; element 0 landed at
+0x84063000, node 0" - with `kmeta` reverted to `frames::alloc`. Writing that proof also
+found a real API hazard: `node_of` returned "no node" for any address that was not
+frame-aligned, because `in_pool` asks a question about frames rather than addresses -
+and the addresses a caller actually holds are interior ones. It rounds down now, so
+"not on any node" cannot quietly mean "not aligned".
+
 **Not yet, and named:** vcore placement does not follow memory (pillar 3's queue
-is per-CPU but knows nothing of a cell's dominant grant node); kernel metadata
-slabs are not per-node; the cell-facing path is proven **at the kernel seam**
+is per-CPU, and a core claiming a cell does not prefer one whose home node is its own -
+the CPU half of "vcores follow memory", and the remaining piece of this pillar); the
+cell-facing path is proven **at the kernel seam**
 rather than from inside a cell - a cell cannot see a physical address, so
 asserting placement from userspace needs the kernel to walk the cell's page
 tables and report back, which is a harness rather than a stronger claim about the
@@ -1333,9 +1361,11 @@ kernel.
   being dropped, proven by the `numa` kernel on x86-64 (ACPI SRAT) and riscv64
   (device tree) against a boundary oracle taken from the QEMU launch, and
   skipping with a measured reason on ARM64 (a bare-ELF boot gets no device
-  tree - `-dtb` was tried). **Not yet:** vcore placement following a cell's
-  dominant grant node, per-node kernel slabs, and core classes (P/E), which
-  QEMU cannot model at all.
+  tree - `-dtb` was tried). **And a cell's memory is co-located with the cell**: a
+  home node stamped at `install` (round-robin, inherited by spawn and fork) that
+  its kernel metadata, its typed grants and every page it commits all follow.
+  **Not yet:** the CPU half - a core claiming a cell does not prefer one whose
+  home node is its own - and core classes (P/E), which QEMU cannot model at all.
 - **S7 - workload gates.** Real Node.js already runs to completion with its
   JIT enabled (GOAL-NODE), real Bun evaluates JavaScript and exits 0
   (GOAL-BUN), and the real Claude Code binary prints its version and exits 0

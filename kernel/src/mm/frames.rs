@@ -211,6 +211,37 @@ pub fn node_range(node: u8) -> (usize, usize) {
     }
 }
 
+/// Which NUMA node the frame **containing** `pa` sits on, or [`NODE_ANY`] if `pa` is
+/// outside the pool or the node layout is unknown.
+///
+/// Derived from the same ranges [`alloc_on`] places against, so it answers "where did
+/// this frame actually come from" - the question a placement proof and a diagnostic
+/// both need, and one nothing else in the tree could answer.
+///
+/// `pa` need **not** be frame-aligned, and that is deliberate: the addresses a caller
+/// has are usually interior - an element inside a funded table, a struct inside a
+/// mapped page - and [`in_pool`] answers `false` for those, since it is a question
+/// about frames rather than about addresses. Rounding down here rather than at each
+/// caller is what stops "not on any node" from meaning "not frame-aligned".
+pub fn node_of(pa: usize) -> u8 {
+    let pa = pa & !(FRAME_SIZE - 1);
+    if !in_pool(pa) {
+        return NODE_ANY;
+    }
+    let frame = (pa - arch::FRAME_POOL_BASE) / FRAME_SIZE;
+    let _g = POOL_LOCK.lock();
+    // SAFETY: the pool lock is held.
+    unsafe {
+        let ranges = &*core::ptr::addr_of!(NODE_RANGE);
+        for (n, &(lo, hi)) in ranges.iter().enumerate() {
+            if lo < hi && frame >= lo && frame < hi {
+                return n as u8;
+            }
+        }
+    }
+    NODE_ANY
+}
+
 /// Free pool frames on `node` (`0` if it holds none, or if NUMA is unknown).
 ///
 /// The exact oracle a placement proof needs: "how many frames could this node have

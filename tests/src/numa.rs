@@ -47,6 +47,7 @@
 
 use kernel::hw;
 use kernel::mm::frames;
+use kernel::mm::kmeta::{self, Funded};
 use kernel::{arch, println};
 
 /// How QEMU is launched for this kernel: node 0 gets the first 512 MiB of RAM.
@@ -237,6 +238,8 @@ fn numa_two_nodes(inv: &hw::Inventory) {
         "node 1's free count did not return to what it was"
     );
 
+    metadata_follows_its_owner(boundary);
+
     println!(
         "numa: OK on {} - {} nodes discovered from {:?}, the pool partitioned at \
          {:#x} exactly where QEMU was told to put the boundary, a node preference \
@@ -246,6 +249,75 @@ fn numa_two_nodes(inv: &hw::Inventory) {
         inv.nnodes,
         inv.firmware,
         boundary
+    );
+}
+
+/// **A cell's kernel metadata sits on the cell's own node** (docs/SUBSTRATE.md pillar
+/// 6): its page tables, capability tables and VA record are funded through
+/// `mm::kmeta`, and `kmeta` places them on the node `user::install` stamped on the
+/// cell rather than wherever the allocator's rotating hint happened to be.
+///
+/// Driven at the `kmeta` seam - `set_owner_node` then grow a funded table - because
+/// that is exactly the call `install` makes and the call every table growth goes
+/// through. `frames::node_of` answers where each frame actually came from, which is
+/// the only way to check placement rather than re-reading the intent.
+fn metadata_follows_its_owner(boundary: u64) {
+    // Two owners, deliberately given *different* nodes, so the assertion is "the
+    // owner decides" and not "everything moved to one node".
+    for (slot, node) in [(6usize, 1u8), (7usize, 0u8)] {
+        let owner = kmeta::Owner::cell(slot);
+        kmeta::set_owner_node(owner, node);
+        assert_eq!(kmeta::owner_node(owner), node);
+
+        let mut table: Funded<u64> = Funded::new();
+        table.set_owner(owner);
+        // Enough elements to need two data frames plus the directory, so the check
+        // covers a directory frame and more than one data frame.
+        let want = kmeta::elems_per_page::<u64>() + 1;
+        assert!(
+            table.reserve(want),
+            "funded reserve failed for owner {slot}"
+        );
+        assert!(table.frames_held() >= 3);
+
+        // Every element's frame must be on the owner's node. Walked per element
+        // rather than per page because the mapping from element to frame is
+        // `kmeta`'s business, not this test's.
+        for i in 0..want {
+            let va = table.get_ref(i).expect("element in range") as *const u64 as usize;
+            let pa = arch::virt_to_phys(va);
+            assert_eq!(
+                frames::node_of(pa),
+                node,
+                "owner {slot} asked for node {node}; element {i} landed at {pa:#x}, \
+                 node {}",
+                frames::node_of(pa)
+            );
+            // And against the launch-derived oracle, not just `node_of` - which is
+            // built from the same ranges `alloc_on` places against, so on its own it
+            // would only prove the allocator is self-consistent.
+            if node == 1 {
+                assert!(pa as u64 >= boundary, "node 1 element below the boundary");
+            } else {
+                assert!((pa as u64) < boundary, "node 0 element above the boundary");
+            }
+        }
+        table.release();
+        assert_eq!(
+            kmeta::charged(owner),
+            0,
+            "owner {slot} still charged after release"
+        );
+    }
+    // Placement must not have cost anything: both nodes had free frames throughout.
+    assert_eq!(
+        frames::numa_fallbacks(),
+        1,
+        "metadata placement fell back - only the deliberate exhaustion above should"
+    );
+    println!(
+        "numa: kernel metadata follows its owner - two owners on different nodes, \
+         every funded frame on the node its owner was given"
     );
 }
 

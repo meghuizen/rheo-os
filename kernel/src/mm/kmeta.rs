@@ -160,6 +160,16 @@ static mut META_FRAMES: usize = 0;
 static mut META_ALLOCS: u64 = 0;
 static mut META_FREES: u64 = 0;
 
+/// The NUMA node each owner's metadata is placed on (docs/SUBSTRATE.md pillar 6),
+/// [`frames::NODE_ANY`] for "wherever".
+///
+/// Held **here** rather than read from the owning cell, so the dependency stays
+/// one-way: `user` sets it at install, `mm` never reaches up into `user`. That is the
+/// same layering the boot sequencer exists to preserve (docs/ARCHITECTURE-DEBT.md
+/// 3.6) - a cell's page tables and capability tables are metadata *about* a cell,
+/// which is not a reason for the memory manager to depend on the cell module.
+static mut OWNER_NODE: [u8; MAX_OWNERS] = [frames::NODE_ANY; MAX_OWNERS];
+
 /// How many frames `owner` currently holds as kernel metadata.
 pub fn charged(owner: Owner) -> usize {
     // SAFETY: single CPU, synchronous traps; a plain table read.
@@ -178,6 +188,22 @@ pub fn counters() -> (u64, u64) {
     unsafe { (*addr_of!(META_ALLOCS), *addr_of!(META_FREES)) }
 }
 
+/// Place `owner`'s future metadata frames on `node` (docs/SUBSTRATE.md pillar 6).
+///
+/// Called by `user::install` with the cell's home node. Only affects allocations made
+/// **after** it: a table that already grew keeps the frames it has, which is why this
+/// is set before a cell's tables are funded rather than adjusted later.
+pub fn set_owner_node(owner: Owner, node: u8) {
+    // SAFETY: single CPU, synchronous trap; a plain table write.
+    unsafe { (*addr_of_mut!(OWNER_NODE))[owner.ledger_slot()] = node };
+}
+
+/// The node `owner`'s metadata is placed on.
+pub fn owner_node(owner: Owner) -> u8 {
+    // SAFETY: single CPU; a plain table read.
+    unsafe { (*addr_of!(OWNER_NODE))[owner.ledger_slot()] }
+}
+
 /// Take one zeroed frame for kernel metadata, charged to `owner`, and return its
 /// **kernel virtual address**.
 ///
@@ -190,7 +216,11 @@ fn alloc_frame(owner: Owner) -> Option<usize> {
     if free <= META_RESERVE_FRAMES {
         return None;
     }
-    let pa = frames::alloc()?;
+    // On the owner's own node, so a cell's page tables and capability tables sit
+    // beside the memory they describe (docs/SUBSTRATE.md pillar 6). `NODE_ANY` -
+    // every owner before `set_owner_node`, and every owner on a machine with one
+    // node - is `frames::alloc` exactly as before.
+    let pa = frames::alloc_on(owner_node(owner))?;
     // SAFETY: single CPU; plain counter updates.
     unsafe {
         let charged = &mut *addr_of_mut!(CHARGED);

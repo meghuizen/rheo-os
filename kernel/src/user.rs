@@ -330,11 +330,52 @@ struct RunCell {
     /// is pickable by any core - which is exactly the single-CPU behaviour, so a boot
     /// that never claims anything is unchanged.
     cpu: usize,
+    /// The NUMA node this cell's memory is placed on (docs/SUBSTRATE.md pillar 6),
+    /// or [`frames::NODE_ANY`] on a machine with one node.
+    ///
+    /// **A cell's memory is co-located with the cell.** Its page tables and
+    /// capability tables (`mm::kmeta`), its typed grants, and every page it commits
+    /// all draw from this node, so a cell's data and the kernel's records about it sit
+    /// together rather than being scattered by whichever allocation happened first.
+    /// A cell that names no node in `SYS_GRANT` gets this one - "no preference" means
+    /// "the kernel decides", and the kernel decides locality, which is also what
+    /// Linux's default allocation policy does.
+    ///
+    /// Assigned round-robin across the nodes the frame pool actually holds, so a
+    /// multi-cell workload spreads its memory bandwidth instead of piling on node 0.
+    /// Not a capability and not the cell's choice: the kernel stamps it, in the shape
+    /// of docs/IDENTITY.md's principal.
+    node: u8,
 }
 
 /// "No CPU owns this cell." The default, and the value that preserves single-CPU
 /// behaviour exactly.
 pub const NO_CPU: usize = usize::MAX;
+
+/// The next cell's home node, advanced round-robin at each `install`
+/// (docs/SUBSTRATE.md pillar 6).
+static NEXT_NODE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The NUMA node cell `idx` places its memory on, or [`frames::NODE_ANY`].
+pub fn cell_node(idx: usize) -> u8 {
+    if idx >= MAX_CELLS {
+        return frames::NODE_ANY;
+    }
+    cells()[idx].node
+}
+
+/// The home node for the next cell, round-robin over the nodes the pool holds.
+///
+/// [`frames::NODE_ANY`] where the machine has fewer than two, which is what keeps a
+/// non-NUMA boot's allocation paths byte-for-byte what they were.
+fn next_home_node() -> u8 {
+    let nodes = frames::nodes_known();
+    if nodes < 2 {
+        return frames::NODE_ANY;
+    }
+    let n = NEXT_NODE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    (n % nodes) as u8
+}
 /// One cross-cell channel end a cell holds (docs/NETSTACK.md, rheo-net N4a).
 #[derive(Copy, Clone)]
 struct ChanEnd {
@@ -365,6 +406,7 @@ const EMPTY: RunCell = RunCell {
     qp_cap_id: 0,
     chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
     cpu: NO_CPU,
+    node: frames::NODE_ANY,
 };
 
 /// Base VA of a native cell's typed memory-grant reservations (docs/LIBRHEO.md
@@ -926,7 +968,11 @@ pub fn unmap_range(va: usize, len: usize) -> usize {
 /// charge is trued up - unlike a fresh `mmap`, a reprotect cannot be rolled back
 /// without discarding page contents the cell already had (docs/ENGINEERING.md 12).
 pub fn commit_range(va: usize, len: usize, perm: MapPerm) -> bool {
-    commit_range_from(va, len, perm, Backing::Ddr, frames::NODE_ANY)
+    // The **current cell's** node, not `NODE_ANY`. This is the bulk of a cell's
+    // memory - anonymous `mmap`, the Linux heap and stack, demand-page fills, COW
+    // copies - so placing it anywhere would make "a cell's memory is co-located with
+    // the cell" false of almost all of it (docs/SUBSTRATE.md pillar 6).
+    commit_range_from(va, len, perm, Backing::Ddr, cell_node(current_index()))
 }
 
 /// Which physical allocator a commit draws its fresh frames from.
@@ -1213,10 +1259,16 @@ fn grant_create(cur: usize, out_va: u64, len: usize, kind: u64, node_hint: u64) 
         // node count is a property of the machine the cell was placed on, which the
         // cell does not choose, so asking for node 3 on a two-node box is a hint
         // that cannot be honoured rather than an error the cell made.
+        // An in-range ask is honoured; anything else - including the `NODE_ANY`
+        // librheo's `Grant::reserve` sends - resolves to the **cell's own** node.
+        // "No preference" means "the kernel decides", and the kernel decides
+        // locality; a node this machine does not have is a hint it cannot honour
+        // rather than an error the cell made, since the cell did not choose the
+        // machine it was placed on.
         node: if (node_hint as usize) < frames::nodes_known() {
             node_hint as u8
         } else {
-            frames::NODE_ANY
+            cells()[cur].node
         },
         sealed: false,
         cap_id,
@@ -1736,10 +1788,19 @@ pub unsafe fn install(
         qp_cap_id: 0,
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
         cpu: NO_CPU,
+        // Round-robin across the nodes the pool holds, so cells spread their
+        // memory bandwidth (docs/SUBSTRATE.md pillar 6). `NODE_ANY` on a
+        // single-node machine, which is every allocation path unchanged.
+        node: next_home_node(),
     };
     *cell_grants(idx) = [EMPTY_GRANT; MAX_GRANTS_PER_CELL];
     // A fresh cell starts with an empty recorded layout. `clear`, not `init`: the
     // table's frames are a boot cost this slot reuses (see `init_layouts`).
+    // Place this cell's kernel metadata - page tables, capability tables, its VA
+    // record - on the cell's own node, before anything funds a frame for it
+    // (docs/SUBSTRATE.md pillar 6). `kmeta` holds the mapping rather than reading it
+    // back out of the cell, so `mm` never depends on `user`.
+    crate::mm::kmeta::set_owner_node(crate::mm::kmeta::Owner::cell(idx), cells()[idx].node);
     cell_va(idx).clear();
     // **Reserve the kernel-owned windows for every cell, mapped or not.** The queue
     // ring and the cross-cell channel slots live at fixed addresses the kernel may
@@ -2078,6 +2139,10 @@ pub unsafe fn install_spawned(
     // path, which is the point: it is a list, not an inheritance.
     // SAFETY: single CPU; slot `idx` is free, so nothing else holds this table.
     unsafe { (*owned_caps(idx)).clear() };
+    // Same as `install`: the child's metadata follows the child's node, set before
+    // its tables are funded. Needed on this path too because a slot is reused - a
+    // stale entry would place this cell's tables on the previous occupant's node.
+    crate::mm::kmeta::set_owner_node(crate::mm::kmeta::Owner::cell(idx), p.node);
     cells()[idx] = RunCell {
         aspace,
         caps: owned_caps(idx),
@@ -2095,6 +2160,10 @@ pub unsafe fn install_spawned(
         qp_cap_id,
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
         cpu: NO_CPU,
+        // The parent's node, not a fresh one: a spawned child shares the parent's
+        // capability bundle and usually a channel with it, so they are one working
+        // set and splitting them across nodes would cost on every message.
+        node: p.node,
     };
     *cell_grants(idx) = [EMPTY_GRANT; MAX_GRANTS_PER_CELL];
     // SAFETY: single CPU; a fresh cell starts with no frames charged.
@@ -2153,6 +2222,10 @@ pub unsafe fn install_forked(
     // SAFETY: single CPU; slot `idx` is free and `parent` is present, so the two
     // tables are distinct and uniquely owned for the trap.
     unsafe { (*owned_caps(idx)).copy_from(&*p.caps) };
+    // Same as `install`: the child's metadata follows the child's node, set before
+    // its tables are funded. Needed on this path too because a slot is reused - a
+    // stale entry would place this cell's tables on the previous occupant's node.
+    crate::mm::kmeta::set_owner_node(crate::mm::kmeta::Owner::cell(idx), p.node);
     cells()[idx] = RunCell {
         aspace,
         caps: owned_caps(idx),
@@ -2166,6 +2239,11 @@ pub unsafe fn install_forked(
         qp_cap_id: 0,
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
         cpu: NO_CPU,
+        // The parent's node, and here it is not a preference but a fact: `fork` is
+        // copy-on-write, so the child starts out mapping the parent's frames, which
+        // are already placed. Anything else would be a claim the pages do not
+        // support.
+        node: p.node,
     };
     // As `install_spawned`: a forked child inherits its parent's burst score
     // (docs/SUBSTRATE.md pillar 3).

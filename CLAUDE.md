@@ -2137,7 +2137,27 @@ failing when `alloc_on` is reverted to `alloc`. **ARM64 skips with a measured
 reason**: QEMU hands a bare-ELF `-kernel` boot no device-tree pointer in `x0` on
 `virt`, so nothing describes memory nodes - checked, not assumed, since `-dtb`
 explicitly does not reach it either - and the single-node path is asserted *unchanged*
-so "NUMA landed" never quietly alters a machine that has none. Two hazards that only
+so "NUMA landed" never quietly alters a machine that has none. **And a cell's memory is
+co-located with the cell**: a cell carries a kernel-stamped **home node** (round-robin
+across the nodes the pool holds, so cells spread bandwidth rather than piling on node 0;
+inherited by `SYS_SPAWN` and, necessarily, by `fork` - COW starts the child mapping
+frames the parent already placed), and three things follow it: its **kernel metadata**
+(page tables, capability tables, VA record - `kmeta` allocates on the owner's node and
+holds the owner->node map itself, so `mm` never reaches up into `user`), its **typed
+grants** (a `SYS_GRANT` naming no node resolves to the cell's own - "no preference" means
+"the kernel decides" and the kernel decides locality, as Linux's default policy does),
+and **every page it commits** (`commit_range`: anonymous `mmap`, the Linux heap and
+stack, demand-page fills, COW copies - the bulk of a cell's memory, so leaving this one
+anywhere would make the property false of almost all of it). Proven at the `kmeta` seam
+every table growth passes through: two owners given different nodes, every funded frame
+of each asserted on its owner's node twice over - against `frames::node_of` and against
+the launch-derived boundary, since `node_of` is built from the same ranges `alloc_on`
+places against and alone would only show the allocator self-consistent - observed failing
+("owner 6 asked for node 1; element 0 landed at 0x84063000, node 0") with `kmeta` reverted
+to `frames::alloc`. That proof also found a real API hazard: `node_of` answered "no node"
+for any address that was not frame-aligned, because `in_pool` asks about frames rather
+than addresses while the addresses a caller holds are interior; it rounds down now, so
+"not on any node" cannot quietly mean "not aligned". Two hazards that only
 exist once placement is real are handled and **not** reachable on QEMU's contiguous
 layout, which is why they are written down rather than left to a proof that cannot see
 them: `librheo`'s `Grant::reserve` passed node `0`, harmless while the hint was dropped
@@ -2148,10 +2168,12 @@ swallowing node 1's - `alloc_on(0)` serving node 1's frames while reporting no f
 a wrong answer that looks right - which is now detected and answered by knowing
 *nothing* (ranges cleared, `alloc_on` degenerating to `alloc`, reason printed) rather
 than something false. Honest: vcore placement
-does **not** follow memory yet, kernel metadata slabs are not per-node, the pmem pool
-has no node of its own, and the cell-facing path is proven at the **kernel seam**
+does **not** follow memory on the CPU side yet, the pmem pool has no node of its own, and
+the cell-facing path is proven at the **kernel seam**
 rather than from inside a cell (a cell cannot see a physical address). Latency is
-unmeasurable here regardless - QEMU models the topology, not its costs.
+unmeasurable here regardless - QEMU models the topology, not its costs. The one
+remaining piece of the pillar is the **CPU half**: a core claiming a cell does not prefer
+one whose home node is its own.
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
