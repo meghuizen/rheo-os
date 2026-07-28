@@ -171,6 +171,46 @@ static SECONDARY_UP: AtomicUsize = AtomicUsize::new(0);
 /// the exact result (a fixed magic, not 1, to catch a stuck/garbage write).
 pub const SECONDARY_MARK: u64 = 0x5EC0;
 
+/// Iterations each core performs in the two-core lock-contention proof.
+pub const CONTENTION_ITERS: u64 = 20_000;
+
+/// A counter the primary and a secondary increment **concurrently**, each under
+/// the [`SpinLock`]. This is the proof the lock provides genuine mutual exclusion
+/// across cores, not merely that a single cross-core write lands: a lock that did
+/// not actually serialise the read-modify-write would lose updates and the final
+/// value would fall short of `CONTENTION_ITERS * 2`. The single-write
+/// [`SHARED`]/[`SECONDARY_MARK`] proof passes even with a broken lock (there is no
+/// concurrent writer), which is exactly the gap this closes.
+static CONTENDED: SpinLock<u64> = SpinLock::new(0);
+
+/// A two-core rendezvous so both cores are inside their increment loops at the
+/// same time - genuine contention, not two sequential runs. Best-effort: a core
+/// whose peer is slow proceeds alone after the bounded wait, which still yields
+/// the exact sum (the correctness oracle) but weaker overlap.
+static CONTEND_READY: AtomicUsize = AtomicUsize::new(0);
+
+/// Run this core's half of the contention proof: rendezvous with the peer, then
+/// take the shared lock `CONTENTION_ITERS` times, adding 1 each time. Called from
+/// both the primary ([`bring_up_one`]) and the secondary ([`secondary_run`]).
+pub fn contend() {
+    CONTEND_READY.fetch_add(1, Ordering::AcqRel);
+    let mut budget = WAIT_BUDGET;
+    while CONTEND_READY.load(Ordering::Acquire) < 2 && budget > 0 {
+        core::hint::spin_loop();
+        budget -= 1;
+    }
+    for _ in 0..CONTENTION_ITERS {
+        let mut g = CONTENDED.lock();
+        *g += 1;
+    }
+}
+
+/// The contended counter (under the lock) - `CONTENTION_ITERS * 2` once both
+/// cores have run [`contend`].
+pub fn contended_value() -> u64 {
+    *CONTENDED.lock()
+}
+
 /// The next free registry index to hand a secondary. The boot CPU is index 0
 /// ([`init`]); secondaries take 1, 2, ... as they come up. This keeps the
 /// registry index independent of the hardware CPU id (the boot hart id may be
@@ -194,6 +234,11 @@ pub fn secondary_run(hw_id: u32) {
     // this_cpu() must resolve to *this* secondary's block now that its identity
     // is set - a check that per-CPU addressing works off the boot core.
     debug_assert!(this_cpu().is_online());
+    // Genuine cross-core contention: hammer a shared counter under the lock while
+    // the primary does the same, proving mutual exclusion (not just a single
+    // write). Runs before the completion signal so the primary's wait on
+    // `SECONDARY_UP` implies this secondary finished contending.
+    contend();
     SECONDARY_UP.fetch_add(1, Ordering::Release);
 }
 
@@ -259,6 +304,13 @@ pub fn bring_up_one() -> Result<usize, StartError> {
     let before = secondaries_up();
     match arch::smp_start_secondary(target_hw) {
         Ok(()) => {
+            // The primary's half of the two-core contention proof, run **here** -
+            // between the start call and the completion wait - because this is the
+            // only window in which the secondary is also running its own `contend`
+            // loop. Both rendezvous inside `contend`, so the lock is genuinely
+            // contended by two cores at once (docs/SMP.md 10, the foundation the
+            // #132 kernel-wide locks rest on).
+            contend();
             let mut budget = WAIT_BUDGET;
             while budget > 0 {
                 if secondaries_up() > before {

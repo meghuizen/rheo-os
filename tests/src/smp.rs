@@ -116,6 +116,25 @@ fn test_secondary_bringup() {
                 smp::online_count(),
                 shared
             );
+            // Genuine two-core mutual exclusion: the primary and the secondary each
+            // incremented one shared counter CONTENTION_ITERS times, concurrently,
+            // under the SpinLock. The exact sum survives only because the lock
+            // serialised every read-modify-write; a lock without real cross-core
+            // exclusion would lose updates to the race and fall short. This is the
+            // proof that upgrades "a cross-core write lands" to "the lock is a
+            // correct mutual-exclusion primitive under contention" - the foundation
+            // the #132 kernel-wide locks rest on (docs/SMP.md 10).
+            let contended = smp::contended_value();
+            let want = smp::CONTENTION_ITERS * 2;
+            assert_eq!(
+                contended, want,
+                "two-core lock contention lost updates: got {contended}, want {want}"
+            );
+            println!(
+                "smp: two-core lock contention OK - {} locked increments from each \
+                 of 2 cores serialised to exactly {contended}",
+                smp::CONTENTION_ITERS
+            );
             println!("smp: real second core on {} confirmed", arch::NAME);
         }
         Err(StartError::NoSecondary) => {

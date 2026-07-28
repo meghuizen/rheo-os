@@ -481,6 +481,14 @@ the interrupt vector writes.
   print what answered.
 - A genuinely interrupt-driven one-shot timer **and** UART RX line on all three ISAs,
   each verified at bring-up by an interrupt the kernel actually took (sections 5, 8).
+- **The `SpinLock` provides real mutual exclusion under two-core contention**, on all
+  three ISAs. The primary and the secondary rendezvous, then each increments one shared
+  counter `CONTENTION_ITERS` (20 000) times **concurrently**, every increment under the
+  lock; the primary asserts the sum is **exactly 40 000**. This is strictly stronger than
+  the single-cross-core-write proof, which passes even with a lock that provides no
+  exclusion (there is no concurrent writer): a lock that failed to serialise the
+  read-modify-write would lose updates and fall short. This is the primitive the
+  phase-2 kernel-wide locks (§10.2) rest on, proven before they are built on it.
 
 **Deferred**
 - Preemptive multi-core scheduling (the runtime stays single-CPU cooperative;
