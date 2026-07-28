@@ -1,0 +1,16 @@
+# Standalone crate (its own workspace): it lives under the `tests/` member
+# directory but is built by xtask for a `*-unknown-linux-gnu` target, not as
+# part of the kernel workspace. The empty [workspace] table detaches it.
+[workspace]
+
+[package]
+name = "tilelinux"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tilelinux"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"

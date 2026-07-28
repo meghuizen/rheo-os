@@ -2136,7 +2136,22 @@ disturbing another's result - and the queue ABI in particular had only ever been
 from one core at a time, since every prior async proof ran a single cell. Four controls
 observed failing (every cell given the same slice; one bit flipped in the attention
 reference; one bit flipped in the GEMM reference; the async strands pointed at `OP_NOP`
-so the echo cannot match). Honest: FA3's own producer/consumer
+so the echo cannot match).
+**And the same tile kernels run under the Linux personality** (docs/TILES.md 13.4b): all
+of the above is librheo, the *native* userspace library, while Node/Bun/Claude Code are
+`Personality::Linux` cells - two substrates with nothing joining them. The tile kernels
+are dependency-free Rust, which is already why `kernel/engine.rs` and `bench-core`
+`#[path]`-include them, so `tests/linux-fixtures/tilelinux` includes the same three files
+(`fmath`/`kernels`/`attn`) and is built as a **static-glibc Linux binary**; `smp` runs it
+as a Linux cell and compares its output hashes against the librheo cells' **actual
+bytes**, hashed kernel-side over the buffers the rounds above filled, so the expected
+transcript is derived rather than copied from a passing run. They agree exactly - GEMM
+`23aa217921e5ccb1`, FlashAttention `0a9704e0e8740540`, all three ISAs. That establishes
+**the tile programs need nothing librheo provides that the Linux personality cannot** (no
+queue pair, no typed grant, no native verb) and that the two substrates agree bit for bit
+on the arithmetic. It is **not** a claim that Node or Bun call these functions - they do
+not, and nothing here pretends otherwise. Control observed failing: one input salt changed
+in the Linux binary. Honest: FA3's own producer/consumer
 overlap is still **interleaving** within a slice - the parallelism above is data
 parallelism *over* the head, and a slice runs on one core, so FA3's wall-clock win over
 FA2 needs a second execution context inside the slice and is not built; the inner loops are
@@ -2643,7 +2658,10 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               inet_personality.rs (the N4b remote-INET datapath registered as
               svc::SocketOps);
               fixtures/ holds the
-              ext4 test image (+ gen-ext4.sh); linux-fixtures/ holds the
+              ext4 test image (+ gen-ext4.sh); linux-fixtures/ (incl. tilelinux/ - the
+              tile kernels `#[path]`-included from librheo and built as a static-glibc
+              Linux binary, so `smp` can assert the two substrates agree bit for bit,
+              docs/TILES.md 13.4b) holds the
               built-from-source glibc test binaries (rusthello/ + rustthreads/
               + hello.c + sig_{raise,segv,dfl}.c + procdemo/cecho/rsh.c +
               dhello.c + af_unix.c + inet.c + inetremote.c; coreutils via cargo

@@ -634,6 +634,31 @@ attention reference (caught at element 512, `3.4976618e0` vs `3.4976616e0`), fli
 bit of the GEMM reference, and pointing the async strands at `OP_NOP` so the echo cannot
 match.
 
+### 13.4b The same kernels under the Linux personality
+
+Everything above runs in **librheo** cells, and librheo is the OS's native userspace
+library. Node, Bun and Claude Code are not librheo cells - they are `Personality::Linux`
+cells speaking the Linux syscall ABI - so "the tile structure works" and "real Linux
+binaries run" were two claims about two substrates with nothing joining them.
+
+They are joined where they honestly can be. The tile *kernels* are dependency-free Rust,
+which is already why `kernel/engine.rs` and `bench-core` `#[path]`-include them rather
+than duplicating them; `tests/linux-fixtures/tilelinux` includes the same three files
+(`fmath`, `kernels`, `attn`) and is built as a **static-glibc Linux program**. The `smp`
+kernel runs it as a Linux cell and compares its output hashes against the **librheo
+cells' actual bytes** - hashed on the kernel side over the buffers the rounds above
+filled, so the expected transcript is derived rather than copied from a passing run.
+
+They agree exactly: GEMM `23aa217921e5ccb1`, FlashAttention `0a9704e0e8740540`, on all
+three ISAs.
+
+What that establishes, precisely: **the tile programs need nothing librheo provides that
+the Linux personality cannot** - no queue pair, no typed grant, no native verb - and the
+two substrates agree bit for bit about the arithmetic. It is a claim about the kernels
+and the ABI beneath them. It is **not** a claim that Node or Bun call these functions;
+they do not, and nothing here pretends otherwise. Control observed failing: changing one
+input salt in the Linux binary.
+
 ### 13.5 Honest scope
 
 - **FA3's overlap is interleaving, not concurrency - even now.** Section 13.4a puts

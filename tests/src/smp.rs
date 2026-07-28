@@ -897,8 +897,119 @@ fn test_flash_attention_parallel() {
                 println!("smp:   CPU {c} ran {n} tile slice(s)");
             }
         }
+        // The same tile kernels, on the **other** substrate.
+        test_tile_under_linux();
         user::reset();
     }
+}
+
+// ------------------------- the tile kernels under the LINUX personality
+//
+// The tile framework lives in librheo, and every proof of it ran in a librheo cell.
+// Node, Bun and Claude Code are not librheo cells - they are `Personality::Linux` cells
+// speaking the Linux syscall ABI - so "the tile structure works" and "real Linux
+// binaries run" were two claims about two substrates with nothing joining them.
+//
+// `tilelinux` joins them where they honestly can be: the tile *kernels* are
+// dependency-free Rust, so the same source `kernel/engine.rs` and `bench-core` include
+// is `#[path]`-included into a static-glibc Linux program. This phase runs it as a Linux
+// cell and compares its output hashes against the **librheo cell's actual output**,
+// computed here over the reference buffers the rounds above filled.
+//
+// What that establishes, precisely: the tile programs need nothing librheo provides that
+// the Linux personality cannot - no queue pair, no typed grant, no native verb - and the
+// two substrates agree bit for bit about the arithmetic. It is a claim about the kernels
+// and the ABI beneath them, not about Node, which does not call these functions.
+
+static TILELINUX: &[u8] = fixture::linux_cargo!("tilelinux");
+
+/// FNV-1a, the same constants `tilelinux` uses, so one `u64` replaces a shared page.
+fn fnv(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Format `h` as the sixteen lowercase hex digits `tilelinux` prints.
+fn hex16(h: u64, out: &mut [u8; 16]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for i in 0..16 {
+        out[i] = HEX[((h >> (60 - 4 * i)) & 0xF) as usize];
+    }
+}
+
+/// Run the tile kernels as a **Linux** cell and require the same bits as the librheo
+/// cell produced.
+///
+/// # Safety
+/// Single-threaded on the primary between rounds, with no cell live.
+unsafe fn test_tile_under_linux() {
+    // The hashes the librheo cells actually produced, over the buffers they filled.
+    // SAFETY: read on the primary after those rounds ended.
+    let (want_gemm, want_attn) = unsafe {
+        let g = core::slice::from_raw_parts(
+            core::ptr::addr_of!(FA_GEMM_OUT) as *const u8,
+            FA_GM * FA_GN * 4,
+        );
+        let a =
+            core::slice::from_raw_parts(core::ptr::addr_of!(FA_OUT) as *const u8, FA_TQ * FA_D * 4);
+        (fnv(g), fnv(a))
+    };
+
+    // Route the cell's stdout into the capture buffer, the way this kernel's other
+    // Linux phases do; `run_linux_cell` installs into slot 0, which is `captured(0)`.
+    // SAFETY: the caller's contract.
+    unsafe {
+        (*core::ptr::addr_of_mut!(STDOUT_LEN))[0] = 0;
+    }
+    kernel::linux::set_stdout_tap(Some(tap));
+    // SAFETY: the caller's contract.
+    let out = unsafe { harness::run_linux_cell(TILELINUX, &[b"tilelinux"]) };
+    kernel::linux::set_stdout_tap(None);
+    let got = captured(0);
+    assert!(
+        matches!(out, Outcome::Exited(0)),
+        "tilelinux exited {out:?}, expected 0"
+    );
+
+    let mut hg = [0u8; 16];
+    let mut ha = [0u8; 16];
+    hex16(want_gemm, &mut hg);
+    hex16(want_attn, &mut ha);
+    // Built from the librheo cells' **own bytes**, so the expected transcript is not a
+    // constant anyone could have copied from a passing run. Fixed-size: this kernel
+    // declares no allocator and does not need one for 66 bytes.
+    let mut want = [0u8; 66];
+    let mut w = 0usize;
+    let mut put = |src: &[u8], w: &mut usize| {
+        for &b in src {
+            want[*w] = b;
+            *w += 1;
+        }
+    };
+    put(b"tilelinux: gemm ", &mut w);
+    put(&hg, &mut w);
+    put(b"\ntilelinux: attn ", &mut w);
+    put(&ha, &mut w);
+    put(b"\n", &mut w);
+    assert_eq!(w, want.len(), "the expected transcript is the wrong length");
+    assert!(
+        got == &want[..],
+        "the Linux cell's tile output does not match the librheo cell's\n  got:  {:?}\n  want: {:?}",
+        core::str::from_utf8(got),
+        core::str::from_utf8(&want)
+    );
+    println!(
+        "smp: THE TILE KERNELS RAN UNDER THE LINUX PERSONALITY - the same \
+         `#[path]`-included tile sources, built as a static-glibc Linux binary, produced \
+         byte-identical GEMM ({:016x}) and FlashAttention ({:016x}) output to the librheo \
+         cells above; the tile programs need no native verb, no queue pair and no typed \
+         grant",
+        want_gemm, want_attn
+    );
 }
 
 /// **A cell ran on a core of the cell's own NUMA node** (docs/SUBSTRATE.md pillar 6,

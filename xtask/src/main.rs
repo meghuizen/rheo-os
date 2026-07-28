@@ -1454,6 +1454,29 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         return false;
     }
 
+    // The **tile framework's own kernels in a Linux binary** (docs/TILES.md 13.4b):
+    // `fmath`/`kernels`/`attn` are `#[path]`-included from librheo, so the same source
+    // the librheo executor and the kernel's compute engine compile is built here as a
+    // static-glibc Linux program instead. The `linuxtile` phase compares its output
+    // hashes against the librheo cell's, byte for byte.
+    let mut tl = Command::new("cargo");
+    tl.args([
+        "build",
+        "--manifest-path",
+        "tests/linux-fixtures/tilelinux/Cargo.toml",
+        "--release",
+        "--target",
+        arch.linux_gnu_target(),
+    ]);
+    tl.env("RUSTFLAGS", &rustflags);
+    if !matches!(tl.status().map(|s| s.success()), Ok(true)) {
+        eprintln!(
+            "[xtask] tile-in-Linux fixture build failed for {}",
+            arch.name()
+        );
+        return false;
+    }
+
     // C hello: gcc -static -no-pie, stock ET_EXEC base (no relink).
     let out_dir = format!("tests/linux-fixtures/build/{}", arch.name());
     if let Err(e) = std::fs::create_dir_all(&out_dir) {
