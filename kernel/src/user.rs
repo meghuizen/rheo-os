@@ -620,6 +620,19 @@ pub fn current_vcore() -> usize {
     *CUR_VCORE.this()
 }
 
+/// Record that this CPU is now running vcore `v` of the current cell.
+///
+/// For the one caller that swaps the register file itself rather than through
+/// [`switch_native_cell_vcore`] - `nproc::preempt_cell`, which must save FP *before* the
+/// pick runs any kernel code (see its own comment) and so cannot use the packaged switch.
+pub fn set_current_vcore(v: usize) {
+    // No `enter_vcore` here, for the reason `switch_native_cell` gives: this is a
+    // cross-cell move, and marking `INSIDE` outside `run_inner`'s bracket produces a
+    // false double-entry when a batch sibling exits without passing back through it.
+    // SAFETY: this CPU's own slot.
+    unsafe { *CUR_VCORE.this_mut() = v };
+}
+
 /// The cell whose trap is being serviced. `crate::uaccess` needs it to know whose
 /// address space a supplied pointer belongs to, and whether that cell's mappings are
 /// lazy at all (a native cell's are not).
@@ -781,6 +794,15 @@ pub fn restore_native_fp_vcore(idx: usize, v: usize) {
 /// [`switch_to_cell`]), because a Linux cell holds up to 8 contexts with an FP
 /// area each.
 pub fn switch_native_cell(from: usize, to: usize) {
+    switch_native_cell_vcore(from, to, 0);
+}
+
+/// [`switch_native_cell`], entering a named **vcore** of the target.
+///
+/// Cross-cell paths that predate vcores enter vcore 0; the native scheduler names the
+/// vcore, because a cell that parked one context and left a sibling runnable must be
+/// re-entered at the sibling rather than at vcore 0.
+pub fn switch_native_cell_vcore(from: usize, to: usize, to_v: usize) {
     // Save the vcore this CPU is actually **inside**, and load the vcore the target is
     // entered at, which for a cross-cell switch is always its vcore 0. Naming both
     // rather than assuming 0 on each side is what lets a multi-vcore cell take this path
@@ -789,9 +811,9 @@ pub fn switch_native_cell(from: usize, to: usize) {
     // to prevent (docs/SUBSTRATE.md pillar 3).
     save_native_fp_vcore(from, current_vcore());
     switch_to_cell(to);
-    restore_native_fp_vcore(to, 0);
-    // SAFETY: this CPU's own slot. The target is entered at its vcore 0.
-    unsafe { *CUR_VCORE.this_mut() = 0 };
+    restore_native_fp_vcore(to, to_v);
+    // SAFETY: this CPU's own slot.
+    unsafe { *CUR_VCORE.this_mut() = to_v };
     // Deliberately **not** `enter_vcore`. `INSIDE` is written on entry and cleared on
     // return by `run_inner`, and a cross-cell switch chain sits *inside* one such
     // bracket - so making this a second writer of the slot was tried and fires a false
@@ -883,6 +905,12 @@ pub fn current_index() -> usize {
 /// (docs/LINUX-COMPAT.md L4); clone-created threads get kernel-owned frames.
 pub fn cell_frame(idx: usize) -> *mut TrapFrame {
     cells()[idx].vframe[0]
+}
+
+/// The frame of vcore `v` of cell `idx` (docs/SUBSTRATE.md pillar 3). `cell_frame(idx)`
+/// is `vcore_frame(idx, 0)`.
+pub fn vcore_frame(idx: usize, v: usize) -> *mut TrapFrame {
+    cells()[idx].vframe[v]
 }
 
 /// Run `f` against the current cell's address space, then re-activate it so

@@ -26,11 +26,12 @@ same instant, in one address space, on all three ISAs. `SYS_YIELD` reaches a **s
 cell before it considers another cell, and that switch changes only the FP/SIMD register
 file and the frame - one address space, so no `activate()` and no TLB consequence - which
 is the two-level scheduler's lower rung finally costing what section 3 says it should.
-What is *not* built is a vcore that **blocks**: `nproc`'s block state is per cell, so one
-vcore parking on `SYS_WAIT` would mark every sibling blocked, the same defect the Linux
-side fixed with per-context `pblock`. So `TicketLock`'s "future multi-vcore case" is now a
-nearer future with a mechanism under it, not a different design; the runtime scheduling
-strands over several vcores still awaits that block.
+And a vcore **blocks**: the block state is per vcore, so a
+context parking on a timer leaves its siblings runnable - proven by the `schedidle` oracle
+one level down (`bSSSSSSSSB`, one cell, two contexts). So `TicketLock`'s "future multi-vcore
+case" has a mechanism under it now. What is still *not* built is the runtime half: strands
+scheduled over several vcores, with the in-cell work stealing section 2 describes - the
+kernel offers the vcores, `runtime/` does not yet ask for more than one.
 
 Position: threads get light by splitting in two. The kernel schedules
 **vcores** (one kernel context each); the runtime inside a cell schedules

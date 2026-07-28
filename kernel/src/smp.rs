@@ -1289,17 +1289,6 @@ unsafe fn drain_cells() {
                 None => return,
             }
         }
-        // Stamp ownership before anything runs: from here no other core's pick can
-        // see these vcores, which is what makes running them need no lock. Per **vcore**,
-        // so two cores can own two contexts of one cell (docs/SUBSTRATE.md pillar 3).
-        for c in cell.iter().take(got) {
-            crate::user::claim_vcore(
-                *c / crate::user::MAX_VCORES,
-                *c % crate::user::MAX_VCORES,
-                cpu,
-            );
-        }
-
         // Run until every cell of the batch has exited. `run` returns the cell that
         // actually ended the run - under preemption that is whichever of the batch
         // finished first, not necessarily the one entered.
@@ -1323,6 +1312,17 @@ unsafe fn drain_cells() {
             // counters disagree with where the cell actually ran (observed: 9 claims
             // counted for 8 cells, one of them stolen).
             count_claim(cell[pos] / crate::user::MAX_VCORES);
+            // **Stamp ownership here, not at claim time.** Past the run-mark this core
+            // *will* run this vcore and no peer can take it; a batch-time stamp is a
+            // claim a stealer can invalidate, and the previous owner has no way to learn
+            // it lost one until it reaches the slot. That was harmless while entry was
+            // gated by the run-mark alone, and became a real race once a *sibling-vcore
+            // yield* started trusting the stamp: a core holding two vcores of one cell in
+            // one batch would enter the sibling from inside the first, while the stealer
+            // was already inside it. Caught by name by `user::double_entries`
+            // (docs/SUBSTRATE.md pillar 3) - the same reasoning `count_claim` above
+            // already carries for the counters.
+            claim_vcore_id(cell[pos], cpu);
             if preemptive {
                 // Under preemption *both* cells of a batch are live at once - the timer
                 // enters the sibling without passing through this loop - so neither can
@@ -1330,6 +1330,10 @@ unsafe fn drain_cells() {
                 for i in 0..got {
                     if slot[i] != usize::MAX {
                         PLACE_RUN[slot[i]].store(1, Ordering::Release);
+                        // Both are live at once under preemption, so both must be owned
+                        // before either runs - the timer enters the sibling without
+                        // passing back through this loop.
+                        claim_vcore_id(cell[i], cpu);
                     }
                 }
             }
@@ -1355,6 +1359,16 @@ unsafe fn drain_cells() {
             PLACE_DONE.fetch_add(1, Ordering::Release);
         }
     }
+}
+
+#[cfg(feature = "smp")]
+/// Give the `(cell, vcore)` a queue entry names to CPU `cpu`.
+fn claim_vcore_id(vid: usize, cpu: usize) {
+    crate::user::claim_vcore(
+        vid / crate::user::MAX_VCORES,
+        vid % crate::user::MAX_VCORES,
+        cpu,
+    );
 }
 
 #[cfg(feature = "smp")]

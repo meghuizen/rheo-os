@@ -91,15 +91,29 @@ enum Block {
 
 #[derive(Copy, Clone)]
 struct Proc {
+    /// The **cell's** state. `Blocked` means *every* vcore is parked - the condition
+    /// under which the cell as a whole cannot run. For a single-vcore cell that is
+    /// exactly what it always meant.
     state: PState,
     /// Parent cell index, or -1 for the top of the tree (the first spawner).
     parent: i32,
-    /// The child cell this proc is blocked in `SYS_WAIT` for (when `Blocked`).
-    /// Kept alongside `block` because `complete_block` reaps an awaited zombie on
+    /// Per vcore: the child cell this context is blocked in `SYS_WAIT` for.
+    /// Kept alongside `vblock` because `complete_block` reaps an awaited zombie on
     /// **every** switch-in, including a plain `SYS_YIELD` (pre-existing behaviour).
-    wait_for: usize,
-    /// What this proc is parked on (when `Blocked`).
-    block: Block,
+    vwait: [usize; user::MAX_VCORES],
+    /// Per vcore: what that context is parked on (docs/SUBSTRATE.md pillar 3).
+    ///
+    /// **Per vcore, not per cell**, and that is the whole of "a vcore can block": with
+    /// one `Block` for the cell, one context parking on a timer would record the wait
+    /// for all of them, so a runnable sibling would look blocked and the scheduler
+    /// would idle the machine with work available. It is the defect the Linux side
+    /// already fixed one level up with per-context `pblock` (docs/LINUX-COMPAT.md).
+    vblock: [Block; user::MAX_VCORES],
+    /// Per vcore: parked - the per-vcore analogue of `state == PState::Blocked`, kept
+    /// separate from `vblock` for the same reason the cell-level pair is separate:
+    /// `wake_satisfiable` clears the *parked* flag while `complete_block` clears the
+    /// *block* later, with the woken context's address space active.
+    vparked: [bool; user::MAX_VCORES],
     /// Exit code while `Zombie` (0..=255, or `FAULT_EXIT` for a faulted child).
     code: u64,
 }
@@ -109,11 +123,37 @@ impl Proc {
         Proc {
             state: PState::Free,
             parent: -1,
-            wait_for: 0,
-            block: Block::None,
+            vwait: [0; user::MAX_VCORES],
+            vblock: [Block::None; user::MAX_VCORES],
+            vparked: [false; user::MAX_VCORES],
             code: 0,
         }
     }
+}
+
+/// Whether vcore `v` of cell `i` is parked.
+fn parked(i: usize, v: usize) -> bool {
+    procs()[i].vparked[v]
+}
+
+/// Whether every vcore of cell `i` is parked - the condition for the cell-level
+/// `PState::Blocked`. Trivially "is vcore 0 parked" for a single-vcore cell.
+fn all_parked(i: usize) -> bool {
+    (0..user::cell_vcores(i).max(1)).all(|v| parked(i, v))
+}
+
+/// The first vcore of cell `i` this CPU may enter that is not parked, preferring the
+/// one already running so a switch that need not happen does not.
+///
+/// Owner-checked (`user::vcore_on_this_cpu`): a cell's vcores may be spread over
+/// several cores, and entering one another core is inside is what the per-CPU entry
+/// guard exists to catch.
+fn runnable_vcore(i: usize) -> Option<usize> {
+    let n = user::cell_vcores(i).max(1);
+    let here = user::current_vcore();
+    (0..n)
+        .map(|step| (here + step) % n)
+        .find(|&v| !parked(i, v) && user::vcore_on_this_cpu(i, v))
 }
 
 static mut PROCS: [Proc; MAX_CELLS] = [const { Proc::free() }; MAX_CELLS];
@@ -152,8 +192,9 @@ fn ensure_top(cell: usize) {
         procs()[cell] = Proc {
             state: PState::Runnable,
             parent: -1,
-            wait_for: 0,
-            block: Block::None,
+            vwait: [0; user::MAX_VCORES],
+            vblock: [Block::None; user::MAX_VCORES],
+            vparked: [false; user::MAX_VCORES],
             code: 0,
         };
     }
@@ -346,8 +387,9 @@ pub fn spawn(
     procs()[child] = Proc {
         state: PState::Runnable,
         parent: cur as i32,
-        wait_for: 0,
-        block: Block::None,
+        vwait: [0; user::MAX_VCORES],
+        vblock: [Block::None; user::MAX_VCORES],
+        vparked: [false; user::MAX_VCORES],
         code: 0,
     };
     child as u64
@@ -428,11 +470,11 @@ pub fn wait(cur: usize, handle: u64, _frame: *mut TrapFrame) -> Sched {
     if procs()[child].state == PState::Zombie {
         return Sched::Ret(reap(child));
     }
-    // Block the caller and hand the CPU to a runnable cell (the child).
-    procs()[cur].state = PState::Blocked;
-    procs()[cur].wait_for = child;
-    procs()[cur].block = Block::Wait { child };
-    Sched::Switch(reschedule(cur))
+    // Park the calling **vcore** and hand the CPU on (to the child, or to a sibling
+    // vcore of this cell that is still runnable).
+    let v = user::current_vcore();
+    procs()[cur].vwait[v] = child;
+    Sched::Switch(park_vcore(cur, v, Block::Wait { child }))
 }
 
 // ------------------------------------------------- the three converted waits
@@ -528,9 +570,22 @@ pub unsafe fn block_net(
 
 /// Mark `cur` blocked on `block` and hand the CPU on.
 fn park(cur: usize, block: Block) -> Option<*mut TrapFrame> {
-    procs()[cur].state = PState::Blocked;
-    procs()[cur].block = block;
-    Some(reschedule(cur))
+    Some(park_vcore(cur, user::current_vcore(), block))
+}
+
+/// Park vcore `v` of cell `cur` on `block` and hand the CPU on.
+///
+/// The cell becomes `Blocked` only when **every** vcore is parked, which is what makes a
+/// single-vcore cell's behaviour identical to what it was: parking its one vcore parks
+/// them all. A cell with a runnable sibling stays `Runnable`, so the scheduler keeps
+/// seeing it - the whole point (docs/SUBSTRATE.md pillar 3).
+fn park_vcore(cur: usize, v: usize, block: Block) -> *mut TrapFrame {
+    procs()[cur].vblock[v] = block;
+    procs()[cur].vparked[v] = true;
+    if all_parked(cur) {
+        procs()[cur].state = PState::Blocked;
+    }
+    reschedule(cur)
 }
 
 /// Whether blocking `cur` can hand the CPU to some **other** cell - either one that
@@ -539,12 +594,27 @@ fn park(cur: usize, block: Block) -> Option<*mut TrapFrame> {
 /// False only in the genuinely single-cell case, where the syscall keeps its in-trap
 /// wait unchanged and that wait *is* the idle.
 fn can_reschedule(cur: usize) -> bool {
+    // A runnable **sibling vcore of this same cell** counts, and is the cheapest place to
+    // hand the CPU (docs/SUBSTRATE.md pillar 3). Without this the whole check falls to
+    // "is another *cell* runnable", so a single multi-vcore cell would take the in-trap
+    // wait and its sibling context would not run at all - the block would be per cell in
+    // effect even though the state is per vcore.
+    // Runnable, or itself parked on something the scheduler idle can wait for - the same
+    // two-part rule the cell branch below uses, and for the same reason: a sibling that
+    // will run again means parking is progress.
+    if (0..user::cell_vcores(cur).max(1)).any(|v| {
+        v != user::current_vcore()
+            && user::vcore_on_this_cpu(cur, v)
+            && (!parked(cur, v) || sources_of(cur, v) & idle::WAITABLE != 0)
+    }) {
+        return true;
+    }
     (0..MAX_CELLS).any(|i| {
         i != cur
             && (schedulable(i)
                 || (user::cell_present(i)
                     && procs()[i].state == PState::Blocked
-                    && sources_of(i) & idle::WAITABLE != 0))
+                    && sources_of(i, 0) & idle::WAITABLE != 0))
     })
 }
 
@@ -608,10 +678,11 @@ pub fn yield_cell(cur: usize) -> Sched {
     // The native cross-cell switch, FP/SIMD register file included: this is a
     // hard-float cell's hand-off point (docs/LIBRHEO.md, docs/ENGINEERING.md 3),
     // and a service cell reaches it on every client round.
-    user::switch_native_cell(cur, next);
+    let v = runnable_vcore(next).expect("`schedulable` required an enterable vcore");
+    user::switch_native_cell_vcore(cur, next, v);
     crate::sched::dispatch::running(next, 0);
-    complete_block(next);
-    Sched::Switch(user::cell_frame(next))
+    complete_block(next, v);
+    Sched::Switch(user::vcore_frame(next, v))
 }
 
 /// **Preempt** native cell `cur` in favour of another runnable native cell,
@@ -638,8 +709,8 @@ pub fn preempt_cell(cur: usize) -> Option<*mut TrapFrame> {
     // The **running vcore's** area, not the cell's first: a multi-vcore cell preempted
     // on this core is inside whichever context this CPU entered, and saving to vcore 0
     // would write one context's live registers over another's saved image
-    // (docs/SUBSTRATE.md pillar 3). `schedulable` refuses to *pick* a multi-vcore cell,
-    // but `cur` is whatever this core happens to be inside.
+    // (docs/SUBSTRATE.md pillar 3): `cur` is whatever context this core is inside, and
+    // saving to vcore 0 would write one context's live registers over another's image.
     user::save_native_fp_vcore(cur, user::current_vcore());
     wake_satisfiable();
     let next = crate::sched::dispatch::pick_excluding_self(cur, MAX_CELLS, schedulable)?;
@@ -648,10 +719,12 @@ pub fn preempt_cell(cur: usize) -> Option<*mut TrapFrame> {
     // whatever the pick left in the registers. The invariant CLAUDE.md states - every
     // native cross-cell switch swaps the FP/SIMD register file - holds here in two
     // stages rather than one, which is why this is the only site allowed to say so.
+    let v = runnable_vcore(next).expect("`schedulable` required an enterable vcore");
     user::switch_to_cell(next);
-    user::restore_native_fp(next);
-    complete_block(next);
-    Some(user::cell_frame(next))
+    user::restore_native_fp_vcore(next, v);
+    user::set_current_vcore(v);
+    complete_block(next, v);
+    Some(user::vcore_frame(next, v))
 }
 
 /// The next vcore of cell `cur` this CPU may enter, scanning round-robin from the one
@@ -669,7 +742,13 @@ fn next_sibling_vcore(cur: usize) -> Option<usize> {
     let here = user::current_vcore();
     (1..n)
         .map(|step| (here + step) % n)
-        .find(|&v| user::vcore_on_this_cpu(cur, v))
+        // **Not parked**, as well as owned. This check was absent while a vcore could not
+        // block, and its absence was invisible until one could: a yield then entered a
+        // sibling parked mid-`SYS_ARM_TIMER`, which resumed it at its syscall return with
+        // the return register still holding the syscall *number* - no fault and no log,
+        // just a wrong answer from a wait that had not finished. Found by the `schedidle`
+        // vcore phase (docs/SUBSTRATE.md pillar 3).
+        .find(|&v| !parked(cur, v) && user::vcore_on_this_cpu(cur, v))
 }
 
 /// Whether cell `i` can be resumed by a yield: present, native, and either a
@@ -683,6 +762,10 @@ fn schedulable(i: usize) -> bool {
         // single-core boot, because nothing there ever claims a cell.
         && user::cell_on_this_cpu(i)
         && matches!(procs()[i].state, PState::Free | PState::Runnable)
+        // And it must have a context this core may enter that is not parked. A `Free`
+        // cell has no `Proc` entry, so nothing is parked and this is trivially true -
+        // which is the pre-vcore behaviour for the Phase E/J cells that never spawn.
+        && runnable_vcore(i).is_some()
 }
 
 /// Reap zombie child `z`: free its cell slot and kernel-owned storage, and
@@ -751,18 +834,33 @@ fn reschedule(leaving: usize) -> *mut TrapFrame {
         // Order from the ready queue when enabled, the pre-migration round-robin
         // when not; the predicate stays the authority on runnability.
         let next = crate::sched::dispatch::pick(leaving, MAX_CELLS, |i| {
-            user::cell_present(i) && procs()[i].state == PState::Runnable
+            user::cell_present(i)
+                && procs()[i].state == PState::Runnable
+                // A cell is only pickable if it has a vcore this core may enter that
+                // is not parked. For a single-vcore cell that is "vcore 0 is not
+                // parked", which `PState::Runnable` already implied, so nothing
+                // changes there.
+                && runnable_vcore(i).is_some()
         });
         if let Some(n) = next {
+            // Which **context** of `n` to enter. A cell that blocked one vcore and left
+            // a sibling runnable is entered at the sibling; a cell whose parked vcore
+            // was just woken is entered at that vcore, which is what completes its
+            // syscall in its own address space.
+            let v = runnable_vcore(n).expect("the pick predicate required one");
             if n != leaving {
                 // Save the outgoing cell's live FP/SIMD state (harmless if it is
-                // exiting) and load the incoming cell's - the native analogue of the
+                // exiting) and load the incoming context's - the native analogue of the
                 // Linux personality's `thread::save_current_fp`/`restore_current`.
-                user::switch_native_cell(leaving, n);
+                user::switch_native_cell_vcore(leaving, n, v);
+            } else if v != user::current_vcore() {
+                // Same cell, different context: the cheap switch - no `activate()`,
+                // only the FP file and the frame.
+                user::switch_native_vcore(n, user::current_vcore(), v);
             }
             crate::sched::dispatch::running(n, 0);
-            complete_block(n);
-            return user::cell_frame(n);
+            complete_block(n, v);
+            return user::vcore_frame(n, v);
         }
 
         // Nothing runnable. Idle on whatever the blocked cells are waiting for.
@@ -778,15 +876,27 @@ fn reschedule(leaving: usize) -> *mut TrapFrame {
 /// Promote every blocked cell whose condition now holds to `Runnable`.
 fn wake_satisfiable() {
     for i in 0..MAX_CELLS {
-        if procs()[i].state == PState::Blocked && satisfiable(i) {
+        if procs()[i].state == PState::Free || procs()[i].state == PState::Zombie {
+            continue;
+        }
+        let mut woke = false;
+        for v in 0..user::cell_vcores(i).max(1) {
+            if parked(i, v) && satisfiable(i, v) {
+                procs()[i].vparked[v] = false;
+                woke = true;
+            }
+        }
+        // A cell is runnable again as soon as **one** of its vcores is. For a
+        // single-vcore cell that is the old `Blocked -> Runnable` transition exactly.
+        if woke && procs()[i].state == PState::Blocked {
             procs()[i].state = PState::Runnable;
         }
     }
 }
 
-/// Whether blocked cell `i`'s condition now holds.
-fn satisfiable(i: usize) -> bool {
-    match procs()[i].block {
+/// Whether parked vcore `v` of cell `i` has its condition met now.
+fn satisfiable(i: usize, v: usize) -> bool {
+    match procs()[i].vblock[v] {
         Block::None => false,
         // Pre-existing behaviour, now expressed through `Block`: a `SYS_WAIT`er wakes
         // when its awaited child is a zombie.
@@ -815,11 +925,8 @@ fn refresh_deadlines() {
     let now = ktimer::now_ns();
     let mut nearest = [u64::MAX; ktimer::CLIENTS];
     let mut net_nearest = u64::MAX;
-    for i in 0..MAX_CELLS {
-        if procs()[i].state != PState::Blocked {
-            continue;
-        }
-        match procs()[i].block {
+    for (i, v) in parked_vcores() {
+        match procs()[i].vblock[v] {
             Block::Timer {
                 deadline_ns,
                 client,
@@ -874,17 +981,28 @@ fn reached(deadline_ns: u64) -> bool {
 /// with nothing runnable is a deadlock.
 fn blocked_sources() -> idle::Sources {
     let mut src = 0;
-    for i in 0..MAX_CELLS {
-        if procs()[i].state == PState::Blocked {
-            src |= sources_of(i);
-        }
+    for (i, v) in parked_vcores() {
+        src |= sources_of(i, v);
     }
     src
 }
 
-/// The wake sources cell `i`'s current block can be satisfied by.
-fn sources_of(i: usize) -> idle::Sources {
-    match procs()[i].block {
+/// Every parked `(cell, vcore)` pair. Iterated rather than gated on the cell-level
+/// `PState::Blocked`, because a cell with one parked vcore and one runnable is **not**
+/// blocked and its parked context's deadline still has to be armed - the arming is what
+/// wakes it. Yields exactly vcore 0 of each blocked cell when nothing has extra vcores,
+/// which is the pre-vcore behaviour.
+fn parked_vcores() -> impl Iterator<Item = (usize, usize)> {
+    (0..MAX_CELLS).flat_map(|i| {
+        (0..user::cell_vcores(i).max(1))
+            .filter(move |&v| parked(i, v))
+            .map(move |v| (i, v))
+    })
+}
+
+/// The wake sources vcore `v` of cell `i`'s current block can be satisfied by.
+fn sources_of(i: usize, v: usize) -> idle::Sources {
+    match procs()[i].vblock[v] {
         Block::None => 0,
         Block::Wait { .. } => idle::PEER,
         Block::Timer { .. } => idle::TIMER,
@@ -913,17 +1031,18 @@ fn report_deadlock(leaving: usize, src: idle::Sources) -> *mut TrapFrame {
         "nproc: DEADLOCK - no runnable native cell, no wake source (leaving={leaving}, waiting on {})",
         idle::describe(src)
     );
-    for i in 0..MAX_CELLS {
-        if procs()[i].state == PState::Blocked {
-            crate::println!("nproc:   cell {i} blocked on {}", block_name(i));
-        }
+    for (i, v) in parked_vcores() {
+        crate::println!(
+            "nproc:   cell {i} vcore {v} blocked on {}",
+            block_name(i, v)
+        );
     }
     user::deadlock_finish()
 }
 
-/// The name of cell `i`'s block, for the deadlock diagnostic.
-fn block_name(i: usize) -> &'static str {
-    match procs()[i].block {
+/// The name of vcore `v` of cell `i`'s block, for the deadlock diagnostic.
+fn block_name(i: usize, v: usize) -> &'static str {
+    match procs()[i].vblock[v] {
         Block::None => "nothing",
         Block::Wait { .. } => "SYS_WAIT (child exit)",
         Block::Timer { .. } => "SYS_ARM_TIMER (deadline)",
@@ -938,22 +1057,22 @@ fn block_name(i: usize) -> &'static str {
 /// `SYS_WAIT` keeps its pre-existing shape exactly: a zombie the cell was waiting
 /// for is reaped on **every** switch-in (including a plain `SYS_YIELD`), keyed on
 /// `wait_for`, because that is what the Phase F/N4a proofs observe.
-fn complete_block(n: usize) {
-    let child = procs()[n].wait_for;
+fn complete_block(n: usize, v: usize) {
+    let child = procs()[n].vwait[v];
     if child < MAX_CELLS
         && procs()[child].state == PState::Zombie
         && procs()[child].parent == n as i32
     {
         let code = reap(child);
-        procs()[n].wait_for = 0;
-        procs()[n].block = Block::None;
-        let frame = user::cell_frame(n);
-        // SAFETY: `frame` is `n`'s saved trap frame.
+        procs()[n].vwait[v] = 0;
+        procs()[n].vblock[v] = Block::None;
+        let frame = user::vcore_frame(n, v);
+        // SAFETY: `frame` is the saved trap frame of `n`'s vcore `v`.
         unsafe { arch::set_syscall_ret(&mut *frame, code) };
         return;
     }
-    let block = procs()[n].block;
-    procs()[n].block = Block::None;
+    let block = procs()[n].vblock[v];
+    procs()[n].vblock[v] = Block::None;
     let r: u64 = match block {
         Block::None | Block::Wait { .. } => return,
         Block::Timer { client, .. } => {
@@ -976,7 +1095,7 @@ fn complete_block(n: usize) {
             unsafe { crate::net_rx::complete_wait(buf_va, len) as u64 }
         }
     };
-    let frame = user::cell_frame(n);
-    // SAFETY: `frame` is `n`'s saved trap frame.
+    let frame = user::vcore_frame(n, v);
+    // SAFETY: `frame` is the saved trap frame of `n`'s vcore `v`.
     unsafe { arch::set_syscall_ret(&mut *frame, r) };
 }

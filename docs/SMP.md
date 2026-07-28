@@ -997,10 +997,55 @@ vcores; "the cell exits when its **last** vcore exits" is the missing semantics.
 asserts vcore 1's completion flag is still 0, so that rule arriving shows up as a test
 change instead of silently.
 
-**Still not done** and named: a vcore that *blocks* (the `nproc` block state is per cell, so
-one vcore parking on `SYS_WAIT` would mark every sibling blocked - the same defect the Linux
-side fixed with per-context `pblock`), a vcore that forks or takes a signal, and per-vcore
-queue pairs (docs/SUBSTRATE.md S5).
+**A vcore blocks** - the next rung after that, also built. `nproc`'s block state was per
+*cell*, so one context parking on a timer recorded the wait for all of them: a cell with a
+runnable sibling looked blocked and the scheduler idled the machine with work available. It
+is the defect the Linux side already fixed one level up with per-context `pblock`
+(docs/LINUX-COMPAT.md), and the fix here mirrors the existing two-phase shape rather than
+inventing one:
+
+- `Proc` carries `vblock`/`vparked`/`vwait` arrays instead of `block`/`wait_for`. `vparked`
+  is the per-vcore analogue of `state == Blocked` and is kept separate from `vblock` for the
+  same reason the cell-level pair is: `wake_satisfiable` clears the parked flag while
+  `complete_block` clears the block later, with the woken context's address space active.
+- The cell-level `PState::Blocked` now means **every** vcore is parked. For a single-vcore
+  cell, parking its one vcore parks them all, so the transitions are what they were - which
+  is why all 66 kernels stayed green through the change.
+- `satisfiable`, `sources_of`, `block_name` and `complete_block` take a vcore.
+  `refresh_deadlines` and `blocked_sources` iterate **parked `(cell, vcore)` pairs** rather
+  than gating on the cell's `Blocked`, because a cell with one parked vcore and one runnable
+  is not blocked and its parked context's deadline still has to be armed - the arming is
+  what wakes it.
+- `reschedule` picks a `(cell, vcore)`: a cell that parked one context and left a sibling
+  runnable is re-entered at the sibling, and a cell whose parked vcore was just woken is
+  re-entered at *that* vcore, which is what completes its syscall in its own address space.
+  `switch_native_cell_vcore` exists for exactly that.
+- `can_reschedule` counts a runnable **sibling vcore** - or one parked on a waitable source,
+  the same two-part rule the cell branch uses. Without it a single multi-vcore cell falls
+  through to "is another *cell* runnable", takes the in-trap wait, and its sibling never
+  runs: the block would be per cell in effect even with the state per vcore.
+
+**The proof** is the `schedidle` oracle one level down, on all three ISAs: the same
+`user_blocker` and `user_peer` programs, now as two **vcores of one cell**, produce the same
+exact order vector **`bSSSSSSSSB`** - the blocker parks on a 20 ms deadline, the sibling
+takes all 8 of its rounds strictly between the two blocker markers, and the arbiter's
+one-shot wakes the blocker. Restoring the per-cell park (`state = Blocked` unconditionally)
+makes the sibling run **zero** rounds, observed.
+
+That phase also **found a real defect in the yield built one commit earlier**:
+`next_sibling_vcore` checked ownership but not *parked*, which was invisible while a vcore
+could not block. A yield then entered a sibling parked mid-`SYS_ARM_TIMER`, resuming it at
+its syscall return with the return register still holding the syscall **number** - no fault
+and no log, just a wrong answer from a wait that had not finished (`SYS_ARM_TIMER returned
+47, want 0`). And a second, in the placement path: `drain_cells` stamped per-vcore ownership
+for a whole batch *before* winning any run-mark, so a core holding two vcores of one cell
+could enter the sibling from inside the first while the stealer that took it was already
+there. Ownership is stamped where the run-mark is won now - the reasoning `count_claim`
+beside it already carried - and the per-CPU entry guard named the pair rather than letting it
+corrupt downstream.
+
+**Still not done** and named: a vcore that forks or takes a signal, per-vcore queue pairs
+(docs/SUBSTRATE.md S5), and the last-vcore-out exit rule above.
 
 **The proof** (the `smp` kernel's two-vcore phase, all three ISAs): two vcores of **one**
 cell go into the placement queue and whichever cores are free claim them. Both are

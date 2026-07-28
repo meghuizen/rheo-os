@@ -2073,10 +2073,36 @@ test makes the guard fire by name (observed). One thing asserted rather than fix
 first vcore to exit unwinds the run**, which is the correct rule for a cell and not yet a
 rule for a cell with several vcores - "the cell exits when its *last* vcore exits" is the
 missing semantics, and the phase pins vcore 1's flag at 0 so that rule arriving shows up as
-a test change instead of silently. Still named as not done: a vcore that **blocks** (the
-`nproc` block state is per cell, so one vcore parking on `SYS_WAIT` would mark every sibling
-blocked - the defect the Linux side fixed with per-context `pblock`), a vcore that forks or
-takes a signal, and per-vcore queue pairs (SUBSTRATE.md S5).
+a test change instead of silently. 
+**And a vcore blocks** (docs/SMP.md 10.0a): `nproc`'s block state was per *cell*, so one
+context parking on a timer recorded the wait for all of them - a cell with a runnable sibling
+looked blocked and the scheduler idled the machine with work available, the defect the Linux
+side already fixed one level up with per-context `pblock`. The fix mirrors the existing
+two-phase shape rather than inventing one: `Proc` carries `vblock`/`vparked`/`vwait` arrays
+(`vparked` being the per-vcore analogue of `state == Blocked`, kept separate from `vblock`
+because `wake_satisfiable` clears the flag while `complete_block` clears the block later with
+the woken context's address space active), the cell-level `PState::Blocked` now means
+**every** vcore is parked - so a single-vcore cell's transitions are byte-for-byte what they
+were, which is why all 66 kernels stayed green - `refresh_deadlines`/`blocked_sources`
+iterate parked `(cell, vcore)` pairs rather than gating on the cell's `Blocked` (a cell with
+one parked vcore is not blocked and its parked context's deadline still has to be armed - the
+arming is what wakes it), `reschedule` picks a `(cell, vcore)` so a woken vcore is re-entered
+at *that* context, and `can_reschedule` counts a runnable sibling vcore or one parked on a
+waitable source. Proven on **all three ISAs** by the `schedidle` oracle one level down: the
+same `user_blocker`/`user_peer` programs as two **vcores of one cell** produce the same exact
+order vector **`bSSSSSSSSB`** - blocker parks on 20 ms, sibling takes all 8 rounds strictly
+between the two blocker markers, arbiter's one-shot wakes the blocker - and restoring the
+per-cell park makes the sibling run **zero** rounds (observed). That phase **found two real
+defects**: `next_sibling_vcore` checked ownership but not *parked*, invisible while a vcore
+could not block, so a yield entered a sibling parked mid-`SYS_ARM_TIMER` and resumed it at
+its syscall return with the return register still holding the syscall **number** (no fault,
+no log, `SYS_ARM_TIMER returned 47, want 0`); and `drain_cells` stamped per-vcore ownership
+for a whole batch *before* winning any run-mark, so a core holding two vcores of one cell
+could enter the sibling while the stealer that took it was already inside - ownership is
+stamped where the run-mark is won now, the reasoning `count_claim` beside it already carried,
+and the per-CPU entry guard named the pair instead of letting it corrupt downstream. Still
+named as not done: a vcore that forks or takes a signal, per-vcore queue pairs (SUBSTRATE.md
+S5), and the last-vcore-out exit rule.
 
 **Honest scope:** preemption is *within* a core's own claim and rebalancing moves only
 **unstarted** cells. Migrating a *running* one was **attempted twice and reverted twice**, with four findings

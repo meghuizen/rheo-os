@@ -191,6 +191,94 @@ fn run_pair(mode: u64, arg: u64) -> (Outcome, u64, u64) {
     }
 }
 
+/// The same proof with the blocker and the peer as **two vcores of one cell**
+/// (docs/SUBSTRATE.md pillar 3) instead of two cells.
+///
+/// The reason this is a separate phase rather than a variant of the above: `nproc`'s block
+/// state used to be per *cell*, so one context parking recorded the wait for all of them.
+/// A cell with a runnable sibling therefore looked blocked, and the scheduler idled the
+/// machine with work available - the defect the Linux side already fixed one level up with
+/// per-context `pblock`. The block is per vcore now, and this asserts it against the
+/// identical oracle the two-cell phase uses: `b`, `ROUNDS` peer markers, `B`.
+///
+/// Nothing else changes, which is the point. One address space, no cross-cell mapping for
+/// the witness page (both contexts already have it), and the wake still comes from the
+/// arbiter's one-shot.
+#[unsafe(link_section = ".user.bss")]
+static mut STORE_V: CellStore = CellStore::new();
+/// Vcore 1's own kernel stack: on ARM64 and RISC-V the trap stack is carried in the
+/// frame, so two contexts must not share one.
+static mut KSTACK_V: KernelStack = KernelStack::new();
+
+fn run_vcore_pair(mode: u64, arg: u64) -> (Outcome, u64, u64) {
+    let shared = reset_shared();
+    // SAFETY: single-threaded kernel; the stores and tables are unique allocations that
+    // outlive the run.
+    unsafe {
+        let objects = &mut *core::ptr::addr_of_mut!(OBJECTS);
+        let caps = &mut *core::ptr::addr_of_mut!(CAPS);
+        *objects = ObjectTable::new();
+        *caps = CapTable::new();
+
+        // Vcore 0: the blocker.
+        let a = core::ptr::addr_of_mut!(STORE_A);
+        let (mut aspace, _oa, mut frame_a) = build_cell(
+            &mut *a,
+            objects,
+            caps,
+            (*core::ptr::addr_of!(KSTACK)).top(),
+            3,
+            user_blocker,
+            mode,
+            arg,
+        );
+
+        // Vcore 1: the peer, a second context in the **same** address space.
+        let v = core::ptr::addr_of_mut!(STORE_V);
+        let stack_v = core::ptr::addr_of!((*v).stack) as usize;
+        let stack_v_len = core::mem::size_of_val(&(*v).stack);
+        aspace.map_user_range(stack_v, stack_v_len, MapPerm::UserRw);
+        let params_v = core::ptr::addr_of!((*v).params) as usize;
+        aspace.map_user(params_v & !0xFFF, MapPerm::UserRw);
+        (*v).params = kernel::abi::Params {
+            iters: ROUNDS,
+            ticks: shared,
+            qp_addr: PEER_PARK_NS,
+            ..kernel::abi::Params::ZERO
+        };
+
+        // One mapping of the witness page, not two - the contexts share an address space.
+        aspace.map_user_range(shared as usize, 4096, MapPerm::UserRw);
+        (*a).params.ticks = shared;
+
+        static mut VFRAME: core::mem::MaybeUninit<kernel::arch::TrapFrame> =
+            core::mem::MaybeUninit::uninit();
+        let vf = core::ptr::addr_of_mut!(VFRAME);
+        (*vf).write(arch::trapframe_new(
+            user_peer as usize,
+            stack_v + stack_v_len,
+            params_v,
+            (*core::ptr::addr_of!(KSTACK_V)).top(),
+        ));
+
+        user::reset();
+        ktimer::reset();
+        idle::reset();
+        user::install(
+            0,
+            &aspace,
+            caps,
+            objects,
+            (*a).qp.qp.as_ptr(),
+            core::ptr::addr_of_mut!(frame_a),
+        );
+        // SAFETY: `VFRAME` outlives the run; vcore 1 has its own user and kernel stack.
+        user::install_vcore(0, (*vf).as_mut_ptr());
+        let (_idx, outcome) = user::run(0);
+        (outcome, (*a).params.ops, (*v).params.ops)
+    }
+}
+
 /// Assert the exact interleave oracle: `b` then `ROUNDS` peer markers then `B`.
 fn assert_interleave(what: &str) {
     let ord = order();
@@ -452,6 +540,31 @@ extern "C" fn kernel_main() -> ! {
         "schedidle: system admission ledger: 90% admitted, a second 90% REFUSED as \
          over-commit (each cell's own controller would have accepted both), and a \
          release returns the capacity OK"
+    );
+
+    // ---- a VCORE blocks while its SIBLING VCORE runs ----
+    //
+    // The same oracle as phase 1, one level down: the blocker and the peer are two
+    // contexts of **one** cell rather than two cells. The block used to be per cell, so a
+    // cell with a runnable sibling looked blocked and the machine idled with work
+    // available (docs/SUBSTRATE.md pillar 3).
+    input::reset();
+    let (outcome, ret, rounds) = run_vcore_pair(BLOCK_TIMER, BLOCK_NS);
+    assert_eq!(
+        outcome,
+        Outcome::Exited(0),
+        "vcore phase: the blocking vcore did not exit cleanly"
+    );
+    assert_eq!(ret, 0, "vcore phase: SYS_ARM_TIMER returned {ret}, want 0");
+    assert_eq!(rounds, ROUNDS, "vcore phase: peer vcore round counter");
+    assert_interleave("vcore");
+    println!(
+        "schedidle: a VCORE BLOCKED while its SIBLING VCORE RAN - one cell, two contexts, \
+         order {:?}: the blocker parked on a {BLOCK_NS}-ns deadline, the sibling took all \
+         {ROUNDS} of its rounds strictly between the two blocker markers, and the arbiter's \
+         one-shot woke the blocker. Per-cell block state would have marked the sibling \
+         blocked too OK",
+        core::str::from_utf8(order()).unwrap_or("?")
     );
 
     println!("schedidle: PASS");
