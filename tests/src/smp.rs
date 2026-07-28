@@ -85,6 +85,10 @@ fn test_secondary_bringup() {
     // and each of its iterations is net-zero (alloc then free), so a correct,
     // properly-locked allocator returns to exactly this count afterward (task #132).
     let frames_before = kernel::mm::frames::stats().0;
+    // Same baseline for the persistent-memory pool. `(free, total)`; total is 0
+    // where no nvdimm was surfaced (arm/riscv `virt`, or x86 without the device),
+    // in which case the pmem contention phase is a documented skip.
+    let (pmem_free_before, pmem_total) = kernel::mm::frames_pmem::stats();
 
     match smp::bring_up_one() {
         Ok(idx) => {
@@ -167,6 +171,31 @@ fn test_secondary_bringup() {
                  bitmap consistent",
                 smp::FRAME_CONTENTION_ITERS
             );
+
+            // The persistent-memory allocator, the other truly-global pool, made
+            // SMP-safe the same way (task #132). Only x86-64 q35 with an attached
+            // nvdimm surfaces one here; arm/riscv `virt` skip-with-reason. The proof
+            // is the double-free assertion in `frames_pmem::free` never firing (a
+            // broken lock would hand one frame to both cores) plus the pool back at
+            // its baseline after the net-zero contention.
+            if pmem_total > 0 {
+                let pmem_after = kernel::mm::frames_pmem::stats().0;
+                assert_eq!(
+                    pmem_after, pmem_free_before,
+                    "pmem pool not balanced after concurrent alloc/free \
+                     (before {pmem_free_before}, after {pmem_after})"
+                );
+                println!(
+                    "smp: two-core pmem-allocator contention OK - {} alloc+free cycles \
+                     from each of 2 cores, pool balanced at {pmem_free_before} free",
+                    smp::FRAME_CONTENTION_ITERS
+                );
+            } else {
+                println!(
+                    "smp: pmem-allocator contention SKIP {} - no nvdimm surfaced",
+                    arch::NAME
+                );
+            }
 
             // Start-all: bring up any *additional* secondaries this ISA supports
             // (docs/SMP.md 10). Sequential - each is fully online before the next

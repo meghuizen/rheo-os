@@ -1552,6 +1552,10 @@ bitmap/refcount/count/hint, taken only in leaf public functions (`free_if_pool` 
 an unlocked inner `free` so the non-re-entrant lock is never taken twice on one core),
 proven under genuine two-core `alloc`/`free` contention on all three ISAs (the `smp`
 test's pool-balanced + `used_matches_bitmap` oracle), the non-SMP build byte-unchanged.
+The persistent-memory pool (`mm::frames_pmem`) is made safe the same way (same gated
+`SpinLock` + a double-free assertion in its `free` it had lacked), proven under two-core
+contention on x86-64 with an nvdimm attached to the `smp` test; arm/riscv skip that
+phase with a reason (no nvdimm), as the `pmem` test does.
 Still deferred: the **rest** of the shared `static mut` state made SMP-safe (page
 tables, capability/cell tables, the Linux per-cell state, ktimer/net_rx/input,
 idle/sched - docs/SMP.md 10.2; then preemptive scheduling itself), a

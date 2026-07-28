@@ -35,6 +35,16 @@ static mut WINDOW_VA: usize = 0;
 static mut READY: bool = false;
 static mut NEXT_HINT: usize = 0;
 
+/// Serialises the mutable pmem state (`BITMAP`, `NEXT_HINT`) so two cores cannot
+/// race the bitmap read-modify-write - the same discipline the DDR `frames` pool
+/// took (docs/SMP.md 10.2, task #132). `BASE_PA`/`NFRAMES`/`WINDOW_VA`/`READY` are
+/// written once by `init` before any secondary starts, so their reads need no
+/// lock. **SMP build only** (`#[cfg(feature = "smp")]`): the single-CPU library
+/// emits no lock and its codegen is unchanged. Every acquire below is in a leaf
+/// function, so the non-re-entrant lock is never taken twice on one core.
+#[cfg(feature = "smp")]
+static PMEM_LOCK: crate::smp::SpinLock<()> = crate::smp::SpinLock::new(());
+
 /// Bring up the allocator over a discovered persistent-memory region
 /// `[base_pa, base_pa + len)`. Called once from `hw::detect` when firmware
 /// surfaced a `MemKind::Pmem` region; a no-op (and left `!ready`) otherwise.
@@ -98,6 +108,8 @@ pub fn alloc() -> Option<usize> {
     if !ready() {
         return None;
     }
+    #[cfg(feature = "smp")]
+    let _g = PMEM_LOCK.lock();
     let base = unsafe { *core::ptr::addr_of!(BASE_PA) };
     let n = unsafe { *core::ptr::addr_of!(NFRAMES) };
     let hint = unsafe { *core::ptr::addr_of!(NEXT_HINT) };
@@ -121,9 +133,21 @@ pub fn free(pa: usize) {
     if !contains(pa) {
         return;
     }
+    #[cfg(feature = "smp")]
+    let _g = PMEM_LOCK.lock();
     let base = unsafe { *core::ptr::addr_of!(BASE_PA) };
     let frame = (pa - base) / FRAME_SIZE;
     let bitmap = unsafe { &mut *core::ptr::addr_of_mut!(BITMAP) };
+    // A live pmem frame has its bit set. A clear bit here means a double free -
+    // which, under two racing cores, is exactly what an unserialised alloc that
+    // handed the same frame to both would cause. Asserting it (as the DDR `frames`
+    // pool does) is what makes the `smp` pmem-contention proof catch a broken lock,
+    // and is correct hardening besides: silently tolerating a double free hides a
+    // bug (docs/SMP.md 10.2).
+    assert!(
+        bitmap[frame / 64] & (1 << (frame % 64)) != 0,
+        "pmem double free at {pa:#x}"
+    );
     bitmap[frame / 64] &= !(1 << (frame % 64));
 }
 
@@ -132,6 +156,8 @@ pub fn stats() -> (usize, usize) {
     if !ready() {
         return (0, 0);
     }
+    #[cfg(feature = "smp")]
+    let _g = PMEM_LOCK.lock();
     let n = unsafe { *core::ptr::addr_of!(NFRAMES) };
     let bitmap = unsafe { &*core::ptr::addr_of!(BITMAP) };
     let used: usize = bitmap.iter().map(|w| w.count_ones() as usize).sum();

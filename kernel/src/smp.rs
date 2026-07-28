@@ -245,6 +245,34 @@ pub fn contend_frames() {
     }
 }
 
+/// A separate rendezvous for the persistent-memory contention phase.
+static PMEM_READY: AtomicUsize = AtomicUsize::new(0);
+
+/// The pmem twin of [`contend_frames`] (task #132): both cores hammer the
+/// **persistent-memory** allocator's `alloc`+`free` concurrently. The pmem pool
+/// only exists where firmware surfaced a real nvdimm - x86-64 q35 with one
+/// attached - so this is a **no-op where the pool is empty** (arm/riscv `virt`,
+/// or x86 without the device), which the caller turns into a skip-with-reason.
+/// A broken pmem lock lets two cores claim one bitmap bit and hand the same frame
+/// to both; when each frees it, `frames_pmem::free`'s double-free assertion fires
+/// (a panic that fails the test), exactly as the DDR pool's does.
+pub fn contend_pmem() {
+    if crate::mm::frames_pmem::stats().1 == 0 {
+        return; // no nvdimm surfaced - nothing to contend
+    }
+    PMEM_READY.fetch_add(1, Ordering::AcqRel);
+    let mut budget = WAIT_BUDGET;
+    while PMEM_READY.load(Ordering::Acquire) < 2 && budget > 0 {
+        core::hint::spin_loop();
+        budget -= 1;
+    }
+    for _ in 0..FRAME_CONTENTION_ITERS {
+        if let Some(pa) = crate::mm::frames_pmem::alloc() {
+            crate::mm::frames_pmem::free(pa);
+        }
+    }
+}
+
 /// The next free registry index to hand a secondary. The boot CPU is index 0
 /// ([`init`]); secondaries take 1, 2, ... as they come up. This keeps the
 /// registry index independent of the hardware CPU id (the boot hart id may be
@@ -285,6 +313,9 @@ pub fn secondary_run(hw_id: u32) {
         // before the completion signal, so the primary's balance/invariant check
         // after the wait sees a finished phase.
         contend_frames();
+        // The persistent-memory allocator too, where an nvdimm exists (a no-op
+        // otherwise). Same window, same reason.
+        contend_pmem();
     }
     SECONDARY_UP.fetch_add(1, Ordering::Release);
 }
@@ -383,6 +414,7 @@ pub fn bring_up_nth(ordinal: usize) -> Result<usize, StartError> {
             if ordinal == 0 {
                 contend();
                 contend_frames();
+                contend_pmem();
             }
             let mut budget = WAIT_BUDGET;
             while budget > 0 {

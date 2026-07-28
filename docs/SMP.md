@@ -502,7 +502,13 @@ the interrupt vector writes.
   bitmap read-modify-write would trip the double-free assertion mid-run (a panic that
   fails the test) or leave the count and bitmap disagreeing. **Every acquire is
   `#[cfg(feature = "smp")]`-gated**, so the 55 non-SMP kernels emit no lock and their
-  codegen is unchanged.
+  codegen is unchanged. **The persistent-memory allocator (`mm::frames_pmem`) is made
+  safe the same way**, the other truly-global pool: the same `#[cfg(feature = "smp")]`
+  `SpinLock` around its bitmap, plus a double-free assertion in `free` it had lacked
+  (the race catcher, mirroring the DDR pool). Proven under the same two-core
+  `alloc`/`free` contention on **x86-64 q35 with an nvdimm attached to the `smp` test**
+  (pool balanced at 4096 free); arm/riscv `virt` expose no nvdimm, so that phase
+  skips-with-reason exactly as the `pmem` test does.
 - **Start-all: multiple secondaries on all three ISAs** - RISC-V four cores at once
   (boot + three secondaries, matching QEMU's `-smp 4`), ARM64 and x86-64 three each
   (boot + two), the first slice of §10.3/§10.7-step-2. Each secondary claims a distinct
@@ -588,7 +594,10 @@ or a single-owner core. The known set, from this tree:
   so the non-SMP build is unchanged, proven under two-core `alloc`/`free` contention.
   A per-CPU magazine (free-list cache) for the hot path - refilled/drained under this
   global lock, the standard slab-magazine shape - stays a later refinement.
-  **`frames_pmem`** (the separate nvdimm pool) still needs the same treatment.
+  **`frames_pmem`** (the separate nvdimm pool) is **DONE too** (same slice): the same
+  `#[cfg(feature = "smp")]` `SpinLock` plus a double-free assertion in its `free` (the
+  DDR pool already had one), proven under two-core contention on x86-64 with an nvdimm,
+  arm/riscv skip-with-reason.
 - **Page tables** - per-cell root, but `AddressSpace` mutation (map/unmap/protect,
   COW privatisation) races a concurrent fault on the same cell. Per-address-space lock;
   a remote-TLB shootdown IPI (section 9 names it) for unmap/protect that another core

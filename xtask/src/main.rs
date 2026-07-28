@@ -485,6 +485,22 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "-device",
             "nvdimm,memdev=pm0,id=nv0",
         ],
+        // smp (docs/SMP.md 10.2, task #132): the same nvdimm as `pmem`, so the SMP
+        // test's two-core contention phase can hammer the persistent-memory
+        // allocator too (not just the DDR pool). QEMU merges these `-machine`/`-m`
+        // options with the base q35 flags. arm/riscv `virt` accept no nvdimm, so the
+        // smp kernel there surfaces no pmem pool and skips that phase with a reason -
+        // exactly like the `pmem` kernel.
+        ("smp", Arch::X86_64) => &[
+            "-machine",
+            "nvdimm=on",
+            "-m",
+            "1G,slots=2,maxmem=4G",
+            "-object",
+            "memory-backend-file,id=pm0,share=on,mem-path=target/pmem.img,size=16M,pmem=on",
+            "-device",
+            "nvdimm,memdev=pm0,id=nv0",
+        ],
         _ => &[],
     }
 }
