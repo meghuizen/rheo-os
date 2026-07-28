@@ -2166,11 +2166,35 @@ other's block between the write and the read, caught **directly** rather than by
 0 mismatched bytes, 0 pointers outside the region, both cores completing every round, and the
 list still serving afterwards. Reverting to the unlocked `UnsafeCell` + `unsafe impl Sync`
 produces a **general protection fault inside the allocator** (observed), the same defect in its
-unsurvivable form. Still named as not done: a vcore that forks or takes a signal, the
-loaded-cell ring placement, and the **userspace half proper** - `strand.rs` is one global
-`Executor` behind a `static mut` with `Rc`-based join handles, so it is per-cell rather than
-per-vcore, and making it per-vcore needs the `spawn`/spawn-on-any split a `Send` bound implies,
-which is an API decision rather than a port.
+unsurvivable form. 
+**And strands now run across vcores** (docs/CONCURRENCY.md): `runtime/`'s executor was one
+global `Executor` behind a `static mut`, so a cell's strands lived on one vcore however many
+the kernel gave it. The obstacle was an **API question, not a port** - `spawn` returns an
+`Rc`-based `JoinHandle`, and an `Rc` cannot cross cores, so a queue any vcore drains cannot
+hold what `spawn` produces. The split a `Send` bound forces: **`spawn` stays vcore-local**
+(same signature, same `Rc` handle, sound because a strand spawned on a vcore stays there - every
+existing caller unchanged), and **`spawn_shared` takes a `Send` future and returns no handle**,
+both restrictions being one fact, with a caller wanting a result using a channel or an atomic as
+a work-stealing pool does anyway. Each vcore's executor is `EXECS[v]`, safe by **partitioning**
+rather than by a lock (a vcore belongs to one core at a time, so two cores are two disjoint
+elements - the `PerCpu` argument); the runtime cannot know which vcore it is on, having no
+register to read, so the embedder supplies an accessor once (`set_vcore_hook`) and unset it is a
+constant 0, so every pre-vcore caller is unchanged. The injector is a `TicketLock<VecDeque<_>>`
+rather than per-vcore stealing deques, and the doc says why: with a handful of vcores it is not
+the structure a many-core deque solves, and whether it becomes one is a measurement there is no
+hardware here to take. Proven by `smp` on **all three ISAs** in two sub-phases, because they
+prove different things and only one is deterministic - **concurrent**: both cores drain at once,
+each of 64 strands asserted to run *exactly* once (a strand delivered twice fails) and the two
+take counts asserted to sum to exactly 64 (so every strand came off the shared injector, not a
+local queue), with the split **reported, never asserted** (22/42, 37/27, 35/29 - one core
+draining first is a legal schedule, and an assertion that can fail on a legal schedule is not a
+proof); and **directed**: the primary spawns and does not drain, the secondary asserted to take
+*all* 64 with the primary taking none, which is the crossing itself. Reverting `run` so it never
+takes from the injector leaves every strand unrun; collapsing the per-vcore executors to one
+**hangs**, two cores corrupting one run queue (both observed). Still named as not done: a vcore
+that forks or takes a signal, the loaded-cell ring placement, per-vcore stealing deques, and a
+**cell** running this - the hook is `smp::cpu_index()` in kernel context, and a cell needs the
+kernel to tell it its vcore index, which is a verb that does not exist yet.
 
 **Honest scope:** preemption is *within* a core's own claim and rebalancing moves only
 **unstarted** cells. Migrating a *running* one was **attempted twice and reverted twice**, with four findings
@@ -2719,8 +2743,11 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               completing its own `OP_ECHO` round trip through its own doorbell on
               its own core; then **TWO CORES IN ONE HEAP** - 512 allocate/stamp/
               verify/free cycles each through `runtime::Heap`'s global allocator,
-              0 bytes of either core's block ever holding the other's marker
-              (docs/SMP.md 10.0a); then an
+              0 bytes of either core's block ever holding the other's marker;
+              then **STRANDS ACROSS VCORES** - 64 `spawn_shared` strands each
+              asserted to run exactly once, drained by two cores at once and then
+              spawned on one vcore and executed entirely by another
+              (docs/CONCURRENCY.md); then an
               **unmodified static-glibc binary as a Linux cell on a secondary**,
               exact stdout + exit asserted, overlapping a native cell on the
               primary; then **two Linux cells on two cores at once**, each

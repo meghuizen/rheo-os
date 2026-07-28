@@ -33,12 +33,44 @@ case" has a mechanism under it now. One prerequisite of the runtime half is done
 `runtime::Heap` **global allocator is multi-core safe** (`TicketLock`, unconditionally - its
 old `unsafe impl Sync` was justified by "single-CPU kernel", which stopped being true), proven
 by two cores running 512 allocate/stamp/verify/free cycles each with zero cross-marker bytes
-and a general protection fault when the lock is removed. What is still *not* built is the
-runtime half proper: strands scheduled over several vcores, with the in-cell work stealing
-section 2 describes. `strand.rs` is one global `Executor` behind a `static mut` with
-`Rc`-based join handles, so it is per-cell rather than per-vcore; making it per-vcore needs the
-`spawn` / spawn-on-any split a `Send` bound implies, which is an API decision rather than a
-port. The kernel offers the vcores; `runtime/` does not yet ask for more than one.
+and a general protection fault when the lock is removed. **And the runtime half is built**: `strand.rs` now
+holds **one executor per vcore** plus a shared injector, so strands run across vcores.
+
+The obstacle was an API question rather than a port, and the answer is the split a `Send`
+bound forces:
+
+- **`spawn` stays vcore-local** - same signature, same `Rc` `JoinHandle`, sound because a
+  strand spawned on a vcore stays on it. Every existing caller is unchanged.
+- **`spawn_shared` takes a `Send` future and returns no handle.** Both restrictions are one
+  fact: work that may cross cores cannot carry an `Rc`, so it cannot carry this runtime's join
+  handle either. A caller wanting a result uses a channel or an atomic - which is what a
+  work-stealing pool does anyway.
+
+Each vcore's executor is `EXECS[v]`, safe by **partitioning** rather than by a lock: a vcore
+belongs to one core at a time (the kernel's claim, docs/SMP.md 10.0a), so two cores here are two
+disjoint elements of the array - the same argument `PerCpu` rests on. The runtime cannot know
+which vcore it is on, having no register to read, so the embedder supplies an accessor once
+(`set_vcore_hook`); unset it is a constant 0 and every pre-vcore caller resolves to slot 0
+exactly as before. The injector is a `TicketLock<VecDeque<_>>` rather than per-vcore deques with
+stealing, and the doc says why: with a handful of vcores it is not the contended structure a
+many-core stealing deque solves, and whether it becomes one is a measurement there is no
+hardware here to take.
+
+Proven by the `smp` kernel on all three ISAs, in two sub-phases because they prove different
+things and only one is deterministic. **Concurrent**: both cores drain the injector at once,
+every one of 64 strands asserted to run *exactly* once (so a strand delivered twice fails), and
+the two take counts asserted to sum to exactly 64 - which is what says every strand came off the
+shared injector rather than a local queue. The split itself is *reported*, never asserted
+(observed 22/42, 37/27, 35/29): one core draining all of them first is a legal schedule, and an
+assertion that can fail on a legal schedule is not a proof. **Directed**: the primary spawns and
+does not drain, only the secondary runs, and the secondary is asserted to have taken *all* 64
+with the primary taking none - the crossing itself, deterministically. Reverting `run` so it
+never takes from the injector leaves every strand unrun; collapsing the per-vcore executors to
+one **hangs**, two cores corrupting one run queue.
+
+Still not built: `!Send` work that migrates (it cannot, by construction), per-vcore stealing
+deques, and a *cell* running this - the hook is wired to `smp::cpu_index()` in kernel context,
+and a cell needs the kernel to tell it its vcore index, which is a verb that does not exist yet.
 
 Position: threads get light by splitting in two. The kernel schedules
 **vcores** (one kernel context each); the runtime inside a cell schedules

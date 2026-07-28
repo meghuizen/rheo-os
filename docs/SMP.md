@@ -1119,11 +1119,11 @@ a **general protection fault inside the allocator** (x86-64 vector 13) - a harde
 the mismatch counter was built to report, which is the same defect in its unsurvivable form.
 
 **Still not done** and named: a vcore that forks or takes a signal, the loaded-cell ring
-placement just named, and the userspace half proper - `runtime/`'s strand executor is still one
-global `Executor` behind a `static mut` with `Rc`-based join handles, so it is per-cell rather
-than per-vcore and nothing yet schedules strands across several (docs/CONCURRENCY.md). Making
-it per-vcore needs the `spawn` / `spawn`-on-any split a `Send` bound implies, which is an API
-decision, not a port.
+placement just named, and a **cell** running the multi-vcore runtime. The runtime half itself is
+built - `runtime/` now holds one executor per vcore plus a `Send`-bounded shared injector, and 64
+strands are proven to run exactly once across two cores (docs/CONCURRENCY.md) - but its
+vcore-index hook is wired to `smp::cpu_index()` in kernel context. A cell needs the kernel to
+tell it its own vcore index, which is a verb that does not exist yet.
 
 **The proof** (the `smp` kernel's two-vcore phase, all three ISAs): two vcores of **one**
 cell go into the placement queue and whichever cores are free claim them. Both are

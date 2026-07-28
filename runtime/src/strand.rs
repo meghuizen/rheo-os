@@ -9,9 +9,21 @@
 // completion ring unparks exactly the strands whose ops finished - one
 // wakeup, N strands resumed (CONCURRENCY.md 1, 8).
 //
-// Single-vcore cooperative (the kernel is single-CPU today), so it needs no
-// locks and no real `Waker` machinery: readiness is the executor's own run
-// queue, and external completions arrive through `complete(token)`. The
+// **One executor per vcore, plus a shared injector.** Each vcore's run queue,
+// slab and wake tables are its own, so nothing on the hot path is locked and
+// `spawn` keeps its `Rc` join handles - a strand spawned on a vcore stays on
+// that vcore, which is what makes `!Send` futures sound. Work that any vcore may
+// take goes through `spawn_shared`, which is `Send`-bounded and has no join
+// handle: that is the whole API split, and it is the split a `Send` bound forces
+// rather than a style choice (docs/CONCURRENCY.md).
+//
+// The runtime cannot know which vcore it is running on - it is a userspace
+// library with no CPU register to read - so the embedder supplies an accessor
+// once with `set_vcore_hook`. Unset, it is a constant 0 and every pre-vcore
+// caller resolves to slot 0 exactly as before.
+//
+// No real `Waker` machinery either: readiness is the executor's own run queue,
+// and external completions arrive through `complete(token)`. The
 // `core::task::Waker` handed to `poll` is a no-op. Regular // comments (not
 // //! module docs) keep this file includable by the host comparison bench.
 
@@ -80,16 +92,58 @@ impl Executor {
     }
 }
 
-static mut EXEC: Option<Executor> = None;
+/// How many vcores one cell's runtime supports. Matches the kernel's `MAX_VCORES`
+/// by value, not by dependency: `runtime` is a userspace library and must not
+/// link the kernel, so the two are kept equal by the fact that a cell cannot be
+/// given more vcores than the kernel will install.
+pub const MAX_VCORES: usize = 4;
 
-/// Short-lived access to the global executor. Single-CPU cooperative use, so
-/// no borrow is ever held across a `poll` (see `run`), which makes the
-/// re-entrant access from inside a strand's `poll` sound.
+static mut EXECS: [Option<Executor>; MAX_VCORES] = [const { None }; MAX_VCORES];
+
+/// The embedder's "which vcore am I on" accessor, as a raw address (0 = unset).
+///
+/// A hook rather than something the runtime works out for itself, because there is
+/// nothing in userspace to work it out *from*: in a cell it is a syscall, in a test
+/// kernel it is the per-CPU registry. The runtime is told, and says so.
+static VCORE_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Tell the runtime how to find the calling vcore's index. Call once, before any
+/// `spawn`. Unset, every access resolves to vcore 0 - which is exactly the
+/// single-vcore behaviour, so a caller that never sets it is unchanged.
+pub fn set_vcore_hook(f: fn() -> usize) {
+    VCORE_HOOK.store(f as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// The calling vcore's index, or 0 when no hook is set.
+#[inline]
+fn cur_vcore() -> usize {
+    let h = VCORE_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if h == 0 {
+        return 0;
+    }
+    // SAFETY: `h` was stored by `set_vcore_hook` from a `fn() -> usize`.
+    let f: fn() -> usize = unsafe { core::mem::transmute::<usize, fn() -> usize>(h) };
+    let v = f();
+    if v < MAX_VCORES { v } else { 0 }
+}
+
+/// Short-lived access to **this vcore's** executor. Cooperative within a vcore, so
+/// no borrow is ever held across a `poll` (see `run`), which makes the re-entrant
+/// access from inside a strand's `poll` sound.
 #[inline]
 fn with_exec<R>(f: impl FnOnce(&mut Executor) -> R) -> R {
-    // SAFETY: single CPU; `run` never holds this borrow across `poll`.
+    with_exec_on(cur_vcore(), f)
+}
+
+#[inline]
+fn with_exec_on<R>(v: usize, f: impl FnOnce(&mut Executor) -> R) -> R {
+    // SAFETY: each vcore touches only its own slot, and a vcore belongs to one core
+    // at a time (the kernel's claim, docs/SMP.md 10.0a) - so two cores here are two
+    // disjoint elements of the array, never one. Safe by partitioning, which is the
+    // same argument the kernel's `PerCpu` rests on rather than a lock. `run` never
+    // holds the borrow across `poll`.
     unsafe {
-        let slot = &mut *core::ptr::addr_of_mut!(EXEC);
+        let slot = &mut (*core::ptr::addr_of_mut!(EXECS))[v];
         if slot.is_none() {
             *slot = Some(Executor::new());
         }
@@ -97,10 +151,56 @@ fn with_exec<R>(f: impl FnOnce(&mut Executor) -> R) -> R {
     }
 }
 
+/// Work any vcore may take, and the counter for how much each one took.
+///
+/// A single shared deque rather than per-vcore deques with stealing: with a handful
+/// of vcores the injector is not the contended structure a many-core stealing deque
+/// solves, and a `TicketLock` around a `VecDeque` is honest about what it is. Whether
+/// that becomes the bottleneck is a measurement, and there is no hardware here to
+/// take it on.
+type SharedWork = alloc::boxed::Box<dyn Future<Output = ()> + Send + 'static>;
+static INJECTOR: crate::lock::TicketLock<Option<VecDeque<SharedWork>>> =
+    crate::lock::TicketLock::new(None);
+static SHARED_TAKEN: [AtomicU64; MAX_VCORES] = [const { AtomicU64::new(0) }; MAX_VCORES];
+
+/// Spawn a strand **any vcore may run**. `Send`, and no join handle.
+///
+/// Both restrictions are the same fact: work that can cross cores cannot carry an
+/// `Rc`, so it cannot carry this runtime's join handle either. A caller that needs a
+/// result uses a channel or an atomic - which is what a work-stealing pool does
+/// anyway. `spawn` remains vcore-local and keeps its handle (docs/CONCURRENCY.md).
+pub fn spawn_shared<F>(future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let mut g = INJECTOR.lock();
+    g.get_or_insert_with(VecDeque::new)
+        .push_back(alloc::boxed::Box::new(future));
+}
+
+/// How many shared strands vcore `v` has taken off the injector.
+pub fn shared_taken(v: usize) -> u64 {
+    SHARED_TAKEN[v].load(Ordering::Acquire)
+}
+
+/// Take one shared strand for this vcore, or `None` when the injector is empty.
+fn take_shared() -> Option<SharedWork> {
+    INJECTOR.lock().as_mut().and_then(|q| q.pop_front())
+}
+
 /// Reset the runtime (drops all strands and state). For tests that run the
 /// executor more than once in one boot.
 pub fn reset() {
-    with_exec(|e| *e = Executor::new());
+    // SAFETY: called between runs, with no vcore inside `run`.
+    unsafe {
+        for slot in (*core::ptr::addr_of_mut!(EXECS)).iter_mut() {
+            *slot = None;
+        }
+    }
+    *INJECTOR.lock() = None;
+    for c in SHARED_TAKEN.iter() {
+        c.store(0, Ordering::Release);
+    }
 }
 
 struct JoinState<T> {
@@ -191,20 +291,41 @@ fn wake_strand(id: StrandId) {
 /// Run every ready strand until none is ready (the vcore would otherwise
 /// idle). Strands that parked are resumed later by `complete`.
 pub fn run() {
-    while let Some(id) = with_exec(|e| e.ready.pop_front()) {
+    let me = cur_vcore();
+    loop {
+        // This vcore's own ready queue first - local work is cheaper, and taking from
+        // the injector while local strands wait would only add lock traffic.
+        let Some(id) = with_exec_on(me, |e| e.ready.pop_front()) else {
+            // Local queue dry: take shared work, if any is left.
+            let Some(work) = take_shared() else { break };
+            SHARED_TAKEN[me].fetch_add(1, Ordering::AcqRel);
+            with_exec_on(me, |e| {
+                e.insert(Strand {
+                    future: Box::into_pin(work),
+                })
+            });
+            continue;
+        };
+        run_one(me, id);
+    }
+}
+
+/// Poll strand `id` on vcore `v` once, retiring or re-parking it.
+fn run_one(v: usize, id: StrandId) {
+    {
         // Take the strand out so its `poll` can freely re-enter the executor
         // (spawn/park/complete) without an aliasing borrow.
-        let mut strand = match with_exec(|e| e.slab.get_mut(id).and_then(|s| s.take())) {
+        let mut strand = match with_exec_on(v, |e| e.slab.get_mut(id).and_then(|s| s.take())) {
             Some(s) => s,
-            None => continue,
+            None => return,
         };
-        with_exec(|e| e.current = id);
+        with_exec_on(v, |e| e.current = id);
 
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
         match strand.future.as_mut().poll(&mut cx) {
             Poll::Ready(()) => {
-                with_exec(|e| {
+                with_exec_on(v, |e| {
                     e.free.push(id);
                     e.live -= 1;
                     e.finished += 1;
@@ -212,7 +333,7 @@ pub fn run() {
                 // strand dropped here
             }
             Poll::Pending => {
-                with_exec(|e| e.slab[id] = Some(strand));
+                with_exec_on(v, |e| e.slab[id] = Some(strand));
             }
         }
     }

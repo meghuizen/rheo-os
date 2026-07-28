@@ -301,6 +301,7 @@ fn test_secondary_bringup() {
             println!("smp: real second core on {} confirmed", arch::NAME);
             test_parallel_gemm(idx);
             test_shared_heap();
+            test_strands_across_vcores();
             test_user_cells_on_both();
             test_placement();
             test_two_vcores_one_cell();
@@ -1952,6 +1953,148 @@ fn test_shared_heap() {
          core's block ever holding the other's marker (so no block was handed to both), \
          0 pointers outside the region, and the free list still serving afterwards OK",
         HEAP_ROUNDS
+    );
+}
+
+// ------------------------------------------- STRANDS ACROSS VCORES (the runtime half)
+//
+// `runtime/`'s executor was one global `Executor` behind a `static mut`, so a cell's
+// strands lived on one vcore however many the kernel gave it - the kernel offered the
+// vcores and the library did not take them (docs/CONCURRENCY.md).
+//
+// The obstacle was an API question, not a port. `spawn` returns an `Rc`-based
+// `JoinHandle`, and an `Rc` cannot cross cores, so a single queue that any vcore drains
+// cannot hold what `spawn` produces. The split that a `Send` bound forces:
+//
+//   * `spawn` stays **vcore-local** - same signature, same `Rc` handle, sound because a
+//     strand spawned on a vcore stays there. Every existing caller is unchanged.
+//   * `spawn_shared` takes a **`Send`** future and returns **no handle**. Both
+//     restrictions are one fact: work that may cross cores cannot carry an `Rc`, so it
+//     cannot carry this runtime's join handle either. A caller wanting a result uses a
+//     channel or an atomic, which is what a work-stealing pool does anyway.
+//
+// Each vcore has its own executor (`EXECS[v]`, safe by partitioning - a vcore belongs to
+// one core at a time, so two cores are two disjoint elements). The runtime cannot know
+// which vcore it is on, having no register to read, so the embedder supplies an accessor:
+// here `smp::cpu_index()`, because in kernel context "which vcore" *is* "which core".
+//
+// Two sub-phases, because they prove different things and only one of them can be
+// asserted deterministically:
+//
+//   A. **Concurrent.** Both cores drain the injector at once. Asserted: every strand ran
+//      **exactly once** (a per-strand counter, so a strand delivered twice fails), and
+//      the two vcores' take counts **sum to exactly** the number spawned - which is what
+//      says every strand came off the shared injector rather than a local queue. The
+//      split itself is *reported*, never asserted: one core draining all of them before
+//      the other's first take is a legal schedule, and an assertion that can fail on a
+//      legal schedule is not a proof (the lesson the GEMM worker count already taught).
+//
+//   B. **Directed.** The primary spawns and does **not** drain; only the secondary runs.
+//      Asserted: the secondary took **all** of them and the primary took none, and every
+//      strand still ran. That is the crossing claim, and it is deterministic - work
+//      spawned on one vcore was executed by another.
+
+const STRAND_WORK: usize = 64;
+
+/// Times each shared strand ran. Every entry must end at exactly 1: a 0 means a strand
+/// was lost, a 2 means one was handed to both vcores.
+static STRAND_RAN: [AtomicUsize; STRAND_WORK] = [const { AtomicUsize::new(0) }; STRAND_WORK];
+
+fn strand_reset() {
+    for c in STRAND_RAN.iter() {
+        c.store(0, Ordering::Release);
+    }
+    runtime::strand::reset();
+}
+
+/// Put `STRAND_WORK` shared strands on the injector. Each yields once in the middle, so
+/// the executor genuinely interleaves them rather than running each to completion inside
+/// its first poll.
+fn strand_fill() {
+    for i in 0..STRAND_WORK {
+        runtime::strand::spawn_shared(async move {
+            runtime::strand::yield_now().await;
+            STRAND_RAN[i].fetch_add(1, Ordering::AcqRel);
+        });
+    }
+}
+
+fn strand_drain() {
+    runtime::strand::run();
+}
+
+fn strand_nothing() {}
+
+fn test_strands_across_vcores() {
+    // The embedder's accessor. In kernel context a vcore *is* a core, so this is
+    // `cpu_index()`; in a cell it would come from the kernel through librheo.
+    runtime::strand::set_vcore_hook(smp::cpu_index);
+
+    // ---- A: both cores drain the injector at once ----
+    strand_reset();
+    strand_fill();
+    let (met, finished) = smp::run_fn_with_secondary(strand_drain, strand_drain);
+    if !finished {
+        println!(
+            "smp: SKIP the strands-across-vcores phase - the secondary did not finish \
+             inside the bound, so nothing about strands on two vcores is claimed"
+        );
+        return;
+    }
+    assert!(
+        met && !smp::rendezvous_timed_out(),
+        "the two cores never met, so they did not drain the injector at once"
+    );
+    for (i, c) in STRAND_RAN.iter().enumerate() {
+        let n = c.load(Ordering::Acquire);
+        assert_eq!(
+            n, 1,
+            "shared strand {i} ran {n} times, not once - it was lost or handed to both \
+             vcores"
+        );
+    }
+    let (t0, t1) = (
+        runtime::strand::shared_taken(0),
+        runtime::strand::shared_taken(1),
+    );
+    assert_eq!(
+        t0 + t1,
+        STRAND_WORK as u64,
+        "the two vcores took {t0} + {t1} strands off the injector, not {STRAND_WORK} - \
+         some ran from a local queue instead"
+    );
+
+    // ---- B: the primary spawns, only the secondary drains ----
+    strand_reset();
+    strand_fill();
+    let (met_b, finished_b) = smp::run_fn_with_secondary(strand_drain, strand_nothing);
+    assert!(finished_b, "the secondary did not drain the injector");
+    assert!(met_b && !smp::rendezvous_timed_out(), "the cores never met");
+    for (i, c) in STRAND_RAN.iter().enumerate() {
+        assert_eq!(
+            c.load(Ordering::Acquire),
+            1,
+            "shared strand {i} did not run exactly once on the secondary alone"
+        );
+    }
+    assert_eq!(
+        runtime::strand::shared_taken(0),
+        0,
+        "the primary took work it was told not to drain"
+    );
+    assert_eq!(
+        runtime::strand::shared_taken(1),
+        STRAND_WORK as u64,
+        "the secondary did not take every strand the primary spawned"
+    );
+
+    println!(
+        "smp: STRANDS RAN ACROSS VCORES - {STRAND_WORK} `spawn_shared` strands, each \
+         asserted to run EXACTLY once: drained by two cores at the same time with the \
+         two take counts summing to exactly {STRAND_WORK} (split {t0}/{t1}, reported not \
+         asserted - one core draining first is a legal schedule), and then spawned on \
+         the primary and executed ENTIRELY by the secondary ({STRAND_WORK}/0), which is \
+         the crossing itself OK"
     );
 }
 
