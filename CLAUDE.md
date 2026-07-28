@@ -2191,10 +2191,25 @@ draining first is a legal schedule, and an assertion that can fail on a legal sc
 proof); and **directed**: the primary spawns and does not drain, the secondary asserted to take
 *all* 64 with the primary taking none, which is the crossing itself. Reverting `run` so it never
 takes from the injector leaves every strand unrun; collapsing the per-vcore executors to one
-**hangs**, two cores corrupting one run queue (both observed). Still named as not done: a vcore
-that forks or takes a signal, the loaded-cell ring placement, per-vcore stealing deques, and a
-**cell** running this - the hook is `smp::cpu_index()` in kernel context, and a cell needs the
-kernel to tell it its vcore index, which is a verb that does not exist yet.
+**hangs**, two cores corrupting one run queue (both observed). 
+**And a cell can ask which vcore it is** - **`SYS_VCORE_INFO` (54)**, the session's one new
+verb, reporting `(index, count)`, with `librheo::sys::vcore_index` shaped as `fn() -> usize` so
+it hands straight to `set_vcore_hook`: the runtime is *told* its index rather than inventing
+one, and this is the telling. The **admission audit is written out at its definition** in
+`abi/` per ARCHITECTURE.md 6 - it adds **no object** (a vcore is an execution context of the
+Cell object, so this is a verb over object 1 exactly as `SYS_QUEUE_INFO` is over the QueuePair
+and `SYS_CONNECT` over the channel), it **cannot be a library** (a cell has nothing to compute
+its own index from: there is no register that says "you are context 1 of your cell", and it
+must not be able to claim a different one since every per-vcore structure keys on it), and it
+is **two integers with all policy outside**. Proven by `smp` on **all three ISAs**: the *same
+binary* in two contexts of one cell reads indices 0 and 1 and a count of 2 - a per-cell reply
+would give both the same and a hardcoded one would give both 0, and reverting the index to a
+constant fails by name (observed). Still named as not done: a vcore that forks or takes a
+signal, per-vcore stealing deques, and a **loaded** cell with two vcores actually running the
+multi-vcore executor - which is **loader** work rather than runtime work (`load::map_queue`
+places one ring at `USER_QUEUE_VA`; a second vcore needs a ring, a user stack and an entry
+frame allocated in the cell's address space), with every piece it composes now proven
+separately.
 
 **Honest scope:** preemption is *within* a core's own claim and rebalancing moves only
 **unstarted** cells. Migrating a *running* one was **attempted twice and reverted twice**, with four findings
@@ -2747,7 +2762,9 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               then **STRANDS ACROSS VCORES** - 64 `spawn_shared` strands each
               asserted to run exactly once, drained by two cores at once and then
               spawned on one vcore and executed entirely by another
-              (docs/CONCURRENCY.md); then an
+              (docs/CONCURRENCY.md); then **A CELL ASKING WHICH VCORE IT IS** -
+              the same binary in two contexts reading indices 0 and 1 out of
+              `SYS_VCORE_INFO`; then an
               **unmodified static-glibc binary as a Linux cell on a secondary**,
               exact stdout + exit asserted, overlapping a native cell on the
               primary; then **two Linux cells on two cores at once**, each

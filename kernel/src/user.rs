@@ -16,8 +16,8 @@ use crate::abi::{
     SYS_CAP_DERIVE, SYS_CAP_DROP, SYS_CAP_INFO, SYS_CAP_REVOKE, SYS_COMMIT, SYS_CONNECT,
     SYS_CYCLES, SYS_DECOMMIT, SYS_DOORBELL, SYS_EXIT, SYS_EXIT_GROUP, SYS_GRANT, SYS_GRANT_SHARE,
     SYS_MMAP, SYS_MMAP_FILE, SYS_MUNMAP, SYS_QUEUE_INFO, SYS_RESERVE_ADMIT, SYS_RESERVE_QUERY,
-    SYS_RESERVE_RELEASE, SYS_SEAL, SYS_SPAWN, SYS_SWITCH, SYS_WAIT, SYS_WAIT_INPUT, SYS_WAIT_NET,
-    SYS_YIELD, ShareInfo,
+    SYS_RESERVE_RELEASE, SYS_SEAL, SYS_SPAWN, SYS_SWITCH, SYS_VCORE_INFO, SYS_WAIT, SYS_WAIT_INPUT,
+    SYS_WAIT_NET, SYS_YIELD, ShareInfo,
 };
 use crate::arch::{self, FaultCause, MapPerm, TrapFrame, TrapKind};
 use crate::capability::{
@@ -2930,6 +2930,30 @@ pub fn on_user_trap(
             let ret = match caps.free_low32(objects, arg as u32) {
                 Ok(()) => 0,
                 Err(e) => -(cap_errno(e) as i64),
+            };
+            arch::set_syscall_ret(unsafe { &mut *frame }, ret as u64);
+            frame
+        }
+
+        // Report which vcore this is and how many the cell holds
+        // (docs/SUBSTRATE.md pillar 3). The answer the runtime cannot work out for
+        // itself: nothing in userspace says "you are context 1 of your cell", because
+        // the kernel is what decided.
+        SYS_VCORE_INFO => {
+            let ret = match user_out::<crate::abi::VcoreInfo>(arg) {
+                // SAFETY: `out` was checked by `user_out` (non-null, aligned, inside the
+                // running cell's user VA range), and the cell's address space is active
+                // for the trap.
+                Some(out) => {
+                    unsafe {
+                        out.write(crate::abi::VcoreInfo {
+                            index: current_vcore() as u64,
+                            count: cells()[cur].nvcores as u64,
+                        });
+                    }
+                    0
+                }
+                None => -(EFAULT as i64),
             };
             arch::set_syscall_ret(unsafe { &mut *frame }, ret as u64);
             frame

@@ -301,6 +301,7 @@ fn test_secondary_bringup() {
             println!("smp: real second core on {} confirmed", arch::NAME);
             test_parallel_gemm(idx);
             test_shared_heap();
+            test_vcore_identity();
             test_strands_across_vcores();
             test_user_cells_on_both();
             test_placement();
@@ -1954,6 +1955,127 @@ fn test_shared_heap() {
          0 pointers outside the region, and the free list still serving afterwards OK",
         HEAP_ROUNDS
     );
+}
+
+// ----------------------------------------- a CELL asks which vcore it is (SYS_VCORE_INFO)
+//
+// The runtime half below indexes every per-vcore structure by the vcore's own number, and a
+// cell cannot derive that number: there is no register it may read that says "you are
+// context 1 of your cell". Only the kernel knows, because the kernel decided. So the answer
+// is a verb - `SYS_VCORE_INFO`, whose admission audit is written out at its definition in
+// `abi/`: it adds no object (a vcore is an execution context of the Cell object), it cannot
+// be a library (the cell has nothing to compute it from), and it is two integers with all
+// policy outside.
+//
+// The proof is the property that makes it worth having: the **same binary** in two contexts
+// gets **different** answers. A per-cell reply would give both the same index, and a
+// hardcoded one would give both 0.
+
+/// Vcore 1's store for this phase.
+#[unsafe(link_section = ".user.bss")]
+static mut STORE_I1: CellStore = CellStore::new();
+static mut KSTACK_I0: KernelStack = KernelStack::new();
+static mut KSTACK_I1: KernelStack = KernelStack::new();
+
+fn test_vcore_identity() {
+    // SAFETY: single-threaded setup on the primary; the secondaries claim nothing until
+    // `place_vcores` publishes the queue.
+    unsafe {
+        let objects = &mut *core::ptr::addr_of_mut!(OBJECTS2);
+        let caps = &mut *core::ptr::addr_of_mut!(CAPS2);
+        *objects = ObjectTable::new();
+        *caps = CapTable::new();
+
+        let i0 = core::ptr::addr_of_mut!(STORE_P);
+        let (mut aspace, _o, mut frame0) = build_cell(
+            &mut *i0,
+            objects,
+            caps,
+            (*core::ptr::addr_of!(KSTACK_I0)).top(),
+            10,
+            kernel::user_progs::user_vcore_id,
+            0,
+            0,
+        );
+
+        let i1 = core::ptr::addr_of_mut!(STORE_I1);
+        let stack1 = core::ptr::addr_of!((*i1).stack) as usize;
+        let stack1_len = core::mem::size_of_val(&(*i1).stack);
+        aspace.map_user_range(stack1, stack1_len, MapPerm::UserRw);
+        let params1 = core::ptr::addr_of!((*i1).params) as usize;
+        aspace.map_user(params1 & !0xFFF, MapPerm::UserRw);
+        (*i1).params = kernel::abi::Params::ZERO;
+
+        static mut IFRAME: core::mem::MaybeUninit<kernel::arch::TrapFrame> =
+            core::mem::MaybeUninit::uninit();
+        let f = core::ptr::addr_of_mut!(IFRAME);
+        (*f).write(arch::trapframe_new(
+            kernel::user_progs::user_vcore_id as usize,
+            stack1 + stack1_len,
+            params1,
+            (*core::ptr::addr_of!(KSTACK_I1)).top(),
+        ));
+
+        user::reset();
+        user::install(
+            0,
+            &aspace,
+            caps,
+            objects,
+            (*i0).qp.qp.as_ptr(),
+            core::ptr::addr_of_mut!(frame0),
+        );
+        // SAFETY: `IFRAME` outlives the run; vcore 1 has its own stacks. It shares vcore 0's
+        // ring, which this phase never rings - the identity question is not about queues.
+        user::install_vcore(0, (*f).as_mut_ptr(), (*i0).qp.qp.as_ptr());
+
+        let vids = [user::MAX_VCORES * 0, user::MAX_VCORES * 0 + 1];
+        let mut out = [(u64::MAX, usize::MAX); 2];
+        // SAFETY: cell 0 is installed, present and native, each vcore listed once.
+        if !smp::place_vcores(&vids, &mut out) {
+            println!(
+                "smp: SKIP the vcore-identity phase - the queue did not drain inside the \
+                 bound, so nothing about SYS_VCORE_INFO is claimed"
+            );
+            return;
+        }
+        assert_eq!(out[0].0, 0, "vcore 0 exited {:#x}", out[0].0);
+        assert_eq!(out[1].0, 0, "vcore 1 exited {:#x}", out[1].0);
+        assert_eq!((*i0).params.status, 1, "vcore 0 got no answer");
+        assert_eq!((*i1).params.status, 1, "vcore 1 got no answer");
+
+        // The same binary, two contexts, two different answers.
+        assert_eq!(
+            (*i0).params.ticks,
+            0,
+            "vcore 0 was told it was index {}",
+            (*i0).params.ticks
+        );
+        assert_eq!(
+            (*i1).params.ticks,
+            1,
+            "vcore 1 was told it was index {}",
+            (*i1).params.ticks
+        );
+        assert_eq!(
+            (*i0).params.ops,
+            2,
+            "vcore 0 was told the cell holds {}",
+            (*i0).params.ops
+        );
+        assert_eq!(
+            (*i1).params.ops,
+            2,
+            "vcore 1 was told the cell holds {}",
+            (*i1).params.ops
+        );
+        println!(
+            "smp: A CELL ASKED WHICH VCORE IT IS - the same binary in two contexts of one \
+             cell got indices 0 and 1 and a count of 2 from SYS_VCORE_INFO, which is what \
+             a per-vcore runtime keys every structure on and what a cell cannot derive for \
+             itself OK"
+        );
+    }
 }
 
 // ------------------------------------------- STRANDS ACROSS VCORES (the runtime half)

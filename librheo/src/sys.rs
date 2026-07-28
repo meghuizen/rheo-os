@@ -30,9 +30,9 @@ pub use rheo_abi::{
     SYS_COMMIT, SYS_CONNECT, SYS_CPUINFO, SYS_CYCLES, SYS_DECOMMIT, SYS_DOORBELL, SYS_ENGINE_INFO,
     SYS_EXIT_GROUP, SYS_GRANT, SYS_GRANT_SHARE, SYS_MMAP, SYS_MMAP_FILE, SYS_MUNMAP,
     SYS_QUEUE_INFO, SYS_RANDOM, SYS_RESERVE_ADMIT, SYS_RESERVE_QUERY, SYS_RESERVE_RELEASE,
-    SYS_SEAL, SYS_SPAWN, SYS_SWITCH, SYS_UPTIME, SYS_WAIT, SYS_WAIT_INPUT, SYS_WAIT_NET,
-    SYS_WRITE_FD, SYS_YIELD, ShareInfo, SqEntry, TIMER_CLIENT_CELL_SLEEP, TIMER_CLIENT_PACER,
-    TileGemmDesc, spawn_chan_spec,
+    SYS_SEAL, SYS_SPAWN, SYS_SWITCH, SYS_UPTIME, SYS_VCORE_INFO, SYS_WAIT, SYS_WAIT_INPUT,
+    SYS_WAIT_NET, SYS_WRITE_FD, SYS_YIELD, ShareInfo, SqEntry, TIMER_CLIENT_CELL_SLEEP,
+    TIMER_CLIENT_PACER, TileGemmDesc, VcoreInfo, spawn_chan_spec,
 };
 
 // ---- raw syscall stubs (from libc/src/sys.rs) ----
@@ -429,6 +429,28 @@ pub fn queue_info() -> Option<QueueInfo> {
     };
     let r = unsafe { syscall1(SYS_QUEUE_INFO, &mut info as *mut QueueInfo as u64) };
     if r == u64::MAX { None } else { Some(info) }
+}
+
+/// Ask the kernel which **vcore** this is and how many the cell holds
+/// (docs/SUBSTRATE.md pillar 3, docs/CONCURRENCY.md).
+///
+/// The number every per-vcore structure in a cell keys on - the strand executor, its
+/// local run queue, the ring [`queue_info`] reports - and the one thing a cell cannot
+/// work out for itself: there is no register it may read that says "you are context 1
+/// of your cell". Only the kernel knows, because the kernel decided.
+pub fn vcore_info() -> Option<VcoreInfo> {
+    let mut info = VcoreInfo { index: 0, count: 1 };
+    let r = unsafe { syscall1(SYS_VCORE_INFO, &mut info as *mut VcoreInfo as u64) };
+    if r == u64::MAX { None } else { Some(info) }
+}
+
+/// This vcore's index, or 0 when the kernel does not answer.
+///
+/// Shaped as `fn() -> usize` so it can be handed straight to
+/// `runtime::strand::set_vcore_hook`, which is the whole reason the verb exists: the
+/// runtime is *told* its index rather than inventing one, and this is the telling.
+pub fn vcore_index() -> usize {
+    vcore_info().map(|i| i.index as usize).unwrap_or(0)
 }
 
 /// A queue-pair overlay bound to the cell's mapped ring region. Reads the

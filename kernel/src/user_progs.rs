@@ -19,8 +19,8 @@ use crate::abi::{
     SYS_CAPS, SYS_CPUINFO, SYS_CYCLES, SYS_DOORBELL, SYS_EVENT_COUNT, SYS_EVENT_EMIT, SYS_EXIT,
     SYS_GRANT, SYS_GRAPH, SYS_LEASE, SYS_LSPCI, SYS_MEMINFO, SYS_MMAP, SYS_MUNMAP, SYS_NUMA,
     SYS_PS, SYS_QUEUE_INFO, SYS_RANDOM, SYS_READLINE, SYS_RESERVE, SYS_SWITCH, SYS_UPTIME,
-    SYS_WAIT_INPUT, SYS_WAIT_NET, SYS_WRITE, SYS_YIELD, ShellIo, WORKLOAD_CROSSCELL,
-    WORKLOAD_ROUNDTRIP, WORKLOAD_SYSCALL,
+    SYS_VCORE_INFO, SYS_WAIT_INPUT, SYS_WAIT_NET, SYS_WRITE, SYS_YIELD, ShellIo,
+    WORKLOAD_CROSSCELL, WORKLOAD_ROUNDTRIP, WORKLOAD_SYSCALL,
 };
 use crate::capability::{
     DELEGATE as RIGHT_DELEGATE, READ as RIGHT_READ, REVOKE as RIGHT_REVOKE, WRITE as RIGHT_WRITE,
@@ -997,6 +997,38 @@ pub extern "C" fn user_attack_munmap_queue(params_va: usize) -> ! {
                 (*p).status = 1;
             }
         }
+        syscall(SYS_EXIT, 0);
+    }
+    loop {}
+}
+
+/// The **vcore-identity** prober (docs/SUBSTRATE.md pillar 3): ask `SYS_VCORE_INFO` which
+/// context this is and how many the cell holds, and report both.
+///
+/// `ticks` receives the index, `ops` the count, `status = 1` on success. Nothing else: the
+/// point is that the answer is *per context*, which a cell cannot derive for itself - there
+/// is no register it may read that says "you are context 1 of your cell".
+///
+/// The 16-byte `VcoreInfo` is written straight over `ticks`/`ops`: adjacent, 8-aligned
+/// outputs, so no mapping beyond this cell's own `Params` page is needed (the F1 pointer
+/// check requires a user VA, which this is).
+#[unsafe(link_section = ".user.text")]
+#[unsafe(no_mangle)]
+pub extern "C" fn user_vcore_id(params_va: usize) -> ! {
+    let p = params_va as *mut Params;
+    // SAFETY: the cell's own mapped Params page (its entry argument).
+    unsafe {
+        if syscall4(
+            SYS_VCORE_INFO,
+            core::ptr::addr_of_mut!((*p).ticks) as u64,
+            0,
+            0,
+            0,
+        ) != 0
+        {
+            syscall(SYS_EXIT, 2);
+        }
+        (*p).status = 1;
         syscall(SYS_EXIT, 0);
     }
     loop {}

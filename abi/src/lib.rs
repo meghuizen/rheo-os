@@ -347,6 +347,32 @@ pub const SYS_CAP_INFO: u64 = 52;
 /// still future work (docs/TILES.md 12).
 pub const SYS_CAP_DROP: u64 = 53;
 
+/// Report the calling **vcore's** index and how many its cell holds:
+/// `(out_va: *mut VcoreInfo) -> 0 | -errno` (docs/SUBSTRATE.md pillar 3,
+/// docs/CONCURRENCY.md).
+///
+/// A cell whose runtime schedules strands over several vcores has to know which
+/// context it is running on, because every per-vcore structure - the executor, the
+/// local run queue, the ring `SYS_QUEUE_INFO` reports - is indexed by it. Nothing in
+/// userspace can work that out: there is no register a cell may read that says "you
+/// are context 1 of your cell". Only the kernel knows, because the kernel decided.
+///
+/// **Admission audit** (docs/ARCHITECTURE.md 6). This adds **no kernel object**: a
+/// vcore is an execution context of the Cell object (object 1), and this is a verb
+/// over it, exactly as [`SYS_QUEUE_INFO`] is a verb over the QueuePair and
+/// [`SYS_CONNECT`] over the shared channel. Against the three tests:
+///
+/// 1. **Unforgeable enforcement** - a cell cannot derive its own vcore index and must
+///    not be able to claim a different one, since every per-vcore structure keys on
+///    it. It cannot be a library.
+/// 2. **Arbitrates shared hardware** - the answer *is* the kernel's own placement
+///    decision about which core runs which context. No other cell knows it either, so
+///    it cannot be a cell.
+/// 3. **Mechanism with policy outside** - it reports two integers. What the runtime
+///    does with them (one executor per vcore, work stealing, affinity) is entirely
+///    the runtime's, and the kernel neither knows nor cares.
+pub const SYS_VCORE_INFO: u64 = 54;
+
 // =========================================================================
 // ABI constants that are not syscall numbers
 // =========================================================================
@@ -692,6 +718,17 @@ pub struct QueueInfo {
     pub qp_va: u64,
     /// 32-bit ABI id of the cell's QueuePair capability (`Handle::raw_low32`).
     pub cap_id: u64,
+}
+
+/// The [`SYS_VCORE_INFO`] result block.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct VcoreInfo {
+    /// This vcore's index within its cell, `0..count`.
+    pub index: u64,
+    /// How many vcores the cell holds. 1 for a cell that was given no extra ones,
+    /// which is every cell that predates vcores.
+    pub count: u64,
 }
 
 /// The [`SYS_CAP_INFO`] result block: what a handle actually carries.

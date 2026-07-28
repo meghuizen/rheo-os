@@ -68,9 +68,24 @@ with the primary taking none - the crossing itself, deterministically. Reverting
 never takes from the injector leaves every strand unrun; collapsing the per-vcore executors to
 one **hangs**, two cores corrupting one run queue.
 
+**A cell can now ask which vcore it is**: `SYS_VCORE_INFO` reports `(index, count)`, and
+`librheo::sys::vcore_index` is shaped as `fn() -> usize` so it hands straight to
+`set_vcore_hook` - the runtime is *told* its index rather than inventing one, and that is the
+telling. The verb's admission audit is written out at its definition in `abi/`: it adds no
+object (a vcore is an execution context of the Cell object, so this is a verb over object 1
+exactly as `SYS_QUEUE_INFO` is over the QueuePair), it cannot be a library (a cell has nothing
+to compute its own index from - there is no register that says "you are context 1 of your
+cell"), and it is two integers with all policy outside. Proven by the `smp` kernel on all three
+ISAs: the **same binary** in two contexts of one cell gets indices 0 and 1 and a count of 2,
+where a per-cell reply would give both the same and a hardcoded one would give both 0 -
+reverting the index to a constant fails by name.
+
 Still not built: `!Send` work that migrates (it cannot, by construction), per-vcore stealing
-deques, and a *cell* running this - the hook is wired to `smp::cpu_index()` in kernel context,
-and a cell needs the kernel to tell it its vcore index, which is a verb that does not exist yet.
+deques, and a **loaded** cell with two vcores actually running the multi-vcore executor. That
+last one is loader work, not runtime work: `load::map_queue` places one ring at
+`USER_QUEUE_VA`, and a second vcore needs a ring, a user stack and an entry frame allocated in
+the cell's address space. Every piece it composes is now proven separately - the verb, the
+per-vcore rings, the per-vcore executor, the multi-core allocator.
 
 Position: threads get light by splitting in two. The kernel schedules
 **vcores** (one kernel context each); the runtime inside a cell schedules
