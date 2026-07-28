@@ -1191,28 +1191,33 @@ kernel.
     (docs/ENGINEERING.md 2: waits are deadlines, and a degraded path reports
     itself). The same fix went to the root-table handshake beside it.
 
-  **The observation and the remaining defect.** The gate is "an IOMMU-contained storage cell drives its own NVMe
-  queues off a live disk"; the *cell* half is DRIVERS.md D2 and is not built, but
-  the containment half is testable now and is a distinct claim - NVMe DMAs from
-  queues and staging buffers it allocated itself, so "this transport is
-  translated" does not follow from the virtio-blk proof. Observed: with an
-  `intel-iommu` and an identity domain, the controller comes up and reads
-  correctly - `NVMe read through the identity domain OK (DMA mediated)`.
+  **And the containment gate is proven, both halves.** With an identity domain the
+  NVMe controller comes up and reads correctly; with the domain revoked the DMA
+  faults and the read fails. Same three steps as the virtio-blk phase beside it,
+  because what is being shown is that containment is a property of the IOMMU rather
+  than of the driver.
 
-  The revoke half did not land, and the reason is a defect in the *driver*: a
-  completion wait halts, and the only thing that ends the halt is the completion
-  interrupt - raised by the same device whose DMA the wait depends on. Revoking
-  the domain stops both together, so the halt has no wake source and the loop's
-  own 5-second deadline is never reached: the failure is a **hang rather than a
-  timeout**. An arbiter-backed backstop deadline is the shape of the fix (`ktimer`
-  exists for exactly this, and a `Storage` slot is the natural home), and a first
-  attempt did not work - `ktimer::park`'s `other_source` argument permits a halt on
-  the device alone, which reintroduces it. Named in `hw/nvme.rs` at the halt rather
-  than shipped half-verified, and the phase is not in the suite, because a test
-  that times out must not land.
+  The revoke half is also what made the driver's completion wait honest, and this
+  is the third defect the gate turned up. A completion wait **halts**, and the only
+  thing that ends the halt is the completion interrupt - raised by the same device
+  whose DMA the wait depends on. Revoking the domain stops both together, so the
+  halt had no wake source and the wait's own five-second deadline was never
+  reached: the failure was a **hang, not a timeout**, and any wedged controller
+  does the same on real hardware. The halt now carries an arbiter deadline of its
+  own (`ktimer::TimerClient::Storage`), with `other_source = false` - `true` lets
+  the arbiter halt on the device alone, which is the hang again, and was the first
+  attempt. Where no hardware timer is up the arbiter declines to halt and the wait
+  spins instead: slower, and the deadline stays reachable, which is the right way
+  round. Proven by reverting to `park(true)`, which hangs at exactly that point.
 
-  **Not done:** the IOMMU-contained storage *cell*, the completion-halt backstop
-  above, and MSI on the two non-x86 ISAs. Transfers bounce through page-aligned frames one page per command, so
+  Adding the slot also caught a small hazard of its own: `ktimer::CLIENTS` is a
+  hand-written count of a hand-written enum, and getting it wrong is an
+  out-of-bounds index from a driver at run time rather than a compile error. It is
+  asserted against the last variant now.
+
+  **Not done:** the storage *cell* itself (DRIVERS.md D2 - a userspace driver
+  owning the queues behind BAR grants and forwarded interrupts), and MSI on the two
+  non-x86 ISAs. Transfers bounce through page-aligned frames one page per command, so
   `PRP1` addresses every command and no PRP list is built - correct, and the
   simple form on purpose, since a PRP list buys throughput TCG cannot show.
 - **S6 - NUMA pools + core classes.** Placement proven in QEMU

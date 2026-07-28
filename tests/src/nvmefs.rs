@@ -51,6 +51,14 @@ extern "C" fn kernel_main() -> ! {
     // arm/riscv boots have no firmware and the x86 PVH path skips it. Opt in here
     // rather than at boot, so the other kernels are untouched (the `gpuhw`
     // precedent, docs/GPU-HARDWARE.md 12).
+    // The completion wait halts only when the timer arbiter has a hardware one-shot
+    // to fall back on - a halt whose sole wake source is the device's own interrupt
+    // cannot end when the device stops (see `hw/nvme.rs`). Bringing the timer up is
+    // a per-kernel opt-in here as elsewhere (`enable_uart_rx_irq`,
+    // `enable_virtio_net_irq`), and this is the kernel that asserts the wait parks,
+    // so this is the kernel that provides the backstop.
+    arch::enable_timer_irq();
+
     let assigned = kernel::hw::assign_pci_bars();
     println!("nvmefs: assigned {assigned} PCI BAR(s)");
 

@@ -142,16 +142,28 @@ fn run_iommu(iommu_base: u64) -> ! {
                     "iommu: NVMe read through the identity domain OK - the storage \
                      transport a driver cell would own is DMA-mediated too"
                 );
-                // The **revoke** half is deliberately not asserted here, and the
-                // reason is a driver defect rather than a gap in the test: revoking
-                // the domain stops the device's DMA *and* its MSI together, and this
-                // driver's completion wait halts on that MSI alone - so the read
-                // hangs instead of reaching its own deadline (see the halt in
-                // `hw/nvme.rs`). Confirmed to still hang after the two mapping
-                // defects this phase uncovered were fixed, so it is the wait and not
-                // the plumbing. Asserting it would mean asserting behaviour that does
-                // not terminate. That revocation is *recorded and blocked* is a
-                // property of the IOMMU, and is proven by the virtio-blk phase above.
+                // And the revoke: DMA outside the domain must fail, for this
+                // transport as for the other.
+                //
+                // This is also the case that made the driver's completion wait
+                // honest. Revoking the domain stops the device's DMA *and* its MSI
+                // together, so a halt whose only wake source is that MSI can never
+                // end - and the wait's own five-second deadline is never reached.
+                // The failure was a hang, not a timeout. The halt now carries an
+                // arbiter deadline of its own (`ktimer::TimerClient::Storage`), so
+                // it degrades to slow instead, and this assertion is reachable.
+                iommu.revoke_all();
+                let revoked = nv.read(2, nbuf);
+                let faulted = iommu.take_fault();
+                assert!(revoked.is_err(), "out-of-grant NVMe DMA should have failed");
+                assert!(
+                    faulted,
+                    "IOMMU did not record an out-of-grant NVMe DMA fault"
+                );
+                println!(
+                    "iommu: NVMe DMA outside the domain FAULTED and the read failed - \
+                     the storage transport a driver cell would own is contained"
+                );
             }
         }
     }

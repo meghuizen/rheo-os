@@ -253,15 +253,22 @@ driver silently replaced the first's mapping and the IOMMU's register writes wen
 into an NVMe BAR (allocated per caller now, exhaustion refused rather than wrapped);
 and the VT-d queued-invalidation wait was **unbounded** (`while IQH != IQT`, no
 deadline), which turned that into a 120-second timeout with no output at all - now
-bounded with the reason printed, as is the root-table handshake beside it. The **revoke** half did not land, and the reason is a driver
-defect worth naming: a completion wait halts, and the only thing that ends the halt
-is the completion interrupt - raised by the same device whose DMA the wait depends
-on - so revoking the domain stops both together and the loop's own 5-second deadline
-is never reached: a **hang rather than a timeout**. An arbiter-backed backstop
-deadline is the shape of the fix (`ktimer`, a `Storage` slot) and a first attempt did
-not work, so it is named at the halt in `hw/nvme.rs` rather than shipped
-half-verified, and the phase is not in the suite because a test that times out must
-not land. Honest: no IOMMU-contained storage cell, no completion-halt backstop, no
+bounded with the reason printed, as is the root-table handshake beside it. The **revoke** half is proven too - DMA outside the domain faults and the read
+fails - and it is what made the driver's completion wait honest, the third defect the
+gate turned up: a completion wait **halts**, and the only thing that ends the halt is
+the completion interrupt, raised by the same device whose DMA the wait depends on. So
+revoking the domain stopped both together, the halt had no wake source, and the wait's
+own five-second deadline was never reached - a **hang, not a timeout**, which any
+wedged controller reproduces on real hardware. The halt now carries an arbiter
+deadline of its own (`ktimer::TimerClient::Storage`) with `other_source = false`;
+`true` lets the arbiter halt on the device alone, which is the hang again and was the
+first attempt. Where no hardware timer is up the arbiter declines to halt and the wait
+spins - slower, deadline reachable, the right way round. Proven by reverting to
+`park(true)`, which hangs at exactly that point. Adding the slot caught a hazard of
+its own: `ktimer::CLIENTS` is a hand-written count of a hand-written enum, and getting
+it wrong is an out-of-bounds index from a driver at run time rather than a compile
+error - asserted against the last variant now. Honest: no storage *cell* itself (DRIVERS.md D2 - a
+userspace driver owning the queues behind BAR grants and forwarded interrupts), no
 ARM64 or RISC-V MSI, and
 transfers bounce through page-aligned frames one page per command so `PRP1`
 addresses every command and no PRP list is built.

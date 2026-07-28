@@ -145,10 +145,26 @@ pub enum TimerClient {
     /// what makes the arbiter's re-arm-the-nearest-remaining behaviour load-bearing
     /// rather than incidental.
     Preempt = 6,
+    /// A storage driver's **completion backstop** (docs/SUBSTRATE.md S5): "this
+    /// command's completion, or this slice, whichever comes first".
+    ///
+    /// Its own slot, and it is not a convenience. A completion wait halts, and the
+    /// only thing that ends the halt is the completion interrupt - raised by the
+    /// same device whose DMA the wait depends on. Anything that stops both (a wedged
+    /// controller, or its IOMMU domain being revoked) leaves the halt with no wake
+    /// source, so the wait's own deadline is never reached and the failure is a hang
+    /// rather than a timeout. A deadline here is the second wake source, and the one
+    /// the device cannot take away.
+    Storage = 7,
 }
 
 /// Number of deadline slots (one per [`TimerClient`]).
-pub const CLIENTS: usize = 7;
+///
+/// Asserted against the enum below rather than trusted: this is a hand-written
+/// count of a hand-written enum, and adding a client without it panics on the
+/// client's first `register` - out of bounds, from a driver, at run time.
+pub const CLIENTS: usize = 8;
+const _: () = assert!(TimerClient::Storage as usize == CLIENTS - 1);
 
 #[derive(Copy, Clone)]
 struct Slot {

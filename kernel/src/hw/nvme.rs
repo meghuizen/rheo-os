@@ -107,6 +107,13 @@ const XFER: usize = 4096;
 /// channel, `MAX_IOQ` channels, so 256 KiB of bounce buffers on an 8-CPU machine.
 const DEPTH: usize = 8;
 
+/// How long a completion halt may last before the loop re-checks in software.
+///
+/// Not a timeout - the command's own five-second deadline is that. This bounds how
+/// long the CPU may stay stopped *believing* an interrupt is coming, so a wait
+/// whose wake source disappears degrades to slow rather than to a hang.
+const WAKE_SLICE_NS: u64 = 1_000_000; // 1 ms
+
 /// A submission-queue entry (NVMe 1.4 figure 105). Written field by field rather
 /// than as a struct literal in the hot path, but declared here so the layout is
 /// checked once.
@@ -633,22 +640,26 @@ impl Nvme {
             // the spin is kept and **counted separately**, so a degraded wait is
             // reported rather than inferred away.
             if ch.irq.load(Ordering::Relaxed) {
-                // **A known gap, stated where it matters.** The only thing that
-                // ends this halt is the completion interrupt, and that interrupt is
-                // raised by the same device whose DMA the wait depends on - so
-                // anything that stops both (a wedged controller, or its IOMMU
-                // domain being revoked) leaves the halt with no wake source, and
-                // the loop's own deadline check above is never reached. The failure
-                // is then a hang rather than a timeout.
+                // **Halt, but never on the completion alone.** The interrupt this
+                // waits for is raised by the same device whose DMA the wait depends
+                // on, so anything that stops both - a wedged controller, or its
+                // IOMMU domain being revoked - leaves the halt with no wake source.
+                // The loop's own deadline above is then never reached and the
+                // failure is a hang rather than a timeout. Measured, not theorised:
+                // the `iommu` kernel revokes the domain on purpose, and a read
+                // after it used to hang.
                 //
-                // Measured, not theorised: the `iommu` kernel revokes the domain
-                // deliberately, and a read after it hangs instead of failing. An
-                // arbiter-backed backstop deadline is the shape of the fix
-                // (`ktimer` exists for exactly this) and a first attempt did not
-                // work, so it is named here rather than shipped half-verified -
-                // docs/SUBSTRATE.md S5.
-                IRQ_PARKS.fetch_add(1, Ordering::Relaxed);
-                arch::idle_wait();
+                // So the halt goes through the timer arbiter with a deadline of its
+                // own, and with `other_source = false`: `true` would let the
+                // arbiter halt on the device alone, which is the hang again. Where
+                // no hardware timer is up the arbiter declines to halt at all and
+                // this spins instead - slower, and the deadline stays reachable,
+                // which is the right way round.
+                crate::ktimer::register(crate::ktimer::TimerClient::Storage, WAKE_SLICE_NS);
+                if crate::ktimer::park(false) {
+                    IRQ_PARKS.fetch_add(1, Ordering::Relaxed);
+                }
+                crate::ktimer::cancel(crate::ktimer::TimerClient::Storage);
             } else {
                 core::hint::spin_loop();
             }
