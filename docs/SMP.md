@@ -812,13 +812,44 @@ enter. With one deliberately long cell among short ones the steal is **asserted*
 hoped for: a round in which it did not happen produces the same exit codes and teaches
 nothing. Observed on all three ISAs: 1 cell rebalanced, the busiest core taking 3 of 8.
 
-A cell that is already **running** is deliberately not stealable, and that is the
-remaining gap rather than an oversight: migrating one means moving a live trap frame, an
-FP save area and an address space between cores while the cell is mid-instruction. This
-one is only "the work had not begun yet".
+A cell that is already **running** is not stealable. That is the remaining gap, and it
+was **attempted and rejected** rather than deferred untried - the record is below,
+because two wrong fixes are more useful to the next attempt than the absence of one.
+
+#### Rejected: migrating a running cell (attempted, reverted)
+
+The mechanism is small and most of it worked. A cell's whole context is already per
+*cell* rather than per core - its `TrapFrame`, its FP save area and its kernel stack all
+travel with it - and the only per-core piece, the saved kernel context a run unwinds
+into, is left behind because the losing core unwinds normally and the gaining core
+enters afresh. So the design was: a dry core sets a request flag; the owner sees it at
+its next preemption point (where the cell's state is already saved and the CPU is in
+ordinary kernel context), unwinds its `run` with the cell released instead of finished;
+the asking core resumes it with `user::run`, which restores a frame captured anywhere -
+the property `enter_user_first` gained when it stopped using SYSRET. It needed one new
+unwind reason, added as `user::run_or_migrate` returning `Option<Outcome>` rather than a
+third `Outcome` variant, because `Outcome` is matched exhaustively at ~140 sites that
+all mean "the cell is finished".
+
+It worked, and then failed roughly two runs in five with a core executing a data symbol.
+Two fixes were tried and **both were wrong**:
+
+1. **Publish the release after the unwind, not inside the trap.** Real: the releasing
+   core is still on the cell's kernel stack when it is inside `migrate_out`. Necessary,
+   not sufficient.
+2. **Hand the cell straight to the named requester rather than clearing its owner.**
+   Also real - an unowned cell is one every core's scheduler will pick, so clearing it
+   opened a window for a *third* core. Also not sufficient.
+
+Something else remains, and guessing a third time is what this document's own rules
+forbid. The honest state is: **an intermittently faulting kernel must not land**, so the
+whole thing is reverted and the two findings recorded. The next attempt should start by
+instrumenting which cores are inside the cell at the moment of the fault, rather than by
+reasoning about the protocol - the reasoning has now been wrong twice.
 
 **Honest scope.** Preemption is *within* a core's own claim, and rebalancing moves only
-**unstarted** cells. Nothing migrates a *running* cell, and there is no priority across
+**unstarted** cells. Nothing migrates a *running* cell (attempted; see above), and there
+is no priority across
 cores - the per-CPU EEVDF+BORE queue orders each core's own cells and does not
 participate in the placement decision. Two Linux cells are proven; *many* is not, and neither
 is a Linux cell that forks, pipes or signals across cores - those reach the global
