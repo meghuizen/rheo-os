@@ -103,7 +103,7 @@ static mut LINUX_STATE: [LinuxState; MAX_CELLS] = [const { LinuxState::new() }; 
 
 /// Record the program path `cell` is now running (`execve`), so
 /// `readlinkat("/proc/self/exe")` can answer it.
-pub(crate) fn set_exe_path(cell: usize, path: &[u8]) {
+pub fn set_exe_path(cell: usize, path: &[u8]) {
     let st = state(cell);
     let n = path.len().min(CWD_MAX);
     st.exe[..n].copy_from_slice(&path[..n]);
@@ -125,8 +125,25 @@ fn state(idx: usize) -> &'static mut LinuxState {
 /// Initialize the Linux state for cell `idx`: console fds 0/1/2, the heap
 /// base at the loaded image end, the mmap cursor at the per-cell region base.
 /// Called by the test kernel after `load::load_elf_linux`, before `run`.
-pub fn install_cell(idx: usize, img: &crate::load::LinuxImage) {
+pub fn install_cell(idx: usize, img: &crate::load::LinuxImage, exe: &[u8]) {
     let st = state(idx);
+    // The path `/proc/self/exe` reports. An **explicit argument** rather than something
+    // derived, because it cannot be derived: a cell loaded from an in-memory image has
+    // no path, and one streamed from the VFS does. It used to be set *only* by the
+    // `execve` syscall (`linux::proc`), so `/proc/self/exe` worked for a process another
+    // cell had exec'd and failed for the initial one - and the test covering it happened
+    // to exercise the working path (docs/ENGINEERING.md 11: a facility that works on one
+    // path and not the other, with the proof on the working side).
+    //
+    // Found by the real Bun binary: asked to run a script *file*, it calls
+    // `createFakeTemporaryNodeExecutable`, which resolves its own executable, and the
+    // abort said `error.FileNotFound` while naming nothing. Four hypotheses were
+    // eliminated before a refused-`readlink` log named `/proc/self/exe`.
+    //
+    // An empty slice is the honest answer for an image with no path, and `readlink` then
+    // refuses as it did - the difference is that the refusal is now the truth about that
+    // cell rather than the truth about every cell.
+    set_exe_path(idx, exe);
     // Takes the whole image rather than one field of it: the heap base and the
     // stack request are both properties of the same load, and passing them as
     // separate arguments is how a call site ends up supplying one and defaulting
@@ -419,6 +436,41 @@ fn trace_record(nr_val: u64, ctl: &Ctl) {
         (*addr_of_mut!(TRACE))[at] = TraceEntry { nr: nr_val, ret };
         *addr_of_mut!(TRACE_AT) = (at + 1) % TRACE_LEN;
     }
+    // **Name every refusal, not just refused `open`s** (docs/ENGINEERING.md 1).
+    //
+    // `open_logged` prints the path when an `open` fails, and that has answered several
+    // diagnoses (Bun's `/proc/self/maps`, the resolver's `/etc/resolv.conf`). It cannot
+    // answer one where the failing call is *not* an open: chasing Bun's
+    // `createFakeTemporaryNodeExecutable` abort, four candidate causes were eliminated
+    // one experiment at a time precisely because nothing said which syscall returned
+    // `ENOENT` - only that some Zig code had turned one into `error.FileNotFound`.
+    //
+    // Bounded, and it has to be: library probing produces legitimate `ENOENT` by the
+    // dozen, so an unbounded log would bury the signal it exists to surface. First
+    // [`ENOENT_LOG_MAX`] only, `open` excluded because it already reports itself with
+    // more information than a number.
+    if ret == -(errno::ENOENT as i64) && !is_open_nr(nr_val) {
+        let n = unsafe { *addr_of!(ENOENT_LOGGED) };
+        if n < ENOENT_LOG_MAX {
+            unsafe { *addr_of_mut!(ENOENT_LOGGED) = n + 1 };
+            crate::println!("linux: nr {nr_val} -> ENOENT");
+        }
+    }
+}
+
+/// How many non-`open` `ENOENT` refusals to name before going quiet. See
+/// [`trace_record`].
+const ENOENT_LOG_MAX: u32 = 32;
+static mut ENOENT_LOGGED: u32 = 0;
+
+/// Whether `nr` is one of the `open` family, which reports its own failures with the
+/// path attached ([`open_logged`]) and would otherwise be logged twice.
+fn is_open_nr(nr: u64) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if nr == nr::OPEN {
+        return true;
+    }
+    nr == nr::OPENAT
 }
 
 /// Print the recorded tail, oldest first. Called from the abnormal-exit paths.
@@ -490,6 +542,32 @@ fn maybe_open_maps(st: &mut LinuxState, path_va: u64, flags: u64) -> Option<i64>
 /// an actionable report and a shrug. Only the failing case prints, so a program that
 /// opens hundreds of files successfully costs nothing (docs/ENGINEERING.md 1: the
 /// unmet expectation must be visible, not inferred).
+/// Name a refused path-taking syscall, the way [`open_logged`] names a refused `open`.
+///
+/// The generalisation exists because a refusal that is *not* an `open` was invisible:
+/// chasing Bun's `createFakeTemporaryNodeExecutable` abort cost four eliminated
+/// hypotheses, and the answer turned out to be a `readlink` returning `ENOENT` on a path
+/// nothing printed (docs/ENGINEERING.md 1 - observe, never infer, applied to the
+/// diagnostic itself).
+fn path_logged(r: i64, path_va: u64, what: &str) -> i64 {
+    if r >= 0 {
+        return r;
+    }
+    let n = strlen(path_va);
+    if n == 0 {
+        crate::println!("linux: {what} failed ({r}) with an unreadable path");
+        return r;
+    }
+    // SAFETY: bounded by `strlen`, which stops inside the calling cell's readable
+    // range; the cell's address space is active for the trap.
+    let bytes = unsafe { core::slice::from_raw_parts(path_va as *const u8, n) };
+    match core::str::from_utf8(bytes) {
+        Ok(p) => crate::println!("linux: {what} failed ({r}): {p}"),
+        Err(_) => crate::println!("linux: {what} failed ({r}) with a non-UTF-8 path"),
+    }
+    r
+}
+
 fn open_logged(r: i64, path_va: u64) -> i64 {
     if r >= 0 {
         return r;
@@ -707,14 +785,22 @@ fn handle_inner(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame)
         // real programs actually read (to re-exec themselves, or to locate
         // resources beside their own binary). It used to be a hardcoded `-ENOENT`
         // for everything, `/proc/self/exe` included (docs/ARCHITECTURE-DEBT.md 4).
-        nr::READLINKAT => ret(sys_readlinkat(cur, args[1], args[2], args[3])),
+        nr::READLINKAT => ret(path_logged(
+            sys_readlinkat(cur, args[1], args[2], args[3]),
+            args[1],
+            "readlink",
+        )),
         // readlink(path, buf, bufsiz) - x86-64 legacy, and the one glibc's
         // `readlink()` issues *there*: the asm-generic table has only
         // `readlinkat`. Missing this arm is why the first version of this work
         // passed on riscv64/aarch64 and failed on x86-64 with the same fixture
         // (docs/ARCHITECTURE-DEBT.md 4) - the arguments shift by one because
         // there is no dirfd.
-        nr::READLINK => ret(sys_readlinkat(cur, args[0], args[1], args[2])),
+        nr::READLINK => ret(path_logged(
+            sys_readlinkat(cur, args[0], args[1], args[2]),
+            args[0],
+            "readlink",
+        )),
         // poll/ppoll: real readiness + a real wait (docs/ARCHITECTURE-DEBT.md 2.4).
         // `poll`'s timeout is an `int` of milliseconds in arg 2; `ppoll`'s is a
         // `struct timespec *` in arg 2 (NULL = wait indefinitely).

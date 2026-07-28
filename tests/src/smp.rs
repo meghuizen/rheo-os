@@ -1530,7 +1530,7 @@ fn test_linux_cell_on_secondary() {
             core::ptr::addr_of_mut!(frame_l),
         );
         user::set_personality(1, user::Personality::Linux);
-        kernel::linux::install_cell(1, &img);
+        kernel::linux::install_cell(1, &img, b"");
         // Bind each cell to the core that will run it, so neither core's scheduler can
         // reach into the other's (docs/SMP.md 10.0).
         user::claim_cell(0, 0);
@@ -1639,7 +1639,7 @@ fn test_two_linux_cells() {
                 frame[i].as_mut_ptr(),
             );
             user::set_personality(i, user::Personality::Linux);
-            kernel::linux::install_cell(i, &img);
+            kernel::linux::install_cell(i, &img, b"");
             user::claim_cell(i, i);
         }
 

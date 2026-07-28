@@ -69,7 +69,7 @@ extern "C" fn kernel_main() -> ! {
         "linuxbun",
         "/bin/bun",
         &[b"bun", b"-e", b"console.log(\"rheo:\"+(40+2))"],
-        &[b"LD_LIBRARY_PATH=/lib:/lib64", b"PATH=/bin"],
+        &[b"LD_LIBRARY_PATH=/lib:/lib64", b"PATH=/bin", b"TMPDIR=/tmp"],
         b"rheo:42\n",
         // Bun aborts before evaluating, for a reason that is no longer attributed
         // (see the module docs: preemption landed, the worker now runs, and the
@@ -89,43 +89,26 @@ extern "C" fn kernel_main() -> ! {
         // kernel in the suite mints nothing of the sort and is refused exactly as
         // before, which is what makes this a capability rather than a setting.
         true,
-        // **JavaScript calling a tile kernel** (docs/TILES.md 13.4d). 13.4b compiled the
-        // tile kernels into a static Linux binary and 13.4c opened a shared library
-        // holding them with `dlopen`/`dlsym` - the mechanism `bun:ffi` is built on -
-        // but neither had JavaScript make the call. This does: `bun:ffi` is built into
-        // Bun, so the runtime opens `/lib/libtileso.so`, generates a native trampoline
-        // for the declared signature, and calls through it.
+        // **JavaScript calling a tile kernel, from a real script file on the disk**
+        // (docs/TILES.md 13.4d). `bun:ffi` is built into Bun, so the runtime opens
+        // `/lib/libtileso.so`, generates a native trampoline for the declared signature,
+        // and calls through it.
         //
-        // The expected value is the low 31 bits of the FNV-1a hash of the whole
-        // 32x32x32 int8 GEMM output - `0x23aa217921e5ccb1 & 0x7fff_ffff` - so it proves
-        // the *kernel ran*, not that a symbol resolved, and it is the same number the
-        // librheo cells, the static `tilelinux` binary and the `dlopentile` C probe
-        // produce. 31 bits because a JS number is exact only to 2^53.
-        // Passed with `-e` rather than as a file on the disk, and that is a measured
-        // choice: running a *file* made Bun call `createFakeTemporaryNodeExecutable`,
-        // which wants to write a stand-in `node` into a temp directory and failed
-        // `error.FileNotFound` - the ext4 driver here is **read-only**, so there is
-        // nowhere for it to write. `-e` does not take that path at all. A read-write
-        // ext4 mount is the real fix and is not built (docs/FILESYSTEMS.md).
-        // Passed with `-e`. Running the same code as a **file** on the disk is
-        // attempted and does not work, and the reason is recorded rather than
-        // guessed at (docs/TILES.md 13.4d): Bun calls
-        // `createFakeTemporaryNodeExecutable` on that path and aborts
-        // `error.FileNotFound`. Three candidate causes were ruled out by
-        // observation - the root being read-only (a writable ramfs is mounted at
-        // `/tmp` now and Bun never touches it), the legacy `stat`/`lstat` being
-        // unimplemented (they are implemented now, and it changed nothing), and
-        // `/proc/self/exe` being absent (it is not). No refused path and no
-        // `ENOSYS` in the trace accounts for it, so the cause is inside Bun's own
-        // path handling and is **not identified**. `-e` does not take that path,
-        // and it exercises the same FFI mechanism.
-        Some((
-            &[
-                b"bun",
-                b"-e",
-                b"const{dlopen,FFIType}=require(\"bun:ffi\");const l=dlopen(\"/lib/libtileso.so\",{tile_gemm_check:{args:[FFIType.u32,FFIType.u32,FFIType.u32],returns:FFIType.i32}});console.log(\"tileffi: gemm \"+l.symbols.tile_gemm_check(32,32,32))",
-            ],
-            b"tileffi: gemm 568708273\n",
-        )),
+        // A **file**, not `-e`, and getting there took five hypotheses. Running a file
+        // makes Bun call `createFakeTemporaryNodeExecutable`, which aborted
+        // `error.FileNotFound` naming nothing. Ruled out by observation: the read-only
+        // root (a writable ramfs is mounted at `/tmp` now), `TMPDIR` being unset, the
+        // legacy `stat`/`lstat` being unimplemented, and `/proc/self/exe` being absent
+        // from the code. The fifth was the answer, and it needed a diagnostic rather than
+        // a guess: a refused `readlink` now names its path, and it named
+        // `/proc/self/exe` - which was set only by the `execve` *syscall*, so it worked
+        // for a process another cell had exec'd and failed for the initial one.
+        //
+        // The expected value is the low 31 bits of the FNV-1a hash of the whole 32x32x32
+        // int8 GEMM output, so it proves the *kernel ran* rather than that a symbol
+        // resolved - the same number the librheo cells, the static `tilelinux` binary and
+        // the `dlopentile` C probe produce. 31 bits because a JS number is exact only to
+        // 2^53.
+        Some((&[b"bun", b"/bin/tileffi.js"], b"tileffi: gemm 568708273\n")),
     )
 }

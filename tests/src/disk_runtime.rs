@@ -112,7 +112,7 @@ fn run_execve(path: &str, argv: &[&[u8]], envp: &[&[u8]], wx: bool) -> Outcome {
             .expect("W^X exception capability");
         }
         user::set_personality(0, Personality::Linux);
-        linux::install_cell(0, &img);
+        linux::install_cell(0, &img, path.as_bytes());
         user::run(0).1
     }
 }

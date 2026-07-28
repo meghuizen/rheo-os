@@ -317,7 +317,9 @@ pub unsafe fn run_linux_cell(image: &[u8], argv: &[&[u8]]) -> Outcome {
         let qp = core::ptr::addr_of!(QP) as *const QueuePair;
         user::install(0, &aspace, caps, objects, qp, addr_of_mut!(frame));
         user::set_personality(0, user::Personality::Linux);
-        linux::install_cell(0, &img);
+        // No exe path: this launch loads an in-memory image rather than a VFS file, so
+        // there is nothing truthful for `/proc/self/exe` to report and `readlink` refuses.
+        linux::install_cell(0, &img, b"");
         user::run(0).1
     }
 }

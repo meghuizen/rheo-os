@@ -2174,13 +2174,17 @@ to `newfstatat(AT_FDCWD, ...)` - the **third** instance of the two-numbers hazar
 matters: **this glibc routes `stat()` through `newfstatat` even on x86-64**, so the first
 fixture called `stat()` and *passed with the fix reverted*; the `lstatx` fixture issues
 the **raw** syscalls instead, and the programs that use the legacy numbers are precisely
-the ones bypassing libc, as Bun's Zig runtime does. Honest about what neither fixed:
-Bun asked to run a script **file** still aborts in
-`createFakeTemporaryNodeExecutable` with `error.FileNotFound`, and three candidate causes
-were ruled out by observation (the read-only root - it never touches `/tmp`; the missing
-legacy `stat` - implemented, no change; a missing `/proc/self/exe` - it exists). No
-refused path and no `ENOSYS` in the trace accounts for it, so the cause is **not
-identified** and is recorded as such rather than guessed at.
+the ones bypassing libc, as Bun's Zig runtime does. **And the fifth hypothesis was the actual defect**:
+`/proc/self/exe` was set only by the `execve` *syscall*, so it resolved for a process
+another cell had exec'd and returned `ENOENT` for the one the launcher loaded - with the
+existing test exercising the working side (docs/ENGINEERING.md 11). `install_cell` now
+takes the exe path as an **explicit argument**, since it cannot be derived (an in-memory
+image genuinely has none, and `b""` there is the truthful answer). What ended a run of
+four wrong guesses was a **diagnostic, not a sixth guess**: `trace_record` now names any
+non-`open` syscall returning `ENOENT` (bounded, since library probing produces dozens),
+and a refused **`readlink` names its path** the way a refused `open` already did - which
+printed `/proc/self/exe` immediately. With that fixed, **Bun runs the tile FFI script as a
+real file off the disk**, not just via `-e`.
 
 **And JavaScript on the real Bun calls a tile kernel** (docs/TILES.md 13.4d): the
 `linuxbun` gate runs the real Bun binary a second time off the same live ext4 disk,

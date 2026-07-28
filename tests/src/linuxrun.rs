@@ -225,7 +225,7 @@ fn run_linux(name: &str, image: &[u8], argv: &[&[u8]]) -> Outcome {
         let qp = core::ptr::addr_of!(QP) as *const QueuePair;
         user::install(0, &aspace, caps, objects, qp, addr_of_mut!(frame));
         user::set_personality(0, Personality::Linux);
-        linux::install_cell(0, &img);
+        linux::install_cell(0, &img, b"");
         user::run(0).1
     }
 }
