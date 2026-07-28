@@ -827,6 +827,14 @@ fn setup_msix(
     if !dev.msix || dev.msix_cap == 0 {
         return false;
     }
+    // Route first, then address. On x86-64 and RISC-V the destination is a field
+    // in the address, so routing is a no-op; on ARM64 every device writes the same
+    // ITS register and the (device, event) -> (LPI, core) mapping *is* the wiring,
+    // so it has to exist before the device can fire.
+    let device_id = ((dev.bus as u32) << 8) | ((dev.dev as u32) << 3) | dev.func as u32;
+    if !arch::msi_route(device_id, slot, dest_hw_id) {
+        return false;
+    }
     let Some((addr, data)) = arch::msi_target(dest_hw_id, slot) else {
         return false;
     };

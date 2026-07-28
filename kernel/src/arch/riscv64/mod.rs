@@ -1264,3 +1264,10 @@ pub fn irq_window() {
         );
     }
 }
+
+/// Route a device's MSI event to a core. Nothing to do on this ISA: the
+/// destination is a field in the address the device writes, so [`msi_target`]
+/// has already expressed it. Exists so the driver has one shape to call.
+pub fn msi_route(_device_id: u32, _slot: usize, _dest_hw_id: u32) -> bool {
+    true
+}

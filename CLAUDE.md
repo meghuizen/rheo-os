@@ -232,8 +232,20 @@ after a completion, so the device's write never reached the IMSIC. The open ques
 is QEMU's PCIe-DMA routing, not the driver; shipping a write path that provably does
 nothing where it can be tested, on the strength of "it should work on hardware", is
 the untested claim this tree refuses, so it is `None` with the evidence recorded in
-`arch/riscv64/mod.rs`. Honest: no IOMMU-contained storage cell, no ARM64 MSI (a
-GICv3 ITS, not attempted), and
+`arch/riscv64/mod.rs`. **A GICv3 ITS driver was written for ARM64 and withdrawn too**, getting further:
+every command was consumed (`GITS_CREADR` caught `GITS_CWRITER` after MAPD/MAPC/
+MAPTI/INV/SYNC) and LPIs were enabled over a shared 8 KiB config table and a
+64 KiB-aligned per-core pending table (statics - the frame allocator offers neither
+contiguity nor that alignment), and it turned up a real defect worth recording:
+`GITS_TYPER.PTA` is **0** here, so `MAPC`'s `RDbase` is a *processor number*, not a
+redistributor address - and getting that wrong looks exactly like getting everything
+else wrong, since the commands are still accepted and the queue still drains. No LPI
+was ever taken, so the open question is which mapping QEMU disagrees with, not
+whether the tables were published. Both withdrawals share a shape worth naming: the
+per-ISA MSI seam (`msi_target`/`msi_route`/`irq_ready_this_cpu`) is in place and the
+x86-64 implementation behind it is proven, so returning to either is filling in one
+function against a working contract from recorded evidence. Honest: no
+IOMMU-contained storage cell, no ARM64 or RISC-V MSI, and
 transfers bounce through page-aligned frames one page per command so `PRP1`
 addresses every command and no PRP list is built.
 

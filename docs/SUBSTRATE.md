@@ -1147,8 +1147,32 @@ kernel.
   of "it should work on hardware" - so it is `None`, the driver polls and says so,
   and the evidence is in `arch/riscv64/mod.rs` for whoever picks it up.
 
-  **Not done:** no IOMMU-contained storage *cell*, and MSI-X on the two non-x86
-  ISAs (ARM64 needs a GICv3 ITS, which has not been attempted). Transfers bounce through page-aligned frames one page per command, so
+  **A GICv3 ITS driver was written for ARM64 and withdrawn too**, and it got
+  further than the RISC-V attempt. Every command was consumed (`GITS_CREADR`
+  caught up to `GITS_CWRITER` after MAPD / MAPC / MAPTI / INV / SYNC), LPIs were
+  enabled on the redistributor over a shared 8 KiB configuration table and a
+  64 KiB-aligned per-core pending table - both statics, because the frame
+  allocator offers neither contiguity nor that alignment and adding a contiguous
+  allocator for one device path would mean changing the tree's most
+  safety-critical allocator. It also turned up a real defect worth keeping in the
+  record: `GITS_TYPER.PTA` is **0** on this machine, so `MAPC`'s `RDbase` is a
+  *processor number* and not a redistributor address - and the symptom of getting
+  that wrong is indistinguishable from getting everything else wrong, since the
+  commands are still accepted and the queue still drains. No LPI was ever taken.
+  The open question is which mapping QEMU disagrees with, or whether the DeviceID
+  the host bridge presents differs from the requester id - not whether the tables
+  were published. ~250 lines of device programming that provably delivers nothing
+  where it can be run is the untested claim this standard refuses, so ARM64 is
+  `None` with the evidence in `arch/aarch64/mod.rs`.
+
+  Both withdrawals share a shape worth naming: the per-ISA MSI seam
+  (`msi_target` / `msi_route` / `irq_ready_this_cpu`) is now in place and the
+  x86-64 implementation behind it is proven, so neither of these is a redesign
+  when someone returns to it - it is filling in one function against a working
+  contract, from recorded evidence rather than from scratch.
+
+  **Not done:** no IOMMU-contained storage *cell*, and MSI on the two non-x86
+  ISAs. Transfers bounce through page-aligned frames one page per command, so
   `PRP1` addresses every command and no PRP list is built - correct, and the
   simple form on purpose, since a PRP list buys throughput TCG cannot show.
 - **S6 - NUMA pools + core classes.** Placement proven in QEMU

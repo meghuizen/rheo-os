@@ -1479,15 +1479,50 @@ pub fn exit(code: super::ExitCode) -> ! {
 
 // ------------------------------------------------------ MSI-X (NVMe completions)
 
+// **A GICv3 ITS driver was written for this and withdrawn.** The result is a
+// measurement, and the evidence is here so the next attempt starts from it.
+//
+// On ARM64 a device MSI is a write to the ITS's `GITS_TRANSLATER`, and the ITS
+// turns it into an LPI routed to a redistributor. Every device writes the *same*
+// address, so unlike x86-64 (destination in the address) the routing lives in ITS
+// tables: a device table mapping the PCI requester id to an Interrupt Translation
+// Table (`MAPD`), the ITT mapping an EventID to an LPI and a collection (`MAPTI`),
+// and a collection table mapping that collection to a redistributor (`MAPC`) -
+// which is where "this queue interrupts that core" is expressed.
+//
+// What was built and observed:
+//   - the ITS is present and reports `GITS_TYPER = 0x1f_0001_efb1`;
+//   - the command queue, device table and collection table were published and
+//     **every command was consumed** - `GITS_CREADR` caught up to `GITS_CWRITER`
+//     after each of MAPD / MAPC / MAPTI / INV / SYNC;
+//   - `GITS_TYPER.PTA` is **0** on this machine, so `MAPC`'s `RDbase` is a
+//     *processor number* and not a redistributor address - a real defect in the
+//     first draft, fixed, and mentioned because the symptom of getting it wrong is
+//     indistinguishable from getting everything else wrong: commands accepted,
+//     queue drained, nothing delivered;
+//   - LPIs were enabled on the redistributor (`GICR_CTLR` bit 0 set) over a shared
+//     8 KiB configuration table and a 64 KiB-aligned per-core pending table, both
+//     statics because the frame allocator offers neither contiguity nor that
+//     alignment;
+//   - and no LPI was ever taken.
+//
+// So the remaining question is which of the three mappings QEMU disagrees with, or
+// whether the PCIe DeviceID the host bridge presents differs from the requester id
+// - not whether the tables were published. Shipping ~250 lines of device
+// programming that provably delivers nothing in the only environment that can run
+// it would be the untested claim this tree's standard refuses, so this is `None`,
+// the driver polls and says so, and the finding is the deliverable.
+
 /// Where a PCIe device should write, and what, to raise a completion interrupt.
-///
-/// **`None` here**, so a caller polls and reports that it is polling rather than
-/// programming a device to write to nowhere. What is missing is not a constant but
-/// a driver: this ISA needs a GICv3 ITS (device table, ITT, MAPD/MAPTI commands),
-/// where x86-64's MSI is just a write to the local-APIC message region. Named in
-/// docs/SUBSTRATE.md S5 as the remaining work rather than papered over.
+/// `None` - see the note above for what was built and measured.
 pub fn msi_target(_dest_hw_id: u32, _slot: usize) -> Option<(u64, u32)> {
     None
+}
+
+/// Route a device's MSI event to a core. Nothing to route while [`msi_target`]
+/// returns `None`.
+pub fn msi_route(_device_id: u32, _slot: usize, _dest_hw_id: u32) -> bool {
+    true
 }
 
 /// Completion interrupts taken - always 0 while [`msi_target`] returns `None`.
