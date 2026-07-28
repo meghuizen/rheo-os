@@ -586,10 +586,9 @@ scheduler itself has not.
   level on two cores at the same instant, a queue of 8 runnable cells is drained by 4
   cores that each claim from it, each core then preempts between the cells it claimed
   (344-405 slices taken on 4 cores at once, against 0 in the cooperative control round),
-  and an **unmodified static-glibc binary** runs as a Linux cell on a secondary with its
-  exact stdout and exit asserted. Not yet the whole scheduler: nothing migrates a running
-  cell between cores, nothing balances after the claim, and only one Linux cell runs at
-  a time.
+  and **two unmodified static-glibc binaries run as Linux cells on two cores at the same
+  time**, each transcript asserted exactly. Not yet the whole scheduler: nothing migrates
+  a running cell between cores and nothing balances after the claim.
 
 ### 10.0 Cells run in user mode on a secondary core - built
 
@@ -764,21 +763,49 @@ what it was. Coarse on purpose: there is exactly one place a Linux syscall enter
 personality, so "every global it touches is protected" is a property of one line rather
 than of a list a new registry can be added to without noticing.
 
-What that buys today is the one-Linux-cell case above, where the lock is genuinely
-exercised multicore - acquired, re-entered, released - but never contended. **Two Linux
-cells at once is attempted and does not work**, and the finding is worth recording
-because it is not what was expected: two Linux cells installed simultaneously fail *even
-when run one after the other on a single core*, so the obstacle is per-cell personality
-state that two `install_cell` calls disturb, not concurrency. Chasing it further was cut
-here rather than shipped as a passing test that proves less than it looks; it is the next
-thing to do, and it is a personality bug rather than an SMP one.
+**And two Linux cells now run on two cores at the same time.** The same unmodified
+static-glibc binary runs as *both* cells, each transcript captured separately and
+asserted exactly, each exiting 9 - on all three ISAs. That needed the stdout tap to
+become per cell (it keys on `user::current_index()`, which is `PerCpu`, so each core
+writes only the slot of the cell it is running; with one shared buffer the two
+transcripts interleave and a test that cannot tell them apart cannot show that both ran
+correctly).
+
+Getting there cost two defects, and the first is worth recording because the initial
+diagnosis was wrong. The phase failed, and the failure looked like it reproduced when
+the two cells were run one after the other on a single core - so it was written up as a
+personality-state bug. Reproducing it in a kernel with **no secondaries** (`linuxrun`)
+showed two Linux cells install and run serially without a murmur. The garbled console
+that made the single-core run *look* broken was coming from the secondaries, and the
+real faults were two:
+
+- **`place_cells` reported a round finished while cores were still in it.**
+  `PLACE_DONE` says every cell finished; it does not say every core has stopped
+  *touching* them. The core that completed the last cell is still unwinding its address
+  space, and the caller - which returns the instant the count is reached - goes on to
+  `user::reset()` the cell table out from under it. A `BUSY` count with an RAII guard
+  now quiesces every core before the round is reported done.
+- **The Linux scheduler had no CPU-affinity test.** `nproc::schedulable` got one when
+  native cells started running on secondaries; `linux::proc`'s three runnable
+  predicates did not. So when the primary's Linux cell exited, its reschedule could
+  pick the cell the *secondary* was running - two cores in one cell, one trap frame,
+  one kernel stack. It presented as an instruction fetch at PC 0 in kernel mode on two
+  cores at once. All three predicates now test `user::cell_on_this_cpu`, which is
+  constant-true on every single-core boot.
+
+The lesson is the one this tree keeps relearning: the first reproduction was in an
+environment that added its own noise, and the "single core reproduces it" conclusion
+drawn from it sent the diagnosis in the wrong direction. Reproducing in the *quietest*
+environment that can host the bug came first the second time, and answered it in one
+run.
 
 **Honest scope.** Preemption is *within* a core's own claim. Nothing takes a cell away
 from another core, nothing migrates a running cell, and there is no priority across
 cores - the per-CPU EEVDF+BORE queue orders each core's own cells and nothing balances
-between queues after the claim. The Linux cell is **one** cell at a time, for the reason
-recorded just above - and that limit is now known to sit in the personality's
-install-time state rather than in the locking. What makes all of it safe is unchanged
+between queues after the claim. Two Linux cells are proven; *many* is not, and neither
+is a Linux cell that forks, pipes or signals across cores - those reach the global
+registries in patterns the two-`chello` case does not exercise, and the big lock is
+correct for them by construction but unproven. What makes all of it safe is unchanged
 and is the reason it could land first: a claimed cell is still a *partitioned* cell (one
 core, one slot, one address space, one kernel stack), the claim simply being made at run
 time instead of by hand.

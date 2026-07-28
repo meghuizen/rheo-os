@@ -267,6 +267,7 @@ fn test_secondary_bringup() {
             test_placement();
             test_cross_core_preemption();
             test_linux_cell_on_secondary();
+            test_two_linux_cells();
         }
         Err(StartError::NoSecondary) => {
             println!(
@@ -940,6 +941,115 @@ fn test_linux_cell_on_secondary() {
              core - exact stdout and exit {CHELLO_EXIT} asserted - while a native cell \
              ran on the primary, the two overlapping at a rendezvous neither could pass \
              alone"
+        );
+    }
+}
+
+// ------------------------------------- TWO Linux cells, on two cores, at the same time
+//
+// The phase above runs **one** Linux cell off the boot CPU, which is safe because the
+// personality's genuinely global tables - the mapped-file registry, the pipe/eventfd/
+// timerfd/unix-socket registries, the pid counter, the trace ring - then have exactly
+// one writer. Two Linux cells reach them concurrently, and that is the question
+// docs/SMP.md 10.2 gates.
+//
+// It is answered the way 10.2 says to answer it first: a **big lock over the whole
+// personality dispatch** (`linux::plock`), taken only while more than one CPU is
+// online, recursive per CPU because a syscall re-enters the personality through
+// `uaccess` -> `fill_fault`. It serialises the *syscalls*; the two cells' user-mode
+// code runs genuinely in parallel. Coarse on purpose - there is exactly one place a
+// Linux syscall enters, so "every global it touches is protected" is a property of one
+// line rather than of a list a new registry can be added to without noticing.
+//
+// The proof runs the same unmodified static-glibc binary as **both** cells and asserts
+// **both** transcripts exactly. That needs the stdout tap to be per cell rather than
+// per machine (see `tap`), which is itself the point: with one shared buffer the two
+// transcripts interleave, and a test that cannot tell them apart cannot show that both
+// ran correctly.
+
+fn test_two_linux_cells() {
+    // SAFETY: single-threaded setup on the primary; secondaries are parked.
+    unsafe {
+        let objects = &mut *core::ptr::addr_of_mut!(OBJECTS2);
+        let caps = &mut *core::ptr::addr_of_mut!(CAPS2);
+        *objects = ObjectTable::new();
+        *caps = CapTable::new();
+
+        user::reset();
+        ktimer::reset();
+        idle::reset();
+
+        let mut aspace = [
+            kernel::mm::AddressSpace::new(3),
+            kernel::mm::AddressSpace::new(4),
+        ];
+        let mut frame: [core::mem::MaybeUninit<kernel::arch::TrapFrame>; 2] =
+            [const { core::mem::MaybeUninit::uninit() }; 2];
+        let kstacks = [
+            (*core::ptr::addr_of!(KSTACK_P)).top(),
+            (*core::ptr::addr_of!(KSTACK_L)).top(),
+        ];
+        for i in 0..2 {
+            let img = kernel::load::load_elf_linux(CHELLO, &mut aspace[i]).expect("load chello");
+            let sp = kernel::linux::stack::setup_stack(&mut aspace[i], &img, &[b"chello"], &[]);
+            frame[i].write(arch::trapframe_new(img.entry, sp, 0, kstacks[i]));
+            user::install(
+                i,
+                &aspace[i],
+                caps,
+                objects,
+                core::ptr::addr_of!(QP_L) as *const kernel::queue::QueuePair,
+                frame[i].as_mut_ptr(),
+            );
+            user::set_personality(i, user::Personality::Linux);
+            kernel::linux::install_cell(i, &img);
+            user::claim_cell(i, i);
+        }
+
+        STDOUT_LEN = [0; CAP_CELLS];
+        kernel::linux::set_stdout_tap(Some(tap));
+        // SAFETY: both cells are installed, present and distinct; both are Linux,
+        // which is what this phase is about.
+        let (met, finished, sec_code, own_code) = smp::run_cells_on_both(0, 1);
+        kernel::linux::set_stdout_tap(None);
+
+        if !finished {
+            println!(
+                "smp: SKIP the two-Linux-cells phase - the secondary did not finish its \
+                 cell within the bound"
+            );
+            return;
+        }
+        assert!(
+            met && !smp::rendezvous_timed_out(),
+            "the two cores never met, so the two Linux cells did not overlap"
+        );
+        assert_eq!(
+            own_code, CHELLO_EXIT,
+            "the primary's Linux cell exited wrong"
+        );
+        assert_eq!(
+            sec_code as u64, CHELLO_EXIT,
+            "the secondary's Linux cell exited wrong"
+        );
+        for i in 0..2 {
+            let got = captured(i);
+            assert!(
+                got == CHELLO_OUT,
+                "Linux cell {i}'s stdout did not match ({} bytes) - the two transcripts \
+                 were not both produced correctly",
+                got.len()
+            );
+        }
+        assert!(
+            kernel::mm::frames::used_matches_bitmap(),
+            "the frame pool's used counter drifted from its bitmap"
+        );
+        println!(
+            "smp: TWO LINUX CELLS ran on TWO CORES at the same time - the same \
+             unmodified static-glibc binary twice, each transcript captured separately \
+             and asserted exactly, each exiting {CHELLO_EXIT}, with the personality's \
+             global tables held by one recursive lock over its dispatch"
         );
     }
 }

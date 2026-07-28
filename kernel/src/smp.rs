@@ -804,6 +804,20 @@ static PLACE_NEXT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "smp")]
 static PLACE_DONE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "smp")]
+/// How many cores are inside a drain. Zero means the round is genuinely over and its
+/// cells can be torn down.
+static BUSY: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "smp")]
+/// Decrements [`BUSY`] however `drain_cells` leaves - including the early returns.
+struct Busy;
+#[cfg(feature = "smp")]
+impl Drop for Busy {
+    fn drop(&mut self) {
+        BUSY.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+#[cfg(feature = "smp")]
 /// Whether the current round runs its cells **preemptively**.
 static PLACE_PREEMPT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "smp")]
@@ -869,6 +883,16 @@ pub const CLAIM_BATCH: usize = 2;
 unsafe fn drain_cells() {
     let n = PLACE_COUNT.load(Ordering::Acquire);
     let cpu = arch::cpu_index();
+    // **Mark this core busy for the whole round, not just for the cells it runs.**
+    // `PLACE_DONE` says every cell finished; it does not say every core has stopped
+    // *touching* them. The core that completed the last cell is still unwinding its
+    // address space and its bookkeeping, and the primary - which returns the instant
+    // the count is reached - would go on to `user::reset()` the cell table out from
+    // under it. That is a use-after-free across cores, and it presented as kernel-mode
+    // page faults on secondaries with no obvious connection to the phase that caused
+    // them (docs/SMP.md 10.0).
+    BUSY.fetch_add(1, Ordering::AcqRel);
+    let _quiesce = Busy;
     if PLACE_PREEMPT.load(Ordering::Acquire) == 1 {
         enable_preemption_here();
     }
@@ -993,11 +1017,21 @@ unsafe fn place_cells_inner(cells: &[usize], out: &mut [(u64, usize)], preempt: 
     while PLACE_DONE.load(Ordering::Acquire) < n {
         if arch::timer_now_ns() >= deadline {
             PLACE_COUNT.store(0, Ordering::Release);
+            let q = arch::timer_now_ns().wrapping_add(RV_TIMEOUT_NS);
+            while BUSY.load(Ordering::Acquire) > 0 && arch::timer_now_ns() < q {
+                core::hint::spin_loop();
+            }
             return false;
         }
         core::hint::spin_loop();
     }
     PLACE_COUNT.store(0, Ordering::Release);
+    // Wait for every core to leave its drain before reporting the round finished: the
+    // caller's next act is usually to tear these cells down.
+    let quiesce = arch::timer_now_ns().wrapping_add(RV_TIMEOUT_NS);
+    while BUSY.load(Ordering::Acquire) > 0 && arch::timer_now_ns() < quiesce {
+        core::hint::spin_loop();
+    }
     for (k, slot) in out.iter_mut().enumerate().take(n) {
         *slot = (
             PLACE_CODE[k].load(Ordering::Acquire) as u64,

@@ -1761,15 +1761,27 @@ atomic `swap` now. The **personality lock** docs/SMP.md 10.2 names as the first 
 also in place (`linux::plock`: one lock over the whole Linux dispatch plus the
 demand-paging entry, **recursive per CPU** - a syscall reaches `fill_fault` through
 `uaccess`, so a non-reentrant lock self-deadlocks there - and **not taken at all** on a
-single-CPU boot, so every pre-existing kernel's hot path is unchanged). It is exercised
-multicore by the phase above but never **contended**: two Linux cells at once is
-attempted and does not work, and the finding is that it fails *even run one after the
-other on a single core*, so the obstacle is per-cell personality state that two
-`install_cell` calls disturb rather than concurrency - recorded as an open finding
-instead of shipped as a weaker passing test.
+single-CPU boot, so every pre-existing kernel's hot path is unchanged). **And two Linux cells now run on two cores at the same time** - the same unmodified
+static-glibc binary as both cells, each transcript captured separately (the stdout tap
+keys on `user::current_index()`, which is `PerCpu`) and asserted exactly, each exiting 9,
+on all three ISAs. Two defects had to go, and the first is recorded because the initial
+diagnosis was **wrong**: the phase failed and appeared to fail single-core too, so it was
+written up as a personality-state bug - but reproducing it in a kernel with no
+secondaries showed two Linux cells install and run serially without a murmur, and the
+garbled console that made the single-core run *look* broken was the secondaries. The real
+faults were (a) `place_cells` reporting a round finished while a core was still unwinding
+inside it, so the caller's next `user::reset()` freed cells under it (a `BUSY` count with
+an RAII guard now quiesces every core first), and (b) **the Linux scheduler had no
+CPU-affinity test** - `nproc::schedulable` got one when native cells reached secondaries;
+`linux::proc`'s three runnable predicates did not, so the primary's exiting cell could
+reschedule *into* the cell the secondary was running, presenting as an instruction fetch
+at PC 0 in kernel mode on two cores. The lesson is the one this tree keeps relearning:
+the first reproduction was in an environment that added its own noise, and reproducing in
+the *quietest* environment that can host the bug answered it in one run.
 **Honest scope:** preemption is *within* a core's own claim - nothing takes a cell from
 another core, nothing migrates a running cell, and nothing balances between the per-CPU
-queues after the claim. A **second** Linux cell on another core is not attempted
+queues after the claim. Two Linux cells are proven; *many*, and a Linux cell that forks,
+pipes or signals across cores, are not
 (the cell/capability/object tables and the Linux per-cell state are still written for
 one CPU - the audit in docs/SMP.md 10.2 is the gate). What makes the native path safe is
 that a claimed cell is still a *partitioned* cell - one core, one slot, one address
@@ -2020,7 +2032,8 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               once against 0 in the cooperative control round; then an
               **unmodified static-glibc binary as a Linux cell on a secondary**,
               exact stdout + exit asserted, overlapping a native cell on the
-              primary - docs/SMP.md 10.0), shell-smoke, hwinfo, rng, runtime,
+              primary; then **two Linux cells on two cores at once**, each
+              transcript captured separately and asserted - docs/SMP.md 10.0), shell-smoke, hwinfo, rng, runtime,
               posix, blockfs (live virtio-blk disk), elfrun (load a native
               ELF), posixrun (native program over the POSIX syscalls),
               libcrun (a program linked against rheo-libc), jsonrun (a

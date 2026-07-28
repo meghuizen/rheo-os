@@ -561,14 +561,13 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
 /// bounded by a deadline or an interrupt - but it is the first thing finer locking
 /// should remove.
 ///
-/// **What is proven and what is not.** The `smp` kernel runs a Linux cell on a
-/// secondary while a native cell runs on the primary, so this path is exercised
-/// multicore: acquired, re-entered recursively through `fill_fault`, released. It is
-/// **not** proven under *contention* - that needs two Linux cells at once, which is
-/// attempted and does not work yet for a reason that is not this lock (two Linux
-/// cells installed simultaneously fail even when run one after the other on a single
-/// core, so it is a personality-state problem, not a concurrency one). Recorded as an
-/// open finding rather than left as a passing test that proves less than it looks.
+/// **What is proven and what is not.** The `smp` kernel runs two Linux cells on two
+/// cores at the same time, each asserting its own exact transcript, so this path is
+/// exercised multicore *and* contended: acquired, re-entered recursively through
+/// `fill_fault`, waited on by the peer, released. What is **not** proven is the shapes
+/// two `chello`s do not reach - a Linux cell that forks, pipes or signals across
+/// cores touches the global registries in patterns this does not exercise. The lock is
+/// correct for them by construction (it covers the whole dispatch); it is untested.
 #[inline]
 fn plock() -> PGuard {
     if !crate::smp::multicore() {

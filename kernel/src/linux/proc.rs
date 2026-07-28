@@ -693,8 +693,12 @@ fn process_exit(cell: usize, status: u32, top_code: u64) -> Ctl {
 /// both ends), the caller returns -EAGAIN instead of blocking, matching the L3
 /// non-blocking pipe (docs/LINUX-COMPAT.md L6).
 pub fn runnable_peer_exists(cur: usize) -> bool {
-    (0..MAX_CELLS)
-        .any(|i| i != cur && user::cell_present(i) && procs()[i].state == PState::Runnable)
+    (0..MAX_CELLS).any(|i| {
+        i != cur
+            && user::cell_present(i)
+            && user::cell_on_this_cpu(i)
+            && procs()[i].state == PState::Runnable
+    })
 }
 
 /// Park `cur` on an empty pipe read; the scheduler completes the read (with
@@ -786,7 +790,11 @@ pub(crate) fn preempt_cell(cur: usize) -> Option<*mut TrapFrame> {
         }
     }
     let n = crate::sched::dispatch::pick_excluding_self(cur, MAX_CELLS, |i| {
-        user::cell_present(i) && procs()[i].state == PState::Runnable
+        // A cell belongs to one core (docs/SMP.md 10.0): without this the core that
+        // finishes first can switch *into* the cell another core is running, sharing
+        // its trap frame and kernel stack. Constant-true on every single-core boot,
+        // because nothing there claims a cell.
+        user::cell_present(i) && user::cell_on_this_cpu(i) && procs()[i].state == PState::Runnable
     })?;
     let idx = first_satisfiable_context(n).unwrap_or_else(|| thread::current_context(n));
     thread::set_current(n, idx);
@@ -821,7 +829,9 @@ fn reschedule(leaving: usize) -> Ctl {
         // run. With dispatch disabled this is the pre-migration round-robin,
         // expression for expression (docs/SUBSTRATE.md 15).
         let next = crate::sched::dispatch::pick(leaving, MAX_CELLS, |i| {
-            user::cell_present(i) && procs()[i].state == PState::Runnable
+            user::cell_present(i)
+                && user::cell_on_this_cpu(i)
+                && procs()[i].state == PState::Runnable
         });
         if let Some(n) = next {
             // Resume the context whose per-context block is satisfiable (a
