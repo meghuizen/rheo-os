@@ -1804,16 +1804,19 @@ short ones the steal is **asserted**, not hoped for (a round without it produces
 exit codes and teaches nothing): 1 rebalanced, busiest core taking 3 of 8, on all three
 ISAs.
 **Honest scope:** preemption is *within* a core's own claim and rebalancing moves only
-**unstarted** cells. Migrating a *running* one was **attempted and reverted**: the
-mechanism (a request flag read at the owner's preemption point, an `Option<Outcome>`
-unwind reason, the gaining core resuming the saved frame) worked, then faulted about two
-runs in five with a core executing a data symbol. Two fixes were tried and both were
-real-but-insufficient - publish the release after the unwind rather than inside the trap,
-and hand the cell straight to the named requester rather than clearing its owner (an
-unowned cell is one every core will pick). An intermittently faulting kernel must not
-land, so it is reverted with both findings recorded in docs/SMP.md 10.0; the next attempt
-should instrument which cores are inside the cell at the fault rather than reason about
-the protocol, which has now been wrong twice. Two Linux cells are proven; *many*, and a Linux cell that forks,
+**unstarted** cells. Migrating a *running* one was **attempted twice and reverted twice**, with four findings
+recorded in docs/SMP.md 10.0. The second attempt followed the first's own advice -
+instrument the invariant instead of reasoning about the symptom - and that is the part
+kept: **the kernel now records which cell each CPU is inside and refuses a second entry**
+(`user::double_entries`, asserted by the preemption phase, one store per cell dispatch).
+It turned the failure from downstream corruption into `cell 0 entered by CPU 0 while CPU
+1 is already inside it`, reproducibly, and exposed a real ordering hole (the request's
+cell and destination were two statics, so an owner could hand a cell to the *previous*
+request's destination). Packing them reduced the failure rate without eliminating it, so
+a fifth thing remains and the mechanism stays out: an intermittently faulting kernel must
+not land. The guard's own first version is a finding too - counted per *cell* it
+false-positives, because under preemption a batch sibling exits without re-entering
+`run_inner`; per **CPU** it names two cores or none. Two Linux cells are proven; *many*, and a Linux cell that forks,
 pipes or signals across cores, are not
 (the cell/capability/object tables and the Linux per-cell state are still written for
 one CPU - the audit in docs/SMP.md 10.2 is the gate). What makes the native path safe is

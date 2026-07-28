@@ -170,7 +170,6 @@ struct RunCell {
 /// "No CPU owns this cell." The default, and the value that preserves single-CPU
 /// behaviour exactly.
 pub const NO_CPU: usize = usize::MAX;
-
 /// One cross-cell channel end a cell holds (docs/NETSTACK.md, rheo-net N4a).
 #[derive(Copy, Clone)]
 struct ChanEnd {
@@ -1522,35 +1521,73 @@ pub fn set_personality(idx: usize, p: Personality) {
 /// which cell ended the run and how. Cross-cell switches keep running
 /// inside the trampoline; only an exit or fault unwinds back here.
 pub fn run(idx: usize) -> (usize, Outcome) {
-    let cell = cells()[idx];
-    assert!(cell.present, "run of empty cell slot {idx}");
-    unsafe {
-        *CURRENT.this_mut() = idx;
-        *TOP_CELL.this_mut() = idx;
-        (*cell.aspace).activate();
-        // Load this cell's own FP/SIMD image before its first instruction: the
-        // clean ABI-default one `fp_area_init` wrote at install for a fresh
-        // cell, or its saved image if a previous `run` left it mid-flight. A
-        // test kernel that runs several cells in sequence would otherwise hand
-        // the next one whatever the last left in the vector registers.
-        restore_native_fp(idx);
-        // The first entry into a cell does not go through either scheduler, so it is
-        // the one place a slice has to be armed explicitly (docs/SUBSTRATE.md pillar
-        // 3). Without this a boot's *first* cell would be the only one that could
-        // never be preempted - the exact shape of bug that makes a preemptive
-        // scheduler look like it works while one workload hangs.
-        crate::sched::dispatch::running(idx, 0);
-        arch::enter_user_first(cell.frame);
-    }
-    // enter_user_first returns via return_to_kernel after an exit/fault.
-    // Restore the kernel address space so setup code can again reach all
-    // of RAM (a cell root only maps that cell's user pages).
-    arch::paging_activate_kernel();
+    run_inner(idx);
     let exited = *EXITED.this();
     (
         exited,
         cells()[exited].outcome.expect("no outcome recorded"),
     )
+}
+
+/// Which cell each CPU is inside, or [`NO_CPU`] for none.
+///
+/// **Per CPU, not per cell**, and the difference is the whole point: a first attempt
+/// counted entries per cell and produced false positives, because under preemption a
+/// batch sibling exits without ever passing through `run_inner`, so the exit decrements
+/// a cell the counter never incremented. Asking "does another CPU already report this
+/// cell" is immune to that - it names two cores or it names none.
+///
+/// Checked rather than assumed because every multi-core defect on this path has
+/// presented as corruption somewhere else entirely (a core executing a data symbol, an
+/// instruction fetch at 0), which says nothing about where the second entry happened.
+/// One store per cell dispatch; nothing on a syscall path.
+static INSIDE: crate::smp::PerCpu<usize> =
+    crate::smp::PerCpu::from_array([NO_CPU; crate::smp::MAX_CPUS]);
+
+/// Cores observed inside one cell at once, and the pair that did it. Recorded rather
+/// than only panicked so the report names both.
+static DOUBLE_ENTRY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// `(count, cell, cpu)` of the most recent double entry, for a test to assert on.
+pub fn double_entries() -> u32 {
+    DOUBLE_ENTRY.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Enter cell `idx` and return when some cell's run on this CPU ends. The reason is in
+/// `cells()[EXITED].outcome`: `Some` for an exit or fault, `None` for a hand-off.
+fn run_inner(idx: usize) {
+    let cell = cells()[idx];
+    assert!(cell.present, "run of empty cell slot {idx}");
+    let me = crate::smp::cpu_index();
+    for cpu in 0..crate::smp::MAX_CPUS {
+        // SAFETY: a plain read of another CPU's slot.
+        if cpu != me && unsafe { *INSIDE.get(cpu) } == idx {
+            DOUBLE_ENTRY.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+            panic!("cell {idx} entered by CPU {me} while CPU {cpu} is already inside it");
+        }
+    }
+    // SAFETY: this CPU's own slot.
+    unsafe { *INSIDE.this_mut() = idx };
+    unsafe {
+        *CURRENT.this_mut() = idx;
+        *TOP_CELL.this_mut() = idx;
+        (*cell.aspace).activate();
+        // Load this cell's own FP/SIMD image before its first instruction: the clean
+        // ABI-default one `fp_area_init` wrote at install for a fresh cell, or its
+        // saved image if a previous `run` left it mid-flight.
+        restore_native_fp(idx);
+        // The first entry into a cell does not go through either scheduler, so it is
+        // the one place a slice has to be armed explicitly (docs/SUBSTRATE.md pillar 3).
+        crate::sched::dispatch::running(idx, 0);
+        arch::enter_user_first(cell.frame);
+    }
+    // enter_user_first returns via return_to_kernel after an exit, a fault, or a
+    // hand-off. Restore the kernel address space so setup code can again reach all of
+    // RAM (a cell root only maps that cell's user pages).
+    arch::paging_activate_kernel();
+    // This CPU is now inside no cell, whichever of its batch ended the run.
+    // SAFETY: this CPU's own slot.
+    unsafe { *INSIDE.this_mut() = NO_CPU };
 }
 
 /// Turn a Linux personality `Ctl` into the frame to resume (or a null-frame

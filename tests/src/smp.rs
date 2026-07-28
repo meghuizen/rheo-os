@@ -761,6 +761,16 @@ fn test_cross_core_preemption() {
             kernel::mm::frames::used_matches_bitmap(),
             "the frame pool's used counter drifted from its bitmap under preemption"
         );
+        // The invariant every other assertion here rests on: one cell, one core. The
+        // kernel records which cell each CPU is inside and refuses a second entry, so
+        // this is checked rather than inferred from the absence of a crash - every
+        // multi-core defect on this path has surfaced as corruption somewhere else
+        // entirely (docs/SMP.md 10.0).
+        assert_eq!(
+            user::double_entries(),
+            0,
+            "two cores were inside one cell at once"
+        );
         // Which cores actually took work, so "on every core" is measured rather than
         // assumed.
         let movers = (0..smp::MAX_CPUS)
