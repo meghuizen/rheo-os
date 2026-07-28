@@ -2,14 +2,19 @@
  * own rings (docs/ARCHITECTURE-DEBT.md 4, blocker 2).
  *
  * `mmap` is placed by a first-fit search over the per-cell VMA list, bounded to a
- * dedicated window (kernel/src/linux/mem.rs: 80..252 GiB, above every fixed region
- * - the image, stack, queue-pair, channels and ELF interpreter all sit below it).
- * The bound is what stops a long run of allocations from walking into the kernel's
- * own rings or the dynamic linker and handing a program addresses that alias them.
- * A request larger than the whole window is refused with ENOMEM rather than placed
- * past the window's end.
+ * dedicated window (kernel/src/linux/mem.rs), above every fixed region - the image,
+ * stack, queue-pair, channels and ELF interpreter all sit below it. The bound is
+ * what stops a long run of allocations from walking into the kernel's own rings or
+ * the dynamic linker and handing a program addresses that alias them. A request
+ * larger than the whole window is refused with ENOMEM rather than placed past the
+ * window's end.
  *
- * Both phases print one line from a fixed set so the transcript stays exact.
+ * The window's *size* is per-ISA (docs/SUBSTRATE.md pillar 2): it ends four GiB
+ * below the ISA's own user half, which is 256 GiB on RISC-V Sv39 but 128 TiB on
+ * x86-64 and 256 TiB on ARM64. So phase 2 below **probes** for the ceiling instead
+ * of naming it - a constant here would be right on one ISA and wrong on two.
+ *
+ * Every phase prints one line from a fixed set so the transcript stays exact.
  */
 
 #include <errno.h>
@@ -18,13 +23,12 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-/* The window is 80..252 GiB (172 GiB), so one 200 GiB request cannot fit and the
- * reservation must be refused. PROT_NONE keeps it a bare reservation - no frames
- * are touched, so this tests the *placement* bound and not the frame budget.
- * (A `MAP_NORESERVE` mapping that *does* fit the window is now demand-filled rather
- * than eagerly committed - the JSC-Gigacage path, GOAL-BUN - which is why the size
- * here must exceed the window, not merely the frame budget.) */
-#define TOO_BIG (200ULL * 1024 * 1024 * 1024)
+#define GIB (1024ULL * 1024 * 1024)
+
+/* JavaScriptCore's Gigacage: one 128 GiB PROT_NONE reservation Bun makes at startup
+ * (GOAL-BUN). It is the smallest reservation that has to fit for a real JS runtime
+ * to come up, so the probe below asserts at least this much on every ISA. */
+#define GIGACAGE (128ULL * GIB)
 
 /* The cell's queue-pair region (kernel/src/load.rs USER_QUEUE_VA). A program has
  * no business mapping here; the point is that it is refused rather than allowed to
@@ -50,19 +54,44 @@ int main(void) {
   }
   puts("mmap: small anonymous mapping usable");
 
-  /* 2. A request larger than the whole region is refused with ENOMEM - an answer
-   *    glibc acts on - instead of silently landing past the region's end. */
-  void *big = mmap(NULL, (size_t)TOO_BIG, PROT_NONE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (big != MAP_FAILED) {
-    puts("mmap: oversized reservation was accepted");
+  /* 2. The window has a ceiling, and the ceiling is the ISA's own.
+   *
+   *    Double a PROT_NONE reservation until one is refused. PROT_NONE keeps each
+   *    attempt a bare reservation - no frames are touched, so this measures the
+   *    *placement* bound and not the frame budget. Each success is unmapped again
+   *    so the next attempt sees an empty window.
+   *
+   *    Two things are asserted and one is reported. Asserted: some size is refused
+   *    (the bound is a bound), and the refusal is ENOMEM (an answer glibc acts on,
+   *    not a fault); and 128 GiB - the Gigacage - succeeds, which is the capability
+   *    a JS runtime needs and the one this used to be unable to give twice.
+   *    Reported: the largest size that fit, which is where the per-ISA ceiling
+   *    becomes visible in the transcript rather than being asserted from a constant
+   *    that would be wrong on two ISAs. */
+  unsigned long long fit = 0;
+  for (unsigned long long want = GIB; want != 0; want *= 2) {
+    void *r = mmap(NULL, (size_t)want, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1,
+                   0);
+    if (r == MAP_FAILED) {
+      if (errno != ENOMEM) {
+        puts("mmap: oversized reservation refused with the wrong errno");
+        return 1;
+      }
+      break;
+    }
+    fit = want;
+    munmap(r, (size_t)want);
+  }
+  if (fit == 0) {
+    puts("mmap: no reservation fit at all");
     return 1;
   }
-  if (errno != ENOMEM) {
-    puts("mmap: oversized reservation refused with the wrong errno");
+  if (fit < GIGACAGE) {
+    printf("mmap: largest reservation %llu GiB, below the 128 GiB Gigacage\n",
+           fit / GIB);
     return 1;
   }
-  puts("mmap: oversized reservation ENOMEM");
+  printf("mmap: reservations fit to %llu GiB, then ENOMEM\n", fit / GIB);
 
   /* 3. MAP_FIXED onto the cell's queue-pair region is refused. This is the case
    *    the bump cursor cannot protect against, because the caller chooses the

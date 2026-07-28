@@ -152,21 +152,35 @@ fn cap_errno(e: CapError) -> u32 {
 // compares - a few instructions on the syscall path, no per-call page-table
 // walk (the P1 grant check's budget, docs/ARCHITECTURE.md).
 
-/// Exclusive upper bound of a cell's low-half user VA range - the portable
-/// "below the kernel half" bound, `2^38` = 256 GiB.
+/// Exclusive upper bound of a cell's low-half user VA range - **each ISA's own**
+/// ([`arch::USER_VA_TOP`]): RISC-V Sv39 `2^38` = 256 GiB, x86-64 `2^47` = 128 TiB,
+/// ARM64 TTBR0 `2^48` = 256 TiB.
 ///
-/// Derivation: of the three ISAs, RISC-V **Sv39** has the narrowest user half -
-/// a 39-bit VA whose low (user) portion is `[0, 2^38)`, everything above being
-/// the sign-extended kernel half (docs/MEMORY.md). ARM64's TTBR0 (48-bit) and
-/// x86-64's 4-level user half (47-bit) are far larger, so `2^38` is the
-/// portable minimum and is *below* the kernel half on all three. Every VA the
-/// loader hands a cell lives far below it: image 1-4 GiB, stack 8 GiB
-/// ([`crate::load::USER_STACK_TOP`]), anon mmap 12 GiB ([`MMAP_BASE`]), queue
-/// 16 GiB ([`crate::load::USER_QUEUE_VA`]), file mmap 20 GiB
-/// ([`FILEMMAP_BASE`]), channels 24 GiB ([`crate::load::USER_CHANNEL_VA`]),
-/// grants 32 GiB ([`GRANT_BASE`]), and the Linux ELF interpreter 64 GiB
-/// ([`crate::load::LINUX_INTERP_BASE`]) - the highest, still 4x below.
-pub const USER_VA_MAX: u64 = 1 << 38;
+/// This was `2^38` on all three, because Sv39 has the narrowest user half and one
+/// portable number is simpler than three. It was also the wrong number twice over,
+/// and both ways cost something real (docs/SUBSTRATE.md pillar 2):
+///
+/// - **It held the two wide ISAs to the narrow one.** A modern runtime reserves
+///   address space by the hundred gigabyte - JavaScriptCore's Gigacage is a single
+///   128 GiB `PROT_NONE` reservation, half of the whole Sv39 half - so the Linux
+///   `mmap` window had to be squeezed into the 172 GiB left over
+///   (`linux::mem::MMAP_BASE`), and a *second* cage would not have fit at all. On
+///   x86-64 and ARM64 the hardware was never the constraint; this constant was.
+/// - **It is a property of the page-table format, so it belongs in `arch`.** Sv39
+///   is the floor *profile*, not a ceiling the other two must accept - the same
+///   distinction `arch::USER_VA_TOP` already draws for [`crate::mm::vaspace`].
+///
+/// Everything the loader places is far below even the floor: image 1-4 GiB, stack
+/// 8 GiB ([`crate::load::USER_STACK_TOP`]), anon mmap 12 GiB ([`MMAP_BASE`]), queue
+/// 16 GiB ([`crate::load::USER_QUEUE_VA`]), file mmap 20 GiB ([`FILEMMAP_BASE`]),
+/// channels 24 GiB ([`crate::load::USER_CHANNEL_VA`]), grants 32 GiB
+/// ([`GRANT_BASE`]), and the Linux ELF interpreter 64 GiB
+/// ([`crate::load::LINUX_INTERP_BASE`]) - asserted below, so the widening cannot
+/// have moved anything. What grows is only what a cell *asks* for at run time.
+pub const USER_VA_MAX: u64 = arch::USER_VA_TOP as u64;
+
+// The narrowest ISA is still the floor, so a region that fit before still fits.
+const _: () = assert!(USER_VA_MAX >= (1 << 38));
 
 // The layout above is asserted at compile time, so moving a region without
 // revisiting this bound cannot compile.
@@ -814,6 +828,16 @@ pub fn unmap_range(va: usize, len: usize) -> usize {
         let mut a = base;
         let mut n = 0;
         while a < end {
+            // Skip a span with no page table under it in one step. Without this the
+            // loop is O(range/4KiB) *regardless of what is mapped*, and a program's
+            // large reservations - JavaScriptCore's 128 GiB Gigacage, or anything
+            // sized against the now-terabyte-wide window - make that a hang rather
+            // than a slow unmap (docs/SUBSTRATE.md pillar 2).
+            let gap = aspace.unmapped_span(a);
+            if gap > 0 {
+                a = a.saturating_add(gap);
+                continue;
+            }
             // Route each frame back to the pool it came from: a `Pmem` grant's
             // frames belong to `frames_pmem`, and `frames::free` asserts on a
             // non-pool address, so getting this wrong is a kernel panic from a

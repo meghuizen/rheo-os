@@ -45,11 +45,26 @@ const MAP_NORESERVE: u64 = 0x4000;
 const MMAP_BASE: usize = 0x14_0000_0000;
 
 /// **End** of the per-cell mmap region - the first address a mapping may not reach.
-/// 252 GiB, four GiB below [`crate::user::USER_VA_MAX`] (256 GiB = RISC-V Sv39's
-/// user half, the narrowest ISA, which is what the F1 pointer bounds check
-/// against). Placement is a first-fit VMA search in `[MMAP_BASE, MMAP_END)`; past
-/// it `mmap` reports `-ENOMEM`, an answer a caller can act on.
-const MMAP_END: usize = 0x3F_0000_0000;
+/// Four GiB below [`crate::user::USER_VA_MAX`], which is now **each ISA's own** user
+/// half rather than the RISC-V Sv39 floor imposed on all three: 252 GiB on riscv64
+/// (unchanged), ~128 TiB on x86-64, ~256 TiB on ARM64. Placement is a first-fit VMA
+/// search in `[MMAP_BASE, MMAP_END)`; past it `mmap` reports `-ENOMEM`, an answer a
+/// caller can act on.
+///
+/// The 4 GiB of headroom is deliberate: the F1 pointer bounds check refuses a span
+/// that *reaches* `USER_VA_MAX`, so a mapping placed hard against it could not then
+/// be read or written through a syscall argument. Leaving the gap means every
+/// address this window hands out is one the kernel can also accept back.
+const MMAP_END: usize = crate::user::USER_VA_MAX as usize - 0x1_0000_0000;
+
+/// The window `[base, end)` a cell's anonymous `mmap` is placed in.
+///
+/// Exposed so a test can compute the oracle for "how large a reservation fits" from
+/// the same two numbers the placement uses, rather than restating them. The answer
+/// is per-ISA now, so a hardcoded one in a fixture would be wrong on two of three.
+pub fn mmap_window() -> (usize, usize) {
+    (MMAP_BASE, MMAP_END)
+}
 const _: () = assert!(MMAP_BASE < MMAP_END);
 const _: () = assert!(MMAP_END as u64 <= crate::user::USER_VA_MAX);
 // Above every fixed region, so the window and the queue/channel/interp cannot alias.

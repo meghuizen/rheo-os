@@ -1857,9 +1857,31 @@ big enough to cross the window first, and a first version of that proof passed w
 ceiling deleted and was removed rather than kept as decoration; `reserve_in` is **windowed
 rather than whole-space** because the loader's own placements (image, interpreter, stack,
 the `.user` window) are still constants and unrecorded, so a global first-fit would
-allocate straight through them - recording those is what removes the windows, and
-`USER_VA_MAX` is still the shared Sv39 floor rather than `arch::USER_VA_TOP`, so no cell
-has yet reserved past 256 GiB. Dispatch is proven for native cells and **off by default** except the
+allocate straight through them - recording those is what removes the windows.
+**And the user half is each ISA's own now**: `USER_VA_MAX` was `2^38` on all three
+because RISC-V Sv39 has the narrowest one, which is a property of the *page-table
+format* and so belongs in `arch` (Sv39 is the floor **profile**, not a ceiling the
+other two must accept) - and holding the wide ISAs to the narrow one cost something
+concrete, since JavaScriptCore's Gigacage is a single 128 GiB `PROT_NONE` reservation,
+half the whole Sv39 half, so the Linux `mmap` window had to be squeezed into the 172 GiB
+left over and a **second** cage would not have fit at all. It is `arch::USER_VA_TOP` now
+and the Linux window follows it (ending 4 GiB below, because the F1 pointer check refuses
+a span that *reaches* the ceiling): the largest reservation a cell can take goes 128 GiB
+-> **64 TiB on x86-64** (`2^47`) and **128 TiB on ARM64** (`2^48`), riscv64 keeping its
+hardware's 128 GiB. Nothing the loader places moved - every fixed region is asserted below
+the floor. `mmapx` proves it by **probing** (double a `PROT_NONE` reservation until
+`ENOMEM`, assert the Gigacage fits, report the largest that did) against a kernel-side
+oracle computed from the same two window constants, because a hardcoded size would now be
+right on one ISA and wrong on two. That surfaced a **real defect the old ceiling had been
+hiding**: `unmap_range` stepped one 4 KiB page at a time, so unmapping was O(range)
+*regardless of what was mapped* - Bun's Gigacage teardown was already 33 million
+four-level walks, and against a terabyte-wide window it became a hang (observed as the
+probe timing out on x86-64). One conservative per-ISA query fixes it,
+`arch::paging_unmapped_span(root, va)`: how many bytes from `va` are *certainly* unmapped
+because a table above the leaf level is absent, `0` when only a leaf lookup can answer -
+so the portable walker skips an empty gigapage in one step instead of 262,144, and since
+it never claims a *mapped* span, a caller that ignored it would still be correct, only
+slow. Dispatch is proven for native cells and **off by default** except the
 `linuxnode` boot -
 enabling it for the *Linux* boots is what the `linuxbun` gate needs - `metrics`
 records nothing until a boot enables it, and the per-CPU EEVDF+BORE queue still drives

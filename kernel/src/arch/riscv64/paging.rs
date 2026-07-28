@@ -318,6 +318,39 @@ pub fn paging_unmap_frame(root: &mut PagingRoot, va: usize) -> Option<usize> {
     Some(pa)
 }
 
+/// How many bytes from `va` are **certainly unmapped**, because a table above the
+/// leaf level is absent - `0` when a leaf lookup is needed to answer.
+///
+/// A range walk that steps one 4 KiB page at a time is O(range), which is fine for
+/// the mappings a program actually touches and hopeless for the ones it merely
+/// reserves. JavaScriptCore's Gigacage is a single 128 GiB `PROT_NONE` reservation
+/// (33 million pages, each a four-level walk) and the per-ISA `mmap` window is now
+/// terabytes wide, so "step every page" is not a slow path, it is a hang.
+///
+/// This lets the portable walker skip the empty gigapage or megapage in one step
+/// instead of 512 or 262,144 of them. It is deliberately conservative: it never
+/// claims a *mapped* span, only an absent one, so a caller that ignores it is still
+/// correct - just slow.
+pub fn paging_unmapped_span(root: &PagingRoot, va: usize) -> usize {
+    const GIB: usize = 1 << 30;
+    const MIB2: usize = 1 << 21;
+    let l2 = table_mut(root.l2_pa);
+    let e = l2[(va >> 30) & 0x1FF];
+    if e & PTE_V == 0 {
+        return GIB - (va & (GIB - 1));
+    }
+    // A gigapage leaf is mapped, not a gap - let the leaf walk answer.
+    if e & (PTE_R | PTE_W | PTE_X) != 0 {
+        return 0;
+    }
+    let l1 = table_mut(pte_to_table(e));
+    let e = l1[(va >> 21) & 0x1FF];
+    if e & PTE_V == 0 {
+        return MIB2 - (va & (MIB2 - 1));
+    }
+    0
+}
+
 /// Rewrite the leaf permission bits at `va`, keeping the mapped frame. A no-op
 /// if `va` is unmapped. The caller flushes the TLB by re-activating the root.
 /// Whether `va` has a **live 4 KiB leaf** in `root` - the question a demand-paging

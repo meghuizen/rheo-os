@@ -14,6 +14,7 @@ pub use paging::{
     PagingRoot, paging_activate, paging_activate_kernel, paging_cow_at, paging_cow_clear,
     paging_cow_protect_user, paging_for_each_user_leaf, paging_kernel_init, paging_map,
     paging_map_frame, paging_mapped, paging_new_root, paging_protect, paging_unmap_frame,
+    paging_unmapped_span,
 };
 pub use paging::{mmio_map_window, pmem_map_window};
 

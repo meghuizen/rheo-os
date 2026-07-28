@@ -171,6 +171,35 @@ fn leaf(root: &PagingRoot, va: usize) -> Option<(usize, usize)> {
     Some((next_table(e), l3_index(va)))
 }
 
+/// How many bytes from `va` are **certainly unmapped**, because a table above the
+/// leaf level is absent - `0` when a leaf lookup is needed to answer. See the
+/// riscv64 twin for why a page-at-a-time range walk is a hang rather than a slow
+/// path once reservations are terabytes wide.
+pub fn paging_unmapped_span(root: &PagingRoot, va: usize) -> usize {
+    const GIB512: usize = 1 << 39;
+    const GIB: usize = 1 << 30;
+    const MIB2: usize = 1 << 21;
+    let l0 = table_mut(root.l0_pa);
+    let e = l0[l0_index(va)];
+    if e & VALID == 0 {
+        return GIB512 - (va & (GIB512 - 1));
+    }
+    let l1 = table_mut(next_table(e));
+    let e = l1[l1_index(va)];
+    if e & VALID == 0 {
+        return GIB - (va & (GIB - 1));
+    }
+    if e & TABLE == 0 {
+        return 0; // a 1 GiB block is mapped, not a gap
+    }
+    let l2 = table_mut(next_table(e));
+    let e = l2[l2_index(va)];
+    if e & VALID == 0 {
+        return MIB2 - (va & (MIB2 - 1));
+    }
+    0
+}
+
 /// Clear write access on every **writable** user leaf and mark it copy-on-write,
 /// returning how many were changed - the `fork` half of COW
 /// (docs/ARCHITECTURE-DEBT.md 4.0, blocker 2). See the riscv64 twin for why this is

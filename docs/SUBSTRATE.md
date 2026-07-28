@@ -272,6 +272,46 @@ a global first-fit would allocate straight through them. Recording those at load
 is what removes the windows, and it is the last step of pillar 2's address
 work.
 
+**And the user half is each ISA's own now, not the narrowest one's.**
+`USER_VA_MAX` was `2^38` on all three because RISC-V Sv39 has the smallest user
+half and one portable number is simpler than three. It was the wrong number in
+two distinct ways. It is a property of the *page-table format*, so it belongs in
+`arch` - Sv39 is the floor **profile**, not a ceiling ARM64 and x86-64 must
+accept, which is the distinction `arch::USER_VA_TOP` already drew for `VaSpace`.
+And holding the wide ISAs to the narrow one cost something concrete: a modern
+runtime reserves address space by the hundred gigabyte, JavaScriptCore's Gigacage
+being a single 128 GiB `PROT_NONE` reservation, so the Linux `mmap` window had to
+be squeezed into the 172 GiB left over and a *second* cage would not have fit at
+all. On x86-64 and ARM64 the hardware was never the constraint; the constant was.
+
+`USER_VA_MAX` is `arch::USER_VA_TOP` and the Linux `mmap` window follows it,
+ending four GiB below - headroom left deliberately, because the F1 pointer check
+refuses a span that *reaches* the ceiling, so a mapping placed hard against it
+could not be read back through a syscall argument. The largest reservation a cell
+can take goes from 128 GiB to **64 TiB on x86-64** (`2^47`) and **128 TiB on
+ARM64** (`2^48`); riscv64 keeps 128 GiB, which is its hardware. Nothing the
+loader places moved - every fixed region is asserted below the floor, so the
+widening can only have added room a cell asks for at run time.
+
+`mmapx` proves it by **probing** rather than by naming a number: it doubles a
+`PROT_NONE` reservation until one is refused, asserts the refusal is `ENOMEM` and
+that 128 GiB - the Gigacage, the capability a JS runtime needs - fits, and reports
+the largest that did. The kernel-side oracle is the largest power of two the
+window holds, computed from the same two constants placement uses. A hardcoded
+size would now be right on one ISA and wrong on two, which is the point.
+
+This surfaced a **real defect the old ceiling had been hiding**. `unmap_range`
+stepped one 4 KiB page at a time, so unmapping was O(range) *regardless of what
+was mapped* - and a reservation is exactly the case where almost nothing is.
+Bun's Gigacage teardown was already 33 million four-level walks; against a
+terabyte-wide window it stopped being a slow path and became a hang, observed
+immediately as the probe timing out on x86-64. The fix is one conservative
+per-ISA query, `arch::paging_unmapped_span(root, va)`: how many bytes from `va`
+are *certainly* unmapped because a table above the leaf level is absent, and `0`
+when only a leaf lookup can answer. The portable walker skips an empty gigapage
+in one step instead of 262,144, and because the query never claims a *mapped*
+span, a caller that ignored it would still be correct - only slow.
+
 - A **per-cell VA allocator over a real VMA structure** (possible once
   pillar 1 exists - today's "no VMA list" is a metadata-space problem)
   replaces the bump cursors and the fixed region bases. Queue, channel and
@@ -852,11 +892,14 @@ kernel.
   address up instead of inferring it from a constant range; and the four
   run-time regions - grant, file mapping, anonymous `mmap`, and the peer's
   read-only share - are placed by `reserve_in` with guard gaps and rollback,
-  retiring three bump cursors including the global one. **Not yet:** the
-  loader's own placements (image, interpreter, stack, `.user` window) are still
-  constants and unrecorded, which is why `reserve_in` is windowed rather than a
-  whole-space `reserve`; and `USER_VA_MAX` is still the shared Sv39 floor rather
-  than `arch::USER_VA_TOP`, so no cell has yet reserved past 256 GiB.
+  retiring three bump cursors including the global one. **And the ceiling is
+  per-ISA**: `USER_VA_MAX` is `arch::USER_VA_TOP`, so the largest reservation a
+  cell can take goes from 128 GiB to 64 TiB on x86-64 and 128 TiB on ARM64
+  (riscv64 keeps its Sv39 128 GiB), with `unmap_range` taught to skip an absent
+  gigapage in one step - without which a terabyte-wide reservation is a hang, not
+  a slow unmap. **Not yet:** the loader's own placements (image, interpreter,
+  stack, `.user` window) are still constants and unrecorded, which is why
+  `reserve_in` is windowed rather than a whole-space `reserve`.
 - **S3' - dispatch through `RunQueue`.** The cooperative scheduler's pick
   becomes the queue's pick; every relinquish and preemption charges the burst;
   `metrics` is enabled at boot. Then preemption, then a second core - the SMP.md

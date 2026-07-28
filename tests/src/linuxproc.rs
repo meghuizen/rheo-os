@@ -295,14 +295,37 @@ extern "C" fn kernel_main() -> ! {
     // is that an impossible request is refused with an errno the caller can act
     // on, that a caller-chosen MAP_FIXED cannot replace the kernel's own rings,
     // and that an ordinary mapping still works.
-    let want_mmap: &[u8] = b"mmap: small anonymous mapping usable\n\
-        mmap: oversized reservation ENOMEM\n\
-        mmap: MAP_FIXED over the queue region EINVAL\n\
-        wx: mmap PROT_WRITE|PROT_EXEC EPERM\n\
-        wx: RW->RX flip works, mprotect to RWX EPERM\n\
-        vma: freed span reused at the same address, and writable\n\
-        vma: partial unmap split the mapping, both ends intact, hole reused\n\
-        mmapx OK\n";
+    //
+    // The ceiling itself is **per-ISA** now (docs/SUBSTRATE.md pillar 2): the window
+    // ends four GiB below the ISA's own user half, not below the RISC-V Sv39 floor
+    // imposed on all three. So the expected line is computed from the same two
+    // numbers the placement uses rather than restated as a constant - the fixture
+    // doubles a PROT_NONE reservation until refused and reports the largest that
+    // fit, and the oracle here is the largest power of two the window can hold.
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let (wlo, whi) = kernel::linux::mem::mmap_window();
+    let span = (whi - wlo) as u64;
+    let mut fit_gib = 1u64; // the fixture starts at 1 GiB and doubles
+    while fit_gib * 2 * GIB <= span {
+        fit_gib *= 2;
+    }
+    // Every ISA must clear the 128 GiB JSC Gigacage; the two wide ones clear it by
+    // orders of magnitude, which is the whole point of the widening.
+    assert!(
+        fit_gib >= 128,
+        "mmapx: the mmap window holds only {fit_gib} GiB - below the 128 GiB Gigacage"
+    );
+    let want_mmap = alloc::format!(
+        "mmap: small anonymous mapping usable\n\
+         mmap: reservations fit to {fit_gib} GiB, then ENOMEM\n\
+         mmap: MAP_FIXED over the queue region EINVAL\n\
+         wx: mmap PROT_WRITE|PROT_EXEC EPERM\n\
+         wx: RW->RX flip works, mprotect to RWX EPERM\n\
+         vma: freed span reused at the same address, and writable\n\
+         vma: partial unmap split the mapping, both ends intact, hole reused\n\
+         mmapx OK\n"
+    );
+    let want_mmap: &[u8] = want_mmap.as_bytes();
     let (code, out) = run_capture(MMAPX, &[b"mmapx"]);
     assert!(
         out == want_mmap,
@@ -312,11 +335,12 @@ extern "C" fn kernel_main() -> ! {
     );
     assert!(code == 0, "mmapx: exit {code}, expected 0");
     println!(
-        "linuxproc: mmap bound OK - an ordinary mapping works, a request larger \
-         than the region is ENOMEM instead of running into ld.so, MAP_FIXED \
-         over the cell's queue region is EINVAL, and W^X is honest - RWX is \
-         EPERM rather than a success that silently drops EXEC, while the RW->RX \
-         flip a JIT falls back to works"
+        "linuxproc: mmap bound OK - an ordinary mapping works, reservations fit to \
+         {fit_gib} GiB - bounded by this ISA's own user half rather than by the \
+         narrowest one - and the next is ENOMEM instead of running into ld.so, \
+         MAP_FIXED over the cell's queue \
+         region is EINVAL, and W^X is honest - RWX is EPERM rather than a success \
+         that silently drops EXEC, while the RW->RX flip a JIT falls back to works"
     );
 
     // --- `sched_yield` crosses processes (docs/ARCHITECTURE-DEBT.md 4). The

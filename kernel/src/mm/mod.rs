@@ -130,6 +130,20 @@ impl AddressSpace {
         arch::paging_mapped(&self.root, va)
     }
 
+    /// How many bytes from `va` are certainly unmapped, because a table above the
+    /// leaf level is absent - `0` when only a leaf lookup can answer.
+    ///
+    /// What this is for: a range walk that steps 4 KiB at a time is O(range), which
+    /// a program's *reservations* make untenable. JavaScriptCore reserves 128 GiB in
+    /// one `PROT_NONE` mapping and the `mmap` window is terabytes wide on two of the
+    /// three ISAs, so unmapping an untouched span page by page is a hang, not a slow
+    /// path. Skipping an absent gigapage in one step turns it into a few thousand
+    /// iterations. Conservative by construction: it never reports a mapped span, so
+    /// ignoring it is still correct.
+    pub fn unmapped_span(&self, va: usize) -> usize {
+        arch::paging_unmapped_span(&self.root, va)
+    }
+
     /// Change the permission of one 4 KiB user page at `va`, keeping its
     /// frame; a no-op if `va` is unmapped. The TLB is flushed by the next
     /// `activate()`.
