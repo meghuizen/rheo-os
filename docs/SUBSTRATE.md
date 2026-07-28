@@ -222,8 +222,24 @@ the regions to the allocator so the bound is a *result* rather than a second
 hand-written number, with guard gaps and per-ISA ceilings - is what remains.
 `VaSpace::reserve` is a global first-fit, so wiring it means first recording
 the fixed placements (image, stack, queue, channel, the `.user` window) as
-reservations so new regions are allocated *around* them; that is the shape of
-the work, and it is not started.
+reservations so new regions are allocated *around* them.
+
+**Recording was tried on its own and does not stand on its own** - a finding
+worth having before the next attempt. A per-cell `VaSpace` was added, every
+region a cell is given was recorded as it was established, and `munmap` was
+changed to classify an address by *asking* the recorded layout rather than by
+which constant range it falls in (the inference this module's own header rules
+out). It worked, and it broke the `security` kernel: recording grows a funded
+table, so the first `reserve_fixed` costs the cell a frame, and that frame
+lands inside the per-operation frame-cost oracles the suite asserts on. Same
+lesson as S1' - *a funded table's one-off growth must not land inside a
+per-operation measurement* - now recurring per cell rather than globally.
+
+So recording and placing have to land **together**, with the frame cost either
+funded at a reset point (S1's answer for the mapped-file registry) or folded
+into the oracles deliberately. Recording alone buys a better classification
+and pays a frame per cell for it; that is not a trade worth making halfway.
+The attempt is reverted; the ceilings above are unaffected and stay.
 
 - A **per-cell VA allocator over a real VMA structure** (possible once
   pillar 1 exists - today's "no VMA list" is a metadata-space problem)
