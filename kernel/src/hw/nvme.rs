@@ -522,6 +522,15 @@ impl Nvme {
     ) -> Result<(), BlkError> {
         let n = blocks.len();
         debug_assert!(n <= DEPTH);
+        // **Before submitting, not after.** A core's local interrupt controller has
+        // to be able to receive the vector by the time the *command* is issued -
+        // enabling it in the verification below (which runs once the batch has
+        // already completed) races the very interrupt it is checking for, and on
+        // RISC-V, where the enable is a per-hart IMSIC file, the first completion
+        // was simply dropped. Idempotent, and skipped once verified.
+        if self.armed && !ch.irq_probed.load(Ordering::Relaxed) {
+            arch::irq_ready_this_cpu();
+        }
         let base_cid;
         let tail;
         {
@@ -646,12 +655,6 @@ impl Nvme {
         if !self.armed || ch.irq_probed.load(Ordering::Relaxed) {
             return;
         }
-        // This core's own interrupt controller has to be enabled before it will
-        // deliver anything addressed to it - the AP trampoline enables none, and a
-        // secondary that has not armed a timer has never enabled its own. Without
-        // this the MSI is correctly addressed and simply dropped, which is what
-        // `cpu 2 armed MSI-X but saw no completion interrupt` was.
-        arch::irq_ready_this_cpu();
         let before = arch::msi_irq_count();
         // The completion was already reaped by the poll above; what is being asked
         // is whether the *vector* also arrived. The kernel runs with interrupts

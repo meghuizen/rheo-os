@@ -1210,14 +1210,34 @@ pub fn exit(code: super::ExitCode) -> ! {
 }
 
 // ------------------------------------------------------ MSI-X (NVMe completions)
+//
+// **Not wired, and this is a measured result rather than an unexplored one.**
+//
+// An MSI here should be a write into the IMSIC: each hart has a 4 KiB interrupt
+// file, and a 32-bit store of an external-interrupt identity to that file makes
+// the identity pending on that hart, raising `sip.SEIP`. The destination is chosen
+// by *which hart's page* the device writes to, so a per-core queue would interrupt
+// its own core by construction - a better fit than x86-64's, where the destination
+// is a field in the address.
+//
+// It was implemented and it does not deliver under QEMU 8.2's `virt`. The evidence,
+// recorded so the next attempt starts from it rather than from scratch: with the
+// NVMe function's MSI-X table entry programmed to `0x2800_0000` (the S-mode IMSIC
+// file for hart 0) with identity 32, the entry **reads back correctly**
+// (`addr=0x28000000, data=0x20`, vector unmasked), the capability's Message Control
+// reads `0x8040_8011` - MSI-X enabled, function unmasked - and this hart's file has
+// `eidelivery=1`, `eithreshold=0`, `eie0` bit 32 set and `sie.SEIE` set. After a
+// completion, `eip0` is still **0**: the device's write never reached the IMSIC at
+// all. So the remaining question is whether QEMU routes PCIe DMA to the IMSIC's
+// address on this machine, not whether the driver programmed it right.
+//
+// Shipping the write path anyway would mean carrying device-programming code that
+// provably does nothing in the only environment that can run it, on the strength of
+// "it should work on hardware" - the untested claim this tree's standard exists to
+// refuse. `None` here is the honest answer, and the driver polls and says so.
 
 /// Where a PCIe device should write, and what, to raise a completion interrupt.
-///
-/// **`None` here**, so a caller polls and reports that it is polling rather than
-/// programming a device to write to nowhere. What is missing is not a constant but
-/// a driver: this ISA needs a IMSIC MSI target address for this hart's S-file,
-/// where x86-64's MSI is just a write to the local-APIC message region. Named in
-/// docs/SUBSTRATE.md S5 as the remaining work rather than papered over.
+/// `None` - see the note above for what was tried and measured.
 pub fn msi_target(_dest_hw_id: u32, _slot: usize) -> Option<(u64, u32)> {
     None
 }
@@ -1226,6 +1246,10 @@ pub fn msi_target(_dest_hw_id: u32, _slot: usize) -> Option<(u64, u32)> {
 pub fn msi_irq_count() -> u64 {
     0
 }
+
+/// Software-enable this core's local interrupt controller for completion vectors.
+/// Nothing to do while [`msi_target`] returns `None`.
+pub fn irq_ready_this_cpu() {}
 
 /// Let any pending interrupt be delivered, then mask again - bounded by
 /// construction, unlike [`idle_wait`]. See the x86-64 twin for why a probe of an
@@ -1240,8 +1264,3 @@ pub fn irq_window() {
         );
     }
 }
-
-/// Software-enable this core's local interrupt controller. Nothing to do here
-/// while [`msi_target`] returns `None`: the per-core enabling these ISAs need is
-/// already done where their interrupt controllers are brought up.
-pub fn irq_ready_this_cpu() {}

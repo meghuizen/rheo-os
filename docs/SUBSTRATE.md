@@ -1130,8 +1130,25 @@ kernel.
 
   Both cores are now woken by their own completion vector, asserted.
 
+  **RISC-V MSI was implemented and withdrawn**, which is worth recording because
+  the result is a measurement rather than an unexplored gap. An MSI there should
+  be a write into the IMSIC - each hart has a 4 KiB interrupt file, and storing an
+  identity to it makes that identity pending on *that hart*, so the destination is
+  chosen by which page the device writes to, a better fit for per-core queues than
+  x86-64's address field. It does not deliver under QEMU 8.2's `virt`: with the
+  table entry programmed to `0x2800_0000` identity 32, the entry **reads back
+  correctly**, Message Control reads `0x8040_8011` (MSI-X enabled, function
+  unmasked), and the hart's file has `eidelivery=1`, `eithreshold=0`, `eie0` bit 32
+  and `sie.SEIE` set - yet after a completion `eip0` is still **0**, so the write
+  never reached the IMSIC. The open question is whether QEMU routes PCIe DMA to
+  that address on this machine, not whether the driver programmed it right.
+  Shipping the path anyway would mean carrying device-programming code that
+  provably does nothing in the only environment that can run it, on the strength
+  of "it should work on hardware" - so it is `None`, the driver polls and says so,
+  and the evidence is in `arch/riscv64/mod.rs` for whoever picks it up.
+
   **Not done:** no IOMMU-contained storage *cell*, and MSI-X on the two non-x86
-  ISAs. Transfers bounce through page-aligned frames one page per command, so
+  ISAs (ARM64 needs a GICv3 ITS, which has not been attempted). Transfers bounce through page-aligned frames one page per command, so
   `PRP1` addresses every command and no PRP list is built - correct, and the
   simple form on purpose, since a PRP list buys throughput TCG cannot show.
 - **S6 - NUMA pools + core classes.** Placement proven in QEMU

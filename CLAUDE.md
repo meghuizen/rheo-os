@@ -223,8 +223,17 @@ because the vector a completion queue raises is a field in its *create* command
 (`CDW11[31:16]`) and leaving it zero sent all eight through entry 0 onto the boot
 CPU. `smp` now asserts `poll_fallbacks() == 0`, which fails by name when that field
 is reverted - a queue whose vector goes elsewhere still returns the right bytes, its
-owner just polls, so nothing else catches it. Honest: no IOMMU-contained storage
-cell, and
+owner just polls, so nothing else catches it. **RISC-V MSI was implemented and withdrawn**, and the result is a
+measurement rather than an unexplored gap: an MSI there is a write into the per-hart
+IMSIC file, and with the table entry programmed to `0x2800_0000` identity 32 the
+entry reads back correctly, Message Control reads `0x8040_8011` (enabled, unmasked)
+and the hart has `eidelivery=1`/`eie0` bit 32/`sie.SEIE` set - yet `eip0` stays **0**
+after a completion, so the device's write never reached the IMSIC. The open question
+is QEMU's PCIe-DMA routing, not the driver; shipping a write path that provably does
+nothing where it can be tested, on the strength of "it should work on hardware", is
+the untested claim this tree refuses, so it is `None` with the evidence recorded in
+`arch/riscv64/mod.rs`. Honest: no IOMMU-contained storage cell, no ARM64 MSI (a
+GICv3 ITS, not attempted), and
 transfers bounce through page-aligned frames one page per command so `PRP1`
 addresses every command and no PRP list is built.
 
