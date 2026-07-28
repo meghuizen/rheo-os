@@ -1171,8 +1171,27 @@ kernel.
   when someone returns to it - it is filling in one function against a working
   contract, from recorded evidence rather than from scratch.
 
-  **The IOMMU-containment gate was attempted and produced one observation and one
-  defect.** The gate is "an IOMMU-contained storage cell drives its own NVMe
+  **The IOMMU-containment gate is half proven, and finding out why cost two
+  defects elsewhere.** `iommu` now runs the NVMe controller behind an identity
+  domain and asserts the read succeeds - `NVMe read through the identity domain
+  OK`. Getting there uncovered two pre-existing defects, both of the kind that has
+  no symptom until a second device exists:
+
+  - **`arch::mmio_map_window` mapped every caller at the same VA.** Correct while
+    exactly one driver asks; the moment a second does, the second mapping replaces
+    the first and the first driver's stored register VA silently addresses the
+    *other device's* registers. It presented as the IOMMU's queued invalidation
+    never draining - because its register writes were going into an NVMe BAR. The
+    window is allocated per caller now, and exhaustion is refused rather than
+    wrapped onto someone else's mapping.
+  - **The VT-d queued-invalidation wait was unbounded.** `while IQH != IQT` with no
+    deadline, which is what turned the above into a 120-second boot-test timeout
+    with *no output at all* - no line naming the wait, the register or the
+    subsystem. Bounded now, with the reason printed and the failure returned
+    (docs/ENGINEERING.md 2: waits are deadlines, and a degraded path reports
+    itself). The same fix went to the root-table handshake beside it.
+
+  **The observation and the remaining defect.** The gate is "an IOMMU-contained storage cell drives its own NVMe
   queues off a live disk"; the *cell* half is DRIVERS.md D2 and is not built, but
   the containment half is testable now and is a distinct claim - NVMe DMAs from
   queues and staging buffers it allocated itself, so "this transport is

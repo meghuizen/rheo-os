@@ -32,6 +32,8 @@ use kernel::hw::smmuv3::Smmu as Iommu;
 /// skips with a reason, so there the static is unreferenced.
 #[allow(dead_code)]
 static mut BUF: [u8; 512] = [0; 512];
+/// A second buffer, so the NVMe phase's DMA target is distinct from virtio-blk's.
+static mut BUF2: [u8; 512] = [0; 512];
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
@@ -107,6 +109,52 @@ fn run_iommu(iommu_base: u64) -> ! {
     assert!(revoked.is_err(), "out-of-grant DMA should have failed");
     assert!(faulted, "IOMMU did not record an out-of-grant DMA fault");
     println!("iommu: out-of-grant DMA FAULTED and was recorded (read failed)");
+
+    // --- the same containment, over NVMe ------------------------------------
+    //
+    // docs/SUBSTRATE.md S5's gate is an *IOMMU-contained storage cell*. The cell
+    // half - a userspace driver owning the queues behind BAR grants and forwarded
+    // interrupts - is DRIVERS.md D2 and is not built. The containment half is, and
+    // it is a distinct claim from the virtio-blk phase above: NVMe DMAs from queues
+    // and staging buffers it allocated itself, so "this transport's DMA is
+    // translated" does not follow from any other device's.
+    //
+    // Deliberately the same three steps, for the same reason `nvmefs` is `blockfs`
+    // with the transport swapped - what is shown is that containment is a property
+    // of the IOMMU and not of the driver.
+    {
+        use kernel::hw::nvme;
+        // Restore translation for a clean start, then bring the controller up - its
+        // admin commands DMA, so it must be probed while DMA works.
+        iommu.restore_all();
+        iommu.take_fault();
+        match nvme::probe() {
+            None => println!("iommu: no NVMe controller attached - storage phase skipped"),
+            Some(nv) => {
+                let nbuf = unsafe { &mut *core::ptr::addr_of_mut!(BUF2) };
+                nv.read(0, nbuf)
+                    .expect("NVMe read through the identity domain");
+                assert!(
+                    !iommu.take_fault(),
+                    "unexpected fault on a granted NVMe DMA"
+                );
+                println!(
+                    "iommu: NVMe read through the identity domain OK - the storage \
+                     transport a driver cell would own is DMA-mediated too"
+                );
+                // The **revoke** half is deliberately not asserted here, and the
+                // reason is a driver defect rather than a gap in the test: revoking
+                // the domain stops the device's DMA *and* its MSI together, and this
+                // driver's completion wait halts on that MSI alone - so the read
+                // hangs instead of reaching its own deadline (see the halt in
+                // `hw/nvme.rs`). Confirmed to still hang after the two mapping
+                // defects this phase uncovered were fixed, so it is the wait and not
+                // the plumbing. Asserting it would mean asserting behaviour that does
+                // not terminate. That revocation is *recorded and blocked* is a
+                // property of the IOMMU, and is proven by the virtio-blk phase above.
+            }
+        }
+    }
 
     // Restore the identity domain and confirm a clean translating state.
     // A fresh successful read is not asserted: the deliberate fault wedges

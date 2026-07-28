@@ -472,13 +472,40 @@ pub fn pmem_map_window(base_pa: usize, len: usize) -> usize {
 /// hardware wants PAT/UC pages (lab).
 const MMIO_WINDOW_VA: usize = 0xFFFF_C080_0000_0000;
 
+/// 2 MiB pages of the window already handed out. **The window is shared, so it has
+/// to be allocated rather than reused.**
+///
+/// It used to map every request at `MMIO_WINDOW_VA`, which is correct only while
+/// exactly one driver ever asks. The moment a second does - an NVMe controller's
+/// BAR0 beside the VT-d register page - the second mapping replaces the first, and
+/// the first driver's stored register VA silently addresses the *other device's*
+/// registers. There is no fault and no log: the IOMMU's queued-invalidation writes
+/// simply went into an NVMe BAR, so `IQH` never moved and the invalidation appeared
+/// to hang. Cheap to fix, expensive to find - three wrong diagnoses before the
+/// shared constant was noticed.
+static mut MMIO_NEXT_PAGE: usize = 0;
+
+/// 2 MiB pages the window spans. One PDPT entry's worth (1 GiB), which is what a
+/// single PML4/PDPT slot pair covers here.
+const MMIO_WINDOW_PAGES: usize = 512;
+
 pub fn mmio_map_window(base_pa: usize, len: usize) -> usize {
     let aligned = base_pa & !(MIB2 - 1);
     let offset = base_pa - aligned;
     let pml4_pa = core::ptr::addr_of!(boot_page_tables) as usize;
     let npages = (offset + len).div_ceil(MIB2);
+    // SAFETY: single-threaded bring-up; drivers map their windows before cells run.
+    let first = unsafe { *core::ptr::addr_of!(MMIO_NEXT_PAGE) };
+    if first + npages > MMIO_WINDOW_PAGES {
+        // Refused rather than wrapped onto another driver's mapping.
+        crate::println!(
+            "arch: MMIO window exhausted ({first} of {MMIO_WINDOW_PAGES} 2 MiB pages used, \
+             {npages} more requested)"
+        );
+        return 0;
+    }
     for p in 0..npages {
-        let va = MMIO_WINDOW_VA + p * MIB2;
+        let va = MMIO_WINDOW_VA + (first + p) * MIB2;
         let pa = aligned + p * MIB2;
         let pml4 = table_mut(pml4_pa);
         let pdpt = table_mut(ensure_table(pml4, pml4_index(va)));
@@ -486,8 +513,10 @@ pub fn mmio_map_window(base_pa: usize, len: usize) -> usize {
         // 2 MiB supervisor page: present, writable, size, global, non-executable.
         pd[pd_index(va)] = addr_bits(pa) | P | RW | PS | G | NX;
     }
+    // SAFETY: as above.
+    unsafe { *core::ptr::addr_of_mut!(MMIO_NEXT_PAGE) = first + npages };
     paging_activate_kernel(); // flush the TLB (reload CR3)
-    MMIO_WINDOW_VA + offset
+    MMIO_WINDOW_VA + first * MIB2 + offset
 }
 
 /// Kernel VA of the **APIC register window** (docs/SMP.md). The x86 APIC

@@ -485,7 +485,11 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "-drive",
             "file=tests/fixtures/ext4.img,if=none,id=blk0,format=raw",
             "-device",
-            "virtio-blk-pci,drive=blk0,disable-legacy=on,iommu_platform=on",
+            "virtio-blk-pci,drive=blk0,disable-legacy=on,iommu_platform=on,share-rw=on",
+            "-drive",
+            "file=tests/fixtures/ext4.img,if=none,id=nvm0,format=raw,readonly=on",
+            "-device",
+            "nvme,drive=nvm0,serial=rheonvme2,share-rw=on",
         ],
         // ARM64: the SMMUv3 covers PCI, so use virtio-blk-*pci* (behind the
         // SMMU) with iommu_platform=on, mirroring the x86 VT-d proof. The

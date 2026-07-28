@@ -206,19 +206,51 @@ impl Vtd {
     }
 
     /// Submit the queued descriptors and wait for the hardware to drain them
-    /// (IQH catches up to IQT).
-    fn qi_submit(&mut self) {
+    /// (IQH catches up to IQT). Returns whether it drained.
+    ///
+    /// **Bounded by a deadline, not by hope.** This used to spin until IQH caught
+    /// up, with no way out - and it always did, on a machine with one DMA-capable
+    /// device. Attaching a second (an NVMe controller beside the virtio-blk one)
+    /// made a later invalidation never complete, and an unbounded spin turns that
+    /// into a 120-second boot-test timeout with **no output at all**: no line
+    /// saying which wait, on which register, in which subsystem. A deadline plus a
+    /// printed reason turns the same failure into one line (docs/ENGINEERING.md 2:
+    /// waits are deadlines, and a degraded path reports itself).
+    ///
+    /// The caller cannot make the hardware finish, so the answer is reported rather
+    /// than retried: an invalidation that did not drain means the translation caches
+    /// may still hold stale entries, which is exactly the sort of thing that must
+    /// not be silently assumed to have worked.
+    fn qi_submit(&mut self) -> bool {
         w64(self.reg_va, REG_IQT, (self.iq_tail as u64) << 4);
+        let deadline = crate::arch::timer_now_ns() + 1_000_000_000; // 1 s
         while (r64(self.reg_va, REG_IQH) >> 4) as usize % 256 != self.iq_tail {
+            if crate::arch::timer_now_ns() > deadline {
+                crate::println!(
+                    "iommu: queued invalidation did not drain (IQH {:#x} != IQT {:#x}) - \
+                     translation caches may hold stale entries",
+                    (r64(self.reg_va, REG_IQH) >> 4) as usize % 256,
+                    self.iq_tail
+                );
+                return false;
+            }
             core::hint::spin_loop();
         }
+        true
     }
 
     /// Program RTADDR and set the root-table pointer, waiting for RTPS.
     fn set_root_table(&mut self) {
         w64(self.reg_va, REG_RTADDR, self.root_pa as u64);
         w32(self.reg_va, REG_GCMD, GCMD_SRTP);
+        // Bounded for the same reason as `qi_submit`: a hardware handshake that
+        // does not complete must say so rather than hang the boot silently.
+        let deadline = crate::arch::timer_now_ns() + 1_000_000_000; // 1 s
         while r32(self.reg_va, REG_GSTS) & GSTS_RTPS == 0 {
+            if crate::arch::timer_now_ns() > deadline {
+                crate::println!("iommu: root-table pointer never took (GSTS.RTPS clear)");
+                return;
+            }
             core::hint::spin_loop();
         }
     }
@@ -229,7 +261,7 @@ impl Vtd {
     fn invalidate_all(&mut self) {
         self.qi_push(QI_CC_GLOBAL, 0);
         self.qi_push(QI_IOTLB_GLOBAL, 0);
-        self.qi_submit();
+        let _ = self.qi_submit();
     }
 
     /// Set TE and wait for TES: translation is now enforced for all

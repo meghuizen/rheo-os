@@ -244,10 +244,16 @@ was ever taken, so the open question is which mapping QEMU disagrees with, not
 whether the tables were published. Both withdrawals share a shape worth naming: the
 per-ISA MSI seam (`msi_target`/`msi_route`/`irq_ready_this_cpu`) is in place and the
 x86-64 implementation behind it is proven, so returning to either is filling in one
-function against a working contract from recorded evidence. **NVMe DMA is IOMMU-mediated** (observed with `intel-iommu` + an identity domain:
-the controller comes up and reads correctly through translation - a distinct claim
-from the virtio-blk proof, since NVMe DMAs from queues and staging buffers it
-allocated itself). The **revoke** half did not land, and the reason is a driver
+function against a working contract from recorded evidence. **NVMe DMA is IOMMU-mediated** (the `iommu` kernel now runs the controller behind an
+identity domain and asserts the read succeeds - a distinct claim from the virtio-blk
+proof, since NVMe DMAs from queues and staging buffers it allocated itself). Getting
+there uncovered **two pre-existing defects**, both invisible until a second device
+exists: `arch::mmio_map_window` mapped *every* caller at the same VA, so the second
+driver silently replaced the first's mapping and the IOMMU's register writes went
+into an NVMe BAR (allocated per caller now, exhaustion refused rather than wrapped);
+and the VT-d queued-invalidation wait was **unbounded** (`while IQH != IQT`, no
+deadline), which turned that into a 120-second timeout with no output at all - now
+bounded with the reason printed, as is the root-table handshake beside it. The **revoke** half did not land, and the reason is a driver
 defect worth naming: a completion wait halts, and the only thing that ends the halt
 is the completion interrupt - raised by the same device whose DMA the wait depends
 on - so revoking the domain stops both together and the loop's own 5-second deadline
