@@ -1832,7 +1832,11 @@ replacing the ring two cells talk through) and `SYS_GRANT` walked out of the ISA
 range instead of refusing. Each region is now bounded by its neighbour, on the cell's own
 path and on the peer's in `SYS_GRANT_SHARE`, and `security` proves it with the property
 that makes a refusal clean - an over-large grant is refused **and** the next ordinary
-grant still lands at the window base, so nothing was consumed. Placing the regions with
+grant still lands at the window base, so nothing was consumed. The map's internal *order*
+is a compile-time assertion now rather than a comment. Honest: the anon ceiling is
+**unproven** - it cannot be reached in one call, because the frame budget refuses any span
+big enough to cross the window first, and a first version of that proof passed with the
+ceiling deleted and was removed rather than kept as decoration. Placing the regions with
 the allocator (which exists and is proven) is the rest of S2' and is not done; dispatch is proven for native cells and **off by default** except the
 `linuxnode` boot -
 enabling it for the *Linux* boots is what the `linuxbun` gate needs - `metrics`
