@@ -2123,8 +2123,15 @@ hand-computed, *inside* the cell running on a core the launcher did not choose. 
 **cell** and not the kernel work queue the GEMM uses because attention is f32 and the
 kernel is deliberately FP-free, while a `.user`-window program's soft-float f32 emits
 out-of-line calls into kernel `.text` a cell cannot reach - a loaded ELF cell carries its
-own builtins and has neither problem. Both controls observed failing (every cell given
-the same slice; one bit flipped in the reference). Honest: FA3's own producer/consumer
+own builtins and has neither problem. **And both tile workloads run at the same instant**: the cell
+carries two jobs - attention, and a tiled int8 GEMM over its own row slice - so the
+placed queue is **mixed**, four cells doing FlashAttention over slices of one head and
+four doing a tiled `32x32` int8 GEMM, interleaved across four cores by claim, with
+*both* assembled outputs bit-identical to their single-cell references. That is what a
+separate proof per workload cannot show however many cores each uses: the f32 softmax
+path and the integer GEMM path resident on the machine together, neither disturbing the
+other's result. Three controls observed failing (every cell given the same slice; one
+bit flipped in the attention reference; one bit flipped in the GEMM reference). Honest: FA3's own producer/consumer
 overlap is still **interleaving** within a slice - the parallelism above is data
 parallelism *over* the head, and a slice runs on one core, so FA3's wall-clock win over
 FA2 needs a second execution context inside the slice and is not built; the inner loops are
@@ -2431,10 +2438,11 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               core is free, with a dry core **stealing an unstarted cell** from a
               peer's claim; then **cross-core preemption** - each core preempts
               between the cells it claimed, ~350-400 slices taken on 4 cores at
-              once against 0 in the cooperative control round; then **FlashAttention 2+3
-              across four cores at once** (8 `librheo-fa` cells each taking a slice of
-              one head's query rows, placed by claim, the assembled result bit-identical
-              to a single cell computing every row); then an
+              once against 0 in the cooperative control round; then **two tile workloads at once across
+              four cores** (one mixed queue of 8 `librheo-fa` cells - 4 computing
+              FlashAttention 2+3 over slices of one head, 4 a tiled int8 GEMM - placed by
+              claim, both assembled results bit-identical to a single cell computing
+              every row); then an
               **node-affine placement** (docs/SUBSTRATE.md pillar 6: two memory nodes with
               the CPUs split across them, the runnable set grouped by home node with one
               claim cursor per node, 7-8 of 8 cells asserted to run on a core of their
@@ -2682,9 +2690,10 @@ librheo/      the native userspace foundation library (docs/LIBRHEO.md):
               compositor demo), Phase F: librheo-orch (spawn/wait/timer proof),
               lrsh (the librheo-native shell), librheo-echo/librheo-child (native
               coreutils it spawns), librheo-embed (the embedded spine-only cell),
-              librheo-fa (FlashAttention 2+3 over one slice of a head's
-              query rows - several of these are placed across cores so one attention
-              head is computed in parallel, docs/TILES.md 13.4a),
+              librheo-fa (two tile workloads in one binary -
+              FlashAttention 2+3, or a tiled int8 GEMM, over one slice of the output
+              rows - so a mixed queue of these placed across cores computes an attention
+              head and a GEMM at the same instant, docs/TILES.md 13.4a),
               librheo-net (Phase G ARP round trip over virtio-net), librheo-netwait
               (rheo-net N2d parked receive: woken by a real frame, then by a
               deadline), librheo-gpu

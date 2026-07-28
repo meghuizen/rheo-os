@@ -569,7 +569,16 @@ struct FaParams {
     hi: u32,
     status: u32,
     rows: u32,
+    job: u32,
 }
+
+/// Workload selector, mirroring `librheo/src/bin/librheo-fa.rs`.
+const FA_JOB_ATTN: u32 = 0;
+const FA_JOB_GEMM: u32 = 1;
+/// GEMM shape and output VA, likewise mirrored.
+const FA_GM: usize = 32;
+const FA_GN: usize = 32;
+const FA_GEMM_OUT_VA: usize = 0x3_4002_0000;
 
 /// One page, aligned so it can be mapped into a cell as a frame.
 #[repr(C, align(4096))]
@@ -579,6 +588,10 @@ struct Page([u8; 4096]);
 /// cell. Kernel statics, mapped into the cells rather than allocated from the pool, so
 /// the launcher can read the result back afterwards through its own linear map.
 static mut FA_OUT: Page = Page([0; 4096]);
+/// The GEMM half's shared i32 output (`FA_GM * FA_GN` i32 = one page) and its
+/// single-cell reference.
+static mut FA_GEMM_OUT: Page = Page([0; 4096]);
+static mut FA_GEMM_REF: [i32; FA_GM * FA_GN] = [0; FA_GM * FA_GN];
 static mut FA_PARAM_PAGES: [Page; FA_CELLS] = [const { Page([0; 4096]) }; FA_CELLS];
 /// The single-cell reference, copied out between the two rounds.
 static mut FA_REF: [f32; FA_TQ * FA_D] = [0.0; FA_TQ * FA_D];
@@ -598,7 +611,7 @@ static mut FA_CAPS: CapTable = CapTable::new();
 ///
 /// # Safety
 /// Single-threaded setup on the primary, after `user::reset()`, with no cell live.
-unsafe fn fa_install(n: usize) -> [usize; FA_CELLS] {
+unsafe fn fa_install(n: usize, jobs: &[u32]) -> [usize; FA_CELLS] {
     use kernel::capability::{BUDGET_UNLIMITED, ObjectKind};
     use kernel::mm::AddressSpace;
     let mut queue = [0usize; FA_CELLS];
@@ -611,11 +624,28 @@ unsafe fn fa_install(n: usize) -> [usize; FA_CELLS] {
         // One page of shared output, cleared so a row nobody wrote is visibly zero.
         (*core::ptr::addr_of_mut!(FA_OUT)).0.fill(0);
 
+        (*core::ptr::addr_of_mut!(FA_GEMM_OUT)).0.fill(0);
         let out_pa = arch::virt_to_phys(core::ptr::addr_of!(FA_OUT) as usize);
-        let per = FA_TQ.div_ceil(n);
+        let gemm_pa = arch::virt_to_phys(core::ptr::addr_of!(FA_GEMM_OUT) as usize);
+        // Each workload's rows are split between the cells that carry it, so a mixed
+        // queue still covers both outputs exactly once.
+        let n_attn = jobs.iter().filter(|&&j| j == FA_JOB_ATTN).count().max(1);
+        let n_gemm = jobs.iter().filter(|&&j| j == FA_JOB_GEMM).count().max(1);
+        let (mut seen_attn, mut seen_gemm) = (0usize, 0usize);
         for i in 0..n {
-            let lo = (i * per).min(FA_TQ);
-            let hi = ((i + 1) * per).min(FA_TQ);
+            let job = jobs[i];
+            let (rows, k, of) = if job == FA_JOB_GEMM {
+                let k = seen_gemm;
+                seen_gemm += 1;
+                (FA_GM, k, n_gemm)
+            } else {
+                let k = seen_attn;
+                seen_attn += 1;
+                (FA_TQ, k, n_attn)
+            };
+            let per = rows.div_ceil(of);
+            let lo = (k * per).min(rows);
+            let hi = ((k + 1) * per).min(rows);
             let pp = core::ptr::addr_of_mut!(FA_PARAM_PAGES[i]);
             (*pp).0.fill(0);
             (pp as *mut FaParams).write(FaParams {
@@ -623,6 +653,7 @@ unsafe fn fa_install(n: usize) -> [usize; FA_CELLS] {
                 hi: hi as u32,
                 status: 0,
                 rows: 0,
+                job,
             });
 
             let aspace = &mut *core::ptr::addr_of_mut!(FA_ASPACE[i]);
@@ -634,6 +665,7 @@ unsafe fn fa_install(n: usize) -> [usize; FA_CELLS] {
             // The two shared regions. RW, and disjoint per cell except for the output -
             // which the cells write at disjoint offsets, so it needs no lock.
             a.map_user_frame(FA_OUT_VA, out_pa, MapPerm::UserRw);
+            a.map_user_frame(FA_GEMM_OUT_VA, gemm_pa, MapPerm::UserRw);
             a.map_user_frame(
                 FA_PARAMS_VA,
                 arch::virt_to_phys(pp as usize),
@@ -679,7 +711,7 @@ fn test_flash_attention_parallel() {
     unsafe {
         // --- Round 1: one cell, every row. The reference. -------------------
         user::reset();
-        let q1 = fa_install(1);
+        let q1 = fa_install(1, &[FA_JOB_ATTN]);
         let out = user::run(q1[0]).1;
         let p0 = &*(core::ptr::addr_of!(FA_PARAM_PAGES[0]) as *const FaParams);
         assert!(
@@ -701,9 +733,43 @@ fn test_flash_attention_parallel() {
         );
         println!("smp: FA2 single-cell reference computed ({FA_TQ} rows x {FA_D})");
 
+        // The GEMM half's reference, the same way: one cell, every row.
+        user::reset();
+        let g1 = fa_install(1, &[FA_JOB_GEMM]);
+        let gout = user::run(g1[0]).1;
+        let gp = &*(core::ptr::addr_of!(FA_PARAM_PAGES[0]) as *const FaParams);
+        assert!(
+            matches!(gout, Outcome::Exited(1)) && gp.status == 1 && gp.rows == FA_GM as u32,
+            "the single-cell GEMM reference did not complete: {gout:?}"
+        );
+        let gsrc = core::ptr::addr_of!(FA_GEMM_OUT) as *const i32;
+        let grefbuf = &mut *core::ptr::addr_of_mut!(FA_GEMM_REF);
+        for (i, r) in grefbuf.iter_mut().enumerate() {
+            *r = gsrc.add(i).read();
+        }
+        assert!(
+            grefbuf.iter().any(|&x| x != 0),
+            "the GEMM reference is entirely zero - nothing was computed"
+        );
+        println!("smp: int8 GEMM single-cell reference computed ({FA_GM}x{FA_GN})");
+
         // --- Round 2: FA_CELLS cells, placed on whichever core is free. -----
         user::reset();
-        let queue = fa_install(FA_CELLS);
+        // **A mixed queue**: half the cells compute f32 attention, half the int8 GEMM, and
+        // the placement interleaves them across cores. This is the part a separate proof
+        // per workload cannot show however many cores each uses - two unrelated tile
+        // workloads resident on the machine at the same instant, each still bit-exact.
+        let jobs = [
+            FA_JOB_ATTN,
+            FA_JOB_GEMM,
+            FA_JOB_ATTN,
+            FA_JOB_GEMM,
+            FA_JOB_ATTN,
+            FA_JOB_GEMM,
+            FA_JOB_ATTN,
+            FA_JOB_GEMM,
+        ];
+        let queue = fa_install(FA_CELLS, &jobs);
         let mut placed = [(0u64, 0usize); FA_CELLS];
         // SAFETY: every cell is installed, present, native and listed exactly once.
         let finished = smp::place_cells(&queue, &mut placed);
@@ -715,27 +781,40 @@ fn test_flash_attention_parallel() {
             return;
         }
         // Every slice ran, finished its rows, and says which slice it was.
-        let per = FA_TQ.div_ceil(FA_CELLS);
-        let mut rows_total = 0usize;
+        let n_attn = jobs.iter().filter(|&&j| j == FA_JOB_ATTN).count();
+        let n_gemm = jobs.iter().filter(|&&j| j == FA_JOB_GEMM).count();
+        let (mut attn_rows, mut gemm_rows) = (0usize, 0usize);
+        let (mut ka, mut kg) = (0usize, 0usize);
         for i in 0..FA_CELLS {
-            let lo = (i * per).min(FA_TQ);
-            let hi = ((i + 1) * per).min(FA_TQ);
+            let (rows, k, of) = if jobs[i] == FA_JOB_GEMM {
+                let k = kg;
+                kg += 1;
+                (FA_GM, k, n_gemm)
+            } else {
+                let k = ka;
+                ka += 1;
+                (FA_TQ, k, n_attn)
+            };
+            let per = rows.div_ceil(of);
+            let lo = (k * per).min(rows);
+            let hi = ((k + 1) * per).min(rows);
             let p = &*(core::ptr::addr_of!(FA_PARAM_PAGES[i]) as *const FaParams);
             assert_eq!(
                 placed[i].0,
                 (lo + 1) as u64,
-                "FA cell {i} exited {} - expected its own slice code",
+                "cell {i} exited {} - expected its own slice code",
                 placed[i].0
             );
-            assert_eq!(p.status, 1, "FA cell {i} never finished its rows");
-            assert_eq!(
-                p.rows as usize,
-                hi - lo,
-                "FA cell {i} wrote the wrong count"
-            );
-            rows_total += p.rows as usize;
+            assert_eq!(p.status, 1, "cell {i} never finished its rows");
+            assert_eq!(p.rows as usize, hi - lo, "cell {i} wrote the wrong count");
+            if jobs[i] == FA_JOB_GEMM {
+                gemm_rows += p.rows as usize;
+            } else {
+                attn_rows += p.rows as usize;
+            }
         }
-        assert_eq!(rows_total, FA_TQ, "the slices do not cover every query row");
+        assert_eq!(attn_rows, FA_TQ, "the slices do not cover every query row");
+        assert_eq!(gemm_rows, FA_GM, "the slices do not cover every GEMM row");
 
         // **Bit-identical**, not within a tolerance: the query-row split changes no
         // row's arithmetic, so anything else is a defect rather than rounding.
@@ -746,6 +825,16 @@ fn test_flash_attention_parallel() {
                 g.to_bits() == w.to_bits(),
                 "parallel FA2 differs from the single-cell reference at element {i}: \
                  {g:e} vs {w:e}"
+            );
+        }
+
+        // The GEMM half too, and integer so equality is unconditional.
+        let ggot = core::ptr::addr_of!(FA_GEMM_OUT) as *const i32;
+        for i in 0..FA_GM * FA_GN {
+            assert_eq!(
+                ggot.add(i).read(),
+                grefbuf[i],
+                "parallel int8 GEMM differs from the single-cell reference at element {i}"
             );
         }
 
@@ -766,16 +855,17 @@ fn test_flash_attention_parallel() {
              serially"
         );
         println!(
-            "smp: FLASHATTENTION 2 COMPUTED ACROSS {movers} OF {cores} CORES AT ONCE - \
-             {FA_CELLS} loaded librheo cells each took a slice of the {FA_TQ} query rows \
-             (claimed, not assigned), every slice reported its own rows, and the \
-             assembled {FA_TQ}x{FA_D} result is **bit-identical** to one cell computing \
-             every row"
+            "smp: TWO TILE WORKLOADS AT ONCE ACROSS {movers} OF {cores} CORES - \
+             {FA_CELLS} loaded librheo cells in one mixed queue, {n_attn} computing \
+             FlashAttention 2+3 over slices of a {FA_TQ}x{FA_D} head and {n_gemm} \
+             computing a tiled int8 {FA_GM}x{FA_GN} GEMM (claimed, not assigned); every \
+             slice reported its own rows, and **both** assembled results are \
+             bit-identical to one cell computing every row"
         );
         for c in 0..smp::MAX_CPUS {
             let n = smp::cells_taken(c);
             if n > 0 {
-                println!("smp:   CPU {c} ran {n} FA slice(s)");
+                println!("smp:   CPU {c} ran {n} tile slice(s)");
             }
         }
         user::reset();

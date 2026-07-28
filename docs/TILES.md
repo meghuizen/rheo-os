@@ -610,8 +610,18 @@ are compiled into the kernel crate, and soft-float f32 emits out-of-line calls i
 kernel `.text` that a cell has no mapping for. A loaded ELF cell carries its own
 builtins and has neither problem, which is why the parallel unit is a cell.
 
-Both controls observed failing: giving every cell the same slice, and flipping one bit
-of the reference (caught at element 512, `3.4976618e0` vs `3.4976616e0`).
+**And both tile workloads run at the same instant.** `librheo-fa` carries two jobs -
+attention, and a tiled int8 GEMM over its own row slice - selected per cell, so the
+placed queue is **mixed**: four cells computing FlashAttention over slices of one head
+and four computing a tiled `32x32` int8 GEMM, interleaved across four cores by claim.
+Both assembled outputs are asserted bit-identical to their single-cell references. That
+is the thing a separate proof per workload cannot show however many cores each uses -
+two unrelated tile programs resident on the machine together, the f32 softmax path and
+the integer GEMM path, neither disturbing the other's result.
+
+Three controls observed failing: giving every cell the same slice, flipping one bit of
+the attention reference (caught at element 512, `3.4976618e0` vs `3.4976616e0`), and
+flipping one bit of the GEMM reference.
 
 ### 13.5 Honest scope
 

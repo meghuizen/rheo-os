@@ -65,7 +65,7 @@ const OUT_VA: usize = 0x3_4001_0000;
 /// What the launcher writes at [`PARAMS_VA`] and reads back after the run.
 #[repr(C)]
 struct Params {
-    /// First query row this cell owns.
+    /// First output row this cell owns.
     lo: u32,
     /// One past the last.
     hi: u32,
@@ -75,7 +75,24 @@ struct Params {
     status: u32,
     /// Rows this cell actually wrote, so a slice that silently did nothing is visible.
     rows: u32,
+    /// Which workload: [`JOB_ATTN`] or [`JOB_GEMM`].
+    ///
+    /// One binary, two tile workloads, so a **mixed** queue of these cells has cores
+    /// running f32 attention and int8 GEMM at the same instant - which is the thing a
+    /// separate proof per workload cannot show, however many cores each uses.
+    job: u32,
 }
+
+/// FlashAttention 2 + 3 over the query rows `[lo, hi)`.
+const JOB_ATTN: u32 = 0;
+/// A tiled int8 -> i32 GEMM over the output rows `[lo, hi)`.
+const JOB_GEMM: u32 = 1;
+
+/// GEMM shape, and its own output page.
+const GM: usize = 32;
+const GN: usize = 32;
+const GK: usize = 32;
+const GEMM_OUT_VA: usize = 0x3_4002_0000;
 
 /// Deterministic Q/K/V, identical in every cell. Integer-derived and then scaled, so
 /// there is no accumulation of rounding differences between cells - each derives the
@@ -93,13 +110,74 @@ fn fill(buf: &mut [f32], salt: u32) {
     }
 }
 
+/// Deterministic int8 operands for the GEMM, index-derived so every cell agrees.
+fn fill_i8(buf: &mut [i8], salt: u32) {
+    for (i, x) in buf.iter_mut().enumerate() {
+        let h = (i as u32)
+            .wrapping_mul(2_246_822_519)
+            .wrapping_add(salt.wrapping_mul(31));
+        *x = ((h >> 17) & 0x7F) as i8 - 64;
+    }
+}
+
+/// The GEMM half: output rows `[lo, hi)` of a tiled int8 -> i32 product, written to the
+/// shared i32 page. The same `tile::kernels::gemm_i8_i32` the kernel's own work queue
+/// runs, called here from a cell instead.
+fn gemm_slice(lo: usize, hi: usize) -> i32 {
+    let mut a = alloc::vec![0i8; GM * GK];
+    let mut b = alloc::vec![0i8; GK * GN];
+    fill_i8(&mut a, 5);
+    fill_i8(&mut b, 7);
+    let mut c = alloc::vec![0i32; (hi - lo) * GN];
+    // SAFETY: `a`/`b` cover the full operands, `c` covers exactly `(hi - lo) * GN`
+    // elements, and the pointers are advanced only inside those bounds.
+    unsafe {
+        librheo::tile::kernels::gemm_i8_i32(
+            a.as_ptr().add(lo * GK),
+            GK,
+            b.as_ptr(),
+            GN,
+            c.as_mut_ptr(),
+            GN,
+            hi - lo,
+            GN,
+            GK,
+        );
+        // Only this cell's rows, disjoint from every peer's - no lock.
+        let dst = GEMM_OUT_VA as *mut i32;
+        for (n, val) in c.iter().enumerate() {
+            dst.add(lo * GN + n).write(*val);
+        }
+    }
+    0
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn main() -> i32 {
     // SAFETY: the launcher mapped a writable, `Params`-aligned page at `PARAMS_VA` and
-    // `TQ * D` f32s at `OUT_VA` before this cell was entered.
+    // the output pages before this cell was entered.
     let p = PARAMS_VA as *mut Params;
-    let (lo, hi) = unsafe { ((*p).lo as usize, (*p).hi as usize) };
-    if hi > TQ || lo > hi {
+    let (lo, hi, job) = unsafe { ((*p).lo as usize, (*p).hi as usize, (*p).job) };
+    if lo > hi {
+        return 2;
+    }
+
+    if job == JOB_GEMM {
+        if hi > GM {
+            return 2;
+        }
+        let rc = gemm_slice(lo, hi);
+        if rc != 0 {
+            return rc;
+        }
+        // SAFETY: the launcher's writable params page.
+        unsafe {
+            (*p).rows = (hi - lo) as u32;
+            (*p).status = 1;
+        }
+        return (lo + 1) as i32;
+    }
+    if job != JOB_ATTN || hi > TQ {
         return 2;
     }
 
