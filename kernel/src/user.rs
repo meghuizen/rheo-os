@@ -30,6 +30,26 @@ use crate::sched::{Admission, AdmitError, Reservation};
 /// Base VA of the per-cell anonymous mmap region (docs/USERLAND.md M2): 12 GiB,
 /// above the image (1-4 GiB) and stack (8 GiB), free in every cell root.
 const MMAP_BASE: usize = 0x3_0000_0000;
+/// Exclusive top of the anonymous-`mmap` window - **the queue region's base**.
+///
+/// The same unbounded-cursor defect as the file-mmap window, and worse in one respect:
+/// this cursor is **global**, not per cell, so the 4 GiB between the window and the
+/// queue ring at 16 GiB is consumed by every cell in the boot together. Past it the
+/// next anonymous mapping would be placed on top of a cell's own queue-pair ring - the
+/// one the kernel still holds a raw `QueuePair` overlay onto (docs/SUBSTRATE.md pillar
+/// 2). Bounded here; placing the regions with the allocator is the rest of S2'.
+///
+/// **Unproven, and deliberately said so.** Unlike the grant ceiling, this one has no
+/// direct test, because it cannot be reached in a single call: an anonymous mapping is
+/// frame-backed, so any span large enough to cross the 4 GiB window is refused first by
+/// the per-cell frame budget (`MAX_FRAMES_PER_CELL`, 384 MiB), and a span large enough
+/// to overflow the arithmetic is refused before that. Reaching it needs ~4 GiB of
+/// *successful* mappings accumulated across several cells - which is precisely the
+/// hazard of the cursor being global rather than per cell, and precisely what the
+/// allocator removes. A first version of the proof asserted a refusal that the existing
+/// overflow check was already producing, i.e. it passed with this ceiling deleted; it
+/// was removed rather than kept as decoration (docs/ENGINEERING.md 1).
+const MMAP_TOP: usize = crate::load::USER_QUEUE_VA;
 static mut MMAP_NEXT: usize = MMAP_BASE;
 
 // Errno values the capability verbs report. Small local constants rather than a
@@ -99,6 +119,35 @@ const _: () = assert!((crate::load::USER_CHANNEL_VA as u64) < USER_VA_MAX);
 const _: () = assert!((FILEMMAP_BASE as u64) < USER_VA_MAX);
 const _: () = assert!((crate::load::USER_QUEUE_VA as u64) < USER_VA_MAX);
 const _: () = assert!((MMAP_BASE as u64) < USER_VA_MAX);
+
+// ...and so is the layout's **internal order**, which was previously only a comment.
+//
+// Every growing region now ends where the next one begins, and each of those bounds is
+// a second hand-written number that has to agree with the first. Writing the agreement
+// down as an assertion is what turns "these constants happen to be ordered" into
+// something a change cannot quietly break: move a base without moving the ceiling that
+// names it and the kernel does not compile. That is the part of S2' available without
+// the allocator; with it, the ordering is a *result* and none of this is needed
+// (docs/SUBSTRATE.md pillar 2).
+const _: () = assert!(crate::load::USER_STACK_TOP < MMAP_BASE);
+const _: () = assert!(MMAP_BASE < MMAP_TOP);
+const _: () = assert!(MMAP_TOP == crate::load::USER_QUEUE_VA);
+const _: () = assert!(crate::load::USER_QUEUE_VA < FILEMMAP_BASE);
+const _: () = assert!(FILEMMAP_BASE < FILEMMAP_TOP);
+const _: () = assert!(FILEMMAP_TOP == crate::load::USER_CHANNEL_VA);
+// The channel window holds every slot a cell can own, and must end below the grants.
+const _: () = assert!(
+    crate::load::USER_CHANNEL_VA + MAX_CELL_CHANNELS * crate::queue::QueuePair::REGION_SIZE
+        <= GRANT_BASE
+);
+const _: () = assert!(GRANT_BASE < GRANT_TOP);
+// Grants run to the top of the user range. The Linux ELF interpreter's base sits inside
+// that span, and does not conflict: a cell has one personality, and a `Personality::
+// Linux` cell has no typed grants while a native cell has no interpreter. Stated rather
+// than asserted, because the assertion that looks right here - that they are disjoint -
+// would be false and would only be satisfiable by capping native grants for a region
+// they can never meet.
+const _: () = assert!(GRANT_TOP == USER_VA_MAX as usize);
 
 /// The cell-memory accessors live in [`crate::uaccess`] now - the single seam every
 /// lazy-mapping feature has to teach, rather than ~98 sites (see that module's header).
@@ -902,6 +951,10 @@ fn mmap_anon(cur: usize, len: usize) -> usize {
     else {
         return 0;
     };
+    // Refuse rather than grow into the queue region above (see [`MMAP_TOP`]).
+    if top > MMAP_TOP {
+        return 0;
+    }
     if !user_write_ok(base as u64, top - base) || !charge_frames(cur, pages) {
         return 0;
     }

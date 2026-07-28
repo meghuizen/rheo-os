@@ -187,6 +187,10 @@ with nothing above them. Two consequences, both real:
 - `SYS_GRANT` reserves pure address space, so asking for terabytes is cheap
   and legitimate - and walked the cursor out of the ISA's user range, which
   surfaces as a fault at some unrelated address instead of a refusal.
+- The anonymous-`mmap` cursor is **global**, not per cell, so the 4 GiB
+  between its base and the queue ring at 16 GiB is consumed by every cell in
+  a boot together; past it a mapping lands on a cell's own queue-pair region,
+  which the kernel still holds a raw `QueuePair` overlay onto.
 
 Each region is now bounded by its neighbour and refuses rather than
 overruns, on the cell's own path and on the peer's in `SYS_GRANT_SHARE`. The
@@ -196,9 +200,30 @@ that follows still lands at the window base, so the refused request did not
 advance the cursor past address space it never got. Observed failing with
 the ceiling removed.
 
+The map's **internal order** is now a compile-time property too, where it was
+a comment: every growing region is asserted to end where the next begins, so
+moving a base without moving the ceiling that names it does not compile.
+
+Two honesty notes. The grant ceiling is *proven*; the anonymous-`mmap` one is
+**not**, and cannot be by a single call - an anonymous mapping is frame-backed,
+so any span large enough to cross its window is refused first by the per-cell
+frame budget, and a span large enough to overflow the arithmetic is refused
+before that. Reaching it needs gigabytes of *successful* mappings accumulated
+across cells, which is exactly the hazard of a global cursor. A first version
+of that proof asserted a refusal the existing overflow check was already
+producing - it passed with the ceiling deleted - and was removed rather than
+kept as decoration. And grants run to the top of the user range, which spans
+the Linux interpreter's base: not a conflict, because a cell has one
+personality and a Linux cell has no typed grants, but stated rather than
+asserted, since the assertion that looks right there would be false.
+
 This is the part of S2' that can be stated as a constant. The rest - giving
 the regions to the allocator so the bound is a *result* rather than a second
 hand-written number, with guard gaps and per-ISA ceilings - is what remains.
+`VaSpace::reserve` is a global first-fit, so wiring it means first recording
+the fixed placements (image, stack, queue, channel, the `.user` window) as
+reservations so new regions are allocated *around* them; that is the shape of
+the work, and it is not started.
 
 - A **per-cell VA allocator over a real VMA structure** (possible once
   pillar 1 exists - today's "no VMA list" is a metadata-space problem)
