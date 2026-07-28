@@ -273,6 +273,31 @@ pub fn contend_pmem() {
     }
 }
 
+/// A separate rendezvous for the admission-ledger contention phase.
+static RESV_READY: AtomicUsize = AtomicUsize::new(0);
+
+/// Both cores concurrently admit and release a reservation against the **system-wide
+/// admission ledger** (docs/SMP.md 10.2, task #132). The ledger is a truly-global
+/// static every cell's admission is charged to, so a second core races its
+/// `committed_ppm` read-modify-write regardless of scheduling. `sched::system_*` now
+/// serialise that behind the same `SpinLock`; this hammers it. Each admit is a tiny
+/// 0.1%-utilisation reservation (1 tick in 1000), immediately released, so the loop
+/// is net-zero and the ledger returns to its baseline - which the primary asserts
+/// afterward (the test oracle), the same balance witness the frame pools use.
+pub fn contend_reservations() {
+    RESV_READY.fetch_add(1, Ordering::AcqRel);
+    let mut budget = WAIT_BUDGET;
+    while RESV_READY.load(Ordering::Acquire) < 2 && budget > 0 {
+        core::hint::spin_loop();
+        budget -= 1;
+    }
+    for _ in 0..FRAME_CONTENTION_ITERS {
+        if let Ok(r) = crate::sched::system_admit(1, 1000, 1000) {
+            crate::sched::system_release(&r);
+        }
+    }
+}
+
 /// The next free registry index to hand a secondary. The boot CPU is index 0
 /// ([`init`]); secondaries take 1, 2, ... as they come up. This keeps the
 /// registry index independent of the hardware CPU id (the boot hart id may be
@@ -316,6 +341,8 @@ pub fn secondary_run(hw_id: u32) {
         // The persistent-memory allocator too, where an nvdimm exists (a no-op
         // otherwise). Same window, same reason.
         contend_pmem();
+        // And the system-wide admission ledger, the other truly-global static.
+        contend_reservations();
     }
     SECONDARY_UP.fetch_add(1, Ordering::Release);
 }
@@ -415,6 +442,7 @@ pub fn bring_up_nth(ordinal: usize) -> Result<usize, StartError> {
                 contend();
                 contend_frames();
                 contend_pmem();
+                contend_reservations();
             }
             let mut budget = WAIT_BUDGET;
             while budget > 0 {

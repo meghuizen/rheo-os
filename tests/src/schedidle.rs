@@ -390,14 +390,12 @@ extern "C" fn kernel_main() -> ! {
     sched::reset_system();
     let mut cell_a = Admission::new();
     let mut cell_b = Admission::new();
-    let a_sys = sched::system()
-        .admit(9, 10, 10)
-        .expect("first 90% must be admitted");
+    let a_sys = sched::system_admit(9, 10, 10).expect("first 90% must be admitted");
     let a_own = cell_a
         .admit(9, 10, 10)
         .expect("cell A's own controller admits it");
     assert_eq!(a_sys.util_ppm(), 900_000, "90% of a period is 900,000 ppm");
-    assert_eq!(sched::system().committed_ppm(), 900_000);
+    assert_eq!(sched::system_committed_ppm(), 900_000);
     // Cell B's own controller accepts - it knows nothing of cell A. The machine's
     // does not. That gap *was* the defect.
     assert!(
@@ -407,23 +405,23 @@ extern "C" fn kernel_main() -> ! {
     );
     assert!(
         matches!(
-            sched::system().admit(9, 10, 10),
+            sched::system_admit(9, 10, 10),
             Err(sched::AdmitError::Overcommit)
         ),
         "the system ledger must refuse a second 90% (it committed {} ppm)",
-        sched::system().committed_ppm()
+        sched::system_committed_ppm()
     );
     assert_eq!(
-        sched::system().committed_ppm(),
+        sched::system_committed_ppm(),
         900_000,
         "a refused admission must leave the ledger unchanged"
     );
     // And a release gives the capacity back, so the ledger does not leak.
     cell_a.release(&a_own);
-    sched::system().release(&a_sys);
-    assert_eq!(sched::system().committed_ppm(), 0);
+    sched::system_release(&a_sys);
+    assert_eq!(sched::system_committed_ppm(), 0);
     assert!(
-        sched::system().admit(9, 10, 10).is_ok(),
+        sched::system_admit(9, 10, 10).is_ok(),
         "released capacity must be reusable"
     );
     sched::reset_system();

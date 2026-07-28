@@ -118,22 +118,74 @@ impl Default for Admission {
 /// controller stays because it is what makes a *cell's* own set schedulable
 /// (docs/SCHEDULING.md 4) and what `SYS_RESERVE_QUERY` reports.
 ///
-/// Single CPU today (task #27). Under SMP a reservation is admitted against a
-/// *core*, so this becomes one ledger per core plus a placement decision; the shape
-/// - admit against the resource, not against the requester - is what matters here.
+/// Under SMP a reservation is admitted against a *core*, so this eventually
+/// becomes one ledger per core plus a placement decision (task #27); the shape -
+/// admit against the resource, not against the requester - is what matters here.
+///
+/// The ledger is a **truly-global** static (every cell's admission is charged
+/// here), so a second core races it independent of scheduling - the same class as
+/// the frame allocators (docs/SMP.md 10.2). It is therefore stored behind a
+/// `SpinLock` on the SMP build and reached only through the lock-guarded operations
+/// below; the old `&'static mut` accessor is gone, because handing a `&mut` to two
+/// cores is unsound. On the non-SMP build the storage is a plain `static mut` and
+/// the operations touch it directly, so that codegen is unchanged.
+#[cfg(not(feature = "smp"))]
 static mut SYSTEM: Admission = Admission::new();
+#[cfg(feature = "smp")]
+static SYSTEM: crate::smp::SpinLock<Admission> = crate::smp::SpinLock::new(Admission::new());
 
-/// The machine-wide admission ledger. Every reservation is charged here as well as
-/// to its own cell.
-pub fn system() -> &'static mut Admission {
-    // SAFETY: single CPU, synchronous traps; no concurrent access.
-    unsafe { &mut *core::ptr::addr_of_mut!(SYSTEM) }
+/// Admit a reservation against the machine-wide ledger (charged in addition to the
+/// caller's own per-cell controller). Atomic: the check and the commit happen under
+/// the lock on SMP, so two cores cannot both slip past a nearly-full ledger.
+pub fn system_admit(budget: u64, period: u64, deadline: u64) -> Result<Reservation, AdmitError> {
+    #[cfg(not(feature = "smp"))]
+    {
+        // SAFETY: single CPU, synchronous traps; no concurrent access.
+        unsafe { (*core::ptr::addr_of_mut!(SYSTEM)).admit(budget, period, deadline) }
+    }
+    #[cfg(feature = "smp")]
+    {
+        SYSTEM.lock().admit(budget, period, deadline)
+    }
+}
+
+/// Release a reservation previously admitted against the machine-wide ledger.
+pub fn system_release(r: &Reservation) {
+    #[cfg(not(feature = "smp"))]
+    {
+        // SAFETY: single CPU, synchronous traps.
+        unsafe { (*core::ptr::addr_of_mut!(SYSTEM)).release(r) }
+    }
+    #[cfg(feature = "smp")]
+    {
+        SYSTEM.lock().release(r);
+    }
+}
+
+/// The machine-wide committed utilization (parts per million).
+pub fn system_committed_ppm() -> u64 {
+    #[cfg(not(feature = "smp"))]
+    {
+        // SAFETY: single CPU.
+        unsafe { (*core::ptr::addr_of!(SYSTEM)).committed_ppm() }
+    }
+    #[cfg(feature = "smp")]
+    {
+        SYSTEM.lock().committed_ppm()
+    }
 }
 
 /// Clear the system-wide ledger (called from `user::reset`, between runs).
 pub fn reset_system() {
-    // SAFETY: single CPU, between runs.
-    unsafe {
-        *core::ptr::addr_of_mut!(SYSTEM) = Admission::new();
+    #[cfg(not(feature = "smp"))]
+    {
+        // SAFETY: single CPU, between runs.
+        unsafe {
+            *core::ptr::addr_of_mut!(SYSTEM) = Admission::new();
+        }
+    }
+    #[cfg(feature = "smp")]
+    {
+        *SYSTEM.lock() = Admission::new();
     }
 }

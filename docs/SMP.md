@@ -509,6 +509,15 @@ the interrupt vector writes.
   `alloc`/`free` contention on **x86-64 q35 with an nvdimm attached to the `smp` test**
   (pool balanced at 4096 free); arm/riscv `virt` expose no nvdimm, so that phase
   skips-with-reason exactly as the `pmem` test does.
+- **The system-wide admission ledger (`sched`) is SMP-safe** (§10.2), the third
+  truly-global static. Its unsound `&'static mut` accessor (`system()`) is **removed** -
+  a `&mut` shared by two cores is UB - and the ledger is reached only through
+  lock-guarded free functions (`system_admit`/`system_release`/`system_committed_ppm`/
+  `reset_system`) holding a `#[cfg(feature = "smp")]` `SpinLock` around its
+  `committed_ppm`; the non-SMP build keeps a plain `static mut` and is unchanged.
+  Proven by a two-core concurrent admit/release phase in the `smp` test leaving the
+  ledger balanced at 0 ppm, on all three ISAs (the 2.5 over-commit proof in `schedidle`
+  and reservations in `librheocompute` stay green through the migrated API).
 - **Start-all: multiple secondaries on all three ISAs** - RISC-V four cores at once
   (boot + three secondaries, matching QEMU's `-smp 4`), ARM64 and x86-64 three each
   (boot + two), the first slice of §10.3/§10.7-step-2. Each secondary claims a distinct
@@ -611,9 +620,11 @@ or a single-owner core. The known set, from this tree:
   becomes **per-CPU**: every core has its own timer arbiter over its own local timer,
   and RX interrupts are steered to a core. This is the natural home for the per-CPU
   timer the section-9 IPI note anticipated.
-- **`idle`, `sched` (the admission ledger)** - the run queue and the system-wide
-  reservation ledger; the ledger stays global under a lock, the run queue goes
-  per-CPU (below).
+- **`sched` (the admission ledger)** - **DONE** (§9 Proven): global under a
+  `#[cfg(feature = "smp")]` `SpinLock`, reached only through lock-guarded free
+  functions (the `&'static mut` accessor removed), proven under two-core admit/release.
+- **`idle`, `sched` (the run queue)** - the per-CPU run queue the scheduler will add
+  goes per-CPU (below); this is scheduler work, not a standalone lock.
 
 The rule (docs/ENGINEERING.md 3, one owner per shared resource) is the whole design:
 each static gets exactly one owner or one lock, and the single-CPU build compiles the

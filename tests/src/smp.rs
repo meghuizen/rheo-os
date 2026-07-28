@@ -197,6 +197,25 @@ fn test_secondary_bringup() {
                 );
             }
 
+            // The system-wide admission ledger, the third truly-global static made
+            // SMP-safe (task #132). Both cores ran net-zero admit+release cycles
+            // against it concurrently through the lock-guarded `sched::system_*`
+            // path (the old `&'static mut` accessor is gone - handing a `&mut` to
+            // two cores was unsound). The oracle is that the ledger is back at zero
+            // committed: every admit matched by exactly one release, no committed
+            // utilization lost or stranded.
+            let committed = kernel::sched::system_committed_ppm();
+            assert_eq!(
+                committed, 0,
+                "admission ledger not balanced after concurrent admit/release \
+                 ({committed} ppm still committed)"
+            );
+            println!(
+                "smp: two-core admission-ledger contention OK - {} admit+release cycles \
+                 from each of 2 cores, ledger balanced at 0 ppm committed",
+                smp::FRAME_CONTENTION_ITERS
+            );
+
             // Start-all: bring up any *additional* secondaries this ISA supports
             // (docs/SMP.md 10). Sequential - each is fully online before the next
             // is released - so the per-CPU stack hand-off has no race. Each extra

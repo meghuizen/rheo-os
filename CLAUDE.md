@@ -1555,10 +1555,14 @@ test's pool-balanced + `used_matches_bitmap` oracle), the non-SMP build byte-unc
 The persistent-memory pool (`mm::frames_pmem`) is made safe the same way (same gated
 `SpinLock` + a double-free assertion in its `free` it had lacked), proven under two-core
 contention on x86-64 with an nvdimm attached to the `smp` test; arm/riscv skip that
-phase with a reason (no nvdimm), as the `pmem` test does.
+phase with a reason (no nvdimm), as the `pmem` test does. The **system-wide admission
+ledger** (`sched`) is the third truly-global static made safe: its unsound
+`&'static mut` accessor is removed and the ledger is reached only through lock-guarded
+free functions (`system_admit`/`system_release`/`system_committed_ppm`), proven by a
+two-core concurrent admit/release phase leaving it balanced at 0 ppm on all three ISAs.
 Still deferred: the **rest** of the shared `static mut` state made SMP-safe (page
 tables, capability/cell tables, the Linux per-cell state, ktimer/net_rx/input,
-idle/sched - docs/SMP.md 10.2; then preemptive scheduling itself), a
+the run queue - docs/SMP.md 10.2; then preemptive scheduling itself), a
 per-CPU register instead of the small id->index table, ARM64 CPU *enumeration* (probing
 `PSCI_AFFINITY_INFO`), cross-CPU IPIs beyond bring-up, and the **x86-64 NIC RX
 interrupt** - the last interrupt source any ISA lacks, now known to need ordinary driver
