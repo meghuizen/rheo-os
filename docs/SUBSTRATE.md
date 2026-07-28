@@ -1171,8 +1171,29 @@ kernel.
   when someone returns to it - it is filling in one function against a working
   contract, from recorded evidence rather than from scratch.
 
-  **Not done:** no IOMMU-contained storage *cell*, and MSI on the two non-x86
-  ISAs. Transfers bounce through page-aligned frames one page per command, so
+  **The IOMMU-containment gate was attempted and produced one observation and one
+  defect.** The gate is "an IOMMU-contained storage cell drives its own NVMe
+  queues off a live disk"; the *cell* half is DRIVERS.md D2 and is not built, but
+  the containment half is testable now and is a distinct claim - NVMe DMAs from
+  queues and staging buffers it allocated itself, so "this transport is
+  translated" does not follow from the virtio-blk proof. Observed: with an
+  `intel-iommu` and an identity domain, the controller comes up and reads
+  correctly - `NVMe read through the identity domain OK (DMA mediated)`.
+
+  The revoke half did not land, and the reason is a defect in the *driver*: a
+  completion wait halts, and the only thing that ends the halt is the completion
+  interrupt - raised by the same device whose DMA the wait depends on. Revoking
+  the domain stops both together, so the halt has no wake source and the loop's
+  own 5-second deadline is never reached: the failure is a **hang rather than a
+  timeout**. An arbiter-backed backstop deadline is the shape of the fix (`ktimer`
+  exists for exactly this, and a `Storage` slot is the natural home), and a first
+  attempt did not work - `ktimer::park`'s `other_source` argument permits a halt on
+  the device alone, which reintroduces it. Named in `hw/nvme.rs` at the halt rather
+  than shipped half-verified, and the phase is not in the suite, because a test
+  that times out must not land.
+
+  **Not done:** the IOMMU-contained storage *cell*, the completion-halt backstop
+  above, and MSI on the two non-x86 ISAs. Transfers bounce through page-aligned frames one page per command, so
   `PRP1` addresses every command and no PRP list is built - correct, and the
   simple form on purpose, since a PRP list buys throughput TCG cannot show.
 - **S6 - NUMA pools + core classes.** Placement proven in QEMU

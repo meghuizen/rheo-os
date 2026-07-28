@@ -633,6 +633,20 @@ impl Nvme {
             // the spin is kept and **counted separately**, so a degraded wait is
             // reported rather than inferred away.
             if ch.irq.load(Ordering::Relaxed) {
+                // **A known gap, stated where it matters.** The only thing that
+                // ends this halt is the completion interrupt, and that interrupt is
+                // raised by the same device whose DMA the wait depends on - so
+                // anything that stops both (a wedged controller, or its IOMMU
+                // domain being revoked) leaves the halt with no wake source, and
+                // the loop's own deadline check above is never reached. The failure
+                // is then a hang rather than a timeout.
+                //
+                // Measured, not theorised: the `iommu` kernel revokes the domain
+                // deliberately, and a read after it hangs instead of failing. An
+                // arbiter-backed backstop deadline is the shape of the fix
+                // (`ktimer` exists for exactly this) and a first attempt did not
+                // work, so it is named here rather than shipped half-verified -
+                // docs/SUBSTRATE.md S5.
                 IRQ_PARKS.fetch_add(1, Ordering::Relaxed);
                 arch::idle_wait();
             } else {

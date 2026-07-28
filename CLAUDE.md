@@ -244,8 +244,19 @@ was ever taken, so the open question is which mapping QEMU disagrees with, not
 whether the tables were published. Both withdrawals share a shape worth naming: the
 per-ISA MSI seam (`msi_target`/`msi_route`/`irq_ready_this_cpu`) is in place and the
 x86-64 implementation behind it is proven, so returning to either is filling in one
-function against a working contract from recorded evidence. Honest: no
-IOMMU-contained storage cell, no ARM64 or RISC-V MSI, and
+function against a working contract from recorded evidence. **NVMe DMA is IOMMU-mediated** (observed with `intel-iommu` + an identity domain:
+the controller comes up and reads correctly through translation - a distinct claim
+from the virtio-blk proof, since NVMe DMAs from queues and staging buffers it
+allocated itself). The **revoke** half did not land, and the reason is a driver
+defect worth naming: a completion wait halts, and the only thing that ends the halt
+is the completion interrupt - raised by the same device whose DMA the wait depends
+on - so revoking the domain stops both together and the loop's own 5-second deadline
+is never reached: a **hang rather than a timeout**. An arbiter-backed backstop
+deadline is the shape of the fix (`ktimer`, a `Storage` slot) and a first attempt did
+not work, so it is named at the halt in `hw/nvme.rs` rather than shipped
+half-verified, and the phase is not in the suite because a test that times out must
+not land. Honest: no IOMMU-contained storage cell, no completion-halt backstop, no
+ARM64 or RISC-V MSI, and
 transfers bounce through page-aligned frames one page per command so `PRP1`
 addresses every command and no PRP list is built.
 
