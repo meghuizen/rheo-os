@@ -583,18 +583,7 @@ pub fn enable_timer_irq_this_cpu() {
     // interrupt, no preemption, and no error to say why (docs/SMP.md 10.0). The
     // *discovery* of which access mode works stays global - it is a property of the
     // machine - so only the enabling is repeated here.
-    // SAFETY: kernel context; `IA32_APIC_BASE` is architectural on every x86-64.
-    unsafe {
-        let base = paging_rdmsr(MSR_APIC_BASE) | APIC_BASE_EN;
-        let base = if mode == ApicMode::X2Apic {
-            base | APIC_BASE_EXTD
-        } else {
-            base
-        };
-        paging_wrmsr(MSR_APIC_BASE, base);
-    }
-    lapic_write(LAPIC_TPR, 0); // accept interrupts of every priority
-    lapic_write(LAPIC_SVR, 0x100 | VEC_SPURIOUS as u32); // software-enable + vector
+    irq_ready_this_cpu();
     // Divide config = 1 (bits: 0b1011 -> divide by 1).
     lapic_write(LAPIC_TDCR, 0b1011);
     // LVT timer: vector 0x20, one-shot (bits 17-18 = 0), unmasked.
@@ -927,6 +916,35 @@ pub fn msi_target(dest_hw_id: u32, slot: usize) -> Option<(u64, u32)> {
     // way: with every queue's MSI aimed at the boot CPU, a secondary's reads never
     // finished (docs/SUBSTRATE.md S5).
     Some((0xFEE0_0000 | ((dest_hw_id as u64) << 12), vector as u32))
+}
+
+/// Software-enable **this core's** local interrupt controller, so it will deliver
+/// anything addressed to it. Idempotent, and touches nothing but the enable.
+///
+/// Split out of [`enable_timer_irq_this_cpu`] rather than reusing it, because that
+/// also writes `TMICT = 0` - which **disarms whatever deadline the timer arbiter
+/// currently holds**. A driver that only needs its core able to receive an MSI
+/// must not be able to silently drop a pending deadline on the way; that is the
+/// class of defect docs/NETSTACK.md 16 (N2h) removed, and it would be reintroduced
+/// by the convenient call rather than by a wrong constant.
+pub fn irq_ready_this_cpu() {
+    if apic_mode() == ApicMode::None {
+        return;
+    }
+    // `IA32_APIC_BASE`, the task-priority register and the spurious-vector register
+    // are all per core, and the AP trampoline sets none of them.
+    // SAFETY: kernel context; `IA32_APIC_BASE` is architectural on every x86-64.
+    unsafe {
+        let base = paging_rdmsr(MSR_APIC_BASE) | APIC_BASE_EN;
+        let base = if apic_mode() == ApicMode::X2Apic {
+            base | APIC_BASE_EXTD
+        } else {
+            base
+        };
+        paging_wrmsr(MSR_APIC_BASE, base);
+    }
+    lapic_write(LAPIC_TPR, 0); // accept interrupts of every priority
+    lapic_write(LAPIC_SVR, 0x100 | VEC_SPURIOUS as u32); // software-enable + vector
 }
 
 /// Let any pending interrupt be delivered, then mask again.

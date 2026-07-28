@@ -1235,12 +1235,24 @@ fn test_nvme_per_core_queues() {
          one of them did not read what it asked for"
     );
 
+    // Each core's completions must wake **that core**. A queue whose vector is
+    // delivered elsewhere still returns the right bytes - the owner just polls
+    // instead of halting - so nothing above this catches it, and the first version
+    // of the per-queue routing had exactly that bug (every queue named vector 0).
+    let fell_back = nvme::poll_fallbacks();
+    assert_eq!(
+        fell_back, 0,
+        "smp: {fell_back} core(s) armed MSI-X and then never saw their own completion \
+         vector - the queues are not interrupting the cores that own them"
+    );
+
     println!(
         "smp: TWO CORES DROVE NVMe THROUGH THEIR OWN QUEUE PAIRS at the same time - \
          {} queue pair(s) ({online} cores online, {cpus} enumerated), {busy} took \
          work ({total} \
          submissions in total), {cross} submissions crossed a core, and each core \
-         read its own sector correctly {NVME_ROUNDS} times",
+         read its own sector correctly {NVME_ROUNDS} times, each woken by its own \
+         completion vector",
         nvme::MAX_IOQ
     );
 }

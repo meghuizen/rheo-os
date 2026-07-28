@@ -1110,10 +1110,25 @@ kernel.
     counter would let a busy sibling answer the question, which is a check passing
     for the wrong reason.
 
-  Honest about the result on secondaries: one core in the four-core run reports
-  `cpu 2 armed MSI-X but saw no completion interrupt - polling`, and polls. That
-  is the mechanism working as designed rather than a passing test hiding a
-  failure, and the remaining work is naming why that core's APIC did not receive.
+  That per-core verification then earned its keep twice over, catching two more
+  defects that every correctness check passes through:
+
+  - **A secondary's local interrupt controller is not enabled by anyone.** The AP
+    trampoline sets no APIC registers, and a core that never armed a timer has
+    never software-enabled its own - so the MSI was correctly addressed and simply
+    dropped. `arch::irq_ready_this_cpu` does the enable, split out of
+    `enable_timer_irq_this_cpu` rather than reusing it, because that also writes
+    `TMICT = 0` and would silently disarm whatever deadline the timer arbiter
+    holds - the N2h class of defect, reintroduced by the convenient call.
+  - **Eight table entries route nothing on their own.** The vector a completion
+    queue raises is a field in its *create* command (`CDW11[31:16]`), and leaving
+    it zero sends every queue through table entry 0 - so all eight vectors landed
+    on the boot CPU. The `smp` phase now asserts `poll_fallbacks() == 0`, which
+    fails by name when that field is reverted: a queue whose vector goes elsewhere
+    still returns the right bytes, its owner just polls, so nothing else catches
+    it.
+
+  Both cores are now woken by their own completion vector, asserted.
 
   **Not done:** no IOMMU-contained storage *cell*, and MSI-X on the two non-x86
   ISAs. Transfers bounce through page-aligned frames one page per command, so

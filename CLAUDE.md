@@ -213,10 +213,18 @@ into a 120 s timeout); the verification itself must not be able to halt either, 
 each channel is verified **by the core that owns it** against **that CPU's** counter,
 since a global one would let a busy sibling answer the question. A per-core queue
 needs a per-core interrupt: with every MSI aimed at the boot CPU a secondary halted
-while the primary took its vector, caught by the `smp` two-core phase. Honest: one
-core in the four-core run reports `cpu 2 armed MSI-X but saw no completion interrupt
-- polling` and polls, which is the mechanism working rather than a test hiding a
-failure. Also honest: no IOMMU-contained storage cell, and
+while the primary took its vector, caught by the `smp` two-core phase. That verification then caught two more defects: a
+secondary's LAPIC is software-enabled by nobody (the AP trampoline sets none, and a
+core that never armed a timer never enabled its own), fixed by
+`arch::irq_ready_this_cpu` - split out of `enable_timer_irq_this_cpu` rather than
+reusing it, since that also writes `TMICT = 0` and would silently disarm the timer
+arbiter's deadline; and eight MSI-X table entries route nothing on their own,
+because the vector a completion queue raises is a field in its *create* command
+(`CDW11[31:16]`) and leaving it zero sent all eight through entry 0 onto the boot
+CPU. `smp` now asserts `poll_fallbacks() == 0`, which fails by name when that field
+is reverted - a queue whose vector goes elsewhere still returns the right bytes, its
+owner just polls, so nothing else catches it. Honest: no IOMMU-contained storage
+cell, and
 transfers bounce through page-aligned frames one page per command so `PRP1`
 addresses every command and no PRP list is built.
 

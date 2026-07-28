@@ -1240,3 +1240,8 @@ pub fn irq_window() {
         );
     }
 }
+
+/// Software-enable this core's local interrupt controller. Nothing to do here
+/// while [`msi_target`] returns `None`: the per-core enabling these ISAs need is
+/// already done where their interrupt controllers are brought up.
+pub fn irq_ready_this_cpu() {}

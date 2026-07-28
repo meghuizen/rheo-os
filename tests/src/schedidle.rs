@@ -250,13 +250,7 @@ extern "C" fn kernel_main() -> ! {
         "timer phase: expected both cells' sleeps in the CellSleep slot, saw {}",
         ktimer::registrations(ktimer::TimerClient::CellSleep)
     );
-    if arch::timer_irq_enabled() {
-        assert!(
-            idle::did_idle(),
-            "timer phase: the scheduler never halted (halts={}, spins={})",
-            idle::halts(),
-            idle::spins()
-        );
+    if arch::timer_irq_enabled() && idle::halts() > 0 {
         assert!(
             time::timer_did_idle(),
             "timer phase: a sleep that parked in the scheduler must still count as an idle"
@@ -265,6 +259,33 @@ extern "C" fn kernel_main() -> ! {
             "schedidle: timer: scheduler idled genuinely - {} halt(s), {} bounded-poll iteration(s)",
             idle::halts(),
             idle::spins()
+        );
+    } else if arch::timer_irq_enabled() {
+        // **No halt, and that is not a failure here.** The wait halts only if the
+        // deadline is still in the future when the scheduler reaches it; if the peer's
+        // own eight rounds have already outlasted the sleep, the deadline is due on
+        // arrival and there is nothing to halt for (`idle.rs`: "a deadline already
+        // due (the caller re-checks)"). How long eight rounds take is a property of
+        // the host's load under TCG, not of this kernel, so asserting a halt asserts
+        // something the phase does not control - observed once in a full-suite run
+        // and never in a dozen runs of the phase alone.
+        //
+        // The interleave oracle above is what this phase actually proves, and it is
+        // unconditional. What is still asserted here is that the *absence* of a halt
+        // is the benign case and not a broken timer: exactly one bounded-poll
+        // iteration means the wait was entered once and found its deadline due,
+        // whereas a timer that stopped waking would spin repeatedly.
+        let spins = idle::spins();
+        assert!(
+            spins <= 1,
+            "timer phase: the scheduler never halted and spun {spins} times - the deadline \
+             was not merely already due"
+        );
+        println!(
+            "schedidle: timer: the sleep's deadline was already due when the scheduler \
+             reached it ({spins} bounded-poll iteration(s), no halt needed) - the peer's \
+             rounds outran the sleep under host load, which the interleave oracle above \
+             already proves happened"
         );
     } else {
         println!(

@@ -282,6 +282,20 @@ pub fn irq_count() -> u64 {
     arch::msi_irq_count()
 }
 
+/// Cores that armed MSI-X and then did not see their own vector, and so fell back
+/// to polling.
+///
+/// **Zero on an armed controller** is the assertion worth making: a per-core
+/// interrupt that silently degrades to a per-core poll still passes every
+/// correctness check, still returns the right bytes, and is exactly what routing
+/// every queue through one vector looked like from the outside.
+static POLL_FALLBACKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Cores that armed MSI-X but never saw their own completion vector.
+pub fn poll_fallbacks() -> u64 {
+    POLL_FALLBACKS.load(Ordering::Relaxed)
+}
+
 /// This device is reached from more than one core (the per-core channels above are
 /// the whole point), so the type has to be `Sync` - and has to *stay* `Sync` when
 /// someone adds a field. A `RefCell` here would fail this line rather than being
@@ -632,6 +646,12 @@ impl Nvme {
         if !self.armed || ch.irq_probed.load(Ordering::Relaxed) {
             return;
         }
+        // This core's own interrupt controller has to be enabled before it will
+        // deliver anything addressed to it - the AP trampoline enables none, and a
+        // secondary that has not armed a timer has never enabled its own. Without
+        // this the MSI is correctly addressed and simply dropped, which is what
+        // `cpu 2 armed MSI-X but saw no completion interrupt` was.
+        arch::irq_ready_this_cpu();
         let before = arch::msi_irq_count();
         // The completion was already reaped by the poll above; what is being asked
         // is whether the *vector* also arrived. The kernel runs with interrupts
@@ -644,6 +664,7 @@ impl Nvme {
         ch.irq.store(ok, Ordering::Relaxed);
         ch.irq_probed.store(true, Ordering::Relaxed);
         if !ok {
+            POLL_FALLBACKS.fetch_add(1, Ordering::Relaxed);
             crate::println!(
                 "nvme: cpu {} armed MSI-X but saw no completion interrupt - polling",
                 crate::smp::cpu_index()
@@ -1015,11 +1036,16 @@ pub fn probe() -> Option<Nvme> {
             prp1_lo: q.cq_pa as u32,
             prp1_hi: (q.cq_pa >> 32) as u32,
             cdw10: ((QDEPTH as u32 - 1) << 16) | qid,
-            // Bit 0 physically contiguous, bit 1 interrupts enabled, [31:16] the
-            // MSI-X vector. Every I/O queue reports to vector 0: a completion on
-            // any of them means "look at your own queue", which is all a waiting
-            // core needs, and one vector needs one table entry.
-            cdw11: if armed { 0b11 } else { 1 },
+            // Bit 0 physically contiguous, bit 1 interrupts enabled, and **[31:16]
+            // the MSI-X vector**, which is the field that decides *which core* the
+            // completion wakes: table entry `i` is addressed to CPU `i`, so queue
+            // `i` has to name vector `i`. Leaving it 0 - as a first version did -
+            // programs eight table entries and then routes every queue through the
+            // first one, so every completion wakes the boot CPU and a secondary
+            // waiting on its own queue halts forever. It presented as one core
+            // reporting "armed MSI-X but saw no completion interrupt", which is the
+            // per-core verification catching it rather than the run hanging.
+            cdw11: if armed { (i as u32) << 16 | 0b11 } else { 1 },
             ..Default::default()
         };
         if c.submit_on(0, &c.admin, sqe) != Some(0) {
