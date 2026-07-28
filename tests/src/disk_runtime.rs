@@ -145,6 +145,11 @@ pub fn prove(
     thread_abort_partial: bool,
     preemptive: bool,
     wx_authority: bool,
+    // An optional **second** invocation of the same binary: `(argv, expected stdout)`.
+    // Run only after the first succeeds, so a partial or a failure is never masked by
+    // it. `linuxbun` uses this to run a JS file that calls a tile kernel through
+    // `bun:ffi` (docs/TILES.md 13.4d); every other caller passes `None`.
+    second: Option<(&[&[u8]], &[u8])>,
 ) -> ! {
     kernel::boot::init();
     println!("{name}: start on {}", arch::NAME);
@@ -247,6 +252,34 @@ pub fn prove(
                 "{name}: REAL runtime evaluated its input OFF A LIVE ext4 DISK, \
                  exact stdout + exit 0 ({fills} block-cache fills through ext4plus)"
             );
+            // The second invocation, if the caller asked for one. After the first has
+            // been asserted, so nothing here can turn a partial into a pass.
+            if let Some((argv2, want2)) = second {
+                unsafe {
+                    STDOUT_LEN = 0;
+                }
+                linux::set_stdout_tap(Some(tap));
+                let out2 = run_execve(path, argv2, envp, wx_authority);
+                linux::set_stdout_tap(None);
+                let got2 = captured();
+                match out2 {
+                    Outcome::Exited(0) => assert!(
+                        got2 == want2,
+                        "{name}: second run exit 0 but stdout mismatch\n  got:      \
+                         {:?}\n  expected: {:?}",
+                        core::str::from_utf8(got2),
+                        core::str::from_utf8(want2),
+                    ),
+                    Outcome::Exited(code) => panic!(
+                        "{name}: second run exit {code} (stdout {:?})",
+                        core::str::from_utf8(got2)
+                    ),
+                    Outcome::Faulted(addr) => {
+                        panic!("{name}: second run faulted at {addr:#x}")
+                    }
+                }
+                println!("{name}: SECOND RUN OK - {:?}", core::str::from_utf8(want2));
+            }
         }
         // Defensive: before per-context blocking (LINUX-COMPAT.md L4) a multi-thread
         // event loop deadlocked here; the scheduler reports `DEADLOCK_EXIT` rather

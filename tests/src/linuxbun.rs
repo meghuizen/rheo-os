@@ -89,5 +89,31 @@ extern "C" fn kernel_main() -> ! {
         // kernel in the suite mints nothing of the sort and is refused exactly as
         // before, which is what makes this a capability rather than a setting.
         true,
+        // **JavaScript calling a tile kernel** (docs/TILES.md 13.4d). 13.4b compiled the
+        // tile kernels into a static Linux binary and 13.4c opened a shared library
+        // holding them with `dlopen`/`dlsym` - the mechanism `bun:ffi` is built on -
+        // but neither had JavaScript make the call. This does: `bun:ffi` is built into
+        // Bun, so the runtime opens `/lib/libtileso.so`, generates a native trampoline
+        // for the declared signature, and calls through it.
+        //
+        // The expected value is the low 31 bits of the FNV-1a hash of the whole
+        // 32x32x32 int8 GEMM output - `0x23aa217921e5ccb1 & 0x7fff_ffff` - so it proves
+        // the *kernel ran*, not that a symbol resolved, and it is the same number the
+        // librheo cells, the static `tilelinux` binary and the `dlopentile` C probe
+        // produce. 31 bits because a JS number is exact only to 2^53.
+        // Passed with `-e` rather than as a file on the disk, and that is a measured
+        // choice: running a *file* made Bun call `createFakeTemporaryNodeExecutable`,
+        // which wants to write a stand-in `node` into a temp directory and failed
+        // `error.FileNotFound` - the ext4 driver here is **read-only**, so there is
+        // nowhere for it to write. `-e` does not take that path at all. A read-write
+        // ext4 mount is the real fix and is not built (docs/FILESYSTEMS.md).
+        Some((
+            &[
+                b"bun",
+                b"-e",
+                b"const{dlopen,FFIType}=require(\"bun:ffi\");const l=dlopen(\"/lib/libtileso.so\",{tile_gemm_check:{args:[FFIType.u32,FFIType.u32,FFIType.u32],returns:FFIType.i32}});console.log(\"tileffi: gemm \"+l.symbols.tile_gemm_check(32,32,32))",
+            ],
+            b"tileffi: gemm 568708273\n",
+        )),
     )
 }

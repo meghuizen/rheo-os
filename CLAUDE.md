@@ -2165,9 +2165,22 @@ times turning a guess into a fact: the first failure's refused-path log named
 library `dlopen` loads needs its *own* dependencies - a missing file, not a missing
 mechanism), and the library then failed to link for aarch64 because it had inherited the
 static fixtures' `+crt-static -no-pie`, which cannot produce a shared object at all.
-**Still not claimed**: that Node or Bun *do* call these kernels - wiring `bun:ffi` to this
-library is a JS-side exercise on top of a mechanism now shown to work, and until it is run
-"reachable" is the honest word and "integrated" is not. Honest: FA3's own producer/consumer
+**And JavaScript on the real Bun calls a tile kernel** (docs/TILES.md 13.4d): the
+`linuxbun` gate runs the real Bun binary a second time off the same live ext4 disk,
+evaluating JS that opens `/lib/libtileso.so` through **`bun:ffi`**, declares
+`tile_gemm_check(u32,u32,u32) -> i32` and calls it, printing `tileffi: gemm 568708273` -
+which is `0x23aa217921e5ccb1 & 0x7fff_ffff`, the low 31 bits of the same GEMM hash the
+librheo cells, the static `tilelinux` binary and the `dlopentile` C probe produce, so the
+value proves the *kernel ran* rather than that a symbol resolved (31 bits because a JS
+number is exact only to 2^53). That closes the chain: one tile source compiled into a
+librheo cell, a static Linux binary and a shared library, and now **invoked from
+JavaScript by a production JS runtime** running as a `Personality::Linux` cell, all four
+routes producing the same bits. One measured constraint on the way: passing the JS as a
+**file** made Bun call `createFakeTemporaryNodeExecutable`, which writes a stand-in `node`
+into a temp dir and failed `error.FileNotFound` - the ext4 driver is **read-only**, so
+there is nowhere to write; `-e` does not take that path, and a read-write ext4 mount is
+the real fix and is not built. Control observed failing: the library left off the disk
+image. Honest: FA3's own producer/consumer
 overlap is still **interleaving** within a slice - the parallelism above is data
 parallelism *over* the head, and a slice runs on one core, so FA3's wall-clock win over
 FA2 needs a second execution context inside the slice and is not built; the inner loops are

@@ -1733,6 +1733,7 @@ fn build_node_disk_fixture(arch: Arch, out_dir: &str) {
             "libstdc++.so.6",
             "libgcc_s.so.1",
         ],
+        &[],
     );
 }
 
@@ -1749,6 +1750,17 @@ fn build_bun_disk_fixture(arch: Arch, out_dir: &str) {
         "/root/.bun/bin/bun",
         "bun",
         &["libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0"],
+        // The tile shared library and the JS that calls it through `bun:ffi`
+        // (docs/TILES.md 13.4d): the last step of "a JS runtime calls a tile kernel".
+        // `libgcc_s.so.1` because a Rust `cdylib` needs the unwinder even at
+        // `panic = "abort"` - the fact the `dlopen` probe turned up.
+        &[
+            (
+                "tests/linux-fixtures/build/x86_64/libtileso.so",
+                "lib/libtileso.so",
+            ),
+            ("/lib/x86_64-linux-gnu/libgcc_s.so.1", "lib/libgcc_s.so.1"),
+        ],
     );
 }
 
@@ -1776,6 +1788,7 @@ fn build_claude_disk_fixture(arch: Arch, out_dir: &str) {
             "libpthread.so.0",
             "librt.so.1",
         ],
+        &[],
     );
 }
 
@@ -1801,6 +1814,10 @@ fn build_runtime_disk_fixture(
     binary: &str,
     dst: &str,
     libs: &[&str],
+    // Extra `(host source, image destination)` files. The Bun image uses this to carry
+    // the tile shared library and the JS that calls it through `bun:ffi`
+    // (docs/TILES.md 13.4d); every other image passes none.
+    extras: &[(&str, &str)],
 ) {
     if arch != Arch::X86_64 {
         return; // x86-64 binaries only; no drive attached elsewhere, test skips
@@ -1892,6 +1909,13 @@ fn build_runtime_disk_fixture(
     debugfs(&format!("write {INTERP_SRC} lib64/ld-linux-x86-64.so.2"));
     for l in libs {
         debugfs(&format!("write {LIBDIR}/{l} lib/{l}"));
+    }
+    for (src, dstpath) in extras {
+        if exists(src) {
+            debugfs(&format!("write {src} {dstpath}"));
+        } else {
+            eprintln!("[xtask] {test} image: extra {src} absent - the phase using it will skip");
+        }
     }
     seed_runtime_procfs(out_dir, &debugfs);
     println!("[xtask] built {test} ext4 image for x86_64 ({img}; real {dst} + glibc set)");

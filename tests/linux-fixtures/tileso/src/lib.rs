@@ -15,6 +15,16 @@ mod kernels;
 /// at all, and the value is exact - one wrong element changes it. The operands are
 /// derived here from the same index formula `tilelinux` and `librheo-fa` use, so all
 /// three must produce the same number.
+/// The same value narrowed to 31 bits, for callers that cannot hold a `u64` exactly.
+///
+/// A JS number is exact only to 2^53, so handing JavaScript the full hash would make the
+/// comparison meaningless in a way that presents as a mismatch. Narrowing here rather
+/// than in the caller keeps the check exact on both sides (docs/TILES.md 13.4d).
+#[no_mangle]
+pub extern "C" fn tile_gemm_check(m: u32, n: u32, k: u32) -> i32 {
+    (tile_gemm_hash(m, n, k) & 0x7FFF_FFFF) as i32
+}
+
 #[no_mangle]
 pub extern "C" fn tile_gemm_hash(m: u32, n: u32, k: u32) -> u64 {
     let (m, n, k) = (m as usize, n as usize, k as usize);

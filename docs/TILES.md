@@ -687,10 +687,43 @@ The probe earned its keep twice, both times by turning a guess into a fact:
   shared object at all; a `.so` is position-independent and dynamically linked by
   definition.
 
-**Still not claimed:** that Node or Bun *do* call these kernels. Wiring `bun:ffi` to this
-library is a JS-side exercise on top of a mechanism now shown to work, and until it is
-run, "reachable" is the honest word and "integrated" is not. Control observed failing:
-the library not seeded, so `dlopen` cannot find it.
+Control observed failing: the library not seeded, so `dlopen` cannot find it.
+
+### 13.4d JavaScript calls a tile kernel, on the real Bun
+
+13.4c left one step: the *mechanism* was shown to work, but no JavaScript had made the
+call. It has now.
+
+The `linuxbun` gate runs the real Bun binary a second time, off the same live ext4 disk,
+evaluating JavaScript that opens `/lib/libtileso.so` through **`bun:ffi`**, declares
+`tile_gemm_check(u32, u32, u32) -> i32`, and calls it. `bun:ffi` is built into Bun, so
+there is no addon to compile: the runtime opens the library, generates a native
+trampoline for the declared signature, and calls through it.
+
+    tileffi: gemm 568708273
+
+`568708273` is `0x23aa217921e5ccb1 & 0x7fff_ffff` - the low 31 bits of the FNV-1a hash of
+the whole 32x32x32 int8 GEMM output, the same value the librheo cells, the static
+`tilelinux` binary and the `dlopentile` C probe produce. So the value proves the *kernel
+ran*, not that a symbol resolved. 31 bits because a JS number is exact only to 2^53, and
+returning something JavaScript cannot represent would make the comparison meaningless in
+a way that presents as a mismatch.
+
+That is the chain closed: one tile source, compiled into a librheo cell (13.4a), a static
+Linux binary (13.4b), and a shared library (13.4c), and now **invoked from JavaScript by a
+production JS runtime** running as a `Personality::Linux` cell - with every one of those
+four routes producing the same bits.
+
+One measured constraint on the way, worth recording because it is a real limit rather
+than a detail: passing the JS as a **file** on the disk made Bun call
+`createFakeTemporaryNodeExecutable`, which writes a stand-in `node` into a temp directory
+and failed `error.FileNotFound` - the ext4 driver here is **read-only**, so there is
+nowhere to write. `-e` does not take that path. A read-write ext4 mount is the real fix
+and is not built (docs/FILESYSTEMS.md); the script is passed inline instead, and the
+reason is in the test rather than in a comment nobody reads.
+
+Control observed failing: the library left off the disk image, so `bun:ffi` cannot open
+it.
 
 ### 13.5 Honest scope
 

@@ -53,5 +53,6 @@ extern "C" fn kernel_main() -> ! {
         // The W^X exception capability, so JavaScriptCore's JIT can map its code pages
         // (docs/ARCHITECTURE.md 5.1).
         true,
+        None,
     )
 }

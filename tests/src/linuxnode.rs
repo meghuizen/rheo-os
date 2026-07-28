@@ -64,5 +64,6 @@ extern "C" fn kernel_main() -> ! {
         // kernel in the suite mints nothing of the sort and is refused exactly as
         // before, which is what makes this a capability rather than a setting.
         true,
+        None,
     )
 }
