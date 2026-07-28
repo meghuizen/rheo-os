@@ -8,10 +8,21 @@
 //! It also drives every GPU device model QEMU provides, one per vendor:
 //! AMD (`ati-vga`), Bochs, Cirrus Logic, VMware SVGA and Red Hat/QXL by a
 //! framebuffer-aperture MMIO write + read-back, and virtio-gpu (behind a
-//! `pcie-root-port`) by its 2D command driver. x86-64 gets all six;
-//! arm/riscv `virt` get four (VMware and QXL are x86-only in QEMU). NVIDIA
+//! `pcie-root-port`) by its 2D command driver. x86-64 gets up to six;
+//! arm/riscv `virt` up to four (VMware and QXL are x86-only in QEMU). NVIDIA
 //! and Intel have no QEMU GPU device model, so their recognition front-ends
 //! report skip-with-reason (docs/GPU-HARDWARE.md 12).
+//!
+//! **"Up to", not "exactly", and the difference is the point.** Which models a
+//! QEMU build actually has is a property of that build - QXL needs SPICE compiled
+//! in, and a QEMU without it *refuses to launch*, which used to be a zero-byte
+//! serial log naming no cause. So `xtask` attaches only the models
+//! `-device help` lists and this kernel asserts a property of the bus rather than
+//! a copy of QEMU's catalogue: every display function present is recognised, and
+//! every one whose vendor has a linear framebuffer is driven. A vendor QEMU cannot
+//! model is handled the way NVIDIA and Intel already are - classified from its PCI
+//! ID directly, reported absent from the inventory - so recognition stays proven
+//! with no such device on the bus.
 
 #![no_std]
 #![no_main]
@@ -39,15 +50,43 @@ extern "C" fn kernel_main() -> ! {
     ] {
         assert!(gpu::vendor_present(inv, vendor), "{} not recognised", what);
     }
-    #[cfg(target_arch = "x86_64")]
-    for (vendor, what) in [
-        (gpu::GpuVendor::Vmware, "vmware 0x15AD"),
-        (gpu::GpuVendor::Redhat, "qxl 0x1B36"),
+    // VMware SVGA and Red Hat/QXL are x86-only in QEMU, and QXL additionally needs
+    // a QEMU built with SPICE - so they are *reported*, not asserted present.
+    // Recognition is still proven either way, because it is a pure function of the
+    // PCI vendor id: the ID classifier is checked directly, which is exactly how
+    // NVIDIA and Intel are covered with no such device anywhere.
+    //
+    // No `cfg(target_arch)` here, which is the point: this loop reads identically on
+    // all three ISAs and reports what each one has. The previous version asserted
+    // these two present under `cfg(target_arch = "x86_64")` - a per-ISA branch
+    // outside `arch/` (docs/TARGET-ARCHITECTURES.md 4) that existed only because the
+    // vendor set was a hardcoded catalogue. Observing the set removed the need for
+    // it.
+    for (vendor, id, what) in [
+        (gpu::GpuVendor::Vmware, gpu::VENDOR_VMWARE, "vmware-svga"),
+        (gpu::GpuVendor::Redhat, gpu::VENDOR_REDHAT, "qxl"),
     ] {
-        assert!(gpu::vendor_present(inv, vendor), "{} not recognised", what);
+        assert_eq!(
+            gpu::GpuVendor::from_id(id),
+            vendor,
+            "{what} vendor id not classified"
+        );
+        if gpu::vendor_present(inv, vendor) {
+            println!("gpuhw: {what} present and recognised");
+        } else {
+            println!("gpuhw: skip {what} - this QEMU build has no such device model");
+        }
     }
-    // No QEMU device model exists for these vendors: recognised by ID,
+    // No QEMU device model exists for these vendors on any ISA: recognised by ID,
     // honestly absent here (skip-with-reason printed above).
+    assert_eq!(
+        gpu::GpuVendor::from_id(gpu::VENDOR_NVIDIA),
+        gpu::GpuVendor::Nvidia
+    );
+    assert_eq!(
+        gpu::GpuVendor::from_id(gpu::VENDOR_INTEL),
+        gpu::GpuVendor::Intel
+    );
     assert!(!gpu::vendor_present(inv, gpu::GpuVendor::Nvidia));
     assert!(!gpu::vendor_present(inv, gpu::GpuVendor::Intel));
 
@@ -185,6 +224,24 @@ extern "C" fn kernel_main() -> ! {
     // `drive_framebuffer` returns None for it. Memory decode is forced on
     // per device so the proof does not depend on who enabled it.
     let inv = hw::inventory();
+    // Every vendor here has a linear framebuffer aperture, so an enumerated
+    // function of one of these vendors MUST be driven. Counted before driving
+    // anything, so the expectation is derived from the bus rather than from the
+    // result it is about to check - the difference between an invariant and a
+    // restatement.
+    let expect_driven = inv.gpus[..inv.ngpu]
+        .iter()
+        .filter(|g| {
+            matches!(
+                g.vendor,
+                gpu::GpuVendor::Amd
+                    | gpu::GpuVendor::QemuBochs
+                    | gpu::GpuVendor::Cirrus
+                    | gpu::GpuVendor::Vmware
+                    | gpu::GpuVendor::Redhat
+            )
+        })
+        .count();
     let mut driven = 0;
     for g in &inv.gpus[..inv.ngpu] {
         let d = &inv.pci[g.pci];
@@ -207,13 +264,21 @@ extern "C" fn kernel_main() -> ! {
         "gpuhw: {} GPU framebuffers driven (write + read-back)",
         driven
     );
-    // x86-64 drives amd/bochs/cirrus/vmware/qxl (5); arm/riscv drive
-    // amd/bochs/cirrus (3, vmware+qxl being x86-only). virtio-gpu is driven
-    // separately by its 2D command driver on every ISA.
-    #[cfg(target_arch = "x86_64")]
-    assert!(driven >= 5, "expected >= 5 framebuffer-driven vendors");
-    #[cfg(not(target_arch = "x86_64"))]
-    assert!(driven >= 3, "expected >= 3 framebuffer-driven vendors");
+    // **Every** aperture-bearing function on the bus was driven - not "at least
+    // five", which was a copy of QEMU's device catalogue and went stale the moment
+    // a build shipped without one of them. virtio-gpu is excluded because it has no
+    // linear framebuffer; it is driven separately by its 2D command driver below.
+    assert_eq!(
+        driven, expect_driven,
+        "{expect_driven} aperture-bearing GPUs enumerated but {driven} driven"
+    );
+    // A floor, so an empty or barely-populated bus cannot satisfy the equality
+    // above trivially. AMD (`ati-vga`), Bochs and Cirrus are in every QEMU build
+    // with PCI on all three ISAs; VMware and QXL are the optional ones.
+    assert!(
+        driven >= 3,
+        "expected >= 3 framebuffer-driven vendors, drove {driven}"
+    );
 
     // --- Attach measurement: offload proves itself (transport) ---------
     // Ticks per KiB streamed through each GPU's framebuffer aperture -

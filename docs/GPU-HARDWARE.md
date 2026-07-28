@@ -703,6 +703,24 @@ kernel that CI runs:
   register interface - program 640x480x32 + LFB, render into the linear
   framebuffer, read pixels back, on all three ISAs). MSI-X *routing* (vectors to vcores) is not in stage 1;
   only capability presence is recorded.
+
+  **"Every GPU device model QEMU has" is now observed, not listed.** The set was
+  a constant in `xtask` and a matching count in the test - a copy of QEMU's
+  device catalogue in two places, and wrong for any build that ships without
+  one of them. QXL is exactly that case: it needs a QEMU built with SPICE, and
+  `-device qxl` against a QEMU without it is rejected **at launch**, so the
+  failure is a zero-byte serial log naming no cause. So `xtask` asks
+  `-device help` and attaches only what is there, printing each drop
+  (`gpu_device_args`), and the test asserts a property of the *bus*: every
+  enumerated function whose vendor has a linear framebuffer is driven
+  (`driven == expect_driven`, counted before anything is driven), with a floor of
+  three so an empty bus cannot satisfy it trivially. A vendor QEMU cannot model
+  is then covered the way NVIDIA and Intel already were - its PCI id classified
+  directly, its absence from the inventory reported - so recognition stays proven
+  with no such device present. Observed: six vendors driven where QXL exists,
+  five where it does not, four on arm/riscv (VMware and QXL being x86-only), and
+  the equality was seen failing when `drive_framebuffer` was made to skip Cirrus
+  silently.
 - **Stage 2 - IOMMU (x86-64 + ARM64 done):** the `iommu` test kernel proves
   a device DMA **inside** a granted (identity) domain succeeds and one
   **outside** it (after revoke) faults - BUILD-ORDER step 12's done-when -

@@ -81,9 +81,17 @@ Pascal/Turing/Ampere/Ada/Hopper/Blackwell, AMD GCN/RDNA/CDNA, Intel Xe) into
 the inventory, resolves a per-vendor driver front-end (`vendor_driver`
 declaring each vendor's lowering path per ACCELERATORS.md 4), drives **every
 GPU QEMU models** (AMD/Bochs/Cirrus/VMware/QXL via a framebuffer-aperture
-write+read-back, virtio-gpu via its 2D command driver - six vendors on
-x86-64, four on arm/riscv where VMware+QXL are x86-only), and each registers
-in the engine table behind `SYS_ENGINE_INFO(out_va, index)` enumeration (kind + PCI
+write+read-back, virtio-gpu via its 2D command driver - up to six vendors on
+x86-64, up to four on arm/riscv where VMware+QXL are x86-only). **Which models a
+QEMU build has is observed, not listed**: it was a constant in `xtask` and a
+matching count in the test, and QXL needs a QEMU built with SPICE - against one
+without it, `-device qxl` is rejected *at launch*, a zero-byte serial log naming
+no cause. `xtask` asks `-device help` and attaches what is there, printing each
+drop; the test asserts a property of the **bus** - every enumerated function whose
+vendor has a linear framebuffer is driven (counted before driving anything), with
+a floor of three - and a vendor QEMU cannot model is covered the way NVIDIA and
+Intel already were, its PCI id classified directly and its absence reported. Each
+registers in the engine table behind `SYS_ENGINE_INFO(out_va, index)` enumeration (kind + PCI
 vendor ID + declared op-boundary preemption, an honest zero measured cost -
 recognised and registered, not yet driven). The `gpuhw` test proves it on all
 three ISAs against QEMU's real `ati-vga` (AMD, 0x1002), a Bochs display, and

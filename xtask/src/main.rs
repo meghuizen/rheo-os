@@ -93,7 +93,85 @@ const TEST_KERNELS: [&str; 65] = [
 /// (the ext4 fixture). arm/riscv `virt` present it over virtio-mmio; x86 q35
 /// has no virtio-mmio, so there it is a virtio-*pci* device (disable-legacy=on
 /// pins the modern-only layout the PCI-config-tunnel driver expects).
-fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
+///
+/// The `gpuhw` arms additionally **drop any GPU device model this QEMU build does
+/// not have** - see [`gpu_device_args`].
+fn extra_qemu_args(arch: Arch, kernel: &str) -> Vec<String> {
+    if kernel == "gpuhw" {
+        return gpu_device_args(arch);
+    }
+    fixed_qemu_args(arch, kernel)
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// The GPU device models `gpuhw` attaches, minus the ones this QEMU cannot make.
+///
+/// QXL needs SPICE compiled in and some distributions ship a QEMU without it, so
+/// `-device qxl` is rejected *at launch* - QEMU exits before the kernel runs, which
+/// is a zero-byte serial log and a failure that names no cause. That is the same
+/// defect the kernel side already avoids for NVIDIA and Intel (no QEMU model at
+/// all: classified by ID, absence reported), just moved up a layer - a hardcoded
+/// catalogue of what QEMU has, asserted instead of observed.
+///
+/// So each model is checked against `-device help` and a missing one is dropped
+/// with its reason printed. The kernel then reports that vendor absent exactly as
+/// it reports NVIDIA absent, and drives every model that *is* there.
+fn gpu_device_args(arch: Arch) -> Vec<String> {
+    // A `pcie-root-port` with virtio-gpu behind it (reachable only if enumeration
+    // programs the bridge's secondary bus - PVH boots have no firmware to do it),
+    // then one function per GPU vendor QEMU models for the ISA.
+    let mut args: Vec<String> = ["-device", "pcie-root-port,id=rp1,chassis=1,slot=1"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    // (model name passed to -device, the base name `-device help` lists it under)
+    let mut models: Vec<(&str, &str)> = vec![
+        ("virtio-gpu-pci,bus=rp1,disable-legacy=on", "virtio-gpu-pci"),
+        ("ati-vga", "ati-vga"),
+        ("bochs-display", "bochs-display"),
+        ("cirrus-vga", "cirrus-vga"),
+    ];
+    if arch == Arch::X86_64 {
+        // VMware SVGA and Red Hat/QXL are x86-only in QEMU.
+        models.push(("vmware-svga", "vmware-svga"));
+        models.push(("qxl", "qxl"));
+    }
+    let listing = qemu_device_listing(arch);
+    for (spec, base) in models {
+        // `-device help` prints `name "ati-vga", bus PCI` - match the quoted name so
+        // one model is never mistaken for another whose name contains it.
+        if listing.contains(&format!("name \"{base}\"")) {
+            args.push("-device".to_string());
+            args.push(spec.to_string());
+        } else {
+            println!(
+                "[xtask] {} has no '{base}' device model - not attached",
+                arch.qemu()
+            );
+        }
+    }
+    args
+}
+
+/// What `qemu-system-<arch> -device help` prints, stdout and stderr together
+/// (QEMU has used both over the years). Empty if QEMU cannot be run, in which case
+/// every model reads as absent and the boot itself reports the missing QEMU.
+fn qemu_device_listing(arch: Arch) -> String {
+    Command::new(arch.qemu())
+        .arg("-device")
+        .arg("help")
+        .output()
+        .map(|o| {
+            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+            s.push_str(&String::from_utf8_lossy(&o.stderr));
+            s
+        })
+        .unwrap_or_default()
+}
+
+fn fixed_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
     match (kernel, arch) {
         ("blockfs", Arch::Riscv64 | Arch::Aarch64) => &[
             // Present the modern (version 2) virtio-mmio transport, which the
@@ -429,49 +507,8 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "virtio-gpu-device",
         ],
         ("librheogpu", Arch::X86_64) => &["-device", "virtio-gpu-pci,disable-legacy=on"],
-        // gpuhw (docs/GPU-HARDWARE.md 3, 12 stage 1): the same three GPU
-        // functions on every ISA - a real AMD/ATI vendor device (ati-vga,
-        // 0x1002), the Bochs display (0x1234), and a virtio-gpu placed
-        // BEHIND a pcie-root-port, reachable only if enumeration programs
-        // the bridge's secondary bus (PVH boots have no firmware to do it).
-        // NVIDIA/Intel have no QEMU GPU model - the kernel prints their
-        // skip-with-reason lines and the test asserts their absence.
-        // Every GPU device model QEMU provides for the ISA, one per vendor.
-        // x86-64 has all six: virtio-gpu (behind a root port), AMD
-        // (ati-vga), Bochs, Cirrus Logic, VMware SVGA, and Red Hat/QXL
-        // (secondary - qxl-vga must be console 0). NVIDIA and Intel have no
-        // QEMU GPU model - recognised by ID, skip-with-reason
-        // (docs/GPU-HARDWARE.md 12).
-        ("gpuhw", Arch::X86_64) => &[
-            "-device",
-            "pcie-root-port,id=rp1,chassis=1,slot=1",
-            "-device",
-            "virtio-gpu-pci,bus=rp1,disable-legacy=on",
-            "-device",
-            "ati-vga",
-            "-device",
-            "bochs-display",
-            "-device",
-            "cirrus-vga",
-            "-device",
-            "vmware-svga",
-            "-device",
-            "qxl",
-        ],
-        // arm/riscv `virt`: vmware-svga and qxl are x86-only in QEMU, so the
-        // per-ISA set is virtio-gpu + AMD + Bochs + Cirrus (four vendors).
-        ("gpuhw", Arch::Riscv64 | Arch::Aarch64) => &[
-            "-device",
-            "pcie-root-port,id=rp1,chassis=1,slot=1",
-            "-device",
-            "virtio-gpu-pci,bus=rp1,disable-legacy=on",
-            "-device",
-            "ati-vga",
-            "-device",
-            "bochs-display",
-            "-device",
-            "cirrus-vga",
-        ],
+        // gpuhw's device set is built by `gpu_device_args`, which drops a model
+        // this QEMU build does not have rather than letting QEMU refuse to launch.
         // iommu (docs/GPU-HARDWARE.md 4, BUILD-ORDER.md step 12): VT-d DMA
         // remapping. x86-64 q35 gets `-device intel-iommu` (caching-mode=on
         // so the vIOMMU faults + requires invalidation, the mode that
@@ -799,9 +836,11 @@ fn main() -> ExitCode {
             };
             arches.iter().all(|&a| {
                 build(a, true)
-                    && kernels
-                        .iter()
-                        .all(|kernel| boot_expect_pass(a, true, kernel, extra_qemu_args(a, kernel)))
+                    && kernels.iter().all(|kernel| {
+                        let args = extra_qemu_args(a, kernel);
+                        let args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                        boot_expect_pass(a, true, kernel, &args)
+                    })
             })
         }
         // Benchmarks always run the release build: instruction path
