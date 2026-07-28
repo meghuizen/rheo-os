@@ -26,16 +26,17 @@ extern "C" fn kernel_main() -> ! {
     // so the captured transcript is exact; UV_THREADPOOL_SIZE=1 keeps libuv's lazy
     // pool minimal (the cell holds up to 8 contexts, node uses ~7).
     //
-    // Run a real **multi-file** program off the disk - `/app/main.js`, which
-    // `require`s a sibling `./lib.js` (CommonJS `module.exports`), reads config with
-    // `JSON.parse`, and uses the `path` builtin. This is the shape every npm package
-    // has (an entry module resolving and reading its dependencies off the
-    // filesystem), so it proves the runtime surface npm and Claude Code are built on
-    // - Node's module resolver reading a second file off the live ext4 disk, not
-    // just an inline `-e` script. `main.js` prints `path.basename('/bin/rheo')` +
-    // ':' + `lib.compute([10,20,12])` = `rheo:42`, so the assertion is unchanged.
-    // The `/app` files are seeded into the disk image by xtask's
-    // `build_node_disk_fixture`.
+    // Run a real program off the disk that resolves an **npm-style package**:
+    // `/app/main.js` does `require('greeter')` - a *bare specifier*, which drives
+    // Node's full module-resolution algorithm (walk `node_modules`, read the
+    // package's `package.json`, follow its `main` field to `index.js`), plus the
+    // `path` builtin. That is exactly how an npm-installed dependency loads, so it
+    // proves the resolver npm and Claude Code stand on - reading a package's
+    // metadata and entry file off the live ext4 disk, not just an inline `-e`
+    // script. `main.js` prints `path.basename('/bin/rheo')` + ':' +
+    // `greeter.answer([10,20,12])` = `rheo:42`, so the assertion is unchanged. The
+    // `/app` tree (app + `node_modules/greeter`) is seeded into the disk image by
+    // xtask's `build_node_disk_fixture`.
     disk_runtime::prove(
         "linuxnode",
         "/bin/node",

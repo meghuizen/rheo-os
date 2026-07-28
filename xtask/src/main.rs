@@ -1523,16 +1523,25 @@ fn build_node_disk_fixture(arch: Arch, out_dir: &str) {
     // the npm foundation (docs/LINUX-COMPAT.md). Staged on the host here, written
     // into the image below; x86-64 only, so nothing is staged on arm/riscv.
     if arch == Arch::X86_64 {
-        let main_js = "const lib = require('./lib.js');\n\
+        // The entry resolves a **bare specifier** `require('greeter')`, which drives
+        // Node's full npm-style resolution: walk `node_modules`, read the package's
+        // `package.json`, follow its `main` field. That is exactly how an
+        // npm-installed dependency is loaded, so proving it is the rung before a real
+        // `npm install` layout.
+        let main_js = "const greeter = require('greeter');\n\
              const path = require('path');\n\
-             const cfg = JSON.parse('{\"nums\":[10,20,12]}');\n\
-             console.log(path.basename('/bin/rheo') + ':' + lib.compute(cfg.nums));\n";
-        let lib_js = "module.exports = { compute: (arr) => arr.reduce((a, b) => a + b, 0) };\n";
+             console.log(path.basename('/bin/rheo') + ':' + greeter.answer([10, 20, 12]));\n";
+        let greeter_index =
+            "module.exports = { answer: (arr) => arr.reduce((a, b) => a + b, 0) };\n";
+        let greeter_pkg =
+            "{ \"name\": \"greeter\", \"version\": \"1.0.0\", \"main\": \"index.js\" }\n";
         let _ = std::fs::write(format!("{out_dir}/node-main.js"), main_js);
-        let _ = std::fs::write(format!("{out_dir}/node-lib.js"), lib_js);
+        let _ = std::fs::write(format!("{out_dir}/node-greeter-index.js"), greeter_index);
+        let _ = std::fs::write(format!("{out_dir}/node-greeter-pkg.json"), greeter_pkg);
     }
     let main_src = format!("{out_dir}/node-main.js");
-    let lib_src = format!("{out_dir}/node-lib.js");
+    let greeter_index_src = format!("{out_dir}/node-greeter-index.js");
+    let greeter_pkg_src = format!("{out_dir}/node-greeter-pkg.json");
     build_runtime_disk_fixture(
         arch,
         out_dir,
@@ -1550,7 +1559,14 @@ fn build_node_disk_fixture(arch: Arch, out_dir: &str) {
         ],
         &[
             ("app/main.js", main_src.as_str()),
-            ("app/lib.js", lib_src.as_str()),
+            (
+                "app/node_modules/greeter/index.js",
+                greeter_index_src.as_str(),
+            ),
+            (
+                "app/node_modules/greeter/package.json",
+                greeter_pkg_src.as_str(),
+            ),
         ],
     );
 }
@@ -1679,11 +1695,25 @@ fn build_runtime_disk_fixture(
     for l in libs {
         debugfs(&format!("write {LIBDIR}/{l} lib/{l}"));
     }
-    // Extra files (a multi-file program). Create /app once if any dest lives there,
-    // then write each. Missing host sources are skipped silently (the app is
-    // optional test payload, never a build blocker).
+    // Extra files (a multi-file program, e.g. an app + a node_modules package).
+    // Create every parent directory of every dest, shallowest first (debugfs mkdir
+    // does not create parents), then write each. Missing host sources are skipped
+    // silently (the app is optional test payload, never a build blocker).
     if !extra.is_empty() {
-        debugfs("mkdir /app");
+        let mut dirs: Vec<String> = Vec::new();
+        for (dest, _) in extra {
+            let parts: Vec<&str> = dest.split('/').collect();
+            for i in 1..parts.len() {
+                let d = parts[..i].join("/");
+                if !dirs.contains(&d) {
+                    dirs.push(d);
+                }
+            }
+        }
+        dirs.sort_by_key(|d| d.matches('/').count());
+        for d in &dirs {
+            debugfs(&format!("mkdir /{d}"));
+        }
         for (dest, src) in extra {
             if std::path::Path::new(src).exists() {
                 debugfs(&format!("write {src} {dest}"));
