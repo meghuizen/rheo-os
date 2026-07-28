@@ -273,7 +273,7 @@ fn run_vcore_pair(mode: u64, arg: u64) -> (Outcome, u64, u64) {
             core::ptr::addr_of_mut!(frame_a),
         );
         // SAFETY: `VFRAME` outlives the run; vcore 1 has its own user and kernel stack.
-        user::install_vcore(0, (*vf).as_mut_ptr());
+        user::install_vcore(0, (*vf).as_mut_ptr(), (*v).qp.qp.as_ptr());
         let (_idx, outcome) = user::run(0);
         (outcome, (*a).params.ops, (*v).params.ops)
     }

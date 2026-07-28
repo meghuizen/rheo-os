@@ -25,7 +25,7 @@ use crate::abi::{
 use crate::capability::{
     DELEGATE as RIGHT_DELEGATE, READ as RIGHT_READ, REVOKE as RIGHT_REVOKE, WRITE as RIGHT_WRITE,
 };
-use crate::queue::{OP_NOP, QueuePair};
+use crate::queue::{OP_ECHO, OP_NOP, QueuePair, STATUS_OK};
 
 // ------------------------------------------------------- syscall + counter
 
@@ -997,6 +997,59 @@ pub extern "C" fn user_attack_munmap_queue(params_va: usize) -> ! {
                 (*p).status = 1;
             }
         }
+        syscall(SYS_EXIT, 0);
+    }
+    loop {}
+}
+
+/// The **per-vcore queue** prober (docs/SUBSTRATE.md S5): drive a full round trip over
+/// this context's ring, and report which region `SYS_QUEUE_INFO` says that ring is.
+///
+/// `workload` carries this vcore's token; `qp_addr`/`cap_id` are its own queue overlay and
+/// capability, handed to it by its launcher exactly as every other `.user` cell's are.
+/// Outputs, written **last** so the round trip cannot be confused with them: `ticks` = the
+/// region VA `SYS_QUEUE_INFO` reported, `ops` = the capability id it reported, `status` = 1
+/// only if the submit, the doorbell and the reap all succeeded with `STATUS_OK`.
+///
+/// Two things are being probed, and they are separate. The **doorbell** drains the ring of
+/// the calling vcore, so a completion coming back at all says this context's own ring was
+/// serviced. And `SYS_QUEUE_INFO` answers **per vcore**, which is the cell-facing half: a
+/// context does not have to be told which ring is its own, and the same binary in two
+/// contexts is told about two different regions with no code that knows about vcores.
+///
+/// The overlay comes from the launcher rather than from the reported region because
+/// building one over a region is `QueuePair::attach`, which lives in kernel `.text` - a
+/// cell has no mapping for it (docs/TARGET-ARCHITECTURES.md 4.1).
+#[unsafe(link_section = ".user.text")]
+#[unsafe(no_mangle)]
+pub extern "C" fn user_vqueue(params_va: usize) -> ! {
+    let p = params_va as *mut Params;
+    // SAFETY: the cell's own mapped Params page (its entry argument), and `qp_addr` is
+    // this vcore's queue overlay, mapped into the cell by its launcher.
+    unsafe {
+        let qp = (*p).qp_addr as *const QueuePair;
+        let cap = (*p).cap_id as u32;
+        let mut ok = 0u64;
+        if (*qp).submit(OP_ECHO, cap, 0, (*p).workload) {
+            syscall(SYS_DOORBELL, 0);
+            if let Some(STATUS_OK) = (*qp).reap() {
+                ok = 1;
+            }
+        }
+        // Now the reported ring. Two `u64`s written straight over `ticks`/`ops` - adjacent,
+        // 8-aligned outputs this program has finished with - so nothing beyond the cell's
+        // own `Params` page needs mapping (the F1 pointer check requires a user VA).
+        if syscall4(
+            SYS_QUEUE_INFO,
+            core::ptr::addr_of_mut!((*p).ticks) as u64,
+            0,
+            0,
+            0,
+        ) != 0
+        {
+            syscall(SYS_EXIT, 2);
+        }
+        (*p).status = ok;
         syscall(SYS_EXIT, 0);
     }
     loop {}

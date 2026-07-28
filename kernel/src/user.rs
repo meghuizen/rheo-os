@@ -302,7 +302,14 @@ struct RunCell {
     aspace: *const AddressSpace,
     caps: *mut CapTable,
     objects: *const ObjectTable,
-    qp: *const QueuePair,
+    /// One **queue pair per vcore** (docs/SUBSTRATE.md S5). Slot 0 is the ring `install`
+    /// was handed; a vcore added by [`install_vcore`] brings its own.
+    ///
+    /// Per vcore because a ring is a single-producer structure: two contexts submitting
+    /// into one would have to serialise, and once they run on two cores that serialisation
+    /// is a cross-core write to shared indices - the cost the io_uring-per-thread shape
+    /// exists to avoid. With one ring each, a submission never leaves its own core.
+    vqp: [*const QueuePair; MAX_VCORES],
     /// One execution context per vcore (docs/SUBSTRATE.md pillar 3, [`MAX_VCORES`]).
     ///
     /// Slot 0 is the cell's original context - the frame `install` was handed, and the
@@ -323,10 +330,11 @@ struct RunCell {
     present: bool,
     personality: Personality,
     /// Base VA of the cell's mapped queue-pair region, reported by
-    /// `SYS_QUEUE_INFO` (docs/LIBRHEO.md). 0 = the cell has no mapped queue.
-    qp_va: u64,
-    /// 32-bit ABI id of the cell's QueuePair capability, reported alongside.
-    qp_cap_id: u32,
+    /// `SYS_QUEUE_INFO` (docs/LIBRHEO.md), **per vcore**: the calling context is told
+    /// about its own ring. 0 = that vcore has no mapped queue.
+    vqp_va: [u64; MAX_VCORES],
+    /// 32-bit ABI id of each vcore's QueuePair capability, reported alongside.
+    vqp_cap: [u32; MAX_VCORES],
     /// Next free VA for a typed memory-grant reservation (`SYS_GRANT`,
     /// docs/LIBRHEO.md Phase B). Per-cell so two cells' grants never collide.
     /// Next free VA for a file mmap (`SYS_MMAP_FILE`).
@@ -415,14 +423,14 @@ const EMPTY: RunCell = RunCell {
     aspace: core::ptr::null(),
     caps: core::ptr::null_mut(),
     objects: core::ptr::null(),
-    qp: core::ptr::null(),
+    vqp: [core::ptr::null(); MAX_VCORES],
     vframe: [core::ptr::null_mut(); MAX_VCORES],
     voutcome: [None; MAX_VCORES],
     nvcores: 0,
     present: false,
     personality: Personality::Native,
-    qp_va: 0,
-    qp_cap_id: 0,
+    vqp_va: [0; MAX_VCORES],
+    vqp_cap: [0; MAX_VCORES],
     chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
     vcpu: [NO_CPU; MAX_VCORES],
     node: frames::NODE_ANY,
@@ -1935,7 +1943,11 @@ pub unsafe fn install(
         aspace,
         caps,
         objects,
-        qp,
+        vqp: {
+            let mut q = [core::ptr::null(); MAX_VCORES];
+            q[0] = qp;
+            q
+        },
         // Vcore 0 is the frame the caller built; a fresh cell holds exactly one vcore,
         // and a launcher that wants more adds them with `install_vcore`.
         vframe: {
@@ -1947,8 +1959,8 @@ pub unsafe fn install(
         nvcores: 1,
         present: true,
         personality: Personality::Native,
-        qp_va: 0,
-        qp_cap_id: 0,
+        vqp_va: [0; MAX_VCORES],
+        vqp_cap: [0; MAX_VCORES],
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
         vcpu: [NO_CPU; MAX_VCORES],
         // Round-robin across the nodes the pool holds, so cells spread their
@@ -2019,15 +2031,20 @@ pub unsafe fn install(
 /// mechanism underneath, proven before anything is exposed - the order every capability
 /// in this tree landed in.
 ///
+/// `qp` is this vcore's **own** ring (docs/SUBSTRATE.md S5) - a ring is
+/// single-producer, so two contexts sharing one would have to serialise, and once they
+/// run on two cores that serialisation is a cross-core write to shared indices.
+///
 /// # Safety
-/// `frame` must outlive the cell's run, and no other vcore may share its user stack or
-/// kernel stack.
-pub unsafe fn install_vcore(idx: usize, frame: *mut TrapFrame) -> usize {
+/// `frame` must outlive the cell's run, and no other vcore may share its user stack,
+/// kernel stack or queue ring.
+pub unsafe fn install_vcore(idx: usize, frame: *mut TrapFrame, qp: *const QueuePair) -> usize {
     let c = &mut cells()[idx];
     assert!(c.present, "install_vcore on empty slot {idx}");
     let v = c.nvcores;
     assert!(v < MAX_VCORES, "cell {idx} already holds {v} vcore(s)");
     c.vframe[v] = frame;
+    c.vqp[v] = qp;
     c.voutcome[v] = None;
     c.vcpu[v] = NO_CPU;
     c.nvcores = v + 1;
@@ -2042,9 +2059,28 @@ pub unsafe fn install_vcore(idx: usize, frame: *mut TrapFrame) -> usize {
 /// (docs/LIBRHEO.md). `SYS_QUEUE_INFO` reports these so a loaded librheo cell
 /// can bind its ring. Call after `install`, before `run`.
 pub fn set_queue_info(idx: usize, qp_va: u64, cap_id: u32) {
+    set_vcore_queue_info(idx, 0, qp_va, cap_id);
+}
+
+/// [`set_queue_info`] for a named vcore (docs/SUBSTRATE.md S5): the ring that vcore's
+/// own `SYS_QUEUE_INFO` reports and its own `SYS_DOORBELL` drains.
+pub fn set_vcore_queue_info(idx: usize, v: usize, qp_va: u64, cap_id: u32) {
     assert!(cells()[idx].present, "set_queue_info on empty slot {idx}");
-    cells()[idx].qp_va = qp_va;
-    cells()[idx].qp_cap_id = cap_id;
+    cells()[idx].vqp_va[v] = qp_va;
+    cells()[idx].vqp_cap[v] = cap_id;
+    if v > 0 {
+        // Vcore 0's region is recorded by `install`; a later vcore's is recorded here.
+        // Recording matters: `SYS_MUNMAP` classifies an address by asking the cell's
+        // recorded layout, so an unrecorded ring is one a cell could free (docs/SMP.md,
+        // the kernel-owned-overlap allow-list).
+        record_region(
+            idx,
+            qp_va as usize,
+            QueuePair::REGION_SIZE,
+            crate::mm::vaspace::RegionKind::Queue,
+        );
+        return;
+    }
     record_region(
         idx,
         qp_va as usize,
@@ -2422,7 +2458,11 @@ pub unsafe fn install_spawned(
         // authority. Reaching an object still needs a capability in this cell's
         // own table.
         objects: p.objects,
-        qp,
+        vqp: {
+            let mut q = [core::ptr::null(); MAX_VCORES];
+            q[0] = qp;
+            q
+        },
         // Vcore 0 is the frame the caller built; a fresh cell holds exactly one vcore,
         // and a launcher that wants more adds them with `install_vcore`.
         vframe: {
@@ -2434,8 +2474,16 @@ pub unsafe fn install_spawned(
         nvcores: 1,
         present: true,
         personality: Personality::Native,
-        qp_va,
-        qp_cap_id,
+        vqp_va: {
+            let mut a = [0; MAX_VCORES];
+            a[0] = qp_va;
+            a
+        },
+        vqp_cap: {
+            let mut a = [0; MAX_VCORES];
+            a[0] = qp_cap_id;
+            a
+        },
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
         vcpu: [NO_CPU; MAX_VCORES],
         // The parent's node, not a fresh one: a spawned child shares the parent's
@@ -2508,7 +2556,7 @@ pub unsafe fn install_forked(
         aspace,
         caps: owned_caps(idx),
         objects: p.objects,
-        qp: p.qp,
+        vqp: p.vqp,
         // Vcore 0 is the frame the caller built; a fresh cell holds exactly one vcore,
         // and a launcher that wants more adds them with `install_vcore`.
         vframe: {
@@ -2520,8 +2568,8 @@ pub unsafe fn install_forked(
         nvcores: 1,
         present: true,
         personality: Personality::Linux,
-        qp_va: 0,
-        qp_cap_id: 0,
+        vqp_va: [0; MAX_VCORES],
+        vqp_cap: [0; MAX_VCORES],
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
         vcpu: [NO_CPU; MAX_VCORES],
         // The parent's node, and here it is not a preference but a fact: `fork` is
@@ -2727,16 +2775,20 @@ pub fn on_user_trap(
     match nr {
         SYS_DOORBELL => {
             let cell = cells()[cur];
+            // **This vcore's own ring** (docs/SUBSTRATE.md S5): a doorbell drains the ring
+            // the caller submitted into, which is the caller's, not the cell's first.
+            let qp = cell.vqp[current_vcore()];
             // SAFETY: the pointers were validated at install time. During the
             // trap the cell's address space is active, so a queue mapped at a
             // user VA (a loaded librheo cell) is reachable here.
-            let n = unsafe { queue::kernel_process(&*cell.qp, &mut *cell.caps, &*cell.objects) };
+            let n = unsafe { queue::kernel_process(&*qp, &mut *cell.caps, &*cell.objects) };
             arch::set_syscall_ret(unsafe { &mut *frame }, n as u64);
             frame
         }
         SYS_QUEUE_INFO => {
             let cell = cells()[cur];
-            let ret = match (cell.qp_va, user_out::<QueueInfo>(arg)) {
+            let v = current_vcore();
+            let ret = match (cell.vqp_va[v], user_out::<QueueInfo>(arg)) {
                 // SAFETY: `out` was checked by `user_out` (non-null, aligned,
                 // inside the running cell's user VA range) and the cell's
                 // address space is active for the trap.
@@ -2744,7 +2796,7 @@ pub fn on_user_trap(
                     unsafe {
                         out.write(QueueInfo {
                             qp_va,
-                            cap_id: cell.qp_cap_id as u64,
+                            cap_id: cell.vqp_cap[v] as u64,
                         });
                     }
                     0

@@ -1044,8 +1044,39 @@ there. Ownership is stamped where the run-mark is won now - the reasoning `count
 beside it already carried - and the per-CPU entry guard named the pair rather than letting it
 corrupt downstream.
 
-**Still not done** and named: a vcore that forks or takes a signal, per-vcore queue pairs
-(docs/SUBSTRATE.md S5), and the last-vcore-out exit rule above.
+**A queue pair per vcore** (docs/SUBSTRATE.md S5) - the third rung, unblocked by the
+second. A submission queue is **single-producer**: two contexts sharing one must serialise
+their submissions, and once those contexts run on two cores that serialisation is a
+cross-core write to shared ring indices - the cost the io_uring-per-thread shape exists to
+avoid. So `RunCell` holds `vqp`/`vqp_va`/`vqp_cap` arrays, `SYS_DOORBELL` drains the ring of
+the **calling** vcore, `SYS_QUEUE_INFO` reports the calling vcore's own region and
+capability, and `install_vcore` takes the new context's ring alongside its frame. Slot 0 is
+what `install` was handed, so a single-vcore cell is unchanged.
+
+The cell-facing shape is the point: a context does not have to be *told* which ring is its
+own. It asks, and the answer is per vcore - so the same binary in two contexts binds two
+different regions with no code in it that knows vcores exist.
+
+**The proof** (the `smp` kernel's per-vcore-queue phase, all three ISAs) makes two separate
+claims. The rings are **disjoint**: each vcore reports a different region VA and a different
+capability id, each matching what its launcher initialised - a per-cell ring reports one VA
+twice, and reverting `SYS_QUEUE_INFO` to `vqp_va[0]`/`vqp_cap[0]` fails on the capability
+(observed). And each ring **completed its own round trip on its own core**: both vcores go
+into the placement queue, each submits an `OP_ECHO`, rings its own doorbell and reaps
+`STATUS_OK`, and the two are asserted to have run on different CPUs - reverting the doorbell
+to `vqp[0]` leaves vcore 1's round trip uncompleted (observed). Together those say a
+submission never left its core: there was no shared ring for it to cross into.
+
+Honest: the ring **overlay** a cell submits through still comes from its launcher, because
+building one over a region is `QueuePair::attach`, which lives in kernel `.text` that a cell
+has no mapping for - so `SYS_QUEUE_INFO` proves per-vcore *reporting* while the round trip
+proves per-vcore *servicing*, and the two are asserted separately rather than conflated. And
+`load::map_queue` still places one ring at `USER_QUEUE_VA`: a **loaded** cell asking for a
+second vcore needs `USER_QUEUE_VA + v * REGION_SIZE`, which is one line and is deliberately
+not written until a loaded cell asks, since nothing would test it.
+
+**Still not done** and named: a vcore that forks or takes a signal, the last-vcore-out exit
+rule above, and the loaded-cell ring placement just named.
 
 **The proof** (the `smp` kernel's two-vcore phase, all three ISAs): two vcores of **one**
 cell go into the placement queue and whichever cores are free claim them. Both are

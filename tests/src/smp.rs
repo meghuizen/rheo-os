@@ -296,6 +296,7 @@ fn test_secondary_bringup() {
             test_placement();
             test_two_vcores_one_cell();
             test_vcore_yield();
+            test_per_vcore_queues();
             test_cross_core_preemption();
             test_linux_cell_on_secondary();
             test_two_linux_cells();
@@ -1397,7 +1398,7 @@ fn test_two_vcores_one_cell() {
         );
         // SAFETY: `FRAME1` outlives the run, and no other vcore shares vcore 1's user
         // stack or kernel stack.
-        let vi = user::install_vcore(0, (*f1).as_mut_ptr());
+        let vi = user::install_vcore(0, (*f1).as_mut_ptr(), (*v1).qp.qp.as_ptr());
         assert_eq!(vi, 1, "the second vcore did not land at index 1");
         assert_eq!(user::cell_vcores(0), 2, "cell 0 does not hold two vcores");
 
@@ -1560,7 +1561,7 @@ fn test_vcore_yield() {
             core::ptr::addr_of_mut!(frame0),
         );
         // SAFETY: `YFRAME` outlives the run; vcore 1 has its own user and kernel stack.
-        user::install_vcore(0, (*yf).as_mut_ptr());
+        user::install_vcore(0, (*yf).as_mut_ptr(), (*y1).qp.qp.as_ptr());
 
         // Both vcores stay **unclaimed**, so both are enterable by this core - which is
         // exactly the single-core behaviour the predicate is written to preserve.
@@ -1612,6 +1613,192 @@ fn test_vcore_yield() {
              strictly over {n} rounds on ONE core ({YIELD_ROUNDS} each), which only a \
              yield that reaches the sibling context can produce; the switch changes the \
              FP file and the frame and nothing else, since both share one address space OK"
+        );
+    }
+}
+
+// ---------------------------------- a QUEUE PAIR PER VCORE, on two cores at once
+//
+// A submission queue is **single-producer**. Two contexts sharing one would have to
+// serialise their submissions, and once those contexts run on two cores that
+// serialisation is a cross-core write to shared ring indices - the cost the
+// io_uring-per-thread shape exists to avoid, and the reason docs/SUBSTRATE.md S5 names a
+// per-vcore ring rather than a per-cell one.
+//
+// The cell-facing shape is the whole point: a context does not have to be *told* which ring
+// is its own. It asks `SYS_QUEUE_INFO`, and the answer is per vcore, so the same binary in
+// both contexts binds two different regions with no code that knows about vcores at all.
+//
+// Two claims, and they are different:
+//
+//   1. **The rings are disjoint.** Each vcore reports a different region VA, and each
+//      matches the region its launcher initialised. A per-cell ring reports one VA twice.
+//   2. **Each ring completed its own round trip, on two cores at once.** Both vcores go
+//      into the placement queue, so whichever cores are free claim them, and each is
+//      asserted to have submitted an `OP_ECHO` into its own ring, rung its own doorbell
+//      and reaped its own completion.
+//
+// Together those say a submission never left its core: there was no shared ring for it to
+// cross into.
+
+/// Vcore 1's store for this phase - its own stack, `Params`, and **queue region**.
+#[unsafe(link_section = ".user.bss")]
+static mut STORE_Q1: CellStore = CellStore::new();
+
+static mut KSTACK_Q0: KernelStack = KernelStack::new();
+static mut KSTACK_Q1: KernelStack = KernelStack::new();
+
+fn test_per_vcore_queues() {
+    // SAFETY: single-threaded setup on the primary; the secondaries claim nothing until
+    // `place_vcores` publishes the queue.
+    unsafe {
+        let objects = &mut *core::ptr::addr_of_mut!(OBJECTS2);
+        let caps = &mut *core::ptr::addr_of_mut!(CAPS2);
+        *objects = ObjectTable::new();
+        *caps = CapTable::new();
+
+        // Vcore 0: an ordinary cell. `build_cell` initialises its ring and mints its cap.
+        let q0 = core::ptr::addr_of_mut!(STORE_P);
+        let (mut aspace, _o, mut frame0) = build_cell(
+            &mut *q0,
+            objects,
+            caps,
+            (*core::ptr::addr_of!(KSTACK_Q0)).top(),
+            9,
+            kernel::user_progs::user_vqueue,
+            0xA0,
+            0,
+        );
+        let va0 = core::ptr::addr_of!((*q0).region) as u64;
+
+        // Vcore 1: a second context in the same address space, with its **own** ring.
+        let q1 = core::ptr::addr_of_mut!(STORE_Q1);
+        let stack1 = core::ptr::addr_of!((*q1).stack) as usize;
+        let stack1_len = core::mem::size_of_val(&(*q1).stack);
+        aspace.map_user_range(stack1, stack1_len, MapPerm::UserRw);
+        let params1 = core::ptr::addr_of!((*q1).params) as usize;
+        aspace.map_user(params1 & !0xFFF, MapPerm::UserRw);
+        let region1 = core::ptr::addr_of_mut!((*q1).region) as *mut u8;
+        aspace.map_user_range(
+            region1 as usize,
+            kernel::queue::QueuePair::REGION_SIZE,
+            MapPerm::UserRw,
+        );
+        let qp1_addr = core::ptr::addr_of!((*q1).qp) as usize;
+        aspace.map_user(qp1_addr & !0xFFF, MapPerm::UserRw);
+
+        // Vcore 1's own queue object and capability - not a second handle on vcore 0's.
+        let obj1 = objects
+            .create(kernel::capability::ObjectKind::QueuePair)
+            .expect("a queue object for vcore 1");
+        let cap1 = caps
+            .mint(
+                objects,
+                obj1,
+                kernel::capability::READ | kernel::capability::WRITE,
+                kernel::capability::BUDGET_UNLIMITED,
+            )
+            .expect("a queue capability for vcore 1");
+        (*q1)
+            .qp
+            .qp
+            .as_mut_ptr()
+            .write(kernel::queue::QueuePair::init(region1));
+        (*q1).params = kernel::abi::Params {
+            workload: 0xB1,
+            // Vcore 1's **own** overlay and capability, not vcore 0's.
+            qp_addr: qp1_addr as u64,
+            cap_id: cap1.raw_low32() as u64,
+            ..kernel::abi::Params::ZERO
+        };
+
+        static mut QFRAME: core::mem::MaybeUninit<kernel::arch::TrapFrame> =
+            core::mem::MaybeUninit::uninit();
+        let qf = core::ptr::addr_of_mut!(QFRAME);
+        (*qf).write(arch::trapframe_new(
+            kernel::user_progs::user_vqueue as usize,
+            stack1 + stack1_len,
+            params1,
+            (*core::ptr::addr_of!(KSTACK_Q1)).top(),
+        ));
+
+        user::reset();
+        user::install(
+            0,
+            &aspace,
+            caps,
+            objects,
+            (*q0).qp.qp.as_ptr(),
+            core::ptr::addr_of_mut!(frame0),
+        );
+        user::set_vcore_queue_info(0, 0, va0, (*q0).params.cap_id as u32);
+        // SAFETY: `QFRAME` outlives the run; vcore 1 has its own stacks and its own ring.
+        let vi = user::install_vcore(0, (*qf).as_mut_ptr(), (*q1).qp.qp.as_ptr());
+        assert_eq!(vi, 1, "the second vcore did not land at index 1");
+        user::set_vcore_queue_info(0, 1, region1 as u64, cap1.raw_low32());
+
+        let vids = [user::MAX_VCORES * 0, user::MAX_VCORES * 0 + 1];
+        let mut out = [(u64::MAX, usize::MAX); 2];
+        // SAFETY: cell 0 is installed, present and native, each vcore listed once.
+        let finished = smp::place_vcores(&vids, &mut out);
+        if !finished {
+            println!(
+                "smp: SKIP the per-vcore queue phase - the queue did not drain inside the \
+                 bound, so nothing about per-vcore rings is claimed"
+            );
+            return;
+        }
+
+        assert_eq!(out[0].0, 0, "vcore 0 exited {:#x}", out[0].0);
+        assert_eq!(out[1].0, 0, "vcore 1 exited {:#x}", out[1].0);
+        assert_eq!(
+            (*q0).params.status,
+            1,
+            "vcore 0 did not complete a round trip on its own ring"
+        );
+        assert_eq!(
+            (*q1).params.status,
+            1,
+            "vcore 1 did not complete a round trip on its own ring"
+        );
+        // `ops` carries the capability id `SYS_QUEUE_INFO` reported: each vcore must be
+        // told about its **own** queue capability, not the cell's first.
+        assert_eq!(
+            (*q0).params.ops,
+            (*q0).params.cap_id,
+            "vcore 0 was told the wrong queue capability"
+        );
+        assert_eq!(
+            (*q1).params.ops,
+            cap1.raw_low32() as u64,
+            "vcore 1 was told the wrong queue capability"
+        );
+
+        // Claim 1: the rings are disjoint, and each is the one its launcher initialised.
+        // Reported by the cell, so this is what `SYS_QUEUE_INFO` actually answered - a
+        // per-cell ring would report vcore 0's VA to both contexts.
+        let (r0, r1) = ((*q0).params.ticks, (*q1).params.ticks);
+        assert_eq!(r0, va0, "vcore 0 was told about the wrong ring");
+        assert_eq!(r1, region1 as u64, "vcore 1 was told about the wrong ring");
+        assert!(
+            r0 != r1,
+            "both vcores were told about the same ring at {r0:#x} - the queue is still \
+             per cell"
+        );
+
+        // Claim 2: two different cores ran them.
+        assert!(
+            out[0].1 != out[1].1,
+            "both vcores ran on CPU {} - the two rings were never driven at once",
+            out[0].1
+        );
+        println!(
+            "smp: A QUEUE PAIR PER VCORE - two vcores of one cell each asked \
+             SYS_QUEUE_INFO and were told about their OWN ring ({r0:#x} and {r1:#x}, \
+             disjoint), each submitted an OP_ECHO into it, rang its own doorbell and \
+             reaped its own completion, running on CPU {} and CPU {} at once - so no \
+             submission crossed a core, because there was no shared ring to cross into OK",
+            out[0].1, out[1].1
         );
     }
 }

@@ -2100,9 +2100,33 @@ no log, `SYS_ARM_TIMER returned 47, want 0`); and `drain_cells` stamped per-vcor
 for a whole batch *before* winning any run-mark, so a core holding two vcores of one cell
 could enter the sibling while the stealer that took it was already inside - ownership is
 stamped where the run-mark is won now, the reasoning `count_claim` beside it already carried,
-and the per-CPU entry guard named the pair instead of letting it corrupt downstream. Still
-named as not done: a vcore that forks or takes a signal, per-vcore queue pairs (SUBSTRATE.md
-S5), and the last-vcore-out exit rule.
+and the per-CPU entry guard named the pair instead of letting it corrupt downstream. 
+**And each vcore has its own queue pair** (docs/SUBSTRATE.md S5, docs/SMP.md 10.0a): a
+submission queue is **single-producer**, so two contexts sharing one must serialise their
+submissions - and once those contexts run on two cores that serialisation is a cross-core
+write to shared ring indices, the cost the io_uring-per-thread shape exists to avoid. So
+`RunCell` holds `vqp`/`vqp_va`/`vqp_cap` arrays, `SYS_DOORBELL` drains the ring of the
+**calling** vcore, `SYS_QUEUE_INFO` reports the calling vcore's own region and capability,
+and `install_vcore` takes the new context's ring beside its frame (slot 0 is what `install`
+was handed, so a single-vcore cell is unchanged). The cell-facing shape is the point: a
+context does not have to be *told* which ring is its own - it asks, and the answer is per
+vcore, so the same binary in two contexts binds two different regions with no code in it
+that knows vcores exist. Proven on **all three ISAs** as two separate claims: the rings are
+**disjoint** (each vcore reports a different region VA and a different capability id, each
+matching what its launcher initialised - reverting `SYS_QUEUE_INFO` to `vqp_va[0]` fails on
+the capability, observed), and each ring **completed its own round trip on its own core**
+(both vcores go into the placement queue, each submits an `OP_ECHO`, rings its own doorbell
+and reaps `STATUS_OK`, and the two are asserted to have run on different CPUs - reverting
+the doorbell to `vqp[0]` leaves vcore 1's round trip uncompleted, observed). Together those
+say a submission never left its core: there was no shared ring to cross into. Honest: the
+ring **overlay** a cell submits through still comes from its launcher, because building one
+over a region is `QueuePair::attach`, which lives in kernel `.text` a cell has no mapping
+for - so `SYS_QUEUE_INFO` proves per-vcore *reporting* while the round trip proves per-vcore
+*servicing*, asserted separately rather than conflated; and `load::map_queue` still places
+one ring at `USER_QUEUE_VA`, so a **loaded** cell wanting a second vcore needs
+`USER_QUEUE_VA + v * REGION_SIZE` - one line, deliberately unwritten until a loaded cell
+asks, since nothing would test it. Still named as not done: a vcore that forks or takes a
+signal, the last-vcore-out exit rule, and that loaded-cell ring placement.
 
 **Honest scope:** preemption is *within* a core's own claim and rebalancing moves only
 **unstarted** cells. Migrating a *running* one was **attempted twice and reverted twice**, with four findings
@@ -2646,7 +2670,10 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               requirements the phase cannot detect; then a **VCORE YIELDING TO ITS
               SIBLING** - two vcores of one cell alternating strictly over 12 rounds
               on ONE core, the oracle only a yield that reaches the sibling context
-              can produce (docs/SMP.md 10.0a); then an
+              can produce; then **A QUEUE PAIR PER VCORE** - two vcores of one cell
+              told about their own disjoint rings by `SYS_QUEUE_INFO`, each
+              completing its own `OP_ECHO` round trip through its own doorbell on
+              its own core (docs/SMP.md 10.0a); then an
               **unmodified static-glibc binary as a Linux cell on a secondary**,
               exact stdout + exit asserted, overlapping a native cell on the
               primary; then **two Linux cells on two cores at once**, each
