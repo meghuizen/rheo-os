@@ -92,3 +92,7 @@ secondary_stack2:
     .space 16 * 1024
 .global secondary_stack2_top
 secondary_stack2_top:
+secondary_stack3:
+    .space 16 * 1024
+.global secondary_stack3_top
+secondary_stack3_top:

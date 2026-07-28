@@ -489,8 +489,10 @@ the interrupt vector writes.
   exclusion (there is no concurrent writer): a lock that failed to serialise the
   read-modify-write would lose updates and fall short. This is the primitive the
   phase-2 kernel-wide locks (§10.2) rest on, proven before they are built on it.
-- **Start-all: a *second* secondary on RISC-V** - three cores online at once (boot +
-  two secondaries), the first slice of §10.3/§10.7-step-2. Bring-up is **sequential**
+- **Start-all: all of RISC-V's cores** - four online at once (boot + three
+  secondaries, matching QEMU's `-smp 4`), the first slice of §10.3/§10.7-step-2. Each
+  secondary claims a distinct registry slot and hardware id (1, 2, 3). Bring-up is
+  **sequential**
   (the primary waits for secondary N online before releasing N+1), so the per-CPU stack
   hand-off is race-free: each secondary loads its own stack top from a shared
   `secondary_sp` word the primary sets before each `hart_start` (arch hook
