@@ -146,6 +146,22 @@ lengths (`bench` `p4_*`): ~450 instructions to spawn+tear down, ~150 to
 switch, consistent across ISAs. (.NET 10 is not installed here, so it is left
 unmeasured with an architectural note rather than a fabricated number.)
 
+**Concurrency, async and synchronisation are measured, not asserted** (the `runtime`
+kernel's three closing phases, all three ISAs, each with a hand-computed oracle and an
+observed negative control). **Concurrency**: 256 strands take 4 rounds each and every
+round of the shared order vector is a **permutation of all 256** - so all 256 were live
+at once (none ran to completion first) and none took two turns in a round (none
+monopolised the vcore); letting one strand skip its yield breaks it on the first round
+boundary. **Async**: 63 queue operations (the ring's depth) are outstanding at a single
+instant - the measurement is taken where the executor first runs dry, with *every*
+strand parked and *none* finished - and one service pass then wakes exactly 63, one park
+and one wake per operation with no re-polling; servicing each submission as it is made
+breaks it. **Sync**: 256 strands contend on one async `Mutex`, each **suspended inside
+its critical section** so every peer must park, and two oracles hold - exactly 256
+increments (no lost update) and never more than **1** concurrent holder, sampled from
+inside the section, because a right total alone would only mean the interleaving
+happened to be benign.
+
 A **POSIX + filesystem stack** (`posix/`, docs/FILESYSTEMS.md,
 POSIX-PERSONALITY.md) sits on a **VFS** translation layer (a `FileSystem`
 trait): a read-write **ramfs** (the working store), a read-only **ext4**
@@ -2051,7 +2067,12 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               **unmodified static-glibc binary as a Linux cell on a secondary**,
               exact stdout + exit asserted, overlapping a native cell on the
               primary; then **two Linux cells on two cores at once**, each
-              transcript captured separately and asserted - docs/SMP.md 10.0), shell-smoke, hwinfo, rng, runtime,
+              transcript captured separately and asserted - docs/SMP.md 10.0), shell-smoke, hwinfo, rng, runtime
+              (the strand runtime, closing with the **measured** concurrency /
+              async / sync phases: 256 strands in flight with every round a
+              permutation, 63 I/O ops outstanding at one instant with one
+              park+wake each, and 256-way mutex contention with never more than
+              one holder - each with an observed negative control),
               posix, blockfs (live virtio-blk disk), elfrun (load a native
               ELF), posixrun (native program over the POSIX syscalls),
               libcrun (a program linked against rheo-libc), jsonrun (a

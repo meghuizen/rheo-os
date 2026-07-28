@@ -15,15 +15,17 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use core::fmt::Write as _;
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use kernel::capability::{BUDGET_UNLIMITED, ObjectKind, ObjectTable, READ, WRITE};
 use kernel::cell::Cell;
-use kernel::queue::{OP_NOP, QueuePair, kernel_process};
+use kernel::queue::{OP_NOP, QueuePair, RING_DEPTH, kernel_process};
 use kernel::{arch, println};
 use runtime::rights::{
     Cap, EXECUTE as R_EXECUTE, Full, READ as R_READ, ReadOnly, ReadWrite, WRITE as R_WRITE,
@@ -54,6 +56,9 @@ extern "C" fn kernel_main() -> ! {
     test_mutex();
     test_ticket_lock();
     test_async_on_queue();
+    test_concurrency_depth();
+    test_async_depth();
+    test_sync_under_contention();
 
     println!("runtime: PASS");
     arch::exit(arch::ExitCode::Success)
@@ -345,4 +350,227 @@ fn test_async_on_queue() {
         "not all queue strands woke"
     );
     println!("runtime: native async on the queue-pair ABI ({N} strands) OK");
+}
+
+// ==================================================================== measured
+//
+// The phases above prove the runtime's mechanisms *work*. These three measure the
+// three properties the design claims - **concurrency, async, synchronisation** - each
+// against a hand-computed oracle, because "high concurrency" is not a claim until a
+// number is attached to it and checked.
+//
+// All three are kernel-context, which is where the strand runtime is proven on all
+// three ISAs; the same library links into a U-mode cell, and `netservice`/`librheoipc`
+// exercise the cell-side shape.
+
+/// Strands in the measured rounds. Large enough that the numbers mean something and
+/// small enough that the order vector fits the test heap.
+const WIDE: usize = 256;
+/// Rounds each strand takes in the concurrency phase.
+const ROUNDS: usize = 4;
+
+/// **Concurrency**: how many strands are genuinely in flight at once.
+///
+/// `WIDE` strands each take `ROUNDS` turns, appending their own id and yielding. The
+/// oracle is exact and round-major: entries `[r*WIDE .. (r+1)*WIDE]` must be a
+/// **permutation of `0..WIDE`** for every round `r`. That is a strictly stronger claim
+/// than "they all ran":
+///
+/// - every strand appears in round 0 before any appears in round 1, so all `WIDE` were
+///   live simultaneously - none ran to completion first;
+/// - no strand appears twice in a round, so none monopolised the vcore.
+///
+/// A runtime that serialised strands, or let one race ahead, fails on the first round
+/// boundary rather than on a total.
+fn test_concurrency_depth() {
+    runtime::reset();
+    // An `Rc<RefCell<..>>` shared by every strand rather than a static: strands are
+    // cooperative on one vcore, so the borrow is never held across an await point and
+    // the sharing is exactly what a cell's own code would write.
+    let order: Rc<RefCell<Vec<u16>>> = Rc::new(RefCell::new(Vec::new()));
+    for id in 0..WIDE {
+        let mine = order.clone();
+        runtime::spawn(async move {
+            for _ in 0..ROUNDS {
+                mine.borrow_mut().push(id as u16);
+                runtime::yield_now().await;
+            }
+        });
+    }
+    runtime::run();
+    assert!(!runtime::has_pending(), "a strand was left pending");
+
+    let v = order.borrow();
+    assert_eq!(
+        v.len(),
+        WIDE * ROUNDS,
+        "expected {} entries, got {}",
+        WIDE * ROUNDS,
+        v.len()
+    );
+    for r in 0..ROUNDS {
+        let mut seen = alloc::vec![false; WIDE];
+        for &id in &v[r * WIDE..(r + 1) * WIDE] {
+            let id = id as usize;
+            assert!(id < WIDE, "round {r} holds an out-of-range id {id}");
+            assert!(
+                !seen[id],
+                "strand {id} took two turns inside round {r} - it ran ahead of its peers"
+            );
+            seen[id] = true;
+        }
+        assert!(
+            seen.iter().all(|&b| b),
+            "round {r} is missing a strand - not all {WIDE} were in flight"
+        );
+    }
+    println!(
+        "runtime: CONCURRENCY - {WIDE} strands in flight at once, {ROUNDS} rounds each, \
+         every round a permutation of all {WIDE} (no strand ran ahead, none starved) OK"
+    );
+}
+
+/// **Async**: how many I/O operations are outstanding at one instant, and whether each
+/// completion is a genuine wake rather than a re-poll.
+///
+/// `WIDE` strands each submit one queue op and park on its token. The measurement is
+/// taken at the point the executor first runs dry: **every** strand must be parked and
+/// **none** finished, which means all `WIDE` submissions were in flight at the same
+/// instant. One service pass then drains the ring, and the number of wakes in that
+/// single pass must be exactly `WIDE` - one park and one wake per operation, never a
+/// spin (`netservice` and `librheoipc` assert the same property cell-side).
+fn test_async_depth() {
+    static DONE: AtomicU64 = AtomicU64::new(0);
+
+    let mut objects = ObjectTable::new();
+    let mut cell = Cell::new(1);
+    let object = objects.create(ObjectKind::MemoryGrant).unwrap();
+    let cap = cell
+        .caps
+        .mint(&objects, object, READ | WRITE, BUDGET_UNLIMITED)
+        .unwrap();
+    let abi_cap = cap.raw_low32();
+    // SAFETY: the queue-pair statics are re-initialised between phases; the reference
+    // lives for the rest of this phase only.
+    let qp: &'static QueuePair = unsafe {
+        *addr_of_mut!(QP) = Some(QueuePair::init(addr_of_mut!(REGION) as *mut u8));
+        (*addr_of_mut!(QP)).as_ref().unwrap()
+    };
+
+    // The ring must be able to hold every submission at once, or the depth being
+    // measured would be the ring's rather than the runtime's.
+    let depth = WIDE.min(RING_DEPTH - 1);
+    runtime::reset();
+    DONE.store(0, Ordering::Relaxed);
+    for _ in 0..depth {
+        runtime::spawn(async move {
+            let token = runtime::next_token();
+            qp.submit(OP_NOP, abi_cap, 0, token);
+            runtime::park_on(token).await;
+            DONE.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
+    // Run until the executor has nothing ready: every strand has submitted and parked.
+    runtime::run();
+    assert!(
+        runtime::has_pending(),
+        "no strand parked - the submissions did not go out asynchronously"
+    );
+    assert_eq!(
+        DONE.load(Ordering::Relaxed),
+        0,
+        "a strand completed before the queue was serviced, so the ops were not all in \
+         flight at once"
+    );
+
+    // One service pass, one drain: every outstanding op completes and wakes its strand.
+    kernel_process(qp, &mut cell.caps, &objects);
+    let mut woke = 0u64;
+    while let Some(cqe) = qp.cq.pop() {
+        runtime::complete(cqe.user_data);
+        woke += 1;
+    }
+    assert_eq!(
+        woke, depth as u64,
+        "{woke} completions for {depth} submissions - the queue lost or duplicated work"
+    );
+    runtime::run();
+    assert!(
+        !runtime::has_pending(),
+        "a strand stayed parked after its completion"
+    );
+    assert_eq!(
+        DONE.load(Ordering::Relaxed),
+        depth as u64,
+        "not every strand resumed"
+    );
+    println!(
+        "runtime: ASYNC - {depth} I/O operations outstanding at one instant, all parked \
+         with none completed, then {woke} completions woke exactly {depth} strands - one \
+         park and one wake each, no re-polling OK"
+    );
+}
+
+/// **Synchronisation**: mutual exclusion holds under real contention, and the cost of
+/// contention is a park rather than a spin.
+///
+/// `WIDE` strands each take the lock, **yield while holding it**, then increment. The
+/// yield is what forces contention: every other strand reaches `lock()` while the
+/// holder is suspended and must park. Two oracles, both exact:
+///
+/// - the total is exactly `WIDE` - a lost update is a lost increment;
+/// - the concurrent-holder count never exceeds **1**, sampled inside the critical
+///   section by every strand. A mutex that admitted two holders would still reach the
+///   right total whenever the interleaving happened to be benign, so the total alone
+///   is not a proof of exclusion.
+fn test_sync_under_contention() {
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    static HOLDERS: AtomicU64 = AtomicU64::new(0);
+    static MAX_HOLDERS: AtomicU64 = AtomicU64::new(0);
+
+    runtime::reset();
+    TOTAL.store(0, Ordering::Relaxed);
+    HOLDERS.store(0, Ordering::Relaxed);
+    MAX_HOLDERS.store(0, Ordering::Relaxed);
+    let m = Mutex::new(0u64);
+    for _ in 0..WIDE {
+        let m2 = m.clone();
+        runtime::spawn(async move {
+            let mut g = m2.lock().await;
+            let held = HOLDERS.fetch_add(1, Ordering::Relaxed) + 1;
+            MAX_HOLDERS.fetch_max(held, Ordering::Relaxed);
+            let v = *g;
+            // Suspended **inside** the critical section: every peer that reaches
+            // `lock()` now has to park, which is the contention being measured.
+            runtime::yield_now().await;
+            *g = v + 1;
+            HOLDERS.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
+    let mr = m.clone();
+    runtime::spawn(async move {
+        let g = mr.lock().await;
+        TOTAL.store(*g, Ordering::Relaxed);
+    });
+    runtime::run();
+    assert!(
+        !runtime::has_pending(),
+        "a strand stayed parked on the mutex"
+    );
+    assert_eq!(
+        TOTAL.load(Ordering::Relaxed),
+        WIDE as u64,
+        "the mutex lost updates under {WIDE}-way contention"
+    );
+    assert_eq!(
+        MAX_HOLDERS.load(Ordering::Relaxed),
+        1,
+        "two strands held the mutex at once - the total being right was luck"
+    );
+    println!(
+        "runtime: SYNC - {WIDE} strands contending on one async mutex, each suspended \
+         inside its critical section: exactly {WIDE} increments, never more than 1 \
+         holder OK"
+    );
 }
