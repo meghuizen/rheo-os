@@ -108,7 +108,6 @@ const MMAP_BASE: usize = 0x3_0000_0000;
 /// overflow check was already producing, i.e. it passed with this ceiling deleted; it
 /// was removed rather than kept as decoration (docs/ENGINEERING.md 1).
 const MMAP_TOP: usize = crate::load::USER_QUEUE_VA;
-static mut MMAP_NEXT: usize = MMAP_BASE;
 
 // Errno values the capability verbs report. Small local constants rather than a
 // dependency on `linux::errno`: these are the *native* ABI, and the native
@@ -254,9 +253,7 @@ struct RunCell {
     qp_cap_id: u32,
     /// Next free VA for a typed memory-grant reservation (`SYS_GRANT`,
     /// docs/LIBRHEO.md Phase B). Per-cell so two cells' grants never collide.
-    grant_next: usize,
     /// Next free VA for a file mmap (`SYS_MMAP_FILE`).
-    filemmap_next: usize,
     /// The cell's cross-cell shared-channel ends, reported by `SYS_CONNECT`
     /// (docs/LIBRHEO.md Phase E; the multi-slot table is docs/NETSTACK.md the
     /// service-cell section, rheo-net N4a). Slot 0 is the Phase E/J channel; a
@@ -305,8 +302,6 @@ const EMPTY: RunCell = RunCell {
     personality: Personality::Native,
     qp_va: 0,
     qp_cap_id: 0,
-    grant_next: GRANT_BASE,
-    filemmap_next: FILEMMAP_BASE,
     chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
     cpu: NO_CPU,
 };
@@ -621,7 +616,6 @@ pub fn reset() {
     *cells() = [EMPTY; MAX_CELLS];
     // SAFETY: single CPU, between runs.
     unsafe {
-        *core::ptr::addr_of_mut!(MMAP_NEXT) = MMAP_BASE;
         *core::ptr::addr_of_mut!(CELL_GRANTS) = [[EMPTY_GRANT; MAX_GRANTS_PER_CELL]; MAX_CELLS];
         *core::ptr::addr_of_mut!(CELL_RES) = [[EMPTY_RES; MAX_RES_PER_CELL]; MAX_CELLS];
         *core::ptr::addr_of_mut!(CELL_ADMISSION) = [EMPTY_ADMISSION; MAX_CELLS];
@@ -1002,18 +996,25 @@ fn mmap_anon(cur: usize, len: usize) -> usize {
         return 0;
     }
     let pages = len.div_ceil(frames::FRAME_SIZE);
-    let base = unsafe { *core::ptr::addr_of!(MMAP_NEXT) };
-    let Some(top) = pages
-        .checked_mul(frames::FRAME_SIZE)
-        .and_then(|b| base.checked_add(b))
-    else {
+    let Some(bytes) = pages.checked_mul(frames::FRAME_SIZE) else {
         return 0;
     };
-    // Refuse rather than grow into the queue region above (see [`MMAP_TOP`]).
-    if top > MMAP_TOP {
+    // Placed by the allocator inside the anonymous-mmap window. This also retires the
+    // **global** cursor this path used to share across every cell in a boot - the space
+    // is now per cell, which is what a per-cell allocator means.
+    let Ok(base) = cell_va(cur).reserve_in(
+        MMAP_BASE,
+        MMAP_TOP,
+        bytes,
+        frames::FRAME_SIZE,
+        crate::mm::vaspace::RegionKind::Anon,
+        0,
+    ) else {
         return 0;
-    }
-    if !user_write_ok(base as u64, top - base) || !charge_frames(cur, pages) {
+    };
+    let top = base + bytes;
+    if !user_write_ok(base as u64, bytes) || !charge_frames(cur, pages) {
+        cell_va(cur).release_at(base);
         return 0;
     }
     let cell = cells()[cur];
@@ -1030,15 +1031,14 @@ fn mmap_anon(cur: usize, len: usize) -> usize {
     // Publish the new mappings on the active root (fence / tlbi / cr3 reload).
     aspace.activate();
     if got < pages {
-        // Exhausted despite the reserve: roll the whole request back.
+        // Exhausted despite the reserve: roll the whole request back, the reservation
+        // included.
         unmap_range(base, got * frames::FRAME_SIZE);
         uncharge_frames(cur, pages - got);
+        cell_va(cur).release_at(base);
         return 0;
     }
-    unsafe {
-        *core::ptr::addr_of_mut!(MMAP_NEXT) = top;
-    }
-    record_region(cur, base, top - base, crate::mm::vaspace::RegionKind::Anon);
+    let _ = top;
     base
 }
 
@@ -1099,17 +1099,21 @@ fn grant_create(cur: usize, out_va: u64, len: usize, kind: u64, _flags: u64) -> 
     let Some(slot) = table.iter_mut().find(|s| !s.in_use) else {
         return u64::MAX;
     };
-    let base = cells()[cur].grant_next;
-    // Refuse rather than run off the top of the window (see [`GRANT_TOP`]). Checked
-    // before the slot is written, so a refused reservation leaves nothing behind.
-    let Some(top) = base.checked_add(bytes) else {
+    // **Placed, not bumped.** The address is now the allocator's answer: first-fit
+    // inside the grant window, around what this cell already holds, with guard gaps and
+    // overlap refused (docs/SUBSTRATE.md pillar 2). The window's ceiling is enforced by
+    // the allocator rather than by a comparison against a second constant, and a
+    // refusal consumes nothing because there is no cursor left to advance.
+    let Ok(base) = cell_va(cur).reserve_in(
+        GRANT_BASE,
+        GRANT_TOP,
+        bytes,
+        frames::FRAME_SIZE,
+        crate::mm::vaspace::RegionKind::Grant,
+        0,
+    ) else {
         return u64::MAX;
     };
-    if top > GRANT_TOP {
-        return u64::MAX;
-    }
-    cells()[cur].grant_next = top;
-    record_region(cur, base, bytes, crate::mm::vaspace::RegionKind::Grant);
     *slot = GrantSlot {
         in_use: true,
         base,
@@ -1355,14 +1359,20 @@ fn grant_share(cur: usize, cap_id: u32, out_va: u64) -> u64 {
     if !slot.sealed {
         return u64::MAX;
     }
-    // Map the grant's frames into the peer read-only at its next grant VA.
-    let peer_base = peer_cell.grant_next;
-    // The peer's window has a top too: a share that would place the mapping past it is
-    // refused, exactly as the peer's own `SYS_GRANT` would be.
-    match peer_base.checked_add(slot.len) {
-        Some(t) if t <= GRANT_TOP => {}
-        _ => return u64::MAX,
-    }
+    // Map the grant's frames into the peer read-only, at an address the **peer's** own
+    // allocator picks - so a delegated mapping is placed by the same rule and around
+    // the same regions as one the peer reserved itself, and cannot be dropped on top of
+    // something it already holds.
+    let Ok(peer_base) = cell_va(peer).reserve_in(
+        GRANT_BASE,
+        GRANT_TOP,
+        slot.len,
+        frames::FRAME_SIZE,
+        crate::mm::vaspace::RegionKind::Grant,
+        0,
+    ) else {
+        return u64::MAX;
+    };
     // SAFETY: single CPU; the client's address space is read (page-table walk,
     // no active requirement) and the peer's is edited (published when the peer is
     // switched to). Both are uniquely owned for the trap.
@@ -1372,9 +1382,9 @@ fn grant_share(cur: usize, cap_id: u32, out_va: u64) -> u64 {
         client_aspace.share_ro_into(peer_aspace, slot.base, slot.len, peer_base)
     };
     if nframes == 0 {
+        cell_va(peer).release_at(peer_base);
         return u64::MAX;
     }
-    cells()[peer].grant_next = peer_base + slot.len;
     // Mint a READ capability in the peer referencing the SAME object (so revoke
     // by epoch kills it too). SAFETY: as above.
     let peer_cap = unsafe {
@@ -1422,22 +1432,24 @@ fn mmap_file(cur: usize, fd: u64, offset: u64, len: usize) -> usize {
         return 0;
     };
     let bytes = page_up(len);
-    let base = cells()[cur].filemmap_next;
     let pages = bytes / frames::FRAME_SIZE;
-    // `len` is cell-supplied here too: bound the span and charge the frames
-    // before mapping anything (docs/ENGINEERING.md 12).
-    let Some(top) = base.checked_add(bytes) else {
+    // Placed by the allocator inside the file-mmap window, as grants are.
+    let Ok(base) = cell_va(cur).reserve_in(
+        FILEMMAP_BASE,
+        FILEMMAP_TOP,
+        bytes,
+        frames::FRAME_SIZE,
+        crate::mm::vaspace::RegionKind::File,
+        0,
+    ) else {
         return 0;
     };
-    // Refuse rather than grow into the channel region above (see [`FILEMMAP_TOP`]).
-    if top > FILEMMAP_TOP {
-        return 0;
-    }
+    // `len` is cell-supplied here too: bound the span and charge the frames
+    // before mapping anything (docs/ENGINEERING.md 12).
     if !user_write_ok(base as u64, bytes) || !charge_frames(cur, pages) {
+        cell_va(cur).release_at(base);
         return 0;
     }
-    cells()[cur].filemmap_next = top;
-    record_region(cur, base, bytes, crate::mm::vaspace::RegionKind::File);
     let got = with_current_aspace(|aspace| {
         let mut got = 0;
         for i in 0..pages {
@@ -1619,8 +1631,6 @@ pub unsafe fn install(
         personality: Personality::Native,
         qp_va: 0,
         qp_cap_id: 0,
-        grant_next: GRANT_BASE,
-        filemmap_next: FILEMMAP_BASE,
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
         cpu: NO_CPU,
     };
@@ -1956,8 +1966,6 @@ pub unsafe fn install_spawned(
         personality: Personality::Native,
         qp_va,
         qp_cap_id,
-        grant_next: GRANT_BASE,
-        filemmap_next: FILEMMAP_BASE,
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
         cpu: NO_CPU,
     };
@@ -2029,8 +2037,6 @@ pub unsafe fn install_forked(
         personality: Personality::Linux,
         qp_va: 0,
         qp_cap_id: 0,
-        grant_next: GRANT_BASE,
-        filemmap_next: FILEMMAP_BASE,
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
         cpu: NO_CPU,
     };

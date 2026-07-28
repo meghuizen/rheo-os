@@ -398,6 +398,74 @@ impl VaSpace {
     /// Record a caller-chosen placement (`MAP_FIXED`, the ELF image's own
     /// `p_vaddr`, a kernel-placed window).
     ///
+    /// Place `len` bytes anywhere free **inside `[lo, hi)`**, honouring `align` and
+    /// leaving guard gaps, exactly as [`VaSpace::reserve`] does over the whole space.
+    ///
+    /// A window rather than the whole range, because the fixed placements a cell still
+    /// receives from the constant map - its image and its initial stack - are not all
+    /// recorded here yet: the loader chooses them before the cell is installed, and
+    /// install is what starts the cell's layout. Allocating over the whole range would
+    /// let a grant land on an image the allocator has never heard of. Confining each
+    /// kind to the window its constants already reserved keeps that impossible while
+    /// still making the address within it a *result* - chosen by first-fit around what
+    /// this cell actually holds, with guard gaps and overlap refused - rather than a
+    /// bump cursor's next value (docs/SUBSTRATE.md pillar 2). The windows come out when
+    /// the loader records the image and stack too.
+    pub fn reserve_in(
+        &mut self,
+        lo: usize,
+        hi: usize,
+        len: usize,
+        align: usize,
+        kind: RegionKind,
+        tag: u32,
+    ) -> Result<usize, VaError> {
+        let len = round_up(len).ok_or(VaError::BadLength)?;
+        if len == 0 {
+            return Err(VaError::BadLength);
+        }
+        let align = align.max(PAGE);
+        if !align.is_power_of_two() {
+            return Err(VaError::BadLength);
+        }
+        let hi = hi.min(self.top);
+        let lo = lo.max(VA_FLOOR);
+        if lo >= hi {
+            return Err(VaError::OutOfRange);
+        }
+        let guard = GUARD_PAGES * PAGE;
+        let mut candidate = align_up(lo, align);
+        while candidate < hi {
+            let end = match candidate.checked_add(len) {
+                Some(e) => e,
+                None => break,
+            };
+            if end > hi {
+                break;
+            }
+            let probe_base = candidate.saturating_sub(guard).max(VA_FLOOR);
+            let probe_len = end.saturating_add(guard) - probe_base;
+            if self.span_free(probe_base, probe_len) {
+                self.insert(Region {
+                    base: candidate,
+                    len,
+                    kind,
+                    tag,
+                })?;
+                return Ok(candidate);
+            }
+            // Skip past whatever is in the way rather than stepping a page at a time.
+            let blocker_end = self
+                .iter()
+                .filter(|r| candidate < r.end() && r.base < end)
+                .map(|r| r.end())
+                .max()
+                .unwrap_or(end);
+            candidate = align_up(blocker_end.saturating_add(guard), align);
+        }
+        Err(VaError::Overlap)
+    }
+
     /// Refuses [`VaError::Overlap`] rather than evicting. Linux's `MAP_FIXED`
     /// silently unmaps whatever was there, which is a footgun this kernel does
     /// not have to inherit: the Linux personality asks explicitly

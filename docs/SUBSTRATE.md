@@ -247,11 +247,30 @@ at boot** (`user::init_layouts`), which makes the cost a boot cost and is the
 same answer S1' gave for the mapped-file registry - including the same honest
 consequence, that exhaustion there names the kernel rather than the cell.
 
-What remains is **placement**: the regions are still put where the constants
-say, and the allocator is only asked to remember it. Flipping `reserve_fixed`
-to `reserve` makes the address a result, and it is a small change now that the
-recording is in place and proven - the fixed placements it has to allocate
-around are already recorded.
+**And placement is now an allocation.** The four regions a cell asks for at run
+time - a typed grant, a file mapping, an anonymous `mmap`, and the read-only
+copy a `SYS_GRANT_SHARE` places in the *peer* - no longer land where a rising
+cursor happens to be. Each is a `VaSpace::reserve_in(lo, hi, ...)`: first-fit
+inside the region's window, with a guard gap either side, skipping any span
+already reserved rather than stepping over it a page at a time, and rolled back
+with `release_at` on every failure path so a refused request costs no address
+space. The three bump cursors are gone, including the **global** anonymous-mmap
+cursor that was shared across all cells - one cell's mappings used to move
+another cell's addresses.
+
+The proof (`security`, all three ISAs) asserts the property rather than the
+mechanism, because a cursor and an allocator agree on the first two answers: the
+first grant lands at the window base, the second is **guard-gapped** past it,
+and after the first is freed the third **reuses its base**. Only the third is
+load-bearing, and it is exactly what a rising cursor cannot produce - with the
+release suppressed it lands at `+0xa000` instead, observed.
+
+`reserve_in` is windowed rather than whole-space on purpose, and the reason is a
+limit worth naming: the loader's own placements - the image, the interpreter,
+the stack, the `.user` window - are still constants and are **not** recorded, so
+a global first-fit would allocate straight through them. Recording those at load
+is what removes the windows, and it is the last step of pillar 2's address
+work.
 
 - A **per-cell VA allocator over a real VMA structure** (possible once
   pillar 1 exists - today's "no VMA list" is a metadata-space problem)
@@ -826,6 +845,18 @@ kernel.
   `SYS_CONNECT` / `SYS_GRANT`). **Done when:** `mmapx`-class collision tests
   pass with regions allocated rather than fixed, and a cell reserves past the
   old 256 GiB bound on the two ISAs that have the room.
+
+  **Landed so far: the ceilings, the recording, and run-time placement.** Each
+  region has a named ceiling with a compile-time ordering assert; every region a
+  cell is given is recorded in a per-cell `VaSpace` and `SYS_MUNMAP` looks the
+  address up instead of inferring it from a constant range; and the four
+  run-time regions - grant, file mapping, anonymous `mmap`, and the peer's
+  read-only share - are placed by `reserve_in` with guard gaps and rollback,
+  retiring three bump cursors including the global one. **Not yet:** the
+  loader's own placements (image, interpreter, stack, `.user` window) are still
+  constants and unrecorded, which is why `reserve_in` is windowed rather than a
+  whole-space `reserve`; and `USER_VA_MAX` is still the shared Sv39 floor rather
+  than `arch::USER_VA_TOP`, so no cell has yet reserved past 256 GiB.
 - **S3' - dispatch through `RunQueue`.** The cooperative scheduler's pick
   becomes the queue's pick; every relinquish and preemption charges the burst;
   `metrics` is enabled at boot. Then preemption, then a second core - the SMP.md

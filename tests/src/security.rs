@@ -41,7 +41,7 @@ use kernel::queue::STATUS_OK;
 use kernel::user::{self, Outcome};
 use kernel::user_progs::{
     user_attack_grant, user_attack_mmap, user_attack_mmap_roundtrip, user_attack_munmap,
-    user_attack_munmap_queue, user_attack_out, user_cap_probe,
+    user_attack_munmap_queue, user_attack_out, user_attack_place, user_cap_probe,
 };
 use kernel::{arch, println};
 
@@ -62,6 +62,11 @@ const CANARY_MAGIC: u64 = 0x5EC0_0DED_5EC0_0DED;
 /// Named here rather than exported, so the test states the address it expects instead
 /// of agreeing with whatever the kernel happens to use.
 const GRANT_WINDOW_BASE: u64 = 0x8_0000_0000;
+
+/// The guard the VA allocator leaves on each side of a region
+/// (`mm::vaspace::GUARD_PAGES` pages). Named here so the test states the gap it
+/// expects rather than agreeing with whatever the allocator happens to use.
+const GUARD_BYTES: u64 = 4 * 4096;
 
 fn canary() -> [u64; 2] {
     // SAFETY: single-threaded kernel, read between cell runs.
@@ -486,8 +491,37 @@ extern "C" fn kernel_main() -> ! {
         r.ops, GRANT_WINDOW_BASE
     );
     println!(
-        "security: S2' an over-large grant is refused at the window ceiling and leaves \
-         the cursor at {GRANT_WINDOW_BASE:#x} OK"
+        "security: S2' an over-large grant is refused at the window ceiling and the next \
+         one still lands at {GRANT_WINDOW_BASE:#x} OK"
+    );
+
+    // Placement is an **allocation**, not a bump. Three reservations of one page: take
+    // two, drop the first, take a third. A bump cursor can only ever hand out a rising
+    // address, so the third landing back on the first's base is something only an
+    // allocator produces - the freed span was reused. And the gap between the first two
+    // is the guard the allocator leaves, which a cursor also cannot produce.
+    const PLACE_LEN: u64 = 4096;
+    let r = attack_with(user_attack_place, PLACE_LEN, scratch);
+    assert_exited(&r, "S2' placement");
+    let (first, second, third) = (r.ticks, r.ops, r.status);
+    assert_eq!(
+        first, GRANT_WINDOW_BASE,
+        "S2': the first grant landed at {first:#x}, not the window base"
+    );
+    assert!(
+        second >= first + PLACE_LEN + GUARD_BYTES,
+        "S2': the second grant at {second:#x} is not {GUARD_BYTES} bytes clear of the \
+         first ({first:#x}+{PLACE_LEN}) - the allocator left no guard gap"
+    );
+    assert_eq!(
+        third, first,
+        "S2': after freeing the grant at {first:#x} the next one landed at {third:#x} - \
+         the freed span was not reused, which is what a bump cursor does"
+    );
+    println!(
+        "security: S2' grant placement is an allocation - first {first:#x}, second \
+         {second:#x} (guard-gapped), and after freeing the first the next reuses \
+         {third:#x} OK"
     );
 
     println!("security: PASS");

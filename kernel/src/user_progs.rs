@@ -811,6 +811,38 @@ pub extern "C" fn user_attack_mmap_roundtrip(params_va: usize) -> ! {
     loop {}
 }
 
+/// The **placement** probe (docs/SUBSTRATE.md pillar 2): reserve two grants, drop the
+/// first, then reserve a third the same size as the first.
+///
+/// `ticks`/`ops` = the first two bases, `status` = the third. A bump cursor can only
+/// ever hand out a *rising* address, so the third landing back at the first's base is
+/// something only an allocator can produce - it means the freed span was reused. The
+/// gap between the first two is the guard, and is checked by the caller.
+#[unsafe(link_section = ".user.text")]
+#[unsafe(no_mangle)]
+pub extern "C" fn user_attack_place(params_va: usize) -> ! {
+    let p = params_va as *mut Params;
+    // SAFETY: `ticks` carries in this cell's own scratch page - the out-parameter the
+    // three reservations write their `GrantInfo` into.
+    unsafe {
+        let out = (*p).ticks;
+        let len = (*p).iters;
+        syscall4(SYS_GRANT, out, len, 0, 0);
+        let first = (out as *const u64).read_volatile();
+        syscall4(SYS_GRANT, out, len, 0, 0);
+        let second = (out as *const u64).read_volatile();
+        // Give the first one back, then ask for the same size again.
+        syscall4(SYS_MUNMAP, first, len, 0, 0);
+        syscall4(SYS_GRANT, out, len, 0, 0);
+        let third = (out as *const u64).read_volatile();
+        (*p).ticks = first;
+        (*p).ops = second;
+        (*p).status = third;
+        syscall(SYS_EXIT, 0);
+    }
+    loop {}
+}
+
 /// The **grant-window ceiling** probe (docs/SUBSTRATE.md pillar 2): ask for a
 /// reservation of `iters` bytes, then ask for one ordinary page.
 ///

@@ -1842,13 +1842,24 @@ cannot exhaust its table. That needed the S1' lesson a second time: a first atte
 each cell's table grow lazily, so its first frame landed inside the per-operation
 frame-cost oracles and broke `security`; the tables are funded **once at boot**
 (`user::init_layouts`), the same answer S1' gave for the mapped-file registry. What
-remains is **placement** - the regions still go where the constants say and the allocator
-only remembers it; flipping `reserve_fixed` to `reserve` is small now that the fixed
-placements it must allocate around are recorded. Honest: the anon ceiling is
+**And placement is now an allocation**: the four regions a cell asks for at run time - a
+typed grant, a file mapping, an anonymous `mmap`, and the read-only copy `SYS_GRANT_SHARE`
+places in the *peer* - are each a `VaSpace::reserve_in` (first-fit inside the region's
+window, guard gap either side, `release_at` rollback on every failure path), retiring
+three bump cursors including the **global** anon-mmap one that let one cell's mappings
+move another cell's addresses. `security` asserts the property rather than the mechanism,
+because a cursor and an allocator agree on the first two answers: first grant at the
+window base, second guard-gapped, and after the first is freed the third **reuses its
+base** - the only load-bearing one, and exactly what a rising cursor cannot produce (with
+the release suppressed it lands at `+0xa000`, observed). Honest: the anon ceiling is
 **unproven** - it cannot be reached in one call, because the frame budget refuses any span
 big enough to cross the window first, and a first version of that proof passed with the
-ceiling deleted and was removed rather than kept as decoration. Placing the regions with
-the allocator (which exists and is proven) is the rest of S2' and is not done; dispatch is proven for native cells and **off by default** except the
+ceiling deleted and was removed rather than kept as decoration; `reserve_in` is **windowed
+rather than whole-space** because the loader's own placements (image, interpreter, stack,
+the `.user` window) are still constants and unrecorded, so a global first-fit would
+allocate straight through them - recording those is what removes the windows, and
+`USER_VA_MAX` is still the shared Sv39 floor rather than `arch::USER_VA_TOP`, so no cell
+has yet reserved past 256 GiB. Dispatch is proven for native cells and **off by default** except the
 `linuxnode` boot -
 enabling it for the *Linux* boots is what the `linuxbun` gate needs - `metrics`
 records nothing until a boot enables it, and the per-CPU EEVDF+BORE queue still drives
