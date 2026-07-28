@@ -119,9 +119,12 @@ ap_pm32:
 
 .code64
 ap_lm64:
-    /* One dedicated secondary stack: this phase brings up exactly one AP
-       (docs/SMP.md), so a single stack cannot be shared by two of them. */
-    movabs $ap_stack_top, %rsp
+    /* Load this AP's stack from `secondary_sp`, which the primary set to the right
+       stack top before sending this SIPI. Start-all is sequential (the primary
+       waits for AP N online before releasing N+1), so there is no race on the
+       shared word - docs/SMP.md 10. */
+    movabs $secondary_sp, %rax
+    mov (%rax), %rsp
     /* Hand off to portable kernel code. `x86_secondary_main` reads this CPU's
        APIC id from the local APIC itself rather than trusting anything the
        primary passed - the identity comes from the hardware. */
@@ -175,11 +178,26 @@ AP_CR0:
 AP_TRAMPOLINE_BASE:
     .quad AP_BASE
 
-/* The secondary's kernel stack: a high VA in ordinary BSS, mapped supervisor in
-   every root (like the primary's boot_stack), so it is valid the instant the AP
-   is in long mode on the shared page tables. */
+/* The stack pointer the next AP loads, set by the primary before each SIPI
+   (sequential bring-up - see ap_lm64). A high .bss word, mapped supervisor in
+   every root like the AP stacks. */
+.section .bss
+.align 8
+.global secondary_sp
+secondary_sp:
+    .space 8
+
+/* Two AP kernel stacks: high VAs in ordinary BSS, mapped supervisor in every root
+   (like the primary's boot_stack), valid the instant the AP is in long mode on the
+   shared page tables. Two, so a second AP brought up while the first is still
+   parked on its own stack does not share it (docs/SMP.md 10). */
 .section .bss
 .align 16
 ap_stack:
     .space 16 * 1024
+.global ap_stack_top
 ap_stack_top:
+ap_stack2:
+    .space 16 * 1024
+.global ap_stack2_top
+ap_stack2_top:

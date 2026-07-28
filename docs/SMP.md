@@ -489,10 +489,15 @@ the interrupt vector writes.
   exclusion (there is no concurrent writer): a lock that failed to serialise the
   read-modify-write would lose updates and fall short. This is the primitive the
   phase-2 kernel-wide locks (§10.2) rest on, proven before they are built on it.
-- **Start-all: all of RISC-V's cores** - four online at once (boot + three
-  secondaries, matching QEMU's `-smp 4`), the first slice of §10.3/§10.7-step-2. Each
-  secondary claims a distinct registry slot and hardware id (1, 2, 3). Bring-up is
-  **sequential**
+- **Start-all: multiple secondaries on all three ISAs** - RISC-V four cores at once
+  (boot + three secondaries, matching QEMU's `-smp 4`), ARM64 and x86-64 three each
+  (boot + two), the first slice of §10.3/§10.7-step-2. Each secondary claims a distinct
+  registry slot and hardware id. The **same portable mechanism** on every ISA: the
+  trampoline loads its stack from a shared `secondary_sp` word (RISC-V `la`+`ld`, ARM64
+  `adrp`+`ldr`, x86-64 `movabs`+`mov` in long mode) that the primary sets - with a
+  release barrier - to the right stack top before each start (`hart_start` / PSCI
+  `CPU_ON` / SIPI), via the arch hooks `smp_secondary_count` / `smp_prepare_secondary`.
+  Bring-up is **sequential**
   (the primary waits for secondary N online before releasing N+1), so the per-CPU stack
   hand-off is race-free: each secondary loads its own stack top from a shared
   `secondary_sp` word the primary sets before each `hart_start` (arch hook
