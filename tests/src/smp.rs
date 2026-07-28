@@ -599,6 +599,21 @@ fn test_placement() {
             most > 1,
             "no core claimed a second cell, so none came back for more work"
         );
+        // 3. **Balancing after the claim.** Claiming divides work by arrival, and once
+        // divided it stays divided: the core that drew the long cell *and* a short one
+        // would finish late while another core idled. A core that runs dry therefore
+        // takes an unstarted cell out of a peer's claim. With one deliberately long
+        // cell in a batch of two, that has to happen - and it is asserted rather than
+        // hoped for, because a round where it did not happen produced the same exit
+        // codes and would have taught nothing.
+        let steals = smp::steals();
+        assert!(
+            steals > 0,
+            "no cell was rebalanced out of a peer's claim, yet one cell is {}x longer \
+             than the rest - the work stayed divided the way arrival happened to divide \
+             it",
+            LONG_ROUNDS / SHORT_ROUNDS
+        );
         assert!(
             kernel::mm::frames::used_matches_bitmap(),
             "the frame pool's used counter drifted from its bitmap under placement"
@@ -606,7 +621,8 @@ fn test_placement() {
         println!(
             "smp: {PLACED} RUNNABLE CELLS were PLACED on whichever core was free - none \
              assigned in advance, {movers} cores claimed work (the busiest took \
-             {most}), every cell exited with its own code"
+             {most}), {steals} rebalanced out of a peer's claim by a core that ran \
+             dry, every cell exited with its own code"
         );
         for c in 0..smp::MAX_CPUS {
             let n = smp::cells_taken(c);

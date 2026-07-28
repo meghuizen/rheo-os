@@ -587,8 +587,10 @@ scheduler itself has not.
   cores that each claim from it, each core then preempts between the cells it claimed
   (344-405 slices taken on 4 cores at once, against 0 in the cooperative control round),
   and **two unmodified static-glibc binaries run as Linux cells on two cores at the same
-  time**, each transcript asserted exactly. Not yet the whole scheduler: nothing migrates
-  a running cell between cores and nothing balances after the claim.
+  time**, each transcript asserted exactly, and a core that runs dry **rebalances an
+  unstarted cell out of a peer's claim**. Not yet the whole scheduler: nothing migrates a
+  cell that is already *running*, and the per-CPU EEVDF+BORE queue does not participate
+  in placement.
 
 ### 10.0 Cells run in user mode on a secondary core - built
 
@@ -799,10 +801,26 @@ drawn from it sent the diagnosis in the wrong direction. Reproducing in the *qui
 environment that can host the bug came first the second time, and answered it in one
 run.
 
-**Honest scope.** Preemption is *within* a core's own claim. Nothing takes a cell away
-from another core, nothing migrates a running cell, and there is no priority across
-cores - the per-CPU EEVDF+BORE queue orders each core's own cells and nothing balances
-between queues after the claim. Two Linux cells are proven; *many* is not, and neither
+**And a core that runs dry rebalances work out of a peer's claim.** Claiming divides
+work by arrival, and once divided it stays divided: a core that drew a long cell *and* a
+short one finishes late while another idles. So a core whose cursor is exhausted looks
+for a cell some peer has **claimed but not started** and takes it. The protocol is one
+exchange - exactly one core can turn a slot's run-mark from 0 to 1, and only that core
+may enter the cell; the previous owner discovers the loss when it reaches the slot and
+finds the mark set. No message, no lock, and no window in which two cores could both
+enter. With one deliberately long cell among short ones the steal is **asserted**, not
+hoped for: a round in which it did not happen produces the same exit codes and teaches
+nothing. Observed on all three ISAs: 1 cell rebalanced, the busiest core taking 3 of 8.
+
+A cell that is already **running** is deliberately not stealable, and that is the
+remaining gap rather than an oversight: migrating one means moving a live trap frame, an
+FP save area and an address space between cores while the cell is mid-instruction. This
+one is only "the work had not begun yet".
+
+**Honest scope.** Preemption is *within* a core's own claim, and rebalancing moves only
+**unstarted** cells. Nothing migrates a *running* cell, and there is no priority across
+cores - the per-CPU EEVDF+BORE queue orders each core's own cells and does not
+participate in the placement decision. Two Linux cells are proven; *many* is not, and neither
 is a Linux cell that forks, pipes or signals across cores - those reach the global
 registries in patterns the two-`chello` case does not exercise, and the big lock is
 correct for them by construction but unproven. What makes all of it safe is unchanged

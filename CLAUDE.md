@@ -1778,9 +1778,18 @@ reschedule *into* the cell the secondary was running, presenting as an instructi
 at PC 0 in kernel mode on two cores. The lesson is the one this tree keeps relearning:
 the first reproduction was in an environment that added its own noise, and reproducing in
 the *quietest* environment that can host the bug answered it in one run.
-**Honest scope:** preemption is *within* a core's own claim - nothing takes a cell from
-another core, nothing migrates a running cell, and nothing balances between the per-CPU
-queues after the claim. Two Linux cells are proven; *many*, and a Linux cell that forks,
+**And a core that runs dry rebalances work out of a peer's claim**: claiming divides
+work by arrival and once divided it stays divided, so a core whose cursor is exhausted
+takes a cell some peer has **claimed but not started**. One exchange is the whole
+protocol - exactly one core can turn a slot's run-mark 0 -> 1 and only that core may
+enter the cell, the previous owner discovering the loss when it reaches the slot - so
+there is no window in which two cores both enter. With one deliberately long cell among
+short ones the steal is **asserted**, not hoped for (a round without it produces the same
+exit codes and teaches nothing): 1 rebalanced, busiest core taking 3 of 8, on all three
+ISAs.
+**Honest scope:** preemption is *within* a core's own claim and rebalancing moves only
+**unstarted** cells - migrating a *running* one means moving a live trap frame, FP save
+area and address space mid-instruction, which is not done. Two Linux cells are proven; *many*, and a Linux cell that forks,
 pipes or signals across cores, are not
 (the cell/capability/object tables and the Linux per-cell state are still written for
 one CPU - the audit in docs/SMP.md 10.2 is the gate). What makes the native path safe is
@@ -2027,7 +2036,8 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               cores at once**, each in its own address space, witnessed by each
               reading the other's progress mid-run; then **start-all + cell
               placement** - 4 CPUs online, 8 runnable cells drained by whichever
-              core is free; then **cross-core preemption** - each core preempts
+              core is free, with a dry core **stealing an unstarted cell** from a
+              peer's claim; then **cross-core preemption** - each core preempts
               between the cells it claimed, ~350-400 slices taken on 4 cores at
               once against 0 in the cooperative control round; then an
               **unmodified static-glibc binary as a Linux cell on a secondary**,

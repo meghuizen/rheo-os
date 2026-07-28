@@ -804,6 +804,27 @@ static PLACE_NEXT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "smp")]
 static PLACE_DONE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "smp")]
+/// Which CPU claimed each slot (`usize::MAX` = nobody yet) and whether its cell has
+/// **started**. Together they are the steal protocol: a slot with an owner and a zero
+/// run-mark is work that has been divided but not begun, and is therefore rebalanceable.
+static PLACE_OWNER: [AtomicUsize; MAX_PLACED_CELLS] =
+    [const { AtomicUsize::new(usize::MAX) }; MAX_PLACED_CELLS];
+#[cfg(feature = "smp")]
+static PLACE_RUN: [AtomicUsize; MAX_PLACED_CELLS] =
+    [const { AtomicUsize::new(0) }; MAX_PLACED_CELLS];
+#[cfg(feature = "smp")]
+/// Cells taken out of a peer's claim by an idle core.
+static STEALS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "smp")]
+/// How many runnable cells were rebalanced out of a busy core's claim in the last
+/// round. Zero means claiming alone happened to divide the work evenly, which for an
+/// uneven workload is evidence that the stealing is not working.
+pub fn steals() -> usize {
+    STEALS.load(Ordering::Acquire)
+}
+
+#[cfg(feature = "smp")]
 /// How many cores are inside a drain. Zero means the round is genuinely over and its
 /// cells can be torn down.
 static BUSY: AtomicUsize = AtomicUsize::new(0);
@@ -893,13 +914,19 @@ unsafe fn drain_cells() {
     // them (docs/SMP.md 10.0).
     BUSY.fetch_add(1, Ordering::AcqRel);
     let _quiesce = Busy;
-    if PLACE_PREEMPT.load(Ordering::Acquire) == 1 {
+    let preemptive = PLACE_PREEMPT.load(Ordering::Acquire) == 1;
+    if preemptive {
         enable_preemption_here();
     }
     loop {
         // Take a batch off the queue.
         let mut slot = [usize::MAX; CLAIM_BATCH];
         let mut cell = [usize::MAX; CLAIM_BATCH];
+        // Whether this core has already set a slot's run-mark. A stolen slot is marked
+        // by the steal itself (that exchange *is* the claim), so the run loop below
+        // must not re-check it - it would find its own mark and drop the cell it just
+        // took, which is a lost cell rather than a lost race.
+        let mut marked = [false; CLAIM_BATCH];
         let mut got = 0;
         while got < CLAIM_BATCH {
             let k = PLACE_NEXT.fetch_add(1, Ordering::AcqRel);
@@ -908,10 +935,26 @@ unsafe fn drain_cells() {
             }
             slot[got] = k;
             cell[got] = PLACE_CELLS.lock()[k];
+            PLACE_OWNER[k].store(cpu, Ordering::Release);
             got += 1;
         }
         if got == 0 {
-            return;
+            // The shared cursor is empty, but a **peer may still be holding a cell it
+            // has not started** - the second half of a batch it claimed while this core
+            // was busy. Take it. This is the balancing that a claim alone cannot do:
+            // claiming divides work by arrival, and once divided it stays divided, so a
+            // core that drew a long cell and a short one finishes late while another
+            // idles (docs/SMP.md 10.0).
+            match steal(cpu, n) {
+                Some(k) => {
+                    slot[0] = k;
+                    cell[0] = PLACE_CELLS.lock()[k];
+                    marked[0] = true;
+                    got = 1;
+                    STEALS.fetch_add(1, Ordering::AcqRel);
+                }
+                None => return,
+            }
         }
         // Stamp ownership before anything runs: from here no other core's pick can
         // see these cells, which is what makes running them need no lock.
@@ -927,6 +970,25 @@ unsafe fn drain_cells() {
             let Some(pos) = (0..got).find(|&i| slot[i] != usize::MAX) else {
                 break;
             };
+            // Mark the cell **started**, which is what takes it out of reach of a
+            // stealer. A slot already marked was taken by a peer that ran dry while
+            // this core was inside an earlier cell of the batch: drop it and move on -
+            // that is the balancing working, not an error.
+            if !preemptive && !marked[pos] && PLACE_RUN[slot[pos]].swap(1, Ordering::AcqRel) == 1 {
+                slot[pos] = usize::MAX;
+                left -= 1;
+                continue;
+            }
+            if preemptive {
+                // Under preemption *both* cells of a batch are live at once - the timer
+                // enters the sibling without passing through this loop - so neither can
+                // be stolen and both are marked here.
+                for i in 0..got {
+                    if slot[i] != usize::MAX {
+                        PLACE_RUN[slot[i]].store(1, Ordering::Release);
+                    }
+                }
+            }
             // The caller's contract holds here: a present native cell this core owns
             // exclusively, because the `fetch_add` handed its index to nobody else.
             let (exited, outcome) = crate::user::run(cell[pos]);
@@ -945,6 +1007,35 @@ unsafe fn drain_cells() {
             PLACE_DONE.fetch_add(1, Ordering::Release);
         }
     }
+}
+
+#[cfg(feature = "smp")]
+/// Take one **claimed but not yet started** cell away from whichever peer holds it.
+///
+/// The exchange on `PLACE_RUN[k]` is the whole protocol: exactly one core can turn a
+/// slot from 0 to 1, and only the core that did may run it. The owner discovers the
+/// loss when it reaches that slot and finds the mark already set - no message, no
+/// lock, and no window in which two cores could both enter the cell.
+///
+/// A cell that is already *running* is deliberately not stealable. Migrating one means
+/// moving a live trap frame, an FP save area and an address space between cores while
+/// the cell is mid-instruction; that is a different capability and is named as not
+/// done (docs/SMP.md 10.0), where this one is just "the work had not begun yet".
+fn steal(cpu: usize, n: usize) -> Option<usize> {
+    for k in 0..n.min(MAX_PLACED_CELLS) {
+        let owner = PLACE_OWNER[k].load(Ordering::Acquire);
+        if owner == usize::MAX || owner == cpu {
+            continue;
+        }
+        if PLACE_RUN[k]
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            PLACE_OWNER[k].store(cpu, Ordering::Release);
+            return Some(k);
+        }
+    }
+    None
 }
 
 #[cfg(feature = "smp")]
@@ -986,7 +1077,10 @@ unsafe fn place_cells_inner(cells: &[usize], out: &mut [(u64, usize)], preempt: 
     for k in 0..MAX_PLACED_CELLS {
         PLACE_CODE[k].store(usize::MAX, Ordering::Release);
         PLACE_CPU[k].store(usize::MAX, Ordering::Release);
+        PLACE_OWNER[k].store(usize::MAX, Ordering::Release);
+        PLACE_RUN[k].store(0, Ordering::Release);
     }
+    STEALS.store(0, Ordering::Release);
     for c in 0..MAX_CPUS {
         // SAFETY: between rounds; no core is draining.
         unsafe { PLACE_TAKEN.get(c) }.store(0, Ordering::Release);
