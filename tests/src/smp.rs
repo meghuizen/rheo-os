@@ -575,6 +575,11 @@ struct FaParams {
 /// Workload selector, mirroring `librheo/src/bin/librheo-fa.rs`.
 const FA_JOB_ATTN: u32 = 0;
 const FA_JOB_GEMM: u32 = 1;
+/// The async job: `hi - lo` strands each doing a real queue round trip. Mirrors
+/// `librheo-fa`'s `JOB_ASYNC`.
+const FA_JOB_ASYNC: u32 = 2;
+/// Strands per async cell. Its `[lo, hi)` is a strand count, not a row range.
+const FA_ASYNC_STRANDS: usize = 8;
 /// GEMM shape and output VA, likewise mirrored.
 const FA_GM: usize = 32;
 const FA_GN: usize = 32;
@@ -634,18 +639,24 @@ unsafe fn fa_install(n: usize, jobs: &[u32]) -> [usize; FA_CELLS] {
         let (mut seen_attn, mut seen_gemm) = (0usize, 0usize);
         for i in 0..n {
             let job = jobs[i];
-            let (rows, k, of) = if job == FA_JOB_GEMM {
-                let k = seen_gemm;
-                seen_gemm += 1;
-                (FA_GM, k, n_gemm)
+            let (lo, hi) = if job == FA_JOB_ASYNC {
+                // Not a split: every async cell runs the full strand count on its own
+                // queue pair, because the claim is that N independent reactors work at
+                // once, not that one workload divides.
+                (0, FA_ASYNC_STRANDS)
             } else {
-                let k = seen_attn;
-                seen_attn += 1;
-                (FA_TQ, k, n_attn)
+                let (rows, k, of) = if job == FA_JOB_GEMM {
+                    let k = seen_gemm;
+                    seen_gemm += 1;
+                    (FA_GM, k, n_gemm)
+                } else {
+                    let k = seen_attn;
+                    seen_attn += 1;
+                    (FA_TQ, k, n_attn)
+                };
+                let per = rows.div_ceil(of);
+                ((k * per).min(rows), ((k + 1) * per).min(rows))
             };
-            let per = rows.div_ceil(of);
-            let lo = (k * per).min(rows);
-            let hi = ((k + 1) * per).min(rows);
             let pp = core::ptr::addr_of_mut!(FA_PARAM_PAGES[i]);
             (*pp).0.fill(0);
             (pp as *mut FaParams).write(FaParams {
@@ -755,17 +766,20 @@ fn test_flash_attention_parallel() {
 
         // --- Round 2: FA_CELLS cells, placed on whichever core is free. -----
         user::reset();
-        // **A mixed queue**: half the cells compute f32 attention, half the int8 GEMM, and
-        // the placement interleaves them across cores. This is the part a separate proof
-        // per workload cannot show however many cores each uses - two unrelated tile
-        // workloads resident on the machine at the same instant, each still bit-exact.
+        // **A mixed queue of three unlike workloads**: f32 attention, integer GEMM, and
+        // cells whose work is *async* rather than compute - strands parked on real queue
+        // completions. The placement interleaves all three across the cores. This is the
+        // part a separate proof per workload cannot show however many cores each uses:
+        // the f32 softmax path, the integer GEMM path and the queue/reactor path resident
+        // on the machine at the same instant, none disturbing another's result. The queue
+        // ABI in particular had only ever been driven from one core at a time.
         let jobs = [
             FA_JOB_ATTN,
             FA_JOB_GEMM,
+            FA_JOB_ASYNC,
             FA_JOB_ATTN,
             FA_JOB_GEMM,
-            FA_JOB_ATTN,
-            FA_JOB_GEMM,
+            FA_JOB_ASYNC,
             FA_JOB_ATTN,
             FA_JOB_GEMM,
         ];
@@ -783,21 +797,25 @@ fn test_flash_attention_parallel() {
         // Every slice ran, finished its rows, and says which slice it was.
         let n_attn = jobs.iter().filter(|&&j| j == FA_JOB_ATTN).count();
         let n_gemm = jobs.iter().filter(|&&j| j == FA_JOB_GEMM).count();
-        let (mut attn_rows, mut gemm_rows) = (0usize, 0usize);
+        let n_async = jobs.iter().filter(|&&j| j == FA_JOB_ASYNC).count();
+        let (mut attn_rows, mut gemm_rows, mut ops) = (0usize, 0usize, 0usize);
         let (mut ka, mut kg) = (0usize, 0usize);
         for i in 0..FA_CELLS {
-            let (rows, k, of) = if jobs[i] == FA_JOB_GEMM {
-                let k = kg;
-                kg += 1;
-                (FA_GM, k, n_gemm)
+            let (lo, hi) = if jobs[i] == FA_JOB_ASYNC {
+                (0, FA_ASYNC_STRANDS)
             } else {
-                let k = ka;
-                ka += 1;
-                (FA_TQ, k, n_attn)
+                let (rows, k, of) = if jobs[i] == FA_JOB_GEMM {
+                    let k = kg;
+                    kg += 1;
+                    (FA_GM, k, n_gemm)
+                } else {
+                    let k = ka;
+                    ka += 1;
+                    (FA_TQ, k, n_attn)
+                };
+                let per = rows.div_ceil(of);
+                ((k * per).min(rows), ((k + 1) * per).min(rows))
             };
-            let per = rows.div_ceil(of);
-            let lo = (k * per).min(rows);
-            let hi = ((k + 1) * per).min(rows);
             let p = &*(core::ptr::addr_of!(FA_PARAM_PAGES[i]) as *const FaParams);
             assert_eq!(
                 placed[i].0,
@@ -807,12 +825,22 @@ fn test_flash_attention_parallel() {
             );
             assert_eq!(p.status, 1, "cell {i} never finished its rows");
             assert_eq!(p.rows as usize, hi - lo, "cell {i} wrote the wrong count");
-            if jobs[i] == FA_JOB_GEMM {
-                gemm_rows += p.rows as usize;
-            } else {
-                attn_rows += p.rows as usize;
+            match jobs[i] {
+                FA_JOB_GEMM => gemm_rows += p.rows as usize,
+                FA_JOB_ASYNC => ops += p.rows as usize,
+                _ => attn_rows += p.rows as usize,
             }
         }
+        // Every async cell completed every one of its round trips. A strand whose
+        // completion carried another cell's token would come back with the wrong value
+        // and the cell would exit 7 instead of its slice code, so this is a claim about
+        // the kernel's opcode dispatch under N concurrent reactors.
+        assert_eq!(
+            ops,
+            n_async * FA_ASYNC_STRANDS,
+            "async cells completed {ops} of {} queue round trips",
+            n_async * FA_ASYNC_STRANDS
+        );
         assert_eq!(attn_rows, FA_TQ, "the slices do not cover every query row");
         assert_eq!(gemm_rows, FA_GM, "the slices do not cover every GEMM row");
 
@@ -855,12 +883,13 @@ fn test_flash_attention_parallel() {
              serially"
         );
         println!(
-            "smp: TWO TILE WORKLOADS AT ONCE ACROSS {movers} OF {cores} CORES - \
-             {FA_CELLS} loaded librheo cells in one mixed queue, {n_attn} computing \
-             FlashAttention 2+3 over slices of a {FA_TQ}x{FA_D} head and {n_gemm} \
-             computing a tiled int8 {FA_GM}x{FA_GN} GEMM (claimed, not assigned); every \
-             slice reported its own rows, and **both** assembled results are \
-             bit-identical to one cell computing every row"
+            "smp: THREE UNLIKE WORKLOADS AT ONCE ACROSS {movers} OF {cores} CORES - \
+             {FA_CELLS} loaded librheo cells in one mixed queue - {n_attn} computing \
+             FlashAttention 2+3 over slices of a {FA_TQ}x{FA_D} head, {n_gemm} computing \
+             a tiled int8 {FA_GM}x{FA_GN} GEMM, and {n_async} driving {FA_ASYNC_STRANDS} \
+             parked strands each over their own queue pair ({ops} round trips in all) - \
+             claimed, not assigned; every slice reported its own work, and **both** \
+             assembled compute results are bit-identical to one cell computing every row"
         );
         for c in 0..smp::MAX_CPUS {
             let n = smp::cells_taken(c);

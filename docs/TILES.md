@@ -610,18 +610,29 @@ are compiled into the kernel crate, and soft-float f32 emits out-of-line calls i
 kernel `.text` that a cell has no mapping for. A loaded ELF cell carries its own
 builtins and has neither problem, which is why the parallel unit is a cell.
 
-**And both tile workloads run at the same instant.** `librheo-fa` carries two jobs -
-attention, and a tiled int8 GEMM over its own row slice - selected per cell, so the
-placed queue is **mixed**: four cells computing FlashAttention over slices of one head
-and four computing a tiled `32x32` int8 GEMM, interleaved across four cores by claim.
-Both assembled outputs are asserted bit-identical to their single-cell references. That
-is the thing a separate proof per workload cannot show however many cores each uses -
-two unrelated tile programs resident on the machine together, the f32 softmax path and
-the integer GEMM path, neither disturbing the other's result.
+**And the workloads run at the same instant.** `librheo-fa` carries three jobs, selected
+per cell - attention, a tiled int8 GEMM over its own row slice, and an async job that
+does no arithmetic at all - so the placed queue is **mixed**: three cells computing
+FlashAttention over slices of one head, three computing a tiled `32x32` int8 GEMM, and
+two driving parked strands over their own queue pairs, all interleaved across four cores
+by claim. Both assembled compute outputs are asserted bit-identical to their single-cell
+references. That is the thing a separate proof per workload cannot show however many
+cores each uses - the f32 softmax path, the integer GEMM path and the queue/reactor path
+resident on the machine together, none disturbing another's result.
 
-Three controls observed failing: giving every cell the same slice, flipping one bit of
-the attention reference (caught at element 512, `3.4976618e0` vs `3.4976616e0`), and
-flipping one bit of the GEMM reference.
+**And a third, unlike workload beside them.** The queue ABI and the strand reactor had
+only ever been driven from *one core at a time* - every prior async proof ran a single
+cell. Two cells in the mixed queue therefore do no arithmetic at all: each runs eight
+strands that submit an `OP_ECHO` over **its own** queue pair and park on the completion,
+so N independent reactors, N queue pairs and N sets of parked strands meet the kernel's
+opcode dispatch at once. All sixteen round trips return their own value; a completion
+carrying another cell's token would come back wrong and the cell would exit 7 instead of
+its slice code.
+
+Four controls observed failing: giving every cell the same slice, flipping one bit of the
+attention reference (caught at element 512, `3.4976618e0` vs `3.4976616e0`), flipping one
+bit of the GEMM reference, and pointing the async strands at `OP_NOP` so the echo cannot
+match.
 
 ### 13.5 Honest scope
 

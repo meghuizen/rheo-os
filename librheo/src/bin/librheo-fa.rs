@@ -87,6 +87,15 @@ struct Params {
 const JOB_ATTN: u32 = 0;
 /// A tiled int8 -> i32 GEMM over the output rows `[lo, hi)`.
 const JOB_GEMM: u32 = 1;
+/// `hi - lo` strands each doing an async round trip over **this cell's own queue
+/// pair** - the "high async" path, driven from whichever core claimed the cell.
+///
+/// Worth having beside the two compute jobs because the queue ABI and the strand
+/// reactor had only ever been driven from **one core at a time**: every prior async
+/// proof ran a single cell. Placing several of these puts N independent reactors, N
+/// queue pairs and N sets of parked strands against the kernel's opcode dispatch at
+/// once, which is a claim about the ABI under parallelism rather than about arithmetic.
+const JOB_ASYNC: u32 = 2;
 
 /// GEMM shape, and its own output page.
 const GM: usize = 32;
@@ -152,6 +161,36 @@ fn gemm_slice(lo: usize, hi: usize) -> i32 {
     0
 }
 
+/// `n` strands, each submitting one `OP_ECHO` and parking on its completion. Returns
+/// the number that came back correct.
+///
+/// Every strand parks on the reactor and is woken by the completion carrying its own
+/// token, so a wrong answer here is a mixed-up `user_data` - exactly what N cells
+/// hammering one kernel dispatch path would expose.
+fn async_slice(n: usize, salt: u32) -> usize {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static DONE: AtomicUsize = AtomicUsize::new(0);
+    DONE.store(0, Ordering::Relaxed);
+    librheo::rt::block_on(async move {
+        let mut handles = alloc::vec::Vec::new();
+        for i in 0..n {
+            handles.push(librheo::rt::spawn(async move {
+                let val = salt ^ (0xB000_0000u32 + i as u32);
+                let mut arg = [0u8; 24];
+                arg[..4].copy_from_slice(&val.to_le_bytes());
+                let cqe = librheo::rt::submit_and_await(librheo::sys::OP_ECHO, arg).await;
+                if cqe.status == librheo::sys::STATUS_OK && cqe.result == val {
+                    DONE.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().await;
+        }
+    });
+    DONE.load(Ordering::Relaxed)
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn main() -> i32 {
     // SAFETY: the launcher mapped a writable, `Params`-aligned page at `PARAMS_VA` and
@@ -173,6 +212,18 @@ extern "C" fn main() -> i32 {
         // SAFETY: the launcher's writable params page.
         unsafe {
             (*p).rows = (hi - lo) as u32;
+            (*p).status = 1;
+        }
+        return (lo + 1) as i32;
+    }
+    if job == JOB_ASYNC {
+        let want = hi - lo;
+        if async_slice(want, lo as u32) != want {
+            return 7;
+        }
+        // SAFETY: the launcher's writable params page.
+        unsafe {
+            (*p).rows = want as u32;
             (*p).status = 1;
         }
         return (lo + 1) as i32;
