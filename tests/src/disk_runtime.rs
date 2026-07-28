@@ -211,6 +211,15 @@ pub fn prove(
     // Mount the live disk as the cell's `/`, then stream-`execve` the binary.
     posix::reset();
     mount::mount("/", Rc::new(disk));
+    // **A writable `/tmp` over the read-only root.** `ext4plus` is read-only, and a real
+    // runtime expects somewhere to write: Bun, asked to run a *script file*, calls
+    // `createFakeTemporaryNodeExecutable` to drop a stand-in `node` into a temp
+    // directory, and failed `error.FileNotFound` without one (docs/TILES.md 13.4d found
+    // this, and the fix is the mount table rather than a read-write ext4 driver - a
+    // ramfs is already read-write, and composing the two is what a mount table is for).
+    // `pick` selects the longest matching prefix, so `/tmp/...` resolves here and
+    // everything else still resolves to the disk.
+    mount::mount("/tmp", Rc::new(posix::RamFs::new()));
     svc::set_file_ops(vfs_personality::ops());
     let fills_before = block::cache_fills();
 

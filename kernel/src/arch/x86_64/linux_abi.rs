@@ -131,6 +131,24 @@ pub mod nr {
     /// alone - the same two-numbers trap that made `readlink` fail here
     /// (docs/ENGINEERING.md 11).
     pub const OPEN: u64 = 2;
+    /// The **legacy** `stat(path, statbuf)` and `lstat`, x86-64-only numbers, and the
+    /// **third** instance of the same two-numbers trap as `OPEN` above and `readlink`
+    /// before it (docs/ENGINEERING.md 11): implementing only `newfstatat` left every
+    /// path-based stat refused on this ISA alone.
+    ///
+    /// Found the way the others were - by a real program failing and the trace naming
+    /// it. Bun, asked to run a *script file*, calls
+    /// `createFakeTemporaryNodeExecutable` to drop a stand-in `node` in a temp
+    /// directory; with `stat` unimplemented it could not see the directory and aborted
+    /// `error.FileNotFound`, which named a missing *file* rather than a missing syscall
+    /// (docs/TILES.md 13.4d).
+    ///
+    /// `lstat` is here beside it because it is the same call for every path this
+    /// personality can produce: there are no symlinks in the VFS, so following one and
+    /// not following one cannot differ. Adding it separately would be the pattern that
+    /// caused this - an ISA where one of a pair works.
+    pub const STAT: u64 = 4;
+    pub const LSTAT: u64 = 6;
     pub const SYSINFO: u64 = 99;
     /// `getrusage(who, usage)`. Bun prints an "Elapsed / User / Sys / RSS" line from
     /// it at startup; refused, it printed **garbage** (`Sys: 8589934ms` - an errno

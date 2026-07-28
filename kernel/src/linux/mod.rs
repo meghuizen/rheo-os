@@ -676,6 +676,22 @@ fn handle_inner(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame)
             .pread(args[0] as i64, args[1], args[2], args[3] as i64)),
         nr::FSTAT => ret(st.fds.fstat(args[0] as i64, args[1])),
         nr::NEWFSTATAT => ret(sys_newfstatat(st, args)),
+        // The legacy path-based `stat`/`lstat` (x86-64 only). Same work as
+        // `newfstatat(AT_FDCWD, path, buf, 0)`, so it is routed there rather than
+        // duplicated. No symlinks exist in this VFS, so `lstat` cannot differ.
+        #[cfg(target_arch = "x86_64")]
+        nr::STAT | nr::LSTAT => {
+            let a = [fd::AT_FDCWD as u64, args[0], args[1], 0, 0, 0];
+            ret(sys_newfstatat(st, &a))
+        }
+        // The legacy path-based `stat`/`lstat` (x86-64 only). Same work as
+        // `newfstatat(AT_FDCWD, path, buf, 0)`, so it is routed there rather than
+        // duplicated: `(path, buf)` becomes `(AT_FDCWD, path, buf, 0)`. No symlinks
+        // exist in this VFS, so `lstat` cannot differ from `stat`.
+        // The legacy path-based `stat`/`lstat` (x86-64 only). Same work as
+        // `newfstatat(AT_FDCWD, path, buf, 0)`, so it is routed there rather than
+        // duplicated: `(path, buf)` becomes `(AT_FDCWD, path, buf, 0)`. No symlinks
+        // exist in this VFS, so `lstat` cannot differ from `stat`.
         nr::STATX => ret(sys_statx(st, args)),
         nr::GETDENTS64 => ret(st.fds.getdents64(args[0] as i64, args[1], args[2])),
         nr::DUP => ret(st.fds.dup(args[0] as i64)),
@@ -1061,6 +1077,8 @@ fn ptr_args_ok(nr_val: u64, args: &[u64; 6]) -> bool {
         nr::ACCESS | nr::CHDIR | nr::OPEN => rd(0, 1),
         nr::FSTAT => wr(1, 1),
         nr::NEWFSTATAT => rd(1, 1) && wr(2, 1),
+        #[cfg(target_arch = "x86_64")]
+        nr::STAT | nr::LSTAT => rd(0, 1) && wr(1, 1),
         nr::STATX => rd(1, 1) && wr(4, 1),
         nr::IOCTL => wr_opt(2, 8), // only TIOCGWINSZ writes; others ignore it
         nr::POLL => args[1] == 0 || wr(0, args[1].saturating_mul(8)),

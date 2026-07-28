@@ -44,6 +44,7 @@ static PROCDEMO: &[u8] = fixture::linux!("procdemo");
 static CECHO: &[u8] = fixture::linux!("cecho");
 static RSH: &[u8] = fixture::linux!("rsh");
 static FCNTLX: &[u8] = fixture::linux!("fcntlx");
+static LSTATX: &[u8] = fixture::linux!("lstatx");
 static KILLX: &[u8] = fixture::linux!("killx");
 static MMAPX: &[u8] = fixture::linux!("mmapx");
 static YIELDX: &[u8] = fixture::linux!("yieldx");
@@ -233,6 +234,39 @@ extern "C" fn kernel_main() -> ! {
         "linuxproc: fcntl OK - F_SETLK -> ENOLCK, an unknown cmd -> EINVAL, \
          F_SETFL(O_NONBLOCK) honoured on a pipe and on stdin, F_GETFL real, \
          FD_CLOEXEC closed across execve while a plain fd survived"
+    );
+
+    // --- the legacy path-based `stat`/`lstat` (docs/LINUX-COMPAT.md).
+    //
+    // glibc on x86-64 compiles `stat()`/`lstat()` to syscall numbers **4** and **6**,
+    // not to `newfstatat`, so implementing only `newfstatat` left every path-based stat
+    // refused on that ISA alone. That is the third instance of the two-numbers trap
+    // after `open` (nr 2) and `readlink` (docs/ENGINEERING.md 11), and it was found the
+    // same way: a real program failed and the trace named `ENOSYS nr=4`.
+    //
+    // The fixture runs on all three ISAs deliberately. arm64/riscv64 route the same C
+    // calls through `newfstatat`, so it passes there whether or not the legacy numbers
+    // exist - which is exactly the asymmetry that lets a trap of this shape survive, and
+    // the reason a proof that only ran where it already worked would be worthless.
+    #[cfg(target_arch = "x86_64")]
+    let want_lstat = b"lstatx: raw stat + lstat OK\n".as_slice();
+    #[cfg(not(target_arch = "x86_64"))]
+    let want_lstat = b"lstatx: newfstatat-only ISA, no legacy numbers\n".as_slice();
+    let (code, out) = run_capture(LSTATX, &[b"lstatx"]);
+    assert!(
+        out == want_lstat,
+        "lstatx: stdout mismatch\n  got:      {:?}\n  expected: {:?}",
+        core::str::from_utf8(out),
+        core::str::from_utf8(want_lstat),
+    );
+    assert!(code == 0, "lstatx: exit {code}, expected 0");
+    println!(
+        "linuxproc: legacy stat/lstat OK - `stat(\"/\")` and `lstat(\"/\")` agree \
+         (same inode, both a directory) and an absent path is still refused. Issued as \
+         **raw** syscalls 4 and 6 on x86-64, not through glibc: an earlier fixture \
+         called `stat()` and passed with the fix reverted, because this glibc routes \
+         `stat()` through `newfstatat` even there - the programs that use the legacy \
+         numbers are the ones that bypass libc, which is how Bun turned this up"
     );
 
     // --- cross-process `kill` + `/proc/self/exe` (docs/ARCHITECTURE-DEBT.md 4).

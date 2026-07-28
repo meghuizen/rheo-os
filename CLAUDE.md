@@ -2165,6 +2165,23 @@ times turning a guess into a fact: the first failure's refused-path log named
 library `dlopen` loads needs its *own* dependencies - a missing file, not a missing
 mechanism), and the library then failed to link for aarch64 because it had inherited the
 static fixtures' `+crt-static -no-pie`, which cannot produce a shared object at all.
+**Two findings came out of that work, both kept.** A **writable `/tmp`** is mounted over
+the read-only ext4 root in the disk-runtime harness (`ext4plus` is read-only, and the
+mount table composing a read-only root with a read-write ramfs is what a mount table is
+for). And the **legacy x86-64 `stat`/`lstat`** (numbers 4 and 6) are implemented, routed
+to `newfstatat(AT_FDCWD, ...)` - the **third** instance of the two-numbers hazard after
+`open` (nr 2) and `readlink`, found by `ENOSYS nr=4` in Bun's trace. How it is proven
+matters: **this glibc routes `stat()` through `newfstatat` even on x86-64**, so the first
+fixture called `stat()` and *passed with the fix reverted*; the `lstatx` fixture issues
+the **raw** syscalls instead, and the programs that use the legacy numbers are precisely
+the ones bypassing libc, as Bun's Zig runtime does. Honest about what neither fixed:
+Bun asked to run a script **file** still aborts in
+`createFakeTemporaryNodeExecutable` with `error.FileNotFound`, and three candidate causes
+were ruled out by observation (the read-only root - it never touches `/tmp`; the missing
+legacy `stat` - implemented, no change; a missing `/proc/self/exe` - it exists). No
+refused path and no `ENOSYS` in the trace accounts for it, so the cause is **not
+identified** and is recorded as such rather than guessed at.
+
 **And JavaScript on the real Bun calls a tile kernel** (docs/TILES.md 13.4d): the
 `linuxbun` gate runs the real Bun binary a second time off the same live ext4 disk,
 evaluating JS that opens `/lib/libtileso.so` through **`bun:ffi`**, declares

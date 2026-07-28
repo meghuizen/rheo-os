@@ -1528,6 +1528,7 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         // commands refused, O_NONBLOCK honoured, F_GETFL real, FD_CLOEXEC closed
         // across execve. Part of the `linuxproc` proof (it execve's itself).
         ("fcntlx.c", "fcntlx", NO_EXTRA),
+        ("lstatx.c", "lstatx", NO_EXTRA),
         // Cross-process signalling + `/proc/self/exe` (docs/ARCHITECTURE-DEBT.md 4):
         // `kill` used to refuse any pid but our own and silently self-target on
         // pid 0/-1, and `readlinkat` was a hardcoded -ENOENT. Part of the
@@ -1760,6 +1761,7 @@ fn build_bun_disk_fixture(arch: Arch, out_dir: &str) {
                 "lib/libtileso.so",
             ),
             ("/lib/x86_64-linux-gnu/libgcc_s.so.1", "lib/libgcc_s.so.1"),
+            ("tests/linux-fixtures/tileffi.js", "bin/tileffi.js"),
         ],
     );
 }

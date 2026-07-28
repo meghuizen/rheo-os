@@ -107,6 +107,18 @@ extern "C" fn kernel_main() -> ! {
         // `error.FileNotFound` - the ext4 driver here is **read-only**, so there is
         // nowhere for it to write. `-e` does not take that path at all. A read-write
         // ext4 mount is the real fix and is not built (docs/FILESYSTEMS.md).
+        // Passed with `-e`. Running the same code as a **file** on the disk is
+        // attempted and does not work, and the reason is recorded rather than
+        // guessed at (docs/TILES.md 13.4d): Bun calls
+        // `createFakeTemporaryNodeExecutable` on that path and aborts
+        // `error.FileNotFound`. Three candidate causes were ruled out by
+        // observation - the root being read-only (a writable ramfs is mounted at
+        // `/tmp` now and Bun never touches it), the legacy `stat`/`lstat` being
+        // unimplemented (they are implemented now, and it changed nothing), and
+        // `/proc/self/exe` being absent (it is not). No refused path and no
+        // `ENOSYS` in the trace accounts for it, so the cause is inside Bun's own
+        // path handling and is **not identified**. `-e` does not take that path,
+        // and it exercises the same FFI mechanism.
         Some((
             &[
                 b"bun",
