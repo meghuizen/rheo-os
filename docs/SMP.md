@@ -910,6 +910,86 @@ and is the reason it could land first: a claimed cell is still a *partitioned* c
 core, one slot, one address space, one kernel stack), the claim simply being made at run
 time instead of by hand.
 
+### 10.0a One cell on two cores - vcores - built
+
+Everything in 10.0 runs **different cells** on different cores. That is real
+parallelism, and it is not the parallelism a *program* has: a Node worker, a strand
+pool, a FlashAttention 3 producer/consumer pair are all one address space that wants
+several cores. A cell belonged to one core, so the answer to "can my program use the
+machine" was **no**, however many cores were online.
+
+The reason a cell was one core is stated in `claim_cell`'s own doc: two cores in one cell
+would share its trap frame, its kernel stack and its FP/SIMD save area, none of which is
+locked. So the fix is not a lock. It is to make those three per **vcore** and move the
+ownership claim down with them, at which point the vcore is the unit that is partitioned
+- exactly as the cell was - and the multikernel argument holds one level lower, unchanged
+(docs/SCHEDULING.md 1a, docs/SUBSTRATE.md pillar 3).
+
+**The mechanism** (`kernel/src/user.rs`, no new kernel object and no new verb - a vcore is
+an execution context of the Cell object, the same shape the Linux personality's contexts
+already are):
+
+- `RunCell` holds `vframe`/`voutcome`/`vcpu` arrays of `MAX_VCORES` (4) instead of three
+  scalars, plus `nvcores`. Slot 0 is the context `install` builds, so a cell nobody adds
+  a vcore to holds `nvcores == 1` and every pre-vcore path is what it was.
+- `CELL_FP` is one area per `(cell, vcore)` rather than per cell, and `FP_SWAPS` became a
+  relaxed atomic - two cores now restore FP for two vcores at the same instant, and a
+  `static mut +=` loses counts (the fix the preempt/dispatch counters already took).
+- `CUR_VCORE`/`EXITED_VCORE` are `PerCpu`, for the reason `CURRENT` is: two cores inside
+  two vcores of one cell are inside the *same* cell index, so the cell alone cannot say
+  which frame or which FP area a trap belongs to.
+- The double-entry guard keys on `cell * MAX_VCORES + vcore`. Two cores in one *cell* is
+  now the point; two cores in one *vcore* is still the corruption it catches.
+- `install_vcore(idx, frame)` is a **launcher** verb, not a syscall: creating a context is
+  creating something the scheduler must own, and the cell-facing spelling of it is the
+  strand runtime asking for a vcore, which belongs with the rest of the process model.
+  The kernel mechanism is proven before anything is exposed, as every capability here was.
+- `smp::place_vcores` publishes **vcore ids** into the same queue `place_cells` uses, so
+  there is one drain loop, one claim protocol, one steal protocol - a cell index is simply
+  the vcore id of its vcore 0 (compose before extending).
+
+**Deliberately refused rather than half-supported.** The cooperative schedulers
+(`nproc::reschedule`, `SYS_YIELD`, `linux::proc`) pick a *cell* and enter its vcore 0.
+For a cell whose vcores are spread over several cores that would enter a context another
+core owns, so `cell_on_this_cpu` returns **false** for any multi-vcore cell and
+`switch_native_cell` asserts against one by name. A multi-vcore cell is driven by
+placement. Teaching the cooperative schedulers to pick vcores is the named next step.
+
+**The proof** (the `smp` kernel's two-vcore phase, all three ISAs): two vcores of **one**
+cell go into the placement queue and whichever cores are free claim them. Both are
+asserted to exit 0, to complete all 64 rounds, to have run on **different CPUs** - without
+which the phase would pass with them run back to back on one core, since the exit codes
+and round counts are identical either way - and to have **each seen the other advance
+mid-run**, using 10.0's witness for 10.0's reason: a nonzero "highest peer counter seen"
+means this vcore read the peer's progress between two of its own rounds, which one CPU
+cannot produce, because there is no kernel-context preemption to interleave them and
+neither vcore yields. Observed: vcore 0 on CPU 1, vcore 1 on CPU 2 (and every other
+pairing across runs), each seeing the other in the 50-64 range.
+
+**Honest scope - two pieces proven, two required but not detectable here.** Reverting
+`vframe[v]` to `vframe[0]` makes vcore 1 never finish, and reverting `voutcome[v]` to
+`voutcome[0]` panics on the missing outcome; both observed. The other two are construction
+requirements this phase cannot see, which is worth recording rather than glossing:
+
+- A **per-vcore kernel stack** is required because ARM64 and RISC-V load the trap stack
+  out of the frame (`ld sp, TF_KSP(sp)`). Giving both vcores one stack was tried and
+  **passes on all three ISAs**, even after `user_copair` was extended to trap every round
+  precisely to make the two cores' use of it overlap: both cores run the *same* short
+  handler, so each overwrites the other's saved return address and spills with identical
+  bytes. Detecting it needs a handler whose stack contents differ per core.
+- A **per-vcore FP save area** matters when a vcore is stopped and resumed. Each vcore
+  here is entered once and exits once, on its own core with its own register file, so
+  nothing reloads a saved image and sharing one area would be invisible. The path that
+  exposes it is preemption of a multi-vcore cell - refused above - so that proof arrives
+  with that capability, not before.
+
+Also honest: `MAX_VCORES` is 4 because the FP areas are a fixed static
+(`MAX_CELLS * MAX_VCORES`, 4 KiB each on x86-64 = 256 KiB of `.bss`); funding them out of
+the owning cell's budget through `mm::kmeta` - the mechanism S1' already built - is what
+removes the number. Two vcores are proven; a vcore that blocks, forks or takes a signal
+is not, and per-vcore queue pairs (docs/SUBSTRATE.md S5) are the next rung now that there
+is something to give them to.
+
 ### 10.1 The measured motivation (not a wish)
 
 The cooperative single-CPU scheduler switches to another context **only when the

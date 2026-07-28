@@ -19,6 +19,16 @@ preemption doorbell (section 4, needs the timer/IRQ path), stackful strands
 multi-vcore build-out (per-core scheduler, work stealing, Linux threads as
 vcores) is owned by docs/SUBSTRATE.md pillar 3 / stage S3.
 
+**The kernel half of "a cell holds N vcores" is now built** (docs/SMP.md 10.0a): a
+cell carries a trap frame, an FP/SIMD save area and an ownership claim **per vcore**
+rather than per cell, and two vcores of one cell are proven to run on two cores at the
+same instant, in one address space, on all three ISAs. What is *not* built is the half
+this document is about - a vcore that blocks, and the runtime scheduling strands over
+several of them. A multi-vcore cell is currently driven by placement and is refused by
+the cooperative schedulers by name (`user::cell_on_this_cpu`), so `TicketLock`'s
+"future multi-vcore case" is now a nearer future with a mechanism under it, not a
+different design.
+
 Position: threads get light by splitting in two. The kernel schedules
 **vcores** (one kernel context each); the runtime inside a cell schedules
 **strands** - user-level threads costing ~200 bytes, spawned in the

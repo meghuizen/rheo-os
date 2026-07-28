@@ -2008,6 +2008,44 @@ there is no window in which two cores both enter. With one deliberately long cel
 short ones the steal is **asserted**, not hoped for (a round without it produces the same
 exit codes and teaches nothing): 1 rebalanced, busiest core taking 3 of 8, on all three
 ISAs.
+**And one cell now runs on two cores at once** (docs/SMP.md 10.0a - *vcores*): every phase
+above runs **different cells** on different cores, which is real parallelism and is not the
+parallelism a *program* has - a Node worker, a strand pool, an FA3 producer/consumer pair
+are all one address space that wants several cores, and a cell belonged to one core. The
+reason it did is stated in `claim_cell`'s own doc: two cores in one cell would share its
+trap frame, its kernel stack and its FP/SIMD save area, none of which is locked. So the fix
+is **not a lock** - it makes those three per **vcore** and moves the ownership claim down
+with them, at which point the vcore is the unit that is partitioned exactly as the cell was
+and the multikernel argument holds one level lower unchanged. `RunCell` carries
+`vframe`/`voutcome`/`vcpu` arrays instead of three scalars (slot 0 is the context `install`
+builds, so a cell nobody adds a vcore to holds `nvcores == 1` and every pre-vcore path is
+byte-for-byte what it was), `CELL_FP` is one area per `(cell, vcore)`, `CUR_VCORE`/
+`EXITED_VCORE` are `PerCpu` for the reason `CURRENT` is, the double-entry guard keys on
+`cell * MAX_VCORES + vcore`, and `smp::place_vcores` publishes **vcore ids** into the same
+queue `place_cells` uses - one drain loop, one claim protocol, one steal protocol, since a
+cell index is just the vcore id of its vcore 0. **No new kernel object and no new verb**: a
+vcore is an execution context of the Cell object, the shape the Linux personality's contexts
+already are, and `install_vcore` is a *launcher* verb because creating a context creates
+something the scheduler must own - the cell-facing spelling is the strand runtime asking for
+a vcore, which belongs with the process model. Deliberately **refused rather than
+half-supported**: the cooperative schedulers pick a *cell* and enter its vcore 0, which for a
+cell spread over several cores would enter a context another core owns, so
+`cell_on_this_cpu` returns false for any multi-vcore cell and `switch_native_cell` asserts
+against one by name. Proven by the `smp` kernel on **all three ISAs**: two vcores of **one**
+cell go into the placement queue, whichever cores are free claim them, and both are asserted
+to exit 0, complete all 64 rounds, run on **different CPUs** (without which the phase passes
+with them run back to back - the codes and counts are identical either way) and **each see
+the other advance mid-run**, which one CPU cannot produce. Two of the four per-vcore pieces
+are proven load-bearing by observed reverts (`vframe[v]` -> `vframe[0]` makes vcore 1 never
+finish; `voutcome[v]` -> `voutcome[0]` panics); the other two are **construction requirements
+this phase cannot detect**, and that is recorded rather than glossed - a shared kernel stack
+**passes on all three ISAs** even with a trap every round, because both cores run the same
+short handler and overwrite each other's spills with identical bytes, and a shared FP area is
+invisible because each vcore is entered once and exits once on its own register file (the path
+that exposes it is preemption of a multi-vcore cell, which is refused). `MAX_VCORES` is 4
+because the FP areas are a fixed static (256 KiB of `.bss` on x86-64); funding them through
+`mm::kmeta` is what removes the number.
+
 **Honest scope:** preemption is *within* a core's own claim and rebalancing moves only
 **unstarted** cells. Migrating a *running* one was **attempted twice and reverted twice**, with four findings
 recorded in docs/SMP.md 10.0. The second attempt followed the first's own advice -
@@ -2542,7 +2580,12 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               the CPUs split across them, the runnable set grouped by home node with one
               claim cursor per node, 7-8 of 8 cells asserted to run on a core of their
               own node and the counters to agree exactly with the core each ran on;
-              ARM64 skips - no firmware describes memory there); then an
+              ARM64 skips - no firmware describes memory there); then **ONE
+              CELL ON TWO CORES** - two *vcores* of one cell, one address space,
+              claimed by whichever cores were free, each asserted to have seen the
+              other advance mid-run, with per-vcore frames and outcomes observed
+              load-bearing and the per-vcore kernel stack / FP area named as
+              requirements the phase cannot detect (docs/SMP.md 10.0a); then an
               **unmodified static-glibc binary as a Linux cell on a secondary**,
               exact stdout + exit asserted, overlapping a native cell on the
               primary; then **two Linux cells on two cores at once**, each

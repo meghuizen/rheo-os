@@ -419,8 +419,8 @@ pub extern "C" fn user_spinner(params_va: usize) -> ! {
 /// The **co-running pair** cell: the witness that two cells execute *at the same
 /// instant* on two CPUs (docs/SMP.md 10.0).
 ///
-/// `workload` is this cell's slot (0 or 1), `iters` the rounds, and `ticks` the VA of
-/// a shared page holding four `u64` words:
+/// `workload` bit 0 is this cell's slot, `iters` the rounds, and `ticks` the VA of a
+/// shared page holding four `u64` words:
 ///
 /// | word | meaning |
 /// |---|---|
@@ -435,6 +435,14 @@ pub extern "C" fn user_spinner(params_va: usize) -> ! {
 /// `preempt`/`schedidle` kernels share one appended order vector instead; that is
 /// safe there because only one CPU is ever executing.)
 ///
+/// `workload` bit 1 asks for **one syscall per round** (a `SYS_CYCLES`, which reads a
+/// counter and returns). Off, this program traps exactly once, at its exit - which is
+/// what the two-*cell* phase wants and also what makes that phase blind to a shared
+/// kernel stack, since two cores that each trap once, far apart, almost never collide.
+/// On, the two contexts trap continuously, so a kernel stack shared between them is
+/// corrupted rather than merely risked - the property the two-*vcore* phase has to be
+/// able to see (docs/SUBSTRATE.md pillar 3).
+///
 /// The witness: word `2 + slot` is nonzero only if this cell saw the peer make
 /// progress **while this cell was between two of its own rounds**. Under a single
 /// CPU with cooperative dispatch the first cell runs to completion before the second
@@ -448,6 +456,7 @@ pub extern "C" fn user_copair(params_va: usize) -> ! {
     // witness page mapped read-write into it.
     unsafe {
         let slot = ((*p).workload & 1) as usize;
+        let trap_each_round = (*p).workload & 2 != 0;
         let rounds = (*p).iters;
         let base = (*p).ticks as *mut u64;
         let mine = base.add(slot);
@@ -472,6 +481,14 @@ pub extern "C" fn user_copair(params_va: usize) -> ! {
                 k += 1;
             }
             (*p).ops = acc;
+            if trap_each_round {
+                // Enter and leave the kernel every round, so this context's use of its
+                // kernel stack overlaps the peer's rather than being one instant at the
+                // end. `SYS_CYCLES` is chosen because it reads a counter and returns:
+                // no state, no block, nothing to make the two contexts interact except
+                // the trap itself.
+                syscall(SYS_CYCLES, 0);
+            }
         }
         (*p).status = 1;
         syscall(SYS_EXIT, 0);

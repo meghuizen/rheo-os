@@ -624,7 +624,12 @@ pub fn preempt_cell(cur: usize) -> Option<*mut TrapFrame> {
     // lands at an arbitrary instruction inside the cell's own vector code
     // (`user::on_user_interrupt` carries the full argument). `switch_native_cell`
     // would otherwise do the save here, after that work.
-    user::save_native_fp(cur);
+    // The **running vcore's** area, not the cell's first: a multi-vcore cell preempted
+    // on this core is inside whichever context this CPU entered, and saving to vcore 0
+    // would write one context's live registers over another's saved image
+    // (docs/SUBSTRATE.md pillar 3). `schedulable` refuses to *pick* a multi-vcore cell,
+    // but `cur` is whatever this core happens to be inside.
+    user::save_native_fp_vcore(cur, user::current_vcore());
     wake_satisfiable();
     let next = crate::sched::dispatch::pick_excluding_self(cur, MAX_CELLS, schedulable)?;
     // Deliberately **not** `switch_native_cell`: its first action is the save that

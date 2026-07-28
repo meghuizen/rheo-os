@@ -18,6 +18,7 @@ whole pre-existing suite (62 kernels per ISA) still green:
 | Per-ISA user VA ceiling (pillar 2) | `arch::USER_VA_TOP` | **Built.** x86-64 `2^47`, ARM64 `2^48`, RISC-V Sv39 `2^38` as its own floor |
 | VA region allocator (pillar 2) | `kernel/src/mm/vaspace.rs` | **Built.** First-fit with guard gaps, overlap refused, mid-range release splits |
 | Per-CPU primitives (pillar 3) | `kernel/src/smp.rs` | **Built.** `PerCpu<T>`, `cpu_index()` total, always compiled |
+| Vcores - one cell on N cores (pillar 3) | `kernel/src/user.rs`, `smp::place_vcores` | **Built for placement.** Per-vcore frame / FP area / claim; two vcores of one cell proven to overlap on two cores, all three ISAs. Refused by the cooperative schedulers, so a vcore that blocks or yields is not done (docs/SMP.md 10.0a) |
 | Hierarchical timer wheel (pillar 7) | `kernel/src/ktimer/wheel.rs` | **Built.** 64 concurrent deadlines honoured in deadline order beside the named-client slots |
 | Per-CPU timer arbiter (pillar 3/7) | `kernel/src/ktimer/mod.rs` | **Built.** The single-owner invariant is now stated per core |
 | Metrics histograms (pillar 7) | `kernel/src/metrics.rs` | **Built.** Integer-only percentiles, jitter fixed as P95-P50, lazily funded |

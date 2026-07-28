@@ -294,6 +294,7 @@ fn test_secondary_bringup() {
             test_parallel_gemm(idx);
             test_user_cells_on_both();
             test_placement();
+            test_two_vcores_one_cell();
             test_cross_core_preemption();
             test_linux_cell_on_secondary();
             test_two_linux_cells();
@@ -1241,6 +1242,218 @@ fn test_placement() {
                 println!("smp:   CPU {c} claimed {n}");
             }
         }
+    }
+}
+
+// ------------------------------- ONE cell, TWO vcores, TWO cores, at the same instant
+//
+// Every phase above runs **different cells** on different cores. That is real
+// parallelism, and it is not the parallelism a program has: a Node worker, a strand
+// pool, an FA3 producer/consumer pair are all *one* address space that wants several
+// cores. Before vcores, a cell belonged to one core - so the answer to "can my program
+// use the machine" was no, however many cores were online (docs/SMP.md 10.0, the claim).
+//
+// Why a cell was one core, exactly: two cores in one cell would share one trap frame,
+// one kernel stack and one FP/SIMD save area, none of which is locked. So the fix is not
+// a lock - it is to make those three per **vcore** and move the ownership claim down
+// with them (docs/SUBSTRATE.md pillar 3). A vcore is then the unit that is partitioned,
+// exactly as a cell was, and the multikernel argument is unchanged one level lower.
+//
+// This phase publishes **two vcores of one cell** into the same queue every other
+// placement uses, so whichever cores are free claim them - nobody is assigned anything.
+//
+// The witness is the one `test_user_cells_on_both` uses, and for the same reason: each
+// vcore writes only its own round counter and the highest peer counter it ever saw, so
+// there is nothing to lock and nothing to lose. A nonzero "highest peer seen" means this
+// vcore read the peer's progress **between two of its own rounds** - which one CPU
+// cannot produce, because there is no kernel-context preemption to interleave them and
+// neither vcore yields. Both directions nonzero is only producible by two cores inside
+// one address space at once.
+//
+// Dispatch stays off, as in the two-cell phase: this is about two cores in one cell, not
+// about preemption.
+//
+// **What this phase proves, and what it only requires.** Two of the three per-vcore
+// pieces are load-bearing here and were observed failing when reverted: entering
+// `vframe[0]` for both vcores instead of `vframe[v]` makes vcore 1 never finish, and
+// recording the outcome in `voutcome[0]` instead of `voutcome[v]` panics on the missing
+// one. The other two are **construction requirements this phase cannot detect**, and
+// saying so is the point:
+//
+//   * A **per-vcore kernel stack** is required because ARM64 and RISC-V load the trap
+//     stack out of the frame (`ld sp, TF_KSP`). Giving both vcores one stack was tried
+//     and **passes on all three ISAs**, even with a trap every round: the two cores run
+//     the *same* short handler, so each overwrites the other's saved return address and
+//     spilled registers with identical bytes. Detecting it needs a handler whose stack
+//     contents differ per core, which is a deeper path than a `SYS_CYCLES`.
+//   * A **per-vcore FP/SIMD save area** matters when a vcore is stopped and resumed. Each
+//     vcore here is entered once and exits once, on its own core with its own register
+//     file, so nothing ever reloads a saved image and sharing one area would be
+//     invisible. The path that would expose it is preemption of a multi-vcore cell, which
+//     the cooperative schedulers currently refuse outright
+//     (`user::cell_on_this_cpu`) - so that proof arrives with that capability, not before.
+
+/// The second vcore's user-visible store - its own stack and its own `Params`, in the
+/// **same** `.user.bss` window, so both are mapped into the one address space.
+#[unsafe(link_section = ".user.bss")]
+static mut STORE_V1: CellStore = CellStore::new();
+
+/// The witness page for this phase. Its own static rather than a reuse of `WITNESS`:
+/// sharing one would couple two phases' assertions through a static.
+#[repr(C, align(4096))]
+struct VWitness([u64; 512]);
+#[unsafe(link_section = ".user.bss")]
+static mut VWITNESS: VWitness = VWitness([0; 512]);
+
+/// One kernel stack **per vcore**, not per cell. On ARM64 and RISC-V a vcore's kernel
+/// stack is carried in its own trap frame, so two vcores sharing one would have two
+/// cores trapping onto the same stack - a corrupted frame, which presents as a random
+/// fault rather than as a missing stack.
+static mut KSTACK_V0: KernelStack = KernelStack::new();
+static mut KSTACK_V1: KernelStack = KernelStack::new();
+
+/// Rounds each vcore runs. As `CO_ROUNDS`: enough to overlap for many rounds under TCG,
+/// few enough to finish inside the boot budget.
+const VCORE_ROUNDS: u64 = 64;
+
+fn test_two_vcores_one_cell() {
+    // SAFETY: single-threaded setup on the primary; the secondaries are parked in their
+    // work loop and claim nothing until `place_vcores` publishes the queue.
+    unsafe {
+        let w = &mut *core::ptr::addr_of_mut!(VWITNESS);
+        w.0[..4].fill(0);
+        let shared = core::ptr::addr_of!(VWITNESS) as usize;
+
+        let objects = &mut *core::ptr::addr_of_mut!(OBJECTS2);
+        let caps = &mut *core::ptr::addr_of_mut!(CAPS2);
+        *objects = ObjectTable::new();
+        *caps = CapTable::new();
+
+        // Vcore 0: an ordinary cell, built exactly as every other phase builds one.
+        let v0 = core::ptr::addr_of_mut!(STORE_P);
+        let (mut aspace, _o, mut frame0) = build_cell(
+            &mut *v0,
+            objects,
+            caps,
+            (*core::ptr::addr_of!(KSTACK_V0)).top(),
+            7,
+            user_copair,
+            // Slot 0, **and** bit 1: trap once per round. Without that this program
+            // traps only at its exit, and two contexts that each trap once, far apart,
+            // never collide - so a kernel stack shared between them would go unnoticed
+            // (verified: with one stack for both vcores and no per-round trap the phase
+            // passes on all three ISAs).
+            0 | 2,
+            VCORE_ROUNDS,
+        );
+
+        // Vcore 1: a second context in the **same address space**. Its stack and its
+        // `Params` page are mapped into that one aspace, and its frame names its own
+        // user stack, its own params VA and its own kernel stack. Written out here
+        // rather than factored into `harness` because this is its only caller; a second
+        // one is when it earns a helper.
+        let v1 = core::ptr::addr_of_mut!(STORE_V1);
+        let stack1 = core::ptr::addr_of!((*v1).stack) as usize;
+        aspace.map_user_range(
+            stack1,
+            core::mem::size_of_val(&(*v1).stack),
+            MapPerm::UserRw,
+        );
+        let params1 = core::ptr::addr_of!((*v1).params) as usize;
+        aspace.map_user(params1 & !0xFFF, MapPerm::UserRw);
+        (*v1).params = kernel::abi::Params {
+            workload: 1 | 2,
+            iters: VCORE_ROUNDS,
+            ..kernel::abi::Params::ZERO
+        };
+
+        // The shared witness page, mapped once - one address space, so "shared between
+        // the vcores" needs no second mapping. That is the whole economy of a vcore over
+        // a second cell: no cross-cell grant, no channel, just memory both already have.
+        aspace.map_user_range(shared, 4096, MapPerm::UserRw);
+        (*v0).params.ticks = shared as u64;
+        (*v1).params.ticks = shared as u64;
+
+        let frame1 = arch::trapframe_new(
+            user_copair as usize,
+            stack1 + core::mem::size_of_val(&(*v1).stack),
+            params1,
+            (*core::ptr::addr_of!(KSTACK_V1)).top(),
+        );
+        static mut FRAME1: core::mem::MaybeUninit<kernel::arch::TrapFrame> =
+            core::mem::MaybeUninit::uninit();
+        let f1 = core::ptr::addr_of_mut!(FRAME1);
+        (*f1).write(frame1);
+
+        user::reset();
+        user::install(
+            0,
+            &aspace,
+            caps,
+            objects,
+            (*v0).qp.qp.as_ptr(),
+            core::ptr::addr_of_mut!(frame0),
+        );
+        // SAFETY: `FRAME1` outlives the run, and no other vcore shares vcore 1's user
+        // stack or kernel stack.
+        let vi = user::install_vcore(0, (*f1).as_mut_ptr());
+        assert_eq!(vi, 1, "the second vcore did not land at index 1");
+        assert_eq!(user::cell_vcores(0), 2, "cell 0 does not hold two vcores");
+
+        // Publish both vcores of cell 0 as the runnable set.
+        let vids = [0 * user::MAX_VCORES, 0 * user::MAX_VCORES + 1];
+        let mut out = [(u64::MAX, usize::MAX); 2];
+        let before = user::double_entries();
+        // SAFETY: cell 0 is installed, present and native, and each vcore is listed once.
+        let finished = smp::place_vcores(&vids, &mut out);
+        if !finished {
+            println!(
+                "smp: SKIP the two-vcore phase - the queue did not drain inside the \
+                 bound, so nothing about one cell on two cores is claimed"
+            );
+            return;
+        }
+
+        assert_eq!(out[0].0, 0, "vcore 0 exited {:#x}", out[0].0);
+        assert_eq!(out[1].0, 0, "vcore 1 exited {:#x}", out[1].0);
+        assert_eq!((*v0).params.status, 1, "vcore 0 never finished");
+        assert_eq!((*v1).params.status, 1, "vcore 1 never finished");
+        assert_eq!(
+            user::double_entries(),
+            before,
+            "two cores were inside the same vcore"
+        );
+
+        let (r0, r1) = (w.0[0], w.0[1]);
+        let (seen0, seen1) = (w.0[2], w.0[3]);
+        assert_eq!(r0, VCORE_ROUNDS, "vcore 0 lost rounds");
+        assert_eq!(r1, VCORE_ROUNDS, "vcore 1 lost rounds");
+
+        // **Two different cores.** Without this the phase would pass with both vcores
+        // run one after the other on one core - the exit codes and the round counts are
+        // identical either way, and only the overlap and the CPUs distinguish them.
+        assert!(
+            out[0].1 != out[1].1,
+            "both vcores of the cell ran on CPU {} - one cell still occupies one core",
+            out[0].1
+        );
+        // The overlap itself.
+        assert!(
+            seen0 > 0 && seen1 > 0,
+            "neither direction of overlap was observed (vcore 0 saw {seen0}, vcore 1 \
+             saw {seen1}) - the two vcores ran one after the other"
+        );
+        assert!(
+            kernel::mm::frames::used_matches_bitmap(),
+            "the frame pool's used counter drifted from its bitmap"
+        );
+        println!(
+            "smp: ONE CELL ran on TWO CORES at once - two vcores of cell 0 in ONE \
+             address space, claimed by CPU {} and CPU {}, {VCORE_ROUNDS} rounds each, \
+             and each saw the other advance mid-run (vcore 0 saw vcore 1 reach {seen0}, \
+             vcore 1 saw vcore 0 reach {seen1}) OK",
+            out[0].1, out[1].1
+        );
     }
 }
 

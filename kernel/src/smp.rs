@@ -1290,9 +1290,14 @@ unsafe fn drain_cells() {
             }
         }
         // Stamp ownership before anything runs: from here no other core's pick can
-        // see these cells, which is what makes running them need no lock.
+        // see these vcores, which is what makes running them need no lock. Per **vcore**,
+        // so two cores can own two contexts of one cell (docs/SUBSTRATE.md pillar 3).
         for c in cell.iter().take(got) {
-            crate::user::claim_cell(*c, cpu);
+            crate::user::claim_vcore(
+                *c / crate::user::MAX_VCORES,
+                *c % crate::user::MAX_VCORES,
+                cpu,
+            );
         }
 
         // Run until every cell of the batch has exited. `run` returns the cell that
@@ -1317,7 +1322,7 @@ unsafe fn drain_cells() {
             // be lost to a stealer, which would count a cell twice and make the
             // counters disagree with where the cell actually ran (observed: 9 claims
             // counted for 8 cells, one of them stolen).
-            count_claim(cell[pos]);
+            count_claim(cell[pos] / crate::user::MAX_VCORES);
             if preemptive {
                 // Under preemption *both* cells of a batch are live at once - the timer
                 // enters the sibling without passing through this loop - so neither can
@@ -1330,9 +1335,13 @@ unsafe fn drain_cells() {
             }
             // The caller's contract holds here: a present native cell this core owns
             // exclusively, because the `fetch_add` handed its index to nobody else.
-            let (exited, outcome) = crate::user::run(cell[pos]);
+            let (ec, ev, outcome) = crate::user::run_vcore(
+                cell[pos] / crate::user::MAX_VCORES,
+                cell[pos] % crate::user::MAX_VCORES,
+            );
+            let exited = ec * crate::user::MAX_VCORES + ev;
             let code = code_of(outcome);
-            // Attribute the outcome to whichever cell of the batch ended the run.
+            // Attribute the outcome to whichever vcore of the batch ended the run.
             let Some(done) = (0..got).find(|&i| cell[i] == exited && slot[i] != usize::MAX) else {
                 // Not one of ours - impossible under the claim, but bailing out beats
                 // spinning if the invariant is ever broken.
@@ -1408,6 +1417,36 @@ pub unsafe fn place_cells_preemptive(cells: &[usize], out: &mut [(u64, usize)]) 
 /// # Safety
 /// As [`place_cells`].
 unsafe fn place_cells_inner(cells: &[usize], out: &mut [(u64, usize)], preempt: bool) -> bool {
+    // A cell index is the vcore id of its vcore 0, so publishing cells is publishing
+    // vcore ids - one queue, one drain loop (docs/SUBSTRATE.md pillar 3).
+    let mut vids = [0usize; MAX_PLACED_CELLS];
+    let k = cells.len().min(MAX_PLACED_CELLS);
+    for (d, &c) in vids.iter_mut().zip(cells.iter()).take(k) {
+        *d = c * crate::user::MAX_VCORES;
+    }
+    // SAFETY: the caller's contract.
+    unsafe { place_vcores_inner(&vids[..k], out, preempt) }
+}
+
+#[cfg(feature = "smp")]
+/// [`place_cells`], over **vcore ids** (`cell * MAX_VCORES + vcore`) rather than cells.
+///
+/// This is what lets one cell occupy several cores: publish two vcores of the same cell
+/// and each is claimed, run and reported independently, because the frame, the kernel
+/// stack, the FP area and the ownership claim are all per vcore.
+///
+/// # Safety
+/// As [`place_cells`], per vcore: each `(cell, vcore)` installed, present, native, and
+/// listed once.
+pub unsafe fn place_vcores(vids: &[usize], out: &mut [(u64, usize)]) -> bool {
+    // SAFETY: the caller's contract.
+    unsafe { place_vcores_inner(vids, out, false) }
+}
+
+#[cfg(feature = "smp")]
+/// # Safety
+/// As [`place_vcores`].
+unsafe fn place_vcores_inner(cells: &[usize], out: &mut [(u64, usize)], preempt: bool) -> bool {
     let n = cells.len().min(MAX_PLACED_CELLS).min(out.len());
     // **Publish the queue grouped by each cell's home node** (docs/SUBSTRATE.md pillar
     // 6), so a core taking work from its own node's cursor gets cells whose pages are
@@ -1422,7 +1461,7 @@ unsafe fn place_cells_inner(cells: &[usize], out: &mut [(u64, usize)], preempt: 
         let mut w = 0usize;
         for (g, end) in PLACE_GROUP_END.iter().enumerate().take(groups) {
             for (i, &c) in cells[..n].iter().enumerate() {
-                let node = crate::user::cell_node(c);
+                let node = crate::user::cell_node(c / crate::user::MAX_VCORES);
                 // A cell with no node - every cell on a single-node machine - belongs
                 // to group 0, the only group there is.
                 let cg = if (node as usize) < groups {

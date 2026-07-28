@@ -303,8 +303,23 @@ struct RunCell {
     caps: *mut CapTable,
     objects: *const ObjectTable,
     qp: *const QueuePair,
-    frame: *mut TrapFrame,
-    outcome: Option<Outcome>,
+    /// One execution context per vcore (docs/SUBSTRATE.md pillar 3, [`MAX_VCORES`]).
+    ///
+    /// Slot 0 is the cell's original context - the frame `install` was handed, and the
+    /// one the Linux personality, `nproc` and `SYS_SWITCH` all mean when they say "the
+    /// cell's frame". Slots `1..nvcores` exist only for a cell some launcher gave them
+    /// to with [`install_vcore`].
+    ///
+    /// **This is what makes one cell runnable on two cores.** Two cores in one cell
+    /// would otherwise share one trap frame, one kernel stack and one FP save area,
+    /// none of which is locked - which is why the claim used to be per *cell*
+    /// (docs/SMP.md 10.0). Per vcore the three are disjoint again, and the claim moves
+    /// down with them.
+    vframe: [*mut TrapFrame; MAX_VCORES],
+    /// How each vcore's run ended, or `None` while it is live or handing off.
+    voutcome: [Option<Outcome>; MAX_VCORES],
+    /// How many vcores this cell holds. 1 unless [`install_vcore`] added more.
+    nvcores: usize,
     present: bool,
     personality: Personality,
     /// Base VA of the cell's mapped queue-pair region, reported by
@@ -329,7 +344,10 @@ struct RunCell {
     /// table. Until something claims a cell this is [`NO_CPU`], and an unclaimed cell
     /// is pickable by any core - which is exactly the single-CPU behaviour, so a boot
     /// that never claims anything is unchanged.
-    cpu: usize,
+    ///
+    /// **Per vcore**, so two cores can own two contexts of the same cell. For a
+    /// single-vcore cell only slot 0 is ever read, which is the pre-vcore behaviour.
+    vcpu: [usize; MAX_VCORES],
     /// The NUMA node this cell's memory is placed on (docs/SUBSTRATE.md pillar 6),
     /// or [`frames::NODE_ANY`] on a machine with one node.
     ///
@@ -398,14 +416,15 @@ const EMPTY: RunCell = RunCell {
     caps: core::ptr::null_mut(),
     objects: core::ptr::null(),
     qp: core::ptr::null(),
-    frame: core::ptr::null_mut(),
-    outcome: None,
+    vframe: [core::ptr::null_mut(); MAX_VCORES],
+    voutcome: [None; MAX_VCORES],
+    nvcores: 0,
     present: false,
     personality: Personality::Native,
     qp_va: 0,
     qp_cap_id: 0,
     chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
-    cpu: NO_CPU,
+    vcpu: [NO_CPU; MAX_VCORES],
     node: frames::NODE_ANY,
 };
 
@@ -551,6 +570,21 @@ fn cell_admission(cur: usize) -> &'static mut Admission {
 /// `SYS_SWITCH` test's `cur ^ 1` pairing (cells 0/1) is unaffected.
 pub const MAX_CELLS: usize = 16;
 
+/// How many **vcores** one cell may hold (docs/SUBSTRATE.md pillar 3).
+///
+/// A vcore is one execution context of a cell: its own trap frame, its own kernel
+/// stack (carried in that frame), its own FP/SIMD save area and its own owning CPU.
+/// Vcore 0 is the context `install` builds, so a cell that is never given a second
+/// vcore holds `nvcores == 1` and every path below behaves exactly as it did before
+/// vcores existed.
+///
+/// Four rather than "as many as there are CPUs" because the FP save areas are a fixed
+/// static here (`MAX_CELLS * MAX_VCORES` of them, 4 KiB each on x86-64 = 256 KiB of
+/// `.bss`). Funding them out of the owning cell's own frame budget - the `mm::kmeta`
+/// mechanism S1' already built for the other tables - is what removes the number, and
+/// is a named follow-on rather than something this slice needs.
+pub const MAX_VCORES: usize = 4;
+
 static mut CELLS: [RunCell; MAX_CELLS] = [EMPTY; MAX_CELLS];
 
 /// The cell each CPU is currently running, the cell each entered `run` with, and the
@@ -572,6 +606,20 @@ fn cur_cpu_cell() -> usize {
     *CURRENT.this()
 }
 
+/// Which **vcore** of [`CURRENT`] this CPU is inside (docs/SUBSTRATE.md pillar 3).
+///
+/// Per CPU for the same reason `CURRENT` is: two cores inside two vcores of one cell
+/// are inside the *same* cell index and different contexts, so the cell alone cannot
+/// say which frame or which FP area a trap belongs to. 0 on every path that predates
+/// vcores, which is why they are all unchanged.
+static CUR_VCORE: crate::smp::PerCpu<usize> = crate::smp::PerCpu::new(0);
+
+/// The vcore of the current cell this CPU is running.
+#[inline]
+pub fn current_vcore() -> usize {
+    *CUR_VCORE.this()
+}
+
 /// The cell whose trap is being serviced. `crate::uaccess` needs it to know whose
 /// address space a supplied pointer belongs to, and whether that cell's mappings are
 /// lazy at all (a native cell's are not).
@@ -585,6 +633,9 @@ pub fn cell_personality(idx: usize) -> Personality {
     cells()[idx].personality
 }
 static EXITED: crate::smp::PerCpu<usize> = crate::smp::PerCpu::new(0);
+
+/// Which vcore of [`EXITED`] ended this CPU's run.
+static EXITED_VCORE: crate::smp::PerCpu<usize> = crate::smp::PerCpu::new(0);
 
 /// A kernel-owned capability table per cell slot, for cells the **kernel**
 /// creates - a native `SYS_SPAWN` child or a Linux `fork` child
@@ -645,44 +696,67 @@ pub fn mint_into(idx: usize, kind: ObjectKind, rights: u32) -> Option<u32> {
 #[repr(C, align(64))]
 struct FpArea([u8; arch::FP_AREA_LEN]);
 
-static mut CELL_FP: [FpArea; MAX_CELLS] = [const { FpArea([0; arch::FP_AREA_LEN]) }; MAX_CELLS];
+/// One area per **vcore**, flat: `cell * MAX_VCORES + vcore`.
+///
+/// Per vcore rather than per cell because two cores running two contexts of one cell
+/// each hold a live register file, and one area between them would have each core save
+/// over the other's image - no fault, no log, wrong numbers, the same shape as the
+/// `SYS_YIELD` defect (docs/LIBRHEO.md).
+static mut CELL_FP: [FpArea; MAX_CELLS * MAX_VCORES] =
+    [const { FpArea([0; arch::FP_AREA_LEN]) }; MAX_CELLS * MAX_VCORES];
 
-/// Pointer to cell `idx`'s FP save area.
-fn cell_fp(idx: usize) -> *mut u8 {
-    // SAFETY: single CPU, synchronous traps; `idx < MAX_CELLS`.
-    unsafe { (*core::ptr::addr_of_mut!(CELL_FP))[idx].0.as_mut_ptr() }
+/// Pointer to vcore `v` of cell `idx`'s FP save area.
+fn cell_fp(idx: usize, v: usize) -> *mut u8 {
+    // SAFETY: `idx < MAX_CELLS` and `v < MAX_VCORES`, so the index is in bounds; each
+    // area belongs to one vcore, which belongs to one CPU at a time.
+    unsafe {
+        (*core::ptr::addr_of_mut!(CELL_FP))[idx * MAX_VCORES + v]
+            .0
+            .as_mut_ptr()
+    }
 }
 
 /// Count of native FP/SIMD register-file swaps performed by
 /// [`switch_native_cell`] (and of the initial loads done by [`run`]). Bumped
 /// *only* inside the swap itself, so a test can assert the swap really ran on
 /// every switch rather than infer it from the code (docs/ENGINEERING.md 1).
-static mut FP_SWAPS: u64 = 0;
+/// Relaxed atomic, not a `static mut +=`: two cores now restore FP for two vcores of
+/// one cell at the same instant, and a read-modify-write of a plain static loses
+/// counts (the fix the `preempt`/`dispatch` counters already took, docs/SMP.md 10.0).
+static FP_SWAPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// How many times a native cell's FP/SIMD register file has been swapped
 /// (docs/LIBRHEO.md; the `librheoipc` FP regression phase asserts this is at
 /// least the number of cross-cell yields it drove).
 pub fn fp_swaps() -> u64 {
-    // SAFETY: single CPU, synchronous traps.
-    unsafe { *core::ptr::addr_of!(FP_SWAPS) }
+    FP_SWAPS.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Save native cell `idx`'s live U-mode FP/SIMD state into its area (the kernel
 /// is soft-float, so the registers hold `idx`'s values at the switch point).
 /// Harmless if `idx` is exiting - the saved image is simply never restored.
 pub fn save_native_fp(idx: usize) {
-    // SAFETY: `cell_fp(idx)` is a valid, sufficiently-aligned area.
-    unsafe { arch::save_user_fp(cell_fp(idx)) };
+    save_native_fp_vcore(idx, 0);
+}
+
+/// [`save_native_fp`] for a named vcore of the cell.
+pub fn save_native_fp_vcore(idx: usize, v: usize) {
+    // SAFETY: `cell_fp(idx, v)` is a valid, sufficiently-aligned area.
+    unsafe { arch::save_user_fp(cell_fp(idx, v)) };
 }
 
 /// Restore native cell `idx`'s U-mode FP/SIMD state before resuming it. For a
 /// cell that has never run, the area was set to a clean image by `fp_area_init`
 /// at install time, so this loads the ABI-default FP state.
 pub fn restore_native_fp(idx: usize) {
-    // SAFETY: `cell_fp(idx)` holds a valid image (saved, or `fp_area_init`ed).
-    unsafe { arch::restore_user_fp(cell_fp(idx)) };
-    // SAFETY: single CPU, synchronous traps.
-    unsafe { *core::ptr::addr_of_mut!(FP_SWAPS) += 1 };
+    restore_native_fp_vcore(idx, 0);
+}
+
+/// [`restore_native_fp`] for a named vcore of the cell.
+pub fn restore_native_fp_vcore(idx: usize, v: usize) {
+    // SAFETY: `cell_fp(idx, v)` holds a valid image (saved, or `fp_area_init`ed).
+    unsafe { arch::restore_user_fp(cell_fp(idx, v)) };
+    FP_SWAPS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
 }
 
 /// **The** native cross-cell switch: make `to` the current cell, activate its
@@ -707,6 +781,17 @@ pub fn restore_native_fp(idx: usize) {
 /// [`switch_to_cell`]), because a Linux cell holds up to 8 contexts with an FP
 /// area each.
 pub fn switch_native_cell(from: usize, to: usize) {
+    // Both sides are vcore 0, because every caller is a cooperative hand-off between
+    // whole cells. A **multi-vcore** cell reaching here would have its vcore 0 FP image
+    // saved or loaded while another core is inside another of its vcores, which is the
+    // corruption per-vcore areas exist to prevent - so refuse it by name rather than
+    // pick a vcore and hope (docs/SUBSTRATE.md pillar 3; `cell_on_this_cpu` keeps such a
+    // cell out of the cooperative schedulers, and this is the assertion that says so).
+    assert!(
+        cells()[from].nvcores == 1 && cells()[to].nvcores == 1,
+        "native cross-cell switch {from} -> {to} with a multi-vcore cell; \
+         a multi-vcore cell is driven by placement, not by a cooperative hand-off"
+    );
     save_native_fp(from);
     switch_to_cell(to);
     restore_native_fp(to);
@@ -754,7 +839,7 @@ pub fn current_index() -> usize {
 /// table uses this as its initial (thread 0) execution context
 /// (docs/LINUX-COMPAT.md L4); clone-created threads get kernel-owned frames.
 pub fn cell_frame(idx: usize) -> *mut TrapFrame {
-    cells()[idx].frame
+    cells()[idx].vframe[0]
 }
 
 /// Run `f` against the current cell's address space, then re-activate it so
@@ -1780,14 +1865,21 @@ pub unsafe fn install(
         caps,
         objects,
         qp,
-        frame,
-        outcome: None,
+        // Vcore 0 is the frame the caller built; a fresh cell holds exactly one vcore,
+        // and a launcher that wants more adds them with `install_vcore`.
+        vframe: {
+            let mut f = [core::ptr::null_mut(); MAX_VCORES];
+            f[0] = frame;
+            f
+        },
+        voutcome: [None; MAX_VCORES],
+        nvcores: 1,
         present: true,
         personality: Personality::Native,
         qp_va: 0,
         qp_cap_id: 0,
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
-        cpu: NO_CPU,
+        vcpu: [NO_CPU; MAX_VCORES],
         // Round-robin across the nodes the pool holds, so cells spread their
         // memory bandwidth (docs/SUBSTRATE.md pillar 6). `NODE_ANY` on a
         // single-node machine, which is every allocation path unchanged.
@@ -1835,8 +1927,44 @@ pub unsafe fn install(
     crate::sched::dispatch::track(idx, 0, None);
     // Clean FP state, so the first cross-cell switch into this cell restores an
     // ABI-default FPU rather than a zeroed area (docs/LIBRHEO.md).
-    // SAFETY: `cell_fp(idx)` is a valid, aligned `FP_AREA_LEN` area.
-    unsafe { arch::fp_area_init(cell_fp(idx)) };
+    // SAFETY: `cell_fp(idx, 0)` is a valid, aligned `FP_AREA_LEN` area.
+    unsafe { arch::fp_area_init(cell_fp(idx, 0)) };
+}
+
+/// Give installed cell `idx` **another vcore** - a second (third, fourth) execution
+/// context in the same address space (docs/SUBSTRATE.md pillar 3).
+///
+/// Returns the new vcore's index. `frame` must be a fresh trap frame whose entry point,
+/// user stack and **kernel stack** are all this vcore's own: a vcore's kernel stack is
+/// carried in its frame on ARM64 and RISC-V, so two vcores sharing one would have two
+/// cores trapping onto the same stack. (On x86-64 the kernel stack is per-CPU rather
+/// than per-frame, so it is already disjoint there; supplying a distinct one anyway is
+/// what keeps the three ISAs one contract.)
+///
+/// Why this is a launcher verb and not a syscall: creating a context is creating
+/// something the *scheduler* must own, and the cell-facing spelling of it is the strand
+/// runtime asking for a vcore, which is a librheo/`SYS_SPAWN`-shaped question that
+/// belongs with the rest of the process model. What is being built here is the kernel
+/// mechanism underneath, proven before anything is exposed - the order every capability
+/// in this tree landed in.
+///
+/// # Safety
+/// `frame` must outlive the cell's run, and no other vcore may share its user stack or
+/// kernel stack.
+pub unsafe fn install_vcore(idx: usize, frame: *mut TrapFrame) -> usize {
+    let c = &mut cells()[idx];
+    assert!(c.present, "install_vcore on empty slot {idx}");
+    let v = c.nvcores;
+    assert!(v < MAX_VCORES, "cell {idx} already holds {v} vcore(s)");
+    c.vframe[v] = frame;
+    c.voutcome[v] = None;
+    c.vcpu[v] = NO_CPU;
+    c.nvcores = v + 1;
+    // Clean FP state for this vcore's first entry, exactly as `install` does for vcore
+    // 0 - a zeroed area is not an ABI-default FPU (docs/LIBRHEO.md).
+    // SAFETY: `cell_fp(idx, v)` is a valid, aligned `FP_AREA_LEN` area.
+    unsafe { arch::fp_area_init(cell_fp(idx, v)) };
+    v
 }
 
 /// Record the mapped queue-pair region VA and capability id for cell `idx`
@@ -1913,15 +2041,26 @@ pub fn set_personality(idx: usize, p: Personality) {
 /// which cell ended the run and how. Cross-cell switches keep running
 /// inside the trampoline; only an exit or fault unwinds back here.
 pub fn run(idx: usize) -> (usize, Outcome) {
-    run_inner(idx);
+    let (cell, _vcore, out) = run_vcore(idx, 0);
+    (cell, out)
+}
+
+/// [`run`], entering a named **vcore** of the cell (docs/SUBSTRATE.md pillar 3).
+///
+/// Returns which `(cell, vcore)` ended the run and how. `run(idx)` is exactly
+/// `run_vcore(idx, 0)`, so every pre-vcore caller is unchanged.
+pub fn run_vcore(idx: usize, v: usize) -> (usize, usize, Outcome) {
+    run_inner(idx, v);
     let exited = *EXITED.this();
+    let ev = *EXITED_VCORE.this();
     (
         exited,
-        cells()[exited].outcome.expect("no outcome recorded"),
+        ev,
+        cells()[exited].voutcome[ev].expect("no outcome recorded"),
     )
 }
 
-/// Which cell each CPU is inside, or [`NO_CPU`] for none.
+/// Which **vcore** each CPU is inside (`cell * MAX_VCORES + vcore`), or [`NO_CPU`].
 ///
 /// **Per CPU, not per cell**, and the difference is the whole point: a first attempt
 /// counted entries per cell and produced false positives, because under preemption a
@@ -1946,32 +2085,43 @@ pub fn double_entries() -> u32 {
 }
 
 /// Enter cell `idx` and return when some cell's run on this CPU ends. The reason is in
-/// `cells()[EXITED].outcome`: `Some` for an exit or fault, `None` for a hand-off.
-fn run_inner(idx: usize) {
+/// `cells()[EXITED].voutcome[EXITED_VCORE]`: `Some` for an exit or fault, `None` for a
+/// hand-off.
+fn run_inner(idx: usize, v: usize) {
     let cell = cells()[idx];
     assert!(cell.present, "run of empty cell slot {idx}");
+    assert!(
+        v < cell.nvcores,
+        "run of vcore {v} of cell {idx}, which holds {}",
+        cell.nvcores
+    );
+    // The guard is on the **vcore**, not the cell: two cores inside two vcores of one
+    // cell is now the point, while two cores inside the *same* vcore is still the
+    // corruption this catches.
+    let vid = idx * MAX_VCORES + v;
     let me = crate::smp::cpu_index();
     for cpu in 0..crate::smp::MAX_CPUS {
         // SAFETY: a plain read of another CPU's slot.
-        if cpu != me && unsafe { *INSIDE.get(cpu) } == idx {
+        if cpu != me && unsafe { *INSIDE.get(cpu) } == vid {
             DOUBLE_ENTRY.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-            panic!("cell {idx} entered by CPU {me} while CPU {cpu} is already inside it");
+            panic!("cell {idx} vcore {v} entered by CPU {me} while CPU {cpu} is already inside it");
         }
     }
     // SAFETY: this CPU's own slot.
-    unsafe { *INSIDE.this_mut() = idx };
+    unsafe { *INSIDE.this_mut() = vid };
     unsafe {
         *CURRENT.this_mut() = idx;
+        *CUR_VCORE.this_mut() = v;
         *TOP_CELL.this_mut() = idx;
         (*cell.aspace).activate();
-        // Load this cell's own FP/SIMD image before its first instruction: the clean
+        // Load this vcore's own FP/SIMD image before its first instruction: the clean
         // ABI-default one `fp_area_init` wrote at install for a fresh cell, or its
         // saved image if a previous `run` left it mid-flight.
-        restore_native_fp(idx);
+        restore_native_fp_vcore(idx, v);
         // The first entry into a cell does not go through either scheduler, so it is
         // the one place a slice has to be armed explicitly (docs/SUBSTRATE.md pillar 3).
         crate::sched::dispatch::running(idx, 0);
-        arch::enter_user_first(cell.frame);
+        arch::enter_user_first(cell.vframe[v]);
     }
     // enter_user_first returns via return_to_kernel after an exit, a fault, or a
     // hand-off. Restore the kernel address space so setup code can again reach all of
@@ -2005,9 +2155,11 @@ fn linux_ctl(ctl: crate::linux::Ctl, frame: *mut TrapFrame) -> *mut TrapFrame {
 /// returning a null frame (the arch trampoline calls return_to_kernel).
 fn finish(outcome: Outcome) -> *mut TrapFrame {
     let cur = cur_cpu_cell();
-    cells()[cur].outcome = Some(outcome);
+    let v = current_vcore();
+    cells()[cur].voutcome[v] = Some(outcome);
     unsafe {
         *EXITED.this_mut() = cur;
+        *EXITED_VCORE.this_mut() = v;
     }
     core::ptr::null_mut()
 }
@@ -2033,20 +2185,48 @@ pub fn cell_present(idx: usize) -> bool {
     cells()[idx].present
 }
 
-/// Give cell `idx` to CPU `cpu`: from now on only that core may pick it.
+/// Give **every vcore** of cell `idx` to CPU `cpu`: from now on only that core may
+/// pick it.
 ///
 /// The claim is the whole of the multi-core safety argument for the native path
-/// (docs/SMP.md 10.0). Two cores running one cell would share its trap frame, its
-/// kernel stack and its FP save area, none of which is locked - so instead of
-/// locking them, a cell belongs to one core and the scheduler on every *other* core
-/// refuses to see it ([`cell_on_this_cpu`]).
+/// (docs/SMP.md 10.0). Two cores running one *vcore* would share its trap frame, its
+/// kernel stack and its FP save area, none of which is locked - so instead of locking
+/// them, a vcore belongs to one core and the scheduler on every *other* core refuses to
+/// see the cell ([`cell_on_this_cpu`]).
+///
+/// For a single-vcore cell - every cell before vcores existed - this is exactly the
+/// old one-field store. To give two cores two contexts of one cell, claim each vcore
+/// separately with [`claim_vcore`].
 pub fn claim_cell(idx: usize, cpu: usize) {
-    cells()[idx].cpu = cpu;
+    let n = cells()[idx].nvcores;
+    for v in 0..n {
+        cells()[idx].vcpu[v] = cpu;
+    }
 }
 
-/// The CPU that owns cell `idx`, or [`NO_CPU`].
+/// Give vcore `v` of cell `idx` to CPU `cpu`, leaving its siblings' owners alone.
+///
+/// This is what lets one cell occupy several cores at once: each vcore is claimed by
+/// the core that will run it, and the three things a context cannot share - frame,
+/// kernel stack, FP area - are per vcore, so the partitioning discipline holds one
+/// level down (docs/SUBSTRATE.md pillar 3).
+pub fn claim_vcore(idx: usize, v: usize, cpu: usize) {
+    cells()[idx].vcpu[v] = cpu;
+}
+
+/// The CPU that owns vcore 0 of cell `idx`, or [`NO_CPU`].
 pub fn cell_cpu(idx: usize) -> usize {
-    cells()[idx].cpu
+    cells()[idx].vcpu[0]
+}
+
+/// The CPU that owns vcore `v` of cell `idx`, or [`NO_CPU`].
+pub fn vcore_cpu(idx: usize, v: usize) -> usize {
+    cells()[idx].vcpu[v]
+}
+
+/// How many vcores cell `idx` holds (1 unless a launcher added more).
+pub fn cell_vcores(idx: usize) -> usize {
+    cells()[idx].nvcores
 }
 
 /// Whether the calling CPU may schedule cell `idx`.
@@ -2060,9 +2240,20 @@ pub fn cell_cpu(idx: usize) -> usize {
 /// the multi-core placement path runs only cells that neither fork nor spawn, and
 /// every boot that does fork runs on one core - but inheriting the parent's owner is
 /// the fix when one does, not a wider lock.
+///
+/// **A multi-vcore cell is never schedulable this way.** The cooperative schedulers
+/// (`nproc::reschedule`, `SYS_YIELD`, `linux::proc`) pick a *cell* and enter its vcore
+/// 0; for a cell whose vcores are spread over several cores that would enter a context
+/// another core owns. Refused here rather than half-supported: a multi-vcore cell is
+/// driven by the placement path, which claims and enters `(cell, vcore)` pairs
+/// (docs/SUBSTRATE.md pillar 3). Teaching the cooperative schedulers to pick vcores is
+/// the named next step, not something this predicate should guess at.
 #[inline]
 pub fn cell_on_this_cpu(idx: usize) -> bool {
-    let owner = cells()[idx].cpu;
+    if cells()[idx].nvcores > 1 {
+        return false;
+    }
+    let owner = cells()[idx].vcpu[0];
     owner == NO_CPU || owner == crate::smp::cpu_index()
 }
 
@@ -2152,14 +2343,21 @@ pub unsafe fn install_spawned(
         // own table.
         objects: p.objects,
         qp,
-        frame,
-        outcome: None,
+        // Vcore 0 is the frame the caller built; a fresh cell holds exactly one vcore,
+        // and a launcher that wants more adds them with `install_vcore`.
+        vframe: {
+            let mut f = [core::ptr::null_mut(); MAX_VCORES];
+            f[0] = frame;
+            f
+        },
+        voutcome: [None; MAX_VCORES],
+        nvcores: 1,
         present: true,
         personality: Personality::Native,
         qp_va,
         qp_cap_id,
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
-        cpu: NO_CPU,
+        vcpu: [NO_CPU; MAX_VCORES],
         // The parent's node, not a fresh one: a spawned child shares the parent's
         // capability bundle and usually a channel with it, so they are one working
         // set and splitting them across nodes would cost on every message.
@@ -2174,13 +2372,13 @@ pub unsafe fn install_spawned(
     // as maximally interactive.
     crate::sched::dispatch::track(idx, 0, Some(parent));
     // Clean FP state for the spawned child's first entry (see `install`).
-    // SAFETY: `cell_fp(idx)` is a valid, aligned `FP_AREA_LEN` area.
-    unsafe { arch::fp_area_init(cell_fp(idx)) };
+    // SAFETY: `cell_fp(idx, 0)` is a valid, aligned `FP_AREA_LEN` area.
+    unsafe { arch::fp_area_init(cell_fp(idx, 0)) };
 }
 
 /// Repoint cell `idx` at a new context-0 frame (after `execve`).
 pub fn set_cell_frame(idx: usize, frame: *mut TrapFrame) {
-    cells()[idx].frame = frame;
+    cells()[idx].vframe[0] = frame;
 }
 
 /// Make cell `idx` the current cell and activate its address space - the
@@ -2231,14 +2429,21 @@ pub unsafe fn install_forked(
         caps: owned_caps(idx),
         objects: p.objects,
         qp: p.qp,
-        frame,
-        outcome: None,
+        // Vcore 0 is the frame the caller built; a fresh cell holds exactly one vcore,
+        // and a launcher that wants more adds them with `install_vcore`.
+        vframe: {
+            let mut f = [core::ptr::null_mut(); MAX_VCORES];
+            f[0] = frame;
+            f
+        },
+        voutcome: [None; MAX_VCORES],
+        nvcores: 1,
         present: true,
         personality: Personality::Linux,
         qp_va: 0,
         qp_cap_id: 0,
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
-        cpu: NO_CPU,
+        vcpu: [NO_CPU; MAX_VCORES],
         // The parent's node, and here it is not a preference but a fact: `fork` is
         // copy-on-write, so the child starts out mapping the parent's frames, which
         // are already placed. Anything else would be a claim the pages do not
@@ -2622,7 +2827,7 @@ pub fn on_user_trap(
             // The one native cross-cell switch: address space **and** FP/SIMD
             // register file (docs/LIBRHEO.md).
             switch_native_cell(cur, peer);
-            peer_cell.frame
+            peer_cell.vframe[0]
         }
         // A spawned native child's exit makes it a zombie and reschedules
         // (docs/LIBRHEO.md Phase F); the top cell's exit unwinds `run`.
