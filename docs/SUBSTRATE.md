@@ -972,6 +972,23 @@ kernel.
   optimization, FP residency, FP-across-signals fixed. Proof: `stdrun`
   gains a float-heavy phase; the librheoipc register-pattern proof re-run
   under preemption; a signal-under-SIMD fixture.
+
+  **Landed: the target flips and FP-across-signals.** The three `rheo_os-*`
+  std targets are hard-float (SSE2 / NEON / `+f,+d` with `lp64d`), and a
+  signal handler no longer destroys the interrupted code's vector registers:
+  delivery saves the FP image to the **user stack**, above the frame it
+  writes, so nesting is handled by construction and `rt_sigreturn` restores
+  its own level (docs/LINUX-COMPAT.md L5). The `sig_fp` fixture proves it on
+  all three ISAs and is worth reading as a lesson in what a proof of this has
+  to look like: **two earlier versions passed with the fix deleted**, because
+  `raise()` is a call (caller-saved FP is already dead across it) and because
+  a handler is an ordinary C function that *preserves* the callee-saved FP
+  registers a register allocator would have chosen. Only inline asm on both
+  sides makes the experiment an experiment. It also found a **fourth
+  SYSRET-provenance defect** - `rt_sigreturn` rewrites its frame in place, so
+  the frame-*pointer* test could not see that the register file had changed;
+  the test is now the precondition itself (RCX == return RIP, R11 == RFLAGS).
+  **Not done:** XSAVE init/modified optimization and per-vcore FP residency.
 - **S5 - per-vcore queues + NVMe/NIC pass-through** (with DRIVERS.md D2).
   Proof: an iommu-contained storage cell drives its own NVMe queues off a
   live disk; per-vcore submission never crosses cores (counter-asserted).

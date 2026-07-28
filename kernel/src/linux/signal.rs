@@ -85,8 +85,17 @@ impl SigAction {
     }
 }
 
-/// Per-context signal state: the blocked mask, the pending set, and the
-/// alternate signal stack (sigaltstack).
+/// How many nested signal deliveries can each preserve their own FP/SIMD state.
+///
+/// Each level's save area lives on the **user stack**, inside the span the frame
+/// builder already reserves, so the depth costs the kernel four `u64` VAs per
+/// context and nothing else. Four is far past what a real program produces - a
+/// profiling signal arriving inside another handler is depth 2 - and past it the
+/// delivery still happens, with the loss printed rather than silently taken.
+const SIG_FP_DEPTH: usize = 4;
+
+/// Per-context signal state: the blocked mask, the pending set, the alternate
+/// signal stack (sigaltstack), and the saved-FP stack.
 #[derive(Copy, Clone)]
 struct SigCtx {
     blocked: u64,
@@ -94,6 +103,11 @@ struct SigCtx {
     alt_sp: u64,
     alt_size: u64,
     alt_active: bool,
+    /// User VAs of the FP/SIMD images saved by each live delivery, innermost last.
+    /// `0` in a slot means that level could not preserve FP (see `SIG_FP_DEPTH`).
+    fp_saves: [u64; SIG_FP_DEPTH],
+    /// How many deliveries are live on this context - the index into `fp_saves`.
+    fp_depth: usize,
 }
 
 impl SigCtx {
@@ -104,6 +118,8 @@ impl SigCtx {
             alt_sp: 0,
             alt_size: 0,
             alt_active: false,
+            fp_saves: [0; SIG_FP_DEPTH],
+            fp_depth: 0,
         }
     }
 }
@@ -206,6 +222,12 @@ pub fn exec_reset(cell: usize) {
     ctx(cell, 0).alt_sp = 0;
     ctx(cell, 0).alt_size = 0;
     ctx(cell, 0).alt_active = false;
+    // The saved-FP images live on the *old* stack, which `execve` has replaced -
+    // the VAs would name whatever the new image put there. A `fork` child keeps
+    // them, and correctly: it inherits the address space, so the VAs still hold
+    // the parent's images and its own `rt_sigreturn` restores the right ones.
+    ctx(cell, 0).fp_saves = [0; SIG_FP_DEPTH];
+    ctx(cell, 0).fp_depth = 0;
     for i in 1..thread::capacity(cell).max(ctx_capacity(cell)) {
         *ctx(cell, i) = SigCtx::new();
     }
@@ -364,6 +386,23 @@ pub fn rt_sigreturn(cell: usize, frame: *mut TrapFrame) -> Ctl {
     let c = ctx(cell, idx);
     c.blocked = mask;
     c.alt_active = false;
+
+    // Put the interrupted FP/SIMD registers back, undoing whatever the handler did
+    // to them. Popped rather than indexed, so nested deliveries unwind in order and
+    // a level that could not save (VA 0) restores nothing rather than restoring
+    // someone else's image.
+    if c.fp_depth > 0 {
+        c.fp_depth -= 1;
+        let at = c.fp_saves[c.fp_depth];
+        c.fp_saves[c.fp_depth] = 0;
+        if at != 0
+            && let Some(area) = crate::uaccess::buf(at, arch::FP_AREA_LEN)
+        {
+            // SAFETY: `area` is the image this context's matching delivery wrote
+            // with `save_user_fp`, resolved present by `buf`.
+            unsafe { arch::restore_user_fp(area as *const u8) };
+        }
+    }
     Ctl::Switch(frame)
 }
 
@@ -728,6 +767,51 @@ unsafe fn build_frame(
         );
         return;
     }
+
+    // Preserve the interrupted FP/SIMD registers.
+    //
+    // The handler runs with the *live* register file: the kernel is soft-float, so
+    // nothing between the trap and here has touched it, and the interrupted code's
+    // vector registers are still in the hardware. A handler that executes one FP or
+    // SIMD instruction - which any C function compiled with SSE/NEON may, before it
+    // reaches a line the programmer wrote - destroys them, and `rt_sigreturn` used to
+    // restore only the GPRs, PC, SP and mask. For most programs that never showed;
+    // for a JIT it is fatal, because a profiling signal lands mid-vector-loop in
+    // generated code and the loop resumes with someone else's registers (no fault,
+    // no log, wrong numbers - the shape docs/ENGINEERING.md 11 already records once,
+    // from the `SYS_YIELD` FP defect).
+    //
+    // The image goes on the **user stack**, above the signal frame the builder is
+    // about to write, so nesting is handled by construction: each delivery gets its
+    // own area and each `rt_sigreturn` restores its own. `stack_top` moves down past
+    // it so the frame cannot overlap it.
+    let fp_len = arch::FP_AREA_LEN as u64;
+    let fp_at = (stack_top - fp_len) & !63; // XSAVE wants 64-byte alignment
+    let depth = c.fp_depth;
+    let saved = if depth >= SIG_FP_DEPTH {
+        crate::println!(
+            "linux: signal {signo} nested {depth} deep - FP/SIMD state not preserved at this level"
+        );
+        0
+    } else if let Some(area) = crate::uaccess::buf_mut(fp_at, arch::FP_AREA_LEN) {
+        // SAFETY: `area` is `FP_AREA_LEN` writable, 64-byte-aligned bytes in the
+        // active cell, resolved present and writable by `buf_mut`.
+        unsafe { arch::save_user_fp(area as *mut u8) };
+        fp_at
+    } else {
+        crate::println!(
+            "linux: no writable stack at {fp_at:#x} for the signal {signo} FP image - \
+             FP/SIMD state not preserved"
+        );
+        0
+    };
+    if depth < SIG_FP_DEPTH {
+        c.fp_saves[depth] = saved;
+        c.fp_depth = depth + 1;
+    }
+    // The frame is built below whatever the FP image consumed, so the two cannot
+    // overlap and the handler's own stack starts below both.
+    let stack_top = if saved != 0 { fp_at } else { stack_top };
 
     let spec = SigFrameSpec {
         signo,

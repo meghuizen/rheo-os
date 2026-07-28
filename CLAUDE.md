@@ -331,9 +331,31 @@ terminates 128+signo. A **native** cell fault stays terminal (`Outcome::Faulted`
 three ISAs**, three static-glibc C fixtures: `sig_raise` (async
 `raise(SIGUSR1)`->handler->resume, exit 0), `sig_segv` (null write ->
 SIGSEGV handler `_exit(0)`, not a killed cell), `sig_dfl` (`raise(SIGABRT)`, no
-handler -> terminate 134). Scope: self / fault delivery (a signal to a non-running
-sibling context is recorded pending, not force-delivered); FP state is not
-saved across a handler - both documented.
+handler -> terminate 134), and `sig_fp`. Scope: self / fault delivery (a signal to
+a non-running sibling context is recorded pending, not force-delivered).
+**FP/SIMD across a handler is now saved and restored** (docs/SUBSTRATE.md S4): a
+handler runs on the *live* register file - the kernel is soft-float, so nothing
+between the trap and delivery touches it - so one FP instruction inside a handler
+used to destroy the interrupted code's vector registers with no fault and no log,
+harmless for the programs L5 shipped with and fatal for a JIT taking a profiling
+signal mid-vector-loop. Delivery saves the image to the **user stack**, above the
+frame it writes, so nesting works by construction (each delivery its own area,
+each `rt_sigreturn` its own restore); the kernel keeps only the VAs, four deep per
+context, and past that the delivery still happens with the loss printed. The
+`sig_fp` fixture is worth reading as a lesson in what such a proof must look like:
+**two earlier versions passed with the fix deleted** - `raise()` is a call, so
+caller-saved FP is already dead across it, and a handler is an ordinary C function
+that *preserves* the callee-saved registers a register allocator would pick - so
+only inline asm on both sides (the `librheoipc` register-pattern technique) makes
+it an experiment. It also found a **fourth SYSRET-provenance defect**: returning
+from a handler to the interrupted instruction had never been exercised, and on
+x86-64 `rt_sigreturn` rewrites its frame **in place**, so the frame-*pointer*
+provenance test saw "the frame I entered on" and took SYSRET, overwriting the
+restored RCX/R11 with the resume RIP/RFLAGS - RCX held a pointer, so the resume
+jumped into it and looped. The test is now the precondition itself (SYSRET is
+correct exactly when RCX already holds the return RIP and R11 the RFLAGS, which
+SYSCALL guarantees on entry), so no flag can be forgotten. Both fixes observed
+failing when reverted.
 **L6 is done**: **processes - fork / execve / wait4 / cross-cell pipes** (no new
 kernel object; all per-cell synthesized state, `kernel/src/linux/proc.rs` +
 `pipe.rs`). `fork` is clone-cell-within-capability-bundle: a new `user` cell in
@@ -2161,7 +2183,11 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               uutils/coreutils multicall cell over a ramfs, incl. threaded
               sort), linuxthreads (L4: an unpatched multi-threaded Rust std
               binary - clone/futex/TLS/join), linuxsig (L5: signal delivery -
-              async raise, fault->SIGSEGV handler, SIG_DFL terminate),
+              async raise, fault->SIGSEGV handler, SIG_DFL terminate, plus
+              `sig_fp`: FP/SIMD registers survive a handler that clobbers them -
+              eight doubles pinned in *caller-saved* FP registers inside one asm
+              block that also contains the faulting store, since the two obvious
+              C formulations both passed with the fix deleted),
               linuxproc (L6: fork/execve/wait4/cross-cell pipes - a direct
               multi-process C fixture + the P11 coreutils-suite shell; plus
               `stackx`, which asks for 12 MiB of stack via PT_GNU_STACK and both

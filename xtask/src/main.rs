@@ -1378,6 +1378,9 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         ("sig_raise.c", "sig_raise", NO_EXTRA),
         ("sig_segv.c", "sig_segv", NO_EXTRA),
         ("sig_dfl.c", "sig_dfl", NO_EXTRA),
+        // FP/SIMD across a handler (docs/SUBSTRATE.md S4): the interrupted
+        // vector registers must survive a handler that clobbers them.
+        ("sig_fp.c", "sig_fp", NO_EXTRA),
         ("procdemo.c", "procdemo", NO_EXTRA),
         ("cecho.c", "cecho", NO_EXTRA),
         ("rsh.c", "rsh", NO_EXTRA),

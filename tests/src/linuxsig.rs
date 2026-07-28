@@ -10,6 +10,12 @@
 //!   killing the cell; the handler prints and `_exit(0)`.
 //! - `sig_dfl`: `raise(SIGABRT)` with no handler - the default disposition
 //!   terminates the cell reporting 128+signo = 134 (SIG_DFL semantics).
+//! - `sig_fp`: FP/SIMD registers survive a handler that deliberately clobbers
+//!   them (docs/SUBSTRATE.md S4). A handler runs on the *live* register file,
+//!   and the kernel used to save only GPRs/PC/SP/mask - so one FP instruction
+//!   inside a handler destroyed the interrupted code's vector registers with no
+//!   fault and no log. Harmless for the programs L5 shipped with; fatal for a
+//!   JIT, where a profiling signal lands mid-vector-loop in generated code.
 //!
 //! Fixtures are built from source by `cargo xtask` (`build_linux_fixtures`); no
 //! binary lives in git. They are `include_bytes!`d below.
@@ -31,6 +37,7 @@ mod harness;
 static SIG_RAISE: &[u8] = fixture::linux!("sig_raise");
 static SIG_SEGV: &[u8] = fixture::linux!("sig_segv");
 static SIG_DFL: &[u8] = fixture::linux!("sig_dfl");
+static SIG_FP: &[u8] = fixture::linux!("sig_fp");
 
 // -- stdout capture, wired to the Linux personality's stdout tap --
 const CAP_MAX: usize = 8 * 1024;
@@ -90,10 +97,11 @@ extern "C" fn kernel_main() -> ! {
     kernel::boot::init();
     println!("linuxsig: start on {}", arch::NAME);
     println!(
-        "linuxsig: fixtures raise={} segv={} dfl={} bytes",
+        "linuxsig: fixtures raise={} segv={} dfl={} fp={} bytes",
         SIG_RAISE.len(),
         SIG_SEGV.len(),
-        SIG_DFL.len()
+        SIG_DFL.len(),
+        SIG_FP.len()
     );
 
     // Async delivery + rt_sigreturn resume: handler sets got=SIGUSR1(10).
@@ -102,6 +110,16 @@ extern "C" fn kernel_main() -> ! {
     check("sig_segv", SIG_SEGV, 0, b"caught segv\n");
     // Default disposition: raise(SIGABRT), no handler -> terminate 128+6 = 134.
     check("sig_dfl", SIG_DFL, 134, b"");
+    // FP/SIMD across a handler: 16 known doubles are live across a `raise` whose
+    // handler overwrites the FP file with different values. Without the kernel
+    // saving and restoring the image the program reads the handler's numbers back
+    // and prints which register was wrong, so the failure names its own cause.
+    check(
+        "sig_fp",
+        SIG_FP,
+        0,
+        b"sigfp: FP registers survived the handler\n",
+    );
 
     println!("linuxsig: PASS");
     arch::exit(arch::ExitCode::Success)

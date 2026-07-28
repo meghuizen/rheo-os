@@ -103,6 +103,31 @@ syscall_entry:
      * file from the frame and consume nothing. */
     cmp %rax, %rcx
     jne iret_resume                    /* rax = frame */
+
+    /* ...but the same *pointer* is not the same *register file*.
+     *
+     * `rt_sigreturn` rewrites the current context's frame **in place** with the
+     * register file the signal interrupted - a fault-captured one - and hands back
+     * the identical pointer. The provenance test above sees "the frame I entered
+     * on" and takes SYSRET, which then overwrites the restored RCX and R11 with the
+     * resume RIP and RFLAGS. The interrupted instruction re-executes with two wrong
+     * registers, and if RCX happened to hold a pointer (it holds the destination of
+     * every `rep` string op) the resume jumps into it: found as a SIGSEGV loop at
+     * the faulting store's own address, once a fixture finally returned from a
+     * handler instead of exiting inside it.
+     *
+     * So test the precondition itself rather than a proxy for it. SYSRET is correct
+     * exactly when RCX already holds the return RIP and R11 the return RFLAGS -
+     * which is what the SYSCALL instruction guarantees on entry and what the stub
+     * above copies into the frame. A frame that no longer satisfies it did not come
+     * from this syscall, whatever its address is. Still no flag to forget: the
+     * frame's own contents answer the question. */
+    mov 120(%rax), %r10                /* rip */
+    cmp 16(%rax), %r10                 /* frame.rcx == rip ? */
+    jne iret_resume
+    mov 128(%rax), %r10                /* rflags */
+    cmp 80(%rax), %r10                 /* frame.r11 == rflags ? */
+    jne iret_resume
     /* fall through to sysret_resume with rax = frame */
 
 .global sysret_resume

@@ -557,9 +557,47 @@ fixup path.
   - **Scope**: delivery is to self / synchronous faults. Signal targeting of a
     *non-running* sibling context is recorded pending but not force-delivered
     (no L5 fixture needs it; full cross-thread delivery is future work).
-  - **FP/SIMD across a handler is not saved/restored** (the ucontext carries
-    GPRs/PC/SP + mask, not the vector state); L5 fixtures do not rely on FP
-    liveness across a handler. Documented; eager per-signal FP save is future.
+  - **FP/SIMD across a handler is saved and restored** (docs/SUBSTRATE.md S4;
+    it was not, until the `sig_fp` fixture below). A handler runs on the *live*
+    register file - the kernel is soft-float, so nothing between the trap and
+    delivery touches it - and one FP instruction inside the handler destroyed the
+    interrupted code's vector registers with no fault and no log. Delivery now
+    saves the image to the **user stack**, in the span the frame builder already
+    reserves and above the frame it writes, so nesting is handled by construction
+    (each delivery gets its own area, each `rt_sigreturn` restores its own); the
+    kernel keeps only the VAs, four deep per context, and past that depth the
+    delivery still happens with the loss printed rather than silently taken.
+    Proven by `sig_fp` in `linuxsig` on all three ISAs, observed failing when
+    reverted.
+
+    The fixture is worth describing, because **two earlier versions passed with
+    the fix deleted** and so tested nothing. (a) `raise()` is a *call*, and on
+    every one of the three ABIs the caller-saved FP registers are dead across a
+    call, so the compiler had spilled every value before the signal existed.
+    (b) Taking a fault mid-loop fixed that, but a handler is an ordinary C
+    function and **preserves the callee-saved FP registers itself** - which is
+    exactly where a register allocator puts values that live across a loop. Only
+    the caller-saved registers are genuinely at risk, and C cannot pin a value in
+    one. The fixture therefore uses inline asm on both sides - the technique the
+    tree's cross-cell FP proof already uses (docs/LIBRHEO.md, the `librheoipc`
+    register-pattern phase) - loading eight doubles into caller-saved FP
+    registers, faulting on a store to a `PROT_NONE` page *inside the same asm
+    block*, and reading them back after the handler (which `mprotect`s the page
+    so the retry succeeds, then overwrites the same registers in asm of its own).
+  - **A fourth SYSRET-provenance defect, found by that fixture.** Returning from
+    a handler to the interrupted instruction had never been exercised - `sig_raise`
+    returns from a `raise()` call, where RCX/R11 are dead, and `sig_segv` calls
+    `_exit(0)` inside the handler - and on x86-64 it did not work. `rt_sigreturn`
+    rewrites the current context's frame **in place** with the fault-captured
+    register file and hands back the identical pointer, so the frame-pointer
+    provenance test saw "the frame I entered on" and took SYSRET, which overwrote
+    the restored RCX and R11 with the resume RIP and RFLAGS. RCX held the trap
+    page, so the resume jumped into it: an unbounded SIGSEGV loop. The fix tests
+    the precondition instead of a proxy for it - SYSRET is correct exactly when
+    RCX already holds the return RIP and R11 the return RFLAGS, which is what the
+    SYSCALL instruction guarantees on entry - so a frame that no longer satisfies
+    it takes IRET whatever its address is. Still no flag to forget; the frame's
+    own contents answer the question.
 - **L6 [done]** - processes: **fork / execve / wait4 / cross-cell pipes**, plus
   a shell running the P11 coreutils suite. All are per-cell synthesized state -
   **no new kernel object** (docs/LINUX-COMPAT.md 1). The kernel mechanisms added
