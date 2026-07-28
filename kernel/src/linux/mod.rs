@@ -43,6 +43,7 @@ use crate::arch::TrapFrame;
 use crate::arch::linux_abi::nr;
 use crate::user::MAX_CELLS;
 use core::ptr::{addr_of, addr_of_mut};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Per-cell Linux personality state (docs/LINUX-COMPAT.md L2). Fixed-size, so
 /// the kernel stays allocation-free.
@@ -198,6 +199,9 @@ pub fn reset() {
 /// blocker 2). The one entry point `user::on_user_trap` calls, so the personality
 /// keeps its own state private.
 pub fn fill_fault(cell: usize, addr: usize) -> bool {
+    // The other entry into the personality from a trap: a demand-paged fill reads
+    // the same global mapped-file registry a syscall does. Same lock, same reason.
+    let _g = plock();
     mem::fault(state(cell), addr)
 }
 
@@ -518,10 +522,112 @@ pub(crate) fn reset_trace() {
 }
 
 pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -> Ctl {
+    let _g = plock();
     let ctl = handle_inner(cur, nr_val, args, frame);
     trace_record(nr_val, &ctl);
     ctl
 }
+
+/// The **personality lock**: one lock over the whole Linux dispatch, taken only
+/// while more than one CPU is online (docs/SMP.md 10.2).
+///
+/// A Linux cell's *own* state is per cell and indexed disjointly, but the
+/// personality also keeps genuinely global tables beside it - the mapped-file
+/// registry, the pipe/eventfd/timerfd/unix-socket registries, the pid counter, the
+/// syscall trace ring - and those have one copy for the machine. Two cells on two
+/// cores reach them concurrently.
+///
+/// This is the **big-kernel-lock first, finer locks proven in later** discipline
+/// docs/SMP.md 10.2 names explicitly, and it is chosen over per-structure locks for
+/// one reason: it is auditable. There is exactly one place a Linux syscall enters
+/// the personality, so "every global the personality touches is protected" is a
+/// property of one line rather than of a list that a new registry can be added to
+/// without noticing.
+///
+/// Two properties keep it honest:
+///
+/// - **It serialises syscalls, not execution.** Two Linux cells run their user-mode
+///   code genuinely in parallel; only the trap into the kernel is one at a time.
+///   That is the whole point of the coarse lock being acceptable as a first step.
+/// - **It is not taken on a single-CPU boot.** `online_count() <= 1` is every
+///   pre-existing kernel in this tree, and there the acquire is not merely
+///   uncontended, it does not happen - so the hot path is byte-for-byte what it was
+///   and no existing proof's instruction count moves.
+///
+/// **Known limitation, stated rather than discovered later:** a syscall that *idles
+/// inside the trap* (the deadlock classifier, and the receive waits that cannot be
+/// parked - docs/ARCHITECTURE-DEBT.md 2.4) holds this lock while it halts, so a
+/// peer core's syscall waits for it. That is latency, not deadlock - the halt is
+/// bounded by a deadline or an interrupt - but it is the first thing finer locking
+/// should remove.
+///
+/// **What is proven and what is not.** The `smp` kernel runs a Linux cell on a
+/// secondary while a native cell runs on the primary, so this path is exercised
+/// multicore: acquired, re-entered recursively through `fill_fault`, released. It is
+/// **not** proven under *contention* - that needs two Linux cells at once, which is
+/// attempted and does not work yet for a reason that is not this lock (two Linux
+/// cells installed simultaneously fail even when run one after the other on a single
+/// core, so it is a personality-state problem, not a concurrency one). Recorded as an
+/// open finding rather than left as a passing test that proves less than it looks.
+#[inline]
+fn plock() -> PGuard {
+    if !crate::smp::multicore() {
+        return PGuard::Off;
+    }
+    // SAFETY: this CPU's own depth slot; only this CPU reads or writes it.
+    let d = unsafe { PDEPTH.this_mut() };
+    if *d > 0 {
+        // **Recursive on purpose.** A syscall that touches the cell's memory goes
+        // through `uaccess`, which calls `fill_fault` to materialise an absent page -
+        // so the second entry into the personality happens *inside* the first, on the
+        // same CPU. A plain non-reentrant lock self-deadlocks there, which is exactly
+        // what the first version of this did (the Linux cell stopped finishing).
+        *d += 1;
+        return PGuard::Nested;
+    }
+    while PLOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        // Test-and-test-and-set, as `smp::SpinLock`: contenders share the line
+        // read-only until the holder releases.
+        while PLOCK.load(Ordering::Relaxed) {
+            core::hint::spin_loop();
+        }
+    }
+    *d = 1;
+    PGuard::Owner
+}
+
+/// What a [`plock`] call is holding, so `Drop` knows what to undo.
+enum PGuard {
+    /// Single CPU: nothing was taken.
+    Off,
+    /// A recursive entry on a CPU that already holds it.
+    Nested,
+    /// The outermost entry on this CPU - the one that releases.
+    Owner,
+}
+
+impl Drop for PGuard {
+    fn drop(&mut self) {
+        match self {
+            PGuard::Off => {}
+            // SAFETY: this CPU's own depth slot.
+            PGuard::Nested => unsafe { *PDEPTH.this_mut() -= 1 },
+            PGuard::Owner => {
+                // SAFETY: as above.
+                unsafe { *PDEPTH.this_mut() = 0 };
+                PLOCK.store(false, Ordering::Release);
+            }
+        }
+    }
+}
+
+static PLOCK: AtomicBool = AtomicBool::new(false);
+/// Per-CPU recursion depth for [`PLOCK`]. A plain counter, not an atomic: only the
+/// CPU that owns the slot ever touches it.
+static PDEPTH: crate::smp::PerCpu<u32> = crate::smp::PerCpu::from_array([0; crate::smp::MAX_CPUS]);
 
 fn handle_inner(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -> Ctl {
     // Every pointer argument below is an address the **cell** chose, and the

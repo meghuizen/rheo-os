@@ -793,19 +793,41 @@ const CHELLO_EXIT: u64 = 9;
 /// Captured stdout of the Linux cell. Written only by the core running it (there is
 /// one such core), read by the primary after the run.
 const CAP_MAX: usize = 1024;
-static mut STDOUT_CAP: [u8; CAP_MAX] = [0; CAP_MAX];
-static mut STDOUT_LEN: usize = 0;
+/// One capture buffer per cell slot used by these phases.
+const CAP_CELLS: usize = 2;
+static mut STDOUT_CAP: [[u8; CAP_MAX]; CAP_CELLS] = [[0; CAP_MAX]; CAP_CELLS];
+static mut STDOUT_LEN: [usize; CAP_CELLS] = [0; CAP_CELLS];
 
+/// Route each cell's stdout to **its own** buffer, keyed by the cell the calling core
+/// is currently running.
+///
+/// A single shared buffer works while one core runs a Linux cell; with two, the two
+/// transcripts interleave and neither can be asserted. `user::current_index()` reads
+/// this CPU's own record (it is `PerCpu`), so the tap needs no argument and no lock -
+/// each core writes only its own cell's slot.
 fn tap(bytes: &[u8]) {
-    // SAFETY: exactly one core runs a Linux cell in this phase, and the tap is called
-    // only from inside that run.
+    let cell = user::current_index().min(CAP_CELLS - 1);
+    // SAFETY: each core writes only the slot of the cell it is running, and a cell
+    // runs on one core (`user::claim_cell`), so the slots are disjoint.
     unsafe {
+        let cap = &mut *core::ptr::addr_of_mut!(STDOUT_CAP);
+        let len = &mut *core::ptr::addr_of_mut!(STDOUT_LEN);
         for &b in bytes {
-            if STDOUT_LEN < CAP_MAX {
-                STDOUT_CAP[STDOUT_LEN] = b;
-                STDOUT_LEN += 1;
+            if len[cell] < CAP_MAX {
+                cap[cell][len[cell]] = b;
+                len[cell] += 1;
             }
         }
+    }
+}
+
+/// Captured stdout of cell `i`.
+fn captured(i: usize) -> &'static [u8] {
+    // SAFETY: read on the primary after the run has ended.
+    unsafe {
+        let cap = &*core::ptr::addr_of!(STDOUT_CAP);
+        let len = *(*core::ptr::addr_of!(STDOUT_LEN)).get_unchecked(i);
+        &cap[i][..len]
     }
 }
 
@@ -876,7 +898,7 @@ fn test_linux_cell_on_secondary() {
         user::claim_cell(0, 0);
         user::claim_cell(1, 1);
 
-        STDOUT_LEN = 0;
+        STDOUT_LEN = [0; CAP_CELLS];
         kernel::linux::set_stdout_tap(Some(tap));
         // SAFETY: both cells are installed and present, and they are distinct; cell 1
         // is Linux, which is what this phase is about.
@@ -903,8 +925,7 @@ fn test_linux_cell_on_secondary() {
             sec_code as u64, CHELLO_EXIT,
             "the glibc binary on the secondary exited {sec_code}, expected {CHELLO_EXIT}"
         );
-        let got = &*core::ptr::addr_of!(STDOUT_CAP);
-        let got = &got[..STDOUT_LEN];
+        let got = captured(1);
         assert!(
             got == CHELLO_OUT,
             "the glibc binary's stdout from the secondary did not match ({} bytes)",

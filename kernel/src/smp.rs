@@ -346,7 +346,23 @@ pub fn this_cpu() -> &'static CpuState {
 pub fn set_online(i: usize, hw_id: u32) {
     CPUS[i].hw_id.store(hw_id, Ordering::Relaxed);
     CPUS[i].online.store(true, Ordering::Release);
+    if i != 0 {
+        MULTICORE.store(true, Ordering::Release);
+    }
 }
+
+/// Whether more than the boot CPU is online.
+///
+/// A cached flag rather than [`online_count`], which scans the whole registry: this is
+/// read on **every Linux syscall** (the personality lock consults it to decide whether
+/// to lock at all), and 64 atomic loads in front of every trap is not a thing to put
+/// on that path to answer a yes/no question.
+#[inline]
+pub fn multicore() -> bool {
+    MULTICORE.load(Ordering::Acquire)
+}
+
+static MULTICORE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Number of CPUs currently marked online.
 pub fn online_count() -> usize {
@@ -996,6 +1012,12 @@ unsafe fn place_cells_inner(cells: &[usize], out: &mut [(u64, usize)], preempt: 
 pub fn cells_taken(cpu: usize) -> usize {
     // SAFETY: a plain atomic read of another CPU's counter, after the round ended.
     unsafe { PLACE_TAKEN.get(cpu) }.load(Ordering::Acquire)
+}
+
+#[cfg(feature = "smp")]
+/// Temporary diagnostic accessor.
+pub fn dbg_code(o: crate::user::Outcome) -> u64 {
+    code_of(o)
 }
 
 #[cfg(feature = "smp")]

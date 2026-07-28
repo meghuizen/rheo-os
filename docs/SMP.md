@@ -752,12 +752,33 @@ frame. With one secondary the two were equivalent; with three it presented as tw
 faulting at PC 0 at the same instant, intermittently. It is an atomic `swap` now, the same
 exclusivity the placement queue's `fetch_add` already had.
 
+**The personality lock is in place; contention is not proven.** Running Linux cells on
+*several* cores at once needs the personality's global tables protected, and 10.2 names
+the first step as a **big kernel lock, finer locks proven in later**. That lock exists
+now (`linux::plock`): one lock over the whole Linux dispatch plus the demand-paging
+entry, **recursive per CPU** (a syscall reaches `fill_fault` through `uaccess`, so the
+second entry happens inside the first on the same core - a non-reentrant lock
+self-deadlocks there, which is what the first version did), and **not taken at all**
+while only one CPU is online, so every pre-existing kernel's hot path is byte-for-byte
+what it was. Coarse on purpose: there is exactly one place a Linux syscall enters the
+personality, so "every global it touches is protected" is a property of one line rather
+than of a list a new registry can be added to without noticing.
+
+What that buys today is the one-Linux-cell case above, where the lock is genuinely
+exercised multicore - acquired, re-entered, released - but never contended. **Two Linux
+cells at once is attempted and does not work**, and the finding is worth recording
+because it is not what was expected: two Linux cells installed simultaneously fail *even
+when run one after the other on a single core*, so the obstacle is per-cell personality
+state that two `install_cell` calls disturb, not concurrency. Chasing it further was cut
+here rather than shipped as a passing test that proves less than it looks; it is the next
+thing to do, and it is a personality bug rather than an SMP one.
+
 **Honest scope.** Preemption is *within* a core's own claim. Nothing takes a cell away
 from another core, nothing migrates a running cell, and there is no priority across
 cores - the per-CPU EEVDF+BORE queue orders each core's own cells and nothing balances
-between queues after the claim. The Linux cell is **one** cell at a time: two Linux cells
-on two cores would reach the global mapped-file, pipe, eventfd and pid registries
-concurrently, and that is exactly what 10.2 gates. What makes all of it safe is unchanged
+between queues after the claim. The Linux cell is **one** cell at a time, for the reason
+recorded just above - and that limit is now known to sit in the personality's
+install-time state rather than in the locking. What makes all of it safe is unchanged
 and is the reason it could land first: a claimed cell is still a *partitioned* cell (one
 core, one slot, one address space, one kernel stack), the claim simply being made at run
 time instead of by hand.

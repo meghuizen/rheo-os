@@ -1757,7 +1757,16 @@ equivalents are already adopted per core) so the portable caller need not know w
 need it. `start_all` also exposed a latent race: the single-cell hand-off published its
 index with a plain load-then-store, so two secondaries could both take it - one cell, two
 cores, one trap frame, presenting as two cores faulting at PC 0 intermittently; it is an
-atomic `swap` now.
+atomic `swap` now. The **personality lock** docs/SMP.md 10.2 names as the first step is
+also in place (`linux::plock`: one lock over the whole Linux dispatch plus the
+demand-paging entry, **recursive per CPU** - a syscall reaches `fill_fault` through
+`uaccess`, so a non-reentrant lock self-deadlocks there - and **not taken at all** on a
+single-CPU boot, so every pre-existing kernel's hot path is unchanged). It is exercised
+multicore by the phase above but never **contended**: two Linux cells at once is
+attempted and does not work, and the finding is that it fails *even run one after the
+other on a single core*, so the obstacle is per-cell personality state that two
+`install_cell` calls disturb rather than concurrency - recorded as an open finding
+instead of shipped as a weaker passing test.
 **Honest scope:** preemption is *within* a core's own claim - nothing takes a cell from
 another core, nothing migrates a running cell, and nothing balances between the per-CPU
 queues after the claim. A **second** Linux cell on another core is not attempted
