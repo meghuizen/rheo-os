@@ -136,10 +136,16 @@ fn parked(i: usize, v: usize) -> bool {
     procs()[i].vparked[v]
 }
 
-/// Whether every vcore of cell `i` is parked - the condition for the cell-level
+/// Whether every **live** vcore of cell `i` is parked - the condition for the cell-level
 /// `PState::Blocked`. Trivially "is vcore 0 parked" for a single-vcore cell.
+///
+/// Live, because a cell outlives its first vcore's exit: an exited vcore is neither parked
+/// nor runnable, and counting it as unparked would leave the cell `Runnable` with nothing
+/// to enter.
 fn all_parked(i: usize) -> bool {
-    (0..user::cell_vcores(i).max(1)).all(|v| parked(i, v))
+    (0..user::cell_vcores(i).max(1))
+        .filter(|&v| user::vcore_live(i, v))
+        .all(|v| parked(i, v))
 }
 
 /// The first vcore of cell `i` this CPU may enter that is not parked, preferring the
@@ -153,6 +159,7 @@ fn runnable_vcore(i: usize) -> Option<usize> {
     let here = user::current_vcore();
     (0..n)
         .map(|step| (here + step) % n)
+        // `vcore_on_this_cpu` implies live, so an exited context is never picked.
         .find(|&v| !parked(i, v) && user::vcore_on_this_cpu(i, v))
 }
 
@@ -766,6 +773,54 @@ fn schedulable(i: usize) -> bool {
         // cell has no `Proc` entry, so nothing is parked and this is trivially true -
         // which is the pre-vcore behaviour for the Phase E/J cells that never spawn.
         && runnable_vcore(i).is_some()
+}
+
+/// `SYS_EXIT` from a vcore of a cell that has **live siblings**: end just this vcore and
+/// hand the CPU on. Returns the frame to resume, or `None` when this was the cell's last
+/// vcore - in which case the caller ends the cell exactly as it did before vcores existed.
+///
+/// The last vcore out ends the cell; an earlier one only ends itself. Without that a cell
+/// with four vcores dies when the first finishes, which is the process/thread split the
+/// Linux personality already has one level up (docs/SMP.md 10.0a).
+///
+/// The hand-off goes through [`reschedule`], which is what makes a *parked* sibling work:
+/// the exiting vcore leaves, nothing is runnable, and the scheduler idles on the sibling's
+/// own wake source until it is satisfiable - the same path a block takes.
+pub fn retire_vcore(cur: usize, code: u64) -> Option<*mut TrapFrame> {
+    let v = user::current_vcore();
+    // Hand off only to a sibling **this core may enter**: live, owned here, and either
+    // runnable or parked on something the scheduler idle can wait for - the same two-part
+    // rule `can_reschedule` uses.
+    //
+    // If every live sibling belongs to another core there is nothing for this core to do,
+    // and that is **not** a deadlock: it is this core's run ending while the cell continues
+    // elsewhere. Returning `None` unwinds with this vcore's own outcome, which is what the
+    // placement path reports - the first version called `reschedule` unconditionally and
+    // got `DEADLOCK_EXIT` for exactly this case, on the two-cores-one-cell phase.
+    let handoff = (0..user::cell_vcores(cur)).any(|w| {
+        w != v
+            && user::vcore_on_this_cpu(cur, w)
+            && (!parked(cur, w) || sources_of(cur, w) & idle::WAITABLE != 0)
+    });
+    if !handoff {
+        return None;
+    }
+    // `reschedule` picks only `Runnable` procs, and a cell that has never spawned or
+    // blocked has no `Proc` entry at all - the reason `ensure_tracked` exists. Without it
+    // this hands the CPU to nobody and the run ends in `DEADLOCK_EXIT` (observed).
+    ensure_tracked(cur);
+    // The register file is saved before anything else runs, for the reason
+    // `preempt_cell` gives: on x86-64 even a soft-float kernel's struct moves use vector
+    // registers. Harmless for an exiting context, and it keeps one rule at every site.
+    user::save_native_fp_vcore(cur, v);
+    user::retire_vcore(cur, v, user::Outcome::Exited(code));
+    // An exited vcore is not parked, so its slot needs clearing: `refresh_deadlines` and
+    // `blocked_sources` iterate parked vcores, and a stale entry would arm a deadline for
+    // a context that can never be entered.
+    procs()[cur].vparked[v] = false;
+    procs()[cur].vblock[v] = Block::None;
+    procs()[cur].vwait[v] = 0;
+    Some(reschedule(cur))
 }
 
 /// Reap zombie child `z`: free its cell slot and kernel-owned storage, and

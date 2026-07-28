@@ -1566,7 +1566,7 @@ fn test_vcore_yield() {
         // Both vcores stay **unclaimed**, so both are enterable by this core - which is
         // exactly the single-core behaviour the predicate is written to preserve.
         let before = user::double_entries();
-        let (_c, _v, out) = user::run_vcore(0, 0);
+        let (_c, ended, out) = user::run_vcore(0, 0);
 
         assert_eq!(
             user::double_entries(),
@@ -1578,18 +1578,22 @@ fn test_vcore_yield() {
             "the yielding vcores ended {out:?}"
         );
         assert_eq!((*y0).params.status, 1, "vcore 0 never finished");
-        // **Vcore 1 is left mid-flight, and that is asserted rather than ignored.** The
-        // first vcore to exit unwinds `run`, because `finish` records an outcome and
-        // returns the null frame the trampoline reads as "unwind" - which is the correct
-        // rule for a *cell* and is not yet a rule for a cell with several vcores. "The
-        // cell exits when its **last** vcore exits" is the missing semantics, and it is a
-        // named follow-on rather than something to slip in here. Pinning the 0 means that
-        // rule arriving shows up as a test change instead of silently.
+        // **Both vcores reach their exit.** `SYS_EXIT` ends the calling vcore; the cell
+        // ends when its **last** one does (docs/SMP.md 10.0a). Before that rule the first
+        // exit unwound the run and this flag was 0, which the phase asserted so the rule
+        // arriving would show up as a test change rather than silently - it did.
         assert_eq!(
             (*y1).params.status,
-            0,
-            "vcore 1 reached its exit, so the run no longer unwinds on the first vcore \
-             out - the last-vcore-out rule landed and this assertion is what should change"
+            1,
+            "vcore 1 did not reach its exit - the first vcore out ended the cell"
+        );
+        // And the run was ended by the **last** vcore out, not the first. This is the rule
+        // stated directly: vcore 0 exits first (it is entered first and both take the same
+        // number of rounds), so a run ended by vcore 1 is a cell that outlived its first
+        // vcore's exit.
+        assert_eq!(
+            ended, 1,
+            "the run was ended by vcore {ended}, so the first vcore out ended the cell"
         );
 
         // The oracle, hand-computed: 12 markers, strictly alternating from '0'.

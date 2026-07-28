@@ -990,12 +990,29 @@ different cores, every round asks "is a sibling enterable" and the answer must b
 Replacing `vcore_on_this_cpu` with a bare bounds test makes the entry guard fire by name -
 `cell 0 vcore 1 entered by CPU 2 while CPU 1 is already inside it` - observed.
 
-One thing the phase asserts rather than fixes: **the first vcore to exit unwinds the run**,
-because `finish` records an outcome and returns the null frame the trampoline reads as
-"unwind". That is the correct rule for a cell and is not yet a rule for a cell with several
-vcores; "the cell exits when its **last** vcore exits" is the missing semantics. The phase
-asserts vcore 1's completion flag is still 0, so that rule arriving shows up as a test
-change instead of silently.
+**The last vcore out ends the cell** - the rule that phase used to assert was *missing*.
+The first vcore to exit unwound the run, because `finish` records an outcome and returns the
+null frame the trampoline reads as "unwind"; correct for a cell, and unusable for a cell with
+four vcores, where the first one finishing would kill the other three. `SYS_EXIT` now ends the
+calling **vcore** and `SYS_EXIT_GROUP` ends the cell - the process/thread split the Linux
+personality already has one level up. A vcore's outcome *is* its liveness
+(`user::vcore_live` = `voutcome[v].is_none()`), so every pick already asks; `all_parked` counts
+only live vcores, since an exited one is neither parked nor runnable and counting it as
+unparked would leave the cell `Runnable` with nothing to enter.
+
+`nproc::retire_vcore` hands the CPU to a sibling **this core may enter** - live, owned here,
+and either runnable or parked on a waitable source, the same two-part rule `can_reschedule`
+uses - and returns `None` otherwise, which unwinds with this vcore's own outcome. That
+condition is the whole correctness of it, and both halves were found by the tests: an
+unconditional `reschedule` returns `DEADLOCK_EXIT` when every live sibling belongs to another
+core (the two-cores-one-cell phase), because a core with nothing to do is not a deadlocked
+machine; and without `ensure_tracked` the hand-off finds no `Proc` entry at all for a cell that
+has never spawned or blocked, and ends the run in `DEADLOCK_EXIT` too (the yield phase).
+
+The yield phase now asserts the rule directly: **both** vcores reach their exit, and the run is
+ended by vcore **1** - the last one out, not the first. Suppressing the hand-off makes vcore 1
+never reach its exit, observed. `SYS_EXIT_GROUP` takes the pre-existing path unchanged, so
+nothing new is claimed for it.
 
 **A vcore blocks** - the next rung after that, also built. `nproc`'s block state was per
 *cell*, so one context parking on a timer recorded the wait for all of them: a cell with a
@@ -1075,8 +1092,9 @@ proves per-vcore *servicing*, and the two are asserted separately rather than co
 second vcore needs `USER_QUEUE_VA + v * REGION_SIZE`, which is one line and is deliberately
 not written until a loaded cell asks, since nothing would test it.
 
-**Still not done** and named: a vcore that forks or takes a signal, the last-vcore-out exit
-rule above, and the loaded-cell ring placement just named.
+**Still not done** and named: a vcore that forks or takes a signal, the loaded-cell ring
+placement just named, and the userspace half - `runtime/`'s strand executor still asks for one
+vcore, so nothing yet schedules strands across several (docs/CONCURRENCY.md).
 
 **The proof** (the `smp` kernel's two-vcore phase, all three ISAs): two vcores of **one**
 cell go into the placement queue and whichever cores are free claim them. Both are

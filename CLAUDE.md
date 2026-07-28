@@ -2125,8 +2125,29 @@ for - so `SYS_QUEUE_INFO` proves per-vcore *reporting* while the round trip prov
 *servicing*, asserted separately rather than conflated; and `load::map_queue` still places
 one ring at `USER_QUEUE_VA`, so a **loaded** cell wanting a second vcore needs
 `USER_QUEUE_VA + v * REGION_SIZE` - one line, deliberately unwritten until a loaded cell
-asks, since nothing would test it. Still named as not done: a vcore that forks or takes a
-signal, the last-vcore-out exit rule, and that loaded-cell ring placement.
+asks, since nothing would test it. 
+**And the last vcore out ends the cell** (docs/SMP.md 10.0a): the first vcore to exit used to
+unwind the run - correct for a cell, unusable for a cell with four vcores, where the first one
+finishing kills the other three. `SYS_EXIT` now ends the calling **vcore** and
+`SYS_EXIT_GROUP` ends the cell, the process/thread split the Linux personality already has one
+level up. A vcore's outcome *is* its liveness (`user::vcore_live` = `voutcome[v].is_none()`), so
+every pick already asks, and `all_parked` counts only live vcores - an exited one is neither
+parked nor runnable, and counting it as unparked would leave the cell `Runnable` with nothing to
+enter. `nproc::retire_vcore` hands the CPU to a sibling **this core may enter** (live, owned
+here, and either runnable or parked on a waitable source - the same two-part rule
+`can_reschedule` uses) and returns `None` otherwise, unwinding with this vcore's own outcome.
+That condition is the whole correctness of it and **both halves were found by the tests**: an
+unconditional `reschedule` returns `DEADLOCK_EXIT` when every live sibling belongs to another
+core, because a core with nothing to do is not a deadlocked machine; and without
+`ensure_tracked` the hand-off finds no `Proc` entry for a cell that has never spawned or
+blocked, and ends the run in `DEADLOCK_EXIT` too. The yield phase asserts the rule directly -
+**both** vcores reach their exit and the run is ended by vcore **1**, the last one out - and
+suppressing the hand-off makes vcore 1 never reach its exit (observed). This is the assertion
+the previous slice deliberately pinned at 0 so the rule's arrival would be a test change rather
+than a silent one; it fired. `SYS_EXIT_GROUP` takes the pre-existing path unchanged, so nothing
+new is claimed for it. Still named as not done: a vcore that forks or takes a signal, the
+loaded-cell ring placement, and the **userspace half** - `runtime/`'s strand executor still asks
+for one vcore, so nothing yet schedules strands across several.
 
 **Honest scope:** preemption is *within* a core's own claim and rebalancing moves only
 **unstarted** cells. Migrating a *running* one was **attempted twice and reverted twice**, with four findings

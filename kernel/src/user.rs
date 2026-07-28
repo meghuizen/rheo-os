@@ -855,6 +855,32 @@ pub fn switch_native_vcore(cell: usize, from: usize, to: usize) -> *mut TrapFram
     cells()[cell].vframe[to]
 }
 
+/// Whether vcore `v` of cell `idx` still exists to be run - it has not exited.
+///
+/// A vcore's outcome is recorded when it ends, so `voutcome[v].is_none()` *is* liveness.
+/// Every path that picks a vcore has to ask, because a cell now outlives its first vcore's
+/// exit (docs/SMP.md 10.0a) and entering a dead context resumes it at its own `SYS_EXIT`.
+#[inline]
+pub fn vcore_live(idx: usize, v: usize) -> bool {
+    v < cells()[idx].nvcores && cells()[idx].voutcome[v].is_none()
+}
+
+/// How many vcores of cell `idx` have not exited.
+pub fn live_vcores(idx: usize) -> usize {
+    (0..cells()[idx].nvcores)
+        .filter(|&v| cells()[idx].voutcome[v].is_none())
+        .count()
+}
+
+/// Record that vcore `v` of cell `idx` has ended with `outcome`, without ending the cell.
+///
+/// The **last vcore out** ends the cell; an earlier one only ends itself. That is the
+/// process/thread split the Linux personality already has one level up (`exit` vs
+/// `exit_group`), and without it a cell with four vcores dies when the first finishes.
+pub fn retire_vcore(idx: usize, v: usize, outcome: Outcome) {
+    cells()[idx].voutcome[v] = Some(outcome);
+}
+
 /// Whether the calling CPU may enter vcore `v` of cell `idx`.
 ///
 /// The per-vcore form of [`cell_on_this_cpu`], and the predicate that replaced that
@@ -863,7 +889,7 @@ pub fn switch_native_vcore(cell: usize, from: usize, to: usize) -> *mut TrapFram
 /// cell is the point rather than a hazard.
 #[inline]
 pub fn vcore_on_this_cpu(idx: usize, v: usize) -> bool {
-    if v >= cells()[idx].nvcores {
+    if !vcore_live(idx, v) {
         return false;
     }
     let owner = cells()[idx].vcpu[v];
@@ -2963,7 +2989,21 @@ pub fn on_user_trap(
         }
         // A spawned native child's exit makes it a zombie and reschedules
         // (docs/LIBRHEO.md Phase F); the top cell's exit unwinds `run`.
-        SYS_EXIT | SYS_EXIT_GROUP => match crate::nproc::on_exit(cur, arg) {
+        // `SYS_EXIT` ends the calling **vcore**; the cell ends when its last one does
+        // (docs/SMP.md 10.0a). `SYS_EXIT_GROUP` ends the cell whatever its siblings are
+        // doing - the process/thread split the Linux personality already has. A cell with
+        // one vcore has no live sibling either way, so both are the pre-vcore behaviour.
+        SYS_EXIT => match crate::nproc::retire_vcore(cur, arg) {
+            // This vcore ended and a live sibling took the CPU.
+            Some(f) => f,
+            // No live sibling: this was the cell's last vcore, so end the cell exactly as
+            // before vcores existed.
+            None => match crate::nproc::on_exit(cur, arg) {
+                Some(f) => f,
+                None => finish(Outcome::Exited(arg)),
+            },
+        },
+        SYS_EXIT_GROUP => match crate::nproc::on_exit(cur, arg) {
             Some(f) => f,
             None => finish(Outcome::Exited(arg)),
         },
