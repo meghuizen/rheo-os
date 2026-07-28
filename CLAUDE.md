@@ -442,9 +442,13 @@ virtio-blk-pci (`ext4fs`/`ext4plus` + block cache, ~15k fills, none resident
 whole), `ld-linux` links all **seven** shared libraries (glibc + libstdc++ +
 libgcc_s), V8 initialises, libuv runs its event loop, and it evaluates
 `console.log("rheo:"+(40+2))`, prints exactly `rheo:42`, and **exits 0** on
-x86-64 (arm/riscv have no node build and skip). It runs `--jitless` so V8's
-Ignition interpreter needs no writable-executable code page (W^X is structural,
-ARCHITECTURE.md 5 - the one `mprotect(RWX)` V8 would issue is refused). This is
+x86-64 (arm/riscv have no node build and skip). It runs **with V8's JIT enabled**:
+the cell is minted the W^X exception capability (ARCHITECTURE.md 5.1) and the run
+log shows V8 taking it - `mprotect PROT_WRITE|PROT_EXEC granted`. It first ran
+`--jitless`, on the Ignition interpreter, because the exception did not exist yet;
+W^X is still structural, since every other kernel in the suite mints nothing of the
+sort and is refused exactly as before, which is what makes this a capability rather
+than a setting. This is
 the production JavaScript runtime Claude Code runs on, executing unmodified via
 the Linux personality + POSIX translation. It needed four measured legacy calls
 (`gettimeofday` - which libuv *asserts* on -, `clock_getres`, `time`; io_uring

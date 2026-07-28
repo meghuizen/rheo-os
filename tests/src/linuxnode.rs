@@ -4,9 +4,11 @@
 //! The actual production `node` (v22, dynamic, ~124 MB, V8 + libuv) is streamed
 //! off a live ext4 disk (`ext4fs`/`ext4plus` + the block cache, GOAL-DISK-2b),
 //! demand-paged, and asked to evaluate JavaScript - touching nothing of Node's
-//! own code. **JIT enabled** - see the W^X note at the `prove` call - needing no
-//! writable-executable code page (W^X is structural, docs/ARCHITECTURE.md 5 - the
-//! one `mprotect(RWX)` V8 would issue is refused). Per-context blocking
+//! own code. **JIT enabled**: the cell is minted the W^X exception capability (see
+//! the note at the `prove` call), and the run log shows V8 taking it - `mprotect
+//! PROT_WRITE|PROT_EXEC granted`. W^X is still structural (docs/ARCHITECTURE.md 5):
+//! every other kernel in the suite mints nothing of the sort and is refused, which
+//! is what makes this a capability rather than a setting. Per-context blocking
 //! (docs/LINUX-COMPAT.md L4) lets its V8 + libuv threads coordinate, so it prints
 //! exactly `rheo:42` and exits 0. **x86-64 only** (no arm64/riscv64 node build -
 //! those skip-with-reason). The whole proof lives in the shared
