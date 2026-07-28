@@ -679,6 +679,13 @@ online: the core that took the long cell takes exactly 1 and the rest take 2-3 -
 ratio is reported, never asserted, because TCG time-slices the vCPUs onto host threads
 and the split is a property of that scheduling, not of ours.
 
+**One cell, one core, checked.** The kernel records which cell each CPU is inside and
+refuses a second entry (`user::double_entries`, asserted by the preemption phase). This
+is the invariant every other multi-core claim rests on, and it is instrumented rather
+than inferred from the absence of a crash: every defect on this path has surfaced as
+corruption somewhere else entirely - a core executing a data symbol, an instruction
+fetch at 0 - which says nothing about where the second entry happened.
+
 **And a claim no longer runs to completion: every core preempts its own cells.** A core
 claims a *batch* (`smp::CLAIM_BATCH` = 2 - one cell has nothing to preempt *to*) and runs
 it under **its own** preemption timer. Everything that needs is per-core hardware no
@@ -832,20 +839,36 @@ third `Outcome` variant, because `Outcome` is matched exhaustively at ~140 sites
 all mean "the cell is finished".
 
 It worked, and then failed roughly two runs in five with a core executing a data symbol.
-Two fixes were tried and **both were wrong**:
+It was attempted **twice**, and the second attempt followed the first one's own advice:
+instrument the invariant rather than reason about the symptom. That was the right move
+and it is the part worth keeping. Four findings, in the order they were established:
 
 1. **Publish the release after the unwind, not inside the trap.** Real: the releasing
-   core is still on the cell's kernel stack when it is inside `migrate_out`. Necessary,
+   core is still on the cell's kernel stack while it is inside `migrate_out`. Necessary,
    not sufficient.
 2. **Hand the cell straight to the named requester rather than clearing its owner.**
    Also real - an unowned cell is one every core's scheduler will pick, so clearing it
-   opened a window for a *third* core. Also not sufficient.
+   opens a window for a *third* core. Also not sufficient. At this point the reasoning
+   had been wrong twice, so the attempt was reverted with a note to instrument next.
+3. **The instrumentation has to be per CPU, not per cell.** A first guard counted
+   entries per *cell* and produced false positives immediately, because under preemption
+   a batch sibling exits without ever passing through `run_inner`, so the exit
+   decrements a counter the entry never incremented. Asking "does another CPU already
+   report this cell" is immune to that: it names two cores or it names none. With that,
+   the failure stopped being a corrupted stack somewhere downstream and became
+   `cell 0 entered by CPU 0 while CPU 1 is already inside it`, reproducibly.
+4. **The request must be published whole.** The cell and the destination core were two
+   statics - the cell set by a compare-exchange, the destination stored straight after -
+   so between them the owner could see the request and hand the cell to whatever
+   destination the *previous* request had left. Packing both into one word fixed that
+   ordering hole. It reduced the failure rate and did not eliminate it.
 
-Something else remains, and guessing a third time is what this document's own rules
-forbid. The honest state is: **an intermittently faulting kernel must not land**, so the
-whole thing is reverted and the two findings recorded. The next attempt should start by
-instrumenting which cores are inside the cell at the moment of the fault, rather than by
-reasoning about the protocol - the reasoning has now been wrong twice.
+So a fifth thing remains. The honest state is unchanged: **an intermittently faulting
+kernel must not land**, and this needs a designed hand-off protocol rather than another
+patch. What is kept is finding 3 - the per-CPU entry guard is now permanent
+(`user::double_entries`), asserted by the preemption phase, and costs one store per cell
+dispatch. It is the tool the next attempt needs, already in place and already proven to
+turn this class of defect from downstream corruption into a named pair of cores.
 
 **Honest scope.** Preemption is *within* a core's own claim, and rebalancing moves only
 **unstarted** cells. Nothing migrates a *running* cell (attempted; see above), and there
