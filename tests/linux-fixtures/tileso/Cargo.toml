@@ -1,0 +1,18 @@
+# Standalone crate (its own workspace), built by xtask for a *-unknown-linux-gnu
+# target: a **shared library** exporting the tile framework's GEMM kernel under a
+# C ABI, so a dynamically-linked program - and in particular a JS runtime's FFI -
+# can call it. See docs/TILES.md 13.4c.
+[workspace]
+
+[package]
+name = "tileso"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "tileso"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[profile.release]
+panic = "abort"

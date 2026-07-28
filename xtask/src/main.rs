@@ -1996,6 +1996,55 @@ fn build_dyn_fixture(arch: Arch, cc: &str, out_dir: &str) -> bool {
         return false;
     }
 
+    // The **dlopen probe** (docs/TILES.md 13.4c): a dynamic PIE that `dlopen`s a
+    // shared library exporting the tile framework's GEMM and calls it. This is the
+    // question a JS runtime's FFI reduces to - `bun:ffi` and Node's N-API addons are
+    // both `dlopen` + `dlsym` + an indirect call - so answering it for C answers
+    // whether a tile kernel is reachable from JavaScript at all, and a failure is a
+    // fact about the personality rather than about JavaScript. Not fatal: a
+    // placeholder makes the phase skip.
+    let so_src = "tests/linux-fixtures/tileso";
+    let mut so = Command::new("cargo");
+    so.args([
+        "build",
+        "--manifest-path",
+        &format!("{so_src}/Cargo.toml"),
+        "--release",
+        "--target",
+        arch.linux_gnu_target(),
+    ]);
+    // **Not** the static fixtures' flags. `+crt-static -no-pie` cannot produce a shared
+    // object at all - a `.so` is position-independent and dynamically linked by
+    // definition - so this one gets only the cross linker. Discovered by the cdylib
+    // failing to link for aarch64 while succeeding on the host, where no cross flags
+    // apply.
+    so.env("RUSTFLAGS", format!("-C linker={cc}"));
+    let so_ok = matches!(so.status().map(|s| s.success()), Ok(true));
+    let so_built = format!(
+        "{so_src}/target/{}/release/libtileso.so",
+        arch.linux_gnu_target()
+    );
+    let so_dst = format!("{out_dir}/libtileso.so");
+    if so_ok && std::fs::copy(&so_built, &so_dst).is_ok() {
+        let mut dl = Command::new(cc);
+        dl.args([
+            "tests/linux-fixtures/dlopentile.c",
+            "-o",
+            &format!("{out_dir}/dlopentile"),
+        ]);
+        if !matches!(dl.status().map(|s| s.success()), Ok(true)) {
+            eprintln!("[xtask] dlopen probe build failed for {}", arch.name());
+            let _ = std::fs::write(format!("{out_dir}/dlopentile"), [0u8]);
+        }
+    } else {
+        eprintln!(
+            "[xtask] tile shared library unavailable for {} - dlopen probe skipped",
+            arch.name()
+        );
+        let _ = std::fs::write(format!("{out_dir}/dlopentile"), [0u8]);
+        let _ = std::fs::write(&so_dst, [0u8]);
+    }
+
     // A second dynamic PIE that links a SECOND shared library (libm) besides
     // libc, so `ld.so` must load two libraries and resolve versions across them
     // (the multi-library case, GOAL-DYN-MULTILIB). `-fno-builtin` forces a real

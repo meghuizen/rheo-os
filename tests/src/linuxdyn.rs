@@ -289,6 +289,15 @@ extern "C" fn kernel_main() -> ! {
     // block carried a real inode (docs/LINUX-COMPAT.md, docs/ENGINEERING.md 11).
     multilib_phase();
 
+    // The **dlopen** phase (docs/TILES.md 13.4c): a dynamic program opens a shared
+    // library at *run time* and calls into it. Everything above is load-time linking,
+    // which `ld.so` does before `main`; `dlopen` is `ld.so` doing it again from inside a
+    // running program, and it is the mechanism a JS runtime's FFI is built on - Bun's
+    // `bun:ffi` and Node's N-API addons are both `dlopen` + `dlsym` + an indirect call.
+    // The library exports the tile framework's GEMM, so what it returns proves a tile
+    // kernel ran, reached by the same route JavaScript would use.
+    dlopen_phase();
+
     // Four-library phase: a dynamic C++ hello links libstdc++ + libgcc_s + libc
     // (+ libm), and runs C++ runtime init (static constructors, iostream setup,
     // exception-unwind tables) - the production shape a real application has, well
@@ -343,6 +352,73 @@ struct Cached(BlockCache<VirtioBlk>);
 impl BlockSource for Cached {
     fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<(), Errno> {
         self.0.read_at(off, buf).map_err(|_| Errno::Io)
+    }
+}
+
+static DLOPENTILE: &[u8] = fixture!("dlopentile");
+static LIBTILESO: &[u8] = fixture!("libtileso.so");
+
+/// Open a shared library at run time and call a tile kernel through it.
+///
+/// Skipped-with-reason where the fixture could not be built, the pattern the rest of
+/// this kernel uses. The expected hash is **not** a constant: it is the FNV-1a the same
+/// kernel source produces for the same shape, and `smp`'s `tilelinux` phase derives it
+/// independently from the librheo cells' own bytes - so the number appearing in two
+/// unrelated tests for two different substrates is the cross-check.
+fn dlopen_phase() {
+    if DLOPENTILE.len() < 4096 || LIBTILESO.len() < 4096 || LIBGCC.len() < 4096 {
+        println!(
+            "linuxdyn: SKIP the dlopen phase on {} - the tile shared library, its probe \
+             or libgcc_s was not built for this ISA",
+            arch::NAME
+        );
+        return;
+    }
+    // A Rust `cdylib` carries a `DT_NEEDED` on `libgcc_s.so.1` (the unwinder) even at
+    // `panic = "abort"`, so the library `dlopen` loads needs its own dependency present.
+    // Found by the probe rather than guessed: the first run failed and the personality's
+    // refused-path log named `/lib/libgcc_s.so.1` - a missing file, not a missing
+    // mechanism, which is exactly the distinction a probe exists to make.
+    fs::write("/lib/libgcc_s.so.1", LIBGCC).expect("seed libgcc_s.so.1");
+    fs::write("/lib/libtileso.so", LIBTILESO).expect("seed libtileso.so");
+
+    fs::write("/bin/dlopentile", DLOPENTILE).expect("seed /bin/dlopentile");
+    unsafe {
+        STDOUT_LEN = 0;
+    }
+    linux::set_stdout_tap(Some(tap));
+    let outcome = run(
+        DLOPENTILE,
+        &[b"dlopentile"],
+        &[b"LD_LIBRARY_PATH=/lib", b"PATH=/bin"],
+    );
+    linux::set_stdout_tap(None);
+    let got = captured();
+    // The hash `tilelinux` and `librheo-fa` produce for a 32x32x32 int8 GEMM.
+    let want = b"dlopentile: gemm 23aa217921e5ccb1\n";
+    match outcome {
+        Outcome::Exited(0) => {
+            assert!(
+                got == want,
+                "dlopentile: stdout mismatch\n  got:      {:?}\n  expected: {:?}",
+                core::str::from_utf8(got),
+                core::str::from_utf8(want),
+            );
+            println!(
+                "linuxdyn: DLOPEN OK - a running program opened /lib/libtileso.so at \
+                 run time, resolved `tile_gemm_hash`, and called the tile framework's \
+                 GEMM through it, getting the same 23aa217921e5ccb1 the librheo cells \
+                 and the static `tilelinux` binary produce. That is the mechanism a JS \
+                 runtime's FFI is built on (bun:ffi / N-API = dlopen + dlsym + an \
+                 indirect call), so a tile kernel is reachable from JavaScript"
+            );
+        }
+        Outcome::Exited(code) => panic!(
+            "dlopentile: exit {code} - dlopen/dlsym did not complete under the \
+             personality; the program said {:?}",
+            core::str::from_utf8(got)
+        ),
+        Outcome::Faulted(addr) => panic!("dlopentile: faulted at {addr:#x}"),
     }
 }
 

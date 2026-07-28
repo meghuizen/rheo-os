@@ -655,9 +655,42 @@ three ISAs.
 What that establishes, precisely: **the tile programs need nothing librheo provides that
 the Linux personality cannot** - no queue pair, no typed grant, no native verb - and the
 two substrates agree bit for bit about the arithmetic. It is a claim about the kernels
-and the ABI beneath them. It is **not** a claim that Node or Bun call these functions;
-they do not, and nothing here pretends otherwise. Control observed failing: changing one
-input salt in the Linux binary.
+and the ABI beneath them. Control observed failing: changing one input salt in the Linux
+binary.
+
+### 13.4c Reachable from a JS runtime's FFI - `dlopen`
+
+13.4b still leaves a gap: a *statically linked* program calling the kernels says nothing
+about whether **JavaScript** could. Node and Bun reach native code exactly one way -
+`dlopen` + `dlsym` + an indirect call (Bun's `bun:ffi` and Node's N-API addons are both
+that) - so the question reduces to whether `dlopen` works under the personality at all.
+
+It is answered rather than assumed. `tests/linux-fixtures/tileso` builds the same
+`#[path]`-included GEMM kernel as a **shared library** exporting
+`tile_gemm_hash` under the C ABI, and `dlopentile.c` opens it at run time, resolves the
+symbol and calls it. Everything in L7 up to now is *load-time* linking, which `ld.so`
+does before `main`; this is `ld.so` doing it again from inside a running program.
+
+It works, on **all three ISAs**, returning `23aa217921e5ccb1` - the same hash the librheo
+cells and the static `tilelinux` binary produce for a 32x32x32 int8 GEMM. So a tile kernel
+is reachable by the route a JS runtime would use.
+
+The probe earned its keep twice, both times by turning a guess into a fact:
+
+- The first run failed, and the refused-path log named `/lib/libgcc_s.so.1`: a Rust
+  `cdylib` carries a `DT_NEEDED` on the unwinder even at `panic = "abort"`, and the
+  library `dlopen` loads needs *its own* dependencies present. A missing **file**, not a
+  missing mechanism - which is the distinction a probe exists to draw, and which
+  "dlopen doesn't work" would have hidden.
+- The library then failed to link for aarch64 while succeeding on the host, because it
+  had inherited the static fixtures' `+crt-static -no-pie`. Those flags cannot produce a
+  shared object at all; a `.so` is position-independent and dynamically linked by
+  definition.
+
+**Still not claimed:** that Node or Bun *do* call these kernels. Wiring `bun:ffi` to this
+library is a JS-side exercise on top of a mechanism now shown to work, and until it is
+run, "reachable" is the honest word and "integrated" is not. Control observed failing:
+the library not seeded, so `dlopen` cannot find it.
 
 ### 13.5 Honest scope
 

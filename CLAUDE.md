@@ -2149,9 +2149,25 @@ transcript is derived rather than copied from a passing run. They agree exactly 
 `23aa217921e5ccb1`, FlashAttention `0a9704e0e8740540`, all three ISAs. That establishes
 **the tile programs need nothing librheo provides that the Linux personality cannot** (no
 queue pair, no typed grant, no native verb) and that the two substrates agree bit for bit
-on the arithmetic. It is **not** a claim that Node or Bun call these functions - they do
-not, and nothing here pretends otherwise. Control observed failing: one input salt changed
-in the Linux binary. Honest: FA3's own producer/consumer
+on the arithmetic. Control observed failing: one input salt changed
+in the Linux binary.
+**And a tile kernel is reachable by the route a JS runtime's FFI uses** (docs/TILES.md
+13.4c): a statically linked program calling the kernels still says nothing about whether
+*JavaScript* could, and Node and Bun reach native code exactly one way - `dlopen` +
+`dlsym` + an indirect call (`bun:ffi` and N-API addons are both that). So it is answered
+rather than assumed: `tests/linux-fixtures/tileso` builds the same `#[path]`-included GEMM
+as a **shared library** exporting `tile_gemm_hash`, and `dlopentile.c` opens it **at run
+time**, resolves the symbol and calls it - `ld.so` linking from inside a running program
+rather than before `main`, which is a step past everything L7 proved. It works on **all
+three ISAs**, returning the same `23aa217921e5ccb1`. The probe earned its keep twice, both
+times turning a guess into a fact: the first failure's refused-path log named
+`/lib/libgcc_s.so.1` (a Rust `cdylib` needs the unwinder even at `panic = "abort"`, so the
+library `dlopen` loads needs its *own* dependencies - a missing file, not a missing
+mechanism), and the library then failed to link for aarch64 because it had inherited the
+static fixtures' `+crt-static -no-pie`, which cannot produce a shared object at all.
+**Still not claimed**: that Node or Bun *do* call these kernels - wiring `bun:ffi` to this
+library is a JS-side exercise on top of a mechanism now shown to work, and until it is run
+"reachable" is the honest word and "integrated" is not. Honest: FA3's own producer/consumer
 overlap is still **interleaving** within a slice - the parallelism above is data
 parallelism *over* the head, and a slice runs on one core, so FA3's wall-clock win over
 FA2 needs a second execution context inside the slice and is not built; the inner loops are
@@ -2661,7 +2677,9 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               ext4 test image (+ gen-ext4.sh); linux-fixtures/ (incl. tilelinux/ - the
               tile kernels `#[path]`-included from librheo and built as a static-glibc
               Linux binary, so `smp` can assert the two substrates agree bit for bit,
-              docs/TILES.md 13.4b) holds the
+              docs/TILES.md 13.4b; and tileso/ + dlopentile.c - the same
+              GEMM as a shared library plus a probe that `dlopen`s it at run time, the
+              route a JS runtime's FFI takes, docs/TILES.md 13.4c) holds the
               built-from-source glibc test binaries (rusthello/ + rustthreads/
               + hello.c + sig_{raise,segv,dfl}.c + procdemo/cecho/rsh.c +
               dhello.c + af_unix.c + inet.c + inetremote.c; coreutils via cargo
