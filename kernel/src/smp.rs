@@ -485,19 +485,24 @@ fn secondary_work_loop() {
             deadline = arch::timer_now_ns().wrapping_add(RV_TIMEOUT_NS);
             continue;
         }
-        // **Taken** out under the lock, not copied: the loop serves more than one job
-        // now, so a job left in place would be drained again the moment this core came
-        // back round. The compute below must not hold the lock, because the primary is
-        // computing its own rows concurrently and would block on it.
-        let job = JOB.lock().take();
-        if let Some(job) = job {
-            if rendezvous(&RV_SECONDARY, &RV_PRIMARY) {
-                // SAFETY: the primary's `run_gemm_with_secondary` contract - the
-                // buffers are valid for the exchange, and each block this claims is
-                // its alone.
-                unsafe { drain_blocks(&job) };
+        // **Copied, not taken**, and gated on the round's generation: every online core
+        // joins the same queue, instead of the first secondary removing the job and the
+        // rest idling beside undrained blocks. The lock is released before the compute,
+        // because peers are draining the same queue concurrently.
+        let round = JOB_GEN.load(Ordering::Acquire);
+        if round != 0 && JOB_SEEN.this().load(Ordering::Acquire) != round {
+            JOB_SEEN.this().store(round, Ordering::Release);
+            let job = *JOB.lock();
+            if let Some(job) = job {
+                // Every expected core meets here, so the drain below genuinely overlaps
+                // across all of them rather than only across two.
+                if gemm_barrier() {
+                    // SAFETY: the primary's `run_gemm` contract - the buffers are valid
+                    // for the exchange, and each block this claims is its alone.
+                    unsafe { drain_blocks(&job) };
+                }
+                JOBS_DONE.fetch_add(1, Ordering::Release);
             }
-            JOBS_DONE.fetch_add(1, Ordering::Release);
             deadline = arch::timer_now_ns().wrapping_add(RV_TIMEOUT_NS);
             continue;
         }
@@ -583,6 +588,59 @@ pub const GEMM_BLOCK_ROWS: usize = 4;
 #[cfg(feature = "smp")]
 /// Next unclaimed block index.
 static NEXT_BLOCK: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp")]
+/// Which round of GEMM work is published. Bumped by the primary; each core drains a
+/// given generation once.
+///
+/// **Generation, not `take()`.** The job used to be removed from its slot by the first
+/// secondary to see it, which made the phase inherently two-core: primary plus whoever
+/// grabbed it. Every other core sat in its idle loop while a queue of blocks went
+/// undrained, which is the opposite of what a work queue is for.
+static JOB_GEN: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp")]
+/// The generation each core last drained, so a core neither misses a round nor drains
+/// one twice.
+static JOB_SEEN: PerCpu<AtomicUsize> =
+    PerCpu::from_array([const { AtomicUsize::new(0) }; MAX_CPUS]);
+#[cfg(feature = "smp")]
+/// An **N-way barrier** for the GEMM round: arrivals, and how many are expected.
+///
+/// The two-way `rendezvous` proves two cores overlapped and cannot prove more, because
+/// each half waits for exactly one peer. Here every participant waits for *all* of
+/// them, sized from [`online_count`] - which the primary knows - so passing it means
+/// every online core was inside the same interval. A core that never arrives lets the
+/// others through on the deadline, and the round then honestly reports fewer
+/// participants rather than hanging.
+static GEMM_ARRIVE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp")]
+static GEMM_EXPECT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp")]
+/// Whether every expected core reached the GEMM barrier.
+static GEMM_ALL_MET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "smp")]
+/// Wait until every expected core has reached this point, or the deadline passes.
+///
+/// Returns whether the full set met. Bounded, like every other wait in this file: a
+/// boot test must not be able to hang on a core that did not come up.
+fn gemm_barrier() -> bool {
+    let want = GEMM_EXPECT.load(Ordering::Acquire);
+    GEMM_ARRIVE.fetch_add(1, Ordering::AcqRel);
+    let deadline = arch::timer_now_ns().wrapping_add(RV_TIMEOUT_NS);
+    while GEMM_ARRIVE.load(Ordering::Acquire) < want {
+        if arch::timer_now_ns() >= deadline {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    true
+}
+
+#[cfg(feature = "smp")]
+/// Whether every online core met at the last GEMM round's barrier.
+pub fn gemm_all_met() -> bool {
+    GEMM_ALL_MET.load(Ordering::Acquire)
+}
 #[cfg(feature = "smp")]
 /// Blocks completed by each core, indexed by CPU. The load-sharing witness: a run
 /// where one entry is zero did not share anything.
@@ -725,31 +783,47 @@ pub unsafe fn run_gemm_with_secondary(job: GemmJob, own_lo: usize, own_hi: usize
         // SAFETY: between runs; no core is draining.
         unsafe { BLOCKS_DONE.get(cpu) }.store(0, Ordering::Release);
     }
-    RV_PRIMARY.store(0, Ordering::Release);
-    RV_SECONDARY.store(0, Ordering::Release);
     RV_TIMEOUT.store(0, Ordering::Release);
+    // **Every online core is a participant**, and the barrier is sized from the count
+    // the primary already has. Publish the job, then bump the generation - in that
+    // order, so a core that sees the new generation always finds the job behind it.
+    GEMM_ARRIVE.store(0, Ordering::Release);
+    GEMM_EXPECT.store(online_count(), Ordering::Release);
+    GEMM_ALL_MET.store(false, Ordering::Release);
     *JOB.lock() = Some(job);
+    JOB_GEN.fetch_add(1, Ordering::AcqRel);
 
-    // Both cores meet here, so the compute below genuinely overlaps rather than the
-    // secondary starting after the primary has finished.
-    let met = rendezvous(&RV_PRIMARY, &RV_SECONDARY);
+    // Every expected core meets here, so the drain below genuinely overlaps across all
+    // of them rather than only across two.
+    let met = gemm_barrier();
+    GEMM_ALL_MET.store(met, Ordering::Release);
 
-    // Both cores now drain the same queue. The primary takes no reserved share: if
-    // the secondary is faster it does more, and if the secondary never arrives the
-    // primary completes the whole job alone - which is what makes this degrade to
-    // correct-but-serial rather than to a hang.
+    // Every core now drains the same queue. No core has a reserved share: a faster one
+    // does more, and if no secondary arrives the primary completes the whole job alone -
+    // which is what makes this degrade to correct-but-serial rather than to a hang.
     // SAFETY: the caller's contract - valid buffers; the claim in `drain_blocks`
     // makes each block one core's alone.
     unsafe { drain_blocks(&job) };
     let _ = (own_lo, own_hi);
 
+    // Wait for **the queue**, not for one secondary's completion flag: with N
+    // participants the primary cannot know how many will signal, but it knows exactly
+    // how many blocks there are, and every block is accounted to the core that did it.
+    let total = job.hi.div_ceil(GEMM_BLOCK_ROWS);
     let deadline = arch::timer_now_ns().wrapping_add(RV_TIMEOUT_NS);
-    while JOBS_DONE.load(Ordering::Acquire) == 0 {
+    loop {
+        let done: usize = (0..MAX_CPUS).map(blocks_done).sum();
+        if done >= total {
+            break;
+        }
         if arch::timer_now_ns() >= deadline {
+            *JOB.lock() = None;
             return (met, false);
         }
         core::hint::spin_loop();
     }
+    // Retire the round so a core coming back round finds nothing to drain.
+    *JOB.lock() = None;
     (met, true)
 }
 

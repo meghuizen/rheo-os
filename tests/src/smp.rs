@@ -176,11 +176,17 @@ fn test_parallel_gemm(idx: usize) {
             );
             return;
         }
+        // **Every online core met**, not just two. The two-way rendezvous this phase
+        // used could only ever witness a pair - each half waits for exactly one peer -
+        // so with four cores online it left the other two unaccounted for. The barrier
+        // is sized from `online_count()`, which the primary already knows, so passing
+        // it means every online core was inside the same interval.
+        let cores = smp::online_count();
         assert!(
-            met && !smp::rendezvous_timed_out(),
-            "the two cores never met at the rendezvous, so they did not run at the \
-             same time - the GEMM may still be correct, but that would only mean the \
-             halves ran one after the other"
+            met && smp::gemm_all_met(),
+            "not all {cores} online cores met at the barrier, so they did not all run \
+             at the same time - the GEMM may still be correct, but that would only mean \
+             the shares ran one after another"
         );
         let got = &*core::ptr::addr_of!(GC);
         let want = &*core::ptr::addr_of!(GREF);
@@ -193,18 +199,29 @@ fn test_parallel_gemm(idx: usize) {
         // whole queue. A run where either is zero did the work on one core and would
         // still have produced the right answer - which is exactly why this is asserted
         // rather than inferred from correctness.
-        let (p_blocks, s_blocks) = (smp::blocks_done(0), smp::blocks_done(idx));
         let total_blocks = GM.div_ceil(smp::GEMM_BLOCK_ROWS);
+        let mut sum = 0usize;
+        let mut workers = 0usize;
+        for c in 0..smp::MAX_CPUS {
+            let n = smp::blocks_done(c);
+            sum += n;
+            if n > 0 {
+                workers += 1;
+            }
+        }
+        let _ = idx;
         assert_eq!(
-            p_blocks + s_blocks,
-            total_blocks,
-            "blocks completed ({p_blocks} + {s_blocks}) do not account for the whole \
-             queue ({total_blocks}) - a claim was lost or double-counted"
+            sum, total_blocks,
+            "blocks completed ({sum}) do not account for the whole queue \
+             ({total_blocks}) - a claim was lost or double-counted"
         );
-        assert!(
-            p_blocks > 0 && s_blocks > 0,
-            "one core did all {total_blocks} blocks (primary {p_blocks}, secondary \
-             {s_blocks}) - the queue was drained serially, not shared"
+        // **Every** online core took work, not merely two. A run where one is zero did
+        // that core's share elsewhere and would still have produced the right answer -
+        // which is exactly why this is asserted rather than inferred from correctness.
+        assert_eq!(
+            workers, cores,
+            "{workers} of {cores} online cores took blocks - the queue was not drained \
+             by all of them"
         );
         // And the frame allocator survived two cores using it (the pool lock,
         // docs/SMP.md 10.2): the incremental used counter still agrees with the bitmap
@@ -214,12 +231,18 @@ fn test_parallel_gemm(idx: usize) {
             "the frame pool's used counter drifted from its bitmap under two cores"
         );
         println!(
-            "smp: TWO CORES drained one {total_blocks}-block work queue for a \
-             {GM}x{GN}x{GK} int8 GEMM at the same time (CPU 0 took {p_blocks}, the \
-             secondary {s_blocks} - claimed, not pre-assigned), result \
-             bit-identical to the single-core oracle, and the two met at a rendezvous \
-             neither could pass alone OK"
+            "smp: {cores} CORES drained one {total_blocks}-block work queue for a \
+             {GM}x{GN}x{GK} int8 GEMM at the same time - the tile framework's own \
+             `gemm_i8_i32`, shared verbatim - every core taking a nonzero share \
+             (claimed, not pre-assigned), result bit-identical to the single-core \
+             oracle, and all {cores} met at a barrier none could pass alone OK"
         );
+        for c in 0..smp::MAX_CPUS {
+            let n = smp::blocks_done(c);
+            if n > 0 {
+                println!("smp:   CPU {c} computed {n} block(s)");
+            }
+        }
     }
 }
 
@@ -580,6 +603,14 @@ fn test_placement() {
     let extra = smp::start_all();
     let online = smp::online_count();
     println!("smp: {online} CPUs online ({extra} more secondaries started for placement)");
+
+    // With the whole machine up, run the tile GEMM again - now with **every** core as a
+    // participant. The earlier round had one secondary because it runs before
+    // `start_all`, so it could only ever witness a pair; this is the same queue, the
+    // same tile kernel and the same bit-exact oracle across all of them, which is what
+    // the generation-gated publish exists for (a `take()`n job could serve one
+    // secondary and no more).
+    test_parallel_gemm(smp::online_count() - 1);
 
     // SAFETY: single-threaded setup on the primary; the secondaries are parked in
     // their work loop and claim nothing until `place_cells` publishes the queue.

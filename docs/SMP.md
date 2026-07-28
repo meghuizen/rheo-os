@@ -582,10 +582,19 @@ scheduler itself has not.
   the `smp` feature, because locking is a property of the data structure rather than of
   a build configuration (the lesson that produced the `SYS_YIELD` FP defect: state
   whose safety depends on which features are enabled gets written twice and diverges).
-  On top of that, both cores **drain a shared work queue**: an int8 GEMM's output rows
-  are split into blocks and each core claims blocks from a single `fetch_add` cursor
+  On top of that, **every online core drains a shared work queue**: an int8 GEMM's output
+  rows are split into blocks and each core claims blocks from a single `fetch_add` cursor
   until it is exhausted, with the result asserted **bit-identical** to a single-core
-  oracle. Claiming rather than pre-assigning is what makes the split a *result*: with a
+  oracle. It was two cores for a while, and not by design: the job was `take()`n out of
+  its slot by the first secondary to see it, so the phase was primary-plus-one while the
+  other cores sat in their idle loops beside undrained blocks. The job is published by
+  **generation** now (each core drains a round once) and the primary waits for *the
+  queue* - every block accounted to the core that did it - rather than for one
+  secondary's completion flag, which it cannot use once the number of participants is
+  unknown. Simultaneity is likewise an **N-way barrier** sized from `online_count()`
+  rather than the two-way rendezvous, which could only ever witness a pair: 4 of 4 cores
+  take a nonzero share on all three ISAs (4/3/6/3, varying run to run), and restoring
+  the `take()` makes the assertion fail. Claiming rather than pre-assigning is what makes the split a *result*: with a
   static half-and-half division the faster core finishes early and idles, and the
   per-core counts prove nothing because they were decided in advance. Here they vary run
   to run (8/8, 9/7) and both are asserted nonzero and asserted to sum to the queue - a

@@ -1840,7 +1840,7 @@ phase evidence of anything), and with dispatch on the shared order vector interl
 the longest unbroken run dropping 24 -> 2-9 with 14-33 slices actually taken. An
 interleave is only producible if something took the CPU away mid-loop.
 
-**Two cores now compute at the same time** (docs/SMP.md 10, the `smp` kernel, all
+**Every online core computes at the same time** (docs/SMP.md 10, the `smp` kernel, all
 three ISAs). Its prerequisite landed first: `frames`' bitmap, reference counts, used
 counter and search hint are one data structure with four fields that every operation
 touches several of, so they are behind a `SpinLock` - **unconditionally**, not behind
@@ -1848,18 +1848,29 @@ the `smp` feature, because locking is a property of the data structure rather th
 build configuration (the lesson that produced the `SYS_YIELD` FP defect: state whose
 safety depends on which features are enabled gets written twice and diverges); an
 uncontended acquire is one atomic exchange, unmeasurable next to zeroing a frame. On
-top of it **both cores drain a shared work queue**: an int8 GEMM - the tile framework's
+top of it **every online core drains a shared work queue**: an int8 GEMM - the tile framework's
 own `gemm_i8_i32`, shared verbatim - has its output rows split into blocks, and each
 core claims blocks from a single `fetch_add` cursor until exhausted. Split by output
 rows so the two write disjoint ranges of C and the compute needs no lock at all;
 *claimed* rather than pre-assigned so the division is a result, not an assumption - with
 a static half-and-half split the faster core idles and the per-core counts prove nothing
 because they were decided in advance. The result is asserted **bit-identical** to a
-single-core oracle, both counts are asserted nonzero and to sum to the queue (they vary
-run to run - 8/8, 9/7), and the frame pool's used counter is asserted still to agree
-with its bitmap (the invariant a lost update breaks). The parallelism is proven by a **rendezvous rather than by
-timing**: each core publishes a flag and waits for the other's, neither writes its flag
-after passing, so both passing means both executed inside one interval - which a single
+single-core oracle, **every** online core's count is asserted nonzero and the counts to
+sum to the queue (they vary run to run - 8/8, 9/7 on two cores; 4/3/6/3 on four), and the
+frame pool's used counter is asserted still to agree with its bitmap (the invariant a lost
+update breaks). **The queue is drained by all four cores, not two**: the job used to be
+`take()`n out of its slot by the first secondary to see it, so the phase was inherently
+primary-plus-one while the rest sat in their idle loops beside undrained blocks. It is
+published by **generation** now - each core drains a given round once - and the primary
+waits for *the queue* (every block accounted to the core that did it) rather than for one
+secondary's flag, since with N participants it cannot know how many will signal. The
+round runs twice: once before `start_all` (2 cores, all that are up) and once after
+(4 cores). Observed failing when the `take()` is restored. The parallelism is proven by a **barrier rather than by
+timing**, and by an **N-way** one: the two-way rendezvous could only ever witness a pair,
+since each half waits for exactly one peer, so with four cores online it left two
+unaccounted for. Every participant now waits for all of them, sized from
+`online_count()` - which the primary already knows - so passing it means every online core
+was inside one interval - which a single
 core cannot produce, since there is no kernel-context preemption to interleave them and
 neither side yields. A wall-clock speedup would prove nothing under TCG (it time-slices
 the two vCPUs onto host threads), so simultaneity is the available evidence and it is
@@ -2397,7 +2408,7 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               skip-with-reason - docs/MEMORY.md 2.1), smp (per-CPU state + kernel spinlock +
               a real secondary core on all three ISAs: SBI HSM on riscv64,
               INIT-SIPI-SIPI + a real-mode AP trampoline on x86-64, PSCI CPU_ON
-              over the probed HVC conduit on aarch64; then both cores draining
+              over the probed HVC conduit on aarch64; then **all four cores** draining
               one int8-GEMM work queue; then **two cells in user mode on two
               cores at once**, each in its own address space, witnessed by each
               reading the other's progress mid-run; then **start-all + cell
