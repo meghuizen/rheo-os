@@ -108,6 +108,7 @@ fn enumerate_function(
         bars: [PciBar::EMPTY; 6],
         msi: false,
         msix: false,
+        msix_cap: 0,
         pcie: false,
         flr: false,
     };
@@ -234,7 +235,10 @@ fn walk_caps(ecam_base: u64, bus: u8, dev: u8, func: u8, d: &mut PciDevice) {
         let cap_id = (cap & 0xFF) as u8;
         match cap_id {
             0x05 => d.msi = true,
-            0x11 => d.msix = true,
+            0x11 => {
+                d.msix = true;
+                d.msix_cap = ptr;
+            }
             0x10 => {
                 d.pcie = true;
                 let devcap = arch::pci_cfg_read32(ecam_base, bus, dev, func, ptr + 4);

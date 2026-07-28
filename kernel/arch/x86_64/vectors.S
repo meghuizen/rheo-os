@@ -183,6 +183,12 @@ common_trap:
 
 IRQ_STUB uart_irq_stub, x86_uart_irq
 
+/* The NVMe MSI-X completion vector. Like the UART's and unlike the timer's, it
+ * never needs to take the CPU away from a cell: it only records that a
+ * completion is ready, and the core that was waiting for it is in kernel mode
+ * inside `hlt`. So the light stub is right here. */
+IRQ_STUB nvme_irq_stub, x86_nvme_irq
+
 /* The LAPIC one-shot vector, which - unlike the UART's - must be able to fire in
  * ring 3 and take the CPU away from the running cell (docs/SUBSTRATE.md pillar 3,
  * timer preemption). An IRQ_STUB cannot: it saves only the caller-saved registers

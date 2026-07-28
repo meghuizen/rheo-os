@@ -216,6 +216,11 @@ static mut LAPIC_VA: usize = 0;
 /// (all above the 32 CPU-exception vectors).
 const VEC_TIMER: usize = 0x20;
 const VEC_UART: usize = 0x21;
+/// The first NVMe MSI-X completion vector (docs/SUBSTRATE.md S5). Queue `i` uses
+/// `VEC_NVME + i` and is delivered to the core that owns queue `i`.
+const VEC_NVME: usize = 0x22;
+/// Completion vectors reserved - one per possible I/O queue.
+const MSI_SLOTS: usize = 8;
 const VEC_SPURIOUS: usize = 0xFF;
 
 static mut TIMER_ENABLED: bool = false;
@@ -258,6 +263,7 @@ fn lapic_write(reg: usize, value: u32) {
 unsafe extern "C" {
     fn timer_irq_stub();
     fn uart_irq_stub();
+    fn nvme_irq_stub();
     fn spurious_irq_stub();
 }
 
@@ -877,6 +883,76 @@ fn mask_legacy_pic() {
 }
 
 static DOORBELLS: AtomicU64 = AtomicU64::new(0);
+
+// ------------------------------------------------------ MSI-X (NVMe completions)
+
+/// Completion interrupts taken, **per CPU**.
+///
+/// Per CPU because the driver uses this to verify its own wake path: a core asking
+/// "did my completion raise my vector?" must not be answered by a *sibling's*
+/// interrupt. With one global counter a core whose MSI was misdirected would see
+/// the number move - because a busy peer moved it - and conclude its own path
+/// worked. That is a check passing for the wrong reason, which is worse than no
+/// check (docs/ENGINEERING.md 1).
+static NVME_IRQS: [AtomicU64; crate::hw::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::hw::MAX_CPUS];
+
+/// Where a PCIe device should write, and what, to raise [`VEC_NVME`] on this CPU.
+///
+/// On x86-64 an MSI *is* a memory write to the local-APIC message region: address
+/// `0xFEE0_0000 | (destination APIC id << 12)`, data = the vector. There is no
+/// interrupt-controller table to program, which is why this ISA gets the
+/// capability first - ARM64 needs a GICv3 ITS (device table, ITT, MAPD/MAPTI) and
+/// RISC-V an IMSIC MSI target, both real drivers rather than two constants.
+///
+/// Returns `None` where no APIC is usable, so a caller that cannot get a target
+/// falls back to polling and says so rather than programming a write to nowhere.
+pub fn msi_target(dest_hw_id: u32, slot: usize) -> Option<(u64, u32)> {
+    // An MSI is a write to the local-APIC message region, so the APIC has to be up
+    // and its access mode known. A boot that never armed a timer or a UART line has
+    // not probed it - so probe here rather than reporting "no MSI on this ISA",
+    // which is what a missing probe used to look like from the outside and is a
+    // different (and false) statement.
+    lapic_probe();
+    if apic_mode() == ApicMode::None || slot >= MSI_SLOTS {
+        return None;
+    }
+    // The APIC must also be software-enabled on *this* core before it will deliver.
+    enable_timer_irq_this_cpu();
+    let vector = VEC_NVME + slot;
+    set_idt_gate(vector, nvme_irq_stub as *const () as u64);
+    // `dest_hw_id` is the destination APIC id - **which core** the completion wakes.
+    // A queue that is one core's private channel has to interrupt *that* core, or
+    // the core waiting on it halts while a peer takes its vector. Found exactly that
+    // way: with every queue's MSI aimed at the boot CPU, a secondary's reads never
+    // finished (docs/SUBSTRATE.md S5).
+    Some((0xFEE0_0000 | ((dest_hw_id as u64) << 12), vector as u32))
+}
+
+/// Let any pending interrupt be delivered, then mask again.
+///
+/// Bounded by construction, unlike [`idle_wait`]: it enables and immediately
+/// disables rather than halting, so a caller that is *checking whether* an
+/// interrupt path works cannot hang when it does not. The kernel runs with
+/// interrupts masked, so without this a pending vector sits in the LAPIC's
+/// request register and a spin-wait for it never ends - which is precisely how
+/// the NVMe bring-up probe first reported "no interrupt" on a working path.
+pub fn irq_window() {
+    // SAFETY: kernel context. `sti` takes effect after the next instruction, so
+    // the `nop` is the one-instruction window in which a pending vector is taken.
+    unsafe { asm!("sti; nop; cli", options(nomem, nostack)) };
+}
+
+/// Completion interrupts **this CPU** has taken.
+pub fn msi_irq_count() -> u64 {
+    NVME_IRQS[cpu_slot().min(crate::hw::MAX_CPUS - 1)].load(Ordering::Relaxed)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn x86_nvme_irq() {
+    NVME_IRQS[cpu_slot().min(crate::hw::MAX_CPUS - 1)].fetch_add(1, Ordering::Relaxed);
+    lapic_write(LAPIC_EOI, 0);
+}
 
 /// Called from the common stub in vectors.S with the interrupt-frame CS so
 /// the RPL distinguishes a kernel trap from a user fault. Vector 3

@@ -25,15 +25,24 @@
 //! firmware to program BARs on the bare arm/riscv boots, and PVH skips it on x86)
 //! and maps BAR0 uncacheable through `arch::mmio_map_window`.
 //!
-//! **Scope, stated rather than implied.** One I/O queue pair, polled, with the
-//! completion phase tag as the only ordering signal - no interrupt, no MSI-X, and
-//! no per-core queue yet (that is the rest of S5, and the reason the queue count
-//! is *requested* from the controller rather than assumed to be 1). Transfers are
-//! bounced through a single page-aligned frame and issued one page at a time, so
-//! `PRP1` alone addresses every command and no PRP list is built - correct, and
-//! deliberately the simple form, since a PRP list buys throughput that QEMU's TCG
-//! cannot show. DMA is by physical address (`arch::virt_to_phys`); an IOMMU domain
-//! for a storage *cell* is the S5 gate this driver is the prerequisite for.
+//! **What it has.** One queue pair *and* one bounce-frame pool **per CPU**, so
+//! cores never share a ring (`Chan`, and the counters `submits` /
+//! `cross_core_submits` that make that a measurement); **queue depth** - up to
+//! [`DEPTH`] commands in flight behind a single doorbell; and, where the ISA can
+//! name an MSI target, **interrupt-driven completion**, so a waiting core halts
+//! instead of spinning. The interrupt is *verified at bring-up* rather than
+//! assumed from having written the registers, and falls back to polling with a
+//! printed reason - which is not ceremony: the reap loop halts, so an interrupt
+//! that never arrives is a hang rather than a slow path.
+//!
+//! **What it does not.** MSI-X is x86-64 only for now (ARM64 needs a GICv3 ITS,
+//! RISC-V an IMSIC target - both real drivers, named in docs/SUBSTRATE.md S5
+//! rather than papered over), so the other two poll and say so. Transfers bounce
+//! through page-aligned frames, one page per command, so `PRP1` alone addresses
+//! every command and no PRP list is built - correct, and deliberately the simple
+//! form, since a PRP list buys throughput that QEMU's TCG cannot show. DMA is by
+//! physical address (`arch::virt_to_phys`); an IOMMU-contained storage *cell* is
+//! the S5 gate this driver is the prerequisite for.
 
 use super::block::{BlkError, BlockDevice, SECTOR};
 use super::{EngineKind, PciDevice};
@@ -214,6 +223,12 @@ impl Queue {
 /// cargo features are enabled (docs/SMP.md).
 struct Chan {
     q: SpinLock<Queue>,
+    /// Whether *this* channel's completions raise *this* core's vector, verified
+    /// by observation on first use. Per channel because each queue interrupts its
+    /// own core, so one channel working says nothing about another's.
+    irq: core::sync::atomic::AtomicBool,
+    /// Whether the check above has run yet.
+    irq_probed: core::sync::atomic::AtomicBool,
     /// This core's bounce frames, one per command that can be outstanding. A pool
     /// rather than a single frame because a batch stages every command's data at
     /// once - with one frame the second command would overwrite the first's.
@@ -245,6 +260,26 @@ pub struct Nvme {
     io: [Option<Chan>; MAX_IOQ],
     /// How many I/O queue pairs the controller actually granted.
     nio: usize,
+    /// Whether the MSI-X table is programmed. Not the same as "a waiting core may
+    /// halt": that is per channel and set only by observation - see `Chan::irq`.
+    armed: bool,
+}
+
+/// Halts taken while waiting for a completion, and polls made instead.
+///
+/// Reported rather than assumed, the same discipline `net_rx` applies to its three
+/// wait modes: a park that silently degraded to a spin would look identical in
+/// every other measurement (docs/SUBSTRATE.md pillar 8).
+static IRQ_PARKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Halts taken waiting for an NVMe completion. Zero where the ISA polls.
+pub fn irq_parks() -> u64 {
+    IRQ_PARKS.load(Ordering::Relaxed)
+}
+
+/// Completion interrupts the CPU actually took.
+pub fn irq_count() -> u64 {
+    arch::msi_irq_count()
 }
 
 /// This device is reached from more than one core (the per-core channels above are
@@ -567,9 +602,53 @@ impl Nvme {
                 crate::println!("nvme: queue {qid} batch timed out with {seen}/{n} reaped");
                 return Err(BlkError::Io);
             }
-            core::hint::spin_loop();
+            // **Halt where an interrupt can wake us.** Every other wait in this
+            // kernel parks rather than spinning (docs/ARCHITECTURE-DEBT.md 2.4);
+            // this one could not, because a polled completion has no wake source.
+            // With MSI-X programmed there is one, so the core stops burning cycles
+            // for the microseconds a command takes. Where no MSI path exists yet
+            // the spin is kept and **counted separately**, so a degraded wait is
+            // reported rather than inferred away.
+            if ch.irq.load(Ordering::Relaxed) {
+                IRQ_PARKS.fetch_add(1, Ordering::Relaxed);
+                arch::idle_wait();
+            } else {
+                core::hint::spin_loop();
+            }
         }
+        self.verify_irq(ch);
         Ok(())
+    }
+
+    /// The first batch a core runs on its channel is reaped by polling; afterwards,
+    /// whether it may halt depends on what that batch **observed**.
+    ///
+    /// Verified per channel and by the core that owns it, because each queue
+    /// interrupts its own core: one channel's vector arriving says nothing about
+    /// another's, and the counter consulted is this CPU's own, so a busy sibling
+    /// cannot answer the question for us. Getting this wrong is not a slow path -
+    /// the wait halts, so an interrupt that never comes is a hang.
+    fn verify_irq(&self, ch: &Chan) {
+        if !self.armed || ch.irq_probed.load(Ordering::Relaxed) {
+            return;
+        }
+        let before = arch::msi_irq_count();
+        // The completion was already reaped by the poll above; what is being asked
+        // is whether the *vector* also arrived. The kernel runs with interrupts
+        // masked, so a pending one has to be let in - bounded, never a halt.
+        let deadline = arch::timer_now_ns() + 50_000_000; // 50 ms
+        while arch::msi_irq_count() == before && arch::timer_now_ns() < deadline {
+            arch::irq_window();
+        }
+        let ok = arch::msi_irq_count() > before;
+        ch.irq.store(ok, Ordering::Relaxed);
+        ch.irq_probed.store(true, Ordering::Relaxed);
+        if !ok {
+            crate::println!(
+                "nvme: cpu {} armed MSI-X but saw no completion interrupt - polling",
+                crate::smp::cpu_index()
+            );
+        }
     }
 
     /// Check what a transfer in either direction must satisfy, and return this
@@ -705,6 +784,61 @@ impl BlockDevice for Nvme {
     }
 }
 
+/// Program MSI-X table entry 0 to raise this CPU's completion vector, and enable
+/// MSI-X on the function. Returns whether it is armed.
+///
+/// The table lives in a BAR the capability names (its Table Offset/BIR dword: the
+/// low three bits select the BAR, the rest is a byte offset into it), which is why
+/// this needs the BAR mapped and cannot ride the config-space tunnel virtio uses.
+/// Every step is checked rather than assumed - an unmapped BAR, a BIR pointing at
+/// a BAR that was never assigned, or an ISA with no MSI target each return `false`
+/// and leave the driver polling.
+fn setup_msix(
+    inv: &super::Inventory,
+    dev: &PciDevice,
+    regs: usize,
+    slot: usize,
+    dest_hw_id: u32,
+) -> bool {
+    if !dev.msix || dev.msix_cap == 0 {
+        return false;
+    }
+    let Some((addr, data)) = arch::msi_target(dest_hw_id, slot) else {
+        return false;
+    };
+    let cap = dev.msix_cap;
+    let tbl = arch::pci_cfg_read32(inv.ecam_base, dev.bus, dev.dev, dev.func, cap + 4);
+    let bir = (tbl & 0x7) as usize;
+    let off = (tbl & !0x7) as usize;
+    let bar = dev.bars[bir.min(5)];
+    if bir > 5 || bar.base == 0 || bar.size == 0 {
+        crate::println!("nvme: MSI-X table is in BAR{bir}, which is not assigned - polling");
+        return false;
+    }
+    // BAR0 is already mapped by the caller; any other BAR gets its own window.
+    let base = if bir == 0 {
+        regs
+    } else {
+        arch::mmio_map_window(bar.base as usize, bar.size as usize)
+    };
+    let entry = base + off + slot * 16; // 16-byte MSI-X table entries
+    // SAFETY: `entry` is inside the mapped BAR window (offset and size both come
+    // from the device's own capability and BAR), and a table entry is 16 bytes.
+    unsafe {
+        core::ptr::write_volatile(entry as *mut u32, addr as u32);
+        core::ptr::write_volatile((entry + 4) as *mut u32, (addr >> 32) as u32);
+        core::ptr::write_volatile((entry + 8) as *mut u32, data);
+        core::ptr::write_volatile((entry + 12) as *mut u32, 0); // unmask this vector
+    }
+    // Message Control is the capability's upper 16 bits: bit 15 enables MSI-X,
+    // bit 14 is the function-wide mask, which must be clear. Idempotent, so
+    // programming a second entry does not disturb the first.
+    let ctrl = arch::pci_cfg_read32(inv.ecam_base, dev.bus, dev.dev, dev.func, cap);
+    let ctrl = (ctrl & !(1 << 30)) | (1 << 31);
+    arch::pci_cfg_write32(inv.ecam_base, dev.bus, dev.dev, dev.func, cap, ctrl);
+    true
+}
+
 /// Find, bring up and return the machine's first NVMe controller, or `None` with
 /// a printed reason.
 ///
@@ -752,6 +886,7 @@ pub fn probe() -> Option<Nvme> {
         stride: 4,
         nlba: 0,
         lba_bytes: 0,
+        armed: false,
         admin: SpinLock::new(admin),
         io: [const { None }; MAX_IOQ],
         nio: 0,
@@ -845,6 +980,22 @@ pub fn probe() -> Option<Nvme> {
 
     frames::free(ident_pa as usize);
 
+    // **MSI-X**, if this ISA can name an MSI target. Programmed before the I/O
+    // queues, because a completion queue names its interrupt vector at creation.
+    //
+    // `armed` is "the hardware is configured to raise a vector"; a channel's `irq`
+    // is "this core has *seen* one and will halt for the next". They are separate
+    // and the second is set only by observation, on first use, per channel: the
+    // probe read goes through the same reap loop, so a driver that already believed
+    // in the interrupt would halt inside the very check meant to discover it must
+    // not - and a channel is verified by the core that owns it, because a queue
+    // interrupts its own core and one channel working says nothing about another.
+    let armed = (0..granted).all(|i| {
+        // Queue `i` belongs to CPU `i`, so its vector must be delivered *there*.
+        let hw = crate::smp::cpu(i).hw_id();
+        setup_msix(inv, dev, regs, i, hw)
+    });
+
     // One queue pair per granted slot, CPU `i` owning queue id `i + 1`.
     for i in 0..granted {
         let q = Queue::alloc()?;
@@ -864,7 +1015,11 @@ pub fn probe() -> Option<Nvme> {
             prp1_lo: q.cq_pa as u32,
             prp1_hi: (q.cq_pa >> 32) as u32,
             cdw10: ((QDEPTH as u32 - 1) << 16) | qid,
-            cdw11: 1, // physically contiguous, interrupts disabled (polled)
+            // Bit 0 physically contiguous, bit 1 interrupts enabled, [31:16] the
+            // MSI-X vector. Every I/O queue reports to vector 0: a completion on
+            // any of them means "look at your own queue", which is all a waiting
+            // core needs, and one vector needs one table entry.
+            cdw11: if armed { 0b11 } else { 1 },
             ..Default::default()
         };
         if c.submit_on(0, &c.admin, sqe) != Some(0) {
@@ -885,21 +1040,30 @@ pub fn probe() -> Option<Nvme> {
         }
         c.io[i] = Some(Chan {
             q: SpinLock::new(q),
+            irq: core::sync::atomic::AtomicBool::new(false),
+            irq_probed: core::sync::atomic::AtomicBool::new(false),
             bounce_va,
             bounce_pa,
         });
     }
     c.nio = granted;
+    c.armed = armed;
 
     crate::println!(
         "nvme: {:04x}:{:04x} up - {} blocks of {} bytes, doorbell stride {}, \
-         {granted} I/O queue pair(s) (one per possible CPU, {} enumerated)",
+         {granted} I/O queue pair(s) (one per possible CPU, {} enumerated), \
+         completions {}",
         dev.vendor,
         dev.device,
         c.nlba,
         c.lba_bytes,
         c.stride,
-        super::inventory().ncpus
+        super::inventory().ncpus,
+        if c.armed {
+            "by MSI-X interrupt (verified per core on first use)"
+        } else {
+            "polled (no MSI target on this ISA)"
+        }
     );
     Some(c)
 }

@@ -201,9 +201,22 @@ bytes streamed - because that is the claim being made about the seam; plus a
 **write round trip** (last sector, fresh handle so the cache cannot answer it,
 pattern written and read back, then the original restored and read back, so the
 device must return two different things for one sector in order) on a drive
-attached `snapshot=on` so the committed fixture is untouched. Honest: polled, no MSI-X and no
-completion interrupt (so a waiting core spins rather than parking through
-`idle`/`ktimer` as every other wait does), no IOMMU-contained storage cell, and
+attached `snapshot=on` so the committed fixture is untouched. **Completions raise an interrupt** on x86-64 (MSI-X, one vector per queue delivered
+to that queue's own core), so a waiting core halts instead of spinning - 31
+interrupts and ~30 halts per run; ARM64 needs a GICv3 ITS and RISC-V an IMSIC
+target, so both poll **and say so**, with the test asserting the two can never
+disagree. The path is **verified by observation** before use, because a claimed
+interrupt that never arrives is a hang rather than a slow path (the reap loop halts
+and so never reaches its deadline - masking the table entry turned a passing test
+into a 120 s timeout); the verification itself must not be able to halt either, so
+`arch::irq_window` opens a one-instruction window rather than using `idle_wait`; and
+each channel is verified **by the core that owns it** against **that CPU's** counter,
+since a global one would let a busy sibling answer the question. A per-core queue
+needs a per-core interrupt: with every MSI aimed at the boot CPU a secondary halted
+while the primary took its vector, caught by the `smp` two-core phase. Honest: one
+core in the four-core run reports `cpu 2 armed MSI-X but saw no completion interrupt
+- polling` and polls, which is the mechanism working rather than a test hiding a
+failure. Also honest: no IOMMU-contained storage cell, and
 transfers bounce through page-aligned frames one page per command so `PRP1`
 addresses every command and no PRP list is built.
 

@@ -1476,3 +1476,34 @@ pub fn exit(code: super::ExitCode) -> ! {
         unsafe { asm!("wfe") };
     }
 }
+
+// ------------------------------------------------------ MSI-X (NVMe completions)
+
+/// Where a PCIe device should write, and what, to raise a completion interrupt.
+///
+/// **`None` here**, so a caller polls and reports that it is polling rather than
+/// programming a device to write to nowhere. What is missing is not a constant but
+/// a driver: this ISA needs a GICv3 ITS (device table, ITT, MAPD/MAPTI commands),
+/// where x86-64's MSI is just a write to the local-APIC message region. Named in
+/// docs/SUBSTRATE.md S5 as the remaining work rather than papered over.
+pub fn msi_target(_dest_hw_id: u32, _slot: usize) -> Option<(u64, u32)> {
+    None
+}
+
+/// Completion interrupts taken - always 0 while [`msi_target`] returns `None`.
+pub fn msi_irq_count() -> u64 {
+    0
+}
+
+/// Let any pending interrupt be delivered, then mask again - bounded by
+/// construction, unlike [`idle_wait`]. See the x86-64 twin for why a probe of an
+/// interrupt path must not be able to halt.
+pub fn irq_window() {
+    // SAFETY: kernel context; unmask IRQ for one instruction, then mask again.
+    unsafe {
+        asm!(
+            "msr daifclr, #2; nop; msr daifset, #2",
+            options(nomem, nostack)
+        )
+    };
+}

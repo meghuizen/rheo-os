@@ -120,6 +120,10 @@ pub struct PciDevice {
     /// Capabilities found on the standard capability list.
     pub msi: bool,
     pub msix: bool,
+    /// Config-space offset of the MSI-X capability (0 when absent). A driver
+    /// wiring an interrupt needs the capability itself, not just the fact that
+    /// there is one: the table's BAR and offset live in its next two dwords.
+    pub msix_cap: u16,
     /// PCIe capability present; `flr` is its DevCap FLR bit.
     pub pcie: bool,
     pub flr: bool,
@@ -212,6 +216,7 @@ impl Inventory {
                 bars: [PciBar::EMPTY; 6],
                 msi: false,
                 msix: false,
+                msix_cap: 0,
                 pcie: false,
                 flr: false,
             }; MAX_PCI_DEVICES],

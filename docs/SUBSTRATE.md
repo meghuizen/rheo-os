@@ -1080,12 +1080,45 @@ kernel.
   path below will do. The second draft was reverted rather than kept, since it was
   more code for a property it did not yet have.
 
-  **Not done:** no MSI-X and no interrupt - completions are polled, so a waiting
-  core spins rather than parking through `idle`/`ktimer` as every other wait in
-  this kernel does; and no IOMMU-contained storage *cell*. Transfers bounce
-  through page-aligned frames one page per command, so `PRP1` addresses every
-  command and no PRP list is built - correct, and the simple form on purpose,
-  since a PRP list buys throughput TCG cannot show.
+  **And completions raise an interrupt.** Every other wait in this kernel parks;
+  this one could not, because a polled completion has no wake source. With MSI-X
+  programmed there is one, and a waiting core halts instead of burning the
+  microseconds a command takes - measured, 31 interrupts and 29-33 halts per run.
+  x86-64 only for now: an MSI there is just a write to the local-APIC message
+  region, while ARM64 needs a GICv3 ITS and RISC-V an IMSIC target, both real
+  drivers. The other two poll **and say so**, and the test asserts the two can
+  never disagree - halts with no interrupts, or interrupts with no halts, both
+  fail.
+
+  Three things this cost, each found by a control rather than by reasoning:
+
+  - **A claimed interrupt that does not arrive is a hang, not a slow path.** The
+    reap loop halts, so it never reaches its own deadline check. Masking the table
+    entry turned a passing test into a 120-second timeout with no diagnostic. So
+    the path is *verified by observation* before it is used - the probe-verify-
+    fall-back pattern the LAPIC, the UART line and the PSCI conduit already use.
+  - **The probe must not be able to halt either.** A first version spun waiting
+    for the counter to move, with interrupts masked as the kernel always runs, so
+    the vector could never be delivered and a working path reported itself
+    broken. `arch::irq_window` opens a one-instruction window instead - bounded by
+    construction, unlike `idle_wait`.
+  - **A per-core queue needs a per-core interrupt.** With every queue's MSI aimed
+    at the boot CPU, a secondary halted while the primary took its vector; the
+    `smp` two-core phase caught it as a secondary that never finished. Each queue
+    now has its own vector delivered to its own core, and each channel is verified
+    **by the core that owns it**, against **that CPU's** interrupt count - a global
+    counter would let a busy sibling answer the question, which is a check passing
+    for the wrong reason.
+
+  Honest about the result on secondaries: one core in the four-core run reports
+  `cpu 2 armed MSI-X but saw no completion interrupt - polling`, and polls. That
+  is the mechanism working as designed rather than a passing test hiding a
+  failure, and the remaining work is naming why that core's APIC did not receive.
+
+  **Not done:** no IOMMU-contained storage *cell*, and MSI-X on the two non-x86
+  ISAs. Transfers bounce through page-aligned frames one page per command, so
+  `PRP1` addresses every command and no PRP list is built - correct, and the
+  simple form on purpose, since a PRP list buys throughput TCG cannot show.
 - **S6 - NUMA pools + core classes.** Placement proven in QEMU
   (chosen-node assertions), P/E and latency measured at the lab.
 - **S7 - workload gates.** Real Node.js already runs to completion

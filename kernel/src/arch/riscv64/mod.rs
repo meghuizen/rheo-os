@@ -1208,3 +1208,35 @@ pub fn exit(code: super::ExitCode) -> ! {
         unsafe { asm!("wfi") };
     }
 }
+
+// ------------------------------------------------------ MSI-X (NVMe completions)
+
+/// Where a PCIe device should write, and what, to raise a completion interrupt.
+///
+/// **`None` here**, so a caller polls and reports that it is polling rather than
+/// programming a device to write to nowhere. What is missing is not a constant but
+/// a driver: this ISA needs a IMSIC MSI target address for this hart's S-file,
+/// where x86-64's MSI is just a write to the local-APIC message region. Named in
+/// docs/SUBSTRATE.md S5 as the remaining work rather than papered over.
+pub fn msi_target(_dest_hw_id: u32, _slot: usize) -> Option<(u64, u32)> {
+    None
+}
+
+/// Completion interrupts taken - always 0 while [`msi_target`] returns `None`.
+pub fn msi_irq_count() -> u64 {
+    0
+}
+
+/// Let any pending interrupt be delivered, then mask again - bounded by
+/// construction, unlike [`idle_wait`]. See the x86-64 twin for why a probe of an
+/// interrupt path must not be able to halt.
+pub fn irq_window() {
+    // SAFETY: kernel context; set then clear sstatus.SIE, so a pending S-mode
+    // interrupt is taken in between.
+    unsafe {
+        asm!(
+            "csrsi sstatus, 2; nop; csrci sstatus, 2",
+            options(nomem, nostack)
+        );
+    }
+}

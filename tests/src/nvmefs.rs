@@ -206,6 +206,40 @@ extern "C" fn kernel_main() -> ! {
         nvme::out_of_order()
     );
 
+    // --- how the wait ends ---------------------------------------------------
+    //
+    // Every other wait in this kernel parks rather than spinning
+    // (docs/ARCHITECTURE-DEBT.md 2.4); this one could not, because a polled
+    // completion has no wake source. With MSI-X programmed there is one.
+    //
+    // Reported per ISA rather than asserted uniformly, because only x86-64 has an
+    // MSI target today: ARM64 needs a GICv3 ITS and RISC-V an IMSIC target, both
+    // real drivers. What *is* asserted is that the two never disagree - a driver
+    // claiming an interrupt path must have taken interrupts, and one that halted
+    // must have had somewhere to be woken from.
+    let irqs = nvme::irq_count();
+    let parks = nvme::irq_parks();
+    if parks > 0 {
+        assert!(
+            irqs > 0,
+            "nvmefs: {parks} halt(s) waiting for a completion but 0 interrupts taken - \
+             the wait had no wake source and only the deadline ended it"
+        );
+        println!(
+            "nvmefs: completions are INTERRUPT-DRIVEN - {irqs} MSI-X interrupt(s) taken, \
+             {parks} halt(s) instead of spinning"
+        );
+    } else {
+        assert!(
+            irqs == 0,
+            "nvmefs: {irqs} interrupt(s) taken but the wait never halted"
+        );
+        println!(
+            "nvmefs: completions are POLLED on this ISA (no MSI target - ARM64 needs a \
+             GICv3 ITS, RISC-V an IMSIC target); the wait spins and says so"
+        );
+    }
+
     println!("nvmefs: PASS");
     arch::exit(arch::ExitCode::Success)
 }
