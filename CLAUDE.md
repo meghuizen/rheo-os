@@ -775,7 +775,8 @@ handler, seal immutable, mmap a VFS file, and a real unmap that fixes the anon-
 exposed** (Phase J: x86-64 q35 via the ACPI NFIT + a separate pmem allocator,
 distinct from the DDR pool; arm/riscv `virt` expose no nvdimm so PMEM
 skips-with-reason to DDR - docs/MEMORY.md 2.1), HBM/CXL/Remote emulated-as-DDR,
-device-BAR refused, NUMA single-node - all honest/documented, per-cell grant
+device-BAR refused, and the **NUMA node hint now real** (see the NUMA paragraph
+below) - all honest/documented, per-cell grant
 tables as fixed statics, every commit/decommit/seal grant-checked), and **real
 async I/O opcodes
 over the queue** (`OP_OPEN`/`READ`/`WRITE`/`CLOSE`/`FSTAT` bridged to
@@ -2104,6 +2105,54 @@ structure is proven ahead of the parallelism that pays for it; the inner loops a
 scalar (they are the oracle a `tile::simd` vector path is checked against); forward
 only (no backward pass, causal mask or dropout); f32 only.
 
+**Frames are NUMA-placed** (docs/SUBSTRATE.md pillar 6 / S6', the `numa` kernel).
+The pieces were all present and disconnected: the Inventory recorded which node each
+memory region belongs to, `SYS_GRANT`'s fourth argument carried a node hint librheo's
+`mem::reserve_on` has always sent, and the allocator served everything from one
+rotating search over one pool - the hint's own comment said "recorded but single-node
+in QEMU", two claims of which only the second was true, and the second stopped being
+true the moment QEMU was asked for two nodes. `mm::frames::init_numa` (called from the
+boot sequencer **after** `hw::detect`, since the pool comes up inside `arch::init`
+before any firmware table is read) learns which pool *frame indices* sit on which node
+- a range per node, not a per-frame id, because the pool is one contiguous span and
+the firmware map is already split at node boundaries, so each node's share is
+contiguous by construction - and `alloc_on(node)` searches it. `alloc` is untouched,
+so every pre-NUMA caller is unchanged and `NODE_ANY` routes straight to it. A
+**preference, not a guarantee**: a full node falls back to the pool at large and
+`numa_fallbacks()` counts it, because refusing would turn a bandwidth question into an
+out-of-memory one (ARCHITECTURE.md 5 has no OOM killer) while a silent misplacement is
+a bandwidth cliff the caller thinks it avoided; `NODE_ANY` is not counted, since
+nothing was asked for. The `numa` test asserts against an oracle it cannot reach - the
+boundary is the first 512 MiB of RAM because that is how the *test* launched QEMU, and
+RAM base comes from the one documented relationship (the pool sits 64 MiB into RAM on
+every ISA) - so every check compares a PA against that, never against the ranges the
+allocator built: the two ranges **partition** the pool (a gap is frames no node can
+reach, an overlap frames two nodes both claim, and neither shows up in a successful
+allocation), 64 frames land on each node with **zero** fallbacks, and a run-dry node
+degrades to its peer with the loss counted exactly once at `node_free`'s exact
+run-dry point. Proven on x86-64 (2 nodes from the ACPI **SRAT**, boundary
+`0x2000_0000`) and riscv64 (2 nodes from the **device tree**, `0xa000_0000`), each
+running node 1 dry after its 16,320 free frames, with the placement assertion observed
+failing when `alloc_on` is reverted to `alloc`. **ARM64 skips with a measured
+reason**: QEMU hands a bare-ELF `-kernel` boot no device-tree pointer in `x0` on
+`virt`, so nothing describes memory nodes - checked, not assumed, since `-dtb`
+explicitly does not reach it either - and the single-node path is asserted *unchanged*
+so "NUMA landed" never quietly alters a machine that has none. Two hazards that only
+exist once placement is real are handled and **not** reachable on QEMU's contiguous
+layout, which is why they are written down rather than left to a proof that cannot see
+them: `librheo`'s `Grant::reserve` passed node `0`, harmless while the hint was dropped
+and now "pin every default grant to node 0" (it passes `NODE_ANY`); and widening a
+node's range across the regions mentioning it is only sound while its slices are
+contiguous, so an interleaved machine (node 0, node 1, node 0) would give node 0 a range
+swallowing node 1's - `alloc_on(0)` serving node 1's frames while reporting no fallback,
+a wrong answer that looks right - which is now detected and answered by knowing
+*nothing* (ranges cleared, `alloc_on` degenerating to `alloc`, reason printed) rather
+than something false. Honest: vcore placement
+does **not** follow memory yet, kernel metadata slabs are not per-node, the pmem pool
+has no node of its own, and the cell-facing path is proven at the **kernel seam**
+rather than from inside a cell (a cell cannot see a physical address). Latency is
+unmeasurable here regardless - QEMU models the topology, not its costs.
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
 proofs, and the hardware-lab performance numbers.
@@ -2237,6 +2286,10 @@ kernel/       the no_std kernel library + boot demo bin
               resolution, so every lazy-mapping feature is one change here rather than a
               ~98-site audit - docs/LINUX-COMPAT.md), time (clock), rng (ChaCha20 DRBG +
               hwrng seeding), event streams,
+              (frames carries the per-frame refcount COW needs **and** the
+              per-NUMA-node frame ranges `alloc_on` places against -
+              docs/SUBSTRATE.md pillar 6), time (clock), rng (ChaCha20 DRBG +
+              hwrng seeding), event streams,
               sched (reservations + the **system-wide admission ledger**:
               a reservation must fit its cell AND the machine -
               docs/ARCHITECTURE-DEBT.md 2.5; plus bore/vcore - the BORE burst
@@ -2294,7 +2347,14 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               queue region / a kernel VA / the .user window / the channel + grant
               regions - each refused, ring still serving; plus a control per
               finding so the bound is not a break),
-              resources, pmem (Phase J: a MemKind::Pmem grant
+              resources, numa (docs/SUBSTRATE.md pillar 6: node-affine frame
+              allocation - QEMU launched with two 512 MiB memory nodes, the pool
+              asserted partitioned between them at exactly the boundary the launch
+              named, 64 frames placed on each node with zero fallbacks, and a
+              run-dry node degrading to its peer with the loss counted; x86-64 via
+              the ACPI SRAT and riscv64 via the device tree, ARM64 skipping with a
+              measured reason - a bare-ELF boot gets no device tree, -dtb included),
+              pmem (Phase J: a MemKind::Pmem grant
               backed by a real QEMU nvdimm - x86-64 via the ACPI NFIT; arm/riscv
               skip-with-reason - docs/MEMORY.md 2.1), smp (per-CPU state + kernel spinlock +
               a real secondary core on all three ISAs: SBI HSM on riscv64,

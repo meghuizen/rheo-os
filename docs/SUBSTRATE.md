@@ -514,6 +514,83 @@ scheduled with this pillar (see the Node/Bun walkthrough, section 12).
 - QEMU models NUMA topology but not its latencies; placement is proven in
   QEMU (the right node is *chosen*), the win is measured at the lab.
 
+**Landed: node-affine frame allocation, and the hint stopped being a lie.**
+The pieces were all present and disconnected. The Inventory recorded which node
+each memory region belongs to; `SYS_GRANT`'s fourth argument carried a node hint
+that librheo's `mem::reserve_on` has always sent; and the allocator served every
+request from one rotating search over one pool. The hint's own comment said
+"recorded but single-node in QEMU" - two claims, and only the second was true.
+The second stopped being true the moment QEMU was asked for two nodes.
+
+`mm::frames` now learns, at boot, which **pool frame indices** sit on which node
+(`init_numa`, called from the boot sequencer *after* `hw::detect()` - the pool is
+brought up inside `arch::init()`, before any firmware table has been read, so the
+question is unanswerable at pool init). A range per node rather than a per-frame
+node id, because the pool is one contiguous physical span and the firmware's map
+is already split at node boundaries, so each node's share is contiguous by
+construction: sixteen pairs of `usize` instead of a 128 KiB side table.
+`alloc_on(node)` searches that range; `alloc` is untouched, so every pre-NUMA
+caller is unchanged, and `NODE_ANY` routes straight to it.
+
+A **preference, not a guarantee**, and the difference is counted. A full node
+falls back to the pool at large and `numa_fallbacks()` records it: refusing
+instead would turn a bandwidth question into an out-of-memory one, and
+ARCHITECTURE.md 5 has no OOM killer to appeal to - but a node-affine allocation
+that quietly lands elsewhere is a placement the caller believes it made and did
+not, which on real hardware is a silent bandwidth cliff rather than an error. So
+the degradation is reported, the treatment `net_rx`'s poll tiers and `input`'s
+interrupt recoveries already get. `NODE_ANY` is *not* counted: nothing was asked
+for, so nothing was missed.
+
+The `numa` test kernel proves it against an oracle it cannot reach. QEMU is
+launched with two 512 MiB nodes, so the boundary is the first 512 MiB of RAM - a
+number the test knows because it is how the test launched QEMU, and RAM base
+comes from the one documented relationship in `mm/frames.rs` (the pool sits
+64 MiB into RAM on every ISA). Every assertion compares a physical address
+against that, never against the ranges the allocator built for itself. Asserted:
+the two ranges **partition** the pool (adjacent, starting at the base, covering
+all of it - a gap would be frames no node can reach, an overlap frames two nodes
+both claim, and neither is visible from a single successful allocation); the
+derived boundary is the oracle's; 64 frames land on each node with **zero**
+fallbacks; a run-dry node degrades to its peer with the loss counted exactly once
+(the run-dry point is `node_free`'s exact count, not "eventually"); and the used
+counter still agrees with the bitmap afterwards. Observed on x86-64 (2 nodes from
+the ACPI **SRAT**, boundary `0x2000_0000`) and riscv64 (2 nodes from the **device
+tree**, `0xa000_0000`), each running node 1 dry after its 16,320 free frames. The
+placement assertion was observed failing - "asked node 1, got 0x84020000 which is
+below the 0xa0000000 boundary" - with `alloc_on` reverted to `alloc`.
+
+**ARM64 skips with a measured reason.** QEMU hands a bare-ELF `-kernel` boot no
+device-tree pointer in `x0` on `virt`, so no firmware source describes memory at
+all and the built-in profile reports one node. That was checked rather than
+assumed: passing `-dtb` explicitly does not reach `x0` either. The single-node
+path is asserted *unchanged* instead - every range empty, `alloc_on`
+degenerating to `alloc`, no fallback counted - so "NUMA landed" never quietly
+alters a machine that has none.
+
+Two things had to be got right that only exist once placement is real. **A default
+must not be a decision**: `librheo`'s `Grant::reserve` passed node `0`, which was
+harmless while the kernel dropped the hint and would now pin every default grant to
+node 0 - a cell that never asked for a node, never falling back until node 0 was
+full. It passes `NODE_ANY` now. And **widening a node's range is only sound while
+its slices are contiguous**: `init_numa` builds each node's range by widening across
+the regions that mention it, so a machine interleaving nodes inside one span (node 0,
+node 1, node 0) would give node 0 a range that swallows node 1's - `alloc_on(0)`
+handing out node 1's frames while reporting no fallback, a wrong answer that looks
+like a right one. It is detected and the response is to know nothing rather than
+something false: every range cleared, `alloc_on` degenerating to `alloc`, the reason
+printed. Neither is reachable on QEMU's contiguous two-node layout, which is exactly
+why they are worth writing down - the proof cannot catch them.
+
+**Not yet, and named:** vcore placement does not follow memory (pillar 3's queue
+is per-CPU but knows nothing of a cell's dominant grant node); kernel metadata
+slabs are not per-node; the cell-facing path is proven **at the kernel seam**
+rather than from inside a cell - a cell cannot see a physical address, so
+asserting placement from userspace needs the kernel to walk the cell's page
+tables and report back, which is a harness rather than a stronger claim about the
+mechanism; and the pmem pool has no node of its own. Latency is unmeasurable
+here in any case: QEMU models the topology, not its costs.
+
 ---
 
 ## 9. Pillar 7 - a real metrics and timer pipeline; interrupts are optional by law
@@ -1250,10 +1327,20 @@ kernel.
   simple form on purpose, since a PRP list buys throughput TCG cannot show.
 - **S6 - NUMA pools + core classes.** Placement proven in QEMU
   (chosen-node assertions), P/E and latency measured at the lab.
-- **S7 - workload gates.** Real Node.js already runs to completion
-  (`--jitless`, GOAL-NODE) and real Bun already loads (GOAL-BUN), so the
-  S7 gates move up a rung: Bun evaluating at full JIT speed via the
-  dual-map path, Claude Code startup, a TLS echo server across vcores
+
+  **Landed: node-affine frame allocation** (`frames::alloc_on` + `init_numa`,
+  section 8) with the `SYS_GRANT` node hint reaching the allocator instead of
+  being dropped, proven by the `numa` kernel on x86-64 (ACPI SRAT) and riscv64
+  (device tree) against a boundary oracle taken from the QEMU launch, and
+  skipping with a measured reason on ARM64 (a bare-ELF boot gets no device
+  tree - `-dtb` was tried). **Not yet:** vcore placement following a cell's
+  dominant grant node, per-node kernel slabs, and core classes (P/E), which
+  QEMU cannot model at all.
+- **S7 - workload gates.** Real Node.js already runs to completion with its
+  JIT enabled (GOAL-NODE), real Bun evaluates JavaScript and exits 0
+  (GOAL-BUN), and the real Claude Code binary prints its version and exits 0
+  (GOAL-CLAUDE), so the
+  S7 gates move up a rung: a TLS echo server across vcores
   with jitter histograms, a Kafka-shaped append-log bench on one NVMe
   queue, an OCI bundle running a Node workload under a `PrincipalId`, the
   `flashattn` tile phase - all as gates, none as design inputs.

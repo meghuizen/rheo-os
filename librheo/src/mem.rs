@@ -99,6 +99,14 @@ pub(crate) unsafe fn init_heap() {
 
 use crate::sys;
 
+/// "No NUMA preference" for [`Grant::reserve_on`] (docs/SUBSTRATE.md pillar 6).
+///
+/// Any node number the machine does not have means the same thing, which is what
+/// makes this safe to pass unconditionally: a cell does not choose the machine it
+/// was placed on, so asking for a node that is not there is a hint that cannot be
+/// honoured rather than an error the cell made.
+pub const NODE_ANY: u32 = u32::MAX;
+
 /// The typed kind of memory a grant is backed by (docs/MEMORY.md 2.1). Mirrors
 /// the kernel's `mm::grant::MemKind`.
 ///
@@ -141,12 +149,18 @@ pub struct Grant {
 impl Grant {
     /// Reserve `len` bytes of grant address space of `kind` (no frames yet -
     /// demand commit). `None` if the kernel refuses (bad kind / table full).
-    /// The `node` NUMA hint is recorded but single-node in QEMU (honest).
+    ///
+    /// `node` is a **NUMA placement preference** for the frames a later commit
+    /// allocates, or [`NODE_ANY`] for none (docs/SUBSTRATE.md pillar 6). A
+    /// preference, not a guarantee: a full node is served from elsewhere and the
+    /// kernel counts the miss rather than failing the commit. A node this machine
+    /// does not have is treated as no preference - the node count is a property of
+    /// wherever the cell was placed, which the cell did not choose.
     pub fn reserve_on(kind: MemKind, len: usize, node: u32) -> Option<Grant> {
         let mut info = sys::GrantInfo { base: 0, cap_id: 0 };
         let out = &mut info as *mut sys::GrantInfo as u64;
-        // `flags` low bits carry the NUMA node hint (ignored by the kernel today,
-        // single-node; documented). See docs/LIBRHEO.md Phase B.
+        // `SYS_GRANT`'s fourth argument is the NUMA node hint, honoured by the
+        // kernel's frame allocator since docs/SUBSTRATE.md pillar 6.
         let r = sys::grant(out, len, kind as u64, node as u64);
         if r != 0 {
             return None;
@@ -159,9 +173,14 @@ impl Grant {
         })
     }
 
-    /// Reserve on the default node.
+    /// Reserve with **no** NUMA preference.
+    ///
+    /// [`NODE_ANY`], not `0`. Passing `0` used to be harmless because the kernel
+    /// dropped the hint, but now that placement is real it would mean "put every
+    /// default grant on node 0" - pinning a cell that never asked for a node, and
+    /// never falling back until node 0 was full. A default must not be a decision.
     pub fn reserve(kind: MemKind, len: usize) -> Option<Grant> {
-        Grant::reserve_on(kind, len, 0)
+        Grant::reserve_on(kind, len, NODE_ANY)
     }
 
     /// Reserve and immediately commit the whole grant (the common working-buffer

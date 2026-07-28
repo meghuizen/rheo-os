@@ -29,6 +29,11 @@ pub fn init() {
     crate::arch::init();
     crate::time::init();
     crate::hw::detect();
+    // Learn which pool frames sit on which NUMA node. Here and not in
+    // `frames::init()`, because the pool is brought up inside `arch::init()` above -
+    // before any firmware table has been read, so the question is unanswerable there
+    // (docs/SUBSTRATE.md pillar 6).
+    crate::mm::frames::init_numa(crate::hw::inventory());
     crate::rng::init();
     crate::svc::init();
     // Pre-fund every cell's recorded address-space layout, so the frames its table

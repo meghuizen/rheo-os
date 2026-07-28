@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 65] = [
+const TEST_KERNELS: [&str; 66] = [
     "kernel",
     "substrate",
     "cap-invariants",
@@ -30,6 +30,7 @@ const TEST_KERNELS: [&str; 65] = [
     "security",
     "resources",
     "pmem",
+    "numa",
     "smp",
     "shell-smoke",
     "hwinfo",
@@ -565,6 +566,24 @@ fn fixed_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "memory-backend-file,id=pm0,share=on,mem-path=target/pmem.img,size=16M,pmem=on",
             "-device",
             "nvdimm,memdev=pm0,id=nv0",
+        ],
+        // numa (docs/SUBSTRATE.md pillar 6): two 512 MiB memory nodes, so the frame
+        // pool - which sits 64 MiB into RAM and is 512 MiB long - genuinely straddles
+        // the boundary and each node owns a real share of it. The **same args on
+        // every ISA**, deliberately: what differs is what each ISA's firmware path
+        // then reports (SRAT on x86-64, the device tree on riscv64, nothing at all on
+        // a bare-ELF arm boot), and holding the launch identical is what makes that
+        // difference the ISA's rather than the test's. CPU affinity is left
+        // unassigned - the claim is about memory placement.
+        ("numa", _) => &[
+            "-object",
+            "memory-backend-ram,id=m0,size=512M",
+            "-numa",
+            "node,nodeid=0,memdev=m0",
+            "-object",
+            "memory-backend-ram,id=m1,size=512M",
+            "-numa",
+            "node,nodeid=1,memdev=m1",
         ],
         _ => &[],
     }

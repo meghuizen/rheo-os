@@ -409,10 +409,16 @@ struct GrantSlot {
     /// `mm::grant::MemKind` discriminant (0=DDR..5=Remote), validated and
     /// recorded at `SYS_GRANT`. Only DDR is real in QEMU; HBM/CXL/PMEM/Remote
     /// are backed by DDR frames (emulated, honest); DeviceBar has no backing and
-    /// is refused. Recorded for future NUMA/placement differentiation; the
-    /// commit path treats every backed kind as DDR today.
+    /// is refused. The typed *kind* selects the physical pool (`Backing`); the
+    /// *node* below selects which part of the DDR pool.
     #[allow(dead_code)]
     kind: u8,
+    /// The NUMA node the cell asked its frames to come from, or
+    /// [`frames::NODE_ANY`] (docs/SUBSTRATE.md pillar 6). Read from `SYS_GRANT`'s
+    /// fourth argument, which librheo's `mem::reserve_on` has always sent and which
+    /// the kernel used to drop on the floor - documented as "recorded but
+    /// single-node", which was two claims and only the second was true.
+    node: u8,
     sealed: bool,
     cap_id: u32,
 }
@@ -422,6 +428,7 @@ const EMPTY_GRANT: GrantSlot = GrantSlot {
     base: 0,
     len: 0,
     kind: 0,
+    node: frames::NODE_ANY,
     sealed: false,
     cap_id: 0,
 };
@@ -919,7 +926,7 @@ pub fn unmap_range(va: usize, len: usize) -> usize {
 /// charge is trued up - unlike a fresh `mmap`, a reprotect cannot be rolled back
 /// without discarding page contents the cell already had (docs/ENGINEERING.md 12).
 pub fn commit_range(va: usize, len: usize, perm: MapPerm) -> bool {
-    commit_range_from(va, len, perm, Backing::Ddr)
+    commit_range_from(va, len, perm, Backing::Ddr, frames::NODE_ANY)
 }
 
 /// Which physical allocator a commit draws its fresh frames from.
@@ -981,7 +988,13 @@ fn note_backing_fallback(kind: u8, reason: &str) {
 
 /// [`commit_range`] with an explicit backing store - the path a typed memory
 /// grant takes, so `MemKind::Pmem` genuinely lands on the nvdimm pool.
-pub fn commit_range_from(va: usize, len: usize, perm: MapPerm, backing: Backing) -> bool {
+///
+/// `node` is a **NUMA preference** for the fresh frames: the node the grant asked
+/// for, or [`frames::NODE_ANY`]. A preference and not a guarantee - a full node falls
+/// back to the pool at large and the fallback is counted
+/// (`frames::numa_fallbacks`), because refusing would turn a bandwidth question into
+/// an out-of-memory one (docs/SUBSTRATE.md pillar 6).
+pub fn commit_range_from(va: usize, len: usize, perm: MapPerm, backing: Backing, node: u8) -> bool {
     if len == 0 {
         return true;
     }
@@ -1014,8 +1027,13 @@ pub fn commit_range_from(va: usize, len: usize, perm: MapPerm, backing: Backing)
                     // frame is still charged to the cell either way (the budget
                     // is about the cell, not about which pool paid).
                     let got = match backing {
-                        Backing::Pmem => crate::mm::frames_pmem::alloc().or_else(frames::alloc),
-                        Backing::Ddr => frames::alloc(),
+                        // The pmem pool is a single region with no node of its own
+                        // here, so a node preference does not apply to it; its DDR
+                        // fallback honours the preference like any other DDR frame.
+                        Backing::Pmem => {
+                            crate::mm::frames_pmem::alloc().or_else(|| frames::alloc_on(node))
+                        }
+                        Backing::Ddr => frames::alloc_on(node),
                     };
                     match got {
                         Some(pa) => {
@@ -1123,7 +1141,7 @@ fn page_up(x: usize) -> usize {
 /// costs no frames (demand commit); `kind` names the memory type
 /// (`mm::grant::MemKind` discriminant). DeviceBar (4) has no backing here and is
 /// refused; the other non-DDR kinds are emulated on DDR (documented).
-fn grant_create(cur: usize, out_va: u64, len: usize, kind: u64, _flags: u64) -> u64 {
+fn grant_create(cur: usize, out_va: u64, len: usize, kind: u64, node_hint: u64) -> u64 {
     if len == 0 || kind > 5 || kind == 4 {
         return u64::MAX; // empty / unknown kind / device-BAR (no backing)
     }
@@ -1190,6 +1208,16 @@ fn grant_create(cur: usize, out_va: u64, len: usize, kind: u64, _flags: u64) -> 
         base,
         len: bytes,
         kind: kind as u8,
+        // The cell's NUMA preference, clamped to a node the machine actually has.
+        // An out-of-range ask becomes "no preference" rather than a refusal: the
+        // node count is a property of the machine the cell was placed on, which the
+        // cell does not choose, so asking for node 3 on a two-node box is a hint
+        // that cannot be honoured rather than an error the cell made.
+        node: if (node_hint as usize) < frames::nodes_known() {
+            node_hint as u8
+        } else {
+            frames::NODE_ANY
+        },
         sealed: false,
         cap_id,
     };
@@ -1332,11 +1360,11 @@ fn grant_commit(cur: usize, cap_id: u32, offset: usize, len: usize) -> u64 {
     // The grant's typed kind decides the physical pool. Before this, every
     // commit went to DDR and a `Pmem` grant was a silent lie
     // (docs/ARCHITECTURE-DEBT.md 3.6).
-    let kind = cell_grants(cur)
+    let (kind, node) = cell_grants(cur)
         .iter()
         .find(|s| s.in_use && s.cap_id == cap_id)
-        .map(|s| s.kind)
-        .unwrap_or(0);
+        .map(|s| (s.kind, s.node))
+        .unwrap_or((0, frames::NODE_ANY));
     let backing = Backing::from_kind(kind);
     if backing == Backing::Pmem && crate::mm::frames_pmem::region().is_none() {
         note_backing_fallback(kind, "no nvdimm region on this machine");
@@ -1346,7 +1374,7 @@ fn grant_commit(cur: usize, cap_id: u32, offset: usize, len: usize) -> u64 {
     // Mirrors the pre-existing behaviour: the commit result is not reported to
     // the cell by this verb (a partial commit leaves the pages it did map). The
     // return value is consumed to keep that explicit rather than accidental.
-    let _ = commit_range_from(base + offset, len, MapPerm::UserRw, backing);
+    let _ = commit_range_from(base + offset, len, MapPerm::UserRw, backing, node);
     0
 }
 
@@ -1474,6 +1502,10 @@ fn grant_share(cur: usize, cap_id: u32, out_va: u64) -> u64 {
             base: peer_base,
             len: slot.len,
             kind: slot.kind,
+            // The frames are the client's and already placed; the peer only maps
+            // them read-only, so there is nothing here for a node preference to
+            // decide. Carried over as a description of where they are.
+            node: slot.node,
             sealed: true,
             cap_id: peer_cap,
         };

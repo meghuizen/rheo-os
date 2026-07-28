@@ -33,6 +33,32 @@ static mut BITMAP: [u64; POOL_FRAMES / 64] = [0; POOL_FRAMES / 64];
 static mut NEXT_HINT: usize = 0;
 static mut INITIALIZED: bool = false;
 
+/// Which pool frames sit on which NUMA node (docs/SUBSTRATE.md pillar 6).
+///
+/// One `(lo, hi)` frame-index range per node, `lo == hi` meaning "this node holds no
+/// pool frames". A range and not a per-frame node id because the pool is **one
+/// contiguous physical span** and the firmware's memory map is already split at node
+/// boundaries (`hw::Inventory`), so each node's share of the pool is contiguous by
+/// construction - 16 pairs of `usize` instead of a 128 KiB side table.
+///
+/// Empty until [`init_numa`] runs, which is after hardware discovery: the pool is
+/// brought up inside `arch::init()`, long before any firmware table has been read, so
+/// "which node is this frame on" is a question that cannot be answered at pool init.
+/// Until it is answered every allocation is node-agnostic, which is exactly the
+/// pre-NUMA behaviour.
+static mut NODE_RANGE: [(usize, usize); crate::hw::MAX_NUMA_NODES] =
+    [(0, 0); crate::hw::MAX_NUMA_NODES];
+static mut NODES_KNOWN: usize = 0;
+
+/// Allocations that asked for a node and were served from another one.
+///
+/// Counted rather than hidden. A node-affine allocation that quietly lands on the
+/// wrong node is a placement decision the caller believes it made and did not, and on
+/// real hardware that is a silent bandwidth cliff rather than an error - so the
+/// fallback is a *reported* degradation (docs/ENGINEERING.md 1), the same treatment
+/// `net_rx`'s poll tiers and `input`'s interrupt recoveries get.
+static FALLBACKS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 /// The allocator's mutual exclusion (docs/SMP.md 10.2, the SMP-safety audit).
 ///
 /// The bitmap, the reference counts, the used counter and the search hint are **one
@@ -102,6 +128,174 @@ pub fn init() {
     );
     unsafe {
         *core::ptr::addr_of_mut!(INITIALIZED) = true;
+    }
+}
+
+/// Learn which pool frames sit on which NUMA node, from the discovered memory map.
+///
+/// Called by the boot sequencer **after** `hw::detect()` - the pool itself is brought
+/// up inside `arch::init()`, before any firmware table has been read, so this cannot
+/// be folded into [`init`].
+///
+/// With one node (or none reported) every range is left empty and
+/// [`alloc_on`] degenerates to [`alloc`], so a machine without NUMA behaves exactly as
+/// it did before this existed.
+pub fn init_numa(inv: &crate::hw::Inventory) {
+    if inv.nnodes < 2 {
+        return;
+    }
+    let pool_lo = arch::FRAME_POOL_BASE as u64;
+    let pool_hi = pool_lo + (POOL_FRAMES * FRAME_SIZE) as u64;
+    let _g = POOL_LOCK.lock();
+    // SAFETY: the pool lock is held; this runs once at boot on the primary CPU.
+    unsafe {
+        let ranges = &mut *core::ptr::addr_of_mut!(NODE_RANGE);
+        for r in inv.mem[..inv.nmem].iter() {
+            if r.kind != crate::hw::MemKind::Ram || (r.node as usize) >= ranges.len() {
+                continue;
+            }
+            // The pool's slice of this region, as frame indices into the pool.
+            let lo = r.base.max(pool_lo);
+            let hi = (r.base + r.len).min(pool_hi);
+            if lo >= hi {
+                continue;
+            }
+            let flo = ((lo - pool_lo) / FRAME_SIZE as u64) as usize;
+            let fhi = ((hi - pool_lo) / FRAME_SIZE as u64) as usize;
+            // A node can appear in several regions, so widen rather than overwrite.
+            let e = &mut ranges[r.node as usize];
+            if e.0 == e.1 {
+                *e = (flo, fhi);
+            } else {
+                *e = (e.0.min(flo), e.1.max(fhi));
+            }
+        }
+        // Widening is only sound while each node's pool slices are *contiguous*.
+        // A machine that interleaves nodes inside one span - node 0, node 1, node 0
+        // - would give node 0 a widened range that swallows node 1's, so
+        // `alloc_on(0)` could hand out node 1's frames while reporting no fallback:
+        // a wrong answer that looks like a right one, which is the failure mode
+        // docs/ENGINEERING.md 1 exists to stop. Detected rather than assumed away,
+        // and the response is to know nothing rather than to know something false -
+        // every range cleared, so `alloc_on` degenerates to `alloc` exactly as on a
+        // machine with no NUMA at all, with the reason printed.
+        let mut overlap = None;
+        for a in 0..ranges.len() {
+            for b in (a + 1)..ranges.len() {
+                let (x, y) = (ranges[a], ranges[b]);
+                if x.0 < x.1 && y.0 < y.1 && x.0 < y.1 && y.0 < x.1 {
+                    overlap = Some((a, b));
+                }
+            }
+        }
+        if let Some((a, b)) = overlap {
+            *ranges = [(0, 0); crate::hw::MAX_NUMA_NODES];
+            crate::println!(
+                "frames: NUMA nodes {a} and {b} interleave inside the frame pool - \
+                 node-affine allocation disabled (placement would be wrong, not just \
+                 imprecise)"
+            );
+            return;
+        }
+        *core::ptr::addr_of_mut!(NODES_KNOWN) = inv.nnodes;
+    }
+}
+
+/// The pool's frame-index range on `node`, `lo == hi` if it holds none.
+pub fn node_range(node: u8) -> (usize, usize) {
+    let _g = POOL_LOCK.lock();
+    // SAFETY: the pool lock is held.
+    unsafe {
+        let ranges = &*core::ptr::addr_of!(NODE_RANGE);
+        ranges.get(node as usize).copied().unwrap_or((0, 0))
+    }
+}
+
+/// Free pool frames on `node` (`0` if it holds none, or if NUMA is unknown).
+///
+/// The exact oracle a placement proof needs: "how many frames could this node have
+/// given me", so that running it dry is a counted event rather than a guess.
+pub fn node_free(node: u8) -> usize {
+    let (lo, hi) = node_range(node);
+    let _g = POOL_LOCK.lock();
+    // SAFETY: the pool lock is held, so no other core is mid-update.
+    unsafe {
+        let bitmap = &*core::ptr::addr_of!(BITMAP);
+        (lo..hi.min(POOL_FRAMES))
+            .filter(|f| bitmap[f / 64] & (1 << (f % 64)) == 0)
+            .count()
+    }
+}
+
+/// How many NUMA nodes the pool knows about (`0` until [`init_numa`] finds >= 2).
+pub fn nodes_known() -> usize {
+    let _g = POOL_LOCK.lock();
+    // SAFETY: the pool lock is held.
+    unsafe { *core::ptr::addr_of!(NODES_KNOWN) }
+}
+
+/// Allocations that asked for one node and were served from another. See [`FALLBACKS`].
+pub fn numa_fallbacks() -> usize {
+    FALLBACKS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// "No node preference" - what every pre-NUMA caller means, and what a cell that
+/// does not ask gets.
+pub const NODE_ANY: u8 = u8::MAX;
+
+/// Allocate one zeroed frame **on `node`** if that node has a free one, else anywhere.
+///
+/// A preference, not a guarantee, and the difference is counted
+/// ([`numa_fallbacks`]) rather than hidden: refusing instead would turn a bandwidth
+/// question into an out-of-memory one, and ARCHITECTURE.md 5 has no OOM killer to
+/// appeal to. [`alloc`] is left untouched, so every pre-NUMA caller is unchanged.
+///
+/// [`NODE_ANY`], and any node the pool holds no frames on, go straight to [`alloc`]
+/// and are **not** counted as fallbacks: nothing was asked for, so nothing was
+/// missed.
+pub fn alloc_on(node: u8) -> Option<usize> {
+    if node == NODE_ANY {
+        return alloc();
+    }
+    let (lo, hi) = node_range(node);
+    if lo < hi {
+        if let Some(pa) = alloc_in(lo, hi) {
+            return Some(pa);
+        }
+        // The node is known but full. Fall through to the whole pool and say so.
+        FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    alloc()
+}
+
+/// Allocate one zeroed frame from pool frame indices `[lo, hi)`, or `None`.
+///
+/// The body of [`alloc`] with the search bounded. Kept separate from `alloc` (rather
+/// than `alloc` calling it with the full range) so the unrestricted path keeps its
+/// rotating [`NEXT_HINT`]: a bounded search must not move the global hint, or one
+/// node-affine allocation would send every subsequent node-agnostic one hunting
+/// through that node's range first.
+fn alloc_in(lo: usize, hi: usize) -> Option<usize> {
+    let _g = POOL_LOCK.lock();
+    // SAFETY: the pool lock is held, so no other core is mid-update.
+    unsafe {
+        assert!(
+            *core::ptr::addr_of!(INITIALIZED),
+            "frame allocator used before init"
+        );
+        let bitmap = &mut *core::ptr::addr_of_mut!(BITMAP);
+        for frame in lo..hi.min(POOL_FRAMES) {
+            let (word, bit) = (frame / 64, frame % 64);
+            if bitmap[word] & (1 << bit) == 0 {
+                bitmap[word] |= 1 << bit;
+                (*core::ptr::addr_of_mut!(REFS))[frame] = 1;
+                *core::ptr::addr_of_mut!(USED) += 1;
+                let pa = arch::FRAME_POOL_BASE + frame * FRAME_SIZE;
+                core::ptr::write_bytes(arch::phys_to_virt(pa) as *mut u8, 0, FRAME_SIZE);
+                return Some(pa);
+            }
+        }
+        None
     }
 }
 

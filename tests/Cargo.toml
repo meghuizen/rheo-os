@@ -64,6 +64,10 @@ name = "pmem"
 path = "src/pmem.rs"
 
 [[bin]]
+name = "numa"
+path = "src/numa.rs"
+
+[[bin]]
 name = "hwinfo"
 path = "src/hwinfo.rs"
 
