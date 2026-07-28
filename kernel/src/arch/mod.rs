@@ -59,6 +59,23 @@ pub enum MapPerm {
     /// tree had to be updated to add it, which is the point - an exhaustive match is
     /// how the compiler makes a security-relevant addition impossible to miss.
     UserRwx,
+    /// User read + write over **device MMIO** - a mapped BAR window
+    /// (docs/DRIVERS.md 4.1, the `BarWindow` grant).
+    ///
+    /// A distinct variant rather than a flag, for the same reason `UserRwx` is one:
+    /// producing a device mapping requires naming it, and the only place that names it
+    /// is the launcher-side BAR grant. It differs from `UserRw` in the memory
+    /// *attribute*, not the permissions - device registers must not be cached,
+    /// speculated into, or write-combined, because a read of a status register is a
+    /// side-effecting bus transaction rather than a load of a value.
+    ///
+    /// Per ISA: x86-64 sets `PCD|PWT` (PAT entry 3 = UC); ARM64 selects MAIR attr 0
+    /// (Device-nGnRnE, the attribute its own kernel MMIO window uses) and drops the
+    /// inner-shareable hint, which is meaningless for device memory; RISC-V's base Sv39
+    /// PTE carries **no** cacheability bits at all, so the mapping is the same as
+    /// `UserRw` there and the attribute is a property of the physical region instead
+    /// (Svpbmt would add one - not present in QEMU 8.2, and named rather than faked).
+    UserDevice,
 }
 
 /// Why a U-mode context trapped back into the kernel.

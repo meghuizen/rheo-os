@@ -55,6 +55,59 @@ pub fn map_queue(aspace: &mut AddressSpace) -> QueuePair {
     }
 }
 
+/// Base VA of a **device BAR window** mapped into a driver cell (docs/DRIVERS.md 4.1):
+/// 28 GiB, in the gap between the channel region (24 GiB) and grants (32 GiB), free in
+/// every cell root and below every ISA's user ceiling.
+pub const USER_BAR_VA: usize = 0x7_0000_0000;
+
+/// Largest BAR window a cell may be given here: 4 MiB.
+///
+/// Not a design ceiling - it is what the proof needs and what a bounded fixed window can
+/// hold without moving its neighbours. NVMe's BAR0 register file is 16 KiB; a GPU
+/// framebuffer aperture is orders larger and would want the region allocator
+/// (docs/SUBSTRATE.md pillar 2) rather than a bigger constant.
+pub const USER_BAR_MAX: usize = 4 * 1024 * 1024;
+const _: () = assert!(USER_BAR_VA + USER_BAR_MAX < 0x8_0000_0000);
+
+/// Map a device **BAR window** into `aspace` as uncached device memory, returning the
+/// cell VA and byte length it was mapped at (docs/DRIVERS.md 4.1, the `BarWindow` grant
+/// and the first leg of D2's device capability trio).
+///
+/// **The launcher does this, not the cell.** `SYS_GRANT(MemKind::DeviceBar)` stays
+/// refused, and that refusal is the design rather than a gap: owning a device is
+/// authority a cell cannot mint for itself, exactly as the W^X exception and the
+/// cell-spawn capability are minted by whatever launches the cell
+/// (docs/ARCHITECTURE.md 5.1). A cell that was not given a window has no mapping at
+/// these addresses and cannot obtain one.
+///
+/// Bounded twice over: to the BAR's **enumerated extent**, so a cell can never reach a
+/// neighbouring device's registers by asking for more than the BAR holds, and to
+/// [`USER_BAR_MAX`]. `None` if the BAR is unassigned, an I/O-space BAR (not memory), or
+/// larger than the window.
+pub fn map_device_bar(
+    aspace: &mut AddressSpace,
+    bar: &crate::hw::PciBar,
+) -> Option<(usize, usize)> {
+    if bar.io || bar.base == 0 || bar.size == 0 {
+        return None;
+    }
+    let len = bar.size as usize;
+    if len > USER_BAR_MAX {
+        return None;
+    }
+    // Whole pages: a BAR is page-aligned by the PCI spec, and mapping a partial page
+    // would expose whatever shares it.
+    let pages = len.div_ceil(FRAME_SIZE);
+    for i in 0..pages {
+        aspace.map_user_frame(
+            USER_BAR_VA + i * FRAME_SIZE,
+            bar.base as usize + i * FRAME_SIZE,
+            MapPerm::UserDevice,
+        );
+    }
+    Some((USER_BAR_VA, pages * FRAME_SIZE))
+}
+
 /// Base VA of a loaded cell's **cross-cell shared channel** region
 /// (docs/LIBRHEO.md Phase E): 24 GiB, between the file-mmap (20 GiB) and grant
 /// (32 GiB) regions, free in every cell root. `SYS_CONNECT` reports it. The two

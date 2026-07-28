@@ -1808,6 +1808,9 @@ fn build_claude_disk_fixture(arch: Arch, out_dir: &str) {
 /// `mkfs.ext4`/`debugfs` are missing, a small placeholder image is written so
 /// QEMU's `-drive` still has a file and the test detects a non-ext4 disk and skips
 /// - CI stays green. Never fails the build.
+// Eight arguments because an image is eight independent facts about itself; bundling
+// them in a struct would move the same list one line up with no caller made simpler.
+#[allow(clippy::too_many_arguments)]
 fn build_runtime_disk_fixture(
     arch: Arch,
     out_dir: &str,

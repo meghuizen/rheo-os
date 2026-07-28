@@ -173,6 +173,44 @@ composition over existing objects. The admission-rule audit is section 7.
   enumerated `BarAssignment` ranges, only to the cell holding the device,
   grant-checked at map time. Doorbell pages stay separate single-page
   grants.
+
+  **Built (leg 1 of D2's three, and only that).** A cell now reads a real
+  device register at the unprivileged level through a window the *launcher*
+  mapped: `load::map_device_bar` maps a whole-page span of an enumerated,
+  assigned, memory-space BAR into a cell's address space as
+  `MapPerm::UserDevice` - uncached device memory per ISA (x86-64 `PCD|PWT`,
+  PAT entry 3 = UC; ARM64 MAIR attr 0, Device-nGnRnE, unshared; RISC-V base
+  Sv39 has no cacheability field at all, so it is a plain mapping and the
+  doc says so rather than implying an attribute the hardware format cannot
+  express). It refuses I/O-space BARs, unassigned BARs, and anything larger
+  than `USER_BAR_MAX` (4 MiB), and it places the window in its own fixed
+  region (`USER_BAR_VA`, 28 GiB) below the ISA user floor.
+
+  What has **not** changed is the authority question: `SYS_GRANT` with
+  `MemKind::DeviceBar` is still refused, so a cell cannot give itself a
+  device - the window is minted by whatever launches the cell, exactly as
+  the W^X exception, the cell-spawn capability and the queue pair are. That
+  is the whole point of calling this leg 1: the *mapping* mechanism exists,
+  the *capability bundle* (a config-space capability, a cell-lifetime IOMMU
+  domain, and a cell-reachable grant verb for both) does not.
+
+  Proven by `nvmefs`'s closing phase on all three ISAs against a value the
+  cell cannot fabricate: the NVMe controller's **VS** register at BAR0+0x08,
+  read by the cell through its granted window and compared against the same
+  register read by the kernel through its own MMIO mapping (`0x10400` under
+  this QEMU - a live reading, not a constant; aiming the cell 4 bytes off
+  makes the comparison fail, observed). The window's **bound** is asserted in
+  the same phase, because a device mapping that overran its BAR would hand
+  the cell the next device's registers: the same cell aimed one page past the
+  mapping **faults**. Removing the grant entirely also faults, observed - so
+  the read is a genuine access through the page tables and not a value the
+  cell could have produced without a mapping.
+
+  Honest: **cacheability is unobservable here.** QEMU's TCG models no cache,
+  so nothing in the tree can distinguish a UC mapping from a writeback one -
+  the attributes above are asserted by construction (the per-ISA paging code)
+  and not by measurement, and a device whose registers a stale cache line
+  would corrupt is a hardware-lab gate.
 - A **config-space capability**: read/write of the device's own PCI config
   function only (the accessor exists in `hw/`; the capability scopes it to
   one BDF).
@@ -290,7 +328,9 @@ lands with its done-when):
   a mount, and a *second* cell reads a file from it through `std::fs`,
   exact content asserted, all three ISAs, QEMU-only. No hardware touched.
 - **D2 - the device capability trio.** BAR-window grants + the per-device
-  IRQ wait + DMA-map-into-domain. **Done when:** virtio-blk (or virtio-net)
+  IRQ wait + DMA-map-into-domain. **Leg 1 (the BAR window) is built** - see
+  4.1; the IRQ wait and the cell-reachable DMA-map verb are not, so D2 is
+  open. **Done when:** virtio-blk (or virtio-net)
   is **re-homed** from the kernel into a native driver cell that drives it
   through granted BARs and a real IRQ wait, serving the existing
   `BlockOps`/`NicOps` seam, with the old in-kernel driver retired from that

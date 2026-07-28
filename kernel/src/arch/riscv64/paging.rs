@@ -147,6 +147,11 @@ pub fn paging_map(root: &mut PagingRoot, va: usize, perm: MapPerm) {
         MapPerm::UserRw => PTE_R | PTE_W,
         MapPerm::UserRx => PTE_R | PTE_X,
         MapPerm::UserRwx => PTE_R | PTE_W | PTE_X,
+        // Device MMIO. Identical bits to `UserRw`, because a base Sv39 PTE has **no**
+        // cacheability field - the attribute is a property of the physical region
+        // here, and Svpbmt (which would add one) is absent from QEMU 8.2. Named
+        // rather than faked (docs/DRIVERS.md 4.1).
+        MapPerm::UserDevice => PTE_R | PTE_W,
     };
     let pa = super::virt_to_phys(va);
     l0[l0_idx] = table_to_pte(pa, PTE_V | PTE_U | PTE_A | PTE_D | rights);
@@ -176,6 +181,11 @@ pub fn paging_map_frame(root: &mut PagingRoot, va: usize, pa: usize, perm: MapPe
         MapPerm::UserRw => PTE_R | PTE_W,
         MapPerm::UserRx => PTE_R | PTE_X,
         MapPerm::UserRwx => PTE_R | PTE_W | PTE_X,
+        // Device MMIO. Identical bits to `UserRw`, because a base Sv39 PTE has **no**
+        // cacheability field - the attribute is a property of the physical region
+        // here, and Svpbmt (which would add one) is absent from QEMU 8.2. Named
+        // rather than faked (docs/DRIVERS.md 4.1).
+        MapPerm::UserDevice => PTE_R | PTE_W,
     };
     l0[(va >> 12) & 0x1FF] = table_to_pte(pa, PTE_V | PTE_U | PTE_A | PTE_D | rights);
 }
@@ -379,6 +389,11 @@ pub fn paging_protect(root: &mut PagingRoot, va: usize, perm: MapPerm) {
             MapPerm::UserRw => PTE_R | PTE_W,
             MapPerm::UserRx => PTE_R | PTE_X,
             MapPerm::UserRwx => PTE_R | PTE_W | PTE_X,
+            // Device MMIO. Identical bits to `UserRw`, because a base Sv39 PTE has **no**
+            // cacheability field - the attribute is a property of the physical region
+            // here, and Svpbmt (which would add one) is absent from QEMU 8.2. Named
+            // rather than faked (docs/DRIVERS.md 4.1).
+            MapPerm::UserDevice => PTE_R | PTE_W,
         };
         l0[idx] = table_to_pte(pa, PTE_V | PTE_U | PTE_A | PTE_D | rights);
     }

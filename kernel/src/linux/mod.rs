@@ -449,7 +449,7 @@ fn trace_record(nr_val: u64, ctl: &Ctl) {
     // dozen, so an unbounded log would bury the signal it exists to surface. First
     // [`ENOENT_LOG_MAX`] only, `open` excluded because it already reports itself with
     // more information than a number.
-    if ret == -(errno::ENOENT as i64) && !is_open_nr(nr_val) {
+    if ret == -errno::ENOENT && !is_open_nr(nr_val) {
         let n = unsafe { *addr_of!(ENOENT_LOGGED) };
         if n < ENOENT_LOG_MAX {
             unsafe { *addr_of_mut!(ENOENT_LOGGED) = n + 1 };

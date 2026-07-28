@@ -281,6 +281,30 @@ ARM64 or RISC-V MSI, and
 transfers bounce through page-aligned frames one page per command so `PRP1`
 addresses every command and no PRP list is built.
 
+**A cell can be handed a device's registers** (docs/DRIVERS.md 4.1, the first of D2's
+three legs - the *mapping*, not the capability bundle): `load::map_device_bar` maps a
+whole-page span of an enumerated, assigned, memory-space BAR into a cell's address space
+as the new `MapPerm::UserDevice` - uncached device memory per ISA (x86-64 `PCD|PWT` =
+PAT entry 3 UC; ARM64 MAIR attr 0 Device-nGnRnE, unshared; RISC-V base Sv39 has **no**
+cacheability field, so it is a plain mapping and that is stated rather than implied) -
+refusing I/O-space and unassigned BARs and anything over `USER_BAR_MAX` (4 MiB), in its
+own fixed region (`USER_BAR_VA`, 28 GiB) below the ISA user floor. `SYS_GRANT` with
+`MemKind::DeviceBar` **stays refused**, which is the point: the window is minted by
+whatever launches the cell, exactly as the W^X exception, the cell-spawn capability and
+the queue pair are, so a cell still cannot give itself a device. Proven by `nvmefs` on
+**all three ISAs** against a value the cell cannot fabricate - the NVMe controller's VS
+register at BAR0+0x08, read at the unprivileged level through the granted window and
+equal to the kernel's own MMIO read of the same register (`0x10400` here, a live reading
+rather than a constant; aiming the cell 4 bytes off makes the comparison fail, observed)
+- with the **bound** asserted in the same phase, since a window that overran its BAR
+would hand the cell the next device's registers: the same cell aimed one page past the
+mapping faults, and removing the grant entirely faults too (both observed), so the read
+is a real access through the page tables. Honest: **cacheability is unobservable under
+QEMU** (TCG models no cache), so the attributes are asserted by construction in the
+per-ISA paging code and not by measurement; and the rest of D2 - a config-space
+capability, a cell-lifetime IOMMU domain, a cell-reachable DMA-map verb, and the
+per-device IRQ wait - is not built, so no driver has been re-homed into a cell.
+
 **And the storage data path is per-core** (docs/SUBSTRATE.md S5, the `smp` kernel's
 NVMe phase, all three ISAs): the driver creates one queue pair *and one bounce frame*
 per CPU, and a core submits on its own - selected by CPU index. Two counters make it a
@@ -2531,7 +2555,9 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               posix, blockfs (live virtio-blk disk), nvmefs (the same ext4 image
               behind a **real NVMe controller** - PCIe BAR0 mapped, admin + one I/O
               queue pair brought up, files read through the identical VFS, plus a
-              write round trip on the last sector), elfrun (load a native
+              write round trip on the last sector, plus **DRIVERS.md D2 leg 1**:
+              an unprivileged cell reads the controller's VS register through a
+              launcher-mapped BAR window and one page past it faults), elfrun (load a native
               ELF), posixrun (native program over the POSIX syscalls),
               libcrun (a program linked against rheo-libc), jsonrun (a
               program parsing JSON with rheo-json on-OS), stdrun (a real-std

@@ -105,15 +105,21 @@ pub fn paging_map(root: &mut PagingRoot, va: usize, perm: MapPerm) {
     let l2 = table_mut(next_table(l1[l1_index(va)]));
     let l3 = table_mut(next_table(l2[l2_index(va)]));
 
-    let (ap, xn) = match perm {
-        MapPerm::UserRo => (AP_RO_ALL, UXN | PXN),
-        MapPerm::UserRw => (AP_RW_ALL, UXN | PXN),
-        MapPerm::UserRx => (AP_RO_ALL, PXN), // EL0-executable (UXN clear)
+    // The third element is the memory attribute + shareability. Device MMIO selects
+    // MAIR attr **0** (Device-nGnRnE, set by `boot.S` and used by the kernel's own MMIO
+    // window) and no inner-shareable hint, which is meaningless for device memory; a
+    // Normal-cacheable device mapping would let a status register read return a stale
+    // line (docs/DRIVERS.md 4.1).
+    let (ap, xn, attr) = match perm {
+        MapPerm::UserRo => (AP_RO_ALL, UXN | PXN, ATTR_NORMAL | SH_INNER),
+        MapPerm::UserRw => (AP_RW_ALL, UXN | PXN, ATTR_NORMAL | SH_INNER),
+        MapPerm::UserRx => (AP_RO_ALL, PXN, ATTR_NORMAL | SH_INNER), // EL0-exec (UXN clear)
         // Writable AND EL0-executable: PXN keeps EL1 from executing it (the kernel
         // must never run a cell's JIT output), UXN clear lets EL0.
-        MapPerm::UserRwx => (AP_RW_ALL, PXN),
+        MapPerm::UserRwx => (AP_RW_ALL, PXN, ATTR_NORMAL | SH_INNER),
+        MapPerm::UserDevice => (AP_RW_ALL, UXN | PXN, 0),
     };
-    l3[l3_index(va)] = addr_bits(va) | ATTR_NORMAL | SH_INNER | ap | AF | NG | xn | TABLE | VALID;
+    l3[l3_index(va)] = addr_bits(va) | attr | ap | AF | NG | xn | TABLE | VALID;
 }
 
 /// Get the next-level table a descriptor points at, creating an empty one
@@ -136,15 +142,21 @@ pub fn paging_map_frame(root: &mut PagingRoot, va: usize, pa: usize, perm: MapPe
     let l1 = table_mut(ensure_table(l0, l0_index(va)));
     let l2 = table_mut(ensure_table(l1, l1_index(va)));
     let l3 = table_mut(ensure_table(l2, l2_index(va)));
-    let (ap, xn) = match perm {
-        MapPerm::UserRo => (AP_RO_ALL, UXN | PXN),
-        MapPerm::UserRw => (AP_RW_ALL, UXN | PXN),
-        MapPerm::UserRx => (AP_RO_ALL, PXN), // EL0-executable (UXN clear)
+    // The third element is the memory attribute + shareability. Device MMIO selects
+    // MAIR attr **0** (Device-nGnRnE, set by `boot.S` and used by the kernel's own MMIO
+    // window) and no inner-shareable hint, which is meaningless for device memory; a
+    // Normal-cacheable device mapping would let a status register read return a stale
+    // line (docs/DRIVERS.md 4.1).
+    let (ap, xn, attr) = match perm {
+        MapPerm::UserRo => (AP_RO_ALL, UXN | PXN, ATTR_NORMAL | SH_INNER),
+        MapPerm::UserRw => (AP_RW_ALL, UXN | PXN, ATTR_NORMAL | SH_INNER),
+        MapPerm::UserRx => (AP_RO_ALL, PXN, ATTR_NORMAL | SH_INNER), // EL0-exec (UXN clear)
         // Writable AND EL0-executable: PXN keeps EL1 from executing it (the kernel
         // must never run a cell's JIT output), UXN clear lets EL0.
-        MapPerm::UserRwx => (AP_RW_ALL, PXN),
+        MapPerm::UserRwx => (AP_RW_ALL, PXN, ATTR_NORMAL | SH_INNER),
+        MapPerm::UserDevice => (AP_RW_ALL, UXN | PXN, 0),
     };
-    l3[l3_index(va)] = addr_bits(pa) | ATTR_NORMAL | SH_INNER | ap | AF | NG | xn | TABLE | VALID;
+    l3[l3_index(va)] = addr_bits(pa) | attr | ap | AF | NG | xn | TABLE | VALID;
 }
 
 /// Walk to the 4 KiB leaf for `va`, returning `(l3_pa, l3_index)` if every
@@ -341,13 +353,19 @@ pub fn paging_protect(root: &mut PagingRoot, va: usize, perm: MapPerm) {
             return;
         }
         let pa = (l3[idx] & 0x0000_FFFF_FFFF_F000) as usize;
-        let (ap, xn) = match perm {
-            MapPerm::UserRo => (AP_RO_ALL, UXN | PXN),
-            MapPerm::UserRw => (AP_RW_ALL, UXN | PXN),
-            MapPerm::UserRx => (AP_RO_ALL, PXN),
-            MapPerm::UserRwx => (AP_RW_ALL, PXN),
+        let (ap, xn, attr) = match perm {
+            MapPerm::UserRo => (AP_RO_ALL, UXN | PXN, ATTR_NORMAL | SH_INNER),
+            MapPerm::UserRw => (AP_RW_ALL, UXN | PXN, ATTR_NORMAL | SH_INNER),
+            MapPerm::UserRx => (AP_RO_ALL, PXN, ATTR_NORMAL | SH_INNER),
+            MapPerm::UserRwx => (AP_RW_ALL, PXN, ATTR_NORMAL | SH_INNER),
+            // A reprotect to device attributes, kept for exhaustiveness rather than for
+            // a caller: `mprotect` is the only path here and no cell can name this perm
+            // (a BAR window is mapped once by the launcher, docs/DRIVERS.md 4.1). The
+            // arm exists so that adding a device-reprotect path later is a decision
+            // taken here rather than a `_` arm silently giving it Normal memory.
+            MapPerm::UserDevice => (AP_RW_ALL, UXN | PXN, 0),
         };
-        l3[idx] = addr_bits(pa) | ATTR_NORMAL | SH_INNER | ap | AF | NG | xn | TABLE | VALID;
+        l3[idx] = addr_bits(pa) | attr | ap | AF | NG | xn | TABLE | VALID;
     }
 }
 

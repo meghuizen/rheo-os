@@ -479,6 +479,34 @@ pub extern "C" fn user_copair(params_va: usize) -> ! {
     loop {}
 }
 
+/// The **device-BAR reader** (docs/DRIVERS.md 4.1): read one 32-bit register out of a
+/// granted BAR window and report it.
+///
+/// `iters` carries the VA to read (the launcher passes `USER_BAR_VA + offset`); `ops`
+/// receives the value and `status` becomes 1. It exists to answer the only question a
+/// BAR grant raises that a mapping alone does not: whether a **cell**, at the
+/// unprivileged level, can perform a real MMIO read of a real device and get the value
+/// the device holds - which is what "owning a device" starts with.
+///
+/// A `volatile` read, and that matters: an ordinary load may be reordered, merged with a
+/// neighbour, or elided if the compiler thinks nothing changed. A device register read is
+/// a bus transaction, so the access has to survive optimisation exactly as written.
+#[unsafe(link_section = ".user.text")]
+#[unsafe(no_mangle)]
+pub extern "C" fn user_bar_read(params_va: usize) -> ! {
+    let p = params_va as *mut Params;
+    // SAFETY: the cell's own mapped Params page (its entry argument), and `iters` is a
+    // VA the launcher mapped as device memory into this cell.
+    unsafe {
+        let va = (*p).iters as usize;
+        let v = core::ptr::read_volatile(va as *const u32);
+        (*p).ops = v as u64;
+        (*p).status = 1;
+        syscall(SYS_EXIT, (*p).workload);
+    }
+    loop {}
+}
+
 /// The **placed** cell: spin `iters` rounds, then exit with `workload` as the code.
 ///
 /// Used where a set of cells is handed to *no particular core* and each is claimed by
