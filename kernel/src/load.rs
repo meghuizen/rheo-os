@@ -36,6 +36,32 @@ pub const USER_QUEUE_VA: usize = 0x4_0000_0000;
 /// QueuePair capability and records `(USER_QUEUE_VA, cap_id)` via
 /// `user::set_queue_info`.
 pub fn map_queue(aspace: &mut AddressSpace) -> QueuePair {
+    map_queue_for(aspace, 0)
+}
+
+/// The VA of vcore `v`'s queue-pair region (docs/SUBSTRATE.md S5).
+///
+/// One region per vcore, packed from [`USER_QUEUE_VA`], because a ring is
+/// single-producer: two contexts sharing one would have to serialise their
+/// submissions, and once they run on two cores that serialisation is a cross-core
+/// write to shared indices. `vcore_queue_va(0)` is `USER_QUEUE_VA` exactly, so every
+/// single-vcore cell is where it always was.
+pub const fn vcore_queue_va(v: usize) -> usize {
+    USER_QUEUE_VA + v * QueuePair::REGION_SIZE
+}
+
+// The whole per-vcore queue window has to stay inside the region the cell's recorded
+// layout reserves for it, which `user::install` sizes from `MAX_CELL_CHANNELS` at the
+// channel base. A compile-time check rather than a comment, since the two constants
+// live in different files.
+const _: () = assert!(
+    vcore_queue_va(crate::user::MAX_VCORES) <= USER_QUEUE_VA + 0x1_0000_0000,
+    "the per-vcore queue window must not reach the next fixed region"
+);
+
+/// [`map_queue`] for a named vcore: its own region at [`vcore_queue_va`].
+pub fn map_queue_for(aspace: &mut AddressSpace, v: usize) -> QueuePair {
+    let base = vcore_queue_va(v);
     let pages = QueuePair::REGION_SIZE / FRAME_SIZE;
     let mut first_pa = 0usize;
     for i in 0..pages {
@@ -43,7 +69,7 @@ pub fn map_queue(aspace: &mut AddressSpace) -> QueuePair {
         if i == 0 {
             first_pa = pa;
         }
-        aspace.map_user_frame(USER_QUEUE_VA + i * FRAME_SIZE, pa, MapPerm::UserRw);
+        aspace.map_user_frame(base + i * FRAME_SIZE, pa, MapPerm::UserRw);
     }
     // The header lives in the first page; write it through the linear map.
     // SAFETY: `first_pa` is a freshly allocated frame reached through the
@@ -51,8 +77,30 @@ pub fn map_queue(aspace: &mut AddressSpace) -> QueuePair {
     unsafe {
         QueuePair::init_header(arch::phys_to_virt(first_pa) as *mut u8);
         // The overlay used at doorbell time binds to the cell's VA.
-        QueuePair::attach(USER_QUEUE_VA as *mut u8)
+        QueuePair::attach(base as *mut u8)
     }
+}
+
+/// Map a **user stack for vcore `v`** and return its top.
+///
+/// Vcore 0's is [`map_stack`]'s, at [`USER_STACK_TOP`]; later ones sit below it with a
+/// one-page gap, so a vcore running off the bottom of its stack faults instead of
+/// walking into a sibling's - a guard page from the layout rather than a dedicated
+/// mapping, the same trick the Linux stack reservation uses.
+///
+/// No System V initial block: a secondary vcore is not a fresh process, it is another
+/// context of one that already parsed its arguments. Its entry takes none.
+pub fn map_vcore_stack(aspace: &mut AddressSpace, v: usize) -> usize {
+    assert!(v > 0, "vcore 0's stack is `map_stack`'s");
+    // (pages + 1) per vcore: the extra page is the guard gap.
+    let top = USER_STACK_TOP - v * (USER_STACK_PAGES + 1) * FRAME_SIZE;
+    let mut va = top - USER_STACK_PAGES * FRAME_SIZE;
+    while va < top {
+        let pa = frames::alloc().expect("vcore stack page (bounded, at load)");
+        aspace.map_user_frame(va, pa, MapPerm::UserRw);
+        va += FRAME_SIZE;
+    }
+    top
 }
 
 /// Base VA of a **device BAR window** mapped into a driver cell (docs/DRIVERS.md 4.1):

@@ -1119,13 +1119,13 @@ a **general protection fault inside the allocator** (x86-64 vector 13) - a harde
 the mismatch counter was built to report, which is the same defect in its unsurvivable form.
 
 **Still not done** and named: a vcore that forks or takes a signal, the loaded-cell ring
-placement just named, and a **loaded** cell with two vcores actually running the multi-vcore
-runtime. The runtime half is built (one executor per vcore plus a `Send`-bounded shared
-injector, 64 strands proven to run exactly once across two cores - docs/CONCURRENCY.md) and so
-is the verb a cell needs to key it (`SYS_VCORE_INFO`, proven by the same binary in two contexts
-reading indices 0 and 1). What is left is loader work: `load::map_queue` places one ring at
-`USER_QUEUE_VA`, and a second vcore needs a ring, a user stack and an entry frame allocated in
-the cell's address space.
+placement just named, and a cell that **asks for** its own vcores. A loaded cell now *runs* the
+multi-vcore executor: `librheo-vcore`, one ELF in two contexts with its own ring
+(`load::map_queue_for`) and stack (`load::map_vcore_stack`) each, entered at the same ELF entry
+and told apart only by `SYS_VCORE_INFO`, with vcore 0 filling the injector and vcore 1 running
+all 32 strands (docs/CONCURRENCY.md). What is left is that the *launcher* installs the vcores -
+the same launcher-mints-authority shape as the queue pair and the W^X exception - and a
+cell-facing `spawn_vcore` is a separate design question.
 
 **The proof** (the `smp` kernel's two-vcore phase, all three ISAs): two vcores of **one**
 cell go into the placement queue and whichever cores are free claim them. Both are

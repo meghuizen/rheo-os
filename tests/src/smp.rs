@@ -303,6 +303,7 @@ fn test_secondary_bringup() {
             test_shared_heap();
             test_vcore_identity();
             test_strands_across_vcores();
+            test_loaded_multi_vcore_cell();
             test_user_cells_on_both();
             test_placement();
             test_two_vcores_one_cell();
@@ -2074,6 +2075,147 @@ fn test_vcore_identity() {
              cell got indices 0 and 1 and a count of 2 from SYS_VCORE_INFO, which is what \
              a per-vcore runtime keys every structure on and what a cell cannot derive for \
              itself OK"
+        );
+    }
+}
+
+// -------------------------- a LOADED CELL runs the multi-vcore executor (the assembly)
+//
+// Everything above proves a piece in isolation: per-vcore frames and FP areas, a
+// per-vcore ring, a per-vcore strand executor with a `Send`-bounded injector, a
+// multi-core-safe allocator, and `SYS_VCORE_INFO` so a context can key all of it on its
+// own index. What none of them shows is a real loaded ELF using them **together**, which
+// is the only form an application ever takes.
+//
+// `librheo-vcore` is that cell. One binary, two contexts, one entry point: both vcores
+// enter at `_start`, and librheo's crt0 branches on `sys::vcore_index()` so the secondary
+// does not redo one-time process setup - re-running `init_heap` would reset the
+// allocator's free list under a sibling already using it, and re-seeding the DRBG would
+// hand two contexts the same stream. The cell is not *told* its role by its launcher; it
+// asks. That is what the verb is for.
+//
+// The cell's own claim is the deterministic one: vcore 0 fills the injector and never
+// drains it, so every strand that ran was executed by a context that did not create it.
+// It checks that itself - all 32 strands exactly once, `shared_taken(0) == 0`,
+// `shared_taken(1) == 32` - and only then ends the cell with `0x42`. Any other exit code
+// names which check failed (31..37), so a failure says what happened rather than just
+// that something did.
+//
+// The launcher's side is the loader work this needed: a second ring at
+// `load::vcore_queue_va(1)` and a second user stack from `load::map_vcore_stack`, below
+// vcore 0's with a one-page guard gap.
+
+/// The kernel-side statics for the loaded two-vcore cell.
+static mut LV_OBJECTS: ObjectTable = ObjectTable::new();
+static mut LV_CAPS: CapTable = CapTable::new();
+static mut LV_QP0: core::mem::MaybeUninit<kernel::queue::QueuePair> =
+    core::mem::MaybeUninit::uninit();
+static mut LV_QP1: core::mem::MaybeUninit<kernel::queue::QueuePair> =
+    core::mem::MaybeUninit::uninit();
+static mut LV_FRAME0: core::mem::MaybeUninit<kernel::arch::TrapFrame> =
+    core::mem::MaybeUninit::uninit();
+static mut LV_FRAME1: core::mem::MaybeUninit<kernel::arch::TrapFrame> =
+    core::mem::MaybeUninit::uninit();
+static mut LV_KSTACK0: KernelStack = KernelStack::new();
+static mut LV_KSTACK1: KernelStack = KernelStack::new();
+
+fn test_loaded_multi_vcore_cell() {
+    let image = fixture::cell!("librheo-vcore");
+    // SAFETY: single-threaded setup on the primary; the secondaries claim nothing until
+    // `place_vcores` publishes the queue, and every static outlives the run.
+    unsafe {
+        let objects = &mut *core::ptr::addr_of_mut!(LV_OBJECTS);
+        let caps = &mut *core::ptr::addr_of_mut!(LV_CAPS);
+        *objects = ObjectTable::new();
+        *caps = CapTable::new();
+
+        let mut aspace = kernel::mm::AddressSpace::new(11);
+        let entry = load::load_elf(image, &mut aspace).expect("load librheo-vcore");
+        let sp0 = load::map_stack(&mut aspace);
+        // One ring per vcore, and one stack per vcore - the two things a second context
+        // cannot share (docs/SUBSTRATE.md S5, and a shared stack is two contexts writing
+        // over each other's locals).
+        let qp0 = load::map_queue_for(&mut aspace, 0);
+        let qp1 = load::map_queue_for(&mut aspace, 1);
+        let sp1 = load::map_vcore_stack(&mut aspace, 1);
+
+        // A capability per ring: vcore 1 does not get a second handle on vcore 0's.
+        let mut cap_of = |objects: &mut ObjectTable, caps: &mut CapTable| {
+            let o = objects
+                .create(kernel::capability::ObjectKind::QueuePair)
+                .expect("a queue object");
+            caps.mint(
+                objects,
+                o,
+                kernel::capability::READ | kernel::capability::WRITE,
+                kernel::capability::BUDGET_UNLIMITED,
+            )
+            .expect("a queue capability")
+            .raw_low32()
+        };
+        let cap0 = cap_of(objects, caps);
+        let cap1 = cap_of(objects, caps);
+
+        (*core::ptr::addr_of_mut!(LV_QP0)).write(qp0);
+        (*core::ptr::addr_of_mut!(LV_QP1)).write(qp1);
+        let qp0_ptr = (*core::ptr::addr_of!(LV_QP0)).as_ptr();
+        let qp1_ptr = (*core::ptr::addr_of!(LV_QP1)).as_ptr();
+
+        let f0 = core::ptr::addr_of_mut!(LV_FRAME0);
+        let f1 = core::ptr::addr_of_mut!(LV_FRAME1);
+        (*f0).write(arch::trapframe_new(
+            entry,
+            sp0,
+            0,
+            (*core::ptr::addr_of!(LV_KSTACK0)).top(),
+        ));
+        // The **same entry point**: the secondary asks which vcore it is rather than
+        // being pointed at a different symbol, which is what keeps the loader free of
+        // symbol-table lookups.
+        (*f1).write(arch::trapframe_new(
+            entry,
+            sp1,
+            0,
+            (*core::ptr::addr_of!(LV_KSTACK1)).top(),
+        ));
+
+        user::reset();
+        user::install(0, &aspace, caps, objects, qp0_ptr, (*f0).as_mut_ptr());
+        user::set_vcore_queue_info(0, 0, load::vcore_queue_va(0) as u64, cap0);
+        // SAFETY: `LV_FRAME1` outlives the run; vcore 1 has its own user stack, kernel
+        // stack and ring.
+        let vi = user::install_vcore(0, (*f1).as_mut_ptr(), qp1_ptr);
+        assert_eq!(vi, 1, "the second vcore did not land at index 1");
+        user::set_vcore_queue_info(0, 1, load::vcore_queue_va(1) as u64, cap1);
+
+        let vids = [user::MAX_VCORES * 0, user::MAX_VCORES * 0 + 1];
+        let mut out = [(u64::MAX, usize::MAX); 2];
+        // SAFETY: cell 0 is installed, present and native, each vcore listed once.
+        if !smp::place_vcores(&vids, &mut out) {
+            println!(
+                "smp: SKIP the loaded multi-vcore cell - the queue did not drain inside \
+                 the bound, so nothing about a loaded cell on two vcores is claimed"
+            );
+            return;
+        }
+        // `SYS_EXIT_GROUP` from vcore 0 ends the cell, so whichever vcore's run unwound
+        // last carries the verdict; the other reports 0 from its own `SYS_EXIT`.
+        let codes = [out[0].0, out[1].0];
+        assert!(
+            codes.contains(&(0x42u64)),
+            "the loaded two-vcore cell exited {codes:?}, not 0x42 - the cell's own \
+             checks name the failure: 31 no vcore info, 32 only one vcore, 33 the \
+             sibling never drained, 34 a strand ran the wrong number of times, 35 vcore \
+             0 took work it should not have, 36 vcore 1 did not take all of it, 37 the \
+             injector was never filled"
+        );
+        println!(
+            "smp: A LOADED CELL RAN THE MULTI-VCORE EXECUTOR - `librheo-vcore`, one \
+             binary in two contexts of one address space with its own ring and stack \
+             each, entered at the same ELF entry and told apart only by SYS_VCORE_INFO: \
+             vcore 0 filled the injector and never drained it, vcore 1 ran all 32 \
+             strands, and vcore 0 verified each ran exactly once with 0/32 taken before \
+             ending the cell 0x42 (codes {codes:?}) OK"
         );
     }
 }

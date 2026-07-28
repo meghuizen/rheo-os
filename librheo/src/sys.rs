@@ -28,7 +28,7 @@ pub use rheo_abi::{
     SIMD_AVX512VNNI, SIMD_NEON, SIMD_SSE2, SPAWN_CHAN_SLOT, STATUS_BAD_HANDLE, STATUS_BAD_OPCODE,
     STATUS_DENIED, STATUS_EXHAUSTED, STATUS_IO, STATUS_OK, STATUS_REVOKED, SYS_ARM_TIMER,
     SYS_COMMIT, SYS_CONNECT, SYS_CPUINFO, SYS_CYCLES, SYS_DECOMMIT, SYS_DOORBELL, SYS_ENGINE_INFO,
-    SYS_EXIT_GROUP, SYS_GRANT, SYS_GRANT_SHARE, SYS_MMAP, SYS_MMAP_FILE, SYS_MUNMAP,
+    SYS_EXIT, SYS_EXIT_GROUP, SYS_GRANT, SYS_GRANT_SHARE, SYS_MMAP, SYS_MMAP_FILE, SYS_MUNMAP,
     SYS_QUEUE_INFO, SYS_RANDOM, SYS_RESERVE_ADMIT, SYS_RESERVE_QUERY, SYS_RESERVE_RELEASE,
     SYS_SEAL, SYS_SPAWN, SYS_SWITCH, SYS_UPTIME, SYS_VCORE_INFO, SYS_WAIT, SYS_WAIT_INPUT,
     SYS_WAIT_NET, SYS_WRITE_FD, SYS_YIELD, ShareInfo, SqEntry, TIMER_CLIENT_CELL_SLEEP,
@@ -295,6 +295,16 @@ pub fn reserve_release(cap_id: u32) -> u64 {
 }
 pub fn exit(code: u64) -> ! {
     unsafe { syscall1(SYS_EXIT_GROUP, code) };
+    loop {}
+}
+/// End **this vcore** and leave the cell running (docs/SMP.md 10.0a).
+///
+/// The counterpart of [`exit`], which is `SYS_EXIT_GROUP` and ends the whole cell.
+/// A secondary vcore returning from `main` must use this one: ending the cell from a
+/// context that was only one of several would take its siblings down mid-work. The
+/// cell ends when its **last** vcore exits.
+pub fn exit_vcore(code: u64) -> ! {
+    unsafe { syscall1(SYS_EXIT, code) };
     loop {}
 }
 /// Hand the CPU to the peer cell (docs/LIBRHEO.md Phase E). Resumes here once the

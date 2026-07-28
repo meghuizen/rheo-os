@@ -2204,12 +2204,35 @@ must not be able to claim a different one since every per-vcore structure keys o
 is **two integers with all policy outside**. Proven by `smp` on **all three ISAs**: the *same
 binary* in two contexts of one cell reads indices 0 and 1 and a count of 2 - a per-cell reply
 would give both the same and a hardcoded one would give both 0, and reverting the index to a
-constant fails by name (observed). Still named as not done: a vcore that forks or takes a
-signal, per-vcore stealing deques, and a **loaded** cell with two vcores actually running the
-multi-vcore executor - which is **loader** work rather than runtime work (`load::map_queue`
-places one ring at `USER_QUEUE_VA`; a second vcore needs a ring, a user stack and an entry
-frame allocated in the cell's address space), with every piece it composes now proven
-separately.
+constant fails by name (observed). 
+**And a loaded cell runs the multi-vcore executor** (docs/CONCURRENCY.md) - the assembly of
+every piece above. **`librheo-vcore`** is one ELF in two contexts of one address space, each
+with its own ring (`load::map_queue_for`, at `load::vcore_queue_va(v)`) and its own user stack
+(`load::map_vcore_stack`, below vcore 0's with a one-page guard gap). Both enter at the **same
+ELF entry point** - the loader resolves no symbols, and giving a cell two entry points would
+make it read a symbol table - so librheo's crt0 branches on `sys::vcore_index()`: the secondary
+skips one-time process setup, because re-running `init_heap` would reset the allocator's free
+list under a sibling already using it and re-seeding the DRBG would hand two contexts the same
+stream. **The cell is not told its role by its launcher; it asks.** Its claim is the
+deterministic one: vcore 0 fills the injector and **never drains it**, so every strand that ran
+was executed by a context that did not create it - and the cell checks that itself (32 strands
+each exactly once, `shared_taken(0) == 0`, `shared_taken(1) == 32`) before ending the cell
+`0x42`, with every other code (31..38) naming which check failed. Proven on **all three ISAs**.
+Two findings from building it: a secondary can be entered **before the primary has executed one
+instruction** (placement publishes every vcore at once and whichever core claims first enters
+first - the first version assumed otherwise and the cell never finished), so crt0 gained a
+`PRIMARY_READY` flag the secondary *yields* on, bounded; and a secondary returning from `main`
+must use `sys::exit_vcore` (`SYS_EXIT`) rather than `sys::exit` (`SYS_EXIT_GROUP`), which would
+take its siblings down mid-work. **Honest about this phase's reach**: load-bearing and observed
+failing are the per-vcore user stack (sharing one wedges both contexts, code 38 twice) and the
+crt0 secondary path (without `PRIMARY_READY` the run does not complete); *not* proven here is
+the per-vcore **ring**, since this cell's strands touch only atomics and ring no doorbell so
+collapsing both rings to one VA still passes - the ring is proven by the `smp` kernel's own
+per-vcore-queue phase instead - nor the `exit_vcore` split, whose effect here is
+race-dependent. Still named as not done: a vcore that forks or takes a signal, per-vcore
+stealing deques, and a cell that **asks for** its own vcores (the launcher installs them, the
+same launcher-mints-authority shape as the queue pair and the W^X exception; a cell-facing
+`spawn_vcore` is a separate design question).
 
 **Honest scope:** preemption is *within* a core's own claim and rebalancing moves only
 **unstarted** cells. Migrating a *running* one was **attempted twice and reverted twice**, with four findings
@@ -2764,7 +2787,10 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               spawned on one vcore and executed entirely by another
               (docs/CONCURRENCY.md); then **A CELL ASKING WHICH VCORE IT IS** -
               the same binary in two contexts reading indices 0 and 1 out of
-              `SYS_VCORE_INFO`; then an
+              `SYS_VCORE_INFO`; then **A LOADED CELL RUNNING THE MULTI-VCORE
+              EXECUTOR** - `librheo-vcore`, one ELF in two contexts with its own
+              ring and stack each, vcore 0 filling the injector and vcore 1
+              running all 32 strands (docs/CONCURRENCY.md); then an
               **unmodified static-glibc binary as a Linux cell on a secondary**,
               exact stdout + exit asserted, overlapping a native cell on the
               primary; then **two Linux cells on two cores at once**, each
@@ -3024,7 +3050,9 @@ librheo/      the native userspace foundation library (docs/LIBRHEO.md):
               (Phase H virtio-gpu 2D present round trip), librheo-ipc (Phase J
               two-cell async Sender/Receiver ping-pong), and librheo-pipe/
               librheo-pipesrc (Phase J cross-cell stdout pipeline: a spawned
-              producer child streams its output to the parent over the channel)
+              producer child streams its output to the parent over the channel),
+              and librheo-vcore (a cell running the multi-vcore strand executor:
+              one ELF in two contexts, told apart only by SYS_VCORE_INFO)
               programs
 net/          rheo-net: the greenfield network stack as portable userspace
               (docs/NETSTACK.md, docs/NETWORKING.md) - no_std+alloc, no per-ISA

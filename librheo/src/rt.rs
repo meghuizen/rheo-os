@@ -22,7 +22,8 @@ use crate::sys::{self, CqEntry, Qp};
 const CHAN_ROLE_CLIENT: u64 = 0;
 
 pub use runtime::strand::{
-    JoinHandle, StrandId, complete, has_pending, next_token, park_on, spawn, stats, yield_now,
+    JoinHandle, StrandId, complete, has_pending, next_token, park_on, run, set_vcore_hook,
+    shared_taken, spawn, spawn_shared, stats, yield_now,
 };
 
 /// The cell's reactor: its queue pair + the capability that authorises it.

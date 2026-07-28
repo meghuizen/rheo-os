@@ -80,12 +80,42 @@ ISAs: the **same binary** in two contexts of one cell gets indices 0 and 1 and a
 where a per-cell reply would give both the same and a hardcoded one would give both 0 -
 reverting the index to a constant fails by name.
 
+**And a loaded cell runs it.** `librheo-vcore` is the assembly: one ELF, two contexts of one
+address space, each with its own ring (`load::map_queue_for`) and its own user stack
+(`load::map_vcore_stack`, below vcore 0's with a one-page guard gap). Both enter at the **same
+ELF entry point** - the loader resolves no symbols, and asking a cell to have two entry points
+would make it read a symbol table - so librheo's crt0 branches on `sys::vcore_index()`: the
+secondary skips one-time process setup, because re-running `init_heap` would reset the
+allocator's free list under a sibling already using it and re-seeding the DRBG would hand two
+contexts the same stream. The cell is not *told* its role by its launcher; it asks.
+
+Its claim is the deterministic one: vcore 0 fills the injector and **never drains it**, so every
+strand that ran was executed by a context that did not create it. The cell checks that itself -
+all 32 strands exactly once, `shared_taken(0) == 0`, `shared_taken(1) == 32` - and only then
+ends the cell `0x42`, with every other exit code (31..38) naming which check failed. Proven on
+all three ISAs.
+
+Two findings from building it. A secondary can be entered **before the primary has executed one
+instruction**, because placement publishes every vcore as runnable at once and whichever core
+claims first enters first - the first version assumed the primary went first and the cell never
+finished, so crt0 now has a `PRIMARY_READY` flag the secondary *yields* on (bounded, so a
+primary that never comes up ends that context with a distinct code rather than hanging). And a
+secondary returning from `main` must exit with `SYS_EXIT` (`sys::exit_vcore`) rather than
+`sys::exit`, which is `SYS_EXIT_GROUP` and would take its siblings down mid-work.
+
+**Honest about what this phase proves and does not.** Load-bearing and observed failing: the
+per-vcore user stack (sharing one wedges both contexts, exit code 38 twice) and the crt0
+secondary path (without `PRIMARY_READY` the run does not complete at all). *Not* proven here:
+the per-vcore **ring** - this cell's strands touch only atomics and ring no doorbell, so
+collapsing both rings to one VA still passes; the ring is proven by the `smp` kernel's own
+per-vcore-queue phase instead. Nor the `exit_vcore` split, whose effect here is
+race-dependent - it is correct by the same argument the kernel's rule rests on, and this phase
+is not its proof.
+
 Still not built: `!Send` work that migrates (it cannot, by construction), per-vcore stealing
-deques, and a **loaded** cell with two vcores actually running the multi-vcore executor. That
-last one is loader work, not runtime work: `load::map_queue` places one ring at
-`USER_QUEUE_VA`, and a second vcore needs a ring, a user stack and an entry frame allocated in
-the cell's address space. Every piece it composes is now proven separately - the verb, the
-per-vcore rings, the per-vcore executor, the multi-core allocator.
+deques, and a cell that asks for its own vcores - the launcher still installs them, which is the
+same launcher-mints-authority shape as the queue pair and the W^X exception, and a cell-facing
+`spawn_vcore` is a separate design question.
 
 Position: threads get light by splitting in two. The kernel schedules
 **vcores** (one kernel context each); the runtime inside a cell schedules

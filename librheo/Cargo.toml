@@ -125,5 +125,9 @@ path = "src/bin/librheo-pipesrc.rs"
 
 # The embedded proof - built `--no-default-features` to prove librheo scales down.
 [[bin]]
+name = "librheo-vcore"
+path = "src/bin/librheo-vcore.rs"
+
+[[bin]]
 name = "librheo-embed"
 path = "src/bin/librheo-embed.rs"
