@@ -2145,9 +2145,32 @@ blocked, and ends the run in `DEADLOCK_EXIT` too. The yield phase asserts the ru
 suppressing the hand-off makes vcore 1 never reach its exit (observed). This is the assertion
 the previous slice deliberately pinned at 0 so the rule's arrival would be a test change rather
 than a silent one; it fired. `SYS_EXIT_GROUP` takes the pre-existing path unchanged, so nothing
-new is claimed for it. Still named as not done: a vcore that forks or takes a signal, the
-loaded-cell ring placement, and the **userspace half** - `runtime/`'s strand executor still asks
-for one vcore, so nothing yet schedules strands across several.
+new is claimed for it. 
+**And the userspace allocator is multi-core safe** (docs/SMP.md 10.0a) - the prerequisite the
+userspace half sits on, and a genuine latent defect rather than a feature. `runtime::Heap` is
+the `#[global_allocator]` every `alloc`-using cell and test kernel binds, and it carried a bare
+`unsafe impl Sync for Heap` justified by *"single-CPU kernel; no concurrent access to the
+allocator"* - true when written, false from the moment two cores ran cells, which is the kind of
+**inherited claim that has to be re-checked rather than trusted**. A free list is the worst case
+for getting it wrong: every operation reads and writes several links, so two concurrent
+allocations hand out **overlapping blocks** and the symptom is not a fault but two owners of one
+buffer writing over each other. It is behind `runtime::lock::TicketLock` now - the lock whose
+own doc said it was "for the future multi-vcore case" - **unconditionally**, because whether a
+structure needs a lock is a property of the structure and not of which cargo features are
+enabled (the call `mm::frames` and the NVMe driver already made); an uncontended acquire is two
+atomics against a free-list walk that is already several dependent loads. Proven by the `smp`
+kernel on **all three ISAs**: each core runs 512 allocate / stamp-every-byte /
+read-every-byte-back / free cycles through the global allocator, meeting at a rendezvous first
+so the overlap is real - a block handed to both cores means one core's marker lands in the
+other's block between the write and the read, caught **directly** rather than by a proxy - with
+0 mismatched bytes, 0 pointers outside the region, both cores completing every round, and the
+list still serving afterwards. Reverting to the unlocked `UnsafeCell` + `unsafe impl Sync`
+produces a **general protection fault inside the allocator** (observed), the same defect in its
+unsurvivable form. Still named as not done: a vcore that forks or takes a signal, the
+loaded-cell ring placement, and the **userspace half proper** - `strand.rs` is one global
+`Executor` behind a `static mut` with `Rc`-based join handles, so it is per-cell rather than
+per-vcore, and making it per-vcore needs the `spawn`/spawn-on-any split a `Send` bound implies,
+which is an API decision rather than a port.
 
 **Honest scope:** preemption is *within* a core's own claim and rebalancing moves only
 **unstarted** cells. Migrating a *running* one was **attempted twice and reverted twice**, with four findings
@@ -2694,7 +2717,10 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               can produce; then **A QUEUE PAIR PER VCORE** - two vcores of one cell
               told about their own disjoint rings by `SYS_QUEUE_INFO`, each
               completing its own `OP_ECHO` round trip through its own doorbell on
-              its own core (docs/SMP.md 10.0a); then an
+              its own core; then **TWO CORES IN ONE HEAP** - 512 allocate/stamp/
+              verify/free cycles each through `runtime::Heap`'s global allocator,
+              0 bytes of either core's block ever holding the other's marker
+              (docs/SMP.md 10.0a); then an
               **unmodified static-glibc binary as a Linux cell on a secondary**,
               exact stdout + exit asserted, overlapping a native cell on the
               primary; then **two Linux cells on two cores at once**, each

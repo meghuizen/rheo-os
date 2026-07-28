@@ -13,7 +13,6 @@
 // so `//` comments, not `//!`.
 
 use core::alloc::{GlobalAlloc, Layout};
-use core::cell::UnsafeCell;
 use core::ptr;
 
 /// A hole header is two words: {size, next-addr}. Every free region is at
@@ -188,27 +187,38 @@ impl HoleList {
     }
 }
 
-/// A `GlobalAlloc` wrapper. Single-CPU cooperative access, so the interior
-/// mutability needs no lock; `Sync` is sound for the same reason the kernel's
-/// other statics are (one CPU runs kernel code today).
+/// A `GlobalAlloc` wrapper over the hole list, **behind a lock**.
+///
+/// The lock is not optional and not feature-gated. A free list is one data structure
+/// whose every operation reads and writes several of its links, so two cores allocating
+/// at once hand out overlapping blocks - and the symptom is not a fault, it is two
+/// owners of one buffer writing over each other. Whether a structure needs a lock is a
+/// property of the structure, not of which cargo features are enabled: the same call
+/// `mm::frames` and the NVMe driver already made (docs/SMP.md 10).
+///
+/// This replaced a bare `unsafe impl Sync for Heap` whose stated justification was
+/// "single-CPU kernel; no concurrent access to the allocator" - true when it was
+/// written and false from the moment two cores ran cells, which is exactly the kind of
+/// claim that has to be re-checked rather than inherited (docs/ENGINEERING.md 1).
+///
+/// Cost: an uncontended acquire is two atomics, against a free-list walk that is
+/// already several dependent loads. `Sync` now comes from the lock rather than from an
+/// assertion about the machine.
 pub struct Heap {
-    list: UnsafeCell<HoleList>,
+    list: crate::lock::TicketLock<HoleList>,
 }
-
-// SAFETY: single-CPU kernel; no concurrent access to the allocator.
-unsafe impl Sync for Heap {}
 
 impl Heap {
     pub const fn empty() -> Heap {
         Heap {
-            list: UnsafeCell::new(HoleList::empty()),
+            list: crate::lock::TicketLock::new(HoleList::empty()),
         }
     }
 
     /// # Safety
     /// See `HoleList::init`. Call once before any allocation.
     pub unsafe fn init(&self, base: usize, size: usize) {
-        unsafe { (*self.list.get()).init(base, size) };
+        unsafe { self.list.lock().init(base, size) };
     }
 
     /// Add another backing region to the heap (arena growth). See
@@ -217,17 +227,15 @@ impl Heap {
     /// # Safety
     /// As [`HoleList::add_region`].
     pub unsafe fn add_region(&self, base: usize, size: usize) {
-        unsafe { (*self.list.get()).add_region(base, size) };
+        unsafe { self.list.lock().add_region(base, size) };
     }
 }
 
 unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let list = unsafe { &mut *self.list.get() };
-        list.allocate(layout) as *mut u8
+        self.list.lock().allocate(layout) as *mut u8
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let list = unsafe { &mut *self.list.get() };
-        list.deallocate(ptr as usize, layout);
+        self.list.lock().deallocate(ptr as usize, layout);
     }
 }

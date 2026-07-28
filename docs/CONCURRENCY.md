@@ -29,9 +29,16 @@ is the two-level scheduler's lower rung finally costing what section 3 says it s
 And a vcore **blocks**: the block state is per vcore, so a
 context parking on a timer leaves its siblings runnable - proven by the `schedidle` oracle
 one level down (`bSSSSSSSSB`, one cell, two contexts). So `TicketLock`'s "future multi-vcore
-case" has a mechanism under it now. What is still *not* built is the runtime half: strands
-scheduled over several vcores, with the in-cell work stealing section 2 describes - the
-kernel offers the vcores, `runtime/` does not yet ask for more than one.
+case" has a mechanism under it now. One prerequisite of the runtime half is done: the
+`runtime::Heap` **global allocator is multi-core safe** (`TicketLock`, unconditionally - its
+old `unsafe impl Sync` was justified by "single-CPU kernel", which stopped being true), proven
+by two cores running 512 allocate/stamp/verify/free cycles each with zero cross-marker bytes
+and a general protection fault when the lock is removed. What is still *not* built is the
+runtime half proper: strands scheduled over several vcores, with the in-cell work stealing
+section 2 describes. `strand.rs` is one global `Executor` behind a `static mut` with
+`Rc`-based join handles, so it is per-cell rather than per-vcore; making it per-vcore needs the
+`spawn` / spawn-on-any split a `Send` bound implies, which is an API decision rather than a
+port. The kernel offers the vcores; `runtime/` does not yet ask for more than one.
 
 Position: threads get light by splitting in two. The kernel schedules
 **vcores** (one kernel context each); the runtime inside a cell schedules

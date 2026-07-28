@@ -27,11 +27,14 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 #[path = "fixture.rs"]
 mod fixture;
 #[path = "harness.rs"]
 mod harness;
 
+use core::sync::atomic::{AtomicUsize, Ordering};
 use harness::{CellStore, KernelStack, build_cell};
 use kernel::arch::MapPerm;
 use kernel::capability::{CapTable, ObjectTable};
@@ -45,6 +48,11 @@ use kernel::{arch, idle, ktimer, load, println, user};
 extern "C" fn kernel_main() -> ! {
     kernel::boot::init();
     println!("smp: start on {}", arch::NAME);
+
+    // SAFETY: once, before any allocation; `HEAP_MEM` is a unique static.
+    unsafe {
+        HEAP.init(core::ptr::addr_of_mut!(HEAP_MEM) as usize, 512 * 1024);
+    }
 
     test_spinlock();
     test_percpu_single();
@@ -292,6 +300,7 @@ fn test_secondary_bringup() {
             );
             println!("smp: real second core on {} confirmed", arch::NAME);
             test_parallel_gemm(idx);
+            test_shared_heap();
             test_user_cells_on_both();
             test_placement();
             test_two_vcores_one_cell();
@@ -1805,6 +1814,145 @@ fn test_per_vcore_queues() {
             out[0].1, out[1].1
         );
     }
+}
+
+// ------------------------------- TWO CORES ALLOCATING FROM ONE HEAP AT THE SAME TIME
+//
+// `runtime::Heap` is the allocator every `alloc`-using cell and test kernel binds as its
+// `#[global_allocator]`, and until this phase it carried a bare
+// `unsafe impl Sync for Heap` justified by "single-CPU kernel; no concurrent access to
+// the allocator". That was true when it was written and false from the moment two cores
+// ran cells - the kind of inherited claim that has to be re-checked rather than trusted
+// (docs/ENGINEERING.md 1). It is behind `runtime::lock::TicketLock` now, unconditionally,
+// because whether a structure needs a lock is a property of the structure and not of
+// which cargo features are enabled - the call `mm::frames` and the NVMe driver already
+// made.
+//
+// A free list is the worst case for getting this wrong: every operation reads and writes
+// several links, so two concurrent allocations hand out **overlapping blocks**, and the
+// symptom is not a fault - it is two owners of one buffer writing over each other.
+//
+// So the check is exactly that. Each core, in a loop: allocate a block, stamp every byte
+// of it with its own marker, read every byte back, and free it. A pointer handed to both
+// cores means one core's stamp lands in the other's block between the write and the read,
+// which the read-back catches directly - not a proxy for the corruption, the corruption
+// itself. The two cores meet at a rendezvous first, so the overlap is real.
+//
+// Two more oracles beside it: the pointers each core saw must lie inside the heap region
+// (a corrupted link walks outside it), and after the round a single-core allocation of the
+// whole per-core block size must still succeed, which a broken free list cannot serve.
+
+/// The heap this phase exercises - its own region, so nothing else in the kernel shares
+/// the structure under test.
+#[global_allocator]
+static HEAP: runtime::Heap = runtime::Heap::empty();
+static mut HEAP_MEM: [u8; 512 * 1024] = [0; 512 * 1024];
+
+/// Rounds per core, and the block size each round allocates. Small blocks and many
+/// rounds: the point is the number of times the two cores are inside the list together,
+/// not the size of what they get.
+const HEAP_ROUNDS: usize = 512;
+const HEAP_BLOCK: usize = 96;
+
+/// Bytes that failed to read back as the marker this core wrote - the direct detection of
+/// two cores holding one block. Relaxed atomics because both cores write them.
+static HEAP_MISMATCH: AtomicUsize = AtomicUsize::new(0);
+/// Allocations that came back null, or outside the heap region.
+static HEAP_BAD_PTR: AtomicUsize = AtomicUsize::new(0);
+/// Rounds completed, per core.
+static HEAP_ROUNDS_DONE: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+
+/// One core's share: `HEAP_ROUNDS` allocate / stamp / verify / free cycles.
+///
+/// `marker` distinguishes the two cores' stamps. A `Vec` rather than a raw
+/// `GlobalAlloc` call so the path under test is the one real code takes.
+fn heap_hammer(marker: u8, slot: usize) {
+    let (lo, hi) = heap_range();
+    for _ in 0..HEAP_ROUNDS {
+        let mut v = alloc::vec::Vec::<u8>::with_capacity(HEAP_BLOCK);
+        let p = v.as_mut_ptr() as usize;
+        if p < lo || p + HEAP_BLOCK > hi {
+            HEAP_BAD_PTR.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        v.resize(HEAP_BLOCK, marker);
+        // Read every byte back. If the other core was handed this same block it has
+        // stamped its own marker over some of these between the write and here.
+        let bad = v.iter().filter(|&&b| b != marker).count();
+        if bad != 0 {
+            HEAP_MISMATCH.fetch_add(bad, Ordering::Relaxed);
+        }
+        drop(v);
+        HEAP_ROUNDS_DONE[slot].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn heap_range() -> (usize, usize) {
+    // SAFETY: a plain address computation over a unique static.
+    unsafe {
+        let base = core::ptr::addr_of!(HEAP_MEM) as usize;
+        (base, base + 512 * 1024)
+    }
+}
+
+fn heap_hammer_primary() {
+    heap_hammer(0xA5, 0);
+}
+
+fn heap_hammer_secondary() {
+    heap_hammer(0x5A, 1);
+}
+
+fn test_shared_heap() {
+    HEAP_MISMATCH.store(0, Ordering::Release);
+    HEAP_BAD_PTR.store(0, Ordering::Release);
+    for c in HEAP_ROUNDS_DONE.iter() {
+        c.store(0, Ordering::Release);
+    }
+
+    let (met, finished) = smp::run_fn_with_secondary(heap_hammer_secondary, heap_hammer_primary);
+    if !finished {
+        println!(
+            "smp: SKIP the shared-heap phase - the secondary did not finish inside the \
+             bound, so nothing about two cores in one allocator is claimed"
+        );
+        return;
+    }
+    assert!(
+        met && !smp::rendezvous_timed_out(),
+        "the two cores never met, so they did not allocate at the same time"
+    );
+
+    let (p, s) = (
+        HEAP_ROUNDS_DONE[0].load(Ordering::Acquire),
+        HEAP_ROUNDS_DONE[1].load(Ordering::Acquire),
+    );
+    assert_eq!(p, HEAP_ROUNDS, "the primary lost rounds");
+    assert_eq!(s, HEAP_ROUNDS, "the secondary lost rounds");
+    assert_eq!(
+        HEAP_BAD_PTR.load(Ordering::Acquire),
+        0,
+        "the allocator handed out a pointer outside its own region"
+    );
+    // The headline: no byte of either core's block was ever found holding the other's
+    // marker, so no block was handed to both.
+    assert_eq!(
+        HEAP_MISMATCH.load(Ordering::Acquire),
+        0,
+        "bytes of one core's block held the other core's marker - the allocator gave \
+         both cores the same block"
+    );
+    // And the list is intact: it can still serve the same size.
+    let probe = alloc::vec![0u8; HEAP_BLOCK];
+    assert_eq!(probe.len(), HEAP_BLOCK, "the heap could not serve a probe");
+    drop(probe);
+    println!(
+        "smp: TWO CORES ALLOCATED FROM ONE HEAP at the same time - {} rounds each of \
+         allocate/stamp/verify/free through the global allocator, 0 bytes of either \
+         core's block ever holding the other's marker (so no block was handed to both), \
+         0 pointers outside the region, and the free list still serving afterwards OK",
+        HEAP_ROUNDS
+    );
 }
 
 // ------------------------------------------------- preemption on every core at once

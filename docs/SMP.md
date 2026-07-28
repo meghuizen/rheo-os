@@ -1092,9 +1092,38 @@ proves per-vcore *servicing*, and the two are asserted separately rather than co
 second vcore needs `USER_QUEUE_VA + v * REGION_SIZE`, which is one line and is deliberately
 not written until a loaded cell asks, since nothing would test it.
 
+**The userspace allocator is multi-core safe** - the prerequisite the userspace half sits on,
+and a genuine latent defect rather than a feature. `runtime::Heap` is the `#[global_allocator]`
+every `alloc`-using cell and test kernel binds, and it carried a bare `unsafe impl Sync for
+Heap` justified by *"single-CPU kernel; no concurrent access to the allocator"*. That was true
+when it was written and false from the moment two cores ran cells - an inherited claim, which
+is the kind that has to be re-checked rather than trusted (docs/ENGINEERING.md 1). A free list
+is the worst case for getting it wrong: every operation reads and writes several links, so two
+concurrent allocations hand out **overlapping blocks**, and the symptom is not a fault but two
+owners of one buffer writing over each other.
+
+It is behind `runtime::lock::TicketLock` now - the lock whose own doc said it was "for the
+future multi-vcore case" - **unconditionally**, because whether a structure needs a lock is a
+property of the structure and not of which cargo features are enabled, the call `mm::frames`
+and the NVMe driver already made. An uncontended acquire is two atomics against a free-list
+walk that is already several dependent loads.
+
+Proven by the `smp` kernel's shared-heap phase on all three ISAs: each core runs 512
+allocate / stamp-every-byte / read-every-byte-back / free cycles through the global allocator,
+meeting at a rendezvous first so the overlap is real. A block handed to both cores means one
+core's marker lands in the other's block between the write and the read, which the read-back
+catches **directly** - the corruption itself, not a proxy for it. Asserted: 0 mismatched bytes,
+0 pointers outside the heap region, both cores completing all their rounds, and the free list
+still serving afterwards. Reverting to the unlocked `UnsafeCell` + `unsafe impl Sync` produces
+a **general protection fault inside the allocator** (x86-64 vector 13) - a harder failure than
+the mismatch counter was built to report, which is the same defect in its unsurvivable form.
+
 **Still not done** and named: a vcore that forks or takes a signal, the loaded-cell ring
-placement just named, and the userspace half - `runtime/`'s strand executor still asks for one
-vcore, so nothing yet schedules strands across several (docs/CONCURRENCY.md).
+placement just named, and the userspace half proper - `runtime/`'s strand executor is still one
+global `Executor` behind a `static mut` with `Rc`-based join handles, so it is per-cell rather
+than per-vcore and nothing yet schedules strands across several (docs/CONCURRENCY.md). Making
+it per-vcore needs the `spawn` / `spawn`-on-any split a `Send` bound implies, which is an API
+decision, not a port.
 
 **The proof** (the `smp` kernel's two-vcore phase, all three ISAs): two vcores of **one**
 cell go into the placement queue and whichever cores are free claim them. Both are
