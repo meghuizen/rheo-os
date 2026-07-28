@@ -224,22 +224,34 @@ hand-written number, with guard gaps and per-ISA ceilings - is what remains.
 the fixed placements (image, stack, queue, channel, the `.user` window) as
 reservations so new regions are allocated *around* them.
 
-**Recording was tried on its own and does not stand on its own** - a finding
-worth having before the next attempt. A per-cell `VaSpace` was added, every
-region a cell is given was recorded as it was established, and `munmap` was
-changed to classify an address by *asking* the recorded layout rather than by
-which constant range it falls in (the inference this module's own header rules
-out). It worked, and it broke the `security` kernel: recording grows a funded
-table, so the first `reserve_fixed` costs the cell a frame, and that frame
-lands inside the per-operation frame-cost oracles the suite asserts on. Same
-lesson as S1' - *a funded table's one-off growth must not land inside a
-per-operation measurement* - now recurring per cell rather than globally.
+**The map is now recorded, and `munmap` asks it instead of inferring.** A
+per-cell `VaSpace` holds every region a cell is given - its queue ring, its
+channel slots, its grants, its anonymous and file mappings - recorded as each
+is established. `SYS_MUNMAP` used to decide what an address was by which
+constant range it fell in, the inference this module's own header rules out
+and one that is wrong the moment a region moves or a new one is added between
+two others; it now looks the address up. The record is **load-bearing**, not
+decoration: with the anonymous-region record removed the legitimate
+mmap/write/munmap round trip is refused, observed. Records are given back when
+a whole region is unmapped, so a cell that churns mappings cannot exhaust its
+table.
 
-So recording and placing have to land **together**, with the frame cost either
-funded at a reset point (S1's answer for the mapped-file registry) or folded
-into the oracles deliberately. Recording alone buys a better classification
-and pays a frame per cell for it; that is not a trade worth making halfway.
-The attempt is reverted; the ceilings above are unaffected and stay.
+Getting there needed the S1' lesson a second time, and it is worth writing
+down because it recurred at a different scope. A first attempt charged each
+cell's table to the cell and let it grow lazily - so the first `reserve_fixed`
+took a frame, and that frame landed inside the per-operation frame-cost
+oracles the suite asserts on, breaking the `security` kernel. *A funded
+table's one-off growth must not land inside a per-operation measurement*, now
+per cell rather than globally. Every cell's table is therefore funded **once
+at boot** (`user::init_layouts`), which makes the cost a boot cost and is the
+same answer S1' gave for the mapped-file registry - including the same honest
+consequence, that exhaustion there names the kernel rather than the cell.
+
+What remains is **placement**: the regions are still put where the constants
+say, and the allocator is only asked to remember it. Flipping `reserve_fixed`
+to `reserve` makes the address a result, and it is a small change now that the
+recording is in place and proven - the fixed placements it has to allocate
+around are already recorded.
 
 - A **per-cell VA allocator over a real VMA structure** (possible once
   pillar 1 exists - today's "no VMA list" is a metadata-space problem)

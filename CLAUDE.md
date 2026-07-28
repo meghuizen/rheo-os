@@ -1833,7 +1833,18 @@ range instead of refusing. Each region is now bounded by its neighbour, on the c
 path and on the peer's in `SYS_GRANT_SHARE`, and `security` proves it with the property
 that makes a refusal clean - an over-large grant is refused **and** the next ordinary
 grant still lands at the window base, so nothing was consumed. The map's internal *order*
-is a compile-time assertion now rather than a comment. Honest: the anon ceiling is
+is a compile-time assertion now rather than a comment. **The map is also recorded**: a
+per-cell `VaSpace` holds every region a cell is given, and `SYS_MUNMAP` classifies an
+address by asking it instead of by which constant range it falls in - load-bearing, not
+decoration (removing the anon record makes the legitimate mmap/write/munmap round trip
+fail, observed), with records handed back on a whole-region unmap so a churning cell
+cannot exhaust its table. That needed the S1' lesson a second time: a first attempt let
+each cell's table grow lazily, so its first frame landed inside the per-operation
+frame-cost oracles and broke `security`; the tables are funded **once at boot**
+(`user::init_layouts`), the same answer S1' gave for the mapped-file registry. What
+remains is **placement** - the regions still go where the constants say and the allocator
+only remembers it; flipping `reserve_fixed` to `reserve` is small now that the fixed
+placements it must allocate around are recorded. Honest: the anon ceiling is
 **unproven** - it cannot be reached in one call, because the frame budget refuses any span
 big enough to cross the window first, and a first version of that proof passed with the
 ceiling deleted and was removed rather than kept as decoration. Placing the regions with

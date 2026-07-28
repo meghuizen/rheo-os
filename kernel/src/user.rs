@@ -29,6 +29,64 @@ use crate::sched::{Admission, AdmitError, Reservation};
 
 /// Base VA of the per-cell anonymous mmap region (docs/USERLAND.md M2): 12 GiB,
 /// above the image (1-4 GiB) and stack (8 GiB), free in every cell root.
+/// Each cell's **recorded** address-space layout (docs/SUBSTRATE.md pillar 2, S2').
+///
+/// A parallel array rather than a field of `RunCell`, because `RunCell` is `Copy` - it
+/// is assigned and read wholesale - and a `VaSpace` owns a funded table.
+///
+/// What this buys before placement moves into the allocator: the map stops being
+/// *inferred*. `SYS_MUNMAP` decided what an address was by asking which constant range
+/// it fell in - the inference `mm/vaspace.rs`'s own header rules out, and one that is
+/// wrong the moment a region moves or a new one is added between two others. Every
+/// region a cell actually gets is now recorded as it is established, and an address is
+/// classified by looking it up.
+static mut CELL_VA: [crate::mm::vaspace::VaSpace; MAX_CELLS] =
+    [const { crate::mm::vaspace::VaSpace::new() }; MAX_CELLS];
+
+/// Records pre-funded per cell at boot. Enough for the regions a cell establishes -
+/// its queue ring, its channel slots, its grants and its mappings - without growing.
+const LAYOUT_RECORDS: usize = 64;
+
+/// Fund every cell's layout table **once, at boot**.
+///
+/// The frames have to be taken here and not on first use. A funded table grows lazily,
+/// so its first frame is charged to whichever operation happens to be first - and every
+/// per-operation frame-cost oracle in the suite then moves by that frame. A first
+/// attempt at recording layouts did exactly that and broke the `security` kernel; this
+/// is the S1' answer (docs/SUBSTRATE.md 15) applied per cell: pay at a reset point, so
+/// the cost is a boot cost.
+///
+/// Charged to `Owner::KERNEL` rather than to each cell, which is the honest consequence
+/// of making it a boot cost: an exhaustion here names the kernel, not the cell that
+/// would have grown the table. That is the same trade the mapped-file registry makes.
+pub fn init_layouts() {
+    for i in 0..MAX_CELLS {
+        let va = cell_va(i);
+        va.init(crate::mm::kmeta::Owner::KERNEL);
+        va.fund(LAYOUT_RECORDS);
+    }
+}
+
+/// Cell `idx`'s recorded layout.
+#[allow(clippy::mut_from_ref)]
+fn cell_va(idx: usize) -> &'static mut crate::mm::vaspace::VaSpace {
+    // SAFETY: a cell belongs to one core (`cell_on_this_cpu`), and its layout is only
+    // touched while servicing that cell's own trap or while installing it.
+    unsafe { &mut (*core::ptr::addr_of_mut!(CELL_VA))[idx] }
+}
+
+/// Record a region a cell has been given, ignoring a refusal.
+///
+/// Best-effort on purpose. A `.user`-window cell's code and stack are linked beside the
+/// kernel on two of the three ISAs, i.e. **above** the allocator's ceiling, so recording
+/// them is refused `OutOfRange` - and correctly so: an address the allocator can never
+/// hand out cannot collide with one it does. This is a *description* of what a cell
+/// holds until placement moves into the allocator, and a description that cannot be
+/// stored is not a failure of the operation being described.
+fn record_region(idx: usize, base: usize, len: usize, kind: crate::mm::vaspace::RegionKind) {
+    let _ = cell_va(idx).reserve_fixed(base, len, kind, 0);
+}
+
 const MMAP_BASE: usize = 0x3_0000_0000;
 /// Exclusive top of the anonymous-`mmap` window - **the queue region's base**.
 ///
@@ -980,6 +1038,7 @@ fn mmap_anon(cur: usize, len: usize) -> usize {
     unsafe {
         *core::ptr::addr_of_mut!(MMAP_NEXT) = top;
     }
+    record_region(cur, base, top - base, crate::mm::vaspace::RegionKind::Anon);
     base
 }
 
@@ -1050,6 +1109,7 @@ fn grant_create(cur: usize, out_va: u64, len: usize, kind: u64, _flags: u64) -> 
         return u64::MAX;
     }
     cells()[cur].grant_next = top;
+    record_region(cur, base, bytes, crate::mm::vaspace::RegionKind::Grant);
     *slot = GrantSlot {
         in_use: true,
         base,
@@ -1100,6 +1160,13 @@ fn sys_munmap(cur: usize, va: usize, len: usize) -> u64 {
         return u64::MAX;
     };
 
+    // Which region is this? **Asked, not inferred.** The classification below used to
+    // be "which constant range does the address fall in", which is wrong the moment a
+    // region moves or a new one is added between two others - the inference
+    // `mm/vaspace.rs`'s own header rules out. The cell's recorded layout answers it
+    // directly; the range tests remain the authority on *extent* until placement moves
+    // into the allocator too (docs/SUBSTRATE.md pillar 2).
+
     // (1) A typed memory grant of this cell, addressed by its reservation VA.
     if base >= GRANT_BASE {
         let slot = cell_grants(cur)
@@ -1117,22 +1184,40 @@ fn sys_munmap(cur: usize, va: usize, len: usize) -> u64 {
         // typed grants does not leak the fixed per-cell slot table.
         if base == slot.base {
             release_grant_at(cur, base);
+            cell_va(cur).release_at(base);
         }
         return 0;
     }
 
-    // (2) The cell's own anonymous-mmap region, and (3) its file-mmap region -
-    // both bump allocators whose frames this cell alone holds. Everything else,
-    // notably the queue-pair region (16 GiB) and the shared channel slots
-    // (24 GiB), is refused.
-    let anon_top = unsafe { *core::ptr::addr_of!(MMAP_NEXT) };
-    let file_top = cells()[cur].filemmap_next;
-    let owned = (base >= MMAP_BASE && end <= anon_top)
-        || (base >= FILEMMAP_BASE && end <= file_top && FILEMMAP_BASE < file_top);
+    // (2) The cell's own anonymous-mmap region, and (3) its file-mmap region - the two
+    // whose frames this cell alone holds. Everything else is refused, notably the
+    // queue-pair region the kernel still has a raw overlay onto and the shared channel
+    // slots mapped into two cells.
+    //
+    // **Which one this is, is asked rather than inferred.** It used to be decided by
+    // which constant range the address fell in - the inference `mm/vaspace.rs`'s own
+    // header rules out, and one that is wrong the moment a region moves or a new one is
+    // added between two others. The cell's recorded layout answers it directly
+    // (docs/SUBSTRATE.md pillar 2); the extent test that follows is still the
+    // authority on *how much* of the region the call may unmap.
+    let region = cell_va(cur).find(base);
+    let owned = matches!(
+        region.map(|r| r.kind),
+        Some(crate::mm::vaspace::RegionKind::Anon | crate::mm::vaspace::RegionKind::File)
+    ) && region.map(|r| end <= r.end()).unwrap_or(false);
     if !owned {
         return u64::MAX;
     }
     unmap_range(base, end - base);
+    // Give the record back when the whole region goes, so a cell that churns mappings
+    // does not exhaust its layout table - the same reasoning that frees a grant slot on
+    // a full-reservation unmap just above.
+    if let Some(r) = region
+        && base == r.base
+        && end == r.end()
+    {
+        cell_va(cur).release_at(base);
+    }
     0
 }
 
@@ -1352,6 +1437,7 @@ fn mmap_file(cur: usize, fd: u64, offset: u64, len: usize) -> usize {
         return 0;
     }
     cells()[cur].filemmap_next = top;
+    record_region(cur, base, bytes, crate::mm::vaspace::RegionKind::File);
     let got = with_current_aspace(|aspace| {
         let mut got = 0;
         for i in 0..pages {
@@ -1539,6 +1625,9 @@ pub unsafe fn install(
         cpu: NO_CPU,
     };
     *cell_grants(idx) = [EMPTY_GRANT; MAX_GRANTS_PER_CELL];
+    // A fresh cell starts with an empty recorded layout. `clear`, not `init`: the
+    // table's frames are a boot cost this slot reuses (see `init_layouts`).
+    cell_va(idx).clear();
     // SAFETY: single CPU; a fresh cell starts with no frames charged.
     unsafe { (*core::ptr::addr_of_mut!(CELL_FRAMES))[idx] = 0 };
     // Give the cell a fair-class vcore on this CPU's ready queue, so the scheduler
@@ -1559,6 +1648,12 @@ pub fn set_queue_info(idx: usize, qp_va: u64, cap_id: u32) {
     assert!(cells()[idx].present, "set_queue_info on empty slot {idx}");
     cells()[idx].qp_va = qp_va;
     cells()[idx].qp_cap_id = cap_id;
+    record_region(
+        idx,
+        qp_va as usize,
+        QueuePair::REGION_SIZE,
+        crate::mm::vaspace::RegionKind::Queue,
+    );
 }
 
 /// Record the mapped cross-cell shared channel for cell `idx` (docs/LIBRHEO.md
@@ -1583,6 +1678,12 @@ pub fn set_channel_slot(idx: usize, slot: usize, chan_va: u64, cap_id: u32, role
         cap_id,
         role,
     };
+    record_region(
+        idx,
+        chan_va as usize,
+        QueuePair::REGION_SIZE,
+        crate::mm::vaspace::RegionKind::Channel,
+    );
 }
 
 /// This cell's channel end `slot` as `(chan_va, role)` (`(0, 0)` = none)

@@ -217,6 +217,36 @@ impl VaSpace {
         self.top = arch::USER_VA_TOP;
     }
 
+    /// Pre-fund the region table to `want` records, so the frames it needs are taken
+    /// **now** rather than on the first reservation.
+    ///
+    /// The reason is measurement, not speed. A funded table grows lazily, so its first
+    /// frame is charged to whichever operation happens to be first - and if that
+    /// operation is inside a proof's frame-cost oracle, the oracle moves. That is the
+    /// S1' lesson (docs/SUBSTRATE.md 15) recurring per cell: a first attempt at
+    /// recording cell layouts broke the `security` kernel exactly this way. Funding
+    /// every cell's table once at boot puts the cost outside every measurement.
+    ///
+    /// Returns false if the frames are not available.
+    pub fn fund(&mut self, want: usize) -> bool {
+        self.regions.reserve(want)
+    }
+
+    /// Empty the space **without** giving its frames back, so the next occupant of the
+    /// slot reuses the table this one was funded with.
+    ///
+    /// The counterpart of [`VaSpace::fund`]: `init` releases and re-charges, which is
+    /// right when the table's storage is the cell's own, and wrong when it is a boot
+    /// cost being reused.
+    pub fn clear(&mut self) {
+        for i in 0..self.high_water {
+            self.regions.set(i, Region::FREE);
+        }
+        self.high_water = 0;
+        self.hint = VA_FLOOR;
+        self.top = arch::USER_VA_TOP;
+    }
+
     /// Lower the allocation ceiling (never above the ISA's own limit).
     ///
     /// The one legitimate use is running a cell inside a narrower address space

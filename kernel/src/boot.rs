@@ -31,4 +31,8 @@ pub fn init() {
     crate::hw::detect();
     crate::rng::init();
     crate::svc::init();
+    // Pre-fund every cell's recorded address-space layout, so the frames its table
+    // needs are a boot cost rather than being charged to whichever operation happens to
+    // establish a cell's first region (docs/SUBSTRATE.md pillar 2).
+    crate::user::init_layouts();
 }
