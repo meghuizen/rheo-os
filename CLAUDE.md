@@ -201,9 +201,10 @@ bytes streamed - because that is the claim being made about the seam; plus a
 **write round trip** (last sector, fresh handle so the cache cannot answer it,
 pattern written and read back, then the original restored and read back, so the
 device must return two different things for one sector in order) on a drive
-attached `snapshot=on` so the committed fixture is untouched. Honest: one I/O queue
-pair, polled, no MSI-X, no per-core queue, no IOMMU-contained storage cell, and
-transfers bounce through one page-aligned frame a page at a time so `PRP1`
+attached `snapshot=on` so the committed fixture is untouched. Honest: polled, no MSI-X and no
+completion interrupt (so a waiting core spins rather than parking through
+`idle`/`ktimer` as every other wait does), no IOMMU-contained storage cell, and
+transfers bounce through page-aligned frames one page per command so `PRP1`
 addresses every command and no PRP list is built.
 
 **And the storage data path is per-core** (docs/SUBSTRATE.md S5, the `smp` kernel's
@@ -225,7 +226,23 @@ underneath - and this device *is* reached from two. It is a `SpinLock` now, neve
 contended because of the partitioning, with a `const` assertion that `Nvme: Sync` so a
 future field cannot undo it silently (the same call `mm::frames` already made: whether a
 structure needs a lock is a property of the structure, not of which cargo features are
-enabled). The second of those was only reachable because **ARM64 CPU enumeration was
+enabled). **The queue also has depth**: a core issues up to 8 commands with **one
+doorbell**, each staging through its own frame from a per-channel pool, instead of paying
+a controller round trip per page - asserted by a read large enough to fill a batch, with
+every page of the batch checked against the same page read singly (a count alone would
+not catch a batch that mixed its pages up), and the assertion observed failing when the
+plan is reverted to one command per batch. Worth recording about the completion path:
+QEMU's controller genuinely reorders (all eight completions of an eight-deep batch arrive
+out of submission order), but **two drafts claimed more than that supports and both
+negative controls passed** - one said assuming submission order would corrupt on
+hardware, the next restructured the copy to happen per completion so the command
+identifier would be load-bearing, and substituting submission order for the looked-up
+identifier changed nothing either time, because each command's `PRP1` already names its
+own staging frame and a batch that waits for all N does disjoint copies whose order
+cannot matter. The identifier's real job here is bounding a completion to its batch; it
+becomes load-bearing only once a completion is acted on before its siblings arrive, which
+is the interrupt path and is not built. The second draft was reverted rather than kept.
+The RefCell fix was only reachable because **ARM64 CPU enumeration was
 fixed first** - see docs/SMP.md 7: `discover` reported one CPU while four ran, so the
 driver sized its queues from a field that lied. It now enumerates from PSCI
 `AFFINITY_INFO` (`arch/aarch64/psci.S`, always compiled - how many CPUs a machine has is

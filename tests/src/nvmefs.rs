@@ -166,6 +166,46 @@ extern "C" fn kernel_main() -> ! {
          then the original restored and read back"
     );
 
+    // --- queue depth --------------------------------------------------------
+    //
+    // The property that separates NVMe from a paravirtual block transport: more
+    // than one command outstanding at a time, one doorbell for the batch, and
+    // completions matched by command id rather than assumed to arrive in order.
+    //
+    // Asserted with a read big enough to fill a batch. The bytes matter as much as
+    // the count: a batch that reaped the wrong completion for a slot would still
+    // report the right *number* of commands, and only the contents catch it - so
+    // this reads a span whose every page differs and checks it against the same
+    // span read one page at a time.
+    let depth_before = nvme::max_inflight();
+    let mut batched = [0u8; 8 * 4096];
+    dev2.read(16, &mut batched).expect("batched read");
+    let after = nvme::max_inflight();
+    assert!(
+        after >= 8,
+        "nvmefs: max {after} command(s) outstanding - the driver is still one-at-a-time"
+    );
+
+    // The same span, one page per call, so each read is its own single-command
+    // batch. Byte-identical or the batch matched a completion to the wrong slot.
+    for p in 0..8 {
+        let mut one = [0u8; 4096];
+        dev2.read(16 + (p as u64) * 8, &mut one).expect("page read");
+        let lo = p * 4096;
+        assert!(
+            one == batched[lo..lo + 4096],
+            "nvmefs: page {p} of the batch differs from the same page read alone"
+        );
+    }
+    println!(
+        "nvmefs: queue depth OK - {} command(s) outstanding at once (was {depth_before} before), \
+         one doorbell per batch, and every page of a {}-page batch matches the same page \
+         read singly; {} completion(s) arrived out of submission order",
+        after,
+        batched.len() / 4096,
+        nvme::out_of_order()
+    );
+
     println!("nvmefs: PASS");
     arch::exit(arch::ExitCode::Success)
 }

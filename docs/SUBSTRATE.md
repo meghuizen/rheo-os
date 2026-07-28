@@ -1054,11 +1054,38 @@ kernel.
     for the same reason: whether a structure needs a lock is a property of the
     structure, not of which cargo features are enabled.
 
-  **Not done:** no MSI-X and no interrupt (completions are polled), no
-  IOMMU-contained storage *cell*, and no queue depth - one command outstanding
-  per core at a time. Transfers bounce through a page-aligned frame one page at a
-  time, so `PRP1` addresses every command and no PRP list is built - correct, and
-  the simple form on purpose, since a PRP list buys throughput TCG cannot show.
+  **And the queue has depth.** A core issues up to 8 commands with **one
+  doorbell**, each staging through its own frame from a per-channel pool, rather
+  than paying a controller round trip per page. `nvmefs` asserts it with a read
+  large enough to fill a batch, and checks the bytes as well as the count: every
+  page of an 8-page batch equals the same page read singly, because a count alone
+  would not catch a batch that mixed its pages up. Reverting the plan to one
+  command per batch fails the assertion by name.
+
+  The completion path is where NVMe stops resembling a paravirtual transport, and
+  it is worth recording what is and is not true of it, because **two drafts
+  claimed more than the evidence supported and both negative controls passed**.
+  QEMU's controller genuinely reorders - all eight completions of an eight-deep
+  batch arrive out of submission order, which the driver counts. The first draft
+  said assuming submission order "would pass here and corrupt on hardware"; the
+  second restructured the copy to happen per completion so the identifier would be
+  load-bearing. Substituting the submission order for the looked-up identifier
+  changed nothing either time, because each command's `PRP1` already names its own
+  staging frame, so the data lands correctly however the reap is ordered, and a
+  batch that waits for all `n` before returning does disjoint copies whose order
+  cannot matter. What the identifier actually does here is bound the completion to
+  this batch - a completion from outside it means the ring state is wrong and is
+  failed on rather than counted as progress. It becomes load-bearing the moment a
+  completion is acted on before its siblings arrive, which is what the interrupt
+  path below will do. The second draft was reverted rather than kept, since it was
+  more code for a property it did not yet have.
+
+  **Not done:** no MSI-X and no interrupt - completions are polled, so a waiting
+  core spins rather than parking through `idle`/`ktimer` as every other wait in
+  this kernel does; and no IOMMU-contained storage *cell*. Transfers bounce
+  through page-aligned frames one page per command, so `PRP1` addresses every
+  command and no PRP list is built - correct, and the simple form on purpose,
+  since a PRP list buys throughput TCG cannot show.
 - **S6 - NUMA pools + core classes.** Placement proven in QEMU
   (chosen-node assertions), P/E and latency measured at the lab.
 - **S7 - workload gates.** Real Node.js already runs to completion

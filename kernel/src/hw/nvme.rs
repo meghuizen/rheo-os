@@ -82,6 +82,22 @@ const CQE_BYTES: usize = 16;
 /// `PRP2`, NVMe 1.4 section 4.3).
 const XFER: usize = 4096;
 
+/// Commands a core may have outstanding at once - the **queue depth**.
+///
+/// This is the property that separates NVMe from a paravirtual block transport,
+/// and the reason it needs saying: a driver that issues one command and waits for
+/// it has the device's register layout without its design. Every transfer costs a
+/// full round trip to the controller, so a 32 KiB read is eight round trips in
+/// series rather than one batch of eight - and, more importantly, the completion
+/// path is never asked the question NVMe exists to answer, because with one
+/// command outstanding the completion at the ring head is necessarily *that*
+/// command. With depth, **completions may arrive in any order**, so they are
+/// matched by command identifier rather than assumed (NVMe 1.4 section 4.6).
+///
+/// Eight is bounded by what a batch costs in staging memory: `DEPTH` frames per
+/// channel, `MAX_IOQ` channels, so 256 KiB of bounce buffers on an 8-CPU machine.
+const DEPTH: usize = 8;
+
 /// A submission-queue entry (NVMe 1.4 figure 105). Written field by field rather
 /// than as a struct literal in the hot path, but declared here so the layout is
 /// checked once.
@@ -198,9 +214,11 @@ impl Queue {
 /// cargo features are enabled (docs/SMP.md).
 struct Chan {
     q: SpinLock<Queue>,
-    /// The bounce frame this core's transfers go through.
-    bounce_va: usize,
-    bounce_pa: u64,
+    /// This core's bounce frames, one per command that can be outstanding. A pool
+    /// rather than a single frame because a batch stages every command's data at
+    /// once - with one frame the second command would overwrite the first's.
+    bounce_va: [usize; DEPTH],
+    bounce_pa: [u64; DEPTH],
 }
 
 /// The most I/O queue pairs to create - one per CPU, capped where the controller
@@ -261,6 +279,29 @@ pub fn submits(c: usize) -> u64 {
 /// **Must be zero** - see [`submits`].
 pub fn cross_core_submits() -> u64 {
     CROSS_CORE.load(Ordering::Relaxed)
+}
+
+/// The largest number of commands this driver has had outstanding at one instant,
+/// and how many completions arrived in an order other than the one they were
+/// submitted in.
+///
+/// Both are measurements of the same thing from opposite sides: `1` for the first
+/// would mean the driver is issuing one command per round trip whatever the ring
+/// can hold, and the second is only ever nonzero if the completion path really is
+/// matching by command id rather than assuming order (it may legitimately be zero
+/// on a device that happens to complete in order - which is why the depth, not the
+/// reorder count, is what gets asserted).
+static MAX_INFLIGHT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static OUT_OF_ORDER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The largest batch this driver has had outstanding at one instant.
+pub fn max_inflight() -> u64 {
+    MAX_INFLIGHT.load(Ordering::Relaxed)
+}
+
+/// Completions that arrived out of submission order.
+pub fn out_of_order() -> u64 {
+    OUT_OF_ORDER.load(Ordering::Relaxed)
 }
 
 impl Nvme {
@@ -397,42 +438,143 @@ impl Nvme {
         self.io.get(cpu).and_then(|c| c.as_ref()).map(|c| (cpu, c))
     }
 
-    /// One `NVM READ`/`NVM WRITE` of `XFER` bytes at logical block `lba`, through
-    /// this CPU's own queue pair and bounce frame.
-    fn rw_page(&self, write: bool, lba: u64, blocks: u16) -> Result<(), BlkError> {
-        let Some((idx, ch)) = self.chan() else {
-            return Err(BlkError::NoDevice);
-        };
-        let bounce_pa = ch.bounce_pa;
-        SUBMITS[idx].fetch_add(1, Ordering::Relaxed);
-        let sqe = Sqe {
-            cdw0: if write { NVM_WRITE } else { NVM_READ } as u32,
-            nsid: 1,
-            prp1_lo: bounce_pa as u32,
-            prp1_hi: (bounce_pa >> 32) as u32,
-            cdw10: lba as u32,
-            cdw11: (lba >> 32) as u32,
-            // NLB is zero-based: 0 means one block.
-            cdw12: (blocks - 1) as u32,
-            ..Default::default()
-        };
-        // Queue ids are 1-based (0 is admin), so CPU `idx` owns queue `idx + 1`.
-        match self.submit_on(idx as u16 + 1, &ch.q, sqe) {
-            Some(0) => Ok(()),
-            Some(s) => {
-                crate::println!("nvme: {} lba {lba} failed, status {s:#x}", {
-                    if write { "write" } else { "read" }
-                });
-                Err(BlkError::Io)
+    /// Submit `n` `NVM READ`/`NVM WRITE` commands - one page each, command `i`
+    /// staging through `ch.bounce[i]` - and reap all `n` completions.
+    ///
+    /// **One doorbell for the batch.** The doorbell is the expensive part (an MMIO
+    /// write the controller polls for), so ringing it once for `n` commands rather
+    /// than once each is what depth buys. With `n` outstanding the controller may
+    /// complete them in any order, and QEMU's does: all eight of an eight-deep
+    /// batch arrive out of submission order here, which [`out_of_order`] counts.
+    ///
+    /// **What the command identifier is for, stated precisely.** It is *not* what
+    /// puts each page in the right place - each command's `PRP1` already names its
+    /// own staging frame, chosen at submission, so the data lands correctly however
+    /// the completions are ordered and whatever the reap believes. It is a bounds
+    /// check: a completion whose id is outside this batch means the ring state is
+    /// wrong, and that is worth failing on rather than counting as progress.
+    ///
+    /// This is written out because two drafts claimed more. The first said
+    /// assuming completion order "would pass here and corrupt on hardware"; the
+    /// second reorganised the copy to happen per completion so the identifier would
+    /// be load-bearing. **Both negative controls passed** - substituting the
+    /// submission order for the looked-up slot changed nothing, because a batch
+    /// that waits for all `n` before returning does disjoint copies whose order
+    /// cannot matter. The identifier becomes load-bearing the moment a completion
+    /// is acted on before its siblings arrive, which is what an interrupt-driven
+    /// path does and this one does not yet (docs/SUBSTRATE.md S5).
+    fn rw_batch(
+        &self,
+        qid: u16,
+        ch: &Chan,
+        write: bool,
+        first_lba: u64,
+        blocks: &[u16],
+    ) -> Result<(), BlkError> {
+        let n = blocks.len();
+        debug_assert!(n <= DEPTH);
+        let base_cid;
+        let tail;
+        {
+            let mut q = ch.q.lock();
+            base_cid = q.cid;
+            let mut lba = first_lba;
+            for (i, &nblk) in blocks.iter().enumerate() {
+                let cid = base_cid.wrapping_add(i as u16);
+                let pa = ch.bounce_pa[i];
+                let sqe = Sqe {
+                    cdw0: (if write { NVM_WRITE } else { NVM_READ } as u32) | ((cid as u32) << 16),
+                    nsid: 1,
+                    prp1_lo: pa as u32,
+                    prp1_hi: (pa >> 32) as u32,
+                    cdw10: lba as u32,
+                    cdw11: (lba >> 32) as u32,
+                    // NLB is zero-based: 0 means one block.
+                    cdw12: (nblk - 1) as u32,
+                    ..Default::default()
+                };
+                // SAFETY: `sq_va` is a mapped frame holding `QDEPTH` entries and
+                // `sq_tail` is kept below QDEPTH, so the write stays inside it.
+                unsafe {
+                    (q.sq_va as *mut Sqe)
+                        .add(q.sq_tail as usize)
+                        .write_volatile(sqe)
+                };
+                q.sq_tail = (q.sq_tail + 1) % QDEPTH;
+                lba += nblk as u64;
             }
-            None => Err(BlkError::Io),
+            q.cid = base_cid.wrapping_add(n as u16);
+            tail = q.sq_tail;
         }
+        // Every entry must be visible to the device before the doorbell that tells
+        // it to look - one doorbell, after all of them.
+        fence(Ordering::SeqCst);
+        self.ring_sq(qid, tail);
+        note_inflight(n as u64);
+
+        // Reap `n` completions, in whatever order they arrive.
+        let mut seen = 0usize;
+        let mut expect_next = 0u16; // the submission order, for the reorder counter
+        let deadline = arch::timer_now_ns() + 5_000_000_000; // 5 s
+        while seen < n {
+            let (cq_va, head, want) = {
+                let q = ch.q.lock();
+                (q.cq_va, q.cq_head, q.phase)
+            };
+            // SAFETY: `cq_va` is a mapped frame of `QDEPTH` completion entries and
+            // `head` is below QDEPTH.
+            let cqe: Cqe = unsafe { (cq_va as *const Cqe).add(head as usize).read_volatile() };
+            if (cqe.status & (1 << 16) != 0) == want {
+                fence(Ordering::SeqCst);
+                let cid = (cqe.status & 0xFFFF) as u16;
+                let status = (cqe.status >> 17) as u16;
+                let slot = cid.wrapping_sub(base_cid);
+                if slot as usize >= n {
+                    // A completion for a command this batch did not submit. Nothing
+                    // else uses this queue, so it means the ring state is wrong -
+                    // reported rather than silently counted as progress.
+                    crate::println!("nvme: queue {qid} completed unknown cid {cid}");
+                    return Err(BlkError::Io);
+                }
+                if slot != expect_next {
+                    OUT_OF_ORDER.fetch_add(1, Ordering::Relaxed);
+                }
+                expect_next = expect_next.wrapping_add(1);
+                let new_head = {
+                    let mut q = ch.q.lock();
+                    q.cq_head = (head + 1) % QDEPTH;
+                    if q.cq_head == 0 {
+                        q.phase = !q.phase;
+                    }
+                    q.cq_head
+                };
+                self.ring_cq(qid, new_head);
+                if status != 0 {
+                    crate::println!(
+                        "nvme: {} lba {first_lba}+{slot} failed, status {status:#x}",
+                        if write { "write" } else { "read" }
+                    );
+                    return Err(BlkError::Io);
+                }
+                seen += 1;
+                continue;
+            }
+            if self.rd32(REG_CSTS) & CSTS_CFS != 0 {
+                crate::println!("nvme: controller fatal status while draining queue {qid}");
+                return Err(BlkError::Io);
+            }
+            if arch::timer_now_ns() > deadline {
+                crate::println!("nvme: queue {qid} batch timed out with {seen}/{n} reaped");
+                return Err(BlkError::Io);
+            }
+            core::hint::spin_loop();
+        }
+        Ok(())
     }
 
-    /// Transfer `buf` to or from `sector`, one page per command.
-    /// Check the arguments a transfer in either direction must satisfy, and return
-    /// the bounce frame's VA.
-    fn xfer_setup(&self, len: usize) -> Result<usize, BlkError> {
+    /// Check what a transfer in either direction must satisfy, and return this
+    /// core's channel.
+    fn xfer_setup(&self, len: usize) -> Result<(usize, &Chan), BlkError> {
         if !len.is_multiple_of(SECTOR) {
             return Err(BlkError::Inval);
         }
@@ -442,62 +584,106 @@ impl Nvme {
         if self.lba_bytes as usize != SECTOR {
             return Err(BlkError::Inval);
         }
-        match self.chan() {
-            Some((_, ch)) => Ok(ch.bounce_va),
-            None => Err(BlkError::NoDevice),
-        }
+        self.chan().ok_or(BlkError::NoDevice)
     }
 
-    /// Read `buf.len()` bytes from `sector`, one page per command.
+    /// How many pages, and how many blocks each, the next batch covers.
+    fn plan(rest: usize, blocks: &mut [u16; DEPTH]) -> usize {
+        let mut n = 0;
+        let mut left = rest;
+        while n < DEPTH && left > 0 {
+            let bytes = left.min(XFER);
+            blocks[n] = (bytes / SECTOR) as u16;
+            left -= bytes;
+            n += 1;
+        }
+        n
+    }
+
+    /// Read `buf.len()` bytes from `sector`, `DEPTH` pages per batch.
     fn transfer_in(&self, sector: u64, buf: &mut [u8]) -> Result<(), BlkError> {
-        let bounce = self.xfer_setup(buf.len())?;
+        let (idx, ch) = self.xfer_setup(buf.len())?;
         let mut done = 0usize;
         while done < buf.len() {
-            let bytes = (buf.len() - done).min(XFER);
-            self.rw_page(
+            let mut blocks = [0u16; DEPTH];
+            let n = Self::plan(buf.len() - done, &mut blocks);
+            SUBMITS[idx].fetch_add(n as u64, Ordering::Relaxed);
+            // Queue ids are 1-based (0 is admin), so CPU `idx` owns queue `idx + 1`.
+            self.rw_batch(
+                idx as u16 + 1,
+                ch,
                 false,
                 sector + (done / SECTOR) as u64,
-                (bytes / SECTOR) as u16,
+                &blocks[..n],
             )?;
-            // SAFETY: `bytes <= XFER` bytes out of the mapped bounce frame into the
-            // caller's buffer at `done`, both in range; the frame is this driver's
-            // own, so the two cannot alias.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    bounce as *const u8,
-                    buf.as_mut_ptr().add(done),
-                    bytes,
-                )
-            };
-            done += bytes;
+            // Every command wrote into its own staging frame, so the copies are
+            // disjoint and their order is immaterial.
+            for (i, &nblk) in blocks[..n].iter().enumerate() {
+                let bytes = nblk as usize * SECTOR;
+                // SAFETY: `bytes <= XFER` out of this core's own bounce frame `i`
+                // into the caller's buffer at `done`, both in range; the frame is
+                // this driver's, so the two cannot alias.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        ch.bounce_va[i] as *const u8,
+                        buf.as_mut_ptr().add(done),
+                        bytes,
+                    )
+                };
+                done += bytes;
+            }
         }
         Ok(())
     }
 
-    /// Write `buf.len()` bytes to `sector`, one page per command.
+    /// Write `buf.len()` bytes to `sector`, `DEPTH` pages per batch.
     ///
     /// A separate function from [`Nvme::transfer_in`] rather than one with a
     /// direction flag, so the write path can take the caller's buffer as `&[u8]`.
     /// Sharing one body would have meant `&mut [u8]` for both and casting away a
-    /// shared borrow at the call site - which is exactly the undefined behaviour
-    /// the `RefCell` above exists to avoid, reintroduced one layer out.
+    /// shared borrow at the call site - the undefined behaviour the locking above
+    /// exists to avoid, reintroduced one layer out.
     fn transfer_out(&self, sector: u64, buf: &[u8]) -> Result<(), BlkError> {
-        let bounce = self.xfer_setup(buf.len())?;
+        let (idx, ch) = self.xfer_setup(buf.len())?;
         let mut done = 0usize;
         while done < buf.len() {
-            let bytes = (buf.len() - done).min(XFER);
-            // SAFETY: as in `transfer_in`, in the other direction.
-            unsafe {
-                core::ptr::copy_nonoverlapping(buf.as_ptr().add(done), bounce as *mut u8, bytes)
-            };
-            self.rw_page(
+            let mut blocks = [0u16; DEPTH];
+            let n = Self::plan(buf.len() - done, &mut blocks);
+            let mut staged = done;
+            for (i, &nblk) in blocks[..n].iter().enumerate() {
+                let bytes = nblk as usize * SECTOR;
+                // SAFETY: as in `transfer_in`, in the other direction.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        buf.as_ptr().add(staged),
+                        ch.bounce_va[i] as *mut u8,
+                        bytes,
+                    )
+                };
+                staged += bytes;
+            }
+            SUBMITS[idx].fetch_add(n as u64, Ordering::Relaxed);
+            self.rw_batch(
+                idx as u16 + 1,
+                ch,
                 true,
                 sector + (done / SECTOR) as u64,
-                (bytes / SECTOR) as u16,
+                &blocks[..n],
             )?;
-            done += bytes;
+            done = staged;
         }
         Ok(())
+    }
+}
+
+/// Record a batch size against the high-water mark.
+fn note_inflight(n: u64) {
+    let mut cur = MAX_INFLIGHT.load(Ordering::Relaxed);
+    while n > cur {
+        match MAX_INFLIGHT.compare_exchange_weak(cur, n, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(seen) => cur = seen,
+        }
     }
 }
 
@@ -662,7 +848,14 @@ pub fn probe() -> Option<Nvme> {
     // One queue pair per granted slot, CPU `i` owning queue id `i + 1`.
     for i in 0..granted {
         let q = Queue::alloc()?;
-        let bounce_pa = frames::alloc()? as u64;
+        // One staging frame per outstanding command (see `DEPTH`).
+        let mut bounce_pa = [0u64; DEPTH];
+        let mut bounce_va = [0usize; DEPTH];
+        for k in 0..DEPTH {
+            let pa = frames::alloc()? as u64;
+            bounce_pa[k] = pa;
+            bounce_va[k] = arch::phys_to_virt(pa as usize);
+        }
         let qid = i as u32 + 1;
         // The completion queue must exist first: a submission queue names the
         // completion queue it reports into, so the reverse order is rejected.
@@ -692,7 +885,7 @@ pub fn probe() -> Option<Nvme> {
         }
         c.io[i] = Some(Chan {
             q: SpinLock::new(q),
-            bounce_va: arch::phys_to_virt(bounce_pa as usize),
+            bounce_va,
             bounce_pa,
         });
     }
