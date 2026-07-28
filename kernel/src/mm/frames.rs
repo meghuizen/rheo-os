@@ -61,6 +61,27 @@ pub const SHARE_MAX: u8 = u8::MAX;
 /// checks the two agree.
 static mut USED: usize = 0;
 
+/// Serialises every access to the shared frame-table state (`BITMAP`, `REFS`,
+/// `USED`, `NEXT_HINT`) so two cores cannot race the read-modify-write that hands
+/// out a bit or adjusts a count. Without it, concurrent `alloc`s could both claim
+/// the same bitmap bit (one frame handed out twice) or lose a `USED` increment
+/// (the count and the bitmap disagree), and a concurrent `free` could trip the
+/// double-free assertion.
+///
+/// **SMP build only.** Every acquire below is `#[cfg(feature = "smp")]`-gated, so
+/// the single-CPU library emits no lock and its codegen is byte-identical to
+/// before this lock existed (docs/SMP.md 10). The single-CPU path is already safe:
+/// traps are synchronous and no interrupt handler in this tree allocates a frame,
+/// so a frame op is never re-entered on one core.
+///
+/// The lock is taken **only in leaf public functions**. `free_if_pool` does the
+/// `in_pool` test itself and then calls the unlocked [`free_inner`] rather than
+/// the locking [`free`], because a spinlock is not re-entrant - a public function
+/// that both holds this lock and calls another that takes it would deadlock the
+/// core.
+#[cfg(feature = "smp")]
+static FRAMES_LOCK: crate::smp::SpinLock<()> = crate::smp::SpinLock::new(());
+
 unsafe extern "C" {
     static __kernel_end: u8;
 }
@@ -111,6 +132,11 @@ pub fn user_available() -> usize {
 /// amount while the user reserve above is held may `expect` it, and each says
 /// why at its call site.
 pub fn alloc() -> Option<usize> {
+    // Serialise the whole find-bit / set-bit / zero sequence: another core must
+    // not observe the bit still clear and claim the same frame. The 4 KiB zeroing
+    // stays inside the section for simplicity - correct first, faster later.
+    #[cfg(feature = "smp")]
+    let _g = FRAMES_LOCK.lock();
     unsafe {
         assert!(
             *core::ptr::addr_of!(INITIALIZED),
@@ -140,7 +166,10 @@ pub fn alloc() -> Option<usize> {
 /// (free frames, total frames) - the shell's `meminfo` builtin, the reservation
 /// memory floor, and the cell-allocation guard above.
 pub fn stats() -> (usize, usize) {
-    // SAFETY: single CPU, synchronous traps.
+    #[cfg(feature = "smp")]
+    let _g = FRAMES_LOCK.lock();
+    // SAFETY: the lock (SMP) or synchronous single-CPU traps (non-SMP) make this
+    // read of `USED` exclusive.
     let used = unsafe { *core::ptr::addr_of!(USED) };
     (POOL_FRAMES - used, POOL_FRAMES)
 }
@@ -150,7 +179,10 @@ pub fn stats() -> (usize, usize) {
 /// the `security` test kernel after every allocation and free it drives
 /// (docs/ENGINEERING.md 1: observe, do not infer).
 pub fn used_matches_bitmap() -> bool {
-    // SAFETY: single CPU, synchronous traps.
+    #[cfg(feature = "smp")]
+    let _g = FRAMES_LOCK.lock();
+    // SAFETY: the lock (SMP) or synchronous single-CPU traps (non-SMP) make this
+    // read of the bitmap and `USED` a consistent snapshot.
     unsafe {
         let bitmap = &*core::ptr::addr_of!(BITMAP);
         let counted: usize = bitmap.iter().map(|w| w.count_ones() as usize).sum();
@@ -178,7 +210,11 @@ pub fn free_if_pool(pa: usize) -> bool {
     if !in_pool(pa) {
         return false;
     }
-    free(pa);
+    #[cfg(feature = "smp")]
+    let _g = FRAMES_LOCK.lock();
+    // Call the unlocked inner, NOT the public `free`: the spinlock is not
+    // re-entrant, so taking it here and again in `free` would deadlock the core.
+    free_inner(pa);
     true
 }
 
@@ -194,7 +230,10 @@ pub fn share(pa: usize) -> bool {
         return false;
     }
     let frame = (pa - arch::FRAME_POOL_BASE) / FRAME_SIZE;
-    // SAFETY: single CPU, synchronous traps.
+    #[cfg(feature = "smp")]
+    let _g = FRAMES_LOCK.lock();
+    // SAFETY: the lock (SMP) or synchronous single-CPU traps (non-SMP) make this
+    // read-modify-write of the reference count exclusive.
     unsafe {
         let refs = &mut *core::ptr::addr_of_mut!(REFS);
         if refs[frame] == 0 || refs[frame] == SHARE_MAX {
@@ -213,7 +252,10 @@ pub fn refs(pa: usize) -> u8 {
         return 0;
     }
     let frame = (pa - arch::FRAME_POOL_BASE) / FRAME_SIZE;
-    // SAFETY: single CPU.
+    #[cfg(feature = "smp")]
+    let _g = FRAMES_LOCK.lock();
+    // SAFETY: the lock (SMP) or synchronous single-CPU traps (non-SMP) make this
+    // read of the reference count exclusive.
     unsafe { (*core::ptr::addr_of!(REFS))[frame] }
 }
 
@@ -224,6 +266,15 @@ pub fn refs(pa: usize) -> u8 {
 /// before COW existed still reads correctly: with no sharing the count is 1 and this
 /// releases, exactly as before.
 pub fn free(pa: usize) {
+    #[cfg(feature = "smp")]
+    let _g = FRAMES_LOCK.lock();
+    free_inner(pa);
+}
+
+/// The body of [`free`], assuming the caller already holds [`FRAMES_LOCK`] (SMP)
+/// or is on the single-CPU path. Kept separate so [`free_if_pool`], which takes
+/// the lock itself, can reuse it without re-entering the non-re-entrant lock.
+fn free_inner(pa: usize) {
     assert!(in_pool(pa), "frames::free of a non-pool address {pa:#x}");
     let offset = pa - arch::FRAME_POOL_BASE;
     let frame = offset / FRAME_SIZE;

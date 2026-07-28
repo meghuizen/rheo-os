@@ -80,6 +80,12 @@ fn test_percpu_single() {
 
 /// Bring up one secondary core, or skip-with-reason where the ISA blocks it.
 fn test_secondary_bringup() {
+    // Baseline free-frame count, captured before the secondary starts. The two-core
+    // frame-allocator contention (`smp::contend_frames`) runs *inside* bring-up,
+    // and each of its iterations is net-zero (alloc then free), so a correct,
+    // properly-locked allocator returns to exactly this count afterward (task #132).
+    let frames_before = kernel::mm::frames::stats().0;
+
     match smp::bring_up_one() {
         Ok(idx) => {
             // A real second core ran kernel code. Verify it through the shared
@@ -135,6 +141,32 @@ fn test_secondary_bringup() {
                 smp::CONTENTION_ITERS
             );
             println!("smp: real second core on {} confirmed", arch::NAME);
+
+            // Genuine two-core frame-allocator contention (task #132): the primary
+            // and the secondary each ran FRAME_CONTENTION_ITERS alloc+free cycles
+            // against `mm::frames` concurrently, under its internal lock. A lock
+            // that failed to serialise the bitmap read-modify-write would either
+            // trip the double-free assertion mid-run (a panic that fails the test)
+            // or leave the count and the bitmap disagreeing. The two survivors
+            // prove it held: the free-frame count is back at its baseline (every
+            // alloc was matched by exactly one free - no frame handed out twice, no
+            // count lost) and the O(1) count still agrees with the bitmap.
+            assert!(
+                kernel::mm::frames::used_matches_bitmap(),
+                "frame count/bitmap disagree after concurrent alloc/free"
+            );
+            let frames_after = kernel::mm::frames::stats().0;
+            assert_eq!(
+                frames_after, frames_before,
+                "frame pool not balanced after concurrent alloc/free \
+                 (before {frames_before}, after {frames_after})"
+            );
+            println!(
+                "smp: two-core frame-allocator contention OK - {} alloc+free cycles \
+                 from each of 2 cores, pool balanced at {frames_before} free, \
+                 bitmap consistent",
+                smp::FRAME_CONTENTION_ITERS
+            );
 
             // Start-all: bring up any *additional* secondaries this ISA supports
             // (docs/SMP.md 10). Sequential - each is fully online before the next

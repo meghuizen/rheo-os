@@ -1540,10 +1540,21 @@ MPIDR - and the `smp` test asserts the shared magic through the cross-core spinl
 that the registry slot and the hardware id are **not** the primary's. Everything is
 behind the `kernel/smp` cargo feature; the non-smp library is **byte-identical**
 (verified). Honest: this is bring-up, **not** preemptive multi-core scheduling - each
-secondary does observable proof-of-life work and parks, nothing in the kernel is yet
-safe to run on two cores concurrently, the runtime stays single-CPU cooperative, and
-only **one** secondary is started (one dedicated stack per ISA). Still deferred: shared
-`static mut` state made SMP-safe end to end, per-CPU stacks + a start-all loop, a
+secondary does observable proof-of-life work and parks, and the runtime stays
+single-CPU cooperative. **Start-all** now brings up every secondary an ISA supports
+(RISC-V four cores matching `-smp 4`, ARM64 and x86-64 three each), each claiming a
+distinct registry slot + hardware id via a portable, race-free `secondary_sp` stack
+hand-off (sequential bring-up, one dedicated stack per core, the arch hooks
+`smp_secondary_count`/`smp_prepare_secondary`). **SMP phase 2 has begun** (task #132):
+the frame allocator (`mm::frames`) is the first kernel-wide `static mut` made
+SMP-safe - one `#[cfg(feature = "smp")]`-gated `SpinLock` around its
+bitmap/refcount/count/hint, taken only in leaf public functions (`free_if_pool` calls
+an unlocked inner `free` so the non-re-entrant lock is never taken twice on one core),
+proven under genuine two-core `alloc`/`free` contention on all three ISAs (the `smp`
+test's pool-balanced + `used_matches_bitmap` oracle), the non-SMP build byte-unchanged.
+Still deferred: the **rest** of the shared `static mut` state made SMP-safe (page
+tables, capability/cell tables, the Linux per-cell state, ktimer/net_rx/input,
+idle/sched - docs/SMP.md 10.2; then preemptive scheduling itself), a
 per-CPU register instead of the small id->index table, ARM64 CPU *enumeration* (probing
 `PSCI_AFFINITY_INFO`), cross-CPU IPIs beyond bring-up, and the **x86-64 NIC RX
 interrupt** - the last interrupt source any ISA lacks, now known to need ordinary driver

@@ -211,6 +211,40 @@ pub fn contended_value() -> u64 {
     *CONTENDED.lock()
 }
 
+/// Iterations of `alloc`+`free` each core performs in the frame-allocator
+/// contention proof (docs/SMP.md 10, task #132). Smaller than [`CONTENTION_ITERS`]
+/// because each iteration also zeroes a 4 KiB frame under the allocator's lock.
+pub const FRAME_CONTENTION_ITERS: u64 = 4_000;
+
+/// A separate two-core rendezvous for the frame-allocator phase, so it cannot
+/// interfere with the [`CONTEND_READY`] barrier of the counter phase.
+static FRAME_READY: AtomicUsize = AtomicUsize::new(0);
+
+/// Both cores allocate a frame and immediately free it, `FRAME_CONTENTION_ITERS`
+/// times, **concurrently** - the proof that [`crate::mm::frames`] is SMP-safe
+/// (task #132). The frame allocator's internal lock must serialise the bitmap
+/// read-modify-write: without it, two cores could observe the same bit clear and
+/// both claim it (one frame handed out twice), lose a `USED` increment (the count
+/// and the bitmap then disagree), or trip the double-free assertion when both free
+/// the frame they both think they own. Each iteration is net-zero (alloc then
+/// free), so the free-frame count returns to its baseline; the primary checks that
+/// **and** `frames::used_matches_bitmap()` after the window (the test's oracle). A
+/// broken lock shows up as a failed invariant or a double-free panic - either way
+/// the test fails.
+pub fn contend_frames() {
+    FRAME_READY.fetch_add(1, Ordering::AcqRel);
+    let mut budget = WAIT_BUDGET;
+    while FRAME_READY.load(Ordering::Acquire) < 2 && budget > 0 {
+        core::hint::spin_loop();
+        budget -= 1;
+    }
+    for _ in 0..FRAME_CONTENTION_ITERS {
+        if let Some(pa) = crate::mm::frames::alloc() {
+            crate::mm::frames::free(pa);
+        }
+    }
+}
+
 /// The next free registry index to hand a secondary. The boot CPU is index 0
 /// ([`init`]); secondaries take 1, 2, ... as they come up. This keeps the
 /// registry index independent of the hardware CPU id (the boot hart id may be
@@ -246,6 +280,11 @@ pub fn secondary_run(hw_id: u32) {
         // single write). Runs before the completion signal so the primary's wait
         // on `SECONDARY_UP` implies this secondary finished contending.
         contend();
+        // The same, but hammering the real frame allocator (task #132): both cores
+        // alloc+free concurrently, proving `mm::frames` serialises its bitmap. Also
+        // before the completion signal, so the primary's balance/invariant check
+        // after the wait sees a finished phase.
+        contend_frames();
     }
     SECONDARY_UP.fetch_add(1, Ordering::Release);
 }
@@ -343,6 +382,7 @@ pub fn bring_up_nth(ordinal: usize) -> Result<usize, StartError> {
             // the lock is genuinely contended by two cores at once (docs/SMP.md 10).
             if ordinal == 0 {
                 contend();
+                contend_frames();
             }
             let mut budget = WAIT_BUDGET;
             while budget > 0 {

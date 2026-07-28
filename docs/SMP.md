@@ -489,6 +489,20 @@ the interrupt vector writes.
   exclusion (there is no concurrent writer): a lock that failed to serialise the
   read-modify-write would lose updates and fall short. This is the primitive the
   phase-2 kernel-wide locks (§10.2) rest on, proven before they are built on it.
+- **The frame allocator is SMP-safe** (§10.2 slice 1, the first kernel-wide static
+  made safe), proven under two-core contention on all three ISAs. The primary and
+  the first secondary rendezvous, then each runs `FRAME_CONTENTION_ITERS` (4 000)
+  `alloc`+`free` cycles against `mm::frames` **concurrently**. `mm::frames` now takes
+  one `SpinLock` around its shared bitmap / refcount / count / hint, acquired only in
+  its leaf public functions - `free_if_pool` calls an unlocked inner `free` so the
+  non-re-entrant lock is never taken twice on one core. After the window the primary
+  asserts the free-frame count is back at its baseline (every `alloc` matched by
+  exactly one `free`: no frame handed out twice, no count lost) **and**
+  `frames::used_matches_bitmap()` still holds. A lock that failed to serialise the
+  bitmap read-modify-write would trip the double-free assertion mid-run (a panic that
+  fails the test) or leave the count and bitmap disagreeing. **Every acquire is
+  `#[cfg(feature = "smp")]`-gated**, so the 55 non-SMP kernels emit no lock and their
+  codegen is unchanged.
 - **Start-all: multiple secondaries on all three ISAs** - RISC-V four cores at once
   (boot + three secondaries, matching QEMU's `-smp 4`), ARM64 and x86-64 three each
   (boot + two), the first slice of §10.3/§10.7-step-2. Each secondary claims a distinct
@@ -514,10 +528,12 @@ the interrupt vector writes.
   CONCURRENCY.md). Each secondary does proof-of-life work and parks; none is yet
   fed runnable cells. **This is the whole of task #27's remaining substance** - the
   bring-up is the prerequisite, not the scheduler.
-- Making the shared kernel `static mut` state SMP-safe end to end (only the SMP
-  test's own shared state is locked today). Nothing in the kernel is safe to run on
-  two cores concurrently yet, which is why the secondary parks rather than being fed
-  work.
+- Making the shared kernel `static mut` state SMP-safe end to end. **The frame
+  allocator (`mm::frames`) is done** (§10.2 slice 1, proven above); the rest of the
+  §10.2 set - page tables, capability/cell tables, the Linux per-cell state,
+  `ktimer`/`net_rx`/`input`, `idle`/`sched` - is still single-CPU-assuming. A
+  secondary parks rather than being fed work because those remain unsafe, not because
+  frames is.
 - More than **one** secondary: each ISA's bring-up has a single dedicated secondary
   stack, and the driver starts one core. Per-CPU stacks and a start-all loop are
   mechanical once the shared state is safe.
@@ -565,9 +581,14 @@ deliverable is an audit, not a scheduler**: enumerate every `static mut` a secon
 could touch, and give each one an explicit discipline - a lock, per-CPU partitioning,
 or a single-owner core. The known set, from this tree:
 
-- **`mm::frames` / `frames_pmem`** - the frame allocator + per-frame refcount (COW).
-  A global `SpinLock` initially; a per-CPU magazine (free-list cache) later for the
-  hot path, refilled/drained under the global lock (the standard slab-magazine shape).
+- **`mm::frames`** - the frame allocator + per-frame refcount (COW). **DONE** (slice
+  1, §9 Proven): one global `SpinLock` around the bitmap / refcount / count / hint,
+  taken only in leaf public functions (`free_if_pool` -> unlocked inner `free` to
+  avoid re-entering the non-re-entrant lock), every acquire `#[cfg(feature = "smp")]`
+  so the non-SMP build is unchanged, proven under two-core `alloc`/`free` contention.
+  A per-CPU magazine (free-list cache) for the hot path - refilled/drained under this
+  global lock, the standard slab-magazine shape - stays a later refinement.
+  **`frames_pmem`** (the separate nvdimm pool) still needs the same treatment.
 - **Page tables** - per-cell root, but `AddressSpace` mutation (map/unmap/protect,
   COW privatisation) races a concurrent fault on the same cell. Per-address-space lock;
   a remote-TLB shootdown IPI (section 9 names it) for unmap/protect that another core
