@@ -76,6 +76,10 @@ name = "librheo-child"
 path = "src/bin/librheo-child.rs"
 
 [[bin]]
+name = "librheo-fa"
+path = "src/bin/librheo-fa.rs"
+
+[[bin]]
 name = "lrsh"
 path = "src/bin/lrsh.rs"
 

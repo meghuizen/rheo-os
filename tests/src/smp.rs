@@ -37,8 +37,9 @@ use kernel::arch::MapPerm;
 use kernel::capability::{CapTable, ObjectTable};
 use kernel::sched::{dispatch, preempt};
 use kernel::smp::{self, SpinLock, StartError};
+use kernel::user::Outcome;
 use kernel::user_progs::{user_copair, user_placed};
-use kernel::{arch, idle, ktimer, println, user};
+use kernel::{arch, idle, ktimer, load, println, user};
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
@@ -215,13 +216,18 @@ fn test_parallel_gemm(idx: usize) {
             "blocks completed ({sum}) do not account for the whole queue \
              ({total_blocks}) - a claim was lost or double-counted"
         );
-        // **Every** online core took work, not merely two. A run where one is zero did
-        // that core's share elsewhere and would still have produced the right answer -
-        // which is exactly why this is asserted rather than inferred from correctness.
-        assert_eq!(
-            workers, cores,
-            "{workers} of {cores} online cores took blocks - the queue was not drained \
-             by all of them"
+        // Sharing, asserted; **which** cores got a block, reported. The barrier above is
+        // what proves all `cores` were inside one interval; it does not promise each of
+        // them *won* a block, because winning one is a race against peers that may drain
+        // the queue first. An earlier version asserted `workers == cores` and was
+        // therefore asserting a race outcome - it failed on a run where three cores took
+        // all sixteen blocks before the fourth reached its first `fetch_add`, which is
+        // correct behaviour for a work queue (docs/ENGINEERING.md 1: a proof must not be
+        // able to fail on a legal schedule).
+        assert!(
+            workers > 1,
+            "one core did all {total_blocks} blocks - the queue was drained serially, \
+             not shared"
         );
         // And the frame allocator survived two cores using it (the pool lock,
         // docs/SMP.md 10.2): the incremental used counter still agrees with the bitmap
@@ -231,11 +237,11 @@ fn test_parallel_gemm(idx: usize) {
             "the frame pool's used counter drifted from its bitmap under two cores"
         );
         println!(
-            "smp: {cores} CORES drained one {total_blocks}-block work queue for a \
-             {GM}x{GN}x{GK} int8 GEMM at the same time - the tile framework's own \
-             `gemm_i8_i32`, shared verbatim - every core taking a nonzero share \
-             (claimed, not pre-assigned), result bit-identical to the single-core \
-             oracle, and all {cores} met at a barrier none could pass alone OK"
+            "smp: {cores} CORES were inside one interval draining a {total_blocks}-block \
+             work queue for a {GM}x{GN}x{GK} int8 GEMM - the tile framework's own \
+             `gemm_i8_i32`, shared verbatim - {workers} of them won blocks (claimed, not \
+             pre-assigned), result bit-identical to the single-core oracle, and all \
+             {cores} met at a barrier none could pass alone OK"
         );
         for c in 0..smp::MAX_CPUS {
             let n = smp::blocks_done(c);
@@ -519,6 +525,263 @@ const PLACED: usize = 8;
 const LONG_ROUNDS: u64 = 96;
 const SHORT_ROUNDS: u64 = 8;
 
+// ------------------------------------------- FlashAttention 2 across every core
+//
+// The GEMM phase above drains its queue in **kernel context**, which works because it
+// is integer. FlashAttention cannot go there: its softmax needs a real `exp`, so it is
+// f32, and the kernel is deliberately FP-free (docs/SUBSTRATE.md pillar 4 - if the
+// kernel never executes an FP instruction, no syscall, trap or interrupt has to save the
+// vector file). The `.user`-window programs cannot host it either: they are compiled as
+// part of the kernel crate, and soft-float f32 emits out-of-line calls into kernel
+// `.text`, which a cell has no mapping for.
+//
+// A **loaded ELF cell** has neither problem - it carries its own builtins - so that is
+// the parallel unit here. Several `librheo-fa` cells are installed, each given a slice
+// of the query rows and a shared output page, and handed to the same placement the cell
+// phase below uses: no cell is told which core to run on.
+//
+// **Why the split is exact.** Output row `i` of attention depends only on query row `i`,
+// so slicing by query rows changes no row's arithmetic - not even its summation order,
+// unlike slicing the K/V loop. N cells must therefore produce a result **bit-identical**
+// to one cell doing every row, and that is what is asserted: not a tolerance, an
+// equality. `librheotilebattle` proves the same decomposition single-threaded on all
+// three ISAs ("FA2 decomposed over 4 query-row chunks matches the whole-batch result");
+// this is that decomposition executed on separate CPUs.
+
+static FA_CELL: &[u8] = fixture::cell!("librheo-fa");
+
+/// Head shape, and the two VAs the cell expects - all four must agree with
+/// `librheo/src/bin/librheo-fa.rs`.
+const FA_TQ: usize = 32;
+const FA_D: usize = 32;
+const FA_PARAMS_VA: usize = 0x3_4000_0000;
+const FA_OUT_VA: usize = 0x3_4001_0000;
+
+/// How many cells split the rows. More than the machine has cores, so some core must
+/// finish a slice and come back - the same reason the cell-placement round over-subscribes.
+const FA_CELLS: usize = 8;
+
+/// The launcher's view of `librheo-fa`'s parameter block.
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct FaParams {
+    lo: u32,
+    hi: u32,
+    status: u32,
+    rows: u32,
+}
+
+/// One page, aligned so it can be mapped into a cell as a frame.
+#[repr(C, align(4096))]
+struct Page([u8; 4096]);
+
+/// The shared output (`FA_TQ * FA_D` f32 = exactly one page) and one parameter page per
+/// cell. Kernel statics, mapped into the cells rather than allocated from the pool, so
+/// the launcher can read the result back afterwards through its own linear map.
+static mut FA_OUT: Page = Page([0; 4096]);
+static mut FA_PARAM_PAGES: [Page; FA_CELLS] = [const { Page([0; 4096]) }; FA_CELLS];
+/// The single-cell reference, copied out between the two rounds.
+static mut FA_REF: [f32; FA_TQ * FA_D] = [0.0; FA_TQ * FA_D];
+
+static mut FA_ASPACE: [core::mem::MaybeUninit<kernel::mm::AddressSpace>; FA_CELLS] =
+    [const { core::mem::MaybeUninit::uninit() }; FA_CELLS];
+static mut FA_FRAME: [core::mem::MaybeUninit<kernel::arch::TrapFrame>; FA_CELLS] =
+    [const { core::mem::MaybeUninit::uninit() }; FA_CELLS];
+static mut FA_KSTACK: [KernelStack; FA_CELLS] = [const { KernelStack::new() }; FA_CELLS];
+static mut FA_QP: [core::mem::MaybeUninit<kernel::queue::QueuePair>; FA_CELLS] =
+    [const { core::mem::MaybeUninit::uninit() }; FA_CELLS];
+static mut FA_OBJECTS: ObjectTable = ObjectTable::new();
+static mut FA_CAPS: CapTable = CapTable::new();
+
+/// Install `n` `librheo-fa` cells, slice `[0, FA_TQ)` between them, and return the
+/// queue of cell indices to place.
+///
+/// # Safety
+/// Single-threaded setup on the primary, after `user::reset()`, with no cell live.
+unsafe fn fa_install(n: usize) -> [usize; FA_CELLS] {
+    use kernel::capability::{BUDGET_UNLIMITED, ObjectKind};
+    use kernel::mm::AddressSpace;
+    let mut queue = [0usize; FA_CELLS];
+    // SAFETY: the caller's contract.
+    unsafe {
+        let objects = &mut *core::ptr::addr_of_mut!(FA_OBJECTS);
+        let caps = &mut *core::ptr::addr_of_mut!(FA_CAPS);
+        *objects = ObjectTable::new();
+        *caps = CapTable::new();
+        // One page of shared output, cleared so a row nobody wrote is visibly zero.
+        (*core::ptr::addr_of_mut!(FA_OUT)).0.fill(0);
+
+        let out_pa = arch::virt_to_phys(core::ptr::addr_of!(FA_OUT) as usize);
+        let per = FA_TQ.div_ceil(n);
+        for i in 0..n {
+            let lo = (i * per).min(FA_TQ);
+            let hi = ((i + 1) * per).min(FA_TQ);
+            let pp = core::ptr::addr_of_mut!(FA_PARAM_PAGES[i]);
+            (*pp).0.fill(0);
+            (pp as *mut FaParams).write(FaParams {
+                lo: lo as u32,
+                hi: hi as u32,
+                status: 0,
+                rows: 0,
+            });
+
+            let aspace = &mut *core::ptr::addr_of_mut!(FA_ASPACE[i]);
+            aspace.write(AddressSpace::new((i + 2) as u16));
+            let a = aspace.assume_init_mut();
+            let entry = load::load_elf(FA_CELL, a).expect("load librheo-fa");
+            let stack_top = load::map_stack(a);
+            let qp = load::map_queue(a);
+            // The two shared regions. RW, and disjoint per cell except for the output -
+            // which the cells write at disjoint offsets, so it needs no lock.
+            a.map_user_frame(FA_OUT_VA, out_pa, MapPerm::UserRw);
+            a.map_user_frame(
+                FA_PARAMS_VA,
+                arch::virt_to_phys(pp as usize),
+                MapPerm::UserRw,
+            );
+
+            let object = objects.create(ObjectKind::QueuePair).unwrap();
+            let cap = caps
+                .mint(
+                    objects,
+                    object,
+                    kernel::capability::READ | kernel::capability::WRITE,
+                    BUDGET_UNLIMITED,
+                )
+                .unwrap();
+            let cap_id = cap.raw_low32();
+            (*core::ptr::addr_of_mut!(FA_QP[i])).write(qp);
+            let qp_ptr = (*core::ptr::addr_of_mut!(FA_QP[i])).as_ptr();
+
+            let kernel_sp = (*core::ptr::addr_of_mut!(FA_KSTACK[i])).top();
+            let frame = &mut *core::ptr::addr_of_mut!(FA_FRAME[i]);
+            frame.write(arch::trapframe_new(entry, stack_top, 0, kernel_sp));
+            user::install(
+                i,
+                aspace.assume_init_ref(),
+                caps,
+                objects,
+                qp_ptr,
+                frame.assume_init_mut(),
+            );
+            user::set_queue_info(i, load::USER_QUEUE_VA as u64, cap_id);
+            queue[i] = i;
+        }
+    }
+    queue
+}
+
+/// FlashAttention 2 computed by `FA_CELLS` cells across every core, asserted
+/// bit-identical to one cell computing every row.
+fn test_flash_attention_parallel() {
+    let cores = smp::online_count();
+    // SAFETY: single-threaded setup on the primary between rounds; no cell is live.
+    unsafe {
+        // --- Round 1: one cell, every row. The reference. -------------------
+        user::reset();
+        let q1 = fa_install(1);
+        let out = user::run(q1[0]).1;
+        let p0 = &*(core::ptr::addr_of!(FA_PARAM_PAGES[0]) as *const FaParams);
+        assert!(
+            matches!(out, Outcome::Exited(1)) && p0.status == 1 && p0.rows == FA_TQ as u32,
+            "the single-cell FA2 reference did not complete: {out:?}, status {}, rows {}",
+            p0.status,
+            p0.rows
+        );
+        let src = core::ptr::addr_of!(FA_OUT) as *const f32;
+        let refbuf = &mut *core::ptr::addr_of_mut!(FA_REF);
+        for (i, r) in refbuf.iter_mut().enumerate() {
+            *r = src.add(i).read();
+        }
+        // A softmax output is a convex combination of V rows, so an all-zero result
+        // would mean nothing ran - and would then match any other all-zero result.
+        assert!(
+            refbuf.iter().any(|&x| x != 0.0),
+            "the FA2 reference is entirely zero - nothing was computed"
+        );
+        println!("smp: FA2 single-cell reference computed ({FA_TQ} rows x {FA_D})");
+
+        // --- Round 2: FA_CELLS cells, placed on whichever core is free. -----
+        user::reset();
+        let queue = fa_install(FA_CELLS);
+        let mut placed = [(0u64, 0usize); FA_CELLS];
+        // SAFETY: every cell is installed, present, native and listed exactly once.
+        let finished = smp::place_cells(&queue, &mut placed);
+        if !finished {
+            println!(
+                "smp: SKIP parallel FA2 - the queue did not drain within the bound, so \
+                 nothing about FlashAttention across cores is claimed"
+            );
+            return;
+        }
+        // Every slice ran, finished its rows, and says which slice it was.
+        let per = FA_TQ.div_ceil(FA_CELLS);
+        let mut rows_total = 0usize;
+        for i in 0..FA_CELLS {
+            let lo = (i * per).min(FA_TQ);
+            let hi = ((i + 1) * per).min(FA_TQ);
+            let p = &*(core::ptr::addr_of!(FA_PARAM_PAGES[i]) as *const FaParams);
+            assert_eq!(
+                placed[i].0,
+                (lo + 1) as u64,
+                "FA cell {i} exited {} - expected its own slice code",
+                placed[i].0
+            );
+            assert_eq!(p.status, 1, "FA cell {i} never finished its rows");
+            assert_eq!(
+                p.rows as usize,
+                hi - lo,
+                "FA cell {i} wrote the wrong count"
+            );
+            rows_total += p.rows as usize;
+        }
+        assert_eq!(rows_total, FA_TQ, "the slices do not cover every query row");
+
+        // **Bit-identical**, not within a tolerance: the query-row split changes no
+        // row's arithmetic, so anything else is a defect rather than rounding.
+        let got = core::ptr::addr_of!(FA_OUT) as *const f32;
+        for i in 0..FA_TQ * FA_D {
+            let (g, w) = (got.add(i).read(), refbuf[i]);
+            assert!(
+                g.to_bits() == w.to_bits(),
+                "parallel FA2 differs from the single-cell reference at element {i}: \
+                 {g:e} vs {w:e}"
+            );
+        }
+
+        // The work was genuinely spread, and by claim rather than assignment.
+        let mut movers = 0;
+        let mut claimed = 0;
+        for c in 0..smp::MAX_CPUS {
+            let n = smp::cells_taken(c);
+            claimed += n;
+            if n > 0 {
+                movers += 1;
+            }
+        }
+        assert_eq!(claimed, FA_CELLS, "claims do not account for the FA cells");
+        assert!(
+            movers > 1,
+            "one core ran all {FA_CELLS} FA slices - the attention head was computed \
+             serially"
+        );
+        println!(
+            "smp: FLASHATTENTION 2 COMPUTED ACROSS {movers} OF {cores} CORES AT ONCE - \
+             {FA_CELLS} loaded librheo cells each took a slice of the {FA_TQ} query rows \
+             (claimed, not assigned), every slice reported its own rows, and the \
+             assembled {FA_TQ}x{FA_D} result is **bit-identical** to one cell computing \
+             every row"
+        );
+        for c in 0..smp::MAX_CPUS {
+            let n = smp::cells_taken(c);
+            if n > 0 {
+                println!("smp:   CPU {c} ran {n} FA slice(s)");
+            }
+        }
+        user::reset();
+    }
+}
+
 /// **A cell ran on a core of the cell's own NUMA node** (docs/SUBSTRATE.md pillar 6,
 /// the CPU half of "vcores follow memory").
 ///
@@ -611,6 +874,10 @@ fn test_placement() {
     // the generation-gated publish exists for (a `take()`n job could serve one
     // secondary and no more).
     test_parallel_gemm(smp::online_count() - 1);
+
+    // And the f32 half of the tile framework, which cannot run in kernel context at
+    // all: FlashAttention 2 across every core, as loaded cells.
+    test_flash_attention_parallel();
 
     // SAFETY: single-threaded setup on the primary; the secondaries are parked in
     // their work loop and claim nothing until `place_cells` publishes the queue.

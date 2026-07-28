@@ -2110,9 +2110,24 @@ staging-swap count hand-computed** (a pipeline that degenerated to one block wou
 pass the other checks); every output inside its V column's range (a softmax output is
 a convex combination, so this is exact and independent of both implementations); a
 paged-KV split accumulation equal to one pass; and the query-row decomposition
-matching the whole batch. Honest: FA3's overlap is cooperative **interleaving**, not
-concurrency - its wall-clock win over FA2 awaits vcores on a second core, so the
-structure is proven ahead of the parallelism that pays for it; the inner loops are
+matching the whole batch. **And one attention head now runs across every core** (docs/TILES.md 13.4a): the
+query-row decomposition is not just a property to assert, it is how attention is
+parallelised, so `librheo-fa` is a cell computing FA2 **and** FA3 over one slice of the
+rows, and eight of them are handed to the kernel's cell placement - whichever core is
+free claims one. On all three ISAs **four cores at once** compute one 32x32 head, and
+the assembled result is asserted **bit-identical** to a single cell computing every
+row: equality rather than a tolerance, because output row `i` depends only on query row
+`i`, so slicing by rows changes no row's arithmetic (unlike slicing the K/V loop). Each
+cell also checks FA3 against FA2 on its own slice with the staging-swap count
+hand-computed, *inside* the cell running on a core the launcher did not choose. It is a
+**cell** and not the kernel work queue the GEMM uses because attention is f32 and the
+kernel is deliberately FP-free, while a `.user`-window program's soft-float f32 emits
+out-of-line calls into kernel `.text` a cell cannot reach - a loaded ELF cell carries its
+own builtins and has neither problem. Both controls observed failing (every cell given
+the same slice; one bit flipped in the reference). Honest: FA3's own producer/consumer
+overlap is still **interleaving** within a slice - the parallelism above is data
+parallelism *over* the head, and a slice runs on one core, so FA3's wall-clock win over
+FA2 needs a second execution context inside the slice and is not built; the inner loops are
 scalar (they are the oracle a `tile::simd` vector path is checked against); forward
 only (no backward pass, causal mask or dropout); f32 only.
 
@@ -2416,7 +2431,10 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               core is free, with a dry core **stealing an unstarted cell** from a
               peer's claim; then **cross-core preemption** - each core preempts
               between the cells it claimed, ~350-400 slices taken on 4 cores at
-              once against 0 in the cooperative control round; then an
+              once against 0 in the cooperative control round; then **FlashAttention 2+3
+              across four cores at once** (8 `librheo-fa` cells each taking a slice of
+              one head's query rows, placed by claim, the assembled result bit-identical
+              to a single cell computing every row); then an
               **node-affine placement** (docs/SUBSTRATE.md pillar 6: two memory nodes with
               the CPUs split across them, the runnable set grouped by home node with one
               claim cursor per node, 7-8 of 8 cells asserted to run on a core of their
@@ -2664,6 +2682,9 @@ librheo/      the native userspace foundation library (docs/LIBRHEO.md):
               compositor demo), Phase F: librheo-orch (spawn/wait/timer proof),
               lrsh (the librheo-native shell), librheo-echo/librheo-child (native
               coreutils it spawns), librheo-embed (the embedded spine-only cell),
+              librheo-fa (FlashAttention 2+3 over one slice of a head's
+              query rows - several of these are placed across cores so one attention
+              head is computed in parallel, docs/TILES.md 13.4a),
               librheo-net (Phase G ARP round trip over virtio-net), librheo-netwait
               (rheo-net N2d parked receive: woken by a real frame, then by a
               deadline), librheo-gpu

@@ -584,15 +584,45 @@ Seven properties in the battle tier, in increasing strength:
 
 All bit-identical across x86-64, ARM64 and riscv64.
 
+### 13.4a One attention head across every core
+
+The query-row decomposition above is not only a property to assert - it is how
+attention is parallelised, and it now runs that way. `librheo-fa` is a cell that
+computes FA2 **and** FA3 over one slice of the query rows; `FA_CELLS` of them are
+installed, each given its slice and a shared output page, and handed to the kernel's
+cell placement, so whichever core is free claims one. On all three ISAs, **four cores
+at once** compute one 32x32 head between eight cells, and the assembled result is
+asserted **bit-identical** to a single cell computing every row.
+
+Bit-identical rather than within a tolerance, and that is the point of splitting this
+way: output row `i` depends only on query row `i`, so slicing by rows changes no row's
+arithmetic - not even its summation order, unlike slicing the K/V loop. Anything other
+than equality would be a defect rather than rounding. Each cell also checks FA3 against
+FA2 on its own slice, with the staging-swap count hand-computed, *inside* the cell
+running on a core the launcher did not choose - so the parallel proof covers both
+kernels rather than only FA2.
+
+**Why a cell and not the kernel's work queue.** The tile GEMM is drained by every core
+in kernel context because it is integer. Attention is f32, and the kernel is
+deliberately FP-free (SUBSTRATE.md pillar 4 - no syscall, trap or interrupt then has to
+save the vector file), so it cannot host this. Nor can the `.user`-window programs: they
+are compiled into the kernel crate, and soft-float f32 emits out-of-line calls into
+kernel `.text` that a cell has no mapping for. A loaded ELF cell carries its own
+builtins and has neither problem, which is why the parallel unit is a cell.
+
+Both controls observed failing: giving every cell the same slice, and flipping one bit
+of the reference (caught at element 512, `3.4976618e0` vs `3.4976616e0`).
+
 ### 13.5 Honest scope
 
-- **The overlap is interleaving, not concurrency.** One cooperative CPU, so FA3's
-  producer and consumer alternate rather than run at once, and its wall-clock win
-  over FA2 is not available until vcores dispatch on more than one core. What is
-  real and tested now is the *structure* - genuinely double-buffered staging, a
-  genuine prologue, a fence that fires the right number of times, and an identical
-  result. Building the pipeline before the parallelism is the right order; the
-  alternative is a pipeline whose first execution is also its first test.
+- **FA3's overlap is interleaving, not concurrency - even now.** Section 13.4a puts
+  *different row slices* on different cores, which is data parallelism over the head;
+  FA3's own producer/consumer pipeline still alternates within a slice, because a slice
+  runs on one core. Its wall-clock win over FA2 needs the staging copy and the compute
+  to proceed at once, which is a second execution context inside the slice and is not
+  built. What is real and tested is the *structure* - genuinely double-buffered
+  staging, a genuine prologue, a fence that fires the right number of times, and an
+  identical result, now also verified on four cores at once.
 - **Scalar inner loops.** The dot product and the exp are scalar; `tile::simd` is
   where a target-specific kernel goes, and the GEMM there is the precedent. Keeping
   these scalar is what makes them the oracle a vector path is checked against.
