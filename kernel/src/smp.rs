@@ -864,8 +864,6 @@ static PLACE_CELLS: SpinLock<[usize; MAX_PLACED_CELLS]> = SpinLock::new([0; MAX_
 #[cfg(feature = "smp")]
 static PLACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "smp")]
-static PLACE_NEXT: AtomicUsize = AtomicUsize::new(0);
-#[cfg(feature = "smp")]
 static PLACE_DONE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "smp")]
 /// Which CPU claimed each slot (`usize::MAX` = nobody yet) and whether its cell has
@@ -879,6 +877,200 @@ static PLACE_RUN: [AtomicUsize; MAX_PLACED_CELLS] =
 #[cfg(feature = "smp")]
 /// Cells taken out of a peer's claim by an idle core.
 static STEALS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "smp")]
+/// **Per-node claim cursors** - the CPU half of "vcores follow memory"
+/// (docs/SUBSTRATE.md pillar 6).
+///
+/// A core takes work from its *own* node's cursor first, so a cell runs on a core that
+/// shares a memory controller with the cell's pages. That is the point of having placed
+/// the pages at all: on real hardware a remote access costs roughly double, and the
+/// placement is wasted if the CPU is on the other side of the interconnect.
+///
+/// It is the **same protocol replicated**, not a new one. Each cursor is a single
+/// `fetch_add`, so exactly one core can obtain each index - which is the property the
+/// one shared cursor had and the reason it was chosen over a scan-and-claim
+/// (docs/SMP.md 10.0: two cores both entering one cell is the failure this design
+/// exists to make impossible). Per-node cursors preserve it exactly; a scan would not.
+///
+/// [`PLACE_GROUP_END`] bounds each node's group in the published (node-sorted) queue.
+/// With fewer than two nodes everything lands in one group and this degenerates to the
+/// single cursor, byte-for-byte the pre-NUMA behaviour.
+static PLACE_NEXT_NODE: [AtomicUsize; crate::hw::MAX_NUMA_NODES] =
+    [const { AtomicUsize::new(0) }; crate::hw::MAX_NUMA_NODES];
+#[cfg(feature = "smp")]
+/// Exclusive end of each node's group in the published queue (`start` is the previous
+/// node's end, or 0).
+static PLACE_GROUP_END: [AtomicUsize; crate::hw::MAX_NUMA_NODES] =
+    [const { AtomicUsize::new(0) }; crate::hw::MAX_NUMA_NODES];
+#[cfg(feature = "smp")]
+/// Where each published slot came from in the caller's list, so results can be
+/// reported in the caller's order after the queue was sorted by node.
+static PLACE_ORIGIN: [AtomicUsize; MAX_PLACED_CELLS] =
+    [const { AtomicUsize::new(0) }; MAX_PLACED_CELLS];
+#[cfg(feature = "smp")]
+/// Claims served by the claiming core's own node, and claims that had to cross.
+///
+/// Counted, not assumed: a core that runs dry locally **must** take remote work -
+/// leaving a core idle beside runnable cells is worse than a remote access - so the
+/// question is never "did it stay local" but "how often could it not", and that is
+/// only answerable if the crossing is recorded (docs/ENGINEERING.md 1).
+static CLAIMS_LOCAL: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp")]
+static CLAIMS_REMOTE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp")]
+/// Crossings that **did not have to happen**: a core took work from another node's
+/// group while its *own* group still had an unclaimed slot.
+///
+/// This is the invariant that separates "the preference is applied" from "the
+/// distribution happened to look local". A local/remote ratio cannot: with cells
+/// round-robin across two nodes and cores split evenly, *random* claiming already lands
+/// ~half the cells locally, and a threshold above that is a guess that turns into
+/// flakiness. This is exact and zero-tolerance - by construction a core reaches another
+/// group only after its own returned nothing, so a nonzero value here means the
+/// preference was not applied at all. Measured: 0 with the preference, positive without
+/// (docs/SUBSTRATE.md pillar 6).
+///
+/// A group only ever shrinks, so "my own group was exhausted" cannot become false
+/// later; there is no race to lose here.
+static CLAIMS_AVOIDABLE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp")]
+/// Whether the claim path prefers a core's own NUMA node. On by default; switchable so
+/// a proof can run the *same* placement round both ways in one binary and compare,
+/// which is the `preempt` kernel's technique for the same problem - a distribution can
+/// only be shown to be a consequence of the preference by measuring it without.
+static NODE_AFFINITY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+#[cfg(feature = "smp")]
+/// Turn the own-node claim preference on or off (docs/SUBSTRATE.md pillar 6). For
+/// proofs; a system boot leaves it on.
+pub fn set_node_affinity(on: bool) {
+    NODE_AFFINITY.store(on, Ordering::Release);
+}
+
+#[cfg(feature = "smp")]
+/// (claims served by the claiming core's own NUMA node, claims that crossed nodes).
+pub fn node_claims() -> (usize, usize) {
+    (
+        CLAIMS_LOCAL.load(Ordering::Acquire),
+        CLAIMS_REMOTE.load(Ordering::Acquire),
+    )
+}
+
+#[cfg(feature = "smp")]
+/// Crossings that did not have to happen. See [`CLAIMS_AVOIDABLE`]; must be zero.
+pub fn avoidable_crossings() -> usize {
+    CLAIMS_AVOIDABLE.load(Ordering::Acquire)
+}
+
+#[cfg(feature = "smp")]
+/// The NUMA node this core sits on, or `None` where the machine reports one node (or
+/// does not report this core) - in which case there is no preference to express and
+/// the claim path takes the single group.
+fn this_node() -> Option<u8> {
+    if crate::mm::frames::nodes_known() < 2 {
+        return None;
+    }
+    // The registry already holds each core's hardware id - every core stored its own
+    // in `set_online`, from a register it read itself. No new arch accessor needed,
+    // and no core is ever *told* which node it is on.
+    crate::hw::inventory().cpu_node(this_cpu().hw_id())
+}
+
+#[cfg(feature = "smp")]
+/// Record whether `cell` was claimed by a core on the cell's own NUMA node.
+///
+/// Called where the **cell** is known rather than inside the cursor, so the *steal*
+/// path is counted too - a steal is a claim, and leaving it out would make the counters
+/// disagree with the observed cell-to-core mapping, which is exactly the check that
+/// makes them worth having.
+fn count_claim(cell: usize) {
+    let Some(mine) = this_node() else {
+        return;
+    };
+    if crate::user::cell_node(cell) == mine {
+        CLAIMS_LOCAL.fetch_add(1, Ordering::AcqRel);
+    } else {
+        CLAIMS_REMOTE.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(feature = "smp")]
+/// Claim the next unclaimed slot for `cpu`, preferring this core's own NUMA node.
+///
+/// Returns the absolute slot index, or `None` when every group is exhausted. Own node
+/// first, then the others in order - work-conserving, because an idle core beside a
+/// runnable cell is a worse outcome than a remote memory access.
+fn claim_next(n: usize) -> Option<usize> {
+    // The *ordering* preference, which the toggle below can switch off so a proof can
+    // measure the same round both ways in one binary (`set_node_affinity`).
+    let mine = if NODE_AFFINITY.load(Ordering::Acquire) {
+        this_node()
+    } else {
+        None
+    };
+    let groups = crate::mm::frames::nodes_known().max(1);
+    // Own node first, then every other group. With one group `mine` is `None` and this
+    // is one `fetch_add` on cursor 0 - exactly the pre-NUMA path.
+    let first = mine.map(|m| m as usize).unwrap_or(0).min(groups - 1);
+    for step in 0..groups {
+        let g = if step == 0 {
+            first
+        } else {
+            let cand = (first + step) % groups;
+            if cand == first {
+                continue;
+            }
+            cand
+        };
+        let start = if g == 0 {
+            0
+        } else {
+            PLACE_GROUP_END[g - 1].load(Ordering::Acquire)
+        };
+        let end = PLACE_GROUP_END[g].load(Ordering::Acquire).min(n);
+        if start >= end {
+            continue;
+        }
+        let k = PLACE_NEXT_NODE[g].fetch_add(1, Ordering::AcqRel);
+        // The cursor is monotonic and may run past the group; that is how exhaustion is
+        // detected, and re-trying the same group would spin.
+        if start + k >= end {
+            continue;
+        }
+        // Was this a crossing, and did it have to be one?
+        //
+        // Judged from the **group actually taken** against `this_node()`, not from the
+        // loop's `step`: `step` counts distance from `first`, and `first` comes from the
+        // preference - so with the preference off every core's `first` is group 0 and a
+        // node-1 core taking group 0 would look like `step == 0`, i.e. local. That is
+        // how the second version of this check passed with the preference disabled
+        // (docs/ENGINEERING.md 1: two vacuous proofs before this one).
+        //
+        // `this_node()` and not `mine`, for the same reason at one remove: the detector
+        // must not share a binding with the thing it detects.
+        if let Some(m) = this_node()
+            .map(|m| (m as usize).min(groups - 1))
+            .filter(|&m| m != g)
+        {
+            {
+                let ms = if m == 0 {
+                    0
+                } else {
+                    PLACE_GROUP_END[m - 1].load(Ordering::Acquire)
+                };
+                let me = PLACE_GROUP_END[m].load(Ordering::Acquire).min(n);
+                // A group only shrinks, so "my own group still had room" cannot become
+                // false later - there is no race to lose here.
+                if ms + PLACE_NEXT_NODE[m].load(Ordering::Acquire) < me {
+                    CLAIMS_AVOIDABLE.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+        }
+        return Some(start + k);
+    }
+    None
+}
 
 #[cfg(feature = "smp")]
 /// How many runnable cells were rebalanced out of a busy core's claim in the last
@@ -993,10 +1185,13 @@ unsafe fn drain_cells() {
         let mut marked = [false; CLAIM_BATCH];
         let mut got = 0;
         while got < CLAIM_BATCH {
-            let k = PLACE_NEXT.fetch_add(1, Ordering::AcqRel);
-            if k >= n {
+            // This core's own NUMA node first (docs/SUBSTRATE.md pillar 6), then any
+            // other - work-conserving, since an idle core beside a runnable cell is a
+            // worse outcome than a remote memory access. One `fetch_add` per group, so
+            // exactly one core can obtain each slot exactly as before.
+            let Some(k) = claim_next(n) else {
                 break;
-            }
+            };
             slot[got] = k;
             cell[got] = PLACE_CELLS.lock()[k];
             PLACE_OWNER[k].store(cpu, Ordering::Release);
@@ -1043,6 +1238,12 @@ unsafe fn drain_cells() {
                 left -= 1;
                 continue;
             }
+            // Past the run-mark this core *will* run this cell and no peer can take it,
+            // so this - not the claim - is where node locality is recorded. A claim can
+            // be lost to a stealer, which would count a cell twice and make the
+            // counters disagree with where the cell actually ran (observed: 9 claims
+            // counted for 8 cells, one of them stolen).
+            count_claim(cell[pos]);
             if preemptive {
                 // Under preemption *both* cells of a batch are live at once - the timer
                 // enters the sibling without passing through this loop - so neither can
@@ -1134,10 +1335,46 @@ pub unsafe fn place_cells_preemptive(cells: &[usize], out: &mut [(u64, usize)]) 
 /// As [`place_cells`].
 unsafe fn place_cells_inner(cells: &[usize], out: &mut [(u64, usize)], preempt: bool) -> bool {
     let n = cells.len().min(MAX_PLACED_CELLS).min(out.len());
+    // **Publish the queue grouped by each cell's home node** (docs/SUBSTRATE.md pillar
+    // 6), so a core taking work from its own node's cursor gets cells whose pages are
+    // on its own memory controller. The caller's order is kept in `PLACE_ORIGIN` and
+    // restored when results are reported, so grouping is invisible above this seam.
+    //
+    // With fewer than two nodes every cell falls in group 0 and the order is the
+    // caller's, which is the pre-NUMA behaviour exactly.
+    let groups = crate::mm::frames::nodes_known().max(1);
     {
         let mut q = PLACE_CELLS.lock();
-        q[..n].copy_from_slice(&cells[..n]);
+        let mut w = 0usize;
+        for (g, end) in PLACE_GROUP_END.iter().enumerate().take(groups) {
+            for (i, &c) in cells[..n].iter().enumerate() {
+                let node = crate::user::cell_node(c);
+                // A cell with no node - every cell on a single-node machine - belongs
+                // to group 0, the only group there is.
+                let cg = if (node as usize) < groups {
+                    node as usize
+                } else {
+                    0
+                };
+                if cg == g {
+                    q[w] = c;
+                    PLACE_ORIGIN[w].store(i, Ordering::Release);
+                    w += 1;
+                }
+            }
+            end.store(w, Ordering::Release);
+        }
+        debug_assert_eq!(w, n, "every published cell must land in exactly one group");
+        for e in PLACE_GROUP_END.iter().skip(groups) {
+            e.store(w, Ordering::Release);
+        }
     }
+    for c in PLACE_NEXT_NODE.iter() {
+        c.store(0, Ordering::Release);
+    }
+    CLAIMS_LOCAL.store(0, Ordering::Release);
+    CLAIMS_REMOTE.store(0, Ordering::Release);
+    CLAIMS_AVOIDABLE.store(0, Ordering::Release);
     for k in 0..MAX_PLACED_CELLS {
         PLACE_CODE[k].store(usize::MAX, Ordering::Release);
         PLACE_CPU[k].store(usize::MAX, Ordering::Release);
@@ -1150,7 +1387,6 @@ unsafe fn place_cells_inner(cells: &[usize], out: &mut [(u64, usize)], preempt: 
         unsafe { PLACE_TAKEN.get(c) }.store(0, Ordering::Release);
     }
     PLACE_DONE.store(0, Ordering::Release);
-    PLACE_NEXT.store(0, Ordering::Release);
     if preempt {
         // The **global** half of timer bring-up - the APIC mode probe, the IDT gate,
         // the one-shot self-test - happens here, on the primary, before any secondary
@@ -1190,13 +1426,32 @@ unsafe fn place_cells_inner(cells: &[usize], out: &mut [(u64, usize)], preempt: 
     while BUSY.load(Ordering::Acquire) > 0 && arch::timer_now_ns() < quiesce {
         core::hint::spin_loop();
     }
-    for (k, slot) in out.iter_mut().enumerate().take(n) {
-        *slot = (
-            PLACE_CODE[k].load(Ordering::Acquire) as u64,
-            PLACE_CPU[k].load(Ordering::Acquire),
-        );
+    // Back into the caller's order: `out[i]` is about `cells[i]`, whatever group the
+    // cell was published in.
+    for k in 0..n {
+        let i = PLACE_ORIGIN[k].load(Ordering::Acquire);
+        if let Some(slot) = out.get_mut(i) {
+            *slot = (
+                PLACE_CODE[k].load(Ordering::Acquire) as u64,
+                PLACE_CPU[k].load(Ordering::Acquire),
+            );
+        }
     }
     true
+}
+
+#[cfg(feature = "smp")]
+/// The hardware id CPU registry slot `cpu` recorded for itself at bring-up.
+///
+/// Each core read this from a register and stored it in `set_online`; nothing tells a
+/// core its identity. Exposed so a proof can map "the CPU that ran this cell" back to
+/// the inventory - which keys CPUs by hardware id, since a registry index is an
+/// artefact of the order bring-up claimed them in.
+pub fn cpu_hw_id_of(cpu: usize) -> u32 {
+    if cpu >= MAX_CPUS {
+        return u32::MAX;
+    }
+    CPUS[cpu].hw_id()
 }
 
 #[cfg(feature = "smp")]

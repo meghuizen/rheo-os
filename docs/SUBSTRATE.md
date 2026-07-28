@@ -609,10 +609,48 @@ frame-aligned, because `in_pool` asks a question about frames rather than addres
 and the addresses a caller actually holds are interior ones. It rounds down now, so
 "not on any node" cannot quietly mean "not aligned".
 
-**Not yet, and named:** vcore placement does not follow memory (pillar 3's queue
-is per-CPU, and a core claiming a cell does not prefer one whose home node is its own -
-the CPU half of "vcores follow memory", and the remaining piece of this pillar); the
-cell-facing path is proven **at the kernel seam**
+**And a core takes work from its own node first** - the CPU half of "vcores follow
+memory". Placing a cell's pages is wasted if the core that runs it sits on the other
+side of the interconnect, where an access costs roughly double. The published runnable
+set is now **grouped by each cell's home node** with **one claim cursor per node**
+(`smp::claim_next`), and a core tries its own node's cursor before any other; the
+caller's ordering is preserved by a recorded permutation, so grouping is invisible above
+the seam. It is the **same protocol replicated, not a new one**: each cursor is a single
+`fetch_add`, so exactly one core can obtain each slot - the property the one shared
+cursor had, and the reason it was chosen over scan-and-claim, since two cores entering
+one cell is the failure docs/SMP.md 10.0 exists to make impossible. Work-conserving: a
+core whose own group is exhausted takes remote work rather than idling. With fewer than
+two nodes everything lands in one group and this is the single cursor, byte-for-byte.
+
+Proven in the `smp` kernel, which now boots with two memory nodes and its CPUs split
+across them (every pre-existing phase was verified to pass unchanged under that launch
+before it was added). Measured: **7-8 of 8 cells run on a core of their own memory
+node**, and the kernel's counters agree **exactly** with the node of the CPU that
+actually ran each cell - which is what makes them evidence rather than decoration, since
+a counter that missed the steal path shows up here as a mismatch.
+
+**Three attempts, and the first two proved nothing** - worth recording, because each
+looked right. (1) Asserting `local > 0` **passed with the preference deleted**: cells are
+round-robin over two nodes and cores split evenly, so *random* claiming already lands
+about half the cells locally. A ratio can never separate "the preference was applied"
+from "the distribution happened to look local", and a threshold above chance is a guess
+that becomes flakiness. (2) So the assertion became exact - *a core must never cross
+while its own node still holds unclaimed work*, which by construction cannot happen -
+but the control **passed again**, twice, for two different reasons: the detector read the
+same `mine` binding the preference did, so disabling the preference disabled the
+detector; and once that was separated, it judged crossings by the loop's `step`, which
+counts distance from a starting group that is *itself* derived from the preference - so
+with the preference off every core's start was group 0 and a node-1 core taking group 0
+read as local. Judged from the group actually taken against a freshly-read `this_node()`,
+the control fires. The lesson is the one this tree keeps relearning: a detector that
+shares state with the thing it detects is not a detector.
+
+Also worth recording: the crossing is counted where a core **wins the run-mark**, not
+where it claims. A claim can be lost to a stealer, and counting at claim time recorded
+nine claims for eight cells - so the counters disagreed with where the cells actually
+ran, which is exactly the check that makes them worth keeping.
+
+**Not yet, and named:** the cell-facing path is proven **at the kernel seam**
 rather than from inside a cell - a cell cannot see a physical address, so
 asserting placement from userspace needs the kernel to walk the cell's page
 tables and report back, which is a harness rather than a stronger claim about the
@@ -1364,8 +1402,11 @@ kernel.
   tree - `-dtb` was tried). **And a cell's memory is co-located with the cell**: a
   home node stamped at `install` (round-robin, inherited by spawn and fork) that
   its kernel metadata, its typed grants and every page it commits all follow.
-  **Not yet:** the CPU half - a core claiming a cell does not prefer one whose
-  home node is its own - and core classes (P/E), which QEMU cannot model at all.
+  **And the CPU half**: the runnable set is grouped by home node with one claim
+  cursor per node, so a core takes its own node's work first (work-conserving,
+  crossing rather than idling) - 7-8 of 8 cells on their own node in the `smp`
+  kernel, with the counters agreeing exactly with the core each cell ran on.
+  **Not yet:** core classes (P/E), which QEMU cannot model at all.
 - **S7 - workload gates.** Real Node.js already runs to completion with its
   JIT enabled (GOAL-NODE), real Bun evaluates JavaScript and exits 0
   (GOAL-BUN), and the real Claude Code binary prints its version and exits 0

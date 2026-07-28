@@ -200,11 +200,25 @@ fn fixed_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
         // The `smp` kernel's per-core queue phase (docs/SUBSTRATE.md S5) needs a
         // real controller to create one queue pair per CPU on. Same fixture, same
         // read-only use - it never writes, so no snapshot is needed.
+        // smp also gets **two memory nodes with the CPUs split across them**, so the
+        // node-preferring claim (docs/SUBSTRATE.md pillar 6) has something to prefer:
+        // CPUs 0-1 on node 0, 2-3 on node 1. Every pre-existing phase was verified to
+        // pass unchanged under this launch before it was added - none of them asserts a
+        // physical address - and on ARM64 no firmware describes memory at all, so there
+        // the machine reports one node and the phase skips with a reason.
         ("smp", _) => &[
             "-drive",
             "file=tests/fixtures/ext4.img,if=none,id=nvm0,format=raw",
             "-device",
             "nvme,drive=nvm0,serial=rheonvme1",
+            "-object",
+            "memory-backend-ram,id=m0,size=512M",
+            "-numa",
+            "node,nodeid=0,memdev=m0,cpus=0-1",
+            "-object",
+            "memory-backend-ram,id=m1,size=512M",
+            "-numa",
+            "node,nodeid=1,memdev=m1,cpus=2-3",
         ],
         ("nvmefs", _) => &[
             "-drive",

@@ -496,6 +496,84 @@ const PLACED: usize = 8;
 const LONG_ROUNDS: u64 = 96;
 const SHORT_ROUNDS: u64 = 8;
 
+/// **A cell ran on a core of the cell's own NUMA node** (docs/SUBSTRATE.md pillar 6,
+/// the CPU half of "vcores follow memory").
+///
+/// `out[i].1` is the CPU that actually ran cell `i`, so the outcome can be checked
+/// directly against the inventory rather than through the mechanism that produced it.
+///
+/// **Zero crossings is deliberately not asserted, and could not honestly be.** A core
+/// that drains its own node's queue takes remote work rather than idling - an idle core
+/// beside a runnable cell is worse than a remote access - and which core drains first
+/// is a race. What *is* asserted is that the kernel's counters agree exactly with the
+/// observed mapping, which is what makes them evidence instead of decoration: a counter
+/// that missed the steal path, or a preference that was never applied, both show up as
+/// a mismatch here.
+fn node_affinity(out: &[(u64, usize)]) {
+    let inv = kernel::hw::inventory();
+    if kernel::mm::frames::nodes_known() < 2 {
+        println!(
+            "smp: SKIP node-affine placement - this machine reports {} memory node(s), \
+             so there is no other node for a claim to prefer or to cross to",
+            inv.nnodes
+        );
+        // The counters must be silent too, not merely small: with one node there is no
+        // preference to express, and a count would mean the path ran anyway.
+        assert_eq!(
+            smp::node_claims(),
+            (0, 0),
+            "node claims were counted on a single-node machine"
+        );
+        return;
+    }
+    // Count the crossings from the *outcome*: for each cell, the node of the CPU that
+    // ran it against the node the cell's memory was placed on.
+    let mut observed_local = 0usize;
+    let mut observed_remote = 0usize;
+    for (i, &(_, cpu)) in out.iter().enumerate() {
+        let cell_node = kernel::user::cell_node(i);
+        let hw = smp::cpu_hw_id_of(cpu);
+        let Some(cpu_node) = inv.cpu_node(hw) else {
+            panic!("cell {i} ran on CPU {cpu} (hw {hw}), which the inventory does not list");
+        };
+        if cpu_node == cell_node {
+            observed_local += 1;
+        } else {
+            observed_remote += 1;
+        }
+    }
+    let (counted_local, counted_remote) = smp::node_claims();
+    assert_eq!(
+        (counted_local, counted_remote),
+        (observed_local, observed_remote),
+        "the kernel counted {counted_local} local / {counted_remote} crossing claims, \
+         but the cells actually ran {observed_local} local / {observed_remote} crossing"
+    );
+    // **The load-bearing assertion, and it is exact rather than a threshold.** A
+    // local/remote ratio cannot separate "the preference is applied" from "the
+    // distribution happened to look local": with cells round-robin over two nodes and
+    // cores split evenly, random claiming already lands about half of them locally. A
+    // first version of this proof asserted only `observed_local > 0` and **passed with
+    // the preference deleted** (4-5 of 8 local instead of 7-8), so it was measuring
+    // nothing (docs/ENGINEERING.md 1).
+    //
+    // What is exact: a core must never cross while its own node still holds unclaimed
+    // work. By construction it cannot - the own group is tried first and left only when
+    // exhausted - so a nonzero count means the preference was not applied at all.
+    assert_eq!(
+        smp::avoidable_crossings(),
+        0,
+        "a core took work from another node while its own node still had unclaimed          cells - the own-node cursor is not being tried first"
+    );
+    println!(
+        "smp: NODE-AFFINE PLACEMENT - {observed_local} of {} cells ran on a core of \
+         their own memory node, {observed_remote} crossed (a core that drains its own \
+         node takes remote work rather than idling), and the kernel's counters agree \
+         with the cells' observed cores exactly",
+        out.len()
+    );
+}
+
 fn test_placement() {
     // Bring up the rest of the machine first: with a single secondary, "whichever core
     // is free" has two participants and the result is hard to tell from a split.
@@ -619,6 +697,10 @@ fn test_placement() {
             kernel::mm::frames::used_matches_bitmap(),
             "the frame pool's used counter drifted from its bitmap under placement"
         );
+        // 4. **The CPU half of "vcores follow memory"** (docs/SUBSTRATE.md pillar 6):
+        // a core takes work from its own NUMA node's queue first, so a cell runs on a
+        // core that shares a memory controller with the pages the cell was placed on.
+        node_affinity(&out);
         println!(
             "smp: {PLACED} RUNNABLE CELLS were PLACED on whichever core was free - none \
              assigned in advance, {movers} cores claimed work (the busiest took \

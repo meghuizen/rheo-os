@@ -2167,13 +2167,29 @@ contiguous, so an interleaved machine (node 0, node 1, node 0) would give node 0
 swallowing node 1's - `alloc_on(0)` serving node 1's frames while reporting no fallback,
 a wrong answer that looks right - which is now detected and answered by knowing
 *nothing* (ranges cleared, `alloc_on` degenerating to `alloc`, reason printed) rather
-than something false. Honest: vcore placement
-does **not** follow memory on the CPU side yet, the pmem pool has no node of its own, and
-the cell-facing path is proven at the **kernel seam**
+than something false. Honest: the pmem pool has no node of its own, core classes (P/E) are
+unmodellable in QEMU, and the cell-facing path is proven at the **kernel seam**
 rather than from inside a cell (a cell cannot see a physical address). Latency is
-unmeasurable here regardless - QEMU models the topology, not its costs. The one
-remaining piece of the pillar is the **CPU half**: a core claiming a cell does not prefer
-one whose home node is its own.
+unmeasurable here regardless - QEMU models the topology, not its costs.
+**And a core takes work from its own node first** (the CPU half of "vcores follow
+memory"): the published runnable set is **grouped by home node** with **one claim cursor
+per node**, and a core tries its own before any other - the *same* protocol replicated,
+each cursor a single `fetch_add` so exactly one core can obtain each slot, which is the
+property that makes two cores entering one cell impossible and the reason a scan was
+refused. Work-conserving (a core whose group is dry crosses rather than idles), and with
+one node it is the single cursor byte-for-byte. The `smp` kernel now boots with two
+memory nodes and its CPUs split across them (every pre-existing phase verified to pass
+unchanged under that launch first): **7-8 of 8 cells run on a core of their own memory
+node**, with the kernel's counters agreeing **exactly** with the node of the CPU that ran
+each cell. **Three attempts, and the first two proved nothing** - asserting `local > 0`
+passed with the preference deleted (random claiming already lands ~half locally, so no
+ratio can separate "applied" from "looked local"), and the exact version then passed
+twice more because the detector shared the `mine` binding with the preference, and then
+because it judged crossings by a loop `step` measured from a starting group derived from
+the preference itself. Judged from the group actually taken against a freshly-read
+`this_node()`, the control fires. The crossing is also counted where a core **wins the
+run-mark**, not where it claims: a claim can be lost to a stealer, and counting at claim
+time recorded nine claims for eight cells.
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
@@ -2390,6 +2406,11 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               peer's claim; then **cross-core preemption** - each core preempts
               between the cells it claimed, ~350-400 slices taken on 4 cores at
               once against 0 in the cooperative control round; then an
+              **node-affine placement** (docs/SUBSTRATE.md pillar 6: two memory nodes with
+              the CPUs split across them, the runnable set grouped by home node with one
+              claim cursor per node, 7-8 of 8 cells asserted to run on a core of their
+              own node and the counters to agree exactly with the core each ran on;
+              ARM64 skips - no firmware describes memory there); then an
               **unmodified static-glibc binary as a Linux cell on a secondary**,
               exact stdout + exit asserted, overlapping a native cell on the
               primary; then **two Linux cells on two cores at once**, each

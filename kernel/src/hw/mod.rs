@@ -278,6 +278,20 @@ impl Inventory {
             .map(|r| r.len)
             .sum()
     }
+
+    /// The NUMA node the CPU with hardware id `hw_id` sits on, or `None` if this
+    /// machine reported no such CPU (docs/SUBSTRATE.md pillar 6).
+    ///
+    /// By **hardware id** and not by registry index, because a core knows its own
+    /// hardware id from a register before it knows anything else - that is how the
+    /// secondaries identify themselves - while a registry index is an artefact of
+    /// the order bring-up happened to claim them in.
+    pub fn cpu_node(&self, hw_id: u32) -> Option<u8> {
+        self.cpus[..self.ncpus]
+            .iter()
+            .find(|c| c.hw_id == hw_id)
+            .map(|c| c.node)
+    }
 }
 
 static mut INVENTORY: Inventory = Inventory::new();
