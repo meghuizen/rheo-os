@@ -1025,11 +1025,40 @@ kernel.
   drive is attached `snapshot=on`, so the writes genuinely reach QEMU's block
   layer while the committed fixture is untouched.
 
-  **Not done, and it is the larger half:** one I/O queue pair, polled, no
-  MSI-X, no per-core queue, and no IOMMU-contained storage *cell*. Transfers
-  bounce through a single page-aligned frame one page at a time, so `PRP1`
-  addresses every command and no PRP list is built - correct, and the simple
-  form on purpose, since a PRP list buys throughput TCG cannot show.
+  **And the per-core data path is proven.** The driver creates one queue pair
+  *and one bounce frame* per CPU, and a core submits on its own - selected by
+  CPU index, not round-robin, not a hash. Two counters make that a measurement
+  rather than an intention: submissions per queue, and submissions made on a
+  queue the submitting CPU does not own. The `smp` kernel's NVMe phase has two
+  cores read **different** sectors at the same instant (meeting at a rendezvous
+  first, so the overlap is real) and asserts that two distinct queues took work,
+  that each core's bytes are its own, and that **zero** submissions crossed a
+  core - on all three ISAs.
+
+  Two things had to be got right for that, and both were initially wrong in the
+  same way - a fact that had been guessed rather than asked for:
+
+  - **A core with no queue of its own is refused, not quietly given core 0's.**
+    The first version counted the fallback and carried on, which reads as a
+    sensible degraded mode and is not one: two cores on one ring is a data race,
+    and it does not present as an error but as *wrong bytes*. It was found
+    exactly that way - the same sector read back differently on round 3, no
+    fault, no log. The counter now records something that must be impossible.
+  - **`RefCell` was the wrong primitive**, and not stylistically. Its borrow flag
+    is a plain `Cell`, so a `RefCell` is `!Sync` and a type containing one cannot
+    soundly be shared between cores whatever the access pattern underneath - and
+    this device *is* reached from two. It is a `SpinLock` now, never contended
+    because of the partitioning, so an acquire is one uncontended atomic exchange
+    next to a PCIe round trip. A `const` assertion that `Nvme: Sync` keeps a
+    future field from undoing it silently. Same call `mm::frames` already made,
+    for the same reason: whether a structure needs a lock is a property of the
+    structure, not of which cargo features are enabled.
+
+  **Not done:** no MSI-X and no interrupt (completions are polled), no
+  IOMMU-contained storage *cell*, and no queue depth - one command outstanding
+  per core at a time. Transfers bounce through a page-aligned frame one page at a
+  time, so `PRP1` addresses every command and no PRP list is built - correct, and
+  the simple form on purpose, since a PRP list buys throughput TCG cannot show.
 - **S6 - NUMA pools + core classes.** Placement proven in QEMU
   (chosen-node assertions), P/E and latency measured at the lab.
 - **S7 - workload gates.** Real Node.js already runs to completion

@@ -130,6 +130,11 @@ pub struct PciDevice {
 pub enum Firmware {
     Acpi,
     DeviceTree,
+    /// ARM64 PSCI: the CPU list came from `AFFINITY_INFO`, the only enumeration
+    /// source a bare-ELF `virt` boot has (QEMU passes no device tree there).
+    /// Distinct from `Builtin` on purpose - it is the difference between having
+    /// asked the platform and having assumed a profile.
+    Psci,
     /// A built-in platform profile (used where the emulator hands a bare
     /// ELF no firmware table; the layout is the fixed QEMU machine model).
     Builtin,

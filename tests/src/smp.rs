@@ -268,6 +268,7 @@ fn test_secondary_bringup() {
             test_cross_core_preemption();
             test_linux_cell_on_secondary();
             test_two_linux_cells();
+            test_nvme_per_core_queues();
         }
         Err(StartError::NoSecondary) => {
             println!(
@@ -1078,4 +1079,168 @@ fn test_two_linux_cells() {
              global tables held by one recursive lock over its dispatch"
         );
     }
+}
+
+// ------------------------------------------------ NVMe: a queue pair per core
+//
+// docs/SUBSTRATE.md S5 states the property as a measurement: "per-vcore submission
+// never crosses cores (counter-asserted)". This is that assertion.
+//
+// NVMe's defining property is that a queue pair is a *private* channel to the
+// controller. A driver that creates one pair and locks it has the device's
+// interface without its design - the ring becomes the serialization point, and the
+// cost shows up as contention that no throughput number distinguishes from a slow
+// disk. So the driver creates one pair per CPU and each core submits on its own,
+// and what makes that a fact rather than an intention is that both cores read at
+// the same instant and the cross-core counter is still zero.
+//
+// The reads are of *different* sectors, and each core checks its own bytes: two
+// cores reading the same sector could be served by one queue and look identical.
+
+/// The device, brought up on the primary and read by both cores. A static because
+/// the secondary reaches it through a bare `fn()` with no captured environment -
+/// the only thing that crosses cores here.
+static mut NVME: Option<kernel::hw::nvme::Nvme> = None;
+
+/// Sector each core reads, and where it puts the bytes. Disjoint per core, so the
+/// two transfers share nothing at all - which is the point being demonstrated.
+const NVME_ROUNDS: usize = 32;
+static mut BUF_P: [u8; 512] = [0; 512];
+static mut BUF_S: [u8; 512] = [0; 512];
+static NVME_P_OK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static NVME_S_OK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Read sector `sector` `NVME_ROUNDS` times into `buf`, counting the reads that
+/// succeeded and returned the same bytes every time.
+///
+/// # Safety
+/// `buf` must be this core's own buffer, and the device must be brought up.
+unsafe fn nvme_hammer(sector: u64, buf: *mut [u8; 512], done: &core::sync::atomic::AtomicUsize) {
+    use kernel::hw::block::BlockDevice;
+    // SAFETY: brought up on the primary before either core is released, and never
+    // written again; the caller owns `buf`.
+    let dev = match unsafe { (*core::ptr::addr_of!(NVME)).as_ref() } {
+        Some(d) => d,
+        None => return,
+    };
+    let mut first = [0u8; 512];
+    for i in 0..NVME_ROUNDS {
+        // SAFETY: the caller's contract - this core's own buffer.
+        let b = unsafe { &mut *buf };
+        if dev.read(sector, b).is_err() {
+            return;
+        }
+        if i == 0 {
+            first = *b;
+        } else if *b != first {
+            // The same sector read twice must give the same bytes. A difference is
+            // a torn or crossed transfer, which is what two cores sharing one ring
+            // produces - so it is reported with the bytes rather than counted.
+            println!(
+                "smp: nvme sector {sector} round {i} differs: {:?} vs first {:?}",
+                &b[..8],
+                &first[..8]
+            );
+            return;
+        }
+        done.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn nvme_primary() {
+    // SAFETY: BUF_P is the primary's alone.
+    unsafe { nvme_hammer(0, core::ptr::addr_of_mut!(BUF_P), &NVME_P_OK) };
+}
+
+fn nvme_secondary() {
+    // SAFETY: BUF_S is the secondary's alone.
+    unsafe { nvme_hammer(8, core::ptr::addr_of_mut!(BUF_S), &NVME_S_OK) };
+}
+
+fn test_nvme_per_core_queues() {
+    use kernel::hw::nvme;
+
+    // NVMe's registers are BAR0 and there is no config-space tunnel to reach them
+    // through, so the BARs have to be programmed first (no firmware does it on the
+    // bare arm/riscv boots).
+    kernel::hw::assign_pci_bars();
+    let dev = match nvme::probe() {
+        Some(d) => d,
+        None => {
+            println!("smp: no NVMe controller attached - per-core queue phase skipped");
+            return;
+        }
+    };
+    let cpus = kernel::hw::inventory().ncpus;
+    let online = smp::online_count();
+    // SAFETY: the primary, before either core is released to `nvme_hammer`.
+    unsafe { *core::ptr::addr_of_mut!(NVME) = Some(dev) };
+
+    let before_cross = nvme::cross_core_submits();
+    let (met, finished) = smp::run_fn_with_secondary(nvme_secondary, nvme_primary);
+    assert!(met, "smp: cores did not meet before the NVMe reads");
+    assert!(finished, "smp: the secondary did not finish its NVMe reads");
+
+    let p = NVME_P_OK.load(core::sync::atomic::Ordering::Relaxed);
+    let s = NVME_S_OK.load(core::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        p, NVME_ROUNDS,
+        "smp: primary completed {p} of {NVME_ROUNDS} NVMe reads"
+    );
+    assert_eq!(
+        s, NVME_ROUNDS,
+        "smp: secondary completed {s} of {NVME_ROUNDS} NVMe reads"
+    );
+
+    // Each core's reads landed on its **own** queue, so **two distinct queues** took
+    // work. Which secondary answered is not fixed - the placement phase above brought
+    // up every core, and whichever is free claims the job - so the assertion is on the
+    // shape (two queues, both busy) rather than on queue 1 by name. Without per-core
+    // queues exactly one queue is nonzero and holds everything.
+    let mut busy = 0;
+    let mut total = 0u64;
+    for c in 0..nvme::MAX_IOQ {
+        let n = nvme::submits(c);
+        if n > 0 {
+            busy += 1;
+            total += n;
+        }
+    }
+    assert!(
+        busy >= 2,
+        "smp: only {busy} NVMe queue(s) took submissions - the two cores shared one ring"
+    );
+    assert!(
+        total >= 2 * NVME_ROUNDS as u64,
+        "smp: {total} submissions for {} reads",
+        2 * NVME_ROUNDS
+    );
+
+    // And the headline: **no submission crossed a core**. This is what makes the
+    // two counts above evidence of a per-core data path rather than of two cores
+    // taking turns on one ring.
+    let cross = nvme::cross_core_submits() - before_cross;
+    assert_eq!(
+        cross, 0,
+        "smp: {cross} NVMe submissions went to another CPU's queue"
+    );
+
+    // The bytes: different sectors, and each core got its own. Reading the same
+    // sector on both would pass with one shared queue too.
+    // SAFETY: both cores are done (`finished` above).
+    let (bp, bs) = unsafe { (*core::ptr::addr_of!(BUF_P), *core::ptr::addr_of!(BUF_S)) };
+    assert!(
+        bp != bs,
+        "smp: the two cores read identical bytes from different sectors - \
+         one of them did not read what it asked for"
+    );
+
+    println!(
+        "smp: TWO CORES DROVE NVMe THROUGH THEIR OWN QUEUE PAIRS at the same time - \
+         {} queue pair(s) ({online} cores online, {cpus} enumerated), {busy} took \
+         work ({total} \
+         submissions in total), {cross} submissions crossed a core, and each core \
+         read its own sector correctly {NVME_ROUNDS} times",
+        nvme::MAX_IOQ
+    );
 }

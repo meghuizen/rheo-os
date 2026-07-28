@@ -59,8 +59,9 @@ Run it: `cargo xtask run --bin lsh --arch <isa>`.
 
 A **hardware-discovery** layer (`kernel/src/hw/`) builds one portable
 machine `Inventory` at boot: firmware source (ACPI on x86-64 via the PVH
-RSDP, a flattened device tree on RISC-V, a fixed QEMU-virt profile on
-ARM64), CPU count and instruction-set features (CPUID / `ID_AA64*` / the
+RSDP, a flattened device tree on RISC-V, **PSCI `AFFINITY_INFO`** on ARM64 - which
+has no firmware table for a bare-ELF boot, so the CPU list is *asked for* rather
+than assumed; the rest of its QEMU-virt profile stays built in), CPU count and instruction-set features (CPUID / `ID_AA64*` / the
 device-tree ISA string), the typed physical memory map (DDR / reserved /
 ACPI / pmem), NUMA topology (SRAT memory + CPU affinities, memory regions
 split at node boundaries), and PCIe enumeration through the ECAM/config
@@ -204,6 +205,33 @@ attached `snapshot=on` so the committed fixture is untouched. Honest: one I/O qu
 pair, polled, no MSI-X, no per-core queue, no IOMMU-contained storage cell, and
 transfers bounce through one page-aligned frame a page at a time so `PRP1`
 addresses every command and no PRP list is built.
+
+**And the storage data path is per-core** (docs/SUBSTRATE.md S5, the `smp` kernel's
+NVMe phase, all three ISAs): the driver creates one queue pair *and one bounce frame*
+per CPU, and a core submits on its own - selected by CPU index. Two counters make it a
+measurement: submissions per queue, and submissions on a queue the submitting CPU does
+not own. Two cores read **different** sectors at the same instant (meeting at a
+rendezvous first, so the overlap is real) and it is asserted that two distinct queues
+took work, each core's bytes are its own, and **zero** submissions crossed a core. Two
+things had to be got right, both initially wrong the same way - a fact guessed rather
+than asked for. (1) A core with no queue of its own is now **refused**, not quietly
+given core 0's: the first version counted the fallback and carried on, which reads as a
+degraded mode and is not one, because two cores on one ring is a data race that presents
+as *wrong bytes* - found exactly that way, the same sector reading back differently on
+round 3 with no fault and no log. (2) `RefCell` was the wrong primitive and not
+stylistically: its borrow flag is a plain `Cell`, so a `RefCell` is `!Sync` and a type
+containing one cannot soundly be shared between cores whatever the access pattern
+underneath - and this device *is* reached from two. It is a `SpinLock` now, never
+contended because of the partitioning, with a `const` assertion that `Nvme: Sync` so a
+future field cannot undo it silently (the same call `mm::frames` already made: whether a
+structure needs a lock is a property of the structure, not of which cargo features are
+enabled). The second of those was only reachable because **ARM64 CPU enumeration was
+fixed first** - see docs/SMP.md 7: `discover` reported one CPU while four ran, so the
+driver sized its queues from a field that lied. It now enumerates from PSCI
+`AFFINITY_INFO` (`arch/aarch64/psci.S`, always compiled - how many CPUs a machine has is
+a property of the hardware, not of a build configuration), reporting `firmware=Psci
+cpus=4` in the **non-SMP** build, and the driver no longer depends on that count being
+right anyway: it sizes by the CPU *index space*, which is the quantity it indexes with.
 
 A **live-disk block stack** closes the loop from storage transport to
 filesystem: a **`BlockDevice` trait** (`kernel/src/hw/block.rs`, 512-byte
@@ -2025,8 +2053,7 @@ only **one** secondary is started (one dedicated stack per ISA). Both of those l
 are superseded: a secondary now runs a **cell in user mode**, and `start_all` brings up
 every enumerable core on its own stack - see above and docs/SMP.md 10.0. Still deferred: shared
 `static mut` state made SMP-safe end to end, per-CPU stacks + a start-all loop, a
-per-CPU register instead of the small id->index table, ARM64 CPU *enumeration* (probing
-`PSCI_AFFINITY_INFO`), cross-CPU IPIs beyond bring-up, and the **x86-64 NIC RX
+per-CPU register instead of the small id->index table, cross-CPU IPIs beyond bring-up, and the **x86-64 NIC RX
 interrupt** - the last interrupt source any ISA lacks, now known to need ordinary driver
 work (assign the virtio-net BAR, program MSI-X or find the q35 INTx routing) rather than
 the platform limit the old wording implied.

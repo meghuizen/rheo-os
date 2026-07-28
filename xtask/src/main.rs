@@ -118,6 +118,15 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
         // unlike virtio there is one device line for all three ISAs. `logical_block
         // _size` is left at QEMU's 512 default, which is what the driver requires
         // and refuses to guess around.
+        // The `smp` kernel's per-core queue phase (docs/SUBSTRATE.md S5) needs a
+        // real controller to create one queue pair per CPU on. Same fixture, same
+        // read-only use - it never writes, so no snapshot is needed.
+        ("smp", _) => &[
+            "-drive",
+            "file=tests/fixtures/ext4.img,if=none,id=nvm0,format=raw",
+            "-device",
+            "nvme,drive=nvm0,serial=rheonvme1",
+        ],
         ("nvmefs", _) => &[
             "-drive",
             // `snapshot=on`: the write round-trip below is a real device write, and

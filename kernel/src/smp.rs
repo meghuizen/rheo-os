@@ -470,6 +470,21 @@ fn secondary_work_loop() {
             deadline = arch::timer_now_ns().wrapping_add(RV_TIMEOUT_NS);
             continue;
         }
+        // A bare function to run - the driver-path job (`run_fn_with_secondary`).
+        // Claimed with a `swap` for the same reason `USER_CELL` is: two secondaries
+        // must not both take it.
+        let f = FN_JOB.swap(0, Ordering::AcqRel);
+        if f != 0 {
+            if rendezvous(&RV_SECONDARY, &RV_PRIMARY) {
+                // SAFETY: `run_fn_with_secondary` stored a real `fn()` here, and
+                // stores nothing else; 0 is the empty value and was excluded above.
+                let f: fn() = unsafe { core::mem::transmute::<usize, fn()>(f) };
+                f();
+            }
+            FN_DONE.fetch_add(1, Ordering::Release);
+            deadline = arch::timer_now_ns().wrapping_add(RV_TIMEOUT_NS);
+            continue;
+        }
         // **Taken** out under the lock, not copied: the loop serves more than one job
         // now, so a job left in place would be drained again the moment this core came
         // back round. The compute below must not hold the lock, because the primary is
@@ -643,6 +658,55 @@ fn rendezvous(mine: &AtomicUsize, theirs: &AtomicUsize) -> bool {
         core::hint::spin_loop();
     }
     true
+}
+
+// ------------------------------------------------- a plain job: run this function
+//
+// The GEMM job above carries matrix shapes because that is what it is for. Some
+// work has nothing to describe but itself - a device driver's per-core submission
+// path, for instance, where the whole question is *which core issued it* and the
+// arguments are already reachable through a static. For those, the job is a bare
+// function pointer.
+//
+// Kept separate from `GemmJob` rather than generalising it: a `GemmJob` with an
+// optional function pointer would make both callers read the other's fields.
+
+#[cfg(feature = "smp")]
+/// The function a secondary should run, as a raw address (0 = none). A pointer
+/// rather than a closure because it crosses cores through a static and must be
+/// `Copy` with no captured environment - a captured reference would be a borrow
+/// this side cannot prove outlives the other core.
+static FN_JOB: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp")]
+/// Bumped by a secondary when it has finished its function job.
+static FN_DONE: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "smp")]
+/// Run `theirs` on a secondary and `mine` on this core **at the same time**,
+/// meeting at a rendezvous first so the overlap is real rather than sequential.
+/// Returns `(rendezvous_held, secondary_finished)`.
+///
+/// Both functions take no arguments and return nothing: anything they need is a
+/// static, which is the only thing two cores can share without a lifetime one of
+/// them cannot check.
+pub fn run_fn_with_secondary(theirs: fn(), mine: fn()) -> (bool, bool) {
+    FN_DONE.store(0, Ordering::Release);
+    RV_PRIMARY.store(0, Ordering::Release);
+    RV_SECONDARY.store(0, Ordering::Release);
+    RV_TIMEOUT.store(0, Ordering::Release);
+    FN_JOB.store(theirs as usize, Ordering::Release);
+
+    let met = rendezvous(&RV_PRIMARY, &RV_SECONDARY);
+    mine();
+
+    let deadline = arch::timer_now_ns().wrapping_add(RV_TIMEOUT_NS);
+    while FN_DONE.load(Ordering::Acquire) == 0 {
+        if arch::timer_now_ns() >= deadline {
+            return (met, false);
+        }
+        core::hint::spin_loop();
+    }
+    (met, true)
 }
 
 #[cfg(feature = "smp")]

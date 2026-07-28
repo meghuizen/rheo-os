@@ -412,17 +412,38 @@ continuation, sets its own stack, installs the kernel's real `vector_table` (con
 a fault on this core reaches the kernel handler), and calls
 `aarch64_secondary_main`, which reads its identity from its own `MPIDR_EL1`.
 
-### What is *not* fixed by this
+### ARM64 CPU enumeration - **now done**, and the deferral was wrong twice
 
-ARM64's `discover` still reports only the boot CPU. That was previously attributed to
-PSCI being unusable, which is now disproved; the real reason is that QEMU's `virt` places
-**no firmware table** for a bare ELF (x0 arrives as 0, no DTB in guest RAM), while x86
-reads the ACPI MADT and RISC-V the device tree. PSCI is not an enumeration API - `CPU_ON`
-starts a CPU you already name. Probing `PSCI_AFFINITY_INFO` over candidate affinities
-*would* be a genuine enumeration path and is a documented follow-on; it is not done here
-because it would move the PSCI helper out of the `smp` cargo feature and change every
-kernel's inventory. The bring-up driver meanwhile synthesises the target id (`boot + 1`)
-for exactly this case, which is why a genuine attempt was possible at all.
+This section used to say ARM64's `discover` reports only the boot CPU, and gave two
+reasons. Both were wrong, and the cost was not a missing feature but a wrong answer,
+so they are kept here rather than quietly replaced.
+
+The first: "PSCI is not an enumeration API - `CPU_ON` starts a CPU you already name."
+True of `CPU_ON`, and not of **`AFFINITY_INFO`**, which answers ON/OFF/ON_PENDING for
+an affinity the platform implements and INVALID_PARAMETERS for one it does not. Asking
+it about each candidate affinity *is* enumeration. (What is genuinely true is that
+QEMU's `virt` places no firmware table for a bare ELF: x0 arrives as 0 and no DTB is in
+guest RAM, which is why the device-tree path RISC-V uses does not apply. `discover`
+tries a DTB first anyway, for the boot modes that do pass one, and falls through.)
+
+The second: "it would move the PSCI helper out of the `smp` cargo feature and change
+every kernel's inventory." That is a description of the fix, offered as a reason
+against it. How many CPUs a machine has is a property of the hardware, not of a build
+configuration - the same reasoning this port already applies to `mpidr_aff0`, in the
+same file. The guarded PSCI call now lives in `arch/aarch64/psci.S`, always compiled;
+only the secondary trampoline is behind `smp`.
+
+**What the deferral cost.** The NVMe driver sized its per-core queue pairs from
+`inventory().ncpus`, so on a four-core ARM64 boot cores 1..3 had no queue of their own
+and silently shared core 0's. It did not present as an error: the same sector read back
+different bytes on successive reads, no fault and no log (docs/SUBSTRATE.md S5). A field
+that is constant is a field that lies, and this one was consulted by a driver that had
+every right to believe it.
+
+ARM64 now reports `firmware=Psci cpus=4` in the **non-SMP** build, and `start_all`'s
+probe-the-next-id fallback - written for exactly this gap - no longer fires on any ISA.
+It stays, because it is a genuine attempt whose answer is observed, and a machine whose
+firmware enumerates nothing is still a machine this kernel should try to start.
 
 ## 8. Re-examining the x86-64 device interrupts
 
@@ -538,8 +559,6 @@ the interrupt vector writes.
   mechanical once the shared state is safe.
 - A per-CPU register on x86-64/ARM64 (`swapgs` / freeing `tpidr_el1`), instead of
   the small hardware-id -> index table `cpu_index()` searches today.
-- ARM64 CPU **enumeration** (probing `PSCI_AFFINITY_INFO`), so the inventory reports
-  more than the boot CPU - section 7.
 - Cross-CPU IPIs for anything beyond bring-up (the natural next users are a per-CPU
   timer arbiter and a remote-TLB shootdown; docs/NETSTACK.md 16 notes the arbiter
   shape).
@@ -942,10 +961,11 @@ is unchanged and stays the proof-of-correctness baseline.
   slot. `this_cpu()` becomes a single register read.
 - **Start-all**: **done** (`smp::start_all`, section 10.0) - it iterates the discovered
   CPU set and brings each up with its own stack via the section 5-7 paths, unchanged,
-  falling back to probing the next hardware ids where the firmware enumerates nothing
-  from EL1. Four CPUs come online on all three ISAs. What is *not* done is ARM64
-  `PSCI_AFFINITY_INFO` **enumeration** proper: the probe answers the same question by
-  asking, which is honest but does not populate the inventory.
+  falling back to probing the next hardware ids where the firmware enumerates nothing.
+  Four CPUs come online on all three ISAs. ARM64 `PSCI_AFFINITY_INFO` **enumeration** is
+  done too (section 7), so the inventory is now populated on every ISA and the fallback
+  no longer fires anywhere - it stays as a genuine attempt for a machine whose firmware
+  enumerates nothing.
 
 ### 10.4 The preemptive tick
 

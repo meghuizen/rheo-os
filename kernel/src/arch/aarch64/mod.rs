@@ -28,6 +28,9 @@ pub const CLONE_BACKWARDS: bool = true;
 global_asm!(include_str!("../../../arch/aarch64/boot.S"));
 global_asm!(include_str!("../../../arch/aarch64/vectors.S"));
 global_asm!(include_str!("../../../arch/aarch64/context_switch.S"));
+// PSCI is the platform's firmware interface and every build needs it - the CPU
+// count comes from `AFFINITY_INFO`. Only the secondary trampoline is SMP-only.
+global_asm!(include_str!("../../../arch/aarch64/psci.S"));
 #[cfg(feature = "smp")]
 global_asm!(include_str!("../../../arch/aarch64/smp.S"));
 
@@ -553,35 +556,146 @@ pub fn doorbell_count() -> u64 {
 
 // ----------------------------------------------------- hardware discovery
 
-/// Discover the machine. QEMU's arm virt hands a bare ELF no firmware
-/// table - x0 arrives as 0 and no DTB is placed in guest RAM - so we use
-/// the fixed QEMU virt platform profile (hw/arm/virt.c) for memory and the
-/// PCIe ECAM window. **CPU topology needs a firmware table**, and there is
-/// none: on x86 the count comes from the ACPI MADT and on RISC-V from the
-/// device tree, but here neither exists, so ARM64 reports the boot CPU only.
+/// Discover the machine. QEMU's arm `virt` hands a bare ELF no firmware table -
+/// x0 arrives as 0 and no DTB is placed in guest RAM - so memory and the PCIe
+/// ECAM window come from the fixed QEMU virt platform profile (hw/arm/virt.c).
 ///
-/// This used to be attributed to PSCI being unusable from EL1, which
-/// docs/SMP.md 7 disproved - PSCI answers on the `hvc` conduit and starts a
-/// real secondary. PSCI is simply not an *enumeration* API (`CPU_ON` starts a
-/// CPU you already name). Probing `PSCI_AFFINITY_INFO` over candidate
-/// affinities would be a genuine enumeration path and is a documented
-/// follow-on; it is not done here because it would move the PSCI helper out of
-/// the `smp` cargo feature and change every kernel's inventory.
+/// **The CPU list does not**: it is enumerated from PSCI `AFFINITY_INFO`. See the
+/// body for why the earlier deferral was wrong on both of its grounds.
 pub fn discover(inv: &mut crate::hw::Inventory) {
-    inv.firmware = crate::hw::Firmware::Builtin;
-    // QEMU virt: RAM at 0x4000_0000. We map (and therefore report) the
-    // first gigabyte; larger -m would need the map extended.
-    inv.add_mem(0x4000_0000, 0x4000_0000, crate::hw::MemKind::Ram, 0);
-    // PCIe ECAM low window (QEMU virt with highmem-ecam=off), inside the
-    // device gigabyte the kernel identity-maps.
-    inv.ecam_base = 0x3f00_0000;
+    // **The CPU list is asked for, not assumed.**
+    //
+    // This used to be `add_cpu(0, 0)` - one CPU, always, on a machine that can be
+    // booted with any number - and the comment above it explained why enumeration
+    // was deferred. The deferral had a cost that showed up as a wrong answer, not
+    // as a missing feature: the NVMe driver sized its per-core queue pairs from
+    // `ncpus`, so on a four-core ARM64 boot cores 1..3 had no queue of their own,
+    // silently shared core 0's, and the same sector read back different bytes on
+    // successive reads with no fault and no log (docs/SUBSTRATE.md S5). A field
+    // that is constant is a field that lies (docs/ENGINEERING.md 11).
+    //
+    // Two sources are tried, in order of how much they say:
+    //
+    // 1. **A device tree**, if one was passed. QEMU hands `virt` a DTB in x0 for a
+    //    Linux-image boot and `boot.S` has always kept it in `BOOT_DTB`; nothing
+    //    read it. It describes CPUs, memory and PCIe together, so where it exists
+    //    it is the better answer. For the bare-ELF `-kernel` boot this tree uses,
+    //    QEMU passes **x0 = 0** and places no tree - which is the observation the
+    //    old "no firmware table" comment was really recording.
+    //
+    // 2. **PSCI `AFFINITY_INFO`**, which is what that boot does have. The old note
+    //    said PSCI "is not an enumeration API (`CPU_ON` starts a CPU you already
+    //    name)" - true of `CPU_ON` and not of `AFFINITY_INFO`, which answers
+    //    ON/OFF for an affinity the platform implements and INVALID_PARAMETERS for
+    //    one it does not. Asking it about each candidate affinity *is* enumeration.
+    //    The other half of the deferral - that it would move the PSCI helper out of
+    //    the `smp` cargo feature - was a reason not to, and the wrong way round:
+    //    how many CPUs a machine has is a property of the hardware, not of a build
+    //    configuration, which is the same reasoning that already keeps
+    //    `mpidr_aff0` ungated.
+    //
+    // SAFETY: `BOOT_DTB` is written once by `boot.S` before any Rust runs.
+    let dtb = unsafe { core::ptr::addr_of!(BOOT_DTB).read() } as usize;
+    let mut source = crate::hw::Firmware::Builtin;
+    if dtb != 0 {
+        crate::hw::fdt::parse(phys_to_virt(dtb), inv);
+        if inv.ncpus > 0 {
+            source = crate::hw::Firmware::DeviceTree;
+        }
+    }
+    if inv.ncpus == 0 {
+        let found = psci_enumerate_cpus(inv);
+        if found > 0 {
+            source = crate::hw::Firmware::Psci;
+        }
+    }
+    if inv.ncpus == 0 {
+        // Neither source answered: the machine still has the core this is running
+        // on. Reported as `Builtin`, so "asked and was told" stays distinguishable
+        // from "assumed".
+        inv.add_cpu(mpidr_aff0(), 0);
+    }
+    inv.firmware = source;
+
+    // The rest of the QEMU `virt` map stays a built-in profile, and deliberately so
+    // rather than for want of a parser: each of these is already verified against
+    // this machine by a test that drives real hardware through it, while a device
+    // tree's answers would be new inputs on paths (the identity-mapped device
+    // gigabyte, an SMMU present only with `iommu=smmuv3`) where being wrong is a
+    // boot failure rather than a wrong number. They are filled only where discovery
+    // left a hole, so a tree that *does* describe them wins.
+    if inv.nmem == 0 {
+        // QEMU virt: RAM at 0x4000_0000. We map (and therefore report) the
+        // first gigabyte; larger -m would need the map extended.
+        inv.add_mem(0x4000_0000, 0x4000_0000, crate::hw::MemKind::Ram, 0);
+    }
+    if inv.ecam_base == 0 {
+        // PCIe ECAM low window (QEMU virt with highmem-ecam=off), inside the
+        // device gigabyte the kernel identity-maps.
+        inv.ecam_base = 0x3f00_0000;
+    }
     // The SMMUv3 register base is fixed in the QEMU virt map (docs/GPU-
     // HARDWARE.md 4). It is only physically present when the machine is
     // booted with `iommu=smmuv3` (the `iommu` test does); no other code
     // reads `iommu_base`, and the SMMUv3 driver touches these registers
     // only on that test, so reporting the address here is safe.
     inv.iommu_base = 0x0905_0000;
-    inv.add_cpu(0, 0);
+}
+
+/// Ask PSCI which CPUs this machine has, adding each to `inv`. Returns how many.
+///
+/// `AFFINITY_INFO(mpidr, 0)` answers ON/OFF/ON_PENDING for an affinity the platform
+/// implements and an error for one it does not, so the candidate set can be walked
+/// and the answers believed. Candidates are the MPIDR encodings QEMU's `virt` uses:
+/// Aff0 within a cluster, Aff1 selecting the cluster. A cluster whose *first* core
+/// is absent ends the walk, so a single-core machine costs two refused calls rather
+/// than a scan of the whole space.
+///
+/// Bounded by construction and by `hw::MAX_CPUS`. Returns 0 with nothing added if
+/// no conduit answers, which is the honest result on a machine without PSCI - the
+/// caller then falls back and says so.
+fn psci_enumerate_cpus(inv: &mut crate::hw::Inventory) -> usize {
+    let Some(conduit) = psci_conduit() else {
+        return 0;
+    };
+    /// Cores per cluster to probe. QEMU's `virt` packs up to 8 (16 with GICv3)
+    /// into Aff0 before moving to Aff1; 16 covers both without assuming which.
+    const PER_CLUSTER: u64 = 16;
+    /// Clusters to probe. 4 x 16 is far past `MAX_CPUS` and past anything QEMU
+    /// models here, and the walk stops at the first empty cluster anyway.
+    const CLUSTERS: u64 = 4;
+
+    let mut found = 0usize;
+    for cluster in 0..CLUSTERS {
+        let mut in_cluster = 0usize;
+        for core in 0..PER_CLUSTER {
+            if found >= crate::hw::MAX_CPUS {
+                return found;
+            }
+            let mpidr = (cluster << 8) | core;
+            // SAFETY: the helper guards the call with its own exception vector, so
+            // a conduit that is UNDEFINED at EL1 returns the sentinel rather than
+            // faulting the kernel.
+            let r = unsafe { psci_call_guarded(conduit, PSCI_AFFINITY_INFO, mpidr, 0, 0) };
+            // 0 = ON, 1 = OFF, 2 = ON_PENDING. Anything else (the sentinel, or a
+            // negative PSCI error such as INVALID_PARAMETERS) means "no CPU here".
+            if r > 2 {
+                break;
+            }
+            inv.add_cpu(mpidr as u32, 0);
+            found += 1;
+            in_cluster += 1;
+        }
+        if in_cluster == 0 {
+            break; // an empty cluster ends the walk
+        }
+    }
+    found
+}
+
+unsafe extern "C" {
+    /// The flattened-device-tree pointer QEMU passes in x0, saved by `boot.S`.
+    static BOOT_DTB: u64;
 }
 
 // ------------------------------------------------------------------- SMP
@@ -663,12 +777,15 @@ pub fn boot_cpu_hw_id() -> u32 {
     mpidr_aff0()
 }
 
-#[cfg(feature = "smp")]
 unsafe extern "C" {
-    /// Guarded PSCI call (arch/aarch64/smp.S): `conduit` 0 = `hvc #0`, 1 =
+    /// Guarded PSCI call (arch/aarch64/psci.S): `conduit` 0 = `hvc #0`, 1 =
     /// `smc #0`, behind a temporary exception vector that catches a trap. Returns
     /// the PSCI return value, or [`PSCI_TRAPPED`] if the conduit trapped.
     fn psci_call_guarded(conduit: u64, fnid: u64, a1: u64, a2: u64, a3: u64) -> u64;
+}
+
+#[cfg(feature = "smp")]
+unsafe extern "C" {
     /// Physical (low LMA) address of the MMU-on secondary entry trampoline.
     static SMP_SECONDARY_ENTRY_PA: u64;
     /// `.boot.bss` slots (identity low) where the primary publishes MAIR/TCR/SCTLR
@@ -677,30 +794,29 @@ unsafe extern "C" {
 }
 
 /// Sentinel returned by [`psci_call_guarded`] when the conduit trapped to EL1.
-#[cfg(feature = "smp")]
 const PSCI_TRAPPED: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 
 /// PSCI function ids (SMC Calling Convention / PSCI 1.1): `PSCI_VERSION` is the
 /// cheapest read-only call, which is what makes it a good conduit probe.
-#[cfg(feature = "smp")]
 const PSCI_VERSION: u64 = 0x8400_0000;
 #[cfg(feature = "smp")]
 const PSCI_CPU_ON: u64 = 0xC400_0003;
+/// `PSCI_AFFINITY_INFO` (64-bit): "is there a CPU at this affinity, and is it on?"
+/// A present CPU answers ON (0), OFF (1) or ON_PENDING (2); an affinity the
+/// platform does not implement answers INVALID_PARAMETERS (-2). That distinction
+/// is what makes it an **enumeration** call and not merely a status call.
+const PSCI_AFFINITY_INFO: u64 = 0xC400_0004;
 
 /// The conduit that actually answered PSCI_VERSION, cached: 0 = HVC, 1 = SMC,
 /// [`u64::MAX`] = neither (probed once).
-#[cfg(feature = "smp")]
 static mut PSCI_CONDUIT: u64 = u64::MAX;
-#[cfg(feature = "smp")]
 static mut PSCI_PROBED: bool = false;
 /// The PSCI version the working conduit reported, for the bring-up report.
-#[cfg(feature = "smp")]
 static mut PSCI_VERSION_SEEN: u64 = 0;
 
 /// Find the PSCI conduit by **calling** it, not by assuming one. Tries HVC then
 /// SMC with `PSCI_VERSION`; a conduit counts as working only if it returns without
 /// trapping and reports a sane (non-zero, non-error) version. Cached.
-#[cfg(feature = "smp")]
 fn psci_conduit() -> Option<u64> {
     // SAFETY: single CPU at bring-up; a plain static read.
     if unsafe { *core::ptr::addr_of!(PSCI_PROBED) } {
