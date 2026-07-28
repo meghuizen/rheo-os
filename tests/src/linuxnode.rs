@@ -26,25 +26,20 @@ extern "C" fn kernel_main() -> ! {
     // so the captured transcript is exact; UV_THREADPOOL_SIZE=1 keeps libuv's lazy
     // pool minimal (the cell holds up to 8 contexts, node uses ~7).
     //
-    // The script exercises the runtime surface npm/Claude Code actually lean on -
-    // not just `console.log`: `require` (Node's module loader), the `path` and `fs`
-    // builtin modules, `fs.existsSync('/bin/node')` (a real `stat` through the VFS
-    // onto the live disk the binary itself streams from), and a
-    // `JSON.parse(JSON.stringify(...))` round-trip over an object with an array
-    // reduced with an arrow closure. The arithmetic is chosen to still print exactly
-    // `rheo:42`: nums reduce to 60, minus `basename('/bin/node')`.length (4), minus
-    // 14 when `/bin/node` is found via the VFS = 42. So a broader slice of Node's
-    // runtime is proven while the assertion shape is unchanged.
+    // Run a real **multi-file** program off the disk - `/app/main.js`, which
+    // `require`s a sibling `./lib.js` (CommonJS `module.exports`), reads config with
+    // `JSON.parse`, and uses the `path` builtin. This is the shape every npm package
+    // has (an entry module resolving and reading its dependencies off the
+    // filesystem), so it proves the runtime surface npm and Claude Code are built on
+    // - Node's module resolver reading a second file off the live ext4 disk, not
+    // just an inline `-e` script. `main.js` prints `path.basename('/bin/rheo')` +
+    // ':' + `lib.compute([10,20,12])` = `rheo:42`, so the assertion is unchanged.
+    // The `/app` files are seeded into the disk image by xtask's
+    // `build_node_disk_fixture`.
     disk_runtime::prove(
         "linuxnode",
         "/bin/node",
-        &[
-            b"node",
-            b"--jitless",
-            b"--no-expose-wasm",
-            b"-e",
-            b"const fs=require('fs'),path=require('path');const data={nums:[10,20,30],name:path.basename('/bin/node'),node:fs.existsSync('/bin/node')};const r=JSON.parse(JSON.stringify(data));console.log('rheo:'+(r.nums.reduce((a,b)=>a+b,0)-r.name.length-(r.node?14:0)));",
-        ],
+        &[b"node", b"--jitless", b"--no-expose-wasm", b"/app/main.js"],
         &[
             b"LD_LIBRARY_PATH=/lib:/lib64",
             b"PATH=/bin",

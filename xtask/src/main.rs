@@ -1516,6 +1516,23 @@ fn build_dyn_disk_fixture(arch: Arch, out_dir: &str) {
 /// off a live virtio-blk disk by the `linuxnode` test. Thin caller of
 /// [`build_runtime_disk_fixture`].
 fn build_node_disk_fixture(arch: Arch, out_dir: &str) {
+    // A real **multi-file** Node program under /app, the shape every npm package
+    // has: an entry `main.js` that `require`s a sibling `./lib.js` (CommonJS
+    // `module.exports`), reads config with `JSON.parse`, and uses a builtin module
+    // (`path`). Proving Node resolves and reads a second file off the ext4 disk is
+    // the npm foundation (docs/LINUX-COMPAT.md). Staged on the host here, written
+    // into the image below; x86-64 only, so nothing is staged on arm/riscv.
+    if arch == Arch::X86_64 {
+        let main_js = "const lib = require('./lib.js');\n\
+             const path = require('path');\n\
+             const cfg = JSON.parse('{\"nums\":[10,20,12]}');\n\
+             console.log(path.basename('/bin/rheo') + ':' + lib.compute(cfg.nums));\n";
+        let lib_js = "module.exports = { compute: (arr) => arr.reduce((a, b) => a + b, 0) };\n";
+        let _ = std::fs::write(format!("{out_dir}/node-main.js"), main_js);
+        let _ = std::fs::write(format!("{out_dir}/node-lib.js"), lib_js);
+    }
+    let main_src = format!("{out_dir}/node-main.js");
+    let lib_src = format!("{out_dir}/node-lib.js");
     build_runtime_disk_fixture(
         arch,
         out_dir,
@@ -1530,6 +1547,10 @@ fn build_node_disk_fixture(arch: Arch, out_dir: &str) {
             "libpthread.so.0",
             "libstdc++.so.6",
             "libgcc_s.so.1",
+        ],
+        &[
+            ("app/main.js", main_src.as_str()),
+            ("app/lib.js", lib_src.as_str()),
         ],
     );
 }
@@ -1547,6 +1568,7 @@ fn build_bun_disk_fixture(arch: Arch, out_dir: &str) {
         "/root/.bun/bin/bun",
         "bun",
         &["libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0"],
+        &[],
     );
 }
 
@@ -1564,6 +1586,7 @@ fn build_bun_disk_fixture(arch: Arch, out_dir: &str) {
 /// `mkfs.ext4`/`debugfs` are missing, a small placeholder image is written so
 /// QEMU's `-drive` still has a file and the test detects a non-ext4 disk and skips
 /// - CI stays green. Never fails the build.
+#[allow(clippy::too_many_arguments)] // a disk-image recipe: binary + dst + libs + extra
 fn build_runtime_disk_fixture(
     arch: Arch,
     out_dir: &str,
@@ -1572,6 +1595,11 @@ fn build_runtime_disk_fixture(
     binary: &str,
     dst: &str,
     libs: &[&str],
+    // Extra files to place in the image, as `(dest_rel, host_src)` - dest paths are
+    // relative to the image root (e.g. "app/main.js"), their parent dirs created
+    // below. Used to seed a multi-file program (the npm-shaped Node app); empty for
+    // a runtime that only needs its binary + libs.
+    extra: &[(&str, &str)],
 ) {
     if arch != Arch::X86_64 {
         return; // x86-64 binaries only; no drive attached elsewhere, test skips
@@ -1650,6 +1678,17 @@ fn build_runtime_disk_fixture(
     debugfs(&format!("write {INTERP_SRC} lib64/ld-linux-x86-64.so.2"));
     for l in libs {
         debugfs(&format!("write {LIBDIR}/{l} lib/{l}"));
+    }
+    // Extra files (a multi-file program). Create /app once if any dest lives there,
+    // then write each. Missing host sources are skipped silently (the app is
+    // optional test payload, never a build blocker).
+    if !extra.is_empty() {
+        debugfs("mkdir /app");
+        for (dest, src) in extra {
+            if std::path::Path::new(src).exists() {
+                debugfs(&format!("write {src} {dest}"));
+            }
+        }
     }
     println!("[xtask] built {test} ext4 image for x86_64 ({img}; real {dst} + glibc set)");
 }
