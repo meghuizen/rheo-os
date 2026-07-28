@@ -2027,11 +2027,7 @@ cell index is just the vcore id of its vcore 0. **No new kernel object and no ne
 vcore is an execution context of the Cell object, the shape the Linux personality's contexts
 already are, and `install_vcore` is a *launcher* verb because creating a context creates
 something the scheduler must own - the cell-facing spelling is the strand runtime asking for
-a vcore, which belongs with the process model. Deliberately **refused rather than
-half-supported**: the cooperative schedulers pick a *cell* and enter its vcore 0, which for a
-cell spread over several cores would enter a context another core owns, so
-`cell_on_this_cpu` returns false for any multi-vcore cell and `switch_native_cell` asserts
-against one by name. Proven by the `smp` kernel on **all three ISAs**: two vcores of **one**
+a vcore, which belongs with the process model. Proven by the `smp` kernel on **all three ISAs**: two vcores of **one**
 cell go into the placement queue, whichever cores are free claim them, and both are asserted
 to exit 0, complete all 64 rounds, run on **different CPUs** (without which the phase passes
 with them run back to back - the codes and counts are identical either way) and **each see
@@ -2045,6 +2041,42 @@ invisible because each vcore is entered once and exits once on its own register 
 that exposes it is preemption of a multi-vcore cell, which is refused). `MAX_VCORES` is 4
 because the FP areas are a fixed static (256 KiB of `.bss` on x86-64); funding them through
 `mm::kmeta` is what removes the number.
+
+**And a vcore yields to its sibling** (docs/SMP.md 10.0a): a cell with more vcores than
+cores is the ordinary case the moment a program asks for eight workers on four cores, and
+the first version refused it - the cooperative schedulers pick a *cell* and enter its vcore
+0, so `cell_on_this_cpu` refused multi-vcore cells outright rather than enter a context
+another core owned. The fix is the predicate one level down: `user::vcore_on_this_cpu(cell,
+v)` answers **per vcore** (a vcore belongs to one core; two cores in two *different* vcores
+of one cell is the point, not a hazard), `cell_on_this_cpu` reverts to asking about vcore 0
+- the right question for a path that enters vcore 0 - and `SYS_YIELD` tries a **sibling
+vcore of the same cell first** (round-robin from the running one, so N vcores share a core
+evenly), for the reason the Linux preemption path tries a sibling context first: it is the
+cheaper move by a wide margin. `user::switch_native_vcore` is the whole of it - **one
+address space, so no `activate()` and no TLB consequence**; only the FP/SIMD register file
+and the frame change hands, which is the economy of a vcore over a second cell stated as
+code. `switch_native_cell` now saves the vcore this CPU is actually *inside* and loads the
+target's vcore 0 rather than assuming 0 on both sides (with `from` fixed at 0, a core inside
+vcore 1 would write vcore 1's live registers into vcore 0's saved image), and the per-CPU
+entry guard became one owner with two callers (`user::enter_vcore`, from `run_inner` and
+from `switch_native_vcore`) - **not** from `switch_native_cell`, where marking was tried and
+produces a *false* double-entry, because `INSIDE` is written on entry and cleared on return
+by `run_inner` while a cross-cell chain sits inside that bracket. The proof is deliberately
+**single-core** so the oracle is exact: each round of each vcore is one append to a shared
+order vector then one yield, so two vcores must produce a strictly **alternating** 12-marker
+vector - which only a yield reaching the sibling context can produce - and reverting the
+sibling path gives **6 markers, not 12** (observed). The **owner check** is proven by the
+two-core phase instead, which is why its witness now issues a `SYS_YIELD` per round rather
+than a counter read: with the two vcores owned by different cores every round asks "is a
+sibling enterable" and the answer must be no, and replacing the check with a bare bounds
+test makes the guard fire by name (observed). One thing asserted rather than fixed: **the
+first vcore to exit unwinds the run**, which is the correct rule for a cell and not yet a
+rule for a cell with several vcores - "the cell exits when its *last* vcore exits" is the
+missing semantics, and the phase pins vcore 1's flag at 0 so that rule arriving shows up as
+a test change instead of silently. Still named as not done: a vcore that **blocks** (the
+`nproc` block state is per cell, so one vcore parking on `SYS_WAIT` would mark every sibling
+blocked - the defect the Linux side fixed with per-context `pblock`), a vcore that forks or
+takes a signal, and per-vcore queue pairs (SUBSTRATE.md S5).
 
 **Honest scope:** preemption is *within* a core's own claim and rebalancing moves only
 **unstarted** cells. Migrating a *running* one was **attempted twice and reverted twice**, with four findings
@@ -2585,7 +2617,10 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               claimed by whichever cores were free, each asserted to have seen the
               other advance mid-run, with per-vcore frames and outcomes observed
               load-bearing and the per-vcore kernel stack / FP area named as
-              requirements the phase cannot detect (docs/SMP.md 10.0a); then an
+              requirements the phase cannot detect; then a **VCORE YIELDING TO ITS
+              SIBLING** - two vcores of one cell alternating strictly over 12 rounds
+              on ONE core, the oracle only a yield that reaches the sibling context
+              can produce (docs/SMP.md 10.0a); then an
               **unmodified static-glibc binary as a Linux cell on a secondary**,
               exact stdout + exit asserted, overlapping a native cell on the
               primary; then **two Linux cells on two cores at once**, each

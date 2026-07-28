@@ -22,12 +22,15 @@ vcores) is owned by docs/SUBSTRATE.md pillar 3 / stage S3.
 **The kernel half of "a cell holds N vcores" is now built** (docs/SMP.md 10.0a): a
 cell carries a trap frame, an FP/SIMD save area and an ownership claim **per vcore**
 rather than per cell, and two vcores of one cell are proven to run on two cores at the
-same instant, in one address space, on all three ISAs. What is *not* built is the half
-this document is about - a vcore that blocks, and the runtime scheduling strands over
-several of them. A multi-vcore cell is currently driven by placement and is refused by
-the cooperative schedulers by name (`user::cell_on_this_cpu`), so `TicketLock`'s
-"future multi-vcore case" is now a nearer future with a mechanism under it, not a
-different design.
+same instant, in one address space, on all three ISAs. `SYS_YIELD` reaches a **sibling vcore** of the same
+cell before it considers another cell, and that switch changes only the FP/SIMD register
+file and the frame - one address space, so no `activate()` and no TLB consequence - which
+is the two-level scheduler's lower rung finally costing what section 3 says it should.
+What is *not* built is a vcore that **blocks**: `nproc`'s block state is per cell, so one
+vcore parking on `SYS_WAIT` would mark every sibling blocked, the same defect the Linux
+side fixed with per-context `pblock`. So `TicketLock`'s "future multi-vcore case" is now a
+nearer future with a mechanism under it, not a different design; the runtime scheduling
+strands over several vcores still awaits that block.
 
 Position: threads get light by splitting in two. The kernel schedules
 **vcores** (one kernel context each); the runtime inside a cell schedules

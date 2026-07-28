@@ -948,12 +948,59 @@ already are):
   there is one drain loop, one claim protocol, one steal protocol - a cell index is simply
   the vcore id of its vcore 0 (compose before extending).
 
-**Deliberately refused rather than half-supported.** The cooperative schedulers
-(`nproc::reschedule`, `SYS_YIELD`, `linux::proc`) pick a *cell* and enter its vcore 0.
-For a cell whose vcores are spread over several cores that would enter a context another
-core owns, so `cell_on_this_cpu` returns **false** for any multi-vcore cell and
-`switch_native_cell` asserts against one by name. A multi-vcore cell is driven by
-placement. Teaching the cooperative schedulers to pick vcores is the named next step.
+**A vcore yields to its sibling** - the named next step, now built. A cell with more
+vcores than cores is the ordinary case the moment a program asks for eight workers on four
+cores, and the first version of this refused it: the cooperative schedulers pick a *cell*
+and enter its vcore 0, so `cell_on_this_cpu` refused multi-vcore cells outright rather than
+enter a context another core owned. The fix is the predicate one level down:
+
+- `user::vcore_on_this_cpu(cell, v)` answers per vcore - a vcore belongs to one core, an
+  unclaimed one is enterable by any, and two cores in two *different* vcores of one cell is
+  the point rather than a hazard. `cell_on_this_cpu` reverts to asking about vcore 0, which
+  is the right question for a path that enters vcore 0, multi-vcore cell or not.
+- `SYS_YIELD` tries a **sibling vcore of the same cell first** (`nproc::next_sibling_vcore`,
+  round-robin from the running one so N vcores share a core evenly), for the reason the
+  Linux preemption path tries a sibling context first: it is the cheaper move by a wide
+  margin. `user::switch_native_vcore` is the whole of it - one address space, so **no
+  `activate()` and no TLB consequence**; only the FP/SIMD register file and the frame change
+  hands. That is the economy of a vcore over a second cell, stated as code.
+- `switch_native_cell` now saves the vcore this CPU is actually *inside* and loads the
+  target's vcore 0, rather than assuming 0 on both sides - with `from` fixed at 0, a core
+  inside vcore 1 would write vcore 1's live registers into vcore 0's saved image.
+- The per-CPU entry guard gained a second caller and one owner: `user::enter_vcore` is
+  reached from `run_inner` and from `switch_native_vcore`, since the intra-cell switch is a
+  new way to become "inside" a vcore and a new path is where a guard gets forgotten.
+  **Not** from `switch_native_cell`: marking there was tried and produces a *false*
+  double-entry during placement, because `INSIDE` is written on entry and cleared on return
+  by `run_inner` while a cross-cell chain sits inside that bracket, and a batch sibling can
+  exit without passing back through it (the looseness 10.0 already records).
+
+**The proof** (the `smp` kernel's vcore-yield phase, all three ISAs) is deliberately
+**single-core**: both vcores are left unclaimed and run on the primary, which is what makes
+the oracle exact. Each round of each vcore is one append to a shared order vector then one
+yield, so two vcores must produce a strictly **alternating** 12-marker vector - an
+alternation only a yield that reaches the sibling context can produce, not one that comes
+back to the caller (a run of one marker) and not one that goes to another cell (there is
+none). Reverting the sibling path gives **6 markers, not 12** - vcore 0 ran alone -
+observed.
+
+The **owner check** is proven by the two-core phase, which is why its witness program now
+issues a `SYS_YIELD` per round rather than a bare counter read: with the two vcores owned by
+different cores, every round asks "is a sibling enterable" and the answer must be no.
+Replacing `vcore_on_this_cpu` with a bare bounds test makes the entry guard fire by name -
+`cell 0 vcore 1 entered by CPU 2 while CPU 1 is already inside it` - observed.
+
+One thing the phase asserts rather than fixes: **the first vcore to exit unwinds the run**,
+because `finish` records an outcome and returns the null frame the trampoline reads as
+"unwind". That is the correct rule for a cell and is not yet a rule for a cell with several
+vcores; "the cell exits when its **last** vcore exits" is the missing semantics. The phase
+asserts vcore 1's completion flag is still 0, so that rule arriving shows up as a test
+change instead of silently.
+
+**Still not done** and named: a vcore that *blocks* (the `nproc` block state is per cell, so
+one vcore parking on `SYS_WAIT` would mark every sibling blocked - the same defect the Linux
+side fixed with per-context `pblock`), a vcore that forks or takes a signal, and per-vcore
+queue pairs (docs/SUBSTRATE.md S5).
 
 **The proof** (the `smp` kernel's two-vcore phase, all three ISAs): two vcores of **one**
 cell go into the placement queue and whichever cores are free claim them. Both are
@@ -980,15 +1027,16 @@ requirements this phase cannot see, which is worth recording rather than glossin
 - A **per-vcore FP save area** matters when a vcore is stopped and resumed. Each vcore
   here is entered once and exits once, on its own core with its own register file, so
   nothing reloads a saved image and sharing one area would be invisible. The path that
-  exposes it is preemption of a multi-vcore cell - refused above - so that proof arrives
-  with that capability, not before.
+  exposes it is preemption of a multi-vcore cell, which is not built, so that proof arrives
+  with that capability, not before. (The *yield* path does swap it, and correctly, but
+  within one core there is no second register file for a wrong image to come from.)
 
 Also honest: `MAX_VCORES` is 4 because the FP areas are a fixed static
 (`MAX_CELLS * MAX_VCORES`, 4 KiB each on x86-64 = 256 KiB of `.bss`); funding them out of
 the owning cell's budget through `mm::kmeta` - the mechanism S1' already built - is what
-removes the number. Two vcores are proven; a vcore that blocks, forks or takes a signal
-is not, and per-vcore queue pairs (docs/SUBSTRATE.md S5) are the next rung now that there
-is something to give them to.
+removes the number. Two vcores are proven, and so is a yield between them; a vcore that
+blocks, forks or takes a signal is not, and per-vcore queue pairs (docs/SUBSTRATE.md S5)
+are the next rung now that there is something to give them to.
 
 ### 10.1 The measured motivation (not a wish)
 

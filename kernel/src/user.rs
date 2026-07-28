@@ -781,20 +781,63 @@ pub fn restore_native_fp_vcore(idx: usize, v: usize) {
 /// [`switch_to_cell`]), because a Linux cell holds up to 8 contexts with an FP
 /// area each.
 pub fn switch_native_cell(from: usize, to: usize) {
-    // Both sides are vcore 0, because every caller is a cooperative hand-off between
-    // whole cells. A **multi-vcore** cell reaching here would have its vcore 0 FP image
-    // saved or loaded while another core is inside another of its vcores, which is the
-    // corruption per-vcore areas exist to prevent - so refuse it by name rather than
-    // pick a vcore and hope (docs/SUBSTRATE.md pillar 3; `cell_on_this_cpu` keeps such a
-    // cell out of the cooperative schedulers, and this is the assertion that says so).
-    assert!(
-        cells()[from].nvcores == 1 && cells()[to].nvcores == 1,
-        "native cross-cell switch {from} -> {to} with a multi-vcore cell; \
-         a multi-vcore cell is driven by placement, not by a cooperative hand-off"
-    );
-    save_native_fp(from);
+    // Save the vcore this CPU is actually **inside**, and load the vcore the target is
+    // entered at, which for a cross-cell switch is always its vcore 0. Naming both
+    // rather than assuming 0 on each side is what lets a multi-vcore cell take this path
+    // at all: with `from` fixed at 0, a core inside vcore 1 would write vcore 1's live
+    // registers into vcore 0's saved image, which is the corruption per-vcore areas exist
+    // to prevent (docs/SUBSTRATE.md pillar 3).
+    save_native_fp_vcore(from, current_vcore());
     switch_to_cell(to);
-    restore_native_fp(to);
+    restore_native_fp_vcore(to, 0);
+    // SAFETY: this CPU's own slot. The target is entered at its vcore 0.
+    unsafe { *CUR_VCORE.this_mut() = 0 };
+    // Deliberately **not** `enter_vcore`. `INSIDE` is written on entry and cleared on
+    // return by `run_inner`, and a cross-cell switch chain sits *inside* one such
+    // bracket - so making this a second writer of the slot was tried and fires a false
+    // double-entry during placement, because a batch sibling can exit without passing
+    // back through `run_inner` at all (the same looseness docs/SMP.md 10.0 records for
+    // the per-cell guard). The intra-cell `switch_native_vcore` does mark, because its
+    // bracket is this core's own run and nothing else moves the slot inside it.
+}
+
+/// Hand this CPU from one vcore of the **current** cell to another (docs/SUBSTRATE.md
+/// pillar 3). Returns the frame to resume.
+///
+/// The cheapest context switch in the system, and the reason a vcore is worth having over
+/// a second cell: both contexts live in one address space, so there is **no**
+/// `activate()` and no TLB consequence - only the FP/SIMD register file and the frame
+/// change hands. That is also the whole of what has to be got right, which is why this is
+/// one function rather than a pattern repeated at call sites (docs/ENGINEERING.md 3, the
+/// `switch_native_cell` precedent).
+pub fn switch_native_vcore(cell: usize, from: usize, to: usize) -> *mut TrapFrame {
+    assert!(from != to, "vcore self-switch in cell {cell}");
+    assert!(
+        to < cells()[cell].nvcores,
+        "switch to vcore {to} of cell {cell}, which holds {}",
+        cells()[cell].nvcores
+    );
+    save_native_fp_vcore(cell, from);
+    restore_native_fp_vcore(cell, to);
+    enter_vcore(cell, to);
+    // SAFETY: this CPU's own slot. `CURRENT` does not change - same cell.
+    unsafe { *CUR_VCORE.this_mut() = to };
+    cells()[cell].vframe[to]
+}
+
+/// Whether the calling CPU may enter vcore `v` of cell `idx`.
+///
+/// The per-vcore form of [`cell_on_this_cpu`], and the predicate that replaced that
+/// function's blanket refusal of multi-vcore cells: a vcore belongs to one core, an
+/// unclaimed one is enterable by any, and two cores inside two *different* vcores of one
+/// cell is the point rather than a hazard.
+#[inline]
+pub fn vcore_on_this_cpu(idx: usize, v: usize) -> bool {
+    if v >= cells()[idx].nvcores {
+        return false;
+    }
+    let owner = cells()[idx].vcpu[v];
+    owner == NO_CPU || owner == crate::smp::cpu_index()
 }
 /// The cell `run` was entered with (docs/LINUX-COMPAT.md L6): the top of the
 /// Linux process tree. Only its exit ends the whole run; a forked child's exit
@@ -2075,6 +2118,34 @@ pub fn run_vcore(idx: usize, v: usize) -> (usize, usize, Outcome) {
 static INSIDE: crate::smp::PerCpu<usize> =
     crate::smp::PerCpu::from_array([NO_CPU; crate::smp::MAX_CPUS]);
 
+/// Mark this CPU as inside vcore `v` of cell `idx`, refusing if a peer already is.
+///
+/// The guard is on the **vcore**, not the cell: two cores inside two vcores of one cell is
+/// now the point, while two cores inside the *same* vcore is still the corruption this
+/// catches.
+///
+/// **Both** paths that make a CPU inside a vcore go through here - `run_inner`, which
+/// enters one from the scheduler, and `switch_native_vcore`, which hands the CPU from one
+/// vcore of a cell to another. One owner for the invariant rather than two copies of the
+/// check (docs/ENGINEERING.md 3): the second path arrived with vcores, and a new path is
+/// exactly where a guard gets forgotten.
+///
+/// The **cross-cell** switch is deliberately not a third caller - see the note in
+/// `switch_native_cell` for why marking there produces a false positive.
+fn enter_vcore(idx: usize, v: usize) {
+    let vid = idx * MAX_VCORES + v;
+    let me = crate::smp::cpu_index();
+    for cpu in 0..crate::smp::MAX_CPUS {
+        // SAFETY: a plain read of another CPU's slot.
+        if cpu != me && unsafe { *INSIDE.get(cpu) } == vid {
+            DOUBLE_ENTRY.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+            panic!("cell {idx} vcore {v} entered by CPU {me} while CPU {cpu} is already inside it");
+        }
+    }
+    // SAFETY: this CPU's own slot.
+    unsafe { *INSIDE.this_mut() = vid };
+}
+
 /// Cores observed inside one cell at once, and the pair that did it. Recorded rather
 /// than only panicked so the report names both.
 static DOUBLE_ENTRY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -2095,20 +2166,7 @@ fn run_inner(idx: usize, v: usize) {
         "run of vcore {v} of cell {idx}, which holds {}",
         cell.nvcores
     );
-    // The guard is on the **vcore**, not the cell: two cores inside two vcores of one
-    // cell is now the point, while two cores inside the *same* vcore is still the
-    // corruption this catches.
-    let vid = idx * MAX_VCORES + v;
-    let me = crate::smp::cpu_index();
-    for cpu in 0..crate::smp::MAX_CPUS {
-        // SAFETY: a plain read of another CPU's slot.
-        if cpu != me && unsafe { *INSIDE.get(cpu) } == vid {
-            DOUBLE_ENTRY.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-            panic!("cell {idx} vcore {v} entered by CPU {me} while CPU {cpu} is already inside it");
-        }
-    }
-    // SAFETY: this CPU's own slot.
-    unsafe { *INSIDE.this_mut() = vid };
+    enter_vcore(idx, v);
     unsafe {
         *CURRENT.this_mut() = idx;
         *CUR_VCORE.this_mut() = v;
@@ -2241,18 +2299,12 @@ pub fn cell_vcores(idx: usize) -> usize {
 /// every boot that does fork runs on one core - but inheriting the parent's owner is
 /// the fix when one does, not a wider lock.
 ///
-/// **A multi-vcore cell is never schedulable this way.** The cooperative schedulers
-/// (`nproc::reschedule`, `SYS_YIELD`, `linux::proc`) pick a *cell* and enter its vcore
-/// 0; for a cell whose vcores are spread over several cores that would enter a context
-/// another core owns. Refused here rather than half-supported: a multi-vcore cell is
-/// driven by the placement path, which claims and enters `(cell, vcore)` pairs
-/// (docs/SUBSTRATE.md pillar 3). Teaching the cooperative schedulers to pick vcores is
-/// the named next step, not something this predicate should guess at.
+/// The question is about **vcore 0**, because that is the context every cell-level path
+/// enters. A multi-vcore cell is answerable here for exactly that reason: entering its
+/// vcore 0 is safe whenever this core owns vcore 0, whatever core is inside a sibling.
+/// A path that enters a *named* vcore asks [`vcore_on_this_cpu`] instead.
 #[inline]
 pub fn cell_on_this_cpu(idx: usize) -> bool {
-    if cells()[idx].nvcores > 1 {
-        return false;
-    }
     let owner = cells()[idx].vcpu[0];
     owner == NO_CPU || owner == crate::smp::cpu_index()
 }

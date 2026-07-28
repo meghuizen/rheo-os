@@ -435,13 +435,19 @@ pub extern "C" fn user_spinner(params_va: usize) -> ! {
 /// `preempt`/`schedidle` kernels share one appended order vector instead; that is
 /// safe there because only one CPU is ever executing.)
 ///
-/// `workload` bit 1 asks for **one syscall per round** (a `SYS_CYCLES`, which reads a
-/// counter and returns). Off, this program traps exactly once, at its exit - which is
-/// what the two-*cell* phase wants and also what makes that phase blind to a shared
-/// kernel stack, since two cores that each trap once, far apart, almost never collide.
-/// On, the two contexts trap continuously, so a kernel stack shared between them is
-/// corrupted rather than merely risked - the property the two-*vcore* phase has to be
-/// able to see (docs/SUBSTRATE.md pillar 3).
+/// `workload` bit 1 asks for **one syscall per round**. Off, this program traps exactly
+/// once, at its exit - which is what the two-*cell* phase wants and also what makes that
+/// phase blind to a shared kernel stack, since two cores that each trap once, far apart,
+/// almost never collide. On, the two contexts trap continuously, so a kernel stack shared
+/// between them is corrupted rather than merely risked (docs/SUBSTRATE.md pillar 3).
+///
+/// The syscall is a **`SYS_YIELD`**, not a bare counter read, and for the two-vcore phase
+/// that is the point: a yield asks the kernel whether a sibling vcore is enterable, and
+/// with the two vcores owned by *different* cores the answer must be no. Getting that
+/// wrong puts two cores inside one context, which `user::double_entries` catches by name -
+/// so the owner check in `nproc::next_sibling_vcore` is exercised by every round of every
+/// vcore rather than reasoned about. With no sibling available and no other runnable cell
+/// the yield returns immediately, so the loop's shape is unchanged.
 ///
 /// The witness: word `2 + slot` is nonzero only if this cell saw the peer make
 /// progress **while this cell was between two of its own rounds**. Under a single
@@ -484,11 +490,46 @@ pub extern "C" fn user_copair(params_va: usize) -> ! {
             if trap_each_round {
                 // Enter and leave the kernel every round, so this context's use of its
                 // kernel stack overlaps the peer's rather than being one instant at the
-                // end. `SYS_CYCLES` is chosen because it reads a counter and returns:
-                // no state, no block, nothing to make the two contexts interact except
-                // the trap itself.
-                syscall(SYS_CYCLES, 0);
+                // end - and ask for a sibling vcore while doing it, which is what puts
+                // the owner check under test on two cores at once.
+                syscall(SYS_YIELD, 0);
             }
+        }
+        (*p).status = 1;
+        syscall(SYS_EXIT, 0);
+    }
+    loop {}
+}
+
+/// The **vcore yielder** (docs/SUBSTRATE.md pillar 3): append this vcore's marker to the
+/// shared order vector, `SYS_YIELD`, repeat.
+///
+/// `workload` carries the marker byte, `iters` the rounds, `ticks` the shared page's VA.
+/// Two vcores of one cell running this on **one** core must produce a strictly
+/// alternating vector, because each round of each vcore is one append followed by one
+/// yield - so an alternation is only producible if the yield genuinely reached the
+/// *sibling context* rather than coming straight back to the caller or going to another
+/// cell. It is the cheapest switch in the system (one address space, so only the FP file
+/// and the frame change hands) and the one a strand runtime with more vcores than cores
+/// needs.
+///
+/// The shared cursor is safe here for the reason `user_blocker`'s is: this proof is
+/// single-core by construction, so only one context is executing at any instant.
+#[unsafe(link_section = ".user.text")]
+#[unsafe(no_mangle)]
+pub extern "C" fn user_vyield(params_va: usize) -> ! {
+    let p = params_va as *mut Params;
+    // SAFETY: the cell's own mapped Params page (its entry argument) and the shared
+    // order page mapped read-write into the cell both vcores live in.
+    unsafe {
+        let marker = (*p).workload as u8;
+        let rounds = (*p).iters;
+        let shared = (*p).ticks as *mut u8;
+        let mut i = 0u64;
+        while i < rounds {
+            order_append(shared, marker);
+            syscall(SYS_YIELD, 0);
+            i += 1;
         }
         (*p).status = 1;
         syscall(SYS_EXIT, 0);

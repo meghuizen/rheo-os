@@ -295,6 +295,7 @@ fn test_secondary_bringup() {
             test_user_cells_on_both();
             test_placement();
             test_two_vcores_one_cell();
+            test_vcore_yield();
             test_cross_core_preemption();
             test_linux_cell_on_secondary();
             test_two_linux_cells();
@@ -1453,6 +1454,164 @@ fn test_two_vcores_one_cell() {
              and each saw the other advance mid-run (vcore 0 saw vcore 1 reach {seen0}, \
              vcore 1 saw vcore 0 reach {seen1}) OK",
             out[0].1, out[1].1
+        );
+    }
+}
+
+// ------------------------------------- a vcore YIELDS to its sibling, on one core
+//
+// The phase above puts two vcores on two cores. It says nothing about a cell with more
+// vcores than cores, which is the ordinary case the moment a program asks for eight
+// workers on four cores - and before this, a multi-vcore cell could not yield at all:
+// the cooperative schedulers pick a *cell* and enter its vcore 0, so `cell_on_this_cpu`
+// refused multi-vcore cells outright rather than enter a context another core owned.
+//
+// The fix is the predicate one level down. `user::vcore_on_this_cpu(cell, v)` answers per
+// vcore, `SYS_YIELD` tries a **sibling vcore of the same cell first** (round-robin from
+// the running one), and the move itself is `user::switch_native_vcore` - the cheapest
+// switch in the system, because both contexts share one address space, so there is no
+// `activate()` and no TLB consequence: only the FP/SIMD register file and the frame
+// change hands.
+//
+// **This phase is deliberately single-core.** Both vcores are left unclaimed and run on
+// the primary, which is what makes the oracle exact: each round of each vcore is one
+// append then one yield, so two vcores must produce a strictly **alternating** order
+// vector. An alternation is only producible if the yield reached the sibling context -
+// not the caller again (which would give a run of one marker) and not another cell
+// (there is none). The shared append cursor is safe for the same reason `schedidle`'s is:
+// one context executes at a time here.
+
+/// The third vcore store - this phase runs two vcores, and reusing `STORE_V1` would
+/// couple the two phases' `Params` through a static.
+#[unsafe(link_section = ".user.bss")]
+static mut STORE_Y0: CellStore = CellStore::new();
+#[unsafe(link_section = ".user.bss")]
+static mut STORE_Y1: CellStore = CellStore::new();
+
+/// The shared order page: byte 0 is the append cursor, bytes 1.. the vector.
+#[repr(C, align(4096))]
+struct OrderPage([u8; 4096]);
+#[unsafe(link_section = ".user.bss")]
+static mut ORDER: OrderPage = OrderPage([0; 4096]);
+
+static mut KSTACK_Y0: KernelStack = KernelStack::new();
+static mut KSTACK_Y1: KernelStack = KernelStack::new();
+
+/// Rounds each vcore runs. Two vcores x 6 rounds = 12 markers, inside `ORDER_MAX` (60).
+const YIELD_ROUNDS: u64 = 6;
+
+fn test_vcore_yield() {
+    // SAFETY: single-threaded on the primary; nothing is published to a secondary here -
+    // this phase runs both vcores on this core on purpose.
+    unsafe {
+        let ord = &mut *core::ptr::addr_of_mut!(ORDER);
+        ord.0.fill(0);
+        let shared = core::ptr::addr_of!(ORDER) as usize;
+
+        let objects = &mut *core::ptr::addr_of_mut!(OBJECTS2);
+        let caps = &mut *core::ptr::addr_of_mut!(CAPS2);
+        *objects = ObjectTable::new();
+        *caps = CapTable::new();
+
+        let y0 = core::ptr::addr_of_mut!(STORE_Y0);
+        let (mut aspace, _o, mut frame0) = build_cell(
+            &mut *y0,
+            objects,
+            caps,
+            (*core::ptr::addr_of!(KSTACK_Y0)).top(),
+            8,
+            kernel::user_progs::user_vyield,
+            b'0' as u64,
+            YIELD_ROUNDS,
+        );
+
+        let y1 = core::ptr::addr_of_mut!(STORE_Y1);
+        let stack1 = core::ptr::addr_of!((*y1).stack) as usize;
+        let stack1_len = core::mem::size_of_val(&(*y1).stack);
+        aspace.map_user_range(stack1, stack1_len, MapPerm::UserRw);
+        let params1 = core::ptr::addr_of!((*y1).params) as usize;
+        aspace.map_user(params1 & !0xFFF, MapPerm::UserRw);
+        (*y1).params = kernel::abi::Params {
+            workload: b'1' as u64,
+            iters: YIELD_ROUNDS,
+            ticks: shared as u64,
+            ..kernel::abi::Params::ZERO
+        };
+        aspace.map_user_range(shared, 4096, MapPerm::UserRw);
+        (*y0).params.ticks = shared as u64;
+
+        static mut YFRAME: core::mem::MaybeUninit<kernel::arch::TrapFrame> =
+            core::mem::MaybeUninit::uninit();
+        let yf = core::ptr::addr_of_mut!(YFRAME);
+        (*yf).write(arch::trapframe_new(
+            kernel::user_progs::user_vyield as usize,
+            stack1 + stack1_len,
+            params1,
+            (*core::ptr::addr_of!(KSTACK_Y1)).top(),
+        ));
+
+        user::reset();
+        user::install(
+            0,
+            &aspace,
+            caps,
+            objects,
+            (*y0).qp.qp.as_ptr(),
+            core::ptr::addr_of_mut!(frame0),
+        );
+        // SAFETY: `YFRAME` outlives the run; vcore 1 has its own user and kernel stack.
+        user::install_vcore(0, (*yf).as_mut_ptr());
+
+        // Both vcores stay **unclaimed**, so both are enterable by this core - which is
+        // exactly the single-core behaviour the predicate is written to preserve.
+        let before = user::double_entries();
+        let (_c, _v, out) = user::run_vcore(0, 0);
+
+        assert_eq!(
+            user::double_entries(),
+            before,
+            "two cores were inside the same vcore"
+        );
+        assert!(
+            matches!(out, Outcome::Exited(0)),
+            "the yielding vcores ended {out:?}"
+        );
+        assert_eq!((*y0).params.status, 1, "vcore 0 never finished");
+        // **Vcore 1 is left mid-flight, and that is asserted rather than ignored.** The
+        // first vcore to exit unwinds `run`, because `finish` records an outcome and
+        // returns the null frame the trampoline reads as "unwind" - which is the correct
+        // rule for a *cell* and is not yet a rule for a cell with several vcores. "The
+        // cell exits when its **last** vcore exits" is the missing semantics, and it is a
+        // named follow-on rather than something to slip in here. Pinning the 0 means that
+        // rule arriving shows up as a test change instead of silently.
+        assert_eq!(
+            (*y1).params.status,
+            0,
+            "vcore 1 reached its exit, so the run no longer unwinds on the first vcore \
+             out - the last-vcore-out rule landed and this assertion is what should change"
+        );
+
+        // The oracle, hand-computed: 12 markers, strictly alternating from '0'.
+        let n = ord.0[0] as usize;
+        assert_eq!(
+            n,
+            2 * YIELD_ROUNDS as usize,
+            "the order vector holds {n} markers, not {}",
+            2 * YIELD_ROUNDS
+        );
+        for (i, &c) in ord.0[1..=n].iter().enumerate() {
+            let want = if i % 2 == 0 { b'0' } else { b'1' };
+            assert_eq!(
+                c, want,
+                "order[{i}] is {:?}, not {:?} - the yield did not reach the sibling vcore",
+                c as char, want as char
+            );
+        }
+        println!(
+            "smp: a VCORE YIELDED TO ITS SIBLING - two vcores of one cell alternated \
+             strictly over {n} rounds on ONE core ({YIELD_ROUNDS} each), which only a \
+             yield that reaches the sibling context can produce; the switch changes the \
+             FP file and the frame and nothing else, since both share one address space OK"
         );
     }
 }

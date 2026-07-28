@@ -586,6 +586,17 @@ pub fn yield_cell(cur: usize) -> Sched {
     // blocked here would withdraw its weight from the queue's total and make every
     // sibling's virtual clock advance too fast.
     crate::sched::dispatch::yielded();
+    // **A sibling vcore of this same cell first** (docs/SUBSTRATE.md pillar 3), for the
+    // reason the Linux preemption path tries a sibling context first: it is the cheaper
+    // move by a wide margin - one address space, so no `activate()` and no TLB
+    // consequence, only the FP file and the frame change hands - and it is the move a
+    // strand runtime with more vcores than cores actually needs. Round-robin from the
+    // running vcore so N vcores share the core evenly rather than two of them trading it.
+    if let Some(to) = next_sibling_vcore(cur) {
+        let frame = user::switch_native_vcore(cur, user::current_vcore(), to);
+        crate::sched::dispatch::running(cur, 0);
+        return Sched::Switch(frame);
+    }
     // The order is the ready queue's when dispatch is enabled; `schedulable` stays
     // the sole authority on who may run. Note the range: a yield deliberately
     // excludes the caller (`1..MAX_CELLS`), so "yield to nobody" is `Ret(0)` rather
@@ -641,6 +652,24 @@ pub fn preempt_cell(cur: usize) -> Option<*mut TrapFrame> {
     user::restore_native_fp(next);
     complete_block(next);
     Some(user::cell_frame(next))
+}
+
+/// The next vcore of cell `cur` this CPU may enter, scanning round-robin from the one
+/// running, or `None` when the cell has no other vcore this core owns.
+///
+/// Owner-checked rather than assumed: a cell's vcores may be spread over several cores by
+/// the placement path, and entering one another core is inside is the corruption the
+/// per-CPU entry guard exists to catch (`user::double_entries`). An unclaimed sibling is
+/// enterable, which is what makes a single-core boot's behaviour the obvious one.
+fn next_sibling_vcore(cur: usize) -> Option<usize> {
+    let n = user::cell_vcores(cur);
+    if n < 2 {
+        return None;
+    }
+    let here = user::current_vcore();
+    (1..n)
+        .map(|step| (here + step) % n)
+        .find(|&v| user::vcore_on_this_cpu(cur, v))
 }
 
 /// Whether cell `i` can be resumed by a yield: present, native, and either a
