@@ -489,6 +489,18 @@ the interrupt vector writes.
   exclusion (there is no concurrent writer): a lock that failed to serialise the
   read-modify-write would lose updates and fall short. This is the primitive the
   phase-2 kernel-wide locks (§10.2) rest on, proven before they are built on it.
+- **Start-all: a *second* secondary on RISC-V** - three cores online at once (boot +
+  two secondaries), the first slice of §10.3/§10.7-step-2. Bring-up is **sequential**
+  (the primary waits for secondary N online before releasing N+1), so the per-CPU stack
+  hand-off is race-free: each secondary loads its own stack top from a shared
+  `secondary_sp` word the primary sets before each `hart_start` (arch hook
+  `smp_prepare_secondary`; the trampoline reads it instead of a hardcoded label). The
+  second core must claim a **distinct** registry slot and a hardware id that is neither
+  the boot CPU's nor the first secondary's - unfakeable. ARM64/x86-64 keep one secondary
+  for now (`smp_secondary_count() == 1`, a no-op `smp_prepare_secondary`), so their
+  bring-up is byte-for-byte unchanged; the multi-stack hand-off is done on RISC-V first
+  and generalises to them next. The contention proof (above) still runs only against the
+  first secondary, so its exact-sum assertion is independent of core count.
 
 **Deferred**
 - Preemptive multi-core scheduling (the runtime stays single-CPU cooperative;

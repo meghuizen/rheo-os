@@ -48,7 +48,12 @@ secondary_high:
 .option norelax
     la   gp, __global_pointer$
 .option pop
-    la   sp, secondary_stack_top   # dedicated secondary stack (high BSS)
+    # Load this secondary's stack from `secondary_sp`, which the primary set to
+    # the right stack top *before* releasing this hart (start-all is sequential:
+    # the primary waits for hart N online before setting the pointer and starting
+    # hart N+1, so there is no race on this shared word - docs/SMP.md 10).
+    la   t0, secondary_sp
+    ld   sp, 0(t0)
     # a0 still = hartid (untouched since SBI entry).
     call rv_secondary_main
 1:
@@ -64,9 +69,26 @@ secondary_high:
 SECONDARY_ENTRY_PA:
     .dword secondary_entry
 
-# Secondary stack: a high VA in ordinary BSS (mapped via l2[258]).
+# The stack pointer the next secondary should load, set by the primary before
+# each hart_start (sequential bring-up - see secondary_high). A high .bss word,
+# mapped via l2[258] into the shared kernel root.
+.section .bss
+.p2align 3
+.global secondary_sp
+secondary_sp:
+    .space 8
+
+# Two secondary stacks: high VAs in ordinary BSS (mapped via l2[258]). Two, so a
+# second secondary brought up while the first is still parked on its own stack
+# does not share it (docs/SMP.md 10, the start-all slice). Each is exported so the
+# primary can hand its top to `secondary_sp`.
 .section .bss
 .p2align 4
 secondary_stack:
     .space 16 * 1024
+.global secondary_stack_top
 secondary_stack_top:
+secondary_stack2:
+    .space 16 * 1024
+.global secondary_stack2_top
+secondary_stack2_top:

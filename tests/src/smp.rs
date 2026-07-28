@@ -85,10 +85,9 @@ fn test_secondary_bringup() {
             // A real second core ran kernel code. Verify it through the shared
             // state it touched: the per-CPU registry and the cross-core spinlock.
             assert!(smp::secondaries_up() >= 1, "secondary did not signal up");
-            assert_eq!(
-                smp::online_count(),
-                2,
-                "expected 2 CPUs online (boot + secondary)"
+            assert!(
+                smp::online_count() >= 2,
+                "expected at least 2 CPUs online (boot + secondary)"
             );
             assert!(
                 smp::cpu(idx).is_online(),
@@ -136,6 +135,54 @@ fn test_secondary_bringup() {
                 smp::CONTENTION_ITERS
             );
             println!("smp: real second core on {} confirmed", arch::NAME);
+
+            // Start-all: bring up any *additional* secondaries this ISA supports
+            // (docs/SMP.md 10). Sequential - each is fully online before the next
+            // is released - so the per-CPU stack hand-off has no race. Each extra
+            // core must claim a *distinct* registry slot and a hardware id that is
+            // neither the boot CPU's nor the first secondary's - unfakeable by the
+            // primary or by one core looping. A failed extra bring-up degrades to a
+            // skip (the ISA keeps the cores it did start); it never fails the test.
+            let mut online = 2usize; // boot + first secondary
+            for ordinal in 1..smp::secondary_count() {
+                match smp::bring_up_nth(ordinal) {
+                    Ok(slot) => {
+                        assert_ne!(slot, 0, "extra secondary took the boot slot");
+                        assert_ne!(slot, idx, "extra secondary reused the first's slot");
+                        assert!(smp::cpu(slot).is_online(), "extra secondary {slot} offline");
+                        assert_ne!(
+                            smp::cpu(slot).hw_id(),
+                            arch::boot_cpu_hw_id(),
+                            "extra secondary recorded the boot CPU's hw id"
+                        );
+                        assert_ne!(
+                            smp::cpu(slot).hw_id(),
+                            smp::cpu(idx).hw_id(),
+                            "extra secondary recorded the first secondary's hw id"
+                        );
+                        online += 1;
+                        println!(
+                            "smp: additional secondary CPU {slot} (hw id {}) online",
+                            smp::cpu(slot).hw_id()
+                        );
+                    }
+                    Err(e) => {
+                        println!("smp: additional secondary {ordinal} skipped: {e:?}");
+                    }
+                }
+            }
+            assert_eq!(
+                smp::online_count(),
+                online,
+                "online count disagrees with the cores actually brought up"
+            );
+            if smp::secondary_count() > 1 {
+                println!(
+                    "smp: start-all OK on {} - {online} CPUs online (boot + {} secondaries)",
+                    arch::NAME,
+                    online - 1
+                );
+            }
         }
         Err(StartError::NoSecondary) => {
             println!(

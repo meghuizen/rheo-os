@@ -226,19 +226,27 @@ pub fn secondary_run(hw_id: u32) {
     // Establish this CPU's identity so this_cpu() resolves to its own block.
     arch::smp_set_this_cpu(idx);
     set_online(idx, hw_id);
-    // Genuine cross-core critical section: take the shared lock and write.
-    {
-        let mut g = SHARED.lock();
-        *g += SECONDARY_MARK;
-    }
     // this_cpu() must resolve to *this* secondary's block now that its identity
     // is set - a check that per-CPU addressing works off the boot core.
     debug_assert!(this_cpu().is_online());
-    // Genuine cross-core contention: hammer a shared counter under the lock while
-    // the primary does the same, proving mutual exclusion (not just a single
-    // write). Runs before the completion signal so the primary's wait on
-    // `SECONDARY_UP` implies this secondary finished contending.
-    contend();
+    // The **first** secondary (registry index 1) runs the single-write and the
+    // two-core contention proofs against the primary. Additional secondaries
+    // (start-all, docs/SMP.md 10) only prove they come online with a distinct
+    // identity - they do NOT touch SHARED/CONTENDED, so the primary's exact
+    // `SECONDARY_MARK` and `CONTENTION_ITERS * 2` assertions stay true regardless
+    // of how many cores are brought up. (A concurrent N-way contention proof needs
+    // simultaneous bring-up + an IPI to re-summon parked cores; that is later.)
+    if idx == 1 {
+        {
+            let mut g = SHARED.lock();
+            *g += SECONDARY_MARK;
+        }
+        // Genuine cross-core contention: hammer a shared counter under the lock
+        // while the primary does the same, proving mutual exclusion (not just a
+        // single write). Runs before the completion signal so the primary's wait
+        // on `SECONDARY_UP` implies this secondary finished contending.
+        contend();
+    }
     SECONDARY_UP.fetch_add(1, Ordering::Release);
 }
 
@@ -278,48 +286,72 @@ pub fn init() {
     set_online(0, arch::boot_cpu_hw_id());
 }
 
-/// Ask the arch layer to start **one** secondary core and wait (bounded) for it
-/// to run kernel code (mark itself online + bump the shared counter). Returns
-/// the CPU index that came online, or a [`StartError`] the caller can turn into
-/// a skip-with-reason. Runs on the primary; never hangs (bounded wait).
+/// How many secondaries the current ISA brings up in the start-all proof (RISC-V:
+/// two; ARM64/x86-64: one, docs/SMP.md 10). The portable [`bring_up_all`] loop and
+/// the test read this so they stay ISA-agnostic.
+pub fn secondary_count() -> usize {
+    arch::smp_secondary_count()
+}
+
+/// Ask the arch layer to start the **first** secondary core (ordinal 0) and wait
+/// (bounded) for it to run kernel code. This is the core that runs the two-core
+/// contention proof against the primary. Returns the CPU index that came online,
+/// or a [`StartError`] the caller turns into a skip-with-reason.
 pub fn bring_up_one() -> Result<usize, StartError> {
+    bring_up_nth(0)
+}
+
+/// Bring up secondary number `ordinal` (0-based) and wait (bounded) for it to come
+/// online. `ordinal 0` is the first secondary (it runs the contention proof);
+/// `ordinal >= 1` are additional cores that only prove they run with a distinct
+/// identity (start-all, docs/SMP.md 10). Bring-up is **sequential**: the caller
+/// brings up ordinal N and waits for it online before ordinal N+1, so the per-CPU
+/// stack hand-off (`arch::smp_prepare_secondary`) has no race.
+pub fn bring_up_nth(ordinal: usize) -> Result<usize, StartError> {
     let inv = crate::hw::inventory();
     let boot = arch::boot_cpu_hw_id();
 
-    // Pick a target hardware id: a firmware-enumerated non-boot CPU if there is
-    // one, else the next id after the boot CPU. The synthesized fallback lets an
-    // ISA whose firmware cannot enumerate secondaries from the kernel's exception
-    // level (ARM64: PSCI enumeration needs EL3, so only the boot CPU is in the
-    // inventory) still make a *genuine* bring-up attempt and report the observed
-    // blocker, rather than silently doing nothing.
+    // Pick the `ordinal`-th firmware-enumerated non-boot CPU. The synthesized
+    // fallback (boot + 1 + ordinal) lets an ISA whose firmware cannot enumerate
+    // secondaries from the kernel's exception level (ARM64: PSCI enumeration needs
+    // EL3, so only the boot CPU is in the inventory) still make a *genuine*
+    // attempt and report the observed blocker, rather than doing nothing.
+    let mut seen = 0usize;
     let mut target = None;
     for i in 0..inv.ncpus {
         if inv.cpus[i].hw_id != boot {
-            target = Some(inv.cpus[i].hw_id);
-            break;
+            if seen == ordinal {
+                target = Some(inv.cpus[i].hw_id);
+                break;
+            }
+            seen += 1;
         }
     }
-    let target_hw = target.unwrap_or(boot + 1);
+    let target_hw = target.unwrap_or(boot + 1 + ordinal as u32);
+
+    // Hand this secondary its own stack before releasing it (sequential bring-up,
+    // so the shared `secondary_sp` word is written and consumed without a race).
+    arch::smp_prepare_secondary(ordinal);
 
     let before = secondaries_up();
     match arch::smp_start_secondary(target_hw) {
         Ok(()) => {
-            // The primary's half of the two-core contention proof, run **here** -
-            // between the start call and the completion wait - because this is the
-            // only window in which the secondary is also running its own `contend`
-            // loop. Both rendezvous inside `contend`, so the lock is genuinely
-            // contended by two cores at once (docs/SMP.md 10, the foundation the
-            // #132 kernel-wide locks rest on).
-            contend();
+            // The primary's half of the two-core contention proof runs **only for
+            // the first secondary** (ordinal 0), in the window between the start
+            // and the completion wait - the only window in which that secondary is
+            // also in its own `contend` loop. Both rendezvous inside `contend`, so
+            // the lock is genuinely contended by two cores at once (docs/SMP.md 10).
+            if ordinal == 0 {
+                contend();
+            }
             let mut budget = WAIT_BUDGET;
             while budget > 0 {
                 if secondaries_up() > before {
-                    // Return the registry index the secondary claimed (the first
-                    // online slot above the boot CPU).
-                    for slot in 1..MAX_CPUS {
-                        if cpu(slot).is_online() {
-                            return Ok(slot);
-                        }
+                    // The ordinal-th secondary claims registry index `ordinal + 1`
+                    // (NEXT_INDEX increments 1,2,... in sequential bring-up order).
+                    let slot = ordinal + 1;
+                    if slot < MAX_CPUS && cpu(slot).is_online() {
+                        return Ok(slot);
                     }
                     return Ok(0);
                 }

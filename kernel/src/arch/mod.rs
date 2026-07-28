@@ -134,7 +134,10 @@ pub use imp::{
 /// SMP surface (docs/SMP.md, task #27), exported only under the `smp` feature so
 /// the non-SMP kernels link a byte-identical `kernel` lib.
 #[cfg(feature = "smp")]
-pub use imp::{boot_cpu_hw_id, cpu_index, smp_set_this_cpu, smp_start_secondary};
+pub use imp::{
+    boot_cpu_hw_id, cpu_index, smp_prepare_secondary, smp_secondary_count, smp_set_this_cpu,
+    smp_start_secondary,
+};
 
 /// The **arch's own** bring-up: serial console, exception vectors, then the
 /// kernel address space with the MMU on.

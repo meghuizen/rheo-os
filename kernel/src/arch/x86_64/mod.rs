@@ -1120,6 +1120,19 @@ fn ap_page_conflict() -> Option<&'static str> {
     None
 }
 
+/// How many secondaries this ISA brings up in the start-all proof. x86-64 keeps
+/// the single-AP bring-up for now (one hardcoded AP stack in smp.S); the
+/// multi-stack hand-off is done on RISC-V first (docs/SMP.md 10).
+#[cfg(feature = "smp")]
+pub fn smp_secondary_count() -> usize {
+    1
+}
+
+/// No-op on x86-64: with a single AP stack there is nothing to prepare before a
+/// start. Present so the portable bring-up loop is ISA-agnostic.
+#[cfg(feature = "smp")]
+pub fn smp_prepare_secondary(_index: usize) {}
+
 /// Start the application processor with APIC id `hw_id`: stage the real-mode
 /// trampoline in low memory, then release the AP with INIT-SIPI-SIPI. Returns
 /// `Ok(())` once the SIPI has been sent (the portable `smp::bring_up_one` then

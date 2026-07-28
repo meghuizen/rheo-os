@@ -675,6 +675,19 @@ fn publish_ap_sysregs() {
     }
 }
 
+/// How many secondaries this ISA brings up in the start-all proof. ARM64 keeps
+/// the single-secondary bring-up for now (one hardcoded AP stack in smp.S); the
+/// multi-stack hand-off is done on RISC-V first (docs/SMP.md 10).
+#[cfg(feature = "smp")]
+pub fn smp_secondary_count() -> usize {
+    1
+}
+
+/// No-op on ARM64: with a single AP stack there is nothing to prepare before a
+/// start. Present so the portable bring-up loop is ISA-agnostic.
+#[cfg(feature = "smp")]
+pub fn smp_prepare_secondary(_index: usize) {}
+
 /// Start the secondary core with MPIDR affinity `hw_id` via PSCI `CPU_ON`, over
 /// whichever conduit the probe found. Returns `Ok(())` once PSCI accepted the
 /// call (the portable `smp::bring_up_one` then waits, bounded, for the core to run
