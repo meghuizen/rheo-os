@@ -418,23 +418,5 @@ pub fn mmio_map_window(base_pa: usize, _len: usize) -> usize {
 /// allocator and the S-mode CSR bits U-mode relies on.
 pub fn paging_kernel_init() {
     frames::init();
-
-    // SUM lets the S-mode kernel read/write U pages (needed so the doorbell
-    // handler can touch a cell's shared ring); scounteren lets U-mode read the
-    // cycle counter for the benchmark's own timing. sstatus.FS = Initial
-    // (0b01) enables the F/D floating-point unit for U-mode
-    // (docs/LINUX-COMPAT.md L1): glibc's ifunc string routines and ordinary FP
-    // both trap with FS=Off. No FP context save/restore is needed yet (one
-    // U-mode context per cell; the kernel is soft-float).
-    // SAFETY: plain CSR writes.
-    unsafe {
-        asm!(
-            "csrs sstatus, {sum}",
-            "csrs sstatus, {fs}",
-            "csrw scounteren, {cen}",
-            sum = in(reg) 1u64 << 18,
-            fs = in(reg) 1u64 << 13,
-            cen = in(reg) 0x7u64,
-        );
-    }
+    super::user_mode_init_this_cpu();
 }

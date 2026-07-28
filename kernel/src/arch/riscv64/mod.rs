@@ -389,6 +389,34 @@ fn rdtime() -> u64 {
 /// is pending) and set `sie.STIE`. Idempotent; call once before a cell that arms
 /// a timer. If Sstc were absent the `stimecmp` write would trap - this is called
 /// only by the Phase F timer test, so no other kernel is affected.
+/// The S-mode CSR bits U-mode relies on, for **this hart**.
+///
+/// SUM lets the S-mode kernel read/write U pages (the doorbell handler touches a
+/// cell's shared ring, and every `uaccess` copy touches its memory); scounteren lets
+/// U-mode read the cycle counter for a benchmark's own timing; `sstatus.FS` =
+/// Initial (0b01) enables the F/D unit for U-mode (docs/LINUX-COMPAT.md L1) - glibc's
+/// ifunc string routines and ordinary FP both trap with FS=Off.
+///
+/// **Per hart, and that is why it is a separate function.** All three are `sstatus` /
+/// `scounteren` CSRs, which no bring-up path sets on a secondary: a core that skipped
+/// this ran cells fine until the kernel first touched one's memory, and then took a
+/// store page fault at a kernel PC on a perfectly-mapped user page - SUM clear
+/// (docs/SMP.md 10.0). It is called from `paging_kernel_init` on the primary and from
+/// `smp::secondary_run` on every other core.
+pub fn user_mode_init_this_cpu() {
+    // SAFETY: plain CSR writes.
+    unsafe {
+        asm!(
+            "csrs sstatus, {sum}",
+            "csrs sstatus, {fs}",
+            "csrw scounteren, {cen}",
+            sum = in(reg) 1u64 << 18,
+            fs = in(reg) 1u64 << 13,
+            cen = in(reg) 0x7u64,
+        );
+    }
+}
+
 pub fn enable_timer_irq() {
     enable_timer_irq_this_cpu();
     // SAFETY: set once by the primary, before any secondary reads it.

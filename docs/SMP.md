@@ -584,10 +584,12 @@ scheduler itself has not.
   and are preempted there** (the `smp` kernel, all three ISAs) - section 10.0. Every
   enumerable secondary is started, two cells are proven running at the unprivileged
   level on two cores at the same instant, a queue of 8 runnable cells is drained by 4
-  cores that each claim from it, and each core then preempts between the cells it
-  claimed - 344-405 slices taken on 4 cores at once, against 0 in the cooperative
-  control round. Not yet the whole scheduler: nothing migrates a running cell between
-  cores, nothing balances after the claim, and no Linux cell is placed.
+  cores that each claim from it, each core then preempts between the cells it claimed
+  (344-405 slices taken on 4 cores at once, against 0 in the cooperative control round),
+  and an **unmodified static-glibc binary** runs as a Linux cell on a secondary with its
+  exact stdout and exit asserted. Not yet the whole scheduler: nothing migrates a running
+  cell between cores, nothing balances after the claim, and only one Linux cell runs at
+  a time.
 
 ### 10.0 Cells run in user mode on a secondary core - built
 
@@ -716,14 +718,47 @@ found by *reading* the resume path after the instrumentation localised the hang 
 resumes via `iret_resume` now, and the rule is: **SYSRET is only ever for returning from
 the syscall it was entered by** - the syscall fast path keeps it; nothing else may.
 
+**And an unmodified Linux binary runs as a cell on a secondary.** Every cell run off the
+boot CPU above is **native** - the tree's own ABI, one context, no fd table, no VMA list,
+no signal state. The Linux personality keeps far more per-cell state and a few genuinely
+global registries beside it, and 10.2 names auditing those as the gate for running Linux
+cells on several cores. This takes the part that does **not** need that audit: *one*
+Linux cell, on one core, at a time - the global registries have exactly one writer, so
+the question the audit exists to answer is not being asked. The narrower question, which
+was genuinely unknown, is whether the Linux syscall path works at all off the boot CPU.
+
+It does. `chello` - the same **unmodified static-glibc C binary** `linuxrun` asserts on
+the primary - runs as a `Personality::Linux` cell on a secondary with its **exact stdout
+and exit code asserted**, while a native cell runs on the primary and the two are held to
+have overlapped by the same rendezvous the two-cells phase uses. Asserting the exact
+transcript is what makes it a claim about the personality rather than about a stub:
+glibc's startup runs `arch_prctl`/`set_tid_address`/`brk`/`readlink` and a demand-paged
+image before it reaches `main`.
+
+It needed one more per-core register set, found the way the others were: **RISC-V's
+`sstatus.SUM`** (plus `FS` and `scounteren`), which `paging_kernel_init` set once on the
+primary. Without it a secondary runs cells perfectly until the kernel first *touches* one
+of their pages - the first `uaccess` copy in a syscall - and then takes a store page fault
+at a kernel PC on a correctly-mapped user page. That is now
+`arch::user_mode_init_this_cpu`, called from `smp::secondary_run`, and it is deliberately
+an empty function on ARM64 and x86-64 (their equivalents are `CPACR_EL1`, adopted by the
+PSCI entry, and CR0/CR4/XCR0, programmed per core by `user_init`) so the portable caller
+does not have to know which ISAs need it.
+
+The `start_all` change also exposed a latent race in the single-cell hand-off:
+`run_cells_on_both` published a cell index with a plain load-then-store, which two
+secondaries could both read before either cleared it - one cell, two cores, one trap
+frame. With one secondary the two were equivalent; with three it presented as two cores
+faulting at PC 0 at the same instant, intermittently. It is an atomic `swap` now, the same
+exclusivity the placement queue's `fetch_add` already had.
+
 **Honest scope.** Preemption is *within* a core's own claim. Nothing takes a cell away
 from another core, nothing migrates a running cell, and there is no priority across
 cores - the per-CPU EEVDF+BORE queue orders each core's own cells and nothing balances
-between queues after the claim. The audit in 10.2 is the gate for the rest: the cell
-table, the capability and object tables, and the Linux personality's per-cell state are
-all still written on the assumption of one CPU, so a **Linux** cell on a secondary is not
-attempted - the cells here are native. What makes the native path safe is unchanged and
-is the reason it could land first: a claimed cell is still a *partitioned* cell (one
+between queues after the claim. The Linux cell is **one** cell at a time: two Linux cells
+on two cores would reach the global mapped-file, pipe, eventfd and pid registries
+concurrently, and that is exactly what 10.2 gates. What makes all of it safe is unchanged
+and is the reason it could land first: a claimed cell is still a *partitioned* cell (one
 core, one slot, one address space, one kernel stack), the claim simply being made at run
 time instead of by hand.
 

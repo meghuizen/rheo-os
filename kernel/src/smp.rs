@@ -393,6 +393,11 @@ pub fn secondary_run(hw_id: u32) {
     let idx = NEXT_INDEX.fetch_add(1, Ordering::AcqRel);
     // Establish this CPU's identity so this_cpu() resolves to its own block.
     arch::smp_set_this_cpu(idx);
+    // The per-core register bits U-mode relies on. No bring-up path sets them, and on
+    // RISC-V one of them is `sstatus.SUM`: without it this core runs cells fine until
+    // the kernel first touches one's memory, and then takes a store page fault at a
+    // kernel PC on a perfectly-mapped user page (docs/SMP.md 10.0).
+    arch::user_mode_init_this_cpu();
     set_online(idx, hw_id);
     // Genuine cross-core critical section: take the shared lock and write.
     {
@@ -433,9 +438,14 @@ fn secondary_work_loop() {
         }
         // A single named cell to run in **user mode**: the hand-placed path that
         // came first, kept because it is what pairs two cells at one instant.
-        let cell = USER_CELL.load(Ordering::Acquire);
+        // **`swap`, not load-then-store.** With one secondary the two were equivalent;
+        // with `start_all` bringing up three, two cores could both read the published
+        // cell before either cleared it and both would run it - one cell, two cores,
+        // one trap frame. It presented as two cores faulting at PC 0 at the same
+        // instant, intermittently (docs/SMP.md 10.0). One atomic exchange makes the
+        // claim exclusive, exactly as the `fetch_add` does for the placement queue.
+        let cell = USER_CELL.swap(usize::MAX, Ordering::AcqRel);
         if cell != usize::MAX {
-            USER_CELL.store(usize::MAX, Ordering::Release);
             if rendezvous(&RV_SECONDARY, &RV_PRIMARY) {
                 let code = code_of(crate::user::run(cell).1);
                 USER_CELL_CODE.store(code as usize, Ordering::Release);

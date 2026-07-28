@@ -1741,9 +1741,26 @@ fault: four cores resumed with two corrupted registers and their bounded loops s
 terminating. Found by reading the resume path once instrumentation localised the hang;
 `enter_user_first` uses `iret_resume` now, and the rule is stated once - **SYSRET is only
 for returning from the syscall it was entered by**.
+**And an unmodified Linux binary runs as a cell on a secondary**: `chello`, the same
+static-glibc C binary `linuxrun` asserts on the primary, runs as a `Personality::Linux`
+cell on a secondary with its **exact stdout and exit code asserted**, while a native cell
+runs on the primary and the two are held to have overlapped by the rendezvous. That is
+one Linux cell at a time - the global mapped-file/pipe/eventfd/pid registries then have
+exactly one writer, so the docs/SMP.md 10.2 audit question is not being asked - but the
+narrower unknown, whether the Linux syscall path works at all off the boot CPU, is
+answered. It needed one more per-core register set, found the same way as the others:
+**RISC-V's `sstatus.SUM`** (plus `FS`/`scounteren`), set once by `paging_kernel_init` on
+the primary, without which a secondary runs cells fine until the kernel first *touches*
+one of their pages and then takes a store page fault at a kernel PC on a correctly-mapped
+user page. It is `arch::user_mode_init_this_cpu` now, empty on ARM64/x86-64 (their
+equivalents are already adopted per core) so the portable caller need not know which ISAs
+need it. `start_all` also exposed a latent race: the single-cell hand-off published its
+index with a plain load-then-store, so two secondaries could both take it - one cell, two
+cores, one trap frame, presenting as two cores faulting at PC 0 intermittently; it is an
+atomic `swap` now.
 **Honest scope:** preemption is *within* a core's own claim - nothing takes a cell from
 another core, nothing migrates a running cell, and nothing balances between the per-CPU
-queues after the claim. A **Linux** cell on a secondary is not attempted
+queues after the claim. A **second** Linux cell on another core is not attempted
 (the cell/capability/object tables and the Linux per-cell state are still written for
 one CPU - the audit in docs/SMP.md 10.2 is the gate). What makes the native path safe is
 that a claimed cell is still a *partitioned* cell - one core, one slot, one address
@@ -1991,7 +2008,10 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               placement** - 4 CPUs online, 8 runnable cells drained by whichever
               core is free; then **cross-core preemption** - each core preempts
               between the cells it claimed, ~350-400 slices taken on 4 cores at
-              once against 0 in the cooperative control round - docs/SMP.md 10.0), shell-smoke, hwinfo, rng, runtime,
+              once against 0 in the cooperative control round; then an
+              **unmodified static-glibc binary as a Linux cell on a secondary**,
+              exact stdout + exit asserted, overlapping a native cell on the
+              primary - docs/SMP.md 10.0), shell-smoke, hwinfo, rng, runtime,
               posix, blockfs (live virtio-blk disk), elfrun (load a native
               ELF), posixrun (native program over the POSIX syscalls),
               libcrun (a program linked against rheo-libc), jsonrun (a

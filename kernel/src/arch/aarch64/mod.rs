@@ -309,6 +309,16 @@ pub fn enable_virtio_net_irq(slot: usize) -> bool {
 
 /// Bring up the CNTV virtual timer interrupt (PPI 27). Called only by the Phase F
 /// test.
+/// The EL1 register bits EL0 relies on, for **this core** - nothing, here.
+///
+/// The counterpart of RISC-V's `sstatus.SUM`/`FS` block. On ARM64 the equivalents
+/// are already per core *and* already set on a secondary: the PSCI entry
+/// (`arch/aarch64/smp.S`) writes `CPACR_EL1.FPEN` itself and adopts the primary's
+/// `SCTLR_EL1`/`MAIR_EL1`/`TCR_EL1` verbatim, and PAN (the SUM analogue) is off. So
+/// this is deliberately empty rather than absent: the portable caller
+/// (`smp::secondary_run`) must not have to know which ISAs need it (docs/SMP.md 10.0).
+pub fn user_mode_init_this_cpu() {}
+
 pub fn enable_timer_irq() {
     enable_timer_irq_this_cpu();
     // SAFETY: set once by the primary, before any secondary reads it.

@@ -617,6 +617,17 @@ static TIMER_FIRES: AtomicU64 = AtomicU64::new(0);
 /// portable code falls back honestly (a cooperative deadline check for
 /// `SYS_ARM_TIMER`, a bounded poll for a receive wait) instead of pretending to
 /// park.
+/// The control-register bits ring 3 relies on, for **this core** - nothing extra.
+///
+/// The counterpart of RISC-V's `sstatus.SUM`/`FS` block. On x86-64 the equivalents
+/// live in CR0/CR4/XCR0, which `user_init` programs per core (a secondary calls it
+/// from `x86_secondary_main`), and the AP trampoline adopts the primary's CR0/CR4/EFER
+/// before that. SMAP - the SUM analogue - is not enabled in CR4, so a kernel access to
+/// a user page needs no window. Deliberately empty rather than absent: the portable
+/// caller (`smp::secondary_run`) must not have to know which ISAs need it
+/// (docs/SMP.md 10.0).
+pub fn user_mode_init_this_cpu() {}
+
 pub fn enable_timer_irq() {
     lapic_probe();
     set_idt_gate(VEC_TIMER, timer_irq_stub as *const () as u64);

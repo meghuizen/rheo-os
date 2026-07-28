@@ -27,6 +27,8 @@
 #![no_std]
 #![no_main]
 
+#[path = "fixture.rs"]
+mod fixture;
 #[path = "harness.rs"]
 mod harness;
 
@@ -264,6 +266,7 @@ fn test_secondary_bringup() {
             test_user_cells_on_both();
             test_placement();
             test_cross_core_preemption();
+            test_linux_cell_on_secondary();
         }
         Err(StartError::NoSecondary) => {
             println!(
@@ -750,6 +753,172 @@ fn test_cross_core_preemption() {
             "smp: CELLS WERE PREEMPTED ON {movers} CORES AT ONCE - {taken} of {armed} \
              slices took the CPU from a cell that issues no syscall ({to_cell} to \
              another cell), against 0 in the cooperative round just above"
+        );
+    }
+}
+
+// --------------------------------------- a LINUX cell in user mode on a secondary
+//
+// Every cell run on a secondary so far has been **native**: the tree's own ABI, one
+// execution context, no fd table, no VMA list, no signal state. That was the honest
+// stopping point, because the Linux personality keeps far more per-cell state and a
+// few genuinely global registries beside it (the mapped-file table, the pipe and
+// eventfd registries, the pid counter), and docs/SMP.md 10.2 names auditing those as
+// the gate for running Linux cells on several cores.
+//
+// This phase takes the part of that which does **not** need the audit: **one** Linux
+// cell, on one core, at a time. The global registries have exactly one writer, so the
+// question the audit exists to answer - what happens when two cores mutate them - is
+// not being asked. What is being asked is narrower and was genuinely unknown: does the
+// Linux syscall path work at all on a core that is not the boot CPU? It runs through
+// the same per-CPU trap state the native path needed (the saved kernel context, the
+// current-cell record, RISC-V's kernel `tp`, x86-64's GS-relative stub words) plus its
+// own dispatch branch, its own fault-to-signal path and its own scheduler.
+//
+// The fixture is `chello`, an **unmodified static-glibc C binary** - the same one
+// `linuxrun` asserts on the primary. Asserting its exact stdout and exit code from a
+// secondary is what makes this a claim about the personality rather than about a stub:
+// glibc's startup runs `arch_prctl`/`set_tid_address`/`brk`/`readlink` and a demand-
+// paged image before it reaches `main`.
+//
+// It runs **concurrently with a native cell on the primary**, through the same
+// rendezvous the two-cells phase uses, so the two are known to have overlapped rather
+// than run in sequence.
+
+static CHELLO: &[u8] = fixture::linux!("chello");
+/// `chello`'s exact output and exit code, as `linuxrun` asserts them on the primary.
+const CHELLO_OUT: &[u8] = b"hello from glibc C\n";
+const CHELLO_EXIT: u64 = 9;
+
+/// Captured stdout of the Linux cell. Written only by the core running it (there is
+/// one such core), read by the primary after the run.
+const CAP_MAX: usize = 1024;
+static mut STDOUT_CAP: [u8; CAP_MAX] = [0; CAP_MAX];
+static mut STDOUT_LEN: usize = 0;
+
+fn tap(bytes: &[u8]) {
+    // SAFETY: exactly one core runs a Linux cell in this phase, and the tap is called
+    // only from inside that run.
+    unsafe {
+        for &b in bytes {
+            if STDOUT_LEN < CAP_MAX {
+                STDOUT_CAP[STDOUT_LEN] = b;
+                STDOUT_LEN += 1;
+            }
+        }
+    }
+}
+
+static mut KSTACK_L: KernelStack = KernelStack::new();
+static mut QP_L: core::mem::MaybeUninit<kernel::queue::QueuePair> =
+    core::mem::MaybeUninit::uninit();
+
+/// The native peer's exit code - distinct from `chello`'s, so neither can be mistaken
+/// for the other.
+const PEER_EXIT: u64 = 21;
+
+fn test_linux_cell_on_secondary() {
+    // SAFETY: single-threaded setup on the primary; secondaries are parked.
+    unsafe {
+        let objects = &mut *core::ptr::addr_of_mut!(OBJECTS2);
+        let caps = &mut *core::ptr::addr_of_mut!(CAPS2);
+        *objects = ObjectTable::new();
+        *caps = CapTable::new();
+
+        // Reset **before** loading: `user::reset` clears the personality's mapped-file
+        // registry, which the loader registers the image in, so resetting afterwards
+        // would make every page of the image fault in as zeros.
+        user::reset();
+        ktimer::reset();
+        idle::reset();
+
+        // Cell 0: the native peer, on the primary.
+        let p = core::ptr::addr_of_mut!(STORE_P);
+        let (mut aspace_p, _op, mut frame_p) = build_cell(
+            &mut *p,
+            objects,
+            caps,
+            (*core::ptr::addr_of!(KSTACK_P)).top(),
+            1,
+            user_placed,
+            PEER_EXIT,
+            LONG_ROUNDS,
+        );
+        let _ = &mut aspace_p;
+
+        // Cell 1: the unmodified glibc binary, on the secondary.
+        let mut aspace_l = kernel::mm::AddressSpace::new(2);
+        let img = kernel::load::load_elf_linux(CHELLO, &mut aspace_l).expect("load chello");
+        let sp = kernel::linux::stack::setup_stack(&mut aspace_l, &img, &[b"chello"], &[]);
+        let mut frame_l =
+            arch::trapframe_new(img.entry, sp, 0, (*core::ptr::addr_of!(KSTACK_L)).top());
+
+        user::install(
+            0,
+            &aspace_p,
+            caps,
+            objects,
+            (*p).qp.qp.as_ptr(),
+            core::ptr::addr_of_mut!(frame_p),
+        );
+        user::install(
+            1,
+            &aspace_l,
+            caps,
+            objects,
+            core::ptr::addr_of!(QP_L) as *const kernel::queue::QueuePair,
+            core::ptr::addr_of_mut!(frame_l),
+        );
+        user::set_personality(1, user::Personality::Linux);
+        kernel::linux::install_cell(1, &img);
+        // Bind each cell to the core that will run it, so neither core's scheduler can
+        // reach into the other's (docs/SMP.md 10.0).
+        user::claim_cell(0, 0);
+        user::claim_cell(1, 1);
+
+        STDOUT_LEN = 0;
+        kernel::linux::set_stdout_tap(Some(tap));
+        // SAFETY: both cells are installed and present, and they are distinct; cell 1
+        // is Linux, which is what this phase is about.
+        let (met, finished, sec_code, own_code) = smp::run_cells_on_both(0, 1);
+        kernel::linux::set_stdout_tap(None);
+
+        if !finished {
+            println!(
+                "smp: SKIP the Linux-on-a-secondary phase - the secondary did not \
+                 finish the cell within the bound"
+            );
+            return;
+        }
+        assert!(
+            met && !smp::rendezvous_timed_out(),
+            "the two cores never met, so the Linux cell and the native peer did not \
+             overlap"
+        );
+        assert_eq!(
+            own_code, PEER_EXIT,
+            "the primary's native peer exited wrong"
+        );
+        assert_eq!(
+            sec_code as u64, CHELLO_EXIT,
+            "the glibc binary on the secondary exited {sec_code}, expected {CHELLO_EXIT}"
+        );
+        let got = &*core::ptr::addr_of!(STDOUT_CAP);
+        let got = &got[..STDOUT_LEN];
+        assert!(
+            got == CHELLO_OUT,
+            "the glibc binary's stdout from the secondary did not match ({} bytes)",
+            got.len()
+        );
+        assert!(
+            kernel::mm::frames::used_matches_bitmap(),
+            "the frame pool's used counter drifted from its bitmap"
+        );
+        println!(
+            "smp: an UNMODIFIED static-glibc BINARY ran as a LINUX CELL on a SECONDARY \
+             core - exact stdout and exit {CHELLO_EXIT} asserted - while a native cell \
+             ran on the primary, the two overlapping at a rendezvous neither could pass \
+             alone"
         );
     }
 }

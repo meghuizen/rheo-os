@@ -140,7 +140,7 @@ pub use imp::{
     set_syscall_ret, set_user_fs_base, setup_rt_frame, sig_tramp_code, spin_loop, ticks_to_ns,
     timer_arm, timer_disarm, timer_expired, timer_irq_enabled, timer_now_ns, timer_park, trap_init,
     trapframe_kernel_sp, trapframe_new, trapframe_zeroed, uart_inject_and_wait, uart_irq_enabled,
-    user_fs_base, user_sp, virt_to_phys,
+    user_fs_base, user_mode_init_this_cpu, user_sp, virt_to_phys,
 };
 
 /// SMP surface (docs/SMP.md, task #27), exported only under the `smp` feature so
