@@ -17,10 +17,10 @@
 use crate::abi::{
     Params, SHELL_BUF, SYS_ARM_TIMER, SYS_CAP_DERIVE, SYS_CAP_DROP, SYS_CAP_INFO, SYS_CAP_REVOKE,
     SYS_CAPS, SYS_CPUINFO, SYS_CYCLES, SYS_DOORBELL, SYS_EVENT_COUNT, SYS_EVENT_EMIT, SYS_EXIT,
-    SYS_GRAPH, SYS_LEASE, SYS_LSPCI, SYS_MEMINFO, SYS_MMAP, SYS_MUNMAP, SYS_NUMA, SYS_PS,
-    SYS_QUEUE_INFO, SYS_RANDOM, SYS_READLINE, SYS_RESERVE, SYS_SWITCH, SYS_UPTIME, SYS_WAIT_INPUT,
-    SYS_WAIT_NET, SYS_WRITE, SYS_YIELD, ShellIo, WORKLOAD_CROSSCELL, WORKLOAD_ROUNDTRIP,
-    WORKLOAD_SYSCALL,
+    SYS_GRANT, SYS_GRAPH, SYS_LEASE, SYS_LSPCI, SYS_MEMINFO, SYS_MMAP, SYS_MUNMAP, SYS_NUMA,
+    SYS_PS, SYS_QUEUE_INFO, SYS_RANDOM, SYS_READLINE, SYS_RESERVE, SYS_SWITCH, SYS_UPTIME,
+    SYS_WAIT_INPUT, SYS_WAIT_NET, SYS_WRITE, SYS_YIELD, ShellIo, WORKLOAD_CROSSCELL,
+    WORKLOAD_ROUNDTRIP, WORKLOAD_SYSCALL,
 };
 use crate::capability::{
     DELEGATE as RIGHT_DELEGATE, READ as RIGHT_READ, REVOKE as RIGHT_REVOKE, WRITE as RIGHT_WRITE,
@@ -806,6 +806,35 @@ pub extern "C" fn user_attack_mmap_roundtrip(params_va: usize) -> ! {
             (*p).status = (base as *const u64).read_volatile();
             (*p).ops = syscall4(SYS_MUNMAP, base, 8192, 0, 0);
         }
+        syscall(SYS_EXIT, 0);
+    }
+    loop {}
+}
+
+/// The **grant-window ceiling** probe (docs/SUBSTRATE.md pillar 2): ask for a
+/// reservation of `iters` bytes, then ask for one ordinary page.
+///
+/// `ticks` = the first call's return (0 = granted, `u64::MAX` = refused), `ops` = the
+/// base the *second* call landed on. Two calls rather than one because a refusal that
+/// still advanced the region cursor is a refusal that leaked address space, and the
+/// only way to see that is to look at where the next reservation goes.
+#[unsafe(link_section = ".user.text")]
+#[unsafe(no_mangle)]
+pub extern "C" fn user_attack_grant(params_va: usize) -> ! {
+    let p = params_va as *mut Params;
+    // SAFETY: `scratch` is this cell's own mapped page - the out-parameter both calls
+    // write their `GrantInfo` into.
+    unsafe {
+        let out = (*p).ticks; // the cell's scratch page, passed in by the harness
+        (*p).ticks = syscall4(SYS_GRANT, out, (*p).iters, 0, 0);
+        let second = syscall4(SYS_GRANT, out, 4096, 0, 0);
+        (*p).status = second;
+        // The second call's base, read back out of the out-parameter.
+        (*p).ops = if second == 0 {
+            (out as *const u64).read_volatile()
+        } else {
+            0
+        };
         syscall(SYS_EXIT, 0);
     }
     loop {}

@@ -1823,8 +1823,17 @@ one CPU - the audit in docs/SMP.md 10.2 is the gate). What makes the native path
 that a claimed cell is still a *partitioned* cell - one core, one slot, one address
 space, one kernel stack - the claim simply made at run time instead of by hand.
 
-**Still honest about what is not wired:** the fixed VA map is still the map (S2'
-untouched), dispatch is proven for native cells and **off by default** except the
+**Still honest about what is not wired:** the fixed VA map is still the map - S2' has
+only its **ceilings**, which landed early because they were a live defect rather than a
+design debt: every per-cell region had a start and no end, so `mmap_file`'s cursor grew
+unbounded from 20 GiB toward the cross-cell channel rings at 24 GiB (4 GiB of file
+mappings would have placed the next one **on top of the cell's own channel**, silently
+replacing the ring two cells talk through) and `SYS_GRANT` walked out of the ISA's user
+range instead of refusing. Each region is now bounded by its neighbour, on the cell's own
+path and on the peer's in `SYS_GRANT_SHARE`, and `security` proves it with the property
+that makes a refusal clean - an over-large grant is refused **and** the next ordinary
+grant still lands at the window base, so nothing was consumed. Placing the regions with
+the allocator (which exists and is proven) is the rest of S2' and is not done; dispatch is proven for native cells and **off by default** except the
 `linuxnode` boot -
 enabling it for the *Linux* boots is what the `linuxbun` gate needs - `metrics`
 records nothing until a boot enables it, and the per-CPU EEVDF+BORE queue still drives

@@ -209,8 +209,30 @@ const EMPTY: RunCell = RunCell {
 /// queue (16) regions, free in every cell root. Reservations are pure address
 /// space (48-bit VA), so multi-GiB grants cost nothing until committed.
 const GRANT_BASE: usize = 0x8_0000_0000;
+/// Exclusive top of the grant window. The fixed VA map (docs/SUBSTRATE.md pillar 2,
+/// migration S2') gives each region a start and, until now, no end: the cursors were
+/// bumps with nothing above them. `SYS_GRANT` reserves pure address space, so a cell
+/// asking for terabytes of it is cheap and legitimate right up to the point the cursor
+/// walks out of the ISA's user range - which is a fault at some unrelated address
+/// rather than a refusal. Grants are the topmost region, so their ceiling is the range
+/// itself.
+const GRANT_TOP: usize = USER_VA_MAX as usize;
 /// Base VA of a native cell's file mmaps (`SYS_MMAP_FILE`): 20 GiB.
 const FILEMMAP_BASE: usize = 0x5_0000_0000;
+/// Exclusive top of the file-mmap window - **the channel region's base**, which is what
+/// this cursor was previously free to grow into.
+///
+/// A real defect, not a tidy-up: `mmap_file` bumped `filemmap_next` with no upper
+/// bound, and the shared cross-cell channel rings sit 4 GiB above the window's start
+/// (`crate::load::USER_CHANNEL_VA`). A cell that file-mapped 4 GiB in total would have
+/// its next mapping placed **on top of its own channel**, silently replacing the ring
+/// two cells communicate through. Bounding each region at its neighbour is the part of
+/// S2' that can be stated as a constant; giving the regions to a real allocator so the
+/// bound is a *result* rather than a second hand-written number is the rest of it, and
+/// is not done (docs/SUBSTRATE.md pillar 2).
+const FILEMMAP_TOP: usize = crate::load::USER_CHANNEL_VA;
+const _: () = assert!(FILEMMAP_BASE < FILEMMAP_TOP);
+const _: () = assert!(GRANT_BASE < GRANT_TOP);
 
 /// Typed memory grants a native cell holds (docs/LIBRHEO.md Phase B). Fixed
 /// per-cell table, like the Linux fd table - no allocation. A grant is a typed
@@ -966,7 +988,15 @@ fn grant_create(cur: usize, out_va: u64, len: usize, kind: u64, _flags: u64) -> 
         return u64::MAX;
     };
     let base = cells()[cur].grant_next;
-    cells()[cur].grant_next = base + bytes;
+    // Refuse rather than run off the top of the window (see [`GRANT_TOP`]). Checked
+    // before the slot is written, so a refused reservation leaves nothing behind.
+    let Some(top) = base.checked_add(bytes) else {
+        return u64::MAX;
+    };
+    if top > GRANT_TOP {
+        return u64::MAX;
+    }
+    cells()[cur].grant_next = top;
     *slot = GrantSlot {
         in_use: true,
         base,
@@ -1189,6 +1219,12 @@ fn grant_share(cur: usize, cap_id: u32, out_va: u64) -> u64 {
     }
     // Map the grant's frames into the peer read-only at its next grant VA.
     let peer_base = peer_cell.grant_next;
+    // The peer's window has a top too: a share that would place the mapping past it is
+    // refused, exactly as the peer's own `SYS_GRANT` would be.
+    match peer_base.checked_add(slot.len) {
+        Some(t) if t <= GRANT_TOP => {}
+        _ => return u64::MAX,
+    }
     // SAFETY: single CPU; the client's address space is read (page-table walk,
     // no active requirement) and the peer's is edited (published when the peer is
     // switched to). Both are uniquely owned for the trap.
@@ -1255,6 +1291,10 @@ fn mmap_file(cur: usize, fd: u64, offset: u64, len: usize) -> usize {
     let Some(top) = base.checked_add(bytes) else {
         return 0;
     };
+    // Refuse rather than grow into the channel region above (see [`FILEMMAP_TOP`]).
+    if top > FILEMMAP_TOP {
+        return 0;
+    }
     if !user_write_ok(base as u64, bytes) || !charge_frames(cur, pages) {
         return 0;
     }

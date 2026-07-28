@@ -40,8 +40,8 @@ use kernel::mm::frames;
 use kernel::queue::STATUS_OK;
 use kernel::user::{self, Outcome};
 use kernel::user_progs::{
-    user_attack_mmap, user_attack_mmap_roundtrip, user_attack_munmap, user_attack_munmap_queue,
-    user_attack_out, user_cap_probe,
+    user_attack_grant, user_attack_mmap, user_attack_mmap_roundtrip, user_attack_munmap,
+    user_attack_munmap_queue, user_attack_out, user_cap_probe,
 };
 use kernel::{arch, println};
 
@@ -57,6 +57,11 @@ static mut CAPS: CapTable = CapTable::new();
 /// clobbered both).
 static mut CANARY: [u64; 2] = [CANARY_MAGIC, CANARY_MAGIC];
 const CANARY_MAGIC: u64 = 0x5EC0_0DED_5EC0_0DED;
+
+/// Base of the per-cell typed-grant window (`kernel::user`'s `GRANT_BASE`, 32 GiB).
+/// Named here rather than exported, so the test states the address it expects instead
+/// of agreeing with whatever the kernel happens to use.
+const GRANT_WINDOW_BASE: u64 = 0x8_0000_0000;
 
 fn canary() -> [u64; 2] {
     // SAFETY: single-threaded kernel, read between cell runs.
@@ -83,6 +88,12 @@ struct Report {
 /// Build a fresh attacker cell around `entry`, run it, and return what it wrote
 /// into its `Params`. `target` reaches the cell as `Params.iters`.
 fn attack(entry: extern "C" fn(usize) -> !, target: u64) -> Report {
+    attack_with(entry, target, 0)
+}
+
+/// [`attack`], with `Params.ticks` seeded - the second argument a probe needs when one
+/// register is not enough (the grant probe passes both a length and an out-parameter).
+fn attack_with(entry: extern "C" fn(usize) -> !, target: u64, ticks: u64) -> Report {
     // SAFETY: single-threaded kernel; each run completes before the next, and
     // STORE is reused with a fresh address space each time.
     unsafe {
@@ -102,6 +113,7 @@ fn attack(entry: extern "C" fn(usize) -> !, target: u64) -> Report {
             0,
             target,
         );
+        (*store_ptr).params.ticks = ticks;
         let qp = (*store_ptr).qp.qp.as_ptr();
 
         user::reset();
@@ -436,6 +448,46 @@ extern "C" fn kernel_main() -> ! {
          capability to another object is untouched",
         epoch_before,
         objects.epoch_of(probe_cap.0)
+    );
+
+    // ------------------------------------------------- S2' region ceilings
+    // The fixed VA map gives each per-cell region a start and, until now, no end: the
+    // cursors were bumps with nothing above them (docs/SUBSTRATE.md pillar 2). A grant
+    // reserves pure address space, so a cell can legitimately ask for terabytes of it -
+    // and used to be given a base that walked out of the ISA's user range, which
+    // surfaces as a fault at some unrelated address rather than as a refusal.
+    //
+    // Two assertions, because a refusal is only clean if it also leaves nothing behind:
+    // the absurd reservation is refused, **and** the ordinary one that follows lands at
+    // the window's base - so the refused request did not advance the cursor past the
+    // address space it did not get.
+    let scratch = {
+        // SAFETY: read of a static the harness owns; the cell's scratch page is where
+        // the probe's `GrantInfo` out-parameter goes.
+        unsafe { core::ptr::addr_of!((*core::ptr::addr_of!(STORE)).scratch) as u64 }
+    };
+    let r = attack_with(user_attack_grant, u64::MAX / 2, scratch);
+    assert_exited(&r, "S2' grant ceiling");
+    assert_eq!(
+        r.ticks,
+        u64::MAX,
+        "S2': a grant of half the address space returned {:#x} - it must be refused",
+        r.ticks
+    );
+    assert_eq!(
+        r.status, 0,
+        "S2': the ordinary grant after the refusal was itself refused ({:#x})",
+        r.status
+    );
+    assert_eq!(
+        r.ops, GRANT_WINDOW_BASE,
+        "S2': the grant after the refusal landed at {:#x}, not the window base {:#x} - \
+         the refused reservation advanced the cursor anyway",
+        r.ops, GRANT_WINDOW_BASE
+    );
+    println!(
+        "security: S2' an over-large grant is refused at the window ceiling and leaves \
+         the cursor at {GRANT_WINDOW_BASE:#x} OK"
     );
 
     println!("security: PASS");

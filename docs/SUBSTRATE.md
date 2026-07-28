@@ -172,6 +172,34 @@ closed by this pillar alone.
 
 ## 4. Pillar 2 - address spaces: full lower half, no magic VAs
 
+**Status: the allocator exists and is proven (`mm/vaspace.rs`, the `substrate`
+kernel); the regions are not placed by it yet (migration S2', not done). One
+piece has landed early because it was a live defect rather than a design
+debt: every per-cell region now has a *ceiling*.**
+
+The fixed map gave each region a start and no end - the cursors were bumps
+with nothing above them. Two consequences, both real:
+
+- `mmap_file`'s cursor started at 20 GiB and grew unbounded, and the shared
+  cross-cell channel rings sit at 24 GiB. A cell that file-mapped 4 GiB in
+  total would have had its next mapping placed **on top of its own channel**,
+  silently replacing the ring two cells communicate through.
+- `SYS_GRANT` reserves pure address space, so asking for terabytes is cheap
+  and legitimate - and walked the cursor out of the ISA's user range, which
+  surfaces as a fault at some unrelated address instead of a refusal.
+
+Each region is now bounded by its neighbour and refuses rather than
+overruns, on the cell's own path and on the peer's in `SYS_GRANT_SHARE`. The
+`security` kernel proves it on all three ISAs with the property that makes a
+refusal *clean*: an over-large grant is refused **and** the ordinary grant
+that follows still lands at the window base, so the refused request did not
+advance the cursor past address space it never got. Observed failing with
+the ceiling removed.
+
+This is the part of S2' that can be stated as a constant. The rest - giving
+the regions to the allocator so the bound is a *result* rather than a second
+hand-written number, with guard gaps and per-ISA ceilings - is what remains.
+
 - A **per-cell VA allocator over a real VMA structure** (possible once
   pillar 1 exists - today's "no VMA list" is a metadata-space problem)
   replaces the bump cursors and the fixed region bases. Queue, channel and
