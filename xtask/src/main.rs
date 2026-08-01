@@ -676,6 +676,21 @@ fn fixed_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "hmat-lb,initiator=1,target=0,hierarchy=memory,data-type=access-bandwidth,bandwidth=10240M",
         ],
 
+        // hwinfo (docs/RESOURCE-GRAPH.md 2.5): a CPU topology with something in it to
+        // discover. The base launch is a flat `-smp 4`, where every CPU is its own core in
+        // its own package - a shape in which a correct discovery and a broken one both say
+        // "four cores", so it can prove nothing. One socket, two cores, two threads each is
+        // the smallest launch where the two groupings differ: 4 CPUs, 2 SMT pairs, 1 cache
+        // domain. **These numbers are the test's oracle**, exactly as the `-numa dist` values
+        // are for distances - the kernel asserts the topology it discovered matches what is
+        // declared here, never that its own decode is self-consistent.
+        //
+        // The same line on every ISA, so what differs is what each ISA can *see*: CPUID on
+        // x86-64, MPIDR's MT bit on ARM64, the device tree's `cpu-map` on riscv64 - and QEMU
+        // flattens threads out of the riscv `cpu-map`, which the test reports rather than
+        // works around.
+        ("hwinfo", _) => &["-smp", "4,sockets=1,cores=2,threads=2"],
+
         ("numa", _) => &[
             "-object",
             "memory-backend-ram,id=m0,size=512M",

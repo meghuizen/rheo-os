@@ -707,6 +707,22 @@ pub fn cpu_feature_names() -> &'static [&'static str] {
     ]
 }
 
+/// RISC-V has no architectural rule for decomposing a hart id
+/// (docs/RESOURCE-GRAPH.md 2.4a).
+///
+/// A hart id is an opaque integer: the privileged spec says nothing about it naming a thread,
+/// a core or a cluster, and there is no register that reports who shares a cache. So the only
+/// evidence here is the device tree's `cpu-map`, which `hw::fdt` reads directly into the
+/// inventory - and where there is no `cpu-map`, the honest answer is that the topology is
+/// unknown, which is what `None` says.
+///
+/// Written out rather than omitted because the absence is the finding: this is the one ISA of
+/// the three where the grouping *cannot* be derived from the id, and a caller that assumed it
+/// could would group four independent harts into one core.
+pub fn cpu_topology_bits() -> Option<(u8, u8)> {
+    None
+}
+
 /// Decode CPU features from the device-tree "riscv,isa" string (misa is an
 /// M-mode CSR and traps in S-mode, so the firmware string is the source).
 pub fn cpu_report(_inv: &crate::hw::Inventory) -> crate::hw::CpuReport {

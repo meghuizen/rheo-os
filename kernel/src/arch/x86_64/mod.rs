@@ -1487,6 +1487,104 @@ pub fn cpu_feature_names() -> &'static [&'static str] {
     ]
 }
 
+/// How many low bits of an APIC id name the SMT thread, and how many name everything below
+/// the last-level cache (docs/RESOURCE-GRAPH.md 2.4a).
+///
+/// An APIC id is not opaque: it is a bit field, and CPUID says where the boundaries are.
+///
+/// **Leaf `0x0B` gives the boundaries.** Each subleaf describes one level of the hierarchy -
+/// `ecx[15:8]` is the level type (1 = SMT, 2 = Core) and `eax[4:0]` is how far to shift an
+/// APIC id right to leave the id *above* that level. So the SMT level's shift leaves the core
+/// id, and the Core level's shift leaves the package id. The subleaves are searched by type
+/// rather than read at fixed indices, because the specification orders them by level and not
+/// by a fixed meaning per index.
+///
+/// **Leaf `4` refines the cache boundary when it exists.** It reports, per cache, how many
+/// logical processors can share it (`eax[25:14] + 1`); the widest such cache is the last-level
+/// one. This matters on parts where the last-level cache is *narrower* than a package - an AMD
+/// core complex, an Intel part with sub-NUMA clustering - where the package would merge two
+/// real cache domains into one.
+///
+/// So the cache boundary is leaf 4's answer where there is one, and the **package** otherwise.
+/// Falling back to the package is deliberate and its direction is the safe one: it can merge
+/// two cache domains into one, which costs a work-stealing heuristic some locality, where
+/// splitting one domain in two would claim two CPUs do not share a cache when they do.
+///
+/// **The fallback is not hypothetical - it is what runs here.** QEMU 8.2's TCG `-cpu max`
+/// returns all zeros for every leaf-4 subleaf (measured, not assumed: a debug print of
+/// subleaves 0..6 showed `eax = 0`), while leaf `0x0B` reports the SMT and Core levels
+/// correctly. A first version of this function used leaf 4 alone with the SMT width as its
+/// floor, and on a one-socket, two-core, two-thread launch it reported **two** cache domains
+/// where there is one - a wrong grouping presented as a discovered one, which is exactly what
+/// the `TopoSource` label is supposed to make impossible.
+///
+/// A count is turned into a width, which is only correct because these counts are powers of
+/// two: x86 packs the APIC id in power-of-two fields, so a cache shared by 4 threads is
+/// selected by 2 bits. Rounding up is again the merging direction.
+///
+/// Returns `None` when neither leaf says anything, which is a real answer: nothing was
+/// discovered, and the caller must say so rather than default to 0 (that would claim every
+/// CPU is a thread of one core).
+pub fn cpu_topology_bits() -> Option<(u8, u8)> {
+    use core::arch::x86_64::__cpuid_count;
+    // `max_leaf` is checked before every leaf is read, which is the documented way to ask
+    // whether a leaf exists.
+    let max_leaf = __cpuid_count(0, 0).eax;
+
+    // Leaf 0x0B: find the SMT level and the Core level by their type, not by subleaf index.
+    // A level that is absent leaves its shift at `None`.
+    let mut smt_shift: Option<u8> = None;
+    let mut pkg_shift: Option<u8> = None;
+    if max_leaf >= 0x0B {
+        for sub in 0..8 {
+            let l = __cpuid_count(0x0B, sub);
+            let level_type = (l.ecx >> 8) & 0xff;
+            let shift = (l.eax & 0x1f) as u8;
+            match level_type {
+                1 => smt_shift = Some(shift),
+                2 => pkg_shift = Some(shift),
+                // Type 0 is "invalid": the list has ended.
+                0 => break,
+                _ => {}
+            }
+        }
+    }
+
+    // Leaf 4: the largest number of logical processors sharing any one cache. Subleaf `i`
+    // describes one cache; `eax[4:0] == 0` (cache type "null") ends the list.
+    let mut widest = 0u32;
+    if max_leaf >= 4 {
+        for sub in 0..8 {
+            let l = __cpuid_count(4, sub);
+            if l.eax & 0x1f == 0 {
+                break;
+            }
+            let sharing = ((l.eax >> 14) & 0xfff) + 1;
+            if sharing > widest {
+                widest = sharing;
+            }
+        }
+    }
+
+    if widest == 0 && smt_shift.is_none() && pkg_shift.is_none() {
+        return None;
+    }
+    let smt_bits = smt_shift.unwrap_or(0);
+    // Bits needed to select one of `widest` processors, rounding up.
+    let mut cache_bits = 0u8;
+    while (1u32 << cache_bits) < widest {
+        cache_bits += 1;
+    }
+    // Leaf 4's boundary where it reported one; the package otherwise. A cache narrower than
+    // one core's threads cannot be the last level, so the SMT width is the floor either way.
+    let llc_bits = if widest > 0 {
+        cache_bits
+    } else {
+        pkg_shift.unwrap_or(smt_bits)
+    };
+    Some((smt_bits, llc_bits.max(smt_bits)))
+}
+
 /// Decode CPU vendor + features via CPUID.
 pub fn cpu_report(_inv: &crate::hw::Inventory) -> crate::hw::CpuReport {
     use core::arch::x86_64::__cpuid_count;

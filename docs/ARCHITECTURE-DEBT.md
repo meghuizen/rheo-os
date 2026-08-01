@@ -1078,11 +1078,11 @@ on a prerequisite in this table.
 |---|---|---|
 | The model, queries, per-class accessors | 11 properties, 5,000 topologies, 9 controls | **done** (`hw/graph.rs`, `verify/graph/`) |
 | **Node-to-node distances**: ACPI SLIT, DT `numa-distance-map-v1` | `-numa dist,val=20` against the launch as oracle, both directions, plus the degraded single-node case | **done** - x86-64 via SLIT, riscv64 via the device tree, ARM64 degrading to `Source::None` with 0 edges asserted. Three controls firing |
-| **HMAT**: real latency and bandwidth per initiator/target | `-machine q35,hmat=on -numa hmat-lb,...` | **G** - the fields exist and read 0 = unknown today, which is deliberate: SLIT does not report them and fabricating them would poison the two metrics a caller is most likely to rank by |
+| **HMAT**: real latency and bandwidth per initiator/target | `-machine q35,hmat=on -numa hmat-lb,...` | **done** - x86-64 parses the SLLBI, and the declared 100 ns / 10240 MB/s are the oracle. arm/riscv have no HMAT and assert those fields read 0 = unknown rather than a number derived from the distance |
 | **Device proximity** (`_PXM`) | a driver's queues land on its device's node | **P, and the blocker is not what the earlier row implied.** `_PXM` is an **AML object**, not a table entry: ACPI has no table-based device-to-proximity mapping, so reading it needs an AML interpreter. This tree should not acquire one for one field. The routes that do not: (a) the **device tree** can put `numa-node-id` on a PCI host bridge, so riscv64/ARM64 are reachable with the walk that already exists; (b) on x86-64, derive a device's locality from its **host bridge / ECAM segment**, which is table-visible, and report `unknown` for anything behind a bridge whose proximity only AML states. Option (b) is honest and partial, which is the right shape - a device whose node is unknown must be *said* to be unknown, not defaulted to 0 |
 | **Per-CPU feature divergence** (a hybrid part; cores without an FPU or a vector width their siblings have) | a CPU that lacks `FloatSimd` is asserted not to offer it | **G**. `graph_build` currently asserts the *machine's* features of every CPU and says so at the site - true of every profile this runs on, and the placeholder the row below depends on |
 | **Heterogeneous-FPU handling** (docs/RESOURCE-GRAPH.md 6.4d): place hard-float work on a CPU that has an FPU, and on a trap **migrate rather than SIGILL** | FP left disabled on one secondary in software, hard-float work asserted to trap, migrate and complete natively, with the graph consulted | **P** (per-CPU discovery + **E4** for migration). The trap sites, the graph query and the resumable-fault shape all exist; the synthetic-asymmetry gate is honest about being synthetic, the `netwait` precedent |
-| **LLC domains and SMT sets**: CPUID leaf 4 / 0x1F, DT `cpu-map` | two CPUs asserted to share an LLC node; a steal preferring that domain | **G** - pure architectural discovery, no firmware table and no AML. This is what unblocks the work-stealing and interference rows, and it is the next slice |
+| **LLC domains and SMT sets**: CPUID leaf `0x0B`/4, MPIDR's MT bit, DT `cpu-map` | `-smp 4,sockets=1,cores=2,threads=2` as the oracle: CPUs asserted to share a `Cache` node through `graph::siblings`, and on x86-64 to be SMT pairs on a `Core` | **done** - all three ISAs discover it (`Architectural` on x86-64/ARM64, `DeviceTree` on riscv64). The SMT half is x86-64 only, because **QEMU cannot express threads to a guest** on the other two - ARM MPIDR is index-based and riscv `cpu-map` emits no `thread` nodes, both read out of QEMU's source. Five controls firing, one of which caught a real defect: leaf 4 returns all zeros under TCG, and a first version using it alone reported two cache domains where there is one while labelling the answer discovered |
 | `/sys/devices/system/{cpu,node}` synthesis | unmodified hwloc reads a correct topology | **P** (discovery) |
 | `librheo::graph` read-only queries | a cell picks a lowering for an engine it cannot CPUID | **P** (discovery) |
 | Driver cells publishing capabilities | a driver's queues land on its device's node | **P** (discovery + DRIVERS.md D2) |
@@ -1139,10 +1139,14 @@ None built. Ranked there by value over cost, repeated here with gates:
 
 ### 7.7 The one-line summary
 
-**Updated after stage 1 landed.** Distances are done, so the resource-graph section is no
-longer blocked on one thing - it is blocked on three, in this order: **LLC/SMT discovery**
-(pure CPUID and `cpu-map`, no firmware table, unblocks work stealing and interference),
-**HMAT** (real latency and bandwidth, provable with `hmat=on`), and **device proximity**
-(partial by construction, because `_PXM` is AML - see the row). Almost everything in 7.1 is blocked on **E2**, which is a pure
+**Updated after distances, HMAT and CPU topology landed.** The resource graph's *discovery*
+is now largely done - localities, distances, magnitudes, and which CPUs share a core or a
+cache - so what remains in that section is no longer discovery but **consumers**: a steal that
+prefers its cache domain and counts the crossing, memory placed by purpose, `librheo::graph`
+read-only queries, `/sys/devices/system/{cpu,node}` synthesis. Two discovery rows are left and
+neither is on the critical path: **per-CPU feature divergence** (the prerequisite for the
+heterogeneous-FPU row, and unmodellable in QEMU beyond a synthetic asymmetry) and **device
+proximity** (partial by construction, because `_PXM` is AML - see the row). Almost everything
+in 7.1 is blocked on **E2**, which is a pure
 refactor with the existing suite as its regression gate. Those two are the whole critical
 path; the rest of this register hangs off them or off hardware.

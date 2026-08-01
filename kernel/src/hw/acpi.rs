@@ -447,8 +447,7 @@ fn parse_hmat(base: u64, inv: &mut super::Inventory) {
                             // consumer of `Cost` reads. Rounded up, so a sub-nanosecond
                             // latency reads as 1 rather than as "not reported".
                             0 => {
-                                inv.lat_ns[from][to] =
-                                    ((v + 999) / 1000).min(u32::MAX as u64) as u32
+                                inv.lat_ns[from][to] = v.div_ceil(1000).min(u32::MAX as u64) as u32
                             }
                             // Access bandwidth, already MB/s.
                             3 => inv.bw_mbs[from][to] = v.min(u32::MAX as u64) as u32,

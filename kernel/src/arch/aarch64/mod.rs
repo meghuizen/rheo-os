@@ -736,6 +736,35 @@ fn mpidr_aff0() -> u32 {
     (mpidr & 0xFF) as u32
 }
 
+/// How many low bits of an MPIDR affinity name the SMT thread, and how many name everything
+/// below the last-level cache (docs/RESOURCE-GRAPH.md 2.4a).
+///
+/// An MPIDR is a stack of 8-bit affinity fields, and `MPIDR_EL1.MT` (bit 24) says what the
+/// bottom one means: set, affinity 0 selects a thread within a core and affinity 1 the core;
+/// clear, affinity 0 *is* the core and affinity 1 the cluster. That single bit is the whole
+/// discovery, and it is a read-only id register available at EL1 - no firmware table, which
+/// matters here because a bare-ELF boot on QEMU's `virt` is handed no device tree at all
+/// (docs/SMP.md 7).
+///
+/// **The cluster is taken as the cache domain, and that is an inference.** ARM64 exposes no
+/// register saying who shares a cache - `CLIDR_EL1`/`CCSIDR_EL1` describe a cache's own
+/// geometry, not its sharers - so the affinity hierarchy is the only architectural evidence,
+/// and a cluster is the level that shares an L2/L3 in Arm's own topology and in a device
+/// tree's `cpu-map`. Reported as [`TopoSource::Architectural`] rather than `DeviceTree`
+/// precisely because it is derived from ids and not read from a sharing count.
+///
+/// [`TopoSource::Architectural`]: crate::hw::TopoSource::Architectural
+pub fn cpu_topology_bits() -> Option<(u8, u8)> {
+    let mpidr: u64;
+    // SAFETY: reads MPIDR_EL1, a read-only id register available at EL1.
+    unsafe { asm!("mrs {0}, mpidr_el1", out(reg) mpidr, options(nomem, nostack)) };
+    if mpidr & (1 << 24) != 0 {
+        Some((8, 16)) // affinity 0 = thread, 1 = core, 2 = cluster
+    } else {
+        Some((0, 8)) // affinity 0 = core, 1 = cluster
+    }
+}
+
 /// This CPU's registry index, resolved from its **own** MPIDR against the table
 /// each CPU filled in [`smp_set_this_cpu`].
 ///

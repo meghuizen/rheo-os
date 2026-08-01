@@ -67,12 +67,40 @@ pub struct MemRegion {
     pub node: u8,
 }
 
+/// The id a CPU carries when nothing discovered its topology.
+///
+/// A sentinel rather than `0`, because `0` is a perfectly good core id and a caller reading
+/// it would believe every CPU shared one core (docs/ENGINEERING.md 11: a field left constant
+/// is a field that lies). Every consumer must check [`TopoSource`] or this value.
+pub const TOPO_UNKNOWN: u16 = u16::MAX;
+
+/// Where a CPU's core and cache ids came from - so a caller can tell a discovered topology
+/// from an absent one, and no test can assert a grouping that was never read.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum TopoSource {
+    /// Nothing described the topology. Every `core_id`/`llc_id` is [`TOPO_UNKNOWN`].
+    None,
+    /// Decoded from the hardware id by an architectural rule: x86-64 CPUID leaves, ARM64
+    /// MPIDR affinity levels. No firmware table involved.
+    Architectural,
+    /// Read from the device tree's `cpu-map`.
+    DeviceTree,
+}
+
 #[derive(Copy, Clone)]
 pub struct CpuInfo {
     /// Hardware id (APIC id / MPIDR affinity / hart id).
     pub hw_id: u32,
     pub node: u8,
     pub online: bool,
+    /// The physical core this CPU is a thread of. Two CPUs with the same `core_id` are SMT
+    /// siblings: they share execution resources, so co-scheduling two compute-bound entities
+    /// on them is slower than spreading them. [`TOPO_UNKNOWN`] when undiscovered.
+    pub core_id: u16,
+    /// The last-level-cache domain this CPU belongs to. Two CPUs with the same `llc_id`
+    /// share a cache, which is what makes stealing work from one of them cheap.
+    /// [`TOPO_UNKNOWN`] when undiscovered.
+    pub llc_id: u16,
 }
 
 /// The engine class a PCIe device maps to (docs/ACCELERATORS.md 1).
@@ -177,6 +205,8 @@ pub struct Inventory {
     pub cpu: CpuReport,
     pub ncpus: usize,
     pub cpus: [CpuInfo; MAX_CPUS],
+    /// Where `cpus[..].core_id`/`llc_id` came from, or [`TopoSource::None`].
+    pub topo: TopoSource,
     pub nmem: usize,
     pub mem: [MemRegion; MAX_MEM_REGIONS],
     pub nnodes: usize,
@@ -214,7 +244,10 @@ impl Inventory {
                 hw_id: 0,
                 node: 0,
                 online: false,
+                core_id: TOPO_UNKNOWN,
+                llc_id: TOPO_UNKNOWN,
             }; MAX_CPUS],
+            topo: TopoSource::None,
             nmem: 0,
             mem: [MemRegion {
                 base: 0,
@@ -260,6 +293,8 @@ impl Inventory {
                 hw_id,
                 node,
                 online: false,
+                core_id: TOPO_UNKNOWN,
+                llc_id: TOPO_UNKNOWN,
             };
             self.ncpus += 1;
             if (node as usize) + 1 > self.nnodes {
@@ -367,6 +402,28 @@ pub fn detect() {
     // The boot CPU is online by definition.
     inv.cpus[0].online = true;
 
+    // CPU topology - which CPUs are threads of one core, which share a last-level cache
+    // (docs/RESOURCE-GRAPH.md 2.4a). Two sources, in this order:
+    //
+    // 1. A device tree's `cpu-map`, already read by `fdt::parse_cpu_map` if there was one.
+    //    It is preferred because it is a *statement* by firmware rather than a decoding of
+    //    ids.
+    // 2. Failing that, the architectural rule for taking the hardware id apart -
+    //    `arch::cpu_topology_bits`. x86-64 has CPUID for it and ARM64 has MPIDR's MT bit;
+    //    RISC-V has neither and says so, which is why this is the fallback and not the
+    //    only path.
+    //
+    // A machine that offers neither keeps `TOPO_UNKNOWN` and `TopoSource::None`. That is the
+    // whole reason for the sentinel: defaulting the ids to 0 would tell a scheduler that
+    // every CPU is a thread of one core, which is worse than telling it nothing.
+    if let (TopoSource::None, Some((smt_bits, llc_bits))) = (inv.topo, arch::cpu_topology_bits()) {
+        for c in inv.cpus[..inv.ncpus].iter_mut() {
+            c.core_id = (c.hw_id >> smt_bits) as u16;
+            c.llc_id = (c.hw_id >> llc_bits) as u16;
+        }
+        inv.topo = TopoSource::Architectural;
+    }
+
     // If firmware surfaced a persistent-memory region (a real QEMU nvdimm - the
     // NFIT SPA range on x86-64), bring up the separate pmem frame allocator over
     // it so a `MemKind::Pmem` grant is genuinely nvdimm-backed (docs/MEMORY.md
@@ -408,6 +465,17 @@ pub fn print_summary() {
     for (i, name) in names.iter().enumerate() {
         if inv.cpu.features & (1 << i) != 0 {
             crate::print!(" {name}");
+        }
+    }
+    crate::println!();
+    // CPU topology, printed as it was discovered - `?` for a CPU whose grouping nothing
+    // described, so a reader can tell "no topology" from "one core" at a glance.
+    crate::print!("hw: cpu topology ({:?}):", inv.topo);
+    for c in &inv.cpus[..inv.ncpus] {
+        if c.core_id == TOPO_UNKNOWN {
+            crate::print!(" id{}=?", c.hw_id);
+        } else {
+            crate::print!(" id{}=core{}/llc{}", c.hw_id, c.core_id, c.llc_id);
         }
     }
     crate::println!();

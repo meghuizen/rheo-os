@@ -182,6 +182,10 @@ pub fn parse(dtb: usize, inv: &mut Inventory) {
             _ => break,
         }
     }
+
+    // The CPU topology needs every `cpu` node's phandle before it can resolve one, so it is
+    // its own walk. See [`parse_cpu_map`].
+    parse_cpu_map(p, off_struct, off_strings, inv);
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -245,6 +249,165 @@ fn save_riscv_isa(p: *const u8, data: usize, len: usize) {
 /// The device tree, unlike ACPI, does not define a minimum distance; the local value is 10 by
 /// the same convention, so anything below it is not stored and "0 means unreported" stays
 /// unambiguous.
+/// Read `/cpus/cpu-map` and fill each CPU's core and cache-domain id
+/// (docs/RESOURCE-GRAPH.md 2.4a).
+///
+/// A second walk of the struct block rather than more state in [`parse`], for one reason: a
+/// `cpu-map` entry names a CPU by **phandle**, and a phandle is only resolvable once every
+/// `cpu` node has been seen. The device-tree specification does not order `cpu-map` after the
+/// `cpu` nodes, so depending on QEMU's ordering would be depending on a coincidence. This
+/// collects both tables and resolves at the end.
+///
+/// The map's shape is a nesting: `cluster` nodes contain `core` nodes, which either name a
+/// CPU directly (one thread) or contain `thread` nodes that each do. So:
+///
+/// - **cache domain** = the enclosing cluster. Counted rather than read from the node name,
+///   because the specification allows a `socket` level above cluster and two sockets may each
+///   have a `cluster0` - a name index would merge them.
+/// - **core** = the enclosing core node, counted the same way, so a core id is unique across
+///   the machine, which is what an SMT-sibling test needs.
+///
+/// Both shapes of core (with and without `thread` children) fall out of that without a special
+/// case: the id in force when a `cpu` property is met is the answer.
+///
+/// Fills nothing and reports nothing when there is no `cpu-map`, which is the honest result -
+/// the caller then leaves the topology unknown rather than defaulting it.
+fn parse_cpu_map(p: *const u8, off_struct: usize, off_strings: usize, inv: &mut Inventory) {
+    /// What the walk is inside, one entry per depth.
+    #[derive(Copy, Clone, PartialEq, Eq)]
+    enum In {
+        Other,
+        CpuNode,
+        CpuMap,
+    }
+
+    const MAX_DEPTH: usize = 24;
+    let mut stack = [In::Other; MAX_DEPTH];
+    let mut depth = 0usize;
+
+    // cpu nodes: phandle -> hardware id.
+    let mut ph = [0u32; crate::hw::MAX_CPUS];
+    let mut ph_hwid = [0u32; crate::hw::MAX_CPUS];
+    let mut nph = 0usize;
+    let mut cur_ph = 0u32;
+    let mut cur_hwid = 0u32;
+
+    // cpu-map: phandle -> (cache domain, core).
+    let mut m_ph = [0u32; crate::hw::MAX_CPUS];
+    let mut m_llc = [0u16; crate::hw::MAX_CPUS];
+    let mut m_core = [0u16; crate::hw::MAX_CPUS];
+    let mut nmap = 0usize;
+    let mut nclusters = 0u16;
+    let mut ncores = 0u16;
+
+    let mut pos = off_struct;
+    loop {
+        let token = be32(p, pos);
+        pos += 4;
+        match token {
+            FDT_BEGIN_NODE => {
+                let name = cstr(p, pos, 64);
+                pos += (name.len() + 1 + 3) & !3;
+                let inside_map = depth > 0 && depth <= MAX_DEPTH && {
+                    // Any depth at or below the `cpu-map` node counts as inside it.
+                    stack[..depth.min(MAX_DEPTH)].contains(&In::CpuMap)
+                };
+                let here = if name == "cpu-map" {
+                    In::CpuMap
+                } else if inside_map {
+                    if name.starts_with("cluster") {
+                        nclusters += 1;
+                    } else if name.starts_with("core") {
+                        ncores += 1;
+                    }
+                    In::CpuMap
+                } else if name_is(name, "cpu") {
+                    cur_ph = 0;
+                    cur_hwid = 0;
+                    In::CpuNode
+                } else {
+                    In::Other
+                };
+                if depth < MAX_DEPTH {
+                    stack[depth] = here;
+                }
+                depth += 1;
+            }
+            FDT_END_NODE => {
+                depth = depth.saturating_sub(1);
+                if depth < MAX_DEPTH
+                    && stack[depth] == In::CpuNode
+                    && cur_ph != 0
+                    && nph < crate::hw::MAX_CPUS
+                {
+                    ph[nph] = cur_ph;
+                    ph_hwid[nph] = cur_hwid;
+                    nph += 1;
+                }
+            }
+            FDT_PROP => {
+                let len = be32(p, pos) as usize;
+                let nameoff = be32(p, pos + 4) as usize;
+                let data = pos + 8;
+                let pname = cstr(p, off_strings + nameoff, 64);
+                pos += 8 + ((len + 3) & !3);
+                let d = depth.saturating_sub(1);
+                let here = if d < MAX_DEPTH { stack[d] } else { In::Other };
+                match here {
+                    In::CpuNode if len >= 4 => {
+                        if pname == "phandle" {
+                            cur_ph = be32(p, data);
+                        } else if pname == "reg" {
+                            cur_hwid = be32(p, data);
+                        }
+                    }
+                    In::CpuMap if pname == "cpu" && len >= 4 && nmap < crate::hw::MAX_CPUS => {
+                        m_ph[nmap] = be32(p, data);
+                        m_llc[nmap] = nclusters.saturating_sub(1);
+                        m_core[nmap] = ncores.saturating_sub(1);
+                        nmap += 1;
+                    }
+                    _ => {}
+                }
+            }
+            FDT_NOP => {}
+            FDT_END => break,
+            _ => break,
+        }
+    }
+
+    if nmap == 0 {
+        return;
+    }
+    // Resolve: phandle -> hardware id -> the inventory's CPU.
+    let mut filled = 0usize;
+    for i in 0..nmap {
+        let Some(j) = (0..nph).find(|&j| ph[j] == m_ph[i]) else {
+            continue;
+        };
+        let hwid = ph_hwid[j];
+        for c in inv.cpus[..inv.ncpus].iter_mut() {
+            if c.hw_id == hwid {
+                c.core_id = m_core[i];
+                c.llc_id = m_llc[i];
+                filled += 1;
+            }
+        }
+    }
+    // Only claim the device tree as the source if every CPU got an answer. A partly-filled
+    // topology is the `slit_truncated` situation again: a caller would read a real grouping
+    // for some CPUs and the unknown sentinel for others, and the arch fallback - which
+    // answers for all of them or none - is the better result.
+    if filled == inv.ncpus {
+        inv.topo = super::TopoSource::DeviceTree;
+    } else {
+        for c in inv.cpus[..inv.ncpus].iter_mut() {
+            c.core_id = super::TOPO_UNKNOWN;
+            c.llc_id = super::TOPO_UNKNOWN;
+        }
+    }
+}
+
 fn parse_distance_matrix(p: *const u8, data: usize, len: usize, inv: &mut Inventory) {
     let triples = len / 12;
     // First pass: does everything fit? Deciding after storing would leave a partial matrix.

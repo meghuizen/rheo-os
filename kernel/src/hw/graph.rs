@@ -112,6 +112,13 @@ pub enum NodeKind {
     /// A storage namespace or zone set, so host-managed placement (ZNS, docs/GREENFIELD.md
     /// 2.8) has something to name.
     Storage = 13,
+    /// A physical core, whose members are the SMT threads sharing it.
+    ///
+    /// Separate from [`NodeKind::Cpu`] because they answer different questions: a `Cpu` is
+    /// what the scheduler places on, and a `Core` is what two of them *contend for*. Two
+    /// compute-bound entities on two threads of one core are slower than the same two spread
+    /// across cores, and without this node that fact has nowhere to live.
+    Core = 14,
 }
 
 /// The ISA contract a node satisfies, so "can this binary run here at all" is answerable
@@ -657,6 +664,62 @@ impl Graph {
             let n = self.nodes.get(i)?;
             if n.kind != NodeKind::Free && n.node == node {
                 Some(NodeId(i as u16))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// The group a `Cpu` belongs to at `level` - its [`NodeKind::Core`] or its
+    /// [`NodeKind::Cache`] - or `None` when nothing published that level.
+    ///
+    /// The hierarchy is expressed by **nesting one `set` field**: a `Cpu`'s set is its `Core`,
+    /// and a `Core`'s set is its `Cache`. One field is enough because that is the shape of the
+    /// hardware, and giving a node a second membership field would let two of them disagree.
+    pub fn group_of(&self, cpu: NodeId, level: NodeKind) -> Option<NodeId> {
+        let core_id = self.get(cpu)?.set;
+        let core = self.get(core_id)?;
+        if core.kind != NodeKind::Core {
+            return None;
+        }
+        match level {
+            NodeKind::Core => Some(core_id),
+            NodeKind::Cache => {
+                let cache_id = core.set;
+                if self.get(cache_id)?.kind == NodeKind::Cache {
+                    Some(cache_id)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Every `Cpu` that shares `level` with `cpu`, **including `cpu` itself**.
+    ///
+    /// This is the query a scheduler asks twice for two different reasons, which is why one
+    /// function takes the level rather than two functions hard-coding it:
+    ///
+    /// - `NodeKind::Cache` - "whose run queue is cheap for me to steal from", because a task
+    ///   whose data is in a cache we share does not have to be fetched again.
+    /// - `NodeKind::Core` - "who am I contending with", because two threads of one core share
+    ///   execution resources, so spreading two compute-bound entities beats packing them.
+    ///
+    /// Empty when the topology was never discovered, which is the point of it being empty
+    /// rather than "everyone": a caller gets no siblings and falls back to whatever it does
+    /// without the information, instead of treating the whole machine as one cache domain.
+    pub fn siblings(&self, cpu: NodeId, level: NodeKind) -> impl Iterator<Item = NodeId> + '_ {
+        let group = self.group_of(cpu, level);
+        (0..self.nodes.capacity()).filter_map(move |i| {
+            let want = group?;
+            let n = self.nodes.get(i)?;
+            if n.kind != NodeKind::Cpu {
+                return None;
+            }
+            let id = NodeId(i as u16);
+            if self.group_of(id, level) == Some(want) {
+                Some(id)
             } else {
                 None
             }

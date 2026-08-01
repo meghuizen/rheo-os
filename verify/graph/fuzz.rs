@@ -565,6 +565,76 @@ fn degraded_is_usable() -> Result<(), String> {
     Ok(())
 }
 
+/// The CPU-topology nesting must behave like a **partition**, whatever the hardware turned
+/// out to look like.
+///
+/// One `set` field carries two levels by nesting - a `Cpu`'s set is its `Core`, a `Core`'s set
+/// is its `Cache` - and three properties follow from that being a partition rather than an
+/// arbitrary relation. They are checked here rather than in a boot test because they are true
+/// of any topology, so a host check covers shapes QEMU cannot be asked for (an odd number of
+/// threads, two cache domains, a core in no cache).
+///
+/// 1. **Reflexive** - a CPU is its own sibling. A scheduler iterating siblings to spread work
+///    must find itself in the set, or it moves work it is already running.
+/// 2. **Symmetric** - if A is B's sibling then B is A's. An asymmetric answer would make
+///    "steal from a sibling" depend on which side asked.
+/// 3. **Nested** - core siblings are a subset of cache siblings. Two threads of one core
+///    share that core's cache by construction, and a query that said otherwise would have
+///    the two levels disagreeing.
+///
+/// Built here as two cores of two threads under one cache, plus a lone CPU in **no** core,
+/// which is the shape a machine with no discovered topology produces - it must answer *empty*
+/// rather than joining everybody.
+fn topology_is_a_partition() -> Result<(), String> {
+    let mut g = fresh();
+    let cache = g.add_node(NodeKind::Cache, 0).ok_or("cache")?;
+    let mut cpus = Vec::new();
+    for core_id in 0..2u64 {
+        let core = g.add_node(NodeKind::Core, core_id).ok_or("core")?;
+        g.set_member(core, cache);
+        for t in 0..2u64 {
+            let cpu = g.add_node(NodeKind::Cpu, core_id * 2 + t).ok_or("cpu")?;
+            g.set_member(cpu, core);
+            cpus.push(cpu);
+        }
+    }
+    let orphan = g.add_node(NodeKind::Cpu, 99).ok_or("orphan")?;
+
+    for &a in &cpus {
+        let core_sibs: Vec<_> = g.siblings(a, NodeKind::Core).collect();
+        let cache_sibs: Vec<_> = g.siblings(a, NodeKind::Cache).collect();
+        if !core_sibs.contains(&a) || !cache_sibs.contains(&a) {
+            return Err("a CPU is not its own sibling".into());
+        }
+        if core_sibs.len() != 2 || cache_sibs.len() != 4 {
+            return Err(format!(
+                "cpu {:?}: {} core siblings and {} cache siblings, want 2 and 4",
+                a.0,
+                core_sibs.len(),
+                cache_sibs.len()
+            ));
+        }
+        for &b in &core_sibs {
+            if !g.siblings(b, NodeKind::Core).any(|s| s == a) {
+                return Err("sibling-at-core is not symmetric".into());
+            }
+            if !cache_sibs.contains(&b) {
+                return Err("a core sibling is not a cache sibling - the levels disagree".into());
+            }
+        }
+        // The orphan shares nothing with anyone, and nobody shares anything with it.
+        if core_sibs.contains(&orphan) || cache_sibs.contains(&orphan) {
+            return Err("a CPU in no core turned up as a sibling".into());
+        }
+    }
+    if g.siblings(orphan, NodeKind::Cache).count() != 0 {
+        return Err("a CPU with no discovered topology has siblings - an undiscovered \
+                    topology must answer empty, not 'the whole machine'"
+            .into());
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------- randomised model
 
 /// Build a random graph and check the invariants that must hold of any of them.
@@ -701,6 +771,7 @@ fn main() {
         ("cost is direct or nothing, never a path", cost_is_not_transitive()),
         ("an edge written twice replaces", edges_replace()),
         ("a degraded graph is usable and honest", degraded_is_usable()),
+        ("the CPU topology nesting is a partition", topology_is_a_partition()),
     ] {
         match r {
             Ok(()) => println!("  ok   {name}"),

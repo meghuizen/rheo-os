@@ -91,6 +91,53 @@ pub fn build(inv: &super::Inventory) {
         );
     }
 
+    // The CPU topology, as nested nodes: a `Cache` holds `Core`s, and a `Core` holds the
+    // `Cpu`s that are its threads (docs/RESOURCE-GRAPH.md 2.4a). Two questions become
+    // membership tests on real nodes instead of arithmetic on ids - "whose queue is cheap to
+    // steal from" and "who am I contending with".
+    //
+    // **Nothing is built when nothing was discovered.** A machine whose topology is
+    // `TopoSource::None` gets no `Cache` and no `Core` node, so `graph::siblings` answers
+    // empty and a scheduler falls back to whatever it does without the information. Inventing
+    // one cache domain covering every CPU would be the more convenient lie: it looks like a
+    // small machine and is indistinguishable from a discovered answer.
+    if inv.topo != super::TopoSource::None {
+        for c in &inv.cpus[..inv.ncpus] {
+            if c.core_id == super::TOPO_UNKNOWN || c.llc_id == super::TOPO_UNKNOWN {
+                continue;
+            }
+            let Some(cpu) = g.find(NodeKind::Cpu, c.hw_id as u64) else {
+                continue;
+            };
+            // One node per distinct id, created on first sight. `find` is the lookup *and* the
+            // "does it exist yet" test, so there is no second table to keep in step with the
+            // graph.
+            let cache = match g.find(NodeKind::Cache, c.llc_id as u64) {
+                Some(id) => id,
+                None => match g.add_node(NodeKind::Cache, c.llc_id as u64) {
+                    Some(id) => id,
+                    None => continue,
+                },
+            };
+            let core = match g.find(NodeKind::Core, c.core_id as u64) {
+                Some(id) => id,
+                None => match g.add_node(NodeKind::Core, c.core_id as u64) {
+                    Some(id) => id,
+                    None => continue,
+                },
+            };
+            g.set_member(core, cache);
+            g.set_member(cpu, core);
+            // A core and its cache sit in the CPU's memory locality too, so a query that
+            // starts from a locality reaches them.
+            let n = c.node as usize;
+            if n < super::MAX_DIST_NODES && mem_node[n] != NodeId::NONE {
+                g.set_locality(core, mem_node[n]);
+                g.set_locality(cache, mem_node[n]);
+            }
+        }
+    }
+
     // The SLIT matrix, as edges. `hops` carries the ACPI distance directly: it is a
     // *relative* number in ACPI's units, which is exactly what `hops` is for - the component
     // every firmware source can supply. Latency and bandwidth stay unknown because SLIT does

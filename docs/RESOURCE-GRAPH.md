@@ -120,7 +120,7 @@ means no lock on the read path.
 | Node-to-node distance | ACPI **SLIT** | - | DT `numa-distance-map-v1` |
 | Initiator/target bandwidth + latency | ACPI **HMAT** | - | - |
 | Device proximity | ACPI `_PXM` | - | DT `numa-node-id` on the node |
-| LLC domains, SMT sets | CPUID leaf 4 / 0x1F | `MPIDR` affinity levels + DT `cpu-map` | DT `cpu-map` |
+| LLC domains, SMT sets | CPUID leaf `0x0B` + leaf 4 (**have**) | `MPIDR` affinity + MT bit (**have**) | DT `cpu-map` (**have**) |
 | Core class (P/E/LP) | CPUID leaf 0x1A | DT `capacity-dmips-mhz` | DT `capacity-dmips-mhz` |
 | PCIe topology | ECAM walk (**have**) | ECAM walk (**have**) | ECAM walk (**have**) |
 
@@ -131,6 +131,91 @@ reason. So the graph must be **useful when degraded**: with one node and no dist
 answers "everything is equally near", which is exactly correct for that machine, and
 `graph_source()` reports what it was built from so no proof can claim distances it does not
 have.
+
+### 2.4a CPU topology: which CPUs share a core, which share a cache
+
+Two questions the scheduler asks for two different reasons, and until this landed the answer
+was nothing at all - `CpuInfo` carried a hardware id and a memory node, so every CPU looked
+equidistant from every other:
+
+- **"Whose run queue is cheap for me to steal from?"** A task whose working set is in a cache
+  we share does not have to be fetched again. This is the input section 6.4b's steal order
+  needs.
+- **"Who am I contending with?"** Two threads of one core share execution resources, so
+  spreading two compute-bound entities across cores beats packing them onto one.
+
+`CpuInfo` gains `core_id` and `llc_id`, and the inventory gains a `TopoSource` saying where
+they came from. **Both ids default to a sentinel, not to 0**: an undiscovered topology reading
+`core_id = 0` everywhere would tell a scheduler that every CPU is a thread of one core, which
+is worse than telling it nothing (docs/ENGINEERING.md 11).
+
+**Two sources, in a fixed order.** A device tree's `cpu-map` first, because it is a
+*statement* by firmware rather than a decoding of ids; failing that, the architectural rule
+for taking a hardware id apart. Each ISA lands somewhere different, and the differences are
+the interesting part:
+
+- **x86-64** - CPUID leaf `0x0B` describes the hierarchy as shift widths: the SMT level's
+  shift leaves the core id, the Core level's leaves the package id. Leaf 4 refines the cache
+  boundary where it exists, which matters on parts whose last-level cache is *narrower* than a
+  package (an AMD core complex, sub-NUMA clustering). Where leaf 4 says nothing the package is
+  the fallback, and that direction is the safe one: it can merge two cache domains into one,
+  costing a heuristic some locality, where splitting one would claim two CPUs do not share a
+  cache when they do.
+- **ARM64** - `MPIDR_EL1` is a stack of 8-bit affinity fields and its `MT` bit (24) says what
+  the bottom one means: set, affinity 0 is a thread and affinity 1 the core; clear, affinity 0
+  *is* the core. A read-only id register at EL1, which is what makes it usable here at all -
+  this is the ISA that gets handed no device tree. The **cluster is taken as the cache domain
+  and that is an inference**: ARM64 exposes no register saying who shares a cache
+  (`CLIDR_EL1`/`CCSIDR_EL1` describe a cache's geometry, not its sharers), so the affinity
+  hierarchy is the only architectural evidence, and a cluster is the level that shares an
+  L2/L3 in Arm's own topology. Labelled `Architectural`, never `DeviceTree`, for exactly that
+  reason.
+- **RISC-V** - a hart id is opaque: the privileged spec says nothing about it naming a thread,
+  a core or a cluster, and there is no sharing register. So `cpu_topology_bits` returns `None`
+  there, written out rather than omitted because the absence *is* the finding - a caller that
+  assumed a decomposition would group four independent harts into one core. The device tree's
+  `cpu-map` is the whole source, read in its own walk because an entry names a CPU by
+  **phandle** and a phandle is only resolvable once every `cpu` node has been seen (the
+  specification does not order `cpu-map` after them, so depending on QEMU's ordering would be
+  depending on a coincidence).
+
+**In the graph it is nesting, not a second field.** A `Cache` node holds `Core` nodes, which
+hold the `Cpu` nodes that are their threads, all through the one `set` field a node already
+had - one field because that is the shape of the hardware, and a second membership field would
+let two of them disagree. `graph::siblings(cpu, level)` is the query a consumer uses, and it
+takes the level rather than existing twice: `Cache` answers the steal question, `Core` the
+contention one. An undiscovered topology builds **no** `Cache` and no `Core` node, so
+`siblings` answers empty and a scheduler falls back to whatever it does without the
+information. Inventing one cache domain over every CPU would be the convenient lie: it looks
+like a small machine and is indistinguishable from a discovered answer.
+
+**The proof, and what it can and cannot reach.** `hwinfo` runs with
+`-smp 4,sockets=1,cores=2,threads=2` - four CPUs, two SMT pairs, one cache domain - and those
+numbers are the oracle. The base launch is a flat `-smp 4`, in which a correct discovery and a
+broken one both say "four cores", so it could prove nothing. The cache claim is asserted on
+all three ISAs; the SMT claim only on x86-64, because **QEMU cannot express threads to a guest
+on the other two**, read out of its source rather than inferred from this kernel's output:
+`arm_build_mp_affinity(idx, clustersz)` is `(idx / clustersz) << 8 | (idx % clustersz)`, purely
+index-based with no MT bit and no thread field, and `hw/riscv/virt.c` emits
+`cpu-map/cluster<socket>/core<hart>` with no `thread` nodes at all. Asserting two cores
+everywhere would fail on two ISAs for a reason that has nothing to do with the code under
+test, so those two assert what their platform genuinely describes - four independent cores -
+and say why.
+
+Five controls observed firing: the x86 package fallback removed (2 cache domains where the
+launch declares 1 - this was a **real defect found this way**, since QEMU's TCG `-cpu max`
+returns all zeros for every leaf-4 subleaf, measured with a debug print, and a first version
+using leaf 4 alone reported a wrong grouping while labelling it `Architectural`); the
+`cpu-map` walk removed (riscv64 reports no topology); the MPIDR rule removed (ARM64 reports
+no topology); the CPU-to-core membership skipped (a CPU shares its cache with 0 CPUs); and, on
+the host, the two graph levels collapsed into one (4 core siblings where there are 2). The
+host driver also checks the three properties that make the nesting a **partition** -
+reflexive, symmetric, and core-siblings a subset of cache-siblings - on shapes QEMU cannot be
+asked for.
+
+Still absent, and named rather than approximated: **core classes** (P/E/LP) and **per-CPU
+feature divergence**, which are the other two rows of the table above and the prerequisite for
+section 6.4d.
 
 ### 2.5 Capability sets, and why heterogeneity makes them first-class
 
