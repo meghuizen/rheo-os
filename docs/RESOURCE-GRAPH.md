@@ -498,6 +498,81 @@ already recorded: when locality and work conservation conflict, **work conservat
 the crossing is counted** (section 6.2's edge-case table). A thief that idles rather than
 cross a socket is a worse failure than one that crosses and says so.
 
+### 6.4d A CPU with no FPU: place it, or trap and move it
+
+A machine whose cores do not all have the same floating-point hardware is ordinary - RISC-V
+cores built without `F`/`D`, ARM cores without a vector width their siblings have, an
+asymmetric part whose efficiency cores are narrower. The graph already carries
+`CapClass::FloatSimd` with `Reach::Inline`, so the question is what the scheduler and the trap
+path do with it. **Two mechanisms, and they are complements rather than alternatives.**
+
+**1. Place it - the cheap path, and it is already expressible.** Hard-float work names
+`FloatSimd` (and, for a specific width, the `detail` bits) in its `Request`, and Phase 1
+filters out any CPU that does not offer it *before* Phase 2 ranks the rest. Nothing new is
+needed: this is the ISA filter of section 3 applied to a capability instead of a baseline. It
+is also the right default, because it costs nothing at run time.
+
+**2. Trap and move it - for the work that was placed before anyone knew.** A cell does not
+declare its FP use, and a JIT decides at run time, so placement cannot always be right. On a
+core without FP the first FP instruction traps: RISC-V with `sstatus.FS == Off` takes an
+illegal instruction, ARM64 with `CPACR_EL1.FPEN` traps to EL1, x86-64 raises `#UD` or `#NM`.
+Today `on_user_trap` maps all of those to `FaultCause::Illegal` and they become a SIGILL for a
+Linux cell or a terminal fault for a native one.
+
+The new path asks the graph first, and it composes with a shape this kernel already has -
+**the resumable fault**. Demand paging returns the frame unchanged so the faulting instruction
+re-executes (`linux::fill_fault`); an FP trap does the same thing after moving the entity:
+
+```
+   FP trap on a core with no FPU
+      |
+      +-- graph: does another CPU offer FloatSimd?
+      |     |
+      |     +-- yes -> re-place the entity there, return the frame UNCHANGED.
+      |     |          The instruction re-executes, natively, on a core that can run it.
+      |     |
+      |     +-- no  -> emulate the instruction in software, IEEE-exact, and REPORT it
+      |                (a program silently running 100x slower looks like broken hardware)
+      |
+      +-- neither possible -> SIGILL / terminal, exactly as today
+```
+
+Three outcomes, in the vocabulary docs/CPU-FEATURES.md 2.1 already uses - `Native` by
+migration, `Emulated` in software, `Unavailable` - and never a fourth.
+
+**Why migrating on the *first* FP instruction is unusually cheap**, and this is the property
+that makes the mechanism attractive rather than merely possible: there is **no FP state to
+move**. The trap happened on the first FP instruction the entity ever executed, so its FP
+register file is the ABI-default image `fp_area_init` wrote and nothing is lost by discarding
+it. The migration is therefore the address-space-free case - the frame and the ownership
+claim change, and the vector file does not, which is exactly what
+`user::switch_native_vcore` already does within a cell. A migration triggered *later* (by
+preemption, say) does have to carry the saved area, which is the "placement follows the wake"
+case of 6.4a.
+
+**The emulation branch inherits the FMA trap, and must not be allowed to hide it.** A software
+emulation of `fmadd` that computes `a*b` then `+c` rounds twice where the hardware rounds once
+(docs/CPU-FEATURES.md 2.2). So the emulation is `Native`-equivalent only if it is IEEE-exact -
+single-rounded, correct in the subnormal and NaN cases - and if it is not, it is `Numeric` and
+must be **refused** under a bit-exact contract rather than substituted. A tile kernel would
+rather fail than return a slightly different answer; that is the whole reason its proofs are
+equalities.
+
+**Prerequisites, both already in the register.** This needs per-CPU feature discovery to know
+*which* cores differ (§7.2 - the machine-wide claim in `graph_build` is the placeholder, and it
+says so at the site), and it needs **E4**, per-entity resources, to migrate an entity at all
+(§7.1). Neither is a reason to defer the design: the trap sites exist, the graph query exists,
+and the resumable-fault shape exists.
+
+**And it is gateable here, with a synthetic asymmetry that is honest about being synthetic.**
+QEMU's `virt` gives homogeneous cores, so the hardware case cannot be reproduced - but the
+*mechanism* can, because FP is enabled per core in software: leave `sstatus.FS` off on one
+secondary, run hard-float work there, and assert it traps, migrates, completes natively, and
+that the graph was consulted. That is the same construction `netwait` uses when it raises the
+interrupt-controller line directly because QEMU's UART loopback does not - the device asymmetry
+is synthetic and the kernel path exercised is the real one. What it would **not** prove is that
+real heterogeneous silicon reports what this expects, which stays a lab claim.
+
 ### 6.4c What makes it a backbone rather than another table
 
 The graph is the fifth thing in this design that everything else composes onto, beside the

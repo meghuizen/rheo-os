@@ -66,8 +66,19 @@ pub fn build(inv: &super::Inventory) {
         if n < super::MAX_DIST_NODES && mem_node[n] != NodeId::NONE {
             g.set_locality(id, mem_node[n]);
         }
-        // Every CPU offers floating point and vector arithmetic **inline** - no queue, no
-        // DMA, no edge. This is the entry that explains why `Reach::Inline` exists at all.
+        // Floating point and vector arithmetic, **inline** - no queue, no DMA, no edge. This
+        // is the entry that explains why `Reach::Inline` exists at all.
+        //
+        // **This is a machine-wide claim asserted per CPU, and that is a real limitation
+        // rather than a simplification.** `Inventory` discovers features for the *machine*
+        // (`inv.cpu`), not per CPU, so on a hybrid part - or any machine where some cores
+        // lack an FPU or a vector width the others have - this would claim a capability a
+        // core does not have. That is the shape docs/ENGINEERING.md 11 names: a field left
+        // constant is a field that lies. It is true of every machine this kernel runs on
+        // today (all three ISAs' QEMU profiles are homogeneous and all have FP), which is
+        // why it is written rather than omitted - but per-CPU feature discovery is the
+        // prerequisite for the heterogeneous-FPU handling in
+        // docs/RESOURCE-GRAPH.md 6.4d, and it arrives here.
         g.add_capability(
             id,
             Capability {
