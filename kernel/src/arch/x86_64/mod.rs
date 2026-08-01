@@ -10,9 +10,9 @@ mod paging;
 use paging::apic_map_window;
 pub use paging::{
     PagingRoot, mmio_map_window, paging_activate, paging_activate_kernel, paging_cow_at,
-    paging_cow_clear, paging_cow_protect_user, paging_for_each_user_leaf, paging_kernel_init,
-    paging_map, paging_map_frame, paging_mapped, paging_new_root, paging_protect,
-    paging_unmap_frame, paging_unmapped_span, pmem_map_window,
+    paging_cow_clear, paging_cow_protect_user, paging_flush_asid, paging_for_each_user_leaf,
+    paging_kernel_init, paging_map, paging_map_frame, paging_mapped, paging_new_root,
+    paging_protect, paging_tlb_tagged, paging_unmap_frame, paging_unmapped_span, pmem_map_window,
 };
 
 /// `uname` machine string for the Linux personality (docs/LINUX-COMPAT.md L2).
@@ -621,7 +621,14 @@ static TIMER_FIRES: AtomicU64 = AtomicU64::new(0);
 /// a user page needs no window. Deliberately empty rather than absent: the portable
 /// caller (`smp::secondary_run`) must not have to know which ISAs need it
 /// (docs/SMP.md 10.0).
-pub fn user_mode_init_this_cpu() {}
+pub fn user_mode_init_this_cpu() {
+    // `CR4.PCIDE` is per core (docs/SUBSTRATE.md pillar 2). The AP trampoline adopts the
+    // primary's CR4 verbatim, so this is normally already on - but adopting a register is
+    // not the same as having set it, and a secondary that ran without it would read the
+    // PCID bits of CR3 as part of the root address. Idempotent: it re-reads CR4 and only
+    // records a latch it observed.
+    paging::pcid_init();
+}
 
 pub fn enable_timer_irq() {
     lapic_probe();
@@ -2339,4 +2346,23 @@ pub fn exit(code: super::ExitCode) -> ! {
 /// has already expressed it. Exists so the driver has one shape to call.
 pub fn msi_route(_device_id: u32, _slot: usize, _dest_hw_id: u32) -> bool {
     true
+}
+
+// ------------------------------------------------- TLB maintenance accounting
+//
+// Counted so a test can assert that a cross-address-space switch performs **none**
+// (docs/SUBSTRATE.md pillar 2). Before the ASID/PCID tag was made load-bearing, every
+// switch invalidated the tag it was switching to, so the tag bought nothing; a count of
+// zero across N switches is what says that is no longer true. Relaxed: it is a witness,
+// not a synchronisation point.
+static TLB_FLUSHES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Record one address-space-scoped TLB invalidation.
+pub(super) fn count_tlb_flush() {
+    TLB_FLUSHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many address-space-scoped TLB invalidations this boot has performed.
+pub fn tlb_flushes() -> u64 {
+    TLB_FLUSHES.load(core::sync::atomic::Ordering::Acquire)
 }

@@ -2291,6 +2291,28 @@ stealing deques, and a cell that **asks for** its own vcores (the launcher insta
 same launcher-mints-authority shape as the queue pair and the W^X exception; a cell-facing
 `spawn_vcore` is a separate design question).
 
+**And an address-space switch no longer flushes the TLB** (docs/SUBSTRATE.md pillar 2 /
+S2): ARM64 and RISC-V already *tagged* entries with an ASID and then invalidated that very
+tag on every `paging_activate`, so the tag bought nothing; x86-64 reloaded CR3 and flushed
+every non-global entry. A switch between two address spaces now performs **no** TLB
+maintenance at all - the tag is what keeps one cell's translations from answering for
+another - and the flush moves to the two places that genuinely need it: a tag handed to a
+**new** root (`AddressSpace::new`, once per root) and a batch of **mutations** to an
+existing one (`AddressSpace::dirty`, checked in `activate`). On x86-64 that means
+`CR4.PCIDE` plus a CR3 whose bit 63 says "keep this PCID's entries", enabled **per core**
+(CR4 is per-core hardware) and only where CPUID reports PCID **and** `INVPCID` - both,
+because with PCIDE on a plain CR3 load no longer flushes the tag, so without `INVPCID`
+nothing could; the latch is read back and `paging_tlb_tagged()` reports what was observed,
+so a CPU without it keeps the untagged path and says so (QEMU 8.2's default model here
+reports no usable tag, and x86-64 prints that rather than claiming one). **The mutation
+half was found by the suite, not by reasoning**: removing the per-switch flush made
+`librheotilebattle` run the same tile program twice and get **different** results, because
+a cell's heap growth mapped frames the TLB still had stale entries for - the hazard
+docs/SMP.md 10.2 names as "`AddressSpace` mutation races a concurrent fault", which the
+per-switch flush had been covering by accident. `librheoipc` asserts the exact claim -
+**flushes < switches**, which were *equal by construction* before - observing 25 switches
+at 4 flushes, all four from real mutations; restoring the per-switch flush makes it fail.
+
 **Honest scope:** preemption is *within* a core's own claim and rebalancing moves only
 **unstarted** cells. Migrating a *running* one was **attempted twice and reverted twice**, with four findings
 recorded in docs/SMP.md 10.0. The second attempt followed the first's own advice -

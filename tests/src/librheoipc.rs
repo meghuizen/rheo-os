@@ -151,6 +151,7 @@ extern "C" fn kernel_main() -> ! {
     );
 
     // SAFETY: single-threaded init; the statics outlive the run.
+    let mut flushes_before = 0u64;
     let outcome = unsafe {
         let objects = &mut *addr_of_mut!(OBJECTS);
         let caps0 = &mut *addr_of_mut!(CAPS0);
@@ -185,6 +186,10 @@ extern "C" fn kernel_main() -> ! {
         user::set_channel_info(0, load::USER_CHANNEL_VA as u64, chan0_cap, 1);
         user::set_channel_info(1, load::USER_CHANNEL_VA as u64, chan1_cap, 0);
 
+        // The TLB-flush witness, sampled with both roots built and just before the run.
+        // Every switch inside `run` is a switch between two **live** address spaces, and
+        // the ASID/PCID tag is what makes those free (docs/SUBSTRATE.md pillar 2).
+        flushes_before = arch::tlb_flushes();
         user::run(0).1
     };
 
@@ -193,6 +198,44 @@ extern "C" fn kernel_main() -> ! {
     // Each cell ran FP_ROUNDS (4) yields with live vector state, so at least
     // 2 * 4 switches carried an FP swap, plus the initial load per `run`.
     let swaps = user::fp_swaps();
+
+    // **A switch between two live address spaces performs no TLB maintenance.**
+    //
+    // Both cells here are loaded ELFs at the *same* link addresses backed by *different*
+    // frames, so this is the shape where a stale translation would be observable at all -
+    // and the whole run above depends on each cell reading its own bytes, which it did.
+    // What is asserted here is the other half: that correctness came from the ASID/PCID
+    // tag rather than from invalidating it on every switch. This used to `tlbi
+    // aside1is` / `sfence.vma` the tag on every `paging_activate`, which made the tag buy
+    // nothing; the flush now happens once per *root*, in `AddressSpace::new`.
+    let flushes = arch::tlb_flushes() - flushes_before;
+    if arch::paging_tlb_tagged() {
+        // **Flushes no longer track switches.** That is the exact claim, and it is exact
+        // because the old code made them equal by construction: `paging_activate` flushed
+        // the tag it was switching to, every time. Asserting *zero* would be wrong - these
+        // cells grow their heaps over `SYS_MMAP`, and a **mutation** of an address space
+        // genuinely does need its tag invalidated (that is what `AddressSpace::dirty` is
+        // for, and what `librheotilebattle` caught when it was missing). What the tag buys
+        // is that a switch between two *unmutated* roots costs nothing, so the count falls
+        // to the number of mutation batches rather than the number of switches.
+        assert!(
+            flushes < swaps,
+            "{flushes} TLB flush(es) across {swaps} cross-cell switches - with the tag \
+             unused these are equal by construction, so the tag is not being relied on"
+        );
+        println!(
+            "librheoipc: address-space switches are TAG-ONLY - {swaps} cross-cell switches \
+             cost {flushes} TLB flush(es) (equal, before the tag was made load-bearing); \
+             what remains is one per batch of *mutations*, which a tag cannot cover \
+             (docs/SUBSTRATE.md pillar 2) OK"
+        );
+    } else {
+        println!(
+            "librheoipc: this CPU reports no usable address-space tag (no PCID+INVPCID), \
+             so every switch still reloads CR3 and flushes non-global entries - correct, \
+             and reported rather than claimed ({flushes} flush(es))"
+        );
+    }
 
     match outcome {
         Outcome::Exited(code) => {

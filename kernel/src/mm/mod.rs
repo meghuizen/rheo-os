@@ -69,16 +69,54 @@ pub fn fork_frames() -> u64 {
 pub struct AddressSpace {
     root: arch::PagingRoot,
     asid: u16,
+    /// Whether this address space's page tables have been **mutated** since its TLB
+    /// entries were last invalidated (docs/SUBSTRATE.md pillar 2, docs/SMP.md 10.2).
+    ///
+    /// An address-space tag makes a *switch* free, because entries belonging to another
+    /// tag cannot answer for this one. It does nothing for a *mutation*: a page mapped,
+    /// unmapped, protected or COW-privatised while this tag's stale entry is still
+    /// cached is exactly a wrong translation, under its own tag.
+    ///
+    /// That distinction was invisible while `paging_activate` flushed the tag on every
+    /// switch - a mutation was always followed by a re-activation, so the flush landed by
+    /// accident. Removing the per-switch flush exposed it immediately: `librheotilebattle`
+    /// ran the same tile program twice and got **different** results, because the cell's
+    /// heap growth mapped new frames the TLB still had stale entries for
+    /// (docs/ENGINEERING.md 11 - a defect the suite found, not reasoning).
+    ///
+    /// So mutation sets this, and [`activate`](Self::activate) invalidates once when it is
+    /// set. A pure switch between two unmutated address spaces still costs nothing.
+    /// `Cell`, because `activate` takes `&self`.
+    dirty: core::cell::Cell<bool>,
 }
 
 impl AddressSpace {
     /// Create a fresh address space: the shared kernel mappings, no user
     /// pages yet. `asid` tags TLB entries so switches need no flush.
     pub fn new(asid: u16) -> AddressSpace {
+        // **Flush this ASID here, not at every switch** (docs/SUBSTRATE.md pillar 2).
+        //
+        // An ASID tag exists so the TLB can hold two address spaces' translations at
+        // once and tell them apart, which makes a switch between *different* ASIDs need
+        // no maintenance at all. The one case that does need it is this one: an ASID
+        // being given to a **new** address space, where entries left by the previous
+        // occupant of that tag would now answer for the wrong root. Callers pick their
+        // own ASIDs and reuse them across runs, so that case is real - and paying for it
+        // once per root instead of once per switch is the whole of the change.
+        arch::paging_flush_asid(asid);
         AddressSpace {
             root: arch::paging_new_root(),
             asid,
+            // Just flushed above, and nothing is mapped yet.
+            dirty: core::cell::Cell::new(false),
         }
+    }
+
+    /// Note that this address space's page tables changed, so the next
+    /// [`activate`](Self::activate) must invalidate its tag before the cell runs again.
+    #[inline]
+    fn touched(&self) {
+        self.dirty.set(true);
     }
 
     /// Map one 4 KiB frame at `va` for user access. Mappings are identity
@@ -87,6 +125,7 @@ impl AddressSpace {
     /// MMU-enforced. `va` must be 4 KiB aligned.
     pub fn map_user(&mut self, va: usize, perm: MapPerm) {
         arch::paging_map(&mut self.root, va, perm);
+        self.touched();
     }
 
     /// Map one 4 KiB frame `pa` at an arbitrary user `va` (docs/USERLAND.md).
@@ -96,6 +135,7 @@ impl AddressSpace {
     /// aligned.
     pub fn map_user_frame(&mut self, va: usize, pa: usize, perm: MapPerm) {
         arch::paging_map_frame(&mut self.root, va, pa, perm);
+        self.touched();
     }
 
     /// Map every 4 KiB page overlapping [start, start+len) for user access.
@@ -114,6 +154,7 @@ impl AddressSpace {
     /// mapped (docs/LINUX-COMPAT.md L2). The TLB is flushed by the next
     /// `activate()`.
     pub fn unmap(&mut self, va: usize) -> Option<usize> {
+        self.touched();
         arch::paging_unmap_frame(&mut self.root, va)
     }
 
@@ -149,10 +190,16 @@ impl AddressSpace {
     /// `activate()`.
     pub fn protect(&mut self, va: usize, perm: MapPerm) {
         arch::paging_protect(&mut self.root, va, perm);
+        self.touched();
     }
 
     /// Make this address space current (ASID-tagged, no full TLB flush).
     pub fn activate(&self) {
+        // Invalidate only if this address space's own mappings changed since last time.
+        // The tag handles the switch; this handles the mutation (see `dirty`).
+        if self.dirty.replace(false) {
+            arch::paging_flush_asid(self.asid);
+        }
         arch::paging_activate(&self.root, self.asid);
     }
 
@@ -237,6 +284,9 @@ impl AddressSpace {
         // simply makes it writable again. Uniform beats a special case here.
         arch::paging_cow_protect_user(&mut self.root);
         arch::paging_cow_protect_user(&mut child.root);
+        // Both sides' mappings changed: the parent's became read-only, the child's appeared.
+        self.touched();
+        child.touched();
         // SAFETY: single CPU, synchronous trap.
         unsafe {
             let p = core::ptr::addr_of_mut!(FORK_FRAMES);
@@ -297,6 +347,7 @@ impl AddressSpace {
             None
         };
         arch::paging_cow_clear(&mut self.root, page, new_pa);
+        self.touched();
         self.activate();
         bump_cow_faults();
         true

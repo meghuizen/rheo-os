@@ -413,13 +413,112 @@ pub fn paging_protect(root: &mut PagingRoot, va: usize, perm: MapPerm) {
     }
 }
 
-/// Activate a root: load CR3. Kernel pages are global, so they survive the
-/// reload; user pages (non-global) are flushed - the isolation guarantee.
-pub fn paging_activate(root: &PagingRoot, _asid: u16) {
-    // SAFETY: pml4_pa is a well-formed root.
+/// Activate a root: load CR3, **tagged with a PCID and asked not to flush** where the
+/// CPU supports it (docs/SUBSTRATE.md pillar 2).
+///
+/// With `CR4.PCIDE` set, the low 12 bits of CR3 are a process-context identifier and bit
+/// 63 means "keep the translations already cached for it". So a switch between two cells
+/// invalidates nothing, exactly as an ARM64 ASID or a RISC-V `satp` ASID does; the one
+/// case that needs invalidation - a PCID handed to a *new* root - is paid once in
+/// [`paging_flush_asid`], from `AddressSpace::new`.
+///
+/// Without PCIDE, this is the pre-existing plain CR3 reload, which flushes every
+/// non-global entry: correct, and the reason kernel pages are mapped global. Which of the
+/// two ran is **observed**, not assumed - `paging_tlb_tagged` reports what bring-up
+/// actually latched, so nothing claims a tagged switch on a CPU that has none.
+///
+/// A PCID is 12 bits and this tree's ASIDs are `u16`, so the tag is masked. Two cells
+/// whose ASIDs differ only above bit 11 would share a PCID, which is a *correctness*
+/// question rather than a performance one: a shared tag with two roots is exactly what
+/// `paging_flush_asid` exists for, and `AddressSpace::new` calls it with the same masked
+/// value, so the flush lands on the tag actually in use.
+pub fn paging_activate(root: &PagingRoot, asid: u16) {
+    let cr3 = if pcid_enabled() {
+        // Bit 63: do not invalidate the cached translations for this PCID.
+        (1u64 << 63) | (root.pml4_pa as u64) | (asid as u64 & PCID_MASK)
+    } else {
+        root.pml4_pa as u64
+    };
+    // SAFETY: `cr3` names a well-formed root, with a PCID only when PCIDE is on.
     unsafe {
-        core::arch::asm!("mov cr3, {0}", in(reg) root.pml4_pa as u64, options(nostack));
+        core::arch::asm!("mov cr3, {0}", in(reg) cr3, options(nostack));
     }
+}
+
+/// Low 12 bits of CR3 are the PCID when `CR4.PCIDE` is set.
+const PCID_MASK: u64 = 0xFFF;
+
+/// Whether `CR4.PCIDE` was latched at bring-up. Set once by [`pcid_init`].
+static PCIDE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn pcid_enabled() -> bool {
+    PCIDE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Turn on `CR4.PCIDE` if the CPU has PCID **and** `INVPCID`, and verify it latched.
+///
+/// Both are required, and that is not belt-and-braces: with PCIDE on, a plain CR3 load
+/// no longer flushes the tag, so the only way to invalidate one is `INVPCID`. A CPU with
+/// PCID but no `INVPCID` would leave `paging_flush_asid` unable to do its job, and a stale
+/// translation answering for a new root is silent wrong memory - so that CPU keeps the
+/// untagged path.
+///
+/// Called per CPU: `CR4` is a per-core register, and a secondary that skipped this would
+/// interpret the PCID bits of CR3 as part of the root address.
+pub(crate) fn pcid_init() {
+    // `__cpuid_count` is safe on x86-64: leaves 1 and 7 are architecturally present.
+    let l1 = core::arch::x86_64::__cpuid_count(1, 0);
+    let l7 = core::arch::x86_64::__cpuid_count(7, 0);
+    let has_pcid = l1.ecx & (1 << 17) != 0;
+    let has_invpcid = l7.ebx & (1 << 10) != 0;
+    if !has_pcid || !has_invpcid {
+        return;
+    }
+    // SAFETY: setting CR4.PCIDE (bit 17). CR3 must have PCID bits clear when it is set,
+    // which holds: the kernel root is loaded with a bare physical address.
+    let latched = unsafe {
+        let mut cr4: u64;
+        core::arch::asm!("mov {0}, cr4", out(reg) cr4, options(nostack, nomem));
+        core::arch::asm!("mov cr4, {0}", in(reg) cr4 | (1 << 17), options(nostack));
+        core::arch::asm!("mov {0}, cr4", out(reg) cr4, options(nostack, nomem));
+        cr4 & (1 << 17) != 0
+    };
+    // Observed, not assumed: only a CR4 that reads back with the bit set gets the tagged
+    // path (the x2APIC lesson, docs/ENGINEERING.md 1).
+    PCIDE.store(latched, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Invalidate every TLB entry carrying this tag, for reuse of the tag by a new root.
+///
+/// `INVPCID` type 1 (single-context) where PCIDE is on; otherwise a CR3 reload, which is
+/// what the untagged path does on every switch anyway.
+pub fn paging_flush_asid(asid: u16) {
+    if pcid_enabled() {
+        // INVPCID descriptor: 16 bytes, PCID in the low 12 bits of the first word.
+        let desc: [u64; 2] = [asid as u64 & PCID_MASK, 0];
+        // SAFETY: type 1 with a well-formed descriptor; `INVPCID` was verified present.
+        unsafe {
+            core::arch::asm!(
+                "invpcid {ty}, [{d}]",
+                ty = in(reg) 1u64,
+                d = in(reg) desc.as_ptr(),
+                options(nostack, readonly),
+            );
+        }
+    } else {
+        // SAFETY: reloading CR3 with the current root flushes every non-global entry.
+        unsafe {
+            let mut cr3: u64;
+            core::arch::asm!("mov {0}, cr3", out(reg) cr3, options(nostack, nomem));
+            core::arch::asm!("mov cr3, {0}", in(reg) cr3, options(nostack));
+        }
+    }
+    super::count_tlb_flush();
+}
+
+/// Whether a cross-address-space switch needs no TLB maintenance on this CPU.
+pub fn paging_tlb_tagged() -> bool {
+    pcid_enabled()
 }
 
 unsafe extern "C" {
@@ -601,6 +700,11 @@ pub fn paging_kernel_init() {
         let efer = rdmsr(0xC000_0080) | (1 << 11);
         wrmsr(0xC000_0080, efer);
     }
+
+    // `CR4.PCIDE`, so a cross-cell CR3 load can carry a tag and skip the flush. Per CPU,
+    // because CR4 is a per-core register and a secondary that skipped this would read the
+    // PCID bits of CR3 as part of the root address (docs/SUBSTRATE.md pillar 2).
+    pcid_init();
 
     // GDT, TSS, and the syscall/sysret MSRs (kernel/arch/x86_64/mod.rs).
     super::user_init();

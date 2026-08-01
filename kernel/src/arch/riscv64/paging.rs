@@ -399,18 +399,35 @@ pub fn paging_protect(root: &mut PagingRoot, va: usize, perm: MapPerm) {
     }
 }
 
-/// Activate a root: write satp (Sv39, ASID-tagged) and fence.
+/// Activate a root: write satp (Sv39, ASID-tagged), with **no TLB maintenance**
+/// (docs/SUBSTRATE.md pillar 2).
+///
+/// The ASID field of `satp` is what makes this sound: entries are tagged, so another
+/// address space's translations cannot answer for this one, and a switch between two
+/// ASIDs invalidates nothing. The case that does need a flush - an ASID handed to a
+/// *new* root - is paid once in [`paging_flush_asid`], from `AddressSpace::new`. This
+/// used to `sfence.vma` the whole ASID on every switch, which made the tag buy nothing.
 pub fn paging_activate(root: &PagingRoot, asid: u16) {
     let satp = (8u64 << 60) | ((asid as u64) << 44) | ((root.l2_pa >> 12) as u64);
-    // SAFETY: satp points at a well-formed root; sfence orders the switch.
+    // SAFETY: satp points at a well-formed root. Writing satp is itself the ordering
+    // point for subsequent instruction fetches and loads on this hart.
     unsafe {
-        asm!(
-            "csrw satp, {0}",
-            "sfence.vma zero, {1}",
-            in(reg) satp,
-            in(reg) asid as u64,
-        );
+        asm!("csrw satp, {0}", in(reg) satp);
     }
+}
+
+/// Invalidate every TLB entry tagged with `asid`, for reuse of that tag by a new root.
+pub fn paging_flush_asid(asid: u16) {
+    // SAFETY: an ASID-scoped `sfence.vma` (rs1 = x0 = all addresses, rs2 = the ASID).
+    unsafe {
+        asm!("sfence.vma zero, {0}", in(reg) asid as u64);
+    }
+    super::count_tlb_flush();
+}
+
+/// Whether a cross-address-space switch needs no TLB maintenance. True: Sv39 ASIDs.
+pub fn paging_tlb_tagged() -> bool {
+    true
 }
 
 unsafe extern "C" {

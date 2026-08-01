@@ -11,9 +11,9 @@ pub mod linux_abi;
 mod paging;
 pub use paging::{
     PagingRoot, paging_activate, paging_activate_kernel, paging_cow_at, paging_cow_clear,
-    paging_cow_protect_user, paging_for_each_user_leaf, paging_kernel_init, paging_map,
-    paging_map_frame, paging_mapped, paging_new_root, paging_protect, paging_unmap_frame,
-    paging_unmapped_span,
+    paging_cow_protect_user, paging_flush_asid, paging_for_each_user_leaf, paging_kernel_init,
+    paging_map, paging_map_frame, paging_mapped, paging_new_root, paging_protect,
+    paging_tlb_tagged, paging_unmap_frame, paging_unmapped_span,
 };
 pub use paging::{mmio_map_window, pmem_map_window};
 
@@ -1547,3 +1547,22 @@ pub fn irq_window() {
 /// while [`msi_target`] returns `None`: the per-core enabling these ISAs need is
 /// already done where their interrupt controllers are brought up.
 pub fn irq_ready_this_cpu() {}
+
+// ------------------------------------------------- TLB maintenance accounting
+//
+// Counted so a test can assert that a cross-address-space switch performs **none**
+// (docs/SUBSTRATE.md pillar 2). Before the ASID/PCID tag was made load-bearing, every
+// switch invalidated the tag it was switching to, so the tag bought nothing; a count of
+// zero across N switches is what says that is no longer true. Relaxed: it is a witness,
+// not a synchronisation point.
+static TLB_FLUSHES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Record one address-space-scoped TLB invalidation.
+pub(super) fn count_tlb_flush() {
+    TLB_FLUSHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many address-space-scoped TLB invalidations this boot has performed.
+pub fn tlb_flushes() -> u64 {
+    TLB_FLUSHES.load(core::sync::atomic::Ordering::Acquire)
+}

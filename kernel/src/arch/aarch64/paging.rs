@@ -369,23 +369,48 @@ pub fn paging_protect(root: &mut PagingRoot, va: usize, perm: MapPerm) {
     }
 }
 
-/// Activate a root: TTBR0_EL1 with ASID in the high bits, flush that
-/// ASID's stale entries (roots are recreated per run reusing ASIDs), isb.
+/// Activate a root: TTBR0_EL1 with the ASID in the high bits, and **no TLB
+/// maintenance** (docs/SUBSTRATE.md pillar 2).
+///
+/// That is what the ASID tag is for. Entries are tagged, so translations belonging to
+/// another address space cannot answer for this one however long they linger, and a
+/// switch between two ASIDs needs to invalidate nothing. The one case that does need a
+/// flush - an ASID handed to a *new* root, where the previous occupant's entries would
+/// now answer wrongly - is paid once in [`paging_flush_asid`], called from
+/// `AddressSpace::new`. This used to `tlbi aside1is` on every switch, which made the tag
+/// buy nothing at all.
 pub fn paging_activate(root: &PagingRoot, asid: u16) {
     let ttbr0 = ((asid as u64) << 48) | (root.l0_pa as u64);
-    // SAFETY: ttbr0 points at a well-formed root; the barriers order the
-    // switch and the ASID-scoped TLB invalidation.
+    // SAFETY: ttbr0 points at a well-formed root; `isb` orders the switch against the
+    // instructions that follow it.
     unsafe {
         core::arch::asm!(
             "msr ttbr0_el1, {ttbr}",
+            "isb",
+            ttbr = in(reg) ttbr0,
+        );
+    }
+}
+
+/// Invalidate every TLB entry tagged with `asid`, for reuse of that tag by a new root.
+pub fn paging_flush_asid(asid: u16) {
+    // SAFETY: an ASID-scoped invalidation with the barriers it requires.
+    unsafe {
+        core::arch::asm!(
             "dsb ishst",
             "tlbi aside1is, {asid}",
             "dsb ish",
             "isb",
-            ttbr = in(reg) ttbr0,
             asid = in(reg) (asid as u64) << 48,
         );
     }
+    super::count_tlb_flush();
+}
+
+/// Whether a cross-address-space switch on this ISA needs no TLB maintenance because
+/// entries carry an address-space tag. True: AArch64 ASIDs.
+pub fn paging_tlb_tagged() -> bool {
+    true
 }
 
 unsafe extern "C" {
