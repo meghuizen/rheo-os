@@ -934,6 +934,8 @@ fn main() -> ExitCode {
         "bench" => arches.iter().all(|&a| build(a, true) && bench(a, true)),
         // Type-check only: the fast inner development loop (see `check`).
         "check" => arches.iter().all(|&a| check(a)),
+        // Host-side model checking of kernel state machines (see `verify`).
+        "verify" => verify(),
         // Patch the toolchain's vendored rust-src to add `target_os = "rheo"`
         // so `std` can be built for the rheo-os target (docs/USERLAND.md M4).
         // Idempotent; run once per toolchain before building std programs.
@@ -953,9 +955,52 @@ fn main() -> ExitCode {
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo xtask <build|check|run|test|bench|std-patch> \
+        "usage: cargo xtask <build|check|run|test|bench|verify|std-patch> \
          [--arch x86_64|aarch64|riscv64|all] [--bin <kernel>[,<kernel>...]] [--release]"
     );
+}
+
+/// Host-side model checking of the kernel state machines that are integer-only and
+/// dependency-free (docs/EXECUTION-MODEL.md 8, `verify/`).
+///
+/// Each driver `#[path]`-includes the shipped kernel source and shims only the storage
+/// the kernel funds from frames - the same rule `comparison/` follows. It is a separate
+/// command from `test` on purpose: `test` boots QEMU and takes minutes, this takes
+/// seconds and catches a class of defect that otherwise needs four cores and a
+/// 120-second boot to surface. Neither replaces the other, and CI runs both.
+fn verify() -> bool {
+    // No target flag: this is a host program, and that is the point.
+    let drivers = [("entity", "verify/entity/fuzz.rs")];
+    let out = std::path::Path::new("target/verify");
+    if let Err(e) = std::fs::create_dir_all(out) {
+        eprintln!("error: cannot create {}: {e}", out.display());
+        return false;
+    }
+    drivers.iter().all(|&(name, src)| {
+        let bin = out.join(name);
+        println!("[xtask] verify: building {src}");
+        let built = Command::new("rustc")
+            .args(["-O", "--edition", "2021", "-o"])
+            .arg(&bin)
+            .arg(src)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !built {
+            eprintln!("[xtask] verify {name}: FAIL (did not compile)");
+            return false;
+        }
+        println!("[xtask] verify: running {name}");
+        let ran = Command::new(&bin)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        println!(
+            "[xtask] verify {name}: {}",
+            if ran { "PASS" } else { "FAIL" }
+        );
+        ran
+    })
 }
 
 /// **Type-check the kernel library, both with and without the `smp` feature** -

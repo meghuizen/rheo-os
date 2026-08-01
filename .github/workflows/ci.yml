@@ -52,6 +52,15 @@ jobs:
       - name: clippy (xtask, host)
         run: cargo clippy -p xtask -- -D warnings
 
+      # Host model-checking of the kernel state machines that are integer-only and
+      # dependency-free (verify/README.md, docs/EXECUTION-MODEL.md 8). Seconds, no
+      # QEMU, and it runs here rather than in the per-ISA matrix because it is not
+      # per-ISA: it drives portable Rust on the host. It does not replace the boot
+      # tests - it catches the class of defect that otherwise needs four cores and a
+      # 120-second boot to surface.
+      - name: verify (host state-machine model check)
+        run: cargo xtask verify
+
       # Build fixtures/userspace for every ISA so every `include_bytes!` in the
       # test kernels resolves before clippy compiles them.
       - name: Build userspace + fixtures (all ISAs)

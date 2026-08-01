@@ -2752,6 +2752,7 @@ cargo xtask run   --arch riscv64 [--bin lsh]            # boot in QEMU, serial o
 cargo xtask test  --arch all                            # boot every test kernel, pass/fail
 cargo xtask test  --arch riscv64 --bin schedidle,netwait # boot only these (iterate)
 cargo xtask bench --arch all                            # icount path lengths (always release)
+cargo xtask verify                                      # host model-check the kernel state machines (seconds, no QEMU)
 cargo fmt --all                                         # format (CI-gated)
 cargo clippy -p xtask -- -D warnings                    # lint host code (CI-gated)
 ```
@@ -3154,7 +3155,21 @@ comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md; plus
               in ns - different units, never divided. Every other axis is
               lab-gated and named; no number in the tree says rheo-os is faster
               than Linux (docs/SUBSTRATE.md)
-xtask/        build/run/test/bench orchestration (cargo xtask ...)
+xtask/        build/run/test/bench/verify orchestration (cargo xtask ...)
+verify/       host-side model checking of the kernel state machines that are
+              integer-only and dependency-free (docs/EXECUTION-MODEL.md 8): each
+              driver `#[path]`-includes the shipped kernel source verbatim and shims
+              only the storage the kernel funds from frames (the comparison/ rule).
+              entity/ drives `sched/entity.rs` - 20,000 sequences x 400 operations
+              over 24 entities and 4 CPUs, checking seven invariants after every
+              step, with the operations being the edges of EXECUTION-MODEL.md's
+              dependency graph so coverage is **asserted** rather than reported.
+              Seven invariants, seven controls observed firing - including `steal`
+              ignoring `inside`, which IS "migrate a running entity", the capability
+              attempted and reverted twice on real hardware and named here in 213
+              operations on the first seed. It does not replace `cargo xtask test`:
+              it checks state machines, not the trap path, the page tables or the FP
+              register file (verify/README.md)
 idl/          system IDL + codegen        (future, step 6)
 runtime/      strand runtime: heap (alloc), async executor + channel,
               type-level capability rights (BUILD-ORDER step 7)

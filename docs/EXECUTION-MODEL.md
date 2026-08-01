@@ -385,6 +385,22 @@ traverses is an untested edge, and section 1 is a list of untested edges failing
 | A CPU runs dry and steals | x | x | | | | | | | proven for **unstarted** entities only |
 | **Migrating a running entity** | | | | | | | | | **attempted twice, reverted twice** |
 
+### 6.0a The simulation is executable
+
+Nine of those rows are now **run**, not tabulated: `verify/entity/`'s scenario suite
+drives each shape as a deterministic sequence against a hand-computed expectation, and
+each has a control observed failing (`verify/README.md` has the table). Two carry the same
+note - "threads of one cell across 4 cores" and "FA3 producer/consumer overlap" have no
+control, because they assert a capability the **model** permits and the **kernel** does
+not yet hold the field for (stage E4). There is nothing to break in the model to make them
+fail, which is exactly why they are written now: when E4 lands, these are the tests it has
+to satisfy, and they exist before the implementation rather than after it.
+
+The one that is worth reading is the Node-teardown scenario. It asserts that a cell with
+one parked entity and one runnable entity is **not** blocked, and its control - making
+`all_parked` treat any parked entity as blocked - reproduces **defect 3 by name**, in
+milliseconds, on the host. That defect originally cost an in-QEMU four-core boot to find.
+
 ### 6.1 What the simulation found
 
 Four gaps, and each is now a *named consequence of a missing field* rather than a
@@ -530,6 +546,26 @@ deterministic seed.
                   shrink a failing sequence to its minimum
 ```
 
+**Built, and it works** (`verify/entity/`, `cargo xtask verify`): 20,000 sequences of 400
+operations over 24 entities and 4 CPUs, checking I1, I2, I3, I4, I5, I7 and I9 after
+every step - so 8 million operations, in about a second, with no QEMU. Every one of the
+seven has a control that was observed **firing** when exactly one check was removed from
+the shipped module; `verify/README.md` carries the table with seeds and operation
+indices. Three results are worth more than the pass:
+
+- **`steal` ignoring `inside` is "migrate a running entity"** - the capability attempted
+  twice on real hardware in this branch and reverted twice, a full experiment each time.
+  The fuzzer names it (I3) in 213 operations on the first seed.
+- **`enter`'s occupied check and owner check are individually redundant and jointly
+  load-bearing.** Removing either alone still passes; removing both fails at op 35. That
+  is recorded rather than tidied away, because "remove one, the other covers it" is
+  precisely the reasoning that produced defect 1.
+- **The first `check_i5` was wrong in the way this document is about.** It asked
+  `pickable` whether work existed - the code under test - so a `pickable` made too strict
+  left CPUs idle beside runnable entities and the check still passed, both sides agreeing
+  on a wrong answer. The oracle now computes availability from the entity's own fields.
+  A passing test whose oracle is the implementation is worse than no test.
+
 Design notes that make it worth building rather than decorative:
 
 - **The operations are the graph's edges**, so coverage is measurable: report which of
@@ -553,12 +589,13 @@ unchanged. The order is forced by the dependency graph, not chosen.
 
 | Stage | Change | Proof | Unblocks |
 |---|---|---|---|
-| E1 | Introduce the entity table beside the current three representations; `sched::Vcore` grows the hot line's fields. Nothing reads it yet. | the suite unchanged | - |
+| E1 | Introduce the entity table beside the current three representations; `sched::Vcore` grows the hot line's fields. Nothing reads it yet. | **Done.** `kernel/src/sched/entity.rs`; the suite unchanged because nothing reads it | E6 |
+| E6' | The host fuzzer, brought forward - it belongs *before* the hot paths depend on the table, not after | **Done.** `verify/entity/`, `cargo xtask verify`: 8M operations, 7 invariants, 7 firing controls | E2-E5 can be refactors with an oracle already in place |
 | E2 | Move `owner` and the entered-guard into the table; the claim and the run-mark become one compare-exchange. Delete the two predicates, leaving one. | I1, I3; the 8 predicate sites become 1, and the 4 claim sites become 0 - the claim happens where the entity is entered | removes defects 1, 2, 5 by construction |
 | E3 | Move `runnable`/`parked` into the table; the personality declares transitions and stops keeping copies. | I5, I8 - both currently unasserted | removes defect 3's class |
 | E4 | Per-entity resources: `kstack_top`, funded FP area, frame. `MAX_VCORES` deleted. | one cell's two entities on two cores with a per-round trap, which the current phase admits it cannot detect | Linux threads across cores; FA3 overlap |
 | E5 | Arm the slice at the single return-to-user site. | I10 on all three ISAs, including ARM64 which takes 0 today | preemption independent of workload |
-| E6 | The host fuzzer over E2-E5. | I1..I10, with edge coverage reported | the defect class, caught early |
+| E6 | Extend the fuzzer as E2-E5 land, adding I6, I8 and I10 (each needs state E1 does not hold yet). | I1..I10, with edge coverage asserted | the defect class, caught early |
 | E7 | Cross-entity signal + wake IPI. | a signal to an entity another core is running | cross-core signals, migration expressible |
 | E8 | FRED behind observation, IDT unchanged. | `event_mode()` reported; lab-gated | the SYSRET class deleted |
 
