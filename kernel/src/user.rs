@@ -2760,8 +2760,38 @@ pub fn on_user_interrupt(frame: *mut TrapFrame) -> *mut TrapFrame {
 ///
 /// Dereferencing the raw `frame` (the state the trampoline just saved) is
 /// the whole point of the dispatcher.
+/// **The single return-to-user site** (docs/EXECUTION-MODEL.md 9, stage E5).
+///
+/// The dispatcher below has eight return paths. Arming the preemption slice at each of
+/// them would be a convention eight callers have to remember, and the one that mattered
+/// was forgotten: an ordinary syscall return re-armed nothing, so a cell whose contexts
+/// are scheduled inside the cell - Node's and Bun's shape - ran on whatever slice its
+/// first entry happened to get. ARM64 measurably took **zero** preemptions across two
+/// whole programs because of it.
+///
+/// So the arming lives here, in the wrapper, exactly as the FP/SIMD swap was reduced to
+/// one site (`user::switch_native_cell`) after the `SYS_YIELD` scar. A new return path
+/// inside `on_user_trap_inner` cannot forget.
+///
+/// A **null** frame means "unwind to the kernel": the cell exited or faulted terminally,
+/// and there is nothing to arm a slice for. Arming one would leave a deadline registered
+/// against a cell that no longer runs.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn on_user_trap(
+    kind: TrapKind,
+    cause: FaultCause,
+    fault_addr: usize,
+    frame: *mut TrapFrame,
+) -> *mut TrapFrame {
+    let next = on_user_trap_inner(kind, cause, fault_addr, frame);
+    if !next.is_null() {
+        crate::sched::dispatch::rearm_remaining();
+    }
+    next
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+fn on_user_trap_inner(
     kind: TrapKind,
     cause: FaultCause,
     fault_addr: usize,

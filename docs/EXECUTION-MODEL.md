@@ -213,13 +213,34 @@ wrong, and where that has already happened.
 
 Two edges deserve their own note because both are currently wrong:
 
-- **Edge (i), re-arm.** A slice is armed at first entry, at a cell-level reschedule, and
-  by the preemption path itself - **not** on an ordinary syscall return. So a cell whose
-  contexts are scheduled inside the cell (Node, Bun) gets one slice and, if it does not
-  fire, nothing arms another. Measured: ARM64 armed 2 slices for two whole programs and
-  took 0 preemptions, where x86-64 armed 322 and riscv64 150 for the same binary
-  (docs/SMP.md 10.2a). The rule the framework needs is the one the FP swap already got:
-  *every* return to user mode arms, at one site, so no path can forget.
+- **Edge (i), re-arm. Fixed (stage E5), and it took two defects rather than one.** A slice
+  used to be armed at first entry, at a cell-level reschedule, and by the preemption path
+  itself - **not** on an ordinary syscall return. So a cell whose contexts are scheduled
+  inside the cell (Node, Bun) got one slice and, if it did not fire, nothing armed another:
+  ARM64 armed 2 slices for two whole programs and took 0 preemptions, where x86-64 armed
+  322 and riscv64 150 for the same binary. The fix is the rule the FP swap already got -
+  *every* return to user arms, at **one** site, so no path can forget - and it arms the
+  slice's **remainder** rather than a fresh slice, because a full slice on every return
+  would let a cell syscalling every 100 us push its deadline out forever, which is the
+  starvation this prevents wearing the costume of a fix.
+
+  Arming alone was not enough, and the second defect is the more interesting one:
+  `dispatch::running` **looked the vcore up and never admitted it**. The only thing that
+  admitted a vcore was `pick`'s `sync_runnable`, so a cell that never reached a cell-level
+  reschedule was never in the queue at all - the running record stayed empty and the
+  CPU-time charge, the burst score *and* the new re-arm all silently did nothing. It was
+  invisible on two ISAs and total on the third, and it was found by a counter rather than
+  by reasoning: the E5 site was reached **472** times on ARM64 and declined all 472
+  (`dispatch::rearm_counters`, which exists to distinguish "never reached" from "reached
+  and declined" - an unchanged `armed` count cannot). "The vcore this CPU is running is in
+  the queue" is now an invariant established where the CPU starts running it.
+
+  A third thing, which is an ordering rule rather than a defect: on ARM64 a cell's SPSR
+  carries its IRQ mask and `trapframe_new` derives it from `dispatch::enabled()`, so
+  enabling dispatch **after** building the frames gives a cell that runs at EL0 with IRQ
+  masked - 474 slices armed, 0 interrupts taken. x86-64 and riscv64 read their mask at the
+  same point, so it is one rule, not a per-ISA workaround: enable dispatch before
+  `trapframe_new`.
 - **Edge (a) before (b).** Claiming and winning the run-mark are two steps and the order
   matters, which defect 1 found. In the target they are **one** operation on the entity
   row - a single compare-exchange that both claims and marks - so the order cannot be got
@@ -594,7 +615,7 @@ unchanged. The order is forced by the dependency graph, not chosen.
 | E2 | Move `owner` and the entered-guard into the table; the claim and the run-mark become one compare-exchange. Delete the two predicates, leaving one. | I1, I3; the 8 predicate sites become 1, and the 4 claim sites become 0 - the claim happens where the entity is entered | removes defects 1, 2, 5 by construction |
 | E3 | Move `runnable`/`parked` into the table; the personality declares transitions and stops keeping copies. | I5, I8 - both currently unasserted | removes defect 3's class |
 | E4 | Per-entity resources: `kstack_top`, funded FP area, frame. `MAX_VCORES` deleted. | one cell's two entities on two cores with a per-round trap, which the current phase admits it cannot detect | Linux threads across cores; FA3 overlap |
-| E5 | Arm the slice at the single return-to-user site. | I10 on all three ISAs, including ARM64 which takes 0 today | preemption independent of workload |
+| E5 | Arm the slice at the single return-to-user site. | **Done.** `on_user_trap` is a wrapper over `on_user_trap_inner`'s eight return paths; `dispatch::rearm_remaining` arms the slice's **remainder**. ARM64 went from 2 armed slices and 0 timer interrupts to 819 and 156, and now takes 55 preemptions where it took none | preemption independent of workload |
 | E6 | Extend the fuzzer as E2-E5 land, adding I6, I8 and I10 (each needs state E1 does not hold yet). | I1..I10, with edge coverage asserted | the defect class, caught early |
 | E7 | Cross-entity signal + wake IPI. | a signal to an entity another core is running | cross-core signals, migration expressible |
 | E8 | FRED behind observation, IDT unchanged. | `event_mode()` reported; lab-gated | the SYSRET class deleted |

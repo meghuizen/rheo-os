@@ -1511,19 +1511,44 @@ from trap context on two cores at once. Three things it does not claim:
 - The *locking* has no deterministic negative control, because removing it leaves a race
   rather than a failure (docs/ENGINEERING.md 7 - reasoned and reviewed, not proven by
   revert).
-- **ARM64 takes no preemption here at all**, and the reason is a real gap in the model
-  rather than a property of that ISA: a Linux syscall that returns to its own context does
-  **not** re-arm a slice (`sched::dispatch::running` is reached from first entry, from
-  `linux::proc::reschedule`, and from the preemption path itself - not from the ordinary
-  syscall return). So a Linux cell whose contexts are scheduled *within* the cell - which
-  is Node's and Bun's shape - gets one slice at first entry, and if that slice does not
-  fire, nothing arms another. ARM64 armed **2** slices for two whole programs and took 0
-  timer interrupts; x86-64 armed 322 and riscv64 150, because their futex timing produced
-  cell-level reschedules and ARM64's did not. The test therefore gates on *whether an
-  interrupt arrived* and claims nothing where none did: a slice that fired and moved
-  nothing is a defect and asserts, a slice that never fired is a fact about the workload.
-  Making a slice enforceable independently of what the workload happens to do is an
-  execution-model change, not a test change - docs/EXECUTION-MODEL.md owns it.
+- ARM64 took no preemption here at all, which was a real gap in the model rather than a
+  property of that ISA - **fixed, see below**.
+
+**And it found the gap that stage E5 closed - three findings, all measured.** The phase
+first reported ARM64 taking **0** preemptions across two whole programs where x86-64 took
+47 and riscv64 27 on the same binary, and the honest first version therefore gated on
+whether a timer interrupt arrived and claimed nothing where none did. Chasing it produced
+three facts, none of which was the first guess:
+
+1. **A Linux syscall returning to its own context did not re-arm a slice.** A slice was
+   armed at first entry, at a cell-level reschedule, and by the preemption path - not on
+   an ordinary syscall return. So a cell whose contexts are scheduled *within* the cell,
+   which is Node's and Bun's shape, got one slice and nothing armed another if it did not
+   fire. `user::on_user_trap` is now a thin wrapper over `on_user_trap_inner`'s eight
+   return paths and `sched::dispatch::rearm_remaining` arms there - one site, the
+   reduction the FP/SIMD swap already got. It arms the slice's **remainder**, not a fresh
+   slice: a full slice per return would let a cell syscalling every 100 us push its
+   deadline out forever, which is the starvation this prevents wearing the costume of a
+   fix.
+2. **`dispatch::running` looked the vcore up and never admitted it.** The only thing that
+   admitted a vcore was `pick`'s `sync_runnable`, so a cell that never reached a
+   cell-level reschedule was never in the queue - the running record stayed empty, and the
+   CPU-time charge, the burst score *and* the new re-arm all silently did nothing. Found
+   by a counter, not by reasoning: `dispatch::rearm_counters` exists to distinguish "the
+   site is never reached" from "the site is reached and declines", which an unchanged
+   `armed` count cannot, and it reported the site reached **472** times and declining all
+   472. "The vcore this CPU is running is in the queue" is an invariant now, established
+   where the CPU starts running it.
+3. **An ordering rule, not a defect.** On ARM64 a cell's SPSR carries its IRQ mask and
+   `trapframe_new` derives it from `dispatch::enabled()`, so enabling dispatch *after*
+   building the frames gives a cell running at EL0 with IRQ masked: 474 slices armed, 0
+   interrupts taken. x86-64 and riscv64 read their mask at the same point, so it is one
+   rule rather than a per-ISA workaround - enable dispatch before `trapframe_new`.
+
+ARM64 now arms 819 slices, takes 156 timer interrupts and 55 preemptions; all three ISAs
+preempt. The escape is narrowed to the one honest case, "this ISA has no slice to arm",
+and the rest is asserted - after E5 the chain is a property of the kernel rather than of
+the workload, so a wired one-shot with hundreds of deadlines against it must fire.
 
 **It found one defect that does have a control.** `smp::run_cells_on_both` published two
 cells and claimed neither. An unclaimed cell is visible to every core's scheduler - correct

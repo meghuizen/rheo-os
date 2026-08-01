@@ -98,6 +98,12 @@ static PICKS: AtomicU64 = AtomicU64::new(0);
 static RR_PICKS: AtomicU64 = AtomicU64::new(0);
 static DIVERGED: AtomicU64 = AtomicU64::new(0);
 static CHARGED_NS: AtomicU64 = AtomicU64::new(0);
+/// How many times the single return-to-user site was reached, and how many of those
+/// found no running record. Counted rather than reasoned about, because "the site is
+/// never reached" and "the site is reached and declines" are different defects and an
+/// unchanged `armed` count cannot tell them apart (docs/ENGINEERING.md 1).
+static REARM_CALLS: AtomicU64 = AtomicU64::new(0);
+static REARM_NO_RECORD: AtomicU64 = AtomicU64::new(0);
 
 /// Turn queue-driven dispatch on or off. Off is the pre-migration behaviour,
 /// exactly.
@@ -143,9 +149,25 @@ pub fn reset() {
         // SAFETY: between runs, nothing else is running on any CPU.
         unsafe { *CURRENT.get_mut(cpu) = Running::NONE };
     }
-    for c in [&PICKS, &RR_PICKS, &DIVERGED, &CHARGED_NS] {
+    for c in [
+        &PICKS,
+        &RR_PICKS,
+        &DIVERGED,
+        &CHARGED_NS,
+        &REARM_CALLS,
+        &REARM_NO_RECORD,
+    ] {
         c.store(0, Ordering::Relaxed);
     }
+}
+
+/// (return-to-user sites reached, of which found no running record). The pair
+/// distinguishes stage E5 not being reached from E5 being reached and declining.
+pub fn rearm_counters() -> (u64, u64) {
+    (
+        REARM_CALLS.load(Ordering::Relaxed),
+        REARM_NO_RECORD.load(Ordering::Relaxed),
+    )
 }
 
 /// Now, in the timer's own monotonic nanosecond domain.
@@ -228,7 +250,35 @@ pub fn running(cell: usize, context: usize) -> u64 {
     // SAFETY: a short call on this CPU's own queue.
     let q = unsafe { queue() };
     let now = now_ns();
-    let id = q.find(cell as u16, context as u16);
+    // **Admit it if the queue has not seen it.** "The vcore this CPU is running is in
+    // the queue" is an invariant, not a hope, and it was neither before: the only thing
+    // that admitted a vcore was `pick`'s `sync_runnable`, so a cell that never reached a
+    // cell-level reschedule was never in the queue at all. `find` then returned `None`
+    // here, the running record stayed empty, and everything downstream that needs it -
+    // the CPU-time charge, the burst score, and stage E5's slice re-arm - silently did
+    // nothing.
+    //
+    // It was measured rather than reasoned about, and only on one ISA: the same
+    // multi-threaded binary produced 322 armed slices on x86-64 and **2** on ARM64,
+    // because the first two happened to reschedule at cell level and the third did not.
+    // The E5 return-to-user site was reached 472 times there and declined all 472,
+    // which is what the two `rearm_counters` exist to distinguish (docs/SMP.md 10.2a).
+    let id = match q.find(cell as u16, context as u16) {
+        Some(id) => Some(id),
+        // Fair class and a fresh burst: a vcore admitted here has been observed doing
+        // nothing yet, and inventing a burst score for it would be the guess the BORE
+        // design refuses. A queue with no metadata left is a `None` record, which is
+        // exactly the pre-existing behaviour - degraded, not wrong.
+        None => q
+            .admit(
+                cell as u16,
+                context as u16,
+                Class::Fair,
+                super::bore::Burst::new(),
+                now,
+            )
+            .ok(),
+    };
     // SAFETY: this CPU's own slot.
     unsafe {
         *CURRENT.this_mut() = Running { id, since_ns: now };
@@ -236,6 +286,57 @@ pub fn running(cell: usize, context: usize) -> u64 {
     let slice = q.current_slice_ns();
     super::preempt::arm(slice);
     slice
+}
+
+/// Re-arm the running vcore's slice for the time it has **left**, at the single
+/// return-to-user site (docs/EXECUTION-MODEL.md 9, stage E5).
+///
+/// # The defect this fixes
+///
+/// A slice was armed at first entry, at a cell-level reschedule, and by the preemption
+/// path itself - **not** on an ordinary syscall return. So a cell whose contexts are
+/// scheduled *inside* the cell, which is Node's and Bun's shape, got one slice at first
+/// entry, and if that slice did not happen to fire, nothing armed another. Measured on
+/// the same binary: ARM64 armed **2** slices for two whole programs and took **0** timer
+/// interrupts, where x86-64 armed 322 and riscv64 150 - the difference being futex timing
+/// producing cell-level reschedules on two ISAs and not the third (docs/SMP.md 10.2a).
+/// A preemption model that depends on how often a workload happens to reschedule is not
+/// a preemption model.
+///
+/// # Why "remaining" and not a fresh slice
+///
+/// Arming a *full* slice here would be worse than the bug. A cell issuing a syscall
+/// every 100 us would push its deadline out by a millisecond on every return and could
+/// never be preempted at all - the starvation this is supposed to prevent, dressed as a
+/// fix. So the deadline stays anchored to when the vcore **started running**: the slice
+/// left is `slice_ns - (now - since_ns)`, and a vcore that has already spent its slice
+/// gets the shortest deadline the arbiter will take, so it is preempted at the next
+/// opportunity rather than never.
+///
+/// Nothing else about the running record is touched - in particular `since_ns` is **not**
+/// reset, which is the whole point: resetting it would make the charge cover only the
+/// time since the last syscall, so a syscall-heavy cell would be charged almost nothing
+/// and its BORE burst score would be measured off a lie.
+///
+/// A no-op when this CPU has no running record (nothing dispatched here yet), and
+/// [`super::preempt::arm`] is itself a no-op when dispatch is off or the ISA has no wired
+/// timer - so a cooperative boot is byte-for-byte unchanged and says so through its
+/// counters.
+pub fn rearm_remaining() {
+    REARM_CALLS.fetch_add(1, Ordering::Relaxed);
+    let rec = *CURRENT.this();
+    if rec.id.is_none() {
+        REARM_NO_RECORD.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    // SAFETY: a short call on this CPU's own queue.
+    let q = unsafe { queue() };
+    let slice = q.current_slice_ns();
+    let used = now_ns().saturating_sub(rec.since_ns);
+    // `max(1)`: a deadline of 0 is "no deadline" to the arbiter, and this vcore is
+    // exactly the one that must be preempted, so it gets the smallest real deadline
+    // instead of none.
+    super::preempt::arm(slice.saturating_sub(used).max(1));
 }
 
 /// Charge the running vcore for the CPU time it just used and mark it stopped.

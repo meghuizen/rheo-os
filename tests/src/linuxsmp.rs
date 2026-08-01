@@ -640,6 +640,15 @@ fn test_preempted_threads_two_cores() {
         user::reset();
         ktimer::reset();
         idle::reset();
+        preempt::reset();
+        // **Before the frames are built, and that ordering is load-bearing.** On ARM64 a
+        // cell's SPSR carries its IRQ mask, and `trapframe_new` derives that mask from
+        // `dispatch::enabled()` - so a frame built while dispatch is off runs at EL0 with
+        // IRQ *masked* and can never be preempted however many slices are armed. Enabling
+        // it after the loop below armed 474 slices and took **0** timer interrupts
+        // (measured; docs/SMP.md 10.2a). x86-64 and riscv64 read their mask at the same
+        // point, so this is one ordering rule rather than a per-ISA workaround.
+        dispatch::enable(true);
 
         let mut aspace = [
             kernel::mm::AddressSpace::new(60),
@@ -671,8 +680,6 @@ fn test_preempted_threads_two_cores() {
 
         STDOUT_LEN = [0; CAP_CELLS];
         kernel::linux::set_stdout_tap(Some(tap));
-        preempt::reset();
-        dispatch::enable(true);
         // SAFETY: both installed, present, distinct, Linux cells with no process tree.
         let (met, finished, sec_code, own_code) = smp::run_cells_on_both(0, 1, true);
         dispatch::enable(false);
@@ -711,6 +718,11 @@ fn test_preempted_threads_two_cores() {
 
         let (armed, taken, unarmable, to_sib, to_cell) = preempt::counters();
         let notes = preempt::notes();
+        let (rearms, no_record) = dispatch::rearm_counters();
+        println!(
+            "linuxsmp:   E5 return-to-user site: reached {rearms} times, {no_record} with no \
+             running record; slices armed {armed}, timer interrupts {notes}"
+        );
         // Two different outcomes, and conflating them would be the mistake. A slice
         // **fired** and the scheduler declined to move the CPU is a defect. A slice
         // never fired is a fact about the workload, not about the kernel: how many
@@ -720,15 +732,34 @@ fn test_preempted_threads_two_cores() {
         // re-arm and the two ISAs' futex timing gives different cell-level reschedule
         // counts. So the interrupt count is the gate, and where none arrived nothing
         // is claimed rather than asserted (docs/ENGINEERING.md 1).
-        if unarmable > 0 || notes == 0 {
+        // The only honest escape is "this ISA has no slice to arm". Everything else is
+        // now an assertion, because after stage E5 the chain is a property of the kernel
+        // rather than of the workload: every return to user re-arms for the slice it has
+        // left, so armed slices are plentiful, and a wired one-shot with hundreds of
+        // deadlines registered against it MUST fire. Before E5 this had to be a report -
+        // ARM64 armed 2 slices for two whole programs and took 0 interrupts, and asserting
+        // there would have been asserting something the test did not control.
+        if unarmable > 0 {
             println!(
                 "linuxsmp: two multi-threaded Linux cells ran correctly on two cores, \
-                 both transcripts exact - but no preemption is claimed: {armed} slices \
-                 armed, {unarmable} unarmable, {notes} timer interrupts arrived. The \
-                 trap-context entry point was not reached on this ISA"
+                 both transcripts exact - but no preemption is claimed: {unarmable} of \
+                 {armed} slices could not be armed, so this ISA has no wired one-shot here"
             );
             return;
         }
+        assert!(
+            armed > 10,
+            "only {armed} slices were armed across two whole programs - stage E5 re-arms \
+             at every return to user, so this means the running record is empty and the \
+             CPU-time charge and burst score are silently doing nothing too \
+             ({rearms} return-to-user sites reached, {no_record} with no record)"
+        );
+        assert!(
+            notes > 0,
+            "{armed} slices were armed against a wired one-shot and NOT ONE fired - on \
+             ARM64 that is a cell whose frame was built with IRQ masked, which happens \
+             when dispatch is enabled after `trapframe_new` rather than before it"
+        );
         assert!(
             taken > 0,
             "{notes} preemption interrupts arrived across {armed} armed slices and the \
