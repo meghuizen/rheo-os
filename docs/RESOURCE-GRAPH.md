@@ -166,6 +166,115 @@ Two things this makes expressible that nothing currently does:
 was given*, and the useful question is almost always "does this node meet the baseline my
 binary was built for", not "does it have each of thirty flags".
 
+### 2.6 Capabilities, not device kinds - and the taxonomy trap
+
+The list of things worth placing work on does not stop at CPUs and GPUs. It includes
+hardware RNGs, a TPM, TPUs and NPUs, integrated accelerators (APUs), the FPU/SIMD units
+inside every core, and - the case that breaks a taxonomy outright - **the extra engines
+sitting on a NIC**: inline IPsec/TLS crypto, compression, DMA engines, a precision-time
+clock, RDMA, packet-processing pipelines, and on a DPU a set of embedded cores. Computational
+storage puts compute on the SSD; a GPU carries video encoders and separate copy engines.
+
+**So the graph must not enumerate device kinds.** A fixed `EngineKind` enum is a list of
+what someone thought of, and every one of the resources above is a thing it did not think
+of. `hw::Inventory` classifies PCI functions into engine kinds today, and that is exactly the
+shape to stop extending. Instead, a node **offers capabilities**:
+
+```rust
+pub struct Capability {
+    pub class: CapClass,     // Matmul | Crypto(alg) | Compress(alg) | Entropy | Attest |
+                             // Timestamp | Dma | Codec | PacketPipeline | ...
+    pub reach: Reach,        // Inline | Offload { queue_depth, doorbell_ns, min_bytes }
+    pub rate: u32,           // units per second, or 0 for "not a throughput resource"
+    pub trust: Trust,        // see below - NOT everything is ranked by speed
+    pub detail: u64,         // class-specific: tile shapes, key sizes, clock accuracy
+}
+```
+
+The precedent is already in the tree and working: docs/TILES.md defines an engine as
+**anything that declares a TileContract**, and one tile program runs on whichever engines
+exist. Section 2.6 is that idea generalised from matmul to every capability class.
+
+#### Inline versus offload is a real structural split, not a label
+
+- **Inline** means "available to code executing on this node": the FPU, SIMD, AES-NI, a
+  CPU's RDRAND. No queue, no DMA, no edge - so the graph carries no cost edge for it, and
+  the capability is a property of the *execution context* rather than a place to send work.
+  This is why the FPU belongs in the list at all: it explains why some capabilities are
+  attributes of a node and others are destinations.
+- **Offload** means "reached by submitting work across an edge": a GPU, an NPU, a NIC's
+  crypto engine, virtio-crypto. It has a queue depth, a doorbell latency, a DMA path that
+  needs an IOMMU domain, and - the field that matters most and is usually missing -
+  **`min_bytes`, the size below which inline wins.**
+
+That threshold is the whole practical difference. A NIC's inline crypto engine beats AES-NI
+only above some payload size; below it, the doorbell and DMA cost more than the cipher. A
+graph that reports "this node can do AES-GCM" without the crossover will confidently make
+work slower, which is worse than not knowing - it is the *bandwidth-versus-latency* mistake
+of section 2.2 repeated one level down. So `min_bytes` is part of the capability, and the
+Phase-1 filter drops an offload candidate whose threshold the request does not clear.
+
+#### Not everything is ranked by speed
+
+```rust
+pub enum Trust {
+    /// Ranked by rate. A codec, a DMA engine, a matmul unit.
+    Performance,
+    /// Ranked by *evidence*: an entropy source that passes SP 800-90B health tests
+    /// outranks a faster one that does not.
+    Entropy { health_tested: bool, source: EntropySource },
+    /// Not comparable by cost at all: which measurement chain does this root?
+    Attestation { chain: PrincipalId },
+}
+```
+
+Two of the user's examples are precisely the reason this field exists:
+
+- **A hardware RNG must not be ranked by throughput.** A fast source of unknown quality is
+  worse than a slow one with evidence behind it, and this tree already holds that position:
+  the per-cell DRBG seeds from RDSEED/RDRAND/RNDR **after SP 800-90B health tests**, is
+  non-blocking, and falls back to a documented floor where no hwrng exists
+  (docs/TIME-IDENTITY.md). Putting `Entropy` in the graph must not undo that by making a
+  device RNG selectable because it is faster.
+- **A TPM has no meaningful latency ranking.** It is not a throughput resource; it is a
+  *trust root*. The only useful query is "which TPM roots the measurement chain this
+  principal's attestation refers to", which ties it to docs/IDENTITY.md's `PrincipalId` and
+  to the attest-by-measurement engine story rather than to any cost metric. A graph that
+  offered `nearest(Attest, Metric::Latency)` would be answering a question nobody should
+  ask.
+
+#### Who publishes a capability - and why it is not the kernel
+
+The kernel must not learn every vendor's offload registers; that is the taxonomy trap with
+extra steps, and it would undo the driver-free property `svc::Bridge` exists to protect
+(docs/ARCHITECTURE-DEBT.md 3.2 - the queue's opcode dispatch names no device driver).
+
+So: **a driver cell publishes its device's capabilities into the graph**, declaring a
+contract, exactly as an engine declares a `TileContract`. The kernel's own contribution is
+what firmware and architectural discovery can tell it - PCIe class codes (0x10
+encryption/decryption controller, 0x12 processing accelerator - both already recognised),
+capability structures, ACPI and device-tree nodes - and everything vendor-specific arrives
+from the cell that drives it. That also makes a **remote** capability expressible with no
+new mechanism: a driver cell on another host publishes into the same graph with a network
+edge's cost.
+
+#### What is gateable here, checked against the built QEMU 11.0.3
+
+| Capability | Provable in this container? |
+|---|---|
+| **Entropy, inline** (RDRAND/RDSEED/RNDR) | **Yes, already** - the DRBG seeding path with its health tests |
+| **Entropy, offload** (`virtio-rng`) | **Yes** - QEMU models `virtio-rng-pci` |
+| **Crypto offload** (`virtio-crypto`) | **Yes** - QEMU models `virtio-crypto-pci`, a genuine queue-based offload engine, which makes the `min_bytes` crossover measurable in *icount* rather than only on hardware |
+| **Attestation / TPM** | **Yes, with work** - QEMU supports TPM; it is absent from *our* build only because this repository's configure passes `--disable-tpm`, and `swtpm` is not installed. A build flag and a package, not a QEMU limitation - stated precisely so nobody records it as impossible |
+| **Matmul, inline** (AVX-512/VNNI) | **Yes, already** - host-proven bit-exact (docs/CPU-FEATURES.md 2.4a) |
+| **TPU / NPU / APU** | **No model.** PCI class 0x12 is recognised and registered; nothing exists to drive |
+| **NIC offload engines** | **No model.** Vendor-specific; `virtio-crypto` is the generic stand-in for the *shape*, and a real one is hardware-gated |
+
+`virtio-crypto` is the interesting entry: it gives the offload path a real device with a real
+queue, so the inline-versus-offload crossover can be established as a *path-length*
+measurement here and re-measured on hardware later - rather than being asserted as a
+constant, which is how such thresholds usually rot.
+
 ---
 
 ## 3. Placement is two phases, and the order matters
