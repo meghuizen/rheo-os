@@ -403,12 +403,52 @@ fn graph_distances(inv: &hw::Inventory) {
         .expect("no distance from locality 1 back to 0 - only one direction was recorded");
     assert_eq!(back.hops, DECLARED, "the reverse distance disagrees");
 
-    assert_eq!(
-        (across.latency_ns, across.bandwidth_mbs),
-        (0, 0),
-        "the graph claims a latency or bandwidth SLIT does not report - HMAT is not parsed, \
-         so these must read as unknown rather than as a fabricated number"
-    );
+    // HMAT is ACPI-only, so the magnitudes are asserted where firmware provides them and
+    // asserted ABSENT where it does not. Both directions matter: a graph that invented a
+    // latency on riscv64 would be fabricating, and one that dropped it on x86-64 would be
+    // discarding what firmware said.
+    //
+    // The oracle is again the launch: `-numa hmat-lb,...,latency=100` and `bandwidth=10G`.
+    if g.source() == Source::Acpi {
+        const DECLARED_LAT_NS: u32 = 100;
+        // Declared as `10240M` rather than `10G` on purpose. QEMU's size suffixes are
+        // **binary**, so `10G` is 10 * 1024 = 10240 MB/s - and the first version of this
+        // oracle hand-computed 10000 from a decimal reading and failed against a parser that
+        // was correct. Stating the launch value in the unit the graph reports removes the
+        // conversion from the test rather than encoding a guess about it.
+        const DECLARED_BW_MBS: u32 = 10_240;
+        assert_eq!(
+            across.latency_ns, DECLARED_LAT_NS,
+            "the graph reports {} ns between nodes 0 and 1; the launch declared \
+             {DECLARED_LAT_NS} ns via HMAT",
+            across.latency_ns
+        );
+        assert_eq!(
+            across.bandwidth_mbs, DECLARED_BW_MBS,
+            "the graph reports {} MB/s between nodes 0 and 1; the launch declared \
+             {DECLARED_BW_MBS} MB/s via HMAT",
+            across.bandwidth_mbs
+        );
+        println!(
+            "numa: AND REAL MAGNITUDES FROM HMAT - {} ns and {} MB/s between nodes 0 and 1, \
+             exactly what the launch declared. SLIT's hops orders localities; HMAT is what \
+             makes 'how much further' a number a caller can rank by, and nothing is derived \
+             from hops because a relative distance is not a latency OK",
+            across.latency_ns, across.bandwidth_mbs
+        );
+    } else {
+        assert_eq!(
+            (across.latency_ns, across.bandwidth_mbs),
+            (0, 0),
+            "the graph claims a latency or bandwidth on a machine with no HMAT - these must \
+             read as unknown rather than as a number derived from the SLIT distance"
+        );
+        println!(
+            "numa: magnitudes read 0 = unknown, correctly - HMAT is ACPI-only and this \
+             machine described its distances through {:?} OK",
+            g.source()
+        );
+    }
     // ACPI on x86-64 via SLIT, the device tree on riscv64 via `numa-distance-map-v1`. The
     // assertion is that the graph names the source it actually read from - not which one,
     // since that is a property of the machine.

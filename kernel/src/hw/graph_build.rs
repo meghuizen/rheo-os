@@ -101,15 +101,27 @@ pub fn build(inv: &super::Inventory) {
         for from in 0..nnodes.min(super::MAX_DIST_NODES) {
             for to in 0..nnodes.min(super::MAX_DIST_NODES) {
                 let d = inv.dist[from][to];
-                if d == 0 || from == to {
+                // A pair with neither a distance nor a magnitude has nothing to record.
+                // `from == to` is skipped because `cost()` answers `LOCAL` for it directly -
+                // recording a self-edge would give two answers to one question.
+                if from == to {
+                    continue;
+                }
+                if d == 0 && inv.lat_ns[from][to] == 0 && inv.bw_mbs[from][to] == 0 {
                     continue;
                 }
                 if mem_node[from] == NodeId::NONE || mem_node[to] == NodeId::NONE {
                     continue;
                 }
+                // SLIT gives `hops` - a relative number, good for ordering. HMAT gives the
+                // magnitudes, and each field is filled **only if HMAT reported it**: a 0 here
+                // means "not reported", which is what lets a caller tell a missing latency
+                // from a fast one. Nothing is derived from `hops`, because a relative
+                // distance is not a latency and converting one to the other would be
+                // inventing a number in the field a caller is most likely to rank by.
                 let cost = Cost {
-                    latency_ns: 0,
-                    bandwidth_mbs: 0,
+                    latency_ns: inv.lat_ns[from][to],
+                    bandwidth_mbs: inv.bw_mbs[from][to],
                     hops: d,
                     energy: 0,
                 };

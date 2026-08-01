@@ -2,7 +2,8 @@
 //! PVH `hvm_start_info` the bootloader handed us; the ACPI RSDP address in
 //! that same struct leads to the XSDT and from there to the MADT (CPU
 //! list), MCFG (PCIe ECAM base), SRAT (NUMA affinities), and SLIT (the
-//! node-to-node distance matrix - docs/RESOURCE-GRAPH.md 2.4).
+//! node-to-node distance matrix), and HMAT (real latency and bandwidth per
+//! initiator/target pair - docs/RESOURCE-GRAPH.md 2.4).
 //!
 //! Physical addresses are read through the kernel's high linear map
 //! (`arch::phys_to_virt`; docs/MEMORY.md) - the MMU is on before discovery
@@ -14,6 +15,9 @@ use crate::arch;
 
 fn rd8(pa: u64) -> u8 {
     unsafe { (arch::phys_to_virt(pa as usize) as *const u8).read() }
+}
+fn rd16(pa: u64) -> u16 {
+    unsafe { (arch::phys_to_virt(pa as usize) as *const u16).read_unaligned() }
 }
 fn rd32(pa: u64) -> u32 {
     unsafe { (arch::phys_to_virt(pa as usize) as *const u32).read_unaligned() }
@@ -111,6 +115,7 @@ fn walk_sdt(sdt: u64, is_xsdt: bool, inv: &mut Inventory) {
             b"MCFG" => parse_mcfg(table, inv),
             b"SRAT" => parse_srat(table, inv),
             b"SLIT" => parse_slit(table, inv),
+            b"HMAT" => parse_hmat(table, inv),
             b"NFIT" => parse_nfit(table, inv),
             b"DMAR" => parse_dmar(table, inv),
             _ => {}
@@ -364,4 +369,95 @@ fn parse_slit(base: u64, inv: &mut super::Inventory) {
     // A count above what SRAT described is legitimate - firmware may describe localities
     // with no memory or CPUs yet - so the node count rises to whichever is larger.
     inv.nnodes = inv.nnodes.max(count);
+}
+
+/// HMAT -> real latency and bandwidth per (initiator, target) pair (ACPI 6.x, 5.2.27).
+///
+/// This is what SLIT cannot give. A SLIT distance is a *relative* number in ACPI's own units,
+/// useful for ordering and useless for a decision that needs a magnitude - and the two fields
+/// a caller is most likely to rank by are exactly the two SLIT omits. HBM is lower-latency
+/// **and** higher-bandwidth than DDR; CXL is similar-bandwidth and much higher-latency; a
+/// scalar distance cannot express either (docs/RESOURCE-GRAPH.md 2.2), and until this parser
+/// existed the graph reported both as 0 = unknown rather than guessing.
+///
+/// Layout: the 40-byte HMAT header (a standard 36-byte table header plus 4 reserved), then a
+/// sequence of `(type u16, reserved u16, length u32)` structures. Type **1** is the System
+/// Locality Latency and Bandwidth Information structure, and the only one read here:
+///
+/// ```text
+///   +0  type u16 = 1        +8  flags u8         +10 reserved u16
+///   +4  length u32          +9  data_type u8     +12 num_initiator u32
+///   +16 num_target u32      +24 entry_base_unit u64
+///   +32 initiator list: num_initiator * u32
+///       target list:    num_target    * u32
+///       entries:        num_initiator * num_target * u16
+/// ```
+///
+/// `data_type` 0 is access latency and 3 is access bandwidth; the read/write variants (1, 2,
+/// 4, 5) are **deliberately ignored** rather than averaged into the access figure, because a
+/// read latency reported as an access latency is a fabricated number and the `Cost` vector has
+/// no field that means "read". They are a later refinement with their own fields.
+///
+/// A value is `entry * entry_base_unit`, latency in picoseconds and bandwidth in MB/s. Entry
+/// `0xFFFF` means "unreachable" and `0` means "unknown"; both are stored as 0, because a
+/// consumer of this table treats them identically - there is no cost it could use either way -
+/// and inventing a distinction here would be inventing information.
+fn parse_hmat(base: u64, inv: &mut super::Inventory) {
+    let total = rd32(base + 4) as usize;
+    if total < 40 {
+        return;
+    }
+    let mut off = 40usize;
+    while off + 8 <= total {
+        let kind = rd16(base + off as u64);
+        let len = rd32(base + off as u64 + 4) as usize;
+        // A zero or unaligned length would loop forever; a length past the table would read
+        // whatever follows it.
+        if len < 8 || off + len > total {
+            return;
+        }
+        if kind == 1 && len >= 32 {
+            let data_type = rd8(base + off as u64 + 9);
+            let ni = rd32(base + off as u64 + 12) as usize;
+            let nt = rd32(base + off as u64 + 16) as usize;
+            let unit = rd64(base + off as u64 + 24);
+            let need = 32 + ni * 4 + nt * 4 + ni * nt * 2;
+            if ni > 0 && nt > 0 && len >= need && unit > 0 {
+                let ilist = base + off as u64 + 32;
+                let tlist = ilist + (ni * 4) as u64;
+                let ents = tlist + (nt * 4) as u64;
+                for i in 0..ni {
+                    let from = rd32(ilist + (i * 4) as u64) as usize;
+                    if from >= super::MAX_DIST_NODES {
+                        continue;
+                    }
+                    for t in 0..nt {
+                        let to = rd32(tlist + (t * 4) as u64) as usize;
+                        if to >= super::MAX_DIST_NODES {
+                            continue;
+                        }
+                        let e = rd16(ents + ((i * nt + t) * 2) as u64);
+                        // 0 = unknown, 0xFFFF = unreachable. Neither is a usable cost.
+                        if e == 0 || e == 0xFFFF {
+                            continue;
+                        }
+                        let v = (e as u64).saturating_mul(unit);
+                        match data_type {
+                            // Access latency, HMAT's picoseconds -> the nanoseconds every
+                            // consumer of `Cost` reads. Rounded up, so a sub-nanosecond
+                            // latency reads as 1 rather than as "not reported".
+                            0 => {
+                                inv.lat_ns[from][to] =
+                                    ((v + 999) / 1000).min(u32::MAX as u64) as u32
+                            }
+                            // Access bandwidth, already MB/s.
+                            3 => inv.bw_mbs[from][to] = v.min(u32::MAX as u64) as u32,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        off += len;
+    }
 }

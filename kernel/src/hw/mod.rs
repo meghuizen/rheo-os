@@ -189,6 +189,11 @@ pub struct Inventory {
     /// worse than none: a caller would read a real answer for some pairs and a fabricated
     /// one for others (docs/ENGINEERING.md 11 - a field left constant is a field that lies).
     pub slit_truncated: bool,
+    /// HMAT access latency in **nanoseconds**, `lat[initiator][target]`, 0 = not reported.
+    /// HMAT states picoseconds; converted here so every consumer reads one unit.
+    pub lat_ns: [[u32; MAX_DIST_NODES]; MAX_DIST_NODES],
+    /// HMAT access bandwidth in **MB/s**, `bw[initiator][target]`, 0 = not reported.
+    pub bw_mbs: [[u32; MAX_DIST_NODES]; MAX_DIST_NODES],
     pub ecam_base: u64,
     /// VT-d remapping-hardware register base (first DRHD in the ACPI DMAR
     /// table), 0 if no IOMMU was discovered (docs/GPU-HARDWARE.md 4).
@@ -220,6 +225,8 @@ impl Inventory {
             nnodes: 0,
             dist: [[0; MAX_DIST_NODES]; MAX_DIST_NODES],
             slit_truncated: false,
+            lat_ns: [[0; MAX_DIST_NODES]; MAX_DIST_NODES],
+            bw_mbs: [[0; MAX_DIST_NODES]; MAX_DIST_NODES],
             ecam_base: 0,
             iommu_base: 0,
             npci: 0,

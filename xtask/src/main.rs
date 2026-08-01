@@ -642,6 +642,40 @@ fn fixed_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
         // a bare-ELF arm boot), and holding the launch identical is what makes that
         // difference the ISA's rather than the test's. CPU affinity is left
         // unassigned - the claim is about memory placement.
+        ("numa", Arch::X86_64) => &[
+            "-object",
+            "memory-backend-ram,id=m0,size=512M",
+            "-numa",
+            // `cpus=` is required once `hmat=on` is set: HMAT latency and bandwidth are
+            // stated per (initiator, target), and an initiator proximity domain is one with
+            // CPUs. Without it QEMU refuses the `hmat-lb` lines outright.
+            "node,nodeid=0,memdev=m0,cpus=0-1",
+            "-object",
+            "memory-backend-ram,id=m1,size=512M",
+            "-numa",
+            "node,nodeid=1,memdev=m1,cpus=2-3",
+            // The SLIT distances, and **these arguments are the test's oracle**: the kernel
+            // asserts that the graph reports exactly what is declared here, never that its
+            // own parser is self-consistent (docs/RESOURCE-GRAPH.md 5). ACPI's local value
+            // is 10; 20 is the conventional one-hop remote.
+            "-numa",
+            "dist,src=0,dst=1,val=20",
+            "-numa",
+            "dist,src=1,dst=0,val=20",
+            // HMAT: the magnitudes SLIT cannot give. These values are the test's oracle for
+            // `Cost::latency_ns` and `Cost::bandwidth_mbs`, exactly as the distances above are
+            // for `hops`. ACPI-only, so riscv64 and ARM64 ignore them and the kernel asserts
+            // those read 0 = unknown there rather than a number derived from the distance.
+            "-numa",
+            "hmat-lb,initiator=0,target=1,hierarchy=memory,data-type=access-latency,latency=100",
+            "-numa",
+            "hmat-lb,initiator=0,target=1,hierarchy=memory,data-type=access-bandwidth,bandwidth=10240M",
+            "-numa",
+            "hmat-lb,initiator=1,target=0,hierarchy=memory,data-type=access-latency,latency=100",
+            "-numa",
+            "hmat-lb,initiator=1,target=0,hierarchy=memory,data-type=access-bandwidth,bandwidth=10240M",
+        ],
+
         ("numa", _) => &[
             "-object",
             "memory-backend-ram,id=m0,size=512M",
@@ -784,7 +818,11 @@ impl Arch {
         match self {
             Arch::X86_64 => &[
                 "-machine",
-                "q35,kernel-irqchip=split",
+                // `hmat=on` publishes the ACPI HMAT table. Inert for every kernel that does
+                // not read it - one extra table in the RSDT - and it is on the machine line
+                // because QEMU takes a single `-machine`, so it cannot be added per kernel
+                // the way `-numa` can (docs/RESOURCE-GRAPH.md 2.4).
+                "q35,kernel-irqchip=split,hmat=on",
                 "-cpu",
                 "max",
                 "-m",
