@@ -1354,7 +1354,8 @@ written with no lock and read on the assumption of one CPU. Feeding a secondary
 runnable work before this is done is a data race, not a scheduler. So the **first
 deliverable is an audit, not a scheduler**: enumerate every `static mut` a second core
 could touch, and give each one an explicit discipline - a lock, per-CPU partitioning,
-or a single-owner core. The known set, from this tree:
+or a single-owner core. The known set, from this tree (the Linux-personality half is
+enumerated statically and classified in §10.2a below; the rest is still a plan):
 
 - **`mm::frames` / `frames_pmem`** - the frame allocator + per-frame refcount (COW).
   A global `SpinLock` initially; a per-CPU magazine (free-list cache) later for the
@@ -1380,6 +1381,113 @@ The rule (docs/ENGINEERING.md 3, one owner per shared resource) is the whole des
 each static gets exactly one owner or one lock, and the single-CPU build compiles the
 locks out (a `SpinLock` on one core is an uncontended flag), so the cooperative path
 is unchanged and stays the proof-of-correctness baseline.
+
+#### 10.2a The Linux-personality half of the audit, performed
+
+The list above is a plan; this is the audit itself for the half that gates Bun. Every
+mutable static in `kernel/src/linux/` is enumerated below with the class it belongs to
+and the discipline that class needs. It is written down because the alternative is a
+list rediscovered each time a slice touches the personality - and because the classes,
+not the individual names, are what decides how much locking is enough.
+
+**Class A - per-cell, indexed by cell.** One row per cell, and no cell's row is read or
+written by another cell's syscall:
+
+| File | Static | Holds |
+|---|---|---|
+| `mod.rs` | `LINUX_STATE` | fd table, cwd, brk/mmap bookkeeping, VMA list |
+| `proc.rs` | `PROCS`, `ASPACE`, `POLLSET` | process state, address space, the one pollset per cell |
+| `thread.rs` | `THREADS`, `FRAMES`, `FPAREAS`, `CUR_THREAD`, `NEXT_TID` | execution contexts, their trap frames and FP areas |
+| `signal.rs` | `ACTIONS`, `CTXS` | dispositions, per-context signal state |
+
+Class A is **safe by partitioning while one cell runs on one core** - which is exactly
+what `user::claim_cell` and the affinity tests in `nproc::schedulable` /
+`linux::proc`'s three runnable predicates enforce today, and why two Linux cells on two
+cores is proven (section 10.0). It stops being safe the moment *two contexts of one
+cell* run on two cores, because then two cores index the same row. That is the slice
+Bun's worker wants, and the discipline it needs is a **per-cell lock** - one per
+`LINUX_STATE` row, taken by the syscall path and by `fill_fault`, which is finer than
+`plock` and is what removes the "syscalls serialise machine-wide" limitation.
+
+**Class B - genuinely global, one copy for the machine.** Reached by any cell's
+syscall, so two cells on two cores reach them concurrently:
+
+| File | Static | Holds |
+|---|---|---|
+| `filemap.rs` | `TBL` (`Funded`) | the refcounted mapped-file registry |
+| `pipe.rs` | `PIPES` | cross-cell pipe rings (L6) |
+| `eventfd.rs` | `TBL` | eventfd counters (the counter is here, not in the fd) |
+| `timerfd.rs` | `TBL` | armed timerfds |
+| `epoll.rs` | `EPOLLS_TBL` | epoll sets |
+| `unixsock.rs` | `LISTENERS_TBL` | the AF_UNIX name registry |
+| `inetsock.rs` | `LISTENERS_TBL`, `DGRAMS`, `EPHEMERAL` | loopback INET endpoints, the ephemeral-port counter |
+| `proc.rs` | `NEXT_PID` | the pid counter |
+
+Class B is what `plock` exists for, and it is the reason the coarse lock was the right
+first step: a per-cell lock does **not** cover these, so the finer-locking slice must
+give each Class B table its own lock at the same time it splits Class A - or keep
+`plock` for exactly these and take it *inside* the per-cell lock. Either is sound; the
+second is smaller and is the recommended order, because a Class B table is touched a
+few times per syscall while Class A is touched on every one.
+
+**Class C - global scratch buffers.** The sharpest hazard in the file set, and the one
+a reader does not expect, because these are not state - they are staging areas used
+*within* one syscall:
+
+| File | Static | Used by |
+|---|---|---|
+| `mod.rs` | `MAPS_SCRATCH` (8 KiB) | rendering `/proc/self/maps` at open |
+| `proc.rs` | `EXEC_STR` (16 KiB), `EXEC_PATH` | staging `execve`'s argv/envp/path out of the old address space |
+| `stack.rs` | `LAST_AUXV`, `LAST_AUXV_LEN` | the auxv `/proc/self/auxv` serves |
+| `signal.rs` | `CTX_SCRATCH` | the fallback when a context has no funded signal slot |
+| `thread.rs` | `FP_SCRATCH` | the fallback FP save area |
+
+Two cores in one of these interleave *mid-syscall*, and the result is not a lost update
+but a **mixed buffer** - one cell's `execve` running with fragments of another's argv, or
+a `maps` render containing another cell's lines. No fault, no log; the failure looks like
+the program misbehaving. `plock` covers all five today. When it is split, each must become
+either per-CPU (the shape `PDEPTH` already uses) or a stack local - and per-CPU is the
+honest answer for the two large ones, since 16 KiB on the kernel stack is not available.
+
+**Class D - already per-CPU or atomic.** `mod.rs`'s `PLOCK` (atomic) and `PDEPTH`
+(`PerCpu`) - the lock's own state, correct by construction.
+
+Futex waiter state is not a table of its own: a context's `fut_addr` and its wait
+deadline are fields of its row in `THREADS`, so it is Class A and needs the per-cell
+lock, nothing more. `vma.rs`, `fd.rs`, `errno.rs` and `dirent.rs` hold **no** mutable
+statics - their state lives inside `LINUX_STATE`, which is what makes them Class A by
+containment rather than by their own discipline. That completes the file set.
+
+**Class E - diagnostic counters, lost updates only.** `mod.rs` `TRACE`, `TRACE_AT`,
+`ENOENT_LOGGED`, `STDOUT_TAP`; `mem.rs` `FAULTS`, `FAULTS_MMAP`; `thread.rs`
+`DEADLOCK_WAITS`, `IMMEDIATE_TIMEOUTS`. A race here costs a miscount or an interleaved
+trace line, never correctness - but a test that *asserts* one of these counts is reading
+a racy value, so any such assertion must either run single-core or the counter must
+become a relaxed atomic first (the fix `preempt`'s counters already took, section 10.0).
+`STDOUT_TAP` is a write-once function pointer set by a test before a run and read per
+write; the tap the `smp` kernel installs keys its capture buffer on
+`user::current_index()`, which is `PerCpu`, which is what lets two cells' transcripts be
+captured separately on two cores.
+
+**What is outside the lock.** `plock` brackets exactly two entry points - `linux::handle`
+(the whole syscall dispatch) and `linux::fill_fault` (the demand-paging entry, which is
+why the lock is recursive per CPU: a syscall reaches `fill_fault` through `uaccess`).
+Four further paths reach personality state from trap context **without** it, and they are
+named here rather than left to be found:
+
+- `linux::thread::preempt_context` and `linux::proc::preempt_cell`, from
+  `user::on_user_interrupt` (Class A: `THREADS`, `CUR_THREAD`, `PROCS`).
+- `linux::deliver_fault` and `linux::proc::exit_signaled`, from `user::on_user_trap`
+  (Class A: `ACTIONS`, `CTXS`, `PROCS`).
+- `linux::dup_state` / `install_cell` / `exec_reinit` / `reap` / `reset`, from the
+  loader and the run loop (Classes A and B).
+
+None of them is currently reachable concurrently: the two-Linux-cells-on-two-cores phase
+runs with dispatch **off**, so no preemption interleaves, and each of those cells owns its
+own Class A rows. That is a property of the proof, not of the code - so bringing
+preemption to two Linux cells at once means bracketing these four the same way, and the
+audit's practical conclusion is that **the per-cell lock must be taken by the trap-context
+entry points too**, not only by the syscall path.
 
 ### 10.3 Per-CPU infrastructure
 
