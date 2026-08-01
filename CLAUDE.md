@@ -12,6 +12,14 @@ The design lives in `docs/` and is the source of truth. Read
 `docs/ARCHITECTURE.md` first; `docs/BUILD-ORDER.md` says what gets built in
 what order; `docs/DEVELOPMENT.md` covers the day-to-day mechanics.
 
+**`docs/EXECUTION-MODEL.md` is the execution framework** - what a thread, a
+process, a task and a CPU each are here, drawn as a hierarchy and as a
+dependency graph, with the information budget each carries, the defaults a cell
+gets when it asks for nothing, ten invariants, every use case simulated against
+the graph, and FRED behind observation. Read it before touching scheduling,
+vcores, or the trap path: it exists because five separate defects in that area
+turned out to be one defect, and it names the cause.
+
 **`docs/ENGINEERING.md` is the engineering standard** - how a change lands
 here: observe-never-infer (a capability is claimed only from evidence the
 code cannot fake), waits expressed as deadlines not iteration counts, one

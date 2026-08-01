@@ -30,7 +30,11 @@ back. Here:
 
 (Implementation is owned by docs/SUBSTRATE.md stage S3, which also names
 the fair-class algorithm: EEVDF with BORE-style burstiness on top of the
-EDF reserved class.)
+EDF reserved class. What is being scheduled - the **execution entity**, its
+information budget, its state machine and its invariants - is designed in
+docs/EXECUTION-MODEL.md, along with the core-class taxonomy this section's
+pools bind to: P / E / LP cores and accelerator engines are one taxonomy, so
+placement is one decision rather than a scheduler plus a separate engine path.)
 
 A choice the design implied but never stated: **the kernel control plane is
 per-core (multikernel-style), not one shared kernel behind a big lock (SMP).**

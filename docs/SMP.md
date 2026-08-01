@@ -912,6 +912,14 @@ time instead of by hand.
 
 ### 10.0a One cell on two cores - vcores - built
 
+> The vcore work below landed in slices, and five defects came out of it (this section
+> records four of them; §10.2a records the fifth). They share one cause: an execution
+> context has three representations in this kernel and the agreement between them is
+> maintained by hand. **docs/EXECUTION-MODEL.md** is the top-down design that removes the
+> cause - one entity table, the dependency graph drawn, the invariants stated, the use
+> cases simulated, and a host fuzzer over the state machine. Read it before extending
+> anything here.
+
 Everything in 10.0 runs **different cells** on different cores. That is real
 parallelism, and it is not the parallelism a *program* has: a Node worker, a strand
 pool, a FlashAttention 3 producer/consumer pair are all one address space that wants

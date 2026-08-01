@@ -17,7 +17,13 @@ Validated as light threads against Linux/Go/Python in comparison/threads/
 preemption doorbell (section 4, needs the timer/IRQ path), stackful strands
 (section 2), priority-inheritance locks, and vcore-local storage. The
 multi-vcore build-out (per-core scheduler, work stealing, Linux threads as
-vcores) is owned by docs/SUBSTRATE.md pillar 3 / stage S3.
+vcores) is owned by docs/SUBSTRATE.md pillar 3 / stage S3, and its **execution
+entity** - the one thing a strand runs on, and the boundary the kernel scheduler
+never crosses - is designed top-down in docs/EXECUTION-MODEL.md. The division of
+labour stated once: the kernel schedules **entities** and never sees a strand; the
+`runtime/` executor schedules strands onto whichever entities the cell holds; the
+entity's burst score is exported read-only so both levels use one metric instead of
+each guessing at the other's.
 
 **The kernel half of "a cell holds N vcores" is now built** (docs/SMP.md 10.0a): a
 cell carries a trap frame, an FP/SIMD save area and an ownership claim **per vcore**

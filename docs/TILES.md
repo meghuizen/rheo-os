@@ -7,6 +7,18 @@ Implementation: `librheo/src/tile/` (the framework), graph-node ops 4-5
 (the kernel slice), the `librheotile` + `librheotilebattle` test kernels,
 `bench-core` `p5_*`, and `comparison/tiles/` (the host battle test).
 
+**Where tiles sit in the framework** (docs/EXECUTION-MODEL.md 2.1): a tile
+program is an ordinary **execution entity** whose class asks for a long slice
+and node-pinned memory, and whose lowering target is one of the **core
+classes**. P-cores, E-cores, LP-cores and accelerator engines are one
+taxonomy, so the machinery that puts a Node worker on a P-core is the machinery
+that puts a tile program on a GPU - one placement decision, one set of
+information, no scheduler path of its own. That is what makes tiles
+foundational rather than bolted on: the library below builds the program, and
+nothing about running it is special-cased. Where no engine exists the class
+resolves to CPU, and where it cannot the answer is `EngineUnavailable` - never
+a faked engine.
+
 Position: tile-centric compute - TileLang/cuTile/Triton on GPUs, SME tile
 registers and AMX on CPUs, systolic arrays on NPUs/TPUs, partial
 reconfiguration regions on FPGAs - is the industry's convergence point,
