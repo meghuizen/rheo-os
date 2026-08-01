@@ -3061,7 +3061,10 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               route a JS runtime's FFI takes, docs/TILES.md 13.4c) holds the
               built-from-source glibc test binaries (rusthello/ + rustthreads/
               + hello.c + sig_{raise,segv,dfl}.c + procdemo/cecho/rsh.c +
-              dhello.c + af_unix.c + inet.c + inetremote.c; coreutils via cargo
+              dhello.c + af_unix.c + inet.c + inetremote.c + regstress.c (the
+              registry-stress fixture: pipes + eventfds hammered in a loop, every
+              value keyed on the caller's pid, so two cells on two cores detect a
+              shared slot rather than tolerate one - docs/SMP.md 10.0d); coreutils via cargo
               install, and the L7 ld.so/libc.so.6
               copied from the toolchain - all gitignored)
 comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md; plus
