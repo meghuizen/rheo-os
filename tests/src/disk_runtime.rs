@@ -77,7 +77,14 @@ impl BlockSource for Cached {
 /// `execve` a dynamically-linked binary via the **streaming, demand-paged** path
 /// (`exec_elf_from_vfs_demand`): the program and its `PT_INTERP` interpreter are
 /// both streamed from the VFS and faulted in on demand - none resident whole.
-fn run_execve(path: &str, argv: &[&[u8]], envp: &[&[u8]], wx: bool) -> Outcome {
+fn run_execve(
+    path: &str,
+    argv: &[&[u8]],
+    envp: &[&[u8]],
+    wx: bool,
+    on_secondary: bool,
+    preempt: bool,
+) -> Outcome {
     user::reset();
     let mut aspace = AddressSpace::new(1);
     let ops = svc::file_ops().expect("file ops registered");
@@ -113,7 +120,22 @@ fn run_execve(path: &str, argv: &[&[u8]], envp: &[&[u8]], wx: bool) -> Outcome {
         }
         user::set_personality(0, Personality::Linux);
         linux::install_cell(0, &img, path.as_bytes());
-        user::run(0).1
+        if on_secondary {
+            // SAFETY: cell 0 is installed and present, and nothing else touches it.
+            match unsafe { run_on_secondary_core(preempt) } {
+                Some(code) => Outcome::Exited(code as u64),
+                None => {
+                    println!(
+                        "SKIP the secondary-core run - no secondary came up, or it did \
+                         not finish inside the bound, so nothing about this runtime off the \
+                         boot CPU is claimed"
+                    );
+                    arch::exit(arch::ExitCode::Success)
+                }
+            }
+        } else {
+            user::run(0).1
+        }
     }
 }
 
@@ -136,6 +158,31 @@ fn run_execve(path: &str, argv: &[&[u8]], envp: &[&[u8]], wx: bool) -> Outcome {
 /// proof **skips-with-reason** and passes; on `Outcome::Exited(0)` it asserts the
 /// exact output; a `DEADLOCK_EXIT` (the pre-per-context-blocking frontier, kept as
 /// a defensive skip) reports the reproducible partial; anything else fails.
+/// Bring up the machine and run installed cell 0 on a **secondary**, returning its exit
+/// code, or `None` if no secondary came up or it did not finish.
+///
+/// Only compiled into a bin built with the `smp` feature; every other caller of [`prove`]
+/// passes `on_secondary: false` and never reaches it.
+///
+/// # Safety
+/// Cell 0 must be installed and present, and nothing else may touch it.
+#[cfg(feature = "smp")]
+unsafe fn run_on_secondary_core(preempt: bool) -> Option<usize> {
+    kernel::smp::init();
+    kernel::smp::start_all();
+    if kernel::smp::online_count() < 2 {
+        return None;
+    }
+    // SAFETY: the caller's contract.
+    let (ok, code) = unsafe { kernel::smp::run_cell_on_secondary(0, preempt) };
+    if ok { Some(code) } else { None }
+}
+
+#[cfg(not(feature = "smp"))]
+unsafe fn run_on_secondary_core(_preempt: bool) -> Option<usize> {
+    None
+}
+
 pub fn prove(
     name: &str,
     path: &str,
@@ -150,6 +197,12 @@ pub fn prove(
     // it. `linuxbun` uses this to run a JS file that calls a tile kernel through
     // `bun:ffi` (docs/TILES.md 13.4d); every other caller passes `None`.
     second: Option<(&[&[u8]], &[u8])>,
+    // Run the cell **on a secondary core** rather than the boot CPU (docs/SMP.md 10.0e).
+    // The question a production runtime raises once the machine has more than one core:
+    // its whole load path - block device, ext4, `ld.so`, file-backed `mmap`, demand
+    // paging - plus JIT arenas and worker contexts, all driven from a core that is not
+    // the one that booted. `false` is the pre-existing path, byte for byte.
+    on_secondary: bool,
 ) -> ! {
     kernel::boot::init();
     println!("{name}: start on {}", arch::NAME);
@@ -227,7 +280,7 @@ pub fn prove(
         STDOUT_LEN = 0;
     }
     linux::set_stdout_tap(Some(tap));
-    let outcome = run_execve(path, argv, envp, wx_authority);
+    let outcome = run_execve(path, argv, envp, wx_authority, on_secondary, preemptive);
     linux::set_stdout_tap(None);
 
     // Streaming witness: the binary + ld.so + its libraries came off the device on
@@ -268,7 +321,7 @@ pub fn prove(
                     STDOUT_LEN = 0;
                 }
                 linux::set_stdout_tap(Some(tap));
-                let out2 = run_execve(path, argv2, envp, wx_authority);
+                let out2 = run_execve(path, argv2, envp, wx_authority, on_secondary, preemptive);
                 linux::set_stdout_tap(None);
                 let got2 = captured();
                 match out2 {

@@ -54,5 +54,7 @@ extern "C" fn kernel_main() -> ! {
         // (docs/ARCHITECTURE.md 5.1).
         true,
         None,
+        // Not on a secondary: this kernel is the boot-CPU proof (docs/SMP.md 10.0e).
+        false,
     )
 }

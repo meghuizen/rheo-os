@@ -463,6 +463,16 @@ fn secondary_work_loop() {
         let cell = USER_CELL.swap(usize::MAX, Ordering::AcqRel);
         if cell != usize::MAX {
             if rendezvous(&RV_SECONDARY, &RV_PRIMARY) {
+                // **This core's own preemption timer**, if the publisher asked for one.
+                // Every register involved is per-core hardware that no trampoline sets, so
+                // a secondary that skipped this runs the cell cooperatively however the
+                // boot is configured - which is what a Bun on a secondary did on the first
+                // run, reporting 0 of 24 slices taken while the primary's identical boot
+                // was preemptive. The *global* half (APIC-mode probe, IDT gate, one-shot
+                // self-test) is the primary's and has already happened.
+                if USER_CELL_PREEMPT.load(Ordering::Acquire) == 1 {
+                    enable_preemption_here();
+                }
                 let code = code_of(crate::user::run(cell).1);
                 USER_CELL_CODE.store(code as usize, Ordering::Release);
             }
@@ -859,6 +869,10 @@ unsafe fn gemm_rows(job: &GemmJob, lo: usize, hi: usize) {
 /// for none (docs/SMP.md 10.0).
 static USER_CELL: AtomicUsize = AtomicUsize::new(usize::MAX);
 #[cfg(feature = "smp")]
+/// Whether the secondary should arm its own preemption timer before entering the published
+/// cell. 1 = yes. Per-core hardware, so the secondary has to do it itself.
+static USER_CELL_PREEMPT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "smp")]
 /// The outcome code the secondary's cell exited with, and a done flag.
 static USER_CELL_CODE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "smp")]
@@ -905,6 +919,50 @@ pub unsafe fn run_cells_on_both(own: usize, other: usize) -> (bool, bool, usize,
         code_of(outcome),
     )
 }
+
+#[cfg(feature = "smp")]
+/// Run **one named cell on a secondary** while this core only waits. Returns
+/// `(rendezvous_held_and_finished, exit_code)`.
+///
+/// [`run_cells_on_both`] needs a cell for the primary too, which is right when the point is
+/// overlap. When the point is only "this cell ran off the boot CPU" - a production runtime
+/// whose whole load path is being asked about, say - inventing a second cell adds a variable
+/// to the experiment. This publishes the cell, meets the secondary so its start is known,
+/// and waits.
+///
+/// # Safety
+/// `cell` must be installed, present, and touched by nobody else for the duration.
+pub unsafe fn run_cell_on_secondary(cell: usize, preempt: bool) -> (bool, usize) {
+    USER_CELL_PREEMPT.store(usize::from(preempt), Ordering::Release);
+    USER_CELL_DONE.store(0, Ordering::Release);
+    USER_CELL_CODE.store(0, Ordering::Release);
+    RV_PRIMARY.store(0, Ordering::Release);
+    RV_SECONDARY.store(0, Ordering::Release);
+    RV_TIMEOUT.store(0, Ordering::Release);
+    USER_CELL.store(cell, Ordering::Release);
+
+    let met = rendezvous(&RV_PRIMARY, &RV_SECONDARY);
+    // **A different bound from the rendezvous's**, and not by taste. `RV_TIMEOUT_NS` (2 s)
+    // answers "did a secondary arrive", which is a handshake. This waits for a whole
+    // *program* to run, and a production runtime streaming ~100 MB off ext4 under TCG takes
+    // tens of seconds - the first version reused the 2 s bound and reported "no secondary
+    // came up" for a Bun that had already brought JSC up and taken its JIT grant. Sized to
+    // sit under the harness's own 120 s boot timeout so a genuine hang still reports here,
+    // with a reason, rather than as a bare timeout.
+    let deadline = arch::timer_now_ns().wrapping_add(CELL_RUN_TIMEOUT_NS);
+    while USER_CELL_DONE.load(Ordering::Acquire) == 0 {
+        if arch::timer_now_ns() >= deadline {
+            return (false, 0);
+        }
+        core::hint::spin_loop();
+    }
+    (met, USER_CELL_CODE.load(Ordering::Acquire))
+}
+
+#[cfg(feature = "smp")]
+/// How long to wait for a **cell** handed to a secondary to finish, as distinct from how
+/// long to wait for the secondary itself to show up. 100 s, under the boot test's 120 s.
+const CELL_RUN_TIMEOUT_NS: u64 = 100_000_000_000;
 
 // ------------------------------------------ placing runnable cells on free cores
 //

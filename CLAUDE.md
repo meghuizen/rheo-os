@@ -2013,10 +2013,21 @@ with the faults taken on a secondary's trap path using its own kernel stack. It 
 `run_cells_on_both` (a **named** cell to a secondary) rather than `place_cells` (where which
 core takes which is a race), and that was not cosmetic: the first version used `place_cells`
 and asserted only that the cells landed on *different* cores - the run put the dynamic cell on
-the **primary**, so the assertion passed while its own message was false. Honest about the
-distance: this says the load path works off the boot CPU; it does **not** run Bun or Claude
-Code there (99 MB and 275 MB, JIT arenas behind the W^X exception, worker contexts - none of
-it touched). What it removes is doubt about the mechanism underneath them.
+the **primary**, so the assertion passed while its own message was false. **And the real Bun runs on a
+secondary too** (`linuxbunsmp`): the same binary, disk, JIT authority and preemptive dispatch
+as `linuxbun` and the same strict gate - it streams off the live ext4 disk (~9,200 block-cache
+fills), brings up JavaScriptCore with its JIT behind the W^X exception, takes **83 preemption
+slices on that secondary**, prints exactly `rheo:42` and exits 0 (x86-64 only, as `linuxbun`).
+**The prediction written down first was wrong, instructively**: it said this needed *threads of
+one Linux cell across cores*, because Bun spawns a worker - it does not, since Bun's contexts
+are scheduled cooperatively *within* whichever core runs the cell, exactly as on the primary.
+Two things the first run got wrong, both found by reading its output: `run_cell_on_secondary`
+reused the 2 s **rendezvous** bound to wait for a whole *program*, and reported "no secondary
+came up" for a Bun that had already taken its JIT grant (it has its own 100 s bound now); and
+the secondary ran the cell **cooperatively** (`0/24` slices) because a preemption timer is
+per-core hardware no trampoline sets - it arms its own now (`83/6243`). Still not shown: Claude
+Code on a secondary (275 MB; the mechanism is now Bun's, so that is time rather than doubt),
+and *parallel* threads of one Linux cell, which still need 10.2's per-cell locking.
 
 **And a Linux cell FORKS off the boot CPU** (docs/SMP.md 10.0c) - the other half of that
 question. `fork` creates a **new cell**, and an unclaimed cell is pickable by every core
@@ -2910,7 +2921,10 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               `regstress FAIL 5`, docs/SMP.md 10.0d; and a **DYNAMIC cell off a
               LIVE ext4 DISK on a SECONDARY** - the Node/Bun/Claude-Code load path
               (block device, ext4, PT_INTERP, file-backed mmap, demand paging)
-              proven off the boot CPU, docs/SMP.md 10.0e), shell-smoke, hwinfo, rng, runtime
+              proven off the boot CPU, docs/SMP.md 10.0e), linuxbunsmp (the REAL
+              Bun binary on a SECONDARY core: same disk, JIT and preemption as
+              linuxbun, 83 slices taken on that core, `rheo:42` and exit 0 -
+              x86-64 only, docs/SMP.md 10.0e), shell-smoke, hwinfo, rng, runtime
               (the strand runtime, closing with the **measured** concurrency /
               async / sync phases: 256 strands in flight with every round a
               permutation, 63 I/O ops outstanding at one instant with one

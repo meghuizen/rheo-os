@@ -65,5 +65,7 @@ extern "C" fn kernel_main() -> ! {
         // before, which is what makes this a capability rather than a setting.
         true,
         None,
+        // Not on a secondary: this kernel is the boot-CPU proof (docs/SMP.md 10.0e).
+        false,
     )
 }

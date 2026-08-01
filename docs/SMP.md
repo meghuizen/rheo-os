@@ -1283,10 +1283,37 @@ cores, and the run put the dynamic cell on the **primary** - the assertion passe
 claim in its own message was false. "The dynamic cell ran off the boot CPU" has to be the
 deterministic form.
 
-**Honest about the distance this closes.** It says the load path works off the boot CPU. It
-does **not** run Bun or Claude Code there: those are 99 MB and 275 MB, they bring up JIT
-arenas behind the W^X exception, and they spawn worker contexts - none of which this touches.
-What it removes is doubt about the mechanism underneath them.
+**And the real Bun runs there too** - `linuxbunsmp`, the same binary, disk, JIT authority
+and preemptive dispatch as `linuxbun`, held to the same strict gate: it streams off the live
+ext4 disk (~9,200 block-cache fills), brings up JavaScriptCore with its JIT behind the W^X
+exception, takes **83 preemption slices on that secondary**, evaluates
+`console.log("rheo:"+(40+2))`, prints exactly `rheo:42` and exits 0. x86-64 only, as
+`linuxbun` - there is no arm64/riscv64 bun build here, so those ISAs skip with a reason.
+
+**The prediction written down before running it was wrong, and instructively.** It said this
+would need *threads of one Linux cell across cores* - the finer per-cell locking 10.2
+describes - because Bun spawns a worker. It does not: Bun's contexts are scheduled
+cooperatively *within* whichever core runs the cell, exactly as on the primary, so nothing
+about them has to change for the cell to sit on a secondary. Parallel execution of those
+contexts is a separate capability and this needs none of it. Worth recording because the
+wrong version was a plausible story, and the cheap experiment settled it (ENGINEERING.md 1).
+
+Two things the first run got wrong, both found by reading its own output rather than by
+reasoning:
+
+- `run_cell_on_secondary` reused `RV_TIMEOUT_NS` (2 s) to wait for the cell. That bound
+  answers "did a secondary arrive"; waiting for a *program* is a different magnitude, and
+  Bun had already brought JSC up and taken its JIT grant when the wait gave up and reported
+  "no secondary came up". It has its own `CELL_RUN_TIMEOUT_NS` (100 s, under the harness's
+  120 s) so a genuine hang still reports here with a reason.
+- The secondary ran the cell **cooperatively**: `0/24` slices taken, while the primary's
+  identical boot was preemptive. A preemption timer is per-core hardware no trampoline sets,
+  so the secondary now arms its own when the publisher asks for one - `83/6243` slices after.
+
+**Honest about what is still not shown.** Claude Code on a secondary is not run (275 MB; the
+mechanism is now the same as Bun's, so this is time rather than doubt), and *parallel* threads
+of one Linux cell still need the per-cell locking of 10.2 - a Linux cell's contexts share one
+core here, whichever core that is.
 
 ### 10.1 The measured motivation (not a wish)
 

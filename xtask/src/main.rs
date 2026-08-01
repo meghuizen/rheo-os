@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 67] = [
+const TEST_KERNELS: [&str; 68] = [
     "kernel",
     "substrate",
     "cap-invariants",
@@ -33,6 +33,7 @@ const TEST_KERNELS: [&str; 67] = [
     "numa",
     "smp",
     "linuxsmp",
+    "linuxbunsmp",
     "shell-smoke",
     "hwinfo",
     "rng",
@@ -307,6 +308,13 @@ fn fixed_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
         // test skips-with-reason. Image built by `build_bun_disk_fixture`
         // (gitignored); a placeholder when /root/.bun is absent (CI) makes the test
         // skip, so CI stays green.
+        // The same bun image as `linuxbun`, for the secondary-core run (docs/SMP.md 10.0e).
+        ("linuxbunsmp", Arch::X86_64) => &[
+            "-drive",
+            "file=tests/linux-fixtures/build/x86_64/bun-disk.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-pci,drive=blk0,disable-legacy=on",
+        ],
         ("linuxbun", Arch::X86_64) => &[
             "-drive",
             "file=tests/linux-fixtures/build/x86_64/bun-disk.img,if=none,id=blk0,format=raw",
@@ -2406,6 +2414,8 @@ fn build_smp_kernel(arch: Arch, release: bool) -> bool {
         "smp",
         "--bin",
         "linuxsmp",
+        "--bin",
+        "linuxbunsmp",
         "--features",
         "smp",
         "--target",

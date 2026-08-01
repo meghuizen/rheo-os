@@ -110,5 +110,7 @@ extern "C" fn kernel_main() -> ! {
         // the `dlopentile` C probe produce. 31 bits because a JS number is exact only to
         // 2^53.
         Some((&[b"bun", b"/bin/tileffi.js"], b"tileffi: gemm 568708273\n")),
+        // Not on a secondary: this kernel is the boot-CPU proof (docs/SMP.md 10.0e).
+        false,
     )
 }
