@@ -132,9 +132,79 @@ answers "everything is equally near", which is exactly correct for that machine,
 `graph_source()` reports what it was built from so no proof can claim distances it does not
 have.
 
+### 2.5 Capability sets, and why heterogeneity makes them first-class
+
+A cost tells you where something is *best* run. It does not tell you where it *can* run,
+and the moment a cluster mixes architectures or generations those are different questions.
+So every executor node carries a capability set:
+
+```rust
+pub struct IsaSet {
+    pub arch: Arch,          // X86_64 | Aarch64 | Riscv64
+    pub baseline: u8,        // x86-64-v1..v4, ARMv8.0..9.x, RVA20/22/23
+    pub features: FeatureMask,  // avx512f, vnni, amx, sve2, rvv, aes, ...
+}
+
+pub struct EngineCaps {
+    pub kind: EngineKind,    // Gpu | Npu | Accel | Cpu
+    pub isa_version: u32,    // an SM level, a GFX target, an NPU generation
+    pub tile_shapes: ...,    // what the TileContract declares (docs/TILES.md)
+    pub mem_bytes: u64,
+}
+```
+
+Two things this makes expressible that nothing currently does:
+
+- **A binary compiled for x86-64-v4 cannot run on a v3 node.** In a mixed-generation
+  cluster that is not a performance question, it is a `SIGILL`. The graph must be able to
+  answer it *before* placement, not after the fault.
+- **A GPU kernel built for one ISA version will not load on another.** NVIDIA SM levels,
+  AMD GFX targets and NPU generations are not interchangeable, and a "nearest GPU" query
+  that ignores that returns a device the work cannot use.
+
+`baseline` is separate from `features` deliberately: a baseline is a *contract a compiler
+was given*, and the useful question is almost always "does this node meet the baseline my
+binary was built for", not "does it have each of thirty flags".
+
 ---
 
-## 3. What a driver does with it
+## 3. Placement is two phases, and the order matters
+
+This is the part heterogeneity forces, and it is where the graph meets
+docs/CPU-FEATURES.md 2:
+
+```
+   want: an int8 GEMM, 64x64x64, on a tile of 4 MiB
+      |
+   PHASE 1 - FILTER by capability.  Which nodes can run this AT ALL?
+      |         each candidate resolves to one of:
+      |           Native      - it has the instruction
+      |           Translated  - a different sequence, SAME BITS (cost penalty applies)
+      |           Emulated    - portable scalar, same bits, large penalty
+      |           Unavailable - drop the candidate
+      v
+   PHASE 2 - RANK the survivors by cost, on the metric the CALLER named
+      |         (bandwidth for a GEMM, latency for an RPC, energy for background work),
+      |         with the resolution penalty folded into the cost
+      v
+   place
+```
+
+Filter first, then rank - never one combined score. A combined score can trade correctness
+for proximity, which is how you get work placed on a node where it produces a *different
+answer* or does not run at all. And the resolution outcome is not binary because
+CPU-FEATURES.md 2.2 already establishes that a translation may be **bit-exact** or merely
+**numerically similar**: a caller under a bit-exact contract - which every tile kernel is,
+and which is what makes the FlashAttention proofs equalities - must have `Numeric`
+candidates filtered *out*, not ranked down. So the filter takes the caller's contract as an
+input.
+
+The payoff is that "run this where it fits best" becomes one query over one graph whether
+the candidates are two sockets, a CPU and a GPU, or two hosts of different generations.
+
+---
+
+## 4. What a driver does with it
 
 This is the point, and it connects docs/DRIVERS.md D2 directly. A driver cell asks:
 
@@ -198,7 +268,71 @@ the launch names, never against the code's own tables**:
 A control exists for each: an inverted distance table, a device's `_PXM` ignored, and a
 driver allocating from the pool at large should each fail a named assertion.
 
-## 6. Honesty
+## 6. The consumers: kernel, libraries, and POSIX translation
+
+A machine model that only the kernel can see is half a model. Three consumers, and the
+third is the one that makes existing software work.
+
+### 6.1 The kernel
+
+- `frames::alloc_on(node)` exists; `nearest(node, MemoryNode, Latency)` is what makes its
+  *fallback* a choice rather than "the pool at large".
+- The entity's `node` and `core_class` fields already exist in the hot line
+  (docs/EXECUTION-MODEL.md 4.1) and are currently set by a round-robin. Phase 1/Phase 2
+  above is what sets them from evidence.
+- Driver queue, bounce-frame and MSI-X placement (section 4).
+- The `sched::dispatch` seam is unchanged: the graph informs *where*, the ready queue still
+  decides *when*. Keeping those apart is why the queue has produced no defects.
+
+### 6.2 The libraries
+
+`librheo` gets a `graph` module - read-only queries over what the kernel published, no new
+verb, the `SYS_ENGINE_INFO` / `SYS_VCORE_INFO` shape. It replaces per-library probing:
+`tile::simd` currently probes CPUID itself, `compute` asks `Engine::info`, and `mem`
+takes a node hint - three components each discovering a slice of one model. With the graph
+they *ask*, which is also what lets a tile program pick a lowering for a **remote** engine
+it cannot execute a CPUID instruction on.
+
+### 6.3 POSIX translation - and this is the biggest practical unlock
+
+The POSIX/Linux surface for topology is **`/sys` plus a few syscalls**, and the de facto
+consumer is **hwloc** - which OpenMP, MPI, and essentially every HPC runtime and batch
+scheduler sits on. Synthesize that surface from the graph and unmodified HPC software gets a
+correct machine view with no port:
+
+| Surface | Fed by |
+|---|---|
+| `/sys/devices/system/cpu/online`, `present`, `possible` | the graph's CPU set |
+| `/sys/devices/system/cpu/cpuN/topology/{core_id,physical_package_id,thread_siblings_list}` | SMT sets and packages |
+| `/sys/devices/system/cpu/cpuN/cache/indexN/{level,size,shared_cpu_list}` | LLC domains |
+| `/sys/devices/system/node/nodeN/{cpulist,meminfo,distance}` | **`distance` is SLIT** - the file libnuma and hwloc read |
+| `/sys/devices/system/node/nodeN/hmem_attrs/…` | HMAT bandwidth and latency |
+| `/sys/bus/pci/devices/*/numa_node` | a device's proximity domain |
+| `/proc/cpuinfo` flags | the per-node `IsaSet` |
+| `getcpu`, `sched_getaffinity`, `sysconf(_SC_NPROCESSORS_ONLN)` | the graph + the entity's owner |
+| `mbind`, `set_mempolicy`, `move_pages` | `alloc_on` and the migration path |
+
+**The rule, which this tree has already paid to learn:** every one of those must be
+*generated from the graph at open*, never seeded as a static file. `/proc/self/maps` is the
+precedent - it is rendered from the cell's real VMA list precisely because "a static `maps`
+would be a fabricated memory layout, and a runtime reading it to locate its own code would
+be misled rather than refused" (docs/LINUX-COMPAT.md). Topology is the same: a program that
+reads a fabricated distance matrix places its data wrongly and reports a benchmark.
+
+**And there is already a live instance of exactly that defect.** `xtask` seeds
+`/sys/devices/system/cpu/online` = `0-0` with the justification "one CPU schedules cells;
+SMP bring-up runs a second core for bounded work but nothing is dispatched to it". That was
+true when written and **is now false**: `linuxsmp` runs four Linux cells across four cores,
+`linuxbunsmp` / `linuxnodesmp` / `linuxclaudesmp` run the real runtimes on a secondary, and
+`place_cells` dispatches to whichever core is free. So the value is a constant that lies -
+the `st_ino = 1` scar restated ("a field left constant is a field that lies",
+docs/ENGINEERING.md 11) - and the consequence is not cosmetic: **libuv sizes its thread
+pool from the CPU count**, so Node and Bun under-parallelise on a 4-core boot because the
+kernel told them there is one core. Fixing it by editing the fixture to `0-3` would be the
+same defect with a different constant; it has to come from `smp::online_count()`, which is
+the narrow first step toward this whole document.
+
+## 7. Honesty
 
 - **Nothing here is built.** `hw::Inventory` has the data; the graph, the costs and the
   queries do not exist.
