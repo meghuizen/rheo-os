@@ -61,6 +61,11 @@ const CHELLO_EXIT: u64 = 9;
 /// preempted two-core phase below, because that phase needs a cell that runs long
 /// enough to be interrupted **and** has sibling contexts to be interrupted *to*.
 static RUSTTHREADS: &[u8] = fixture::linux_cargo!("rustthreads");
+
+/// Reads `/sys/devices/system/cpu/online` and prints it. Run here rather than in a
+/// single-CPU kernel because the value being tested is the *online count*, and a one-core
+/// boot cannot tell a synthesized answer from the constant `0-0` it replaced.
+static CPULIST: &[u8] = fixture::linux!("cpulist");
 const RUSTTHREADS_OUT: &[u8] = b"threads 4 total 1550 channel 1550\n";
 const RUSTTHREADS_EXIT: u64 = 4;
 
@@ -116,6 +121,7 @@ extern "C" fn kernel_main() -> ! {
     test_four_linux_cells();
     test_linux_fork_across_cores();
     test_registry_stress_two_cores();
+    test_cpu_list();
     test_preempted_threads_two_cores();
     test_dynamic_cell_on_secondary();
 
@@ -938,4 +944,56 @@ fn test_dynamic_cell_on_secondary() {
              boot CPU (docs/SMP.md 10.0e) OK"
         );
     }
+}
+
+// --------------------------------- the kernel's CPU list, asserted against the launch
+//
+// `/sys/devices/system/cpu/online` was a **seeded constant** `0-0`, justified in xtask's own
+// comment as "one CPU schedules cells; SMP bring-up runs a second core for bounded work but
+// nothing is dispatched to it". That was true when written and became false: this very kernel
+// runs four Linux cells across four cores. So it was a constant that lies - the `st_ino = 1`
+// scar restated (docs/ENGINEERING.md 11) - and the consequence is not cosmetic, because
+// **libuv sizes its thread pool from the CPU count**: Node and Bun under-parallelise on a
+// four-core boot when the kernel tells them there is one core.
+//
+// It is synthesized from `smp::online_count()` now, the way `/proc/self/maps` is rendered
+// from the real VMA list rather than seeded - a static topology file is a fabricated machine.
+//
+// **The oracle is the launch, not the kernel.** QEMU starts this kernel with `-smp 4`, so the
+// expected string is `0-3`. Asserting the kernel's rendering against the kernel's own count
+// would show only that it is self-consistent, which is the mistake the `entity` fuzzer's
+// first I5 check made (verify/README.md).
+
+fn test_cpu_list() {
+    let online = smp::online_count();
+    // SAFETY: single-threaded setup on the primary; secondaries are parked in their work
+    // loop and this cell runs here.
+    let outcome = unsafe {
+        STDOUT_LEN = [0; CAP_CELLS];
+        kernel::linux::set_stdout_tap(Some(tap));
+        let o = harness::run_linux_cell(CPULIST, &[b"cpulist"]);
+        kernel::linux::set_stdout_tap(None);
+        o
+    };
+    let got = captured(0);
+    // `-smp 4` in the launch. Derived from `online` only for the message, never for the
+    // comparison.
+    let want: &[u8] = b"cpulist: online=0-3\n";
+    match outcome {
+        kernel::user::Outcome::Exited(0) => {}
+        other => panic!("cpulist exited {other:?} (kernel reports {online} online)"),
+    }
+    assert!(
+        got == want,
+        "the kernel's /sys/devices/system/cpu/online reads {:?}; QEMU launched this kernel \
+         with -smp 4 so it must read 0-3. A seeded constant would read 0-0 here, and libuv \
+         sizes its thread pool from it",
+        core::str::from_utf8(got)
+    );
+    println!(
+        "linuxsmp: THE CPU LIST IS SYNTHESIZED, NOT SEEDED - a Linux cell read \
+         /sys/devices/system/cpu/online and got `0-3`, which is what QEMU's `-smp 4` \
+         declared; the kernel independently reports {online} online. It was the constant \
+         `0-0`, and libuv sizes its thread pool from it OK"
+    );
 }

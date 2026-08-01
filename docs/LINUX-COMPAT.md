@@ -1170,13 +1170,27 @@ fixup path.
 
   Alongside it the disk fixture seeds the small set of `/proc` and `/sys` values this
   kernel genuinely has, each true rather than plausible:
-  `/sys/devices/system/cpu/online` = `0-0` (one CPU schedules cells),
   `/proc/sys/vm/overcommit_memory` = 0 (heuristic - accurate, since `mmap` reserves and
   frames arrive on fault), `/proc/sys/vm/mmap_min_addr` = 65536 (nothing is mapped
   below it), `/proc/self/cgroup` = `0::/` and cgroup `memory.max`/`memory.high` = `max`
   (there are no cgroups, and that is the v2 spelling of unconstrained), and a
-  `/proc/stat` whose `cpuN` line count is right while its jiffy fields are 0 **because
-  they are 0**.
+  `/proc/stat` whose jiffy fields are 0 **because they are 0** - though its `cpuN` line
+  count is still one whatever the boot's CPU count is, which is the defect below with
+  the fix deferred rather than done (docs/ARCHITECTURE-DEBT.md 7.6).
+
+  **`/sys/devices/system/cpu/{online,present,possible}` is synthesized, not seeded.** It
+  was a seeded `0-0`, justified as "one CPU schedules cells; SMP bring-up runs a second
+  core for bounded work but nothing is dispatched to it" - true when written, and false
+  from the moment `linuxsmp` ran four Linux cells across four cores and `place_cells`
+  began dispatching to whichever core was free. So it was a constant that lies, the
+  `st_ino = 1` scar restated, and the consequence is not cosmetic: **libuv sizes its
+  thread pool from the CPU count**, so Node and Bun under-parallelise on a four-core
+  boot. `maybe_open_maps` now renders it from `smp::online_count()`, and the file is
+  **removed** from the disk seed rather than corrected - editing it to `0-3` would be the
+  same defect with a different constant, and leaving it there would let the seeded copy
+  answer first on the disk boots. Proven by `cpulist` in `linuxsmp`, whose oracle is
+  **QEMU's `-smp 4`** and not the kernel's own count: asserting a rendering against the
+  number that produced it shows only self-consistency.
 
   **The lesson is the cheapness of the fix relative to the guesses.** Two large,
   correctly-built mechanisms - preemption and the W^X capability - were each driven to

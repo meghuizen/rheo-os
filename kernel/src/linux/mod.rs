@@ -518,6 +518,32 @@ fn maybe_open_maps(st: &mut LinuxState, path_va: u64, flags: u64) -> Option<i64>
     // SAFETY: bounded by `strlen` inside the calling cell's readable range, whose
     // address space is active for the trap.
     let path = unsafe { core::slice::from_raw_parts(path_va as *const u8, n) };
+    // `/sys/devices/system/cpu/online` is **synthesized from the CPU count**, for the same
+    // reason `/proc/self/maps` is rendered from the real VMA list rather than seeded: a
+    // static topology file is a fabricated machine, and a runtime that reads it to size
+    // itself is misled rather than refused.
+    //
+    // It was seeded as the constant `0-0`, justified as "one CPU schedules cells; SMP
+    // bring-up runs a second core for bounded work but nothing is dispatched to it". That
+    // was true when written and became false: `linuxsmp` runs four Linux cells across four
+    // cores, `linuxbunsmp` / `linuxnodesmp` / `linuxclaudesmp` run the real runtimes on a
+    // secondary, and `place_cells` dispatches to whichever core is free. So it was a
+    // constant that lies - the `st_ino = 1` scar restated (docs/ENGINEERING.md 11) - and the
+    // consequence is not cosmetic: **libuv sizes its thread pool from the CPU count**, so
+    // Node and Bun under-parallelise on a four-core boot because the kernel told them there
+    // was one core.
+    //
+    // Editing the seeded file to `0-3` would be the same defect with a different constant.
+    if path == b"/sys/devices/system/cpu/online"
+        || path == b"/sys/devices/system/cpu/present"
+        || path == b"/sys/devices/system/cpu/possible"
+    {
+        // SAFETY: as `MAPS_SCRATCH` below - a synchronous trap, used and copied out before
+        // returning.
+        let scratch = unsafe { &mut *addr_of_mut!(MAPS_SCRATCH) };
+        let len = render_cpu_list(scratch);
+        return Some(st.fds.open_maps(&scratch[..len], flags));
+    }
     if path != b"/proc/self/maps" {
         return None;
     }
@@ -2471,4 +2497,58 @@ fn sys_arch_prctl(cur: usize, code: u64, addr: u64) -> Ctl {
         }
         _ => err(errno::EINVAL),
     }
+}
+
+/// Render Linux's CPU-list format for the cores that are **actually online**.
+///
+/// The kernel format is a comma-separated list of ranges, and the single-CPU case must render
+/// as `0` rather than `0-0`: a real Linux prints `0` there, and a parser that special-cases
+/// the degenerate form is one more thing that can be wrong. Both are accepted by every
+/// parser in practice, so this is about matching what the file says rather than about
+/// compatibility.
+///
+/// Contiguous from 0 because that is what `smp::online_count()` describes - this kernel
+/// brings up cores 0..n and does not offline one. A machine with a hole would need the real
+/// online mask, and the honest note is that this renders a *count*, not a *set*; if offlining
+/// ever exists, this is the function that has to learn the difference.
+fn render_cpu_list(out: &mut [u8]) -> usize {
+    let n = crate::smp::online_count().max(1);
+    let mut w = 0usize;
+    w += put_num(out, w, 0);
+    if n > 1 {
+        if w < out.len() {
+            out[w] = b'-';
+            w += 1;
+        }
+        w += put_num(out, w, n - 1);
+    }
+    if w < out.len() {
+        out[w] = b'\n';
+        w += 1;
+    }
+    w
+}
+
+/// Write `v` in decimal at `at`, returning the bytes written. Bounded by `out`, so a buffer
+/// too small truncates rather than writing past it.
+fn put_num(out: &mut [u8], at: usize, v: usize) -> usize {
+    let mut digits = [0u8; 20];
+    let mut i = digits.len();
+    let mut x = v;
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (x % 10) as u8;
+        x /= 10;
+        if x == 0 {
+            break;
+        }
+    }
+    let mut n = 0usize;
+    for &d in &digits[i..] {
+        if at + n < out.len() {
+            out[at + n] = d;
+            n += 1;
+        }
+    }
+    n
 }

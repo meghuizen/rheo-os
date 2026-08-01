@@ -1726,6 +1726,7 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         // so the wrong spelling links fine and produces a p_memsz of 0.
         ("stackx.c", "stackx", &["-Wl,-z,stack-size=12582912"]),
         ("sysx.c", "sysx", NO_EXTRA),
+        ("cpulist.c", "cpulist", NO_EXTRA),
         ("mmapdp.c", "mmapdp", NO_EXTRA),
         ("cowfork.c", "cowfork", NO_EXTRA),
     ] {
@@ -2090,10 +2091,6 @@ fn build_runtime_disk_fixture(
 ///
 /// Each value is true of this kernel:
 ///
-/// - `/sys/devices/system/cpu/online` = `0-0`. One CPU schedules cells; SMP bring-up
-///   runs a second core for bounded work but nothing is dispatched to it (docs/SMP.md
-///   10), so a runtime sizing a thread pool from this gets the number of cores it can
-///   actually be scheduled on.
 /// - `/proc/sys/vm/overcommit_memory` = `0` (heuristic). Accurate: `mmap` reserves
 ///   without committing and frames arrive on fault (demand paging), which is what
 ///   heuristic overcommit describes.
@@ -2103,15 +2100,22 @@ fn build_runtime_disk_fixture(
 ///   spelling of "the root, unconstrained" - the answer an unconstrained Linux process
 ///   gets, not a placeholder.
 /// - `/proc/stat` = one `cpu` aggregate line plus `cpu0`. The jiffy fields are zero
-///   because this kernel keeps no per-CPU jiffy accounting; a reader counting `cpuN`
-///   lines - which is what a runtime uses this for - gets the right count.
+///   because this kernel keeps no per-CPU jiffy accounting. The `cpuN` line count is
+///   **still one whatever the boot's CPU count is**, which is the same defect the
+///   `online` file above had and is named in docs/ARCHITECTURE-DEBT.md 7.6 rather than
+///   fixed here - synthesizing it needs per-CPU time accounting to put in the fields,
+///   and a right line count with fabricated numbers beside it is not an improvement.
 ///
 /// Deliberately **not** provided: `/proc/self/maps`, which Bun also probes. A static
 /// file there would be a fabricated memory map, and the honest version is generated
 /// from the cell's own VMA list by the personality - real work, named in
-/// docs/LINUX-COMPAT.md rather than faked here. Same for `/etc/localtime`: glibc
-/// falls back to UTC on `ENOENT`, which is correct, since this kernel has no timezone
-/// database and inventing one would be worse than the fallback.
+/// docs/LINUX-COMPAT.md rather than faked here. Same for
+/// `/sys/devices/system/cpu/{online,present,possible}`: those were seeded as the
+/// constant `0-0`, and are now **synthesized by the personality** from
+/// `smp::online_count()`, for exactly the reason `maps` is - a static topology file is
+/// a fabricated machine, and libuv sizes its thread pool from it. Same for
+/// `/etc/localtime`: glibc falls back to UTC on `ENOENT`, which is correct, since this
+/// kernel has no timezone database and inventing one would be worse than the fallback.
 fn seed_runtime_procfs(out_dir: &str, debugfs: &dyn Fn(&str)) {
     debugfs("mkdir /proc");
     debugfs("mkdir /proc/self");
@@ -2124,7 +2128,6 @@ fn seed_runtime_procfs(out_dir: &str, debugfs: &dyn Fn(&str)) {
     debugfs("mkdir /sys/fs");
     debugfs("mkdir /sys/fs/cgroup");
     let files: &[(&str, &str)] = &[
-        ("cpu_online", "0-0\n"),
         ("overcommit_memory", "0\n"),
         ("mmap_min_addr", "65536\n"),
         ("cgroup", "0::/\n"),
@@ -2145,7 +2148,6 @@ fn seed_runtime_procfs(out_dir: &str, debugfs: &dyn Fn(&str)) {
             continue;
         }
         let dest = match *name {
-            "cpu_online" => "sys/devices/system/cpu/online",
             "overcommit_memory" => "proc/sys/vm/overcommit_memory",
             "mmap_min_addr" => "proc/sys/vm/mmap_min_addr",
             "cgroup" => "proc/self/cgroup",
