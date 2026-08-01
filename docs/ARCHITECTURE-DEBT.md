@@ -1077,7 +1077,10 @@ on a prerequisite in this table.
 | What | Gate | State |
 |---|---|---|
 | The model, queries, per-class accessors | 11 properties, 5,000 topologies, 9 controls | **done** (`hw/graph.rs`, `verify/graph/`) |
-| **Per-ISA discovery**: ACPI SLIT + HMAT, `_PXM`, CPUID leaf 4/0x1F, DT `numa-distance-map` / `cpu-map` | `-numa dist` and `-machine hmat=on` against a launch-derived oracle, plus the degraded single-node case | **G** - and it blocks almost everything below |
+| **Node-to-node distances**: ACPI SLIT, DT `numa-distance-map-v1` | `-numa dist,val=20` against the launch as oracle, both directions, plus the degraded single-node case | **done** - x86-64 via SLIT, riscv64 via the device tree, ARM64 degrading to `Source::None` with 0 edges asserted. Three controls firing |
+| **HMAT**: real latency and bandwidth per initiator/target | `-machine q35,hmat=on -numa hmat-lb,...` | **G** - the fields exist and read 0 = unknown today, which is deliberate: SLIT does not report them and fabricating them would poison the two metrics a caller is most likely to rank by |
+| **Device proximity** (`_PXM`) | a driver's queues land on its device's node | **P, and the blocker is not what the earlier row implied.** `_PXM` is an **AML object**, not a table entry: ACPI has no table-based device-to-proximity mapping, so reading it needs an AML interpreter. This tree should not acquire one for one field. The routes that do not: (a) the **device tree** can put `numa-node-id` on a PCI host bridge, so riscv64/ARM64 are reachable with the walk that already exists; (b) on x86-64, derive a device's locality from its **host bridge / ECAM segment**, which is table-visible, and report `unknown` for anything behind a bridge whose proximity only AML states. Option (b) is honest and partial, which is the right shape - a device whose node is unknown must be *said* to be unknown, not defaulted to 0 |
+| **LLC domains and SMT sets**: CPUID leaf 4 / 0x1F, DT `cpu-map` | two CPUs asserted to share an LLC node; a steal preferring that domain | **G** - pure architectural discovery, no firmware table and no AML. This is what unblocks the work-stealing and interference rows, and it is the next slice |
 | `/sys/devices/system/{cpu,node}` synthesis | unmodified hwloc reads a correct topology | **P** (discovery) |
 | `librheo::graph` read-only queries | a cell picks a lowering for an engine it cannot CPUID | **P** (discovery) |
 | Driver cells publishing capabilities | a driver's queues land on its device's node | **P** (discovery + DRIVERS.md D2) |
@@ -1133,7 +1136,10 @@ None built. Ranked there by value over cost, repeated here with gates:
 
 ### 7.7 The one-line summary
 
-Almost everything in 7.2 is blocked on **one** thing - per-ISA discovery - and that thing is
-provable in this container. Almost everything in 7.1 is blocked on **E2**, which is a pure
+**Updated after stage 1 landed.** Distances are done, so the resource-graph section is no
+longer blocked on one thing - it is blocked on three, in this order: **LLC/SMT discovery**
+(pure CPUID and `cpu-map`, no firmware table, unblocks work stealing and interference),
+**HMAT** (real latency and bandwidth, provable with `hmat=on`), and **device proximity**
+(partial by construction, because `_PXM` is AML - see the row). Almost everything in 7.1 is blocked on **E2**, which is a pure
 refactor with the existing suite as its regression gate. Those two are the whole critical
 path; the rest of this register hangs off them or off hardware.
