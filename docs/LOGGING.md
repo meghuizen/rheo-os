@@ -92,6 +92,53 @@ checks it against an independent `VecDeque` oracle: 2,000 runs x 4,000 operation
 0 and again across the wrap, plus the per-CPU merge at 1..8 CPUs. **Six negative
 controls, six observed firing** (verify/README.md).
 
+### 0.1 Coalescing, and what was taken from shmif
+
+Arcan's **shmif** was evaluated as a source of ideas for this ring and for the wider IPC
+path. Honest accounting, because most of it is already here and one part of it is weaker
+than what this tree has:
+
+| shmif idea | Status here |
+|---|---|
+| Fixed-size tagged event records in a shared ring, versioned ABI | **already** - `abi/`'s `repr(C)` `QueueHeader` + `SqEntry`/`CqEntry`, versioned, defined once |
+| Two directions in one shared region | **already** - a cross-cell channel is one ring region mapped into two cells, driving SPSC rings the kernel never drains (docs/LIBRHEO.md Phase E) |
+| No allocation on the hot path, one region describes everything | **already** - the kernel is allocation-free and a cell's ring comes from its own grant |
+| Handle passing for zero copy | **already, and stronger** - a sealed memory grant delegated read-only into the peer (`SYS_GRANT_SHARE`), epoch-revocable, rather than a file descriptor |
+| Negotiated subsegments (a client asks the server for another channel) | **weaker than ours.** A channel here is *minted by whatever launches the cell*, so a cell cannot widen its own authority - the same launcher-mints-authority shape as the W^X exception and the queue pair. A negotiation protocol would be a way to ask for something the capability model already grants or refuses |
+| Batching: one signal for N produced items | **already** - `submit_and_await` queues and parks; `block_on` rings the doorbell **once** and drains all N (`librheo/src/io.rs`). Proven: 63 operations outstanding at a single instant with one park and one wake each (`runtime`), and three requests queued before the first reply (`netservice`). There is no N+1 in the submit path to address |
+| **Coalescing: a later event whose value supersedes its predecessor is not new information** | **adopted - this was the gap** |
+
+Coalescing is the one genuinely additive idea, and it lands exactly where this ring was
+weakest. As first built, a full ring **dropped** and counted the drop. Folding is strictly
+better wherever the records are equivalent, and two forms are now implemented:
+
+- **Repeat folding.** An identical record folds into the newest **unread** one and
+  increments `repeats`, consuming no slot. A run of 500 identical lines occupies one slot
+  and reports `repeats == 499`. The kept timestamp is the **first** of the run - that is
+  what keeps the drain's ordering stable, and "when did this start" is the question a
+  repeated kernel message actually raises.
+- **Loss positioning.** When the ring is genuinely full, the loss folds into the newest
+  record's `lost` count as well as the global counter. A drop count says *how many* were
+  lost; it does not say *where*, and a burst lost during a fault matters in a way the same
+  count lost during idle chatter does not.
+
+Two conditions make it sound rather than a shortcut, and both have controls: the record
+must still be **unread** (amending one a consumer already holds would change a value that
+has been read), and a fold must discriminate level, CPU, payload **and** length (a fold
+that ignored any of them would merge two genuinely different events and report a repeat
+that never happened).
+
+And the fold is **rendered by the drain** - `[repeated N more times]`, `[N records lost
+here]` - because coalescing that is not reported is silent information loss, which is the
+thing this section exists to prevent.
+
+Twelve controls, twelve observed firing (verify/README.md). Note what coalescing did to
+the pre-existing wrap-around model: it **broke it at seed 0**, because the generator emits
+zero-length payloads and those now legitimately fold. The oracle was comparing against a
+stream the ring no longer produced. That is the outcome to want - the model disagreed
+loudly instead of the change slipping through - and the fix was to model the fold, which
+means the wrap-around test now exercises coalescing across the counter boundary as well.
+
 One of those controls is worth recording, because it caught this document's own subject
 inside the implementation of it: a control that broke the level filter in
 `Rings::push_claimed` **passed**, because `Rings::push` had its own copy of the same

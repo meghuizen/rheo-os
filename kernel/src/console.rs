@@ -134,6 +134,43 @@ pub fn flush() {
                 crate::arch::serial_write_byte(byte);
             }
         }
+        // **A fold must be rendered, or coalescing is silent information loss.** The ring
+        // folds an identical repeat into its predecessor rather than consuming a slot, and
+        // folds a lost record into the newest one rather than only counting it globally -
+        // both strictly better than dropping, and both only honest if the drain says so.
+        if rec.repeats > 0 {
+            note(b"  [repeated ", rec.repeats as u64, b" more times]\r\n");
+        }
+        if rec.lost > 0 {
+            note(b"  [", rec.lost as u64, b" records lost here]\r\n");
+        }
+    }
+}
+
+/// Emit `prefix`, a decimal, then `suffix` - for the drain's fold notes.
+///
+/// Hand-rolled rather than `write!`, because this runs *inside* `flush`, which already
+/// holds the console lock: routing through `write` would take it again and deadlock.
+fn note(prefix: &[u8], value: u64, suffix: &[u8]) {
+    for &b in prefix {
+        crate::arch::serial_write_byte(b);
+    }
+    let mut digits = [0u8; 20];
+    let mut n = value;
+    let mut i = digits.len();
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    for &b in &digits[i..] {
+        crate::arch::serial_write_byte(b);
+    }
+    for &b in suffix {
+        crate::arch::serial_write_byte(b);
     }
 }
 

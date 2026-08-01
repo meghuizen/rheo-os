@@ -131,6 +131,34 @@ fields.
 | the truncated flag uses the clamped length | an over-long record not marked |
 | a filtered record counted as a drop | 2 counted as dropped |
 
+### Coalescing (docs/LOGGING.md 0.1)
+
+The one idea taken from Arcan's shmif that this ring did not already have: a later record
+whose value supersedes its predecessor is not new information, so fold it rather than fill
+up and drop.
+
+| Check broken in `telemetry.rs` | Result |
+|---|---|
+| fold without checking the record is still unread | an identical push after a read folded into the record already taken |
+| fold ignores the payload | records differing in payload folded together |
+| fold ignores the level | records differing in level folded together |
+| fold ignores the CPU | records differing in CPU folded together |
+| a reused slot inherits the previous occupant's fold counts | popped repeats 1, expected 0 |
+| overflow counted globally but not folded into the stream | 0 losses in the stream, expected 7 |
+
+Twelve controls in this driver, twelve firing. Two of them earned their keep beyond the
+pass:
+
+- **The reused-slot control did not fire at first.** The oracle was a queue of payloads, so
+  a record carrying a previous occupant's `repeats` was invisible to it. It is a queue of
+  `(payload, repeats, lost)` now, and the control fires at seed 0. A test that checks some
+  of a record's fields reports confidence about all of them.
+- **Coalescing broke the pre-existing wrap-around model at seed 0**, because the generator
+  emits zero-length payloads and those legitimately fold - so the `VecDeque` oracle was
+  comparing against a stream the ring no longer produced. That is the outcome to want: the
+  model disagreed loudly instead of the change slipping through. Modelling the fold means
+  the wrap-around test now exercises coalescing across the counter boundary too.
+
 Six controls, six firing. The last one is worth reading: it **did not fire** at first.
 `Rings::push` and `Rings::push_claimed` each carried their own copy of the buffered /
 threshold / CPU-range checks, so breaking one left the other intact and the test called the

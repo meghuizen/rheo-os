@@ -56,11 +56,16 @@ fn ring_model(seed: u64, start: u32, steps: usize) -> Result<(), String> {
     // Start both counters at `start`: an empty ring at an arbitrary point in the counter
     // space, which is what a long-lived kernel's ring actually is.
     ring.seek_for_test(start, start);
-    let mut model: VecDeque<Vec<u8>> = VecDeque::new();
+    // (payload, repeats, lost) - the fold counts are modelled too, because a slot reused
+    // after the wrap must not inherit its previous occupant's. Checking only the payload
+    // left that invisible: the control for it PASSED until this triple replaced the plain
+    // payload queue (verify/README.md).
+    let mut model: VecDeque<(Vec<u8>, u16, u16)> = VecDeque::new();
     let mut st = seed;
     let mut seq = 0u64;
     let mut pushed = 0u32;
     let mut dropped = 0u32;
+    let mut coalesced = 0u32;
 
     for _ in 0..steps {
         if lcg(&mut st) % 100 < 60 {
@@ -74,13 +79,34 @@ fn ring_model(seed: u64, start: u32, steps: usize) -> Result<(), String> {
                 _ => (lcg(&mut st) as usize) % PAYLOAD_MAX,
             };
             let body = payload_for(0, seq, len);
-            let ok = ring.push(Level::Info, 0, seq, &body);
             let kept = len.min(PAYLOAD_MAX);
-            if ok {
+            let want = body[..kept].to_vec();
+            // **The oracle models coalescing, because the ring does it.** The generator
+            // emits a distinct payload per `seq` - except at length 0, where every push is
+            // the same empty payload - so folds genuinely occur here, and an oracle that
+            // did not model them would have been comparing against a stream the ring no
+            // longer produces. That is what the first version of this driver did, and it
+            // failed at seed 0 the moment coalescing landed, which is the outcome to want:
+            // the model disagreed loudly instead of the change slipping through.
+            //
+            // Two conditions, both the ring's own: a fold needs the newest **unread**
+            // record to be byte-identical, and an over-long (truncated) record never folds.
+            let foldable = len <= PAYLOAD_MAX && model.back().map(|(p, _, _)| p) == Some(&want);
+            let ok = ring.push(Level::Info, 0, seq, &body);
+            if foldable {
+                // A fold is accepted even when the ring is full - it consumes no slot.
+                if !ok {
+                    return Err(format!("an identical repeat was refused at seq {seq}"));
+                }
+                if let Some(back) = model.back_mut() {
+                    back.1 = back.1.saturating_add(1);
+                }
+                coalesced += 1;
+            } else if ok {
                 if model.len() >= SLOTS {
                     return Err(format!("accepted a push into a full ring at seq {seq}"));
                 }
-                model.push_back(body[..kept].to_vec());
+                model.push_back((want, 0, 0));
                 pushed += 1;
             } else {
                 if model.len() < SLOTS {
@@ -89,17 +115,35 @@ fn ring_model(seed: u64, start: u32, steps: usize) -> Result<(), String> {
                         model.len()
                     ));
                 }
+                // The loss folds into the newest unread record, so the model records it
+                // there too - otherwise "where did it lose" is unchecked.
+                if let Some(back) = model.back_mut() {
+                    back.2 = back.2.saturating_add(1);
+                }
                 dropped += 1;
             }
             seq += 1;
         } else {
             match (ring.pop(), model.pop_front()) {
-                (Some(rec), Some(want)) => {
+                (Some(rec), Some((want, repeats, lost))) => {
                     if rec.bytes() != &want[..] {
                         return Err(format!(
                             "popped {} bytes, expected {} - a record was torn or misplaced",
                             rec.bytes().len(),
                             want.len()
+                        ));
+                    }
+                    if rec.repeats != repeats {
+                        return Err(format!(
+                            "popped repeats {}, expected {repeats} - a reused slot inherited \
+                             a previous occupant's fold count, or a fold was lost",
+                            rec.repeats
+                        ));
+                    }
+                    if rec.lost != lost {
+                        return Err(format!(
+                            "popped lost {}, expected {lost}",
+                            rec.lost
                         ));
                     }
                 }
@@ -117,10 +161,11 @@ fn ring_model(seed: u64, start: u32, steps: usize) -> Result<(), String> {
         }
     }
 
-    let (w, d) = ring.counters();
-    if w != pushed || d != dropped {
+    let (w, d, c) = ring.counters();
+    if w != pushed || d != dropped || c != coalesced {
         return Err(format!(
-            "counters ({w} written, {d} dropped) disagree with the model ({pushed}, {dropped})"
+            "counters ({w} written, {d} dropped, {c} folded) disagree with the model \
+             ({pushed}, {dropped}, {coalesced})"
         ));
     }
     Ok(())
@@ -136,6 +181,7 @@ fn merge_model(seed: u64, cpus: u16, steps: usize) -> Result<(), String> {
     rings.set_buffered(true);
     let mut st = seed;
     let mut expect: Vec<(u64, u16, Vec<u8>)> = Vec::new();
+    let mut last: Vec<Option<Vec<u8>>> = vec![None; MAX_RING_CPUS];
     let mut seq = 0u64;
 
     for _ in 0..steps {
@@ -146,9 +192,16 @@ fn merge_model(seed: u64, cpus: u16, steps: usize) -> Result<(), String> {
         let ts = seq * 10 + lcg(&mut st) % 7;
         let len = (lcg(&mut st) as usize) % 32;
         let body = payload_for(cpu, seq, len);
-        if rings.push(Level::Info, cpu, ts, &body) {
-            expect.push((ts, cpu, body));
+        // As the single-ring model: a fold consumes no slot and keeps the FIRST timestamp,
+        // so the oracle must not add an entry for it. `last` is the newest unread record of
+        // each CPU's ring, which is what the ring folds into - nothing is drained until the
+        // loop ends, so the newest pushed IS the newest unread.
+        let folds = last[cpu as usize].as_ref() == Some(&body);
+        let ok = rings.push(Level::Info, cpu, ts, &body);
+        if ok && !folds {
+            expect.push((ts, cpu, body.clone()));
         }
+        last[cpu as usize] = Some(body);
         seq += 1;
     }
 
@@ -197,7 +250,7 @@ fn bypass_model() -> Result<(), String> {
             return Err("a push succeeded while buffering was off".into());
         }
     }
-    let (w, d, bypassed) = rings.counters();
+    let (w, d, _c, bypassed) = rings.counters();
     if w != 0 || d != 0 {
         return Err(format!("buffering off yet {w} written, {d} dropped"));
     }
@@ -226,7 +279,7 @@ fn threshold_model() -> Result<(), String> {
     if rings.push(Level::Trace, 0, 4, b"t") {
         return Err("Trace was recorded at threshold Warn".into());
     }
-    let (w, d, _) = rings.counters();
+    let (w, d, _c, _) = rings.counters();
     if w != 2 {
         return Err(format!("{w} records written, expected 2"));
     }
@@ -244,7 +297,7 @@ fn overflow_cpu_model() -> Result<(), String> {
     if rings.push(Level::Info, MAX_RING_CPUS as u16, 1, b"x") {
         return Err("a push from an out-of-range CPU was accepted".into());
     }
-    let (_, d, _) = rings.counters();
+    let (_, d, _c, _) = rings.counters();
     if d != 1 {
         return Err(format!("{d} drops recorded for an out-of-range CPU, expected 1"));
     }
@@ -272,6 +325,123 @@ fn truncation_model() -> Result<(), String> {
     Ok(())
 }
 
+/// A run of identical records folds into one slot, and the fold is reported.
+///
+/// The oracle is arithmetic and computed here: N identical pushes must occupy **one** slot
+/// and carry `repeats == N - 1`. That is the shmif idea - a later copy of an event whose
+/// value supersedes its predecessor is not new information - applied to a repeated kernel
+/// line, and it is strictly better than the alternative this ring had, which was to fill up
+/// and drop.
+fn coalesce_run_model() -> Result<(), String> {
+    let mut ring = Ring::EMPTY;
+    const N: usize = 500;
+    for i in 0..N {
+        if !ring.push(Level::Warn, 0, i as u64, b"same message") {
+            return Err(format!("push {i} of an identical run was refused"));
+        }
+    }
+    if ring.pending() != 1 {
+        return Err(format!(
+            "{N} identical records occupy {} slots, expected 1",
+            ring.pending()
+        ));
+    }
+    let rec = ring.pop().ok_or("nothing recorded")?;
+    if rec.repeats as usize != N - 1 {
+        return Err(format!("repeats {}, expected {}", rec.repeats, N - 1));
+    }
+    // The FIRST timestamp is kept, because that is what makes the drain's ordering stable
+    // and "when did this start" is the question a repeated message raises.
+    if rec.ts_ns != 0 {
+        return Err(format!("kept ts {}, expected the first (0)", rec.ts_ns));
+    }
+    let (w, d, c) = ring.counters();
+    if w != 1 || d != 0 || c as usize != N - 1 {
+        return Err(format!(
+            "counters ({w} written, {d} dropped, {c} folded), expected (1, 0, {})",
+            N - 1
+        ));
+    }
+    Ok(())
+}
+
+/// A record already taken by the consumer must NOT be amended.
+///
+/// The safety condition for the whole mechanism: amending a record a consumer holds would
+/// change a value that has been read. So an identical push after a drain starts a new
+/// record rather than folding into the departed one.
+fn coalesce_not_after_read_model() -> Result<(), String> {
+    let mut ring = Ring::EMPTY;
+    ring.push(Level::Info, 0, 1, b"x");
+    let first = ring.pop().ok_or("nothing recorded")?;
+    if first.repeats != 0 {
+        return Err("the first record was folded into before anything repeated it".into());
+    }
+    ring.push(Level::Info, 0, 2, b"x");
+    if ring.pending() != 1 {
+        return Err("an identical push after a read folded into the record already taken".into());
+    }
+    Ok(())
+}
+
+/// Differing level, CPU or payload must not fold - a fold that ignored any of them would
+/// merge two genuinely different events into one and report a repeat that never happened.
+fn coalesce_discriminates_model() -> Result<(), String> {
+    for (name, a, b) in [
+        ("payload", (Level::Info, 0u16, &b"aa"[..]), (Level::Info, 0u16, &b"ab"[..])),
+        ("level", (Level::Info, 0, &b"aa"[..]), (Level::Warn, 0, &b"aa"[..])),
+        ("cpu", (Level::Info, 0, &b"aa"[..]), (Level::Info, 1, &b"aa"[..])),
+        ("length", (Level::Info, 0, &b"aa"[..]), (Level::Info, 0, &b"a"[..])),
+    ] {
+        let mut ring = Ring::EMPTY;
+        ring.push(a.0, a.1, 1, a.2);
+        ring.push(b.0, b.1, 2, b.2);
+        if ring.pending() != 2 {
+            return Err(format!("records differing in {name} were folded together"));
+        }
+    }
+    Ok(())
+}
+
+/// A full ring folds the loss into the newest record, so **where** it happened survives -
+/// which a global drop counter cannot say, and which is the half a reader needs.
+fn overflow_position_model() -> Result<(), String> {
+    let mut ring = Ring::EMPTY;
+    // Distinct payloads so nothing coalesces and the ring genuinely fills.
+    for i in 0..SLOTS {
+        if !ring.push(Level::Info, 0, i as u64, &[i as u8, (i >> 8) as u8]) {
+            return Err(format!("push {i} refused before the ring was full"));
+        }
+    }
+    const LOST: usize = 7;
+    for i in 0..LOST {
+        if ring.push(Level::Info, 0, 9000 + i as u64, &[0xAA, i as u8]) {
+            return Err("a push into a full ring was accepted".into());
+        }
+    }
+    // The loss is folded into the newest record - the last one accepted.
+    let mut seen_lost = 0u32;
+    let mut count = 0usize;
+    while let Some(rec) = ring.pop() {
+        seen_lost += rec.lost as u32;
+        count += 1;
+    }
+    if count != SLOTS {
+        return Err(format!("drained {count} records, expected {SLOTS}"));
+    }
+    if seen_lost as usize != LOST {
+        return Err(format!(
+            "{seen_lost} losses recorded in the stream, expected {LOST} - the position of \
+             the loss was not preserved"
+        ));
+    }
+    let (_, d, _) = ring.counters();
+    if d as usize != LOST {
+        return Err(format!("{d} global drops, expected {LOST}"));
+    }
+    Ok(())
+}
+
 fn main() {
     let mut failures = 0usize;
 
@@ -281,6 +451,10 @@ fn main() {
         ("a level above the threshold is filtered, not dropped", threshold_model()),
         ("an out-of-range CPU is counted", overflow_cpu_model()),
         ("an over-long record keeps its head and is marked", truncation_model()),
+        ("a run of identical records folds into one slot", coalesce_run_model()),
+        ("a record already read is never amended", coalesce_not_after_read_model()),
+        ("a fold discriminates level, CPU, payload and length", coalesce_discriminates_model()),
+        ("a full ring records WHERE it lost, not just how many", overflow_position_model()),
     ] {
         match r {
             Ok(()) => println!("  ok   {name}"),

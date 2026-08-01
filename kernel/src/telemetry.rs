@@ -118,7 +118,21 @@ pub struct Record {
     /// Set when the producer had more bytes than `PAYLOAD_MAX`. A truncated record says so
     /// rather than looking like a complete short one.
     pub truncated: bool,
-    _pad: [u8; 2],
+    _pad: [u8; 1],
+    /// How many **additional** identical records this one stands for (0 = just itself).
+    ///
+    /// Coalescing, taken from Arcan's shmif: for an event whose later copy supersedes its
+    /// earlier one, folding is not lossy - it is the same information at constant cost. A
+    /// kernel log's repeated line is exactly that shape, and folding it is strictly better
+    /// than the alternative this ring had, which was to fill up and start dropping.
+    pub repeats: u16,
+    /// Records lost to a full ring **at this point in the stream**.
+    ///
+    /// A global drop counter says how many were lost; it does not say *where*, which is the
+    /// half a reader needs (a burst lost during a fault matters, the same count lost during
+    /// idle chatter does not). Folding the loss into the newest record preserves the
+    /// position at no slot cost.
+    pub lost: u16,
     pub payload: [u8; PAYLOAD_MAX],
 }
 
@@ -129,7 +143,9 @@ impl Record {
         len: 0,
         level: Level::Info,
         truncated: false,
-        _pad: [0; 2],
+        _pad: [0; 1],
+        repeats: 0,
+        lost: 0,
         payload: [0; PAYLOAD_MAX],
     };
 
@@ -150,6 +166,7 @@ pub struct Ring {
     tail: u32,
     dropped: u32,
     written: u32,
+    coalesced: u32,
     slots: [Record; SLOTS],
 }
 
@@ -159,13 +176,28 @@ impl Ring {
         tail: 0,
         dropped: 0,
         written: 0,
+        coalesced: 0,
         slots: [Record::EMPTY; SLOTS],
     };
 
-    /// Records produced, and records lost to a full ring. Both, always: a drop count that
-    /// is not reported is a log that lies about being complete.
-    pub fn counters(&self) -> (u32, u32) {
-        (self.written, self.dropped)
+    /// Records produced, records lost to a full ring, and records folded into a previous
+    /// one. All three, always: a drop count that is not reported is a log that lies about
+    /// being complete, and a *fold* count that is not reported is a log that lies about how
+    /// many times something happened.
+    pub fn counters(&self) -> (u32, u32, u32) {
+        (self.written, self.dropped, self.coalesced)
+    }
+
+    /// The newest record the consumer has not yet taken, or `None` when the ring is empty.
+    ///
+    /// "Not yet taken" is the whole safety condition for coalescing: amending a record a
+    /// consumer already holds would change a value that has been read.
+    fn newest_unread(&mut self) -> Option<&mut Record> {
+        if self.head == self.tail {
+            return None;
+        }
+        let idx = (self.head.wrapping_sub(1) as usize) & (SLOTS - 1);
+        Some(&mut self.slots[idx])
     }
 
     pub fn pending(&self) -> usize {
@@ -192,18 +224,47 @@ impl Ring {
         bytes: &[u8],
         claimed: usize,
     ) -> bool {
+        let n = bytes.len().min(PAYLOAD_MAX);
+        // **Coalesce an identical repeat into the newest unread record** before considering
+        // a slot. Two properties make this sound rather than a shortcut: the record must
+        // still be unread (a consumer that has already taken it cannot have its count
+        // amended), and the fold is reported (`repeats`), so the drain emits the same
+        // information rather than less of it.
+        //
+        // The kept timestamp is the **first** of the run, deliberately: it is what makes
+        // the drain's ordering stable, and "when did this start" is the question a repeated
+        // kernel message raises. The last one is recoverable from the next record's.
+        if let Some(newest) = self.newest_unread().filter(|r| {
+            r.level == level
+                && r.cpu == cpu
+                && !r.truncated
+                && claimed <= PAYLOAD_MAX
+                && r.len as usize == n
+                && r.payload[..n] == bytes[..n]
+        }) {
+            newest.repeats = newest.repeats.saturating_add(1);
+            self.coalesced = self.coalesced.wrapping_add(1);
+            return true;
+        }
         if self.pending() >= SLOTS {
             self.dropped = self.dropped.wrapping_add(1);
+            // **Fold the loss into the newest record instead of only counting it globally.**
+            // A drop count says how many; this says where, which is what a reader needs.
+            if let Some(newest) = self.newest_unread() {
+                newest.lost = newest.lost.saturating_add(1);
+            }
             return false;
         }
         let idx = (self.head as usize) & (SLOTS - 1);
-        let n = bytes.len().min(PAYLOAD_MAX);
         let slot = &mut self.slots[idx];
         slot.ts_ns = ts_ns;
         slot.cpu = cpu;
         slot.len = n as u16;
         slot.level = level;
         slot.truncated = claimed > PAYLOAD_MAX;
+        // A reused slot must not inherit the previous occupant's fold counts.
+        slot.repeats = 0;
+        slot.lost = 0;
         slot.payload[..n].copy_from_slice(&bytes[..n]);
         // Publish last: a consumer must never see a slot index it can read before the
         // bytes are in it.
@@ -236,6 +297,7 @@ impl Ring {
         self.tail = 0;
         self.dropped = 0;
         self.written = 0;
+        self.coalesced = 0;
     }
 
     /// Place the free-running counters at an arbitrary point in their space, leaving the
@@ -362,17 +424,20 @@ impl Rings {
         self.rings[i].pop()
     }
 
-    /// (records written, records dropped, records offered while buffering was off),
-    /// summed over every CPU.
-    pub fn counters(&self) -> (u32, u32, u32) {
+    /// (records written, records dropped because a ring was full, records folded into a
+    /// previous identical one, records offered while buffering was off), summed over every
+    /// CPU.
+    pub fn counters(&self) -> (u32, u32, u32, u32) {
         let mut w = 0u32;
         let mut d = 0u32;
+        let mut c = 0u32;
         for r in self.rings.iter() {
-            let (rw, rd) = r.counters();
+            let (rw, rd, rc) = r.counters();
             w = w.wrapping_add(rw);
             d = d.wrapping_add(rd);
+            c = c.wrapping_add(rc);
         }
-        (w, d, self.bypassed)
+        (w, d, c, self.bypassed)
     }
 
     pub fn pending(&self) -> usize {
@@ -415,9 +480,9 @@ pub fn set_buffered(on: bool) {
     unsafe { rings().set_buffered(on) };
 }
 
-/// (records written, records dropped because a ring was full, records offered while
-/// buffering was off).
-pub fn counters() -> (u32, u32, u32) {
+/// (records written, records dropped, records folded, records offered while buffering was
+/// off).
+pub fn counters() -> (u32, u32, u32, u32) {
     // SAFETY: a read of counters; a concurrent producer can only make them larger.
     unsafe { rings().counters() }
 }
