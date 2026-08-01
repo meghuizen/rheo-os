@@ -1469,11 +1469,11 @@ write; the tap the `smp` kernel installs keys its capture buffer on
 `user::current_index()`, which is `PerCpu`, which is what lets two cells' transcripts be
 captured separately on two cores.
 
-**What is outside the lock.** `plock` brackets exactly two entry points - `linux::handle`
-(the whole syscall dispatch) and `linux::fill_fault` (the demand-paging entry, which is
-why the lock is recursive per CPU: a syscall reaches `fill_fault` through `uaccess`).
-Four further paths reach personality state from trap context **without** it, and they are
-named here rather than left to be found:
+**What was outside the lock, and now is not.** `plock` brackets `linux::handle` (the
+whole syscall dispatch) and `linux::fill_fault` (the demand-paging entry, which is why
+the lock is recursive per CPU: a syscall reaches `fill_fault` through `uaccess`). Three
+further paths reach personality state from trap context, and the audit found all three
+**outside** it:
 
 - `linux::thread::preempt_context` and `linux::proc::preempt_cell`, from
   `user::on_user_interrupt` (Class A: `THREADS`, `CUR_THREAD`, `PROCS`).
@@ -1482,12 +1482,51 @@ named here rather than left to be found:
 - `linux::dup_state` / `install_cell` / `exec_reinit` / `reap` / `reset`, from the
   loader and the run loop (Classes A and B).
 
-None of them is currently reachable concurrently: the two-Linux-cells-on-two-cores phase
-runs with dispatch **off**, so no preemption interleaves, and each of those cells owns its
-own Class A rows. That is a property of the proof, not of the code - so bringing
-preemption to two Linux cells at once means bracketing these four the same way, and the
-audit's practical conclusion is that **the per-cell lock must be taken by the trap-context
-entry points too**, not only by the syscall path.
+The first two now take `plock` themselves (`user.rs`, both sites, under the recursive
+guard the syscall path uses), which is why `linux::plock` and `PGuard` are `pub`. The
+third set runs on the primary between rounds with no core inside a cell, and is left
+alone rather than bracketed for a concurrency it does not have.
+
+They had been **unreachable, not safe** - every multi-core Linux phase ran with dispatch
+**off**, so no slice fired and neither call was ever made. That was a property of the
+proofs, not of the code, so a phase was written to execute them: `linuxsmp`'s
+`test_preempted_threads_two_cores` runs two *multi-threaded* cells (the `rustthreads`
+fixture `linuxthreads` asserts) on two cores under each core's own preemption timer, and
+asserts both exact transcripts, both exit codes, the overlap, no double entry, and that
+preemptions were genuinely taken - 47 of 322 slices on x86-64, 27 of 150 on riscv64, every
+one of them into a **sibling context**, which is `linux::thread::preempt_context` executing
+from trap context on two cores at once. Three things it does not claim:
+
+- `linux::proc::preempt_cell` is still unexercised. A 4-thread cell always has a ready
+  sibling, so the first arm always answers; executing the second needs a single-context
+  cell that outlives its slice, and no fixture here is one.
+- The *locking* has no deterministic negative control, because removing it leaves a race
+  rather than a failure (docs/ENGINEERING.md 7 - reasoned and reviewed, not proven by
+  revert).
+- **ARM64 takes no preemption here at all**, and the reason is a real gap in the model
+  rather than a property of that ISA: a Linux syscall that returns to its own context does
+  **not** re-arm a slice (`sched::dispatch::running` is reached from first entry, from
+  `linux::proc::reschedule`, and from the preemption path itself - not from the ordinary
+  syscall return). So a Linux cell whose contexts are scheduled *within* the cell - which
+  is Node's and Bun's shape - gets one slice at first entry, and if that slice does not
+  fire, nothing arms another. ARM64 armed **2** slices for two whole programs and took 0
+  timer interrupts; x86-64 armed 322 and riscv64 150, because their futex timing produced
+  cell-level reschedules and ARM64's did not. The test therefore gates on *whether an
+  interrupt arrived* and claims nothing where none did: a slice that fired and moved
+  nothing is a defect and asserts, a slice that never fired is a fact about the workload.
+  Making a slice enforceable independently of what the workload happens to do is an
+  execution-model change, not a test change - docs/EXECUTION-MODEL.md owns it.
+
+**It found one defect that does have a control.** `smp::run_cells_on_both` published two
+cells and claimed neither. An unclaimed cell is visible to every core's scheduler - correct
+on a single-CPU boot, and correct while dispatch was off - but with a slice firing, the
+peer's `preempt_cell` scan saw this core's cell as runnable and switched into it: two cores,
+one trap frame, one kernel stack. It presented as an instruction fetch at address 0 on both
+cores, immediately and on every run. Each core now claims the cell it is about to enter -
+the secondary in its work loop, because which core wins the published cell is not known to
+the publisher - and reverting that reproduces the fault. It is the same lesson §10.0 records
+for `place_cells`: the claim is the whole multi-core safety argument, so a path that enters a
+cell without making one is unsafe the moment anything else can pick it.
 
 ### 10.3 Per-CPU infrastructure
 

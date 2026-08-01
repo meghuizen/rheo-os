@@ -2707,19 +2707,29 @@ pub fn on_user_interrupt(frame: *mut TrapFrame) -> *mut TrapFrame {
     let resumed = match cells()[cur].personality {
         // A Linux cell: try its own ready contexts first (this is the fix for "a
         // spinning thread starves its siblings"), then other cells.
-        Personality::Linux => match crate::linux::thread::preempt_context(cur) {
-            Some(f) => {
-                crate::sched::preempt::took(true);
-                f
-            }
-            None => match crate::linux::proc::preempt_cell(cur) {
+        //
+        // Under the **personality lock**, because both arms write personality state that
+        // is not this cell's alone: `preempt_cell` picks *another* cell's context and
+        // touches its row, and both walk the funded per-cell tables a peer core's syscall
+        // may be growing. The syscall path takes the same lock (`linux::handle`), and it
+        // is recursive per CPU, so a nested acquire from anything these call is free
+        // (docs/SMP.md 10.2a - this site was named there as outside the bracket).
+        Personality::Linux => {
+            let _g = crate::linux::plock();
+            match crate::linux::thread::preempt_context(cur) {
                 Some(f) => {
-                    crate::sched::preempt::took(false);
+                    crate::sched::preempt::took(true);
                     f
                 }
-                None => frame,
-            },
-        },
+                None => match crate::linux::proc::preempt_cell(cur) {
+                    Some(f) => {
+                        crate::sched::preempt::took(false);
+                        f
+                    }
+                    None => frame,
+                },
+            }
+        }
         // A native cell has one context, so the only move is to another cell.
         Personality::Native => match crate::nproc::preempt_cell(cur) {
             Some(f) => {
@@ -2786,6 +2796,15 @@ pub fn on_user_trap(
             // made the intermittent Node segfault under preemption unattributable
             // (docs/LINUX-COMPAT.md). One line, only on the path that is already
             // failing, so it costs nothing in the common case.
+            // From here to the end of this arm is personality state: the context
+            // read, the signal-frame build, and - on the terminate path - the reap
+            // that touches the *global* pid and pipe registries. Under the same
+            // recursive lock the syscall path holds, for the same reason
+            // (docs/SMP.md 10.2a). `fill_fault` above took and released it already;
+            // taking it again here rather than widening one bracket over both keeps
+            // the demand-paging path, which runs on every fault, out of the lock on
+            // the common path where it succeeds.
+            let _g = crate::linux::plock();
             let (_, taken, _, to_sib, to_cell) = crate::sched::preempt::counters();
             crate::println!(
                 "linux: unhandled {:?} fault in cell {cur} ctx {} at {fault_addr:#x}                  (preemptions taken {taken}: {to_sib} sibling, {to_cell} cell)",

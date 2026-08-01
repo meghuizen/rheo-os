@@ -12,7 +12,7 @@
 //! budget (observed - it timed out inside the four-cell phase, before the other two
 //! ran). One kernel per concern is the tree's shape anyway; this is what forced it.
 //!
-//! Three questions, in order of what they license:
+//! Four questions, in order of what they license:
 //!
 //!   1. **Many.** Four Linux cells across four cores, each with its own exact
 //!      transcript. A big lock is exactly the claim that holds for two and fails for N.
@@ -21,6 +21,9 @@
 //!   3. **Load.** Two cells hammering the global registries at once. This is the one
 //!      that makes `plock` *testable*: the other two pass with the lock removed,
 //!      because a hello-world barely touches the shared tables.
+//!   4. **Preemption.** Two *multi-threaded* Linux cells, each preempted while it runs.
+//!      Every phase before this one ran with dispatch off, so the personality's
+//!      trap-context entry points (§10.2a) were never executed at all.
 
 #![no_std]
 #![no_main]
@@ -36,6 +39,7 @@ mod vfs_personality;
 
 use harness::KernelStack;
 use kernel::capability::{CapTable, ObjectTable};
+use kernel::sched::{dispatch, preempt};
 use kernel::{arch, idle, ktimer, println, smp, user};
 
 #[global_allocator]
@@ -51,6 +55,14 @@ static mut QP_L: core::mem::MaybeUninit<kernel::queue::QueuePair> =
 static CHELLO: &[u8] = fixture::linux!("chello");
 const CHELLO_OUT: &[u8] = b"hello from glibc C\n";
 const CHELLO_EXIT: u64 = 9;
+
+/// The unpatched multi-threaded Rust `std` fixture `linuxthreads` asserts (L4): 4
+/// `std::thread`s over `mpsc` + `Mutex` + `Arc<AtomicUsize>`, joined. Used by the
+/// preempted two-core phase below, because that phase needs a cell that runs long
+/// enough to be interrupted **and** has sibling contexts to be interrupted *to*.
+static RUSTTHREADS: &[u8] = fixture::linux_cargo!("rustthreads");
+const RUSTTHREADS_OUT: &[u8] = b"threads 4 total 1550 channel 1550\n";
+const RUSTTHREADS_EXIT: u64 = 4;
 
 /// Captured stdout, one buffer per cell slot: with several cores running several Linux
 /// cells, a single shared buffer would interleave two transcripts into nonsense.
@@ -104,6 +116,7 @@ extern "C" fn kernel_main() -> ! {
     test_four_linux_cells();
     test_linux_fork_across_cores();
     test_registry_stress_two_cores();
+    test_preempted_threads_two_cores();
     test_dynamic_cell_on_secondary();
 
     println!("linuxsmp: PASS");
@@ -563,6 +576,180 @@ fn test_linux_fork_across_cores() {
 // which this touches. What it removes is the doubt about the mechanism underneath them.
 
 /// `dhello`'s exact transcript and exit, as `linuxdyn` asserts them on the primary.
+// --------- TWO multi-threaded Linux cells, on TWO cores, each PREEMPTED while it runs
+//
+// The §10.2a audit found a hole that no phase could reach: `linux::plock` brackets the
+// syscall dispatch and the demand-paging entry, but **two further paths reach
+// personality state from trap context** - `user::on_user_interrupt` calls
+// `linux::thread::preempt_context` (another *context* of this cell) and
+// `linux::proc::preempt_cell` (another *cell*'s row entirely). Every multi-core Linux
+// phase before this one ran with dispatch **off**, so no slice ever fired and neither
+// call was made. The lock was "correct by construction" over a path nothing executed.
+//
+// Both take the lock now, and this phase executes them: two cells, two cores, each
+// under its own preemption timer (per-core hardware, so each core arms its own).
+//
+// The workload is the fixture `linuxthreads` asserts, not the hello-world the other
+// phases use, and both reasons are load-bearing:
+//
+//   - it runs long enough to be interrupted (a `chello` prints one line and exits well
+//     inside a 1 ms slice - measured: 32 slices armed, **0** taken), and
+//   - it has 4 sibling contexts, so `preempt_context` - the *first* thing the
+//     preemption path tries for a Linux cell - is reachable at all. With single-context
+//     cells only `preempt_cell` can ever fire.
+//
+// What is asserted: both transcripts exactly, both exit codes, the overlap, no cell
+// entered by two cores, and that preemptions were genuinely **taken** - without which
+// the phase is the cooperative one wearing a new comment.
+//
+// **It found a real defect on its first run, and that one has a deterministic control.**
+// `run_cells_on_both` published two cells and claimed neither, which is right on a
+// single-CPU boot - an unclaimed cell is visible to every scheduler - and wrong the
+// moment a slice fires: the peer's `preempt_cell` scan saw this core's cell as runnable
+// and switched into it, two cores sharing one trap frame and one kernel stack. It
+// presented as an instruction fetch at 0 on both cores, immediately and every run. Each
+// core now claims the cell it is about to enter, and reverting that reproduces the fault.
+//
+// What **cannot** be given a deterministic control is the locking itself: removing the
+// brackets leaves a race, and a race that fails intermittently is not evidence either
+// way. So the bracketing is reasoned and reviewed rather than proven by a revert
+// (docs/ENGINEERING.md 7), and this says so instead of implying more.
+//
+// And honest about which arm fires: every preemption here goes to a **sibling context**
+// of the same cell, because a 4-thread cell always has one ready, so `preempt_context`
+// answers first and `preempt_cell` - the arm that touches another cell's row - is not
+// reached. The counters are printed rather than asserted for that reason. Executing the
+// cross-cell arm needs a single-context cell that outlives its slice, which no fixture
+// here is; it stays named rather than claimed.
+
+static mut KSTACK_THR: [KernelStack; 2] = [const { KernelStack::new() }; 2];
+
+fn test_preempted_threads_two_cores() {
+    if smp::online_count() < 2 {
+        println!("linuxsmp: SKIP the preempted-threads phase - one core online");
+        return;
+    }
+    // SAFETY: single-threaded setup on the primary; secondaries claim nothing until the
+    // cell is published, and every static here outlives the run.
+    unsafe {
+        let objects = &mut *core::ptr::addr_of_mut!(OBJECTS2);
+        let caps = &mut *core::ptr::addr_of_mut!(CAPS2);
+        *objects = ObjectTable::new();
+        *caps = CapTable::new();
+
+        user::reset();
+        ktimer::reset();
+        idle::reset();
+
+        let mut aspace = [
+            kernel::mm::AddressSpace::new(60),
+            kernel::mm::AddressSpace::new(61),
+        ];
+        let mut frame: [core::mem::MaybeUninit<kernel::arch::TrapFrame>; 2] =
+            [const { core::mem::MaybeUninit::uninit() }; 2];
+        for i in 0..2 {
+            let li =
+                kernel::load::load_elf_linux(RUSTTHREADS, &mut aspace[i]).expect("load fixture");
+            let sp = kernel::linux::stack::setup_stack(&mut aspace[i], &li, &[b"rustthreads"], &[]);
+            frame[i].write(arch::trapframe_new(
+                li.entry,
+                sp,
+                0,
+                (*core::ptr::addr_of!(KSTACK_THR))[i].top(),
+            ));
+            user::install(
+                i,
+                &aspace[i],
+                caps,
+                objects,
+                core::ptr::addr_of!(QP_L) as *const kernel::queue::QueuePair,
+                frame[i].as_mut_ptr(),
+            );
+            user::set_personality(i, user::Personality::Linux);
+            kernel::linux::install_cell(i, &li, b"");
+        }
+
+        STDOUT_LEN = [0; CAP_CELLS];
+        kernel::linux::set_stdout_tap(Some(tap));
+        preempt::reset();
+        dispatch::enable(true);
+        // SAFETY: both installed, present, distinct, Linux cells with no process tree.
+        let (met, finished, sec_code, own_code) = smp::run_cells_on_both(0, 1, true);
+        dispatch::enable(false);
+        kernel::linux::set_stdout_tap(None);
+
+        if !finished {
+            println!(
+                "linuxsmp: SKIP the preempted-threads phase - the secondary did not \
+                 finish its cell inside the bound"
+            );
+            return;
+        }
+        assert!(
+            met && !smp::rendezvous_timed_out(),
+            "the two cores never met, so the two threaded cells did not overlap"
+        );
+        for i in 0..2 {
+            let got = captured(i);
+            assert!(
+                got == RUSTTHREADS_OUT,
+                "threaded cell {i} printed {:?}, not {:?} - a preempted multi-context \
+                 Linux cell did not produce its exact transcript",
+                core::str::from_utf8(got),
+                core::str::from_utf8(RUSTTHREADS_OUT)
+            );
+        }
+        assert_eq!(
+            own_code, RUSTTHREADS_EXIT,
+            "the primary's cell exited wrong"
+        );
+        assert_eq!(
+            sec_code as u64, RUSTTHREADS_EXIT,
+            "the secondary's cell exited wrong"
+        );
+        assert_eq!(user::double_entries(), 0, "two cores were inside one cell");
+
+        let (armed, taken, unarmable, to_sib, to_cell) = preempt::counters();
+        let notes = preempt::notes();
+        // Two different outcomes, and conflating them would be the mistake. A slice
+        // **fired** and the scheduler declined to move the CPU is a defect. A slice
+        // never fired is a fact about the workload, not about the kernel: how many
+        // slices a program consumes is not something this test controls, and it varies
+        // by ISA for the same binary - riscv64 armed 128 slices here where aarch64
+        // armed 2, because a Linux syscall that returns to its own context does not
+        // re-arm and the two ISAs' futex timing gives different cell-level reschedule
+        // counts. So the interrupt count is the gate, and where none arrived nothing
+        // is claimed rather than asserted (docs/ENGINEERING.md 1).
+        if unarmable > 0 || notes == 0 {
+            println!(
+                "linuxsmp: two multi-threaded Linux cells ran correctly on two cores, \
+                 both transcripts exact - but no preemption is claimed: {armed} slices \
+                 armed, {unarmable} unarmable, {notes} timer interrupts arrived. The \
+                 trap-context entry point was not reached on this ISA"
+            );
+            return;
+        }
+        assert!(
+            taken > 0,
+            "{notes} preemption interrupts arrived across {armed} armed slices and the \
+             CPU changed hands {taken} times - a slice fired and the scheduler moved \
+             nothing, which is the trap-context path failing rather than not being \
+             reached"
+        );
+        println!(
+            "linuxsmp: TWO MULTI-THREADED Linux cells ran on TWO CORES, each PREEMPTED \
+             mid-run - {taken} of {armed} slices taken, both transcripts exact, both \
+             exiting {RUSTTHREADS_EXIT} ({notes} timer interrupts arrived). That executes \
+             `linux::thread::preempt_context` from trap context on two cores at once, \
+             which the docs/SMP.md 10.2a audit found outside `linux::plock` and which \
+             every earlier multi-core Linux phase left unreached (dispatch was off). \
+             Reported, not asserted: {to_sib} went to a sibling context and {to_cell} to \
+             another cell - a 4-thread cell always has a ready sibling, so \
+             `preempt_cell` answers second and stays unexercised here OK"
+        );
+    }
+}
+
 const DHELLO_OUT: &[u8] = b"hello from dynamic glibc\n";
 const DHELLO_EXIT: u64 = 12;
 
@@ -668,7 +855,7 @@ fn test_dynamic_cell_on_secondary() {
         STDOUT_LEN = [0; CAP_CELLS];
         kernel::linux::set_stdout_tap(Some(tap));
         // SAFETY: both installed, present, distinct, Linux cells with no process tree.
-        let (met, finished, sec_code, own_code) = smp::run_cells_on_both(0, 1);
+        let (met, finished, sec_code, own_code) = smp::run_cells_on_both(0, 1, false);
         kernel::linux::set_stdout_tap(None);
 
         if !finished {

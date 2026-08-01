@@ -646,8 +646,17 @@ pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -
 /// two `chello`s do not reach - a Linux cell that forks, pipes or signals across
 /// cores touches the global registries in patterns this does not exercise. The lock is
 /// correct for them by construction (it covers the whole dispatch); it is untested.
+///
+/// **Why it is `pub`.** The syscall dispatch is not the only way into personality state.
+/// `user::on_user_trap` (a fault that becomes a signal) and `user::on_user_interrupt` (a
+/// preemption) both reach it from trap context, and the §10.2a audit found them
+/// **outside** this bracket - reachable only because the two-Linux-cells proof ran with
+/// dispatch off. They take it themselves now, which is why the guard type and this
+/// function are visible outside the module. Both are ordinary kernel context at trap
+/// exit, not interrupt context (the handler only sets a flag), so acquiring here is the
+/// same wait a syscall already performs.
 #[inline]
-fn plock() -> PGuard {
+pub fn plock() -> PGuard {
     if !crate::smp::multicore() {
         return PGuard::Off;
     }
@@ -677,7 +686,7 @@ fn plock() -> PGuard {
 }
 
 /// What a [`plock`] call is holding, so `Drop` knows what to undo.
-enum PGuard {
+pub enum PGuard {
     /// Single CPU: nothing was taken.
     Off,
     /// A recursive entry on a CPU that already holds it.

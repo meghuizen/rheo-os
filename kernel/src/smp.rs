@@ -473,6 +473,16 @@ fn secondary_work_loop() {
                 if USER_CELL_PREEMPT.load(Ordering::Acquire) == 1 {
                     enable_preemption_here();
                 }
+                // **Claim it for this core before entering it.** An unclaimed cell is
+                // visible to every core's scheduler, which is right on a single-CPU
+                // boot and wrong here: with preemption on, the *peer*'s slice fires,
+                // its `preempt_cell` scan sees this cell as runnable and switches into
+                // it - one cell, two cores, one trap frame. Observed as an instruction
+                // fetch at 0 on both cores with two multi-threaded cells
+                // (docs/SMP.md 10.2a). Which core takes the published cell is not known
+                // to the publisher, so the claim has to be made here, by the core that
+                // wins it.
+                crate::user::claim_cell(cell, cpu_index());
                 let code = code_of(crate::user::run(cell).1);
                 USER_CELL_CODE.store(code as usize, Ordering::Release);
             }
@@ -889,11 +899,30 @@ static USER_CELL_DONE: AtomicUsize = AtomicUsize::new(0);
 /// partitioning, not a lock, is what makes it safe, and it is the multikernel answer
 /// this design commits to rather than a shortcut (docs/SCHEDULING.md 1a).
 ///
+/// With `preempt`, **both** cores run their cell under their own preemption timer, so
+/// the two cells are preempted while they overlap. Every register involved is per-core
+/// hardware, so each core arms its own; the global half of timer bring-up (APIC-mode
+/// probe, IDT gate) is done here on the primary first, exactly as
+/// `place_vcores_inner` does it. The caller must have enabled dispatch, or a slice has
+/// nothing to hand the CPU to.
+///
 /// Returns `(rendezvous_held, secondary_finished, secondary_exit_code, own_outcome)`.
 ///
 /// # Safety
-/// Both cells must be installed, present, and **native**; neither may be the other.
-pub unsafe fn run_cells_on_both(own: usize, other: usize) -> (bool, bool, usize, u64) {
+/// Both cells must be installed, present, and distinct. Both may be Linux: their
+/// per-cell rows are disjoint and the personality's global tables are serialised by
+/// `crate::linux::plock`, which under `preempt` covers the trap-context entry points
+/// too (docs/SMP.md 10.2a).
+pub unsafe fn run_cells_on_both(
+    own: usize,
+    other: usize,
+    preempt: bool,
+) -> (bool, bool, usize, u64) {
+    USER_CELL_PREEMPT.store(usize::from(preempt), Ordering::Release);
+    if preempt {
+        arch::enable_timer_irq();
+        enable_preemption_here();
+    }
     USER_CELL_DONE.store(0, Ordering::Release);
     USER_CELL_CODE.store(0, Ordering::Release);
     RV_PRIMARY.store(0, Ordering::Release);
@@ -902,6 +931,9 @@ pub unsafe fn run_cells_on_both(own: usize, other: usize) -> (bool, bool, usize,
     USER_CELL.store(other, Ordering::Release);
 
     let met = rendezvous(&RV_PRIMARY, &RV_SECONDARY);
+    // This core's own cell, claimed for the same reason the secondary claims its one
+    // just above: an unclaimed cell is fair game for the peer's scheduler.
+    crate::user::claim_cell(own, cpu_index());
     // SAFETY: the caller's contract; this core touches only its own cell slot.
     let outcome = crate::user::run(own).1;
 

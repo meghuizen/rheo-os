@@ -455,7 +455,7 @@ fn test_user_cells_on_both() {
         );
 
         // SAFETY: both cells are installed, present, native, and distinct.
-        let (met, finished, sec_code, own_code) = smp::run_cells_on_both(0, 1);
+        let (met, finished, sec_code, own_code) = smp::run_cells_on_both(0, 1, false);
 
         if !finished {
             println!(
@@ -2660,7 +2660,7 @@ fn test_linux_cell_on_secondary() {
         kernel::linux::set_stdout_tap(Some(tap));
         // SAFETY: both cells are installed and present, and they are distinct; cell 1
         // is Linux, which is what this phase is about.
-        let (met, finished, sec_code, own_code) = smp::run_cells_on_both(0, 1);
+        let (met, finished, sec_code, own_code) = smp::run_cells_on_both(0, 1, false);
         kernel::linux::set_stdout_tap(None);
 
         if !finished {
@@ -2723,6 +2723,16 @@ fn test_linux_cell_on_secondary() {
 // per machine (see `tap`), which is itself the point: with one shared buffer the two
 // transcripts interleave, and a test that cannot tell them apart cannot show that both
 // ran correctly.
+//
+// Dispatch stays **off** here, and the §10.2a audit is why that is a limit rather than
+// a choice: `plock` brackets the syscall dispatch and the demand-paging entry, but
+// `user::on_user_interrupt` reaches `linux::thread::preempt_context` /
+// `linux::proc::preempt_cell` from trap context, and with no slice firing that path is
+// never taken. Turning dispatch on here was tried and does not help - `chello` prints
+// one line and exits well inside a 1 ms slice, so 32 slices were armed and **none**
+// fired. The preempted two-core Linux phase therefore needs a workload that runs long
+// enough to be interrupted and has siblings to be interrupted *to*, which is
+// `linuxsmp`'s `rustthreads` phase, not this one.
 
 fn test_two_linux_cells() {
     // SAFETY: single-threaded setup on the primary; secondaries are parked.
@@ -2767,7 +2777,7 @@ fn test_two_linux_cells() {
         kernel::linux::set_stdout_tap(Some(tap));
         // SAFETY: both cells are installed, present and distinct; both are Linux,
         // which is what this phase is about.
-        let (met, finished, sec_code, own_code) = smp::run_cells_on_both(0, 1);
+        let (met, finished, sec_code, own_code) = smp::run_cells_on_both(0, 1, false);
         kernel::linux::set_stdout_tap(None);
 
         if !finished {
