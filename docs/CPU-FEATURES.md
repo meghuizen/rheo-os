@@ -108,11 +108,30 @@ Three requirements, each forced by a real defect in this tree:
   no proof can say "FRED" about an IDT run. The three wake modes
   (`net_rx::IdleMode`) and `input::interrupt_driven()` are the same pattern.
 
-**The IDT path is not legacy.** QEMU 8.2 does not model FRED, so the IDT path is the one
-every one of the 210 boot tests runs on, and it stays a first-class proven path. FRED will
-skip-with-reason here and be gated at the lab, exactly as AVX-512, PMEM on arm/riscv and
-the RISC-V IOMMU already are. A design where the fallback rots is a design with one
-untested path and one unreachable one.
+**The IDT path is not legacy, and this was checked rather than assumed.** The obvious
+reading - "8.2 is old, a newer QEMU will model FRED" - is wrong, and the difference matters
+because it decides whether the FRED path can ever be proven in this repository.
+**QEMU 11.0.3 was built from source here and inspected**: `fred` and `lkgs` appear in
+`target/i386/cpu.c`'s feature names and in `target/i386/kvm/kvm.c`, and **nothing in
+`target/i386/tcg/` mentions FRED at all**. So FRED in QEMU is a bit that can be *exposed to
+a KVM guest whose host CPU has it*, not an event-delivery path TCG *emulates*. This
+container has no KVM.
+
+The consequence, stated so nobody re-runs the experiment: the IDT path is the one all 210
+boot tests run on under any QEMU available here, it stays first-class and proven, and the
+FRED path is lab-gated on real silicon - exactly as AVX-512 is (also confirmed absent from
+QEMU 11's TCG: zero mentions in `target/i386/tcg/`). A design where the fallback rots is a
+design with one untested path and one unreachable one, so the ordering is deliberate: the
+IDT path stays the tested default and FRED is added beside it.
+
+**What a newer QEMU *does* unlock, measured the same way**, because the same inspection
+found four things 8.2 lacked - `CPUID_EXT_X2APIC` and `CPUID_EXT_PCID` in
+`TCG_EXT_FEATURES`, `INVPCID` in the TCG leaf-7 word, and a real `riscv-iommu-pci` device
+(`hw/riscv/riscv-iommu-pci.c`). The first three are the interesting ones for this section's
+thesis: this kernel *observes* all three rather than assuming them, so on QEMU 11 the same
+binary should take the x2APIC path instead of the xAPIC-MMIO fallback and report a usable
+TLB tag - and if it fails there, the fallback had been masking a defect in the primary path.
+That is a genuine test of observe-never-infer rather than a version bump.
 
 ### 1.4 It reduces per-ISA divergence
 
