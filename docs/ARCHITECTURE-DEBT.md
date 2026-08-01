@@ -1044,3 +1044,96 @@ per-core timer wheel, and the workload gates - staged S1-S7 there.
 **Throughout.** Every step additive per `ENGINEERING.md` §8: the pre-existing
 proofs must pass **unedited**. If a proof needed editing, the step was not
 additive - find out why.
+
+---
+
+## 7. Named but not built - the consolidated register
+
+Everything designed, named or promised in `docs/` that has **no code behind it**, in one
+list, so nothing is lost to the document it happens to live in. Each row carries the gate
+that would close it and what blocks it *today*, because "not built" and "not buildable
+here" are different states and conflating them is how a deferral becomes a claim.
+
+Legend: **G** = provable in this container; **L** = needs hardware or a lab; **P** = blocked
+on a prerequisite in this table.
+
+### 7.1 The execution model (docs/EXECUTION-MODEL.md 9)
+
+| Stage | What | Gate | State |
+|---|---|---|---|
+| E1 | The entity table beside the three representations | the suite unchanged | **done** (`sched/entity.rs`) |
+| E6' | Host model-checker, brought forward | 7 invariants, 7 controls | **done** (`verify/entity/`) |
+| E5 | A slice re-armed at every return to user | I10 on all three ISAs | **done** |
+| **E2** | Ownership + the entered-guard into the table; claim and run-mark become one compare-exchange | the 8 predicate sites become 1, the 4 claim sites become 0 | **G** |
+| **E3** | Runnability into the table; the personality stops keeping copies | I5 and I8, both currently unasserted anywhere | **P** (E2) |
+| **E4** | Per-entity `kstack_top`, funded FP area, frame; `MAX_VCORES` deleted | the two scenarios in `verify/entity/` written *before* the implementation and deliberately without controls | **P** (E2, E3). **Unblocks: threads of one Linux cell across cores, and FA3's real producer/consumer overlap** |
+| E7 | Cross-entity signal + wake IPI | a signal to an entity another core is running | **P** (E4) |
+| E8 | FRED behind observation | `event_mode()` reported | **L** (see 7.3) |
+| - | Migrating a **running** entity | attempted twice, reverted twice (docs/SMP.md 10.0) | **P** (E4 makes it a state-machine edge rather than a race) |
+| - | Fuzzer invariants **I6, I8, I10** | each needs state E1 does not hold | **P** (E3, E4) |
+
+### 7.2 The resource graph (docs/RESOURCE-GRAPH.md)
+
+| What | Gate | State |
+|---|---|---|
+| The model, queries, per-class accessors | 11 properties, 5,000 topologies, 9 controls | **done** (`hw/graph.rs`, `verify/graph/`) |
+| **Per-ISA discovery**: ACPI SLIT + HMAT, `_PXM`, CPUID leaf 4/0x1F, DT `numa-distance-map` / `cpu-map` | `-numa dist` and `-machine hmat=on` against a launch-derived oracle, plus the degraded single-node case | **G** - and it blocks almost everything below |
+| `/sys/devices/system/{cpu,node}` synthesis | unmodified hwloc reads a correct topology | **P** (discovery) |
+| `librheo::graph` read-only queries | a cell picks a lowering for an engine it cannot CPUID | **P** (discovery) |
+| Driver cells publishing capabilities | a driver's queues land on its device's node | **P** (discovery + DRIVERS.md D2) |
+| Memory-purpose placement (weights / KV / activations / spill / parked state) | frames land on the node the purpose names | **P** (HMAT discovery) |
+| Work stealing within an LLC domain, crossings counted | a steal prefers the cache domain; the crossing count is asserted | **P** (discovery) |
+| Cluster / remote `Host` nodes | one query answers local and remote alike | **P** (transport, N3b/N5a in a cell) |
+
+### 7.3 CPU features (docs/CPU-FEATURES.md)
+
+| What | Gate | State |
+|---|---|---|
+| **FRED** bring-up, probe/verify/report, IDT unchanged | `event_mode() == Fred` after one synthetic event | **L**. Checked, not assumed: QEMU 11.0.3 has FRED in `cpu.c` and `kvm/kvm.c` and **nothing in `target/i386/tcg/`**, so it is KVM-only and this container has no KVM |
+| The **feature-resolution layer** (`Native`/`Translated`/`Emulated`/`Numeric`/`Unavailable`) as code | a `Numeric` translation refused under a bit-exact contract | **G** - the classification exists in `hw::graph`'s `select`; the *resolution table* (what translates to what) does not |
+| **AMX** as a fourth dispatch tier | bit-exact against the scalar oracle | **L** - absent from this host and from TCG; Intel SDE unreachable under the network policy. Its fallback (int8 AMX → AVX-512/VNNI, `BitExact`) is the code running today and **is** proven |
+| AVX-512 / VNNI **inside a cell, on the OS** | a cell executes it | **L** - the *kernels* are host-proven bit-exact; TCG has no AVX-512 |
+
+### 7.4 Observability (docs/LOGGING.md 0)
+
+| What | Gate | State |
+|---|---|---|
+| The console lock, always on | 210/210 | **done** |
+| The per-CPU record ring with coalescing | 12 controls | **done** (`telemetry.rs`, `verify/telemetry/`) |
+| **A boot that actually enables buffering** | a kernel sets `telemetry::set_buffered(true)`, drains, and asserts the transcript is whole and ordered | **G** - *nothing enables it today*, so the in-QEMU half is unexercised. The ring is proven on the host and unproven on the machine, and those are different claims |
+| The metrics pipeline wired to a boot | percentiles reported from a real run | **G** - `metrics.rs` exists and no boot enables it |
+
+### 7.5 Research adopted-in-principle (docs/GREENFIELD.md 2)
+
+None built. Ranked there by value over cost, repeated here with gates:
+
+| Idea | Gate | State |
+|---|---|---|
+| **ZNS / FDP** host-managed placement | append to a zone, the write pointer advances, an out-of-order write is refused **by the device** | **G** - QEMU models `nvme,zoned=on`. The only one provable here, which moves it up |
+| **Supervision / restart** (Erlang, recovery-oriented computing) | a driver cell killed mid-request, restarted, the client completing or failing cleanly, the old fencing token refused | **G** - leases with fencing tokens already exist, which is the hard half |
+| **Flow-based accounting** (Nemesis) | two clients of one driver cell, charged CPU splitting by flow rather than landing on the driver | **G** - flow context is already in the ABI |
+| **Contract-checked channels** (Singularity) | an out-of-order message is a *compile* error; the wire format is unchanged | **G** - fills `idl/`, which is a stub |
+| **Cross-object persistent references** (Twizzler) | a different cell traverses a persistent index at a different base with no fixup pass | **G** - PMEM grants exist |
+| **Interference-driven core reallocation** (Caladan) | a latency cell's P99 held while a batch cell runs | **L** - TCG models no cache or bandwidth contention |
+| **CHERI** | pointer bounds enforced by hardware | **L** - upstream QEMU has no support; Morello is hardware |
+| **Accessibility / debug segments** (Arcan) | a cell's debug surface minted as an event stream | **G** |
+| **A12** network-transparent display | same client semantics remote | **P** (transport) |
+| **ghOSt** policy in userspace | a policy swapped without a kernel change | **P** (E2-E4 first, deliberately: a replaceable policy over three disagreeing entity representations multiplies the defect class) |
+
+### 7.6 Open defects and unproven claims
+
+| What | State |
+|---|---|
+| **QEMU 11: the 4-core GEMM barrier fails** - not all four online cores met inside one interval, where it passes on 8.2. Every phase up to two cells in user mode on two cores passes, so it is a distinct failure | **undiagnosed**, recorded in docs/SMP.md 10.1a rather than guessed at |
+| **`/sys/devices/system/cpu/online` = `0-0` is a constant that lies.** True when written; false since `linuxsmp` runs four Linux cells across four cores. libuv sizes its thread pool from it, so Node and Bun under-parallelise | **G** - and the fix is `smp::online_count()`, not a different constant |
+| **`linux::plock` is one big lock** over the whole dispatch. The finer per-cell locking docs/SMP.md 10.2 describes - what threads of one cell across cores would need - is not built | **P** (E4) |
+| **`linux::proc::preempt_cell` is unexercised.** A 4-thread cell always has a ready sibling, so the first arm always answers; executing the second needs a single-context cell that outlives its slice | **G** - needs a fixture |
+| **The full 210-boot matrix under QEMU 11** has not been run. QEMU 8.2 remains the reference emulator for every claim in this repository | **G** |
+| **No wall-clock comparison with tuned Linux.** No trustworthy baseline exists in this container - a 4-hog P50 moved 1,576 ns to 22,125 ns on identical code - and TCG models no caches or TLB | **L**. The tree says "designed to, unmeasured", which is what the evidence supports |
+
+### 7.7 The one-line summary
+
+Almost everything in 7.2 is blocked on **one** thing - per-ISA discovery - and that thing is
+provable in this container. Almost everything in 7.1 is blocked on **E2**, which is a pure
+refactor with the existing suite as its regression gate. Those two are the whole critical
+path; the rest of this register hangs off them or off hardware.

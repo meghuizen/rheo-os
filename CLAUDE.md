@@ -12,6 +12,14 @@ The design lives in `docs/` and is the source of truth. Read
 `docs/ARCHITECTURE.md` first; `docs/BUILD-ORDER.md` says what gets built in
 what order; `docs/DEVELOPMENT.md` covers the day-to-day mechanics.
 
+**`docs/ARCHITECTURE-DEBT.md` 7 is the consolidated "named but not built" register** -
+everything designed or promised in `docs/` with no code behind it, in one list, each row
+carrying its gate and what blocks it, marked **G** (provable in this container), **L**
+(needs hardware) or **P** (blocked on a prerequisite in the same table). Read it before
+planning: two entries are the whole critical path - per-ISA topology discovery unblocks
+almost all of the resource graph and is provable here, and stage E2 unblocks almost all of
+the execution model and is a pure refactor with the existing suite as its gate.
+
 **`docs/RESOURCE-GRAPH.md` is the machine model** - one typed graph of CPUs, memory
 nodes, devices, engines and links, with **cost vectors** rather than a scalar distance
 (HBM is low-latency *and* high-bandwidth; CXL is neither), queried rather than hardcoded,
