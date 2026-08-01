@@ -2587,7 +2587,15 @@ fn render_cpu_topology(path: &[u8]) -> Option<usize> {
     if i == 0 {
         return None;
     }
-    let file = rest[i..].strip_prefix(b"/topology/")?;
+    // `cpu_capacity` sits beside `topology/` rather than inside it, so it is matched before the
+    // directory prefix. Linux's own spelling: a per-host ratio out of 1024, which is what a
+    // capacity-aware reader (and this kernel's own scheduler) ranks by.
+    let capacity_file = rest[i..] == *b"/cpu_capacity";
+    let file: &[u8] = if capacity_file {
+        b"cpu_capacity"
+    } else {
+        rest[i..].strip_prefix(b"/topology/")?
+    };
 
     let inv = crate::hw::inventory();
     // `idx` came out of a **path the cell chose**, so the bound is a safety check and not a
@@ -2616,6 +2624,14 @@ fn render_cpu_topology(path: &[u8]) -> Option<usize> {
     let out = unsafe { &mut *addr_of_mut!(MAPS_SCRATCH) };
     let mut w = 0usize;
     match file {
+        // Absent rather than 1024 on a machine that described no classes, for the reason
+        // `MemFree` is absent from `meminfo`: a reader that finds `cpu_capacity` believes the
+        // machine was measured, and every capacity reading full is indistinguishable from a
+        // machine nobody asked. Linux itself only creates the file where an architecture
+        // supplies capacities.
+        b"cpu_capacity" if inv.class_src != crate::hw::ClassSource::None => {
+            w += put_num(out, w, me.capacity as usize)
+        }
         b"core_id" => w += put_num(out, w, me.core_id as usize),
         b"physical_package_id" => w += put_num(out, w, me.llc_id as usize),
         b"thread_siblings_list" | b"core_siblings_list" => {

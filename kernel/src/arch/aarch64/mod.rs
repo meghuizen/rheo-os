@@ -765,6 +765,43 @@ pub fn cpu_topology_bits() -> Option<(u8, u8)> {
     }
 }
 
+/// What kind of core **this** CPU is (docs/RESOURCE-GRAPH.md 2.4b).
+///
+/// ARM64 has no architectural register that names a core's *class*. `MIDR_EL1` names the
+/// implemented part, and on a big.LITTLE design the big and little cores report different part
+/// numbers - but turning a part number into "performance" or "efficiency" needs a table of
+/// every part Arm and its licensees have shipped, which is a list of what someone thought of
+/// and exactly the taxonomy trap docs/RESOURCE-GRAPH.md 2.6 refuses. The architectural answer
+/// is ACPI's PPTT or the device tree's `capacity-dmips-mhz`, and a bare-ELF `virt` boot is
+/// handed neither (docs/SMP.md 7).
+///
+/// So this returns `None` and the *divergence* is what it reports instead: `midr_el1()` is
+/// exposed so the portable side can notice that two cores describe different parts, which is a
+/// fact about the machine that needs no table. Written out rather than omitted because the
+/// absence is the finding.
+pub fn cpu_class_this_cpu() -> Option<(crate::hw::graph::CoreClass, u16)> {
+    None
+}
+
+/// This core's `MIDR_EL1` - the part it implements. Equal across every core of a symmetric
+/// machine; different between the big and little cores of a big.LITTLE one, which is how
+/// asymmetry is *detected* here without a table of part numbers.
+pub fn cpu_model_this_cpu() -> u64 {
+    let midr: u64;
+    // SAFETY: reads MIDR_EL1, a read-only id register available at EL1.
+    unsafe { asm!("mrs {0}, midr_el1", out(reg) midr, options(nomem, nostack)) };
+    midr
+}
+
+/// Whether this CPU offers a per-thread hardware class hint (docs/SCHEDULING.md 12).
+///
+/// False by construction rather than by probe: Intel Thread Director is an x86 feature and
+/// ARM64 defines no equivalent - there is no register to read and no bit to test, so a probe
+/// would be a probe of nothing. Written out so the portable caller needs no `cfg`.
+pub fn thread_director_present() -> bool {
+    false
+}
+
 /// This CPU's registry index, resolved from its **own** MPIDR against the table
 /// each CPU filled in [`smp_set_this_cpu`].
 ///

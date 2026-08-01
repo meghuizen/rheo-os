@@ -78,6 +78,13 @@ pub fn parse(dtb: usize, inv: &mut Inventory) {
     let mut kind = [NodeKind::Other; MAX_DEPTH];
     let mut numa = [0u8; MAX_DEPTH]; // per-depth numa-node-id (inherited)
     let mut cpu_hwid = 0u32;
+    // `capacity-dmips-mhz` per cpu node, in the device tree's own arbitrary units, indexed by
+    // the order cpu nodes are added. Normalised to `CAPACITY_FULL` after the walk, because the
+    // ratio is the only thing the numbers mean - the property's own documentation says they are
+    // comparable only against each other.
+    let mut cap_dmips = [0u32; crate::hw::MAX_CPUS];
+    let mut cur_dmips = 0u32;
+    let mut ncpu_seen = 0usize;
     let mut depth = 0usize;
 
     let mut pos = off_struct;
@@ -103,6 +110,7 @@ pub fn parse(dtb: usize, inv: &mut Inventory) {
                 }
                 if k == NodeKind::Cpu {
                     cpu_hwid = 0;
+                    cur_dmips = 0;
                 }
                 depth += 1;
             }
@@ -110,6 +118,10 @@ pub fn parse(dtb: usize, inv: &mut Inventory) {
                 depth = depth.saturating_sub(1);
                 if depth < MAX_DEPTH && kind[depth] == NodeKind::Cpu {
                     inv.add_cpu(cpu_hwid, numa[depth]);
+                    if ncpu_seen < crate::hw::MAX_CPUS {
+                        cap_dmips[ncpu_seen] = cur_dmips;
+                        ncpu_seen += 1;
+                    }
                 }
             }
             FDT_PROP => {
@@ -155,6 +167,8 @@ pub fn parse(dtb: usize, inv: &mut Inventory) {
                             cpu_hwid = be32(p, data);
                         } else if pname == "riscv,isa" {
                             save_riscv_isa(p, data, len);
+                        } else if pname == "capacity-dmips-mhz" && len >= 4 {
+                            cur_dmips = be32(p, data);
                         }
                     }
                     NodeKind::Memory => {
@@ -186,6 +200,48 @@ pub fn parse(dtb: usize, inv: &mut Inventory) {
     // The CPU topology needs every `cpu` node's phandle before it can resolve one, so it is
     // its own walk. See [`parse_cpu_map`].
     parse_cpu_map(p, off_struct, off_strings, inv);
+
+    apply_capacities(&cap_dmips[..ncpu_seen.min(crate::hw::MAX_CPUS)], inv);
+}
+
+/// Turn the device tree's `capacity-dmips-mhz` values into the graph's per-host capacity ratio
+/// and a core class (docs/RESOURCE-GRAPH.md 2.4b).
+///
+/// The property is deliberately unitless: its own binding says the numbers mean nothing except
+/// relative to each other, so the fastest core becomes `CAPACITY_FULL` and everything else is
+/// scaled against it. That is the same normalisation Linux performs, and it is why capacity is
+/// a per-host ratio rather than an absolute rate.
+///
+/// The **class** is derived from the ratio rather than stated by the device tree, which has no
+/// field for it: the fastest cores are `Performance` and anything slower is `Efficiency`. That
+/// is an interpretation and it is labelled as one - `class_src` becomes `DeviceTree`, so a
+/// consumer that wants to distinguish a stated class from a derived one can.
+///
+/// Does nothing when no cpu node carried the property, which is every machine QEMU models -
+/// checked in its source, where the string does not appear at all.
+fn apply_capacities(dmips: &[u32], inv: &mut Inventory) {
+    use crate::hw::graph::{CAPACITY_FULL, CoreClass};
+    let Some(&top) = dmips.iter().max() else {
+        return;
+    };
+    if top == 0 {
+        return;
+    }
+    for (i, &d) in dmips.iter().enumerate() {
+        if i >= inv.ncpus || d == 0 {
+            continue;
+        }
+        // Rounded, and floored at 1: a core 2000x slower than its sibling is still a core, and a
+        // capacity of 0 would read as "no information" to every consumer.
+        let cap = ((d as u64 * CAPACITY_FULL as u64 + top as u64 / 2) / top as u64).max(1);
+        inv.cpus[i].capacity = cap as u16;
+        inv.cpus[i].class = if d == top {
+            CoreClass::Performance
+        } else {
+            CoreClass::Efficiency
+        };
+    }
+    inv.class_src = super::ClassSource::DeviceTree;
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]

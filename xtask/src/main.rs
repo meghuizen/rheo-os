@@ -1095,6 +1095,7 @@ fn verify() -> bool {
         ("entity", "verify/entity/fuzz.rs"),
         ("telemetry", "verify/telemetry/fuzz.rs"),
         ("graph", "verify/graph/fuzz.rs"),
+        ("hetero", "verify/hetero/fuzz.rs"),
     ];
     let out = std::path::Path::new("target/verify");
     if let Err(e) = std::fs::create_dir_all(out) {

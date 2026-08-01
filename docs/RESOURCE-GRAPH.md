@@ -223,6 +223,71 @@ Still absent, and named rather than approximated: **core classes** (P/E/LP) and 
 feature divergence**, which are the other two rows of the table above and the prerequisite for
 section 6.4d.
 
+### 2.4b P-cores and E-cores: same instruction set, different capacity
+
+**The design decision this section exists to make explicit: a core class is not an instruction
+set.** A P-core and an E-core execute the same machine code - the same x86-64 base, the same SSE
+through AVX2, the same AES-NI, SHA, BMI1/BMI2, FMA and virtualization extensions - and AMD's Zen 5
+and Zen 5c are closer still, differing mainly in cache size and frequency. They present the same
+architectural state, so a thread migrates between them with an ordinary context switch (registers,
+program counter, vector state saved and restored exactly as for any other switch) with no
+recompilation and no emulation. They differ in *how fast* and *how efficiently* they run the same
+code.
+
+So the model carries, on the `Cpu` node beside its `IsaSet` and never inside it:
+
+- **`class`** - `Performance`, `Efficiency`, `LowPower`, or `Unknown`. `Unknown` is the zero value,
+  because these tables grow into zeroed frames and "nothing was described" must *be* the all-zero
+  pattern.
+- **`capacity`** - throughput relative to the fastest core **on this host**, out of 1024 (Linux's
+  convention). A machine that describes no classes has every core at 1024, which is exactly right
+  for it: they are all the fastest core there is.
+
+**The one historical exception is the rule's proof.** Early Alder Lake had AVX-512 on the P-cores
+only, and Intel disabled it **chip-wide** rather than ship a machine where a running thread could
+not be migrated. So a feature present on some cores and not others is a *correctness* constraint,
+not a placement hint. Its home is the per-CPU `IsaSet`, where placement can be restricted to the
+cores that have it - or the feature is not advertised at all. `sched::hetero` deliberately says
+nothing about features, and the per-CPU `IsaSet` is the register row that is still open.
+
+**Capacity is scoped to a host, which is what makes the cluster case expressible.** Each host
+normalises to its own fastest core, so comparing `capacity` across hosts is meaningless without a
+per-host scale factor that nothing in this tree can measure. A cross-host placement therefore
+ranks *within* a host and chooses the host by some other means - and since class and capacity ride
+the `Cpu` node, a remote host's cores carry theirs with no new mechanism, exactly as a remote
+memory bank carries its own locality.
+
+#### Discovery, and why only a core can classify itself
+
+| Source | x86-64 | ARM64 | RISC-V |
+|---|---|---|---|
+| Core class | CPUID leaf 7 hybrid flag then leaf `0x1A` | - (see below) | - |
+| Capacity | derived from the class | DT `capacity-dmips-mhz` | DT `capacity-dmips-mhz` |
+| Per-thread hint | **Intel Thread Director** (`CPUID.06H:EAX[19]` + `[23]`) | - | - |
+
+**A core's class can only be read by that core.** CPUID leaf `0x1A` answers about whoever executed
+it, and `MIDR_EL1` names the part *that* core implements. So `hw::detect` fills the boot CPU's
+class and `smp::secondary_run` fills each secondary's as it comes up, and the graph learns the
+result once, from the primary, at the end of `smp::start_all` - one writer at a known point, which
+is what keeps the graph's read path lock-free. The same is true of per-CPU *feature* divergence,
+and it is the same reason the AVX-512 case is a correctness problem rather than an inconvenience.
+
+ARM64 gets **no class**, and the reason is a refusal rather than a gap: `MIDR_EL1` names the part,
+and turning a part number into "performance" or "efficiency" needs a table of every part Arm and
+its licensees have shipped - a list of what someone thought of, the taxonomy trap section 2.6
+refuses. What is reported instead is **divergence**: each core records its model id and the
+inventory raises a flag the moment two of them disagree. An asymmetry this kernel cannot *name*,
+reported as an asymmetry, is strictly better than one reported as uniformity.
+
+**Nothing here is observable in QEMU**, and that is measured rather than assumed: QEMU 11
+implements no CPUID leaf `0x1A` and has no hybrid support at all, and the string
+`capacity-dmips-mhz` does not appear in its source. So the discovery runs, honestly finds nothing,
+and `hwinfo` **asserts the absence** on all three ISAs - which fails the moment a discovery path
+starts inventing an answer, exactly as the first version of the cache-domain decode did. The
+*consumption* is therefore gated on a **declared** asymmetry (`hw::declare_core_class`, its own
+`ClassSource::Declared` so it can never be mistaken for a measurement) and on a host
+model-checker over every machine shape QEMU cannot be asked for.
+
 ### 2.5 Capability sets, and why heterogeneity makes them first-class
 
 A cost tells you where something is *best* run. It does not tell you where it *can* run,

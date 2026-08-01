@@ -160,6 +160,49 @@ pub enum Arch {
     Riscv64 = 3,
 }
 
+/// What kind of core a `Cpu` node is on a hybrid part (docs/RESOURCE-GRAPH.md 2.4b).
+///
+/// **This is not an instruction set.** A P-core and an E-core execute the same machine code -
+/// same x86-64 base, same SSE through AVX2, same AES-NI, same FMA - and differ in how *fast*
+/// and how *efficiently* they execute it. That is why the class lives beside `capacity` on the
+/// `Cpu` node rather than in its [`IsaSet`]: a thread migrates between them with an ordinary
+/// context switch, no recompilation and no emulation, because both implement the same
+/// architectural state.
+///
+/// The one historical exception proves the rule. Early Alder Lake had AVX-512 on the P-cores
+/// only, and Intel disabled it **chip-wide** rather than ship a machine where a thread could
+/// not be migrated. So a feature present on some cores and not others is not a placement hint,
+/// it is a correctness constraint - and the honest handling is either to restrict placement to
+/// the cores that have it or not to advertise it at all. That belongs in the per-CPU `IsaSet`,
+/// and this enum deliberately says nothing about it.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+#[repr(u8)]
+pub enum CoreClass {
+    /// Nothing described this core's class. **The zero value on purpose**: the tables this
+    /// lands in grow into zeroed frames, and "unknown" must *be* the all-zero pattern.
+    #[default]
+    Unknown = 0,
+    /// A performance core: highest single-thread throughput, usually with SMT.
+    Performance = 1,
+    /// An efficiency core: lower throughput per clock, better throughput per watt, usually
+    /// without SMT.
+    Efficiency = 2,
+    /// A low-power core outside the main complex (Intel's LP E-core, an always-on island).
+    LowPower = 3,
+}
+
+/// The capacity a core of unknown class carries, and the top of the scale.
+///
+/// 1024 is Linux's convention and it is a **ratio, not a unit**: the fastest core on a host is
+/// 1024 and everything else is relative to it. A machine that describes no classes has every
+/// core at 1024, which is exactly right for it - they are all the fastest core there is.
+///
+/// **Scoped to a host.** Two hosts in a cluster each normalise to their own fastest core, so
+/// comparing `capacity` across hosts is meaningless without a per-host scale factor that
+/// nothing in this tree can measure. A cross-host placement therefore ranks *within* a host and
+/// chooses the host by some other means (docs/RESOURCE-GRAPH.md 2.4b).
+pub const CAPACITY_FULL: u16 = 1024;
+
 /// What a node can *do*. The open-ended half of the model.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[repr(u16)]
@@ -374,6 +417,12 @@ pub struct Node {
     /// Set membership - a cache domain, an SMT set, a power domain. `NONE` when unset.
     pub set: NodeId,
     pub isa: IsaSet,
+    /// For a `Cpu`: what kind of core it is. `Unknown` everywhere else, and on every machine
+    /// that is not hybrid.
+    pub class: CoreClass,
+    /// For a `Cpu`: its throughput relative to the fastest core **on this host**, out of
+    /// [`CAPACITY_FULL`]. 0 for a node that is not a CPU.
+    pub capacity: u16,
     /// Bus-device-function for a `Device`, a hardware id for a `Cpu`, a size for memory.
     pub hw_id: u64,
     /// Index of this node's first capability in the capability table, and how many.
@@ -387,6 +436,8 @@ impl Node {
         node: NodeId::NONE,
         set: NodeId::NONE,
         isa: IsaSet::NONE,
+        class: CoreClass::Unknown,
+        capacity: 0,
         hw_id: 0,
         caps_at: 0,
         caps_len: 0,
@@ -549,6 +600,72 @@ impl Graph {
         };
         n.isa = isa;
         self.nodes.set(id.0 as usize, n)
+    }
+
+    /// Record what kind of core a `Cpu` is and how fast it is relative to the fastest core on
+    /// this host (docs/RESOURCE-GRAPH.md 2.4b).
+    pub fn set_core(&mut self, id: NodeId, class: CoreClass, capacity: u16) -> bool {
+        let Some(mut n) = self.get(id) else {
+            return false;
+        };
+        n.class = class;
+        n.capacity = capacity;
+        self.nodes.set(id.0 as usize, n)
+    }
+
+    /// The `Cpu` with the **highest capacity** among those `want` selects, or `None` if none
+    /// match.
+    ///
+    /// The query "where should a demanding entity run", separated from the scheduler so a cell,
+    /// a driver and the POSIX translation ask it the same way. `want` is applied as a filter
+    /// first and capacity ranks only what survives - the same two-phase order
+    /// [`Graph::nearest`] uses, and for the same reason: a combined score can trade
+    /// *correctness* for speed, which is how work lands on a core that cannot run it.
+    ///
+    /// **Ties go to the lowest node id**, which makes the answer deterministic. On a machine
+    /// that described no classes every CPU is at [`CAPACITY_FULL`], so this returns the first
+    /// matching CPU - byte-for-byte what a caller that did not know about capacity would pick.
+    pub fn fastest_cpu(&self, want: Option<CoreClass>) -> Option<NodeId> {
+        let mut best: Option<(NodeId, u16)> = None;
+        for i in 0..self.nodes.capacity() {
+            let Some(n) = self.nodes.get(i) else {
+                continue;
+            };
+            if n.kind != NodeKind::Cpu {
+                continue;
+            }
+            if let Some(c) = want
+                && n.class != c
+            {
+                continue;
+            }
+            match best {
+                Some((_, cap)) if n.capacity <= cap => {}
+                _ => best = Some((NodeId(i as u16), n.capacity)),
+            }
+        }
+        best.map(|(id, _)| id)
+    }
+
+    /// Whether this host holds cores of more than one class or more than one capacity - the
+    /// question every capacity-aware decision must ask first, because on a uniform machine
+    /// every such decision must reduce to the answer it gave before.
+    pub fn is_hybrid(&self) -> bool {
+        let mut seen: Option<(CoreClass, u16)> = None;
+        for i in 0..self.nodes.capacity() {
+            let Some(n) = self.nodes.get(i) else {
+                continue;
+            };
+            if n.kind != NodeKind::Cpu {
+                continue;
+            }
+            match seen {
+                None => seen = Some((n.class, n.capacity)),
+                Some(first) if first != (n.class, n.capacity) => return true,
+                Some(_) => {}
+            }
+        }
+        false
     }
 
     /// Attach a capability to `id`.

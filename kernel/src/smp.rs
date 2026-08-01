@@ -414,6 +414,10 @@ pub fn secondary_run(hw_id: u32) {
     // the kernel first touches one's memory, and then takes a store page fault at a
     // kernel PC on a perfectly-mapped user page (docs/SMP.md 10.0).
     arch::user_mode_init_this_cpu();
+    // This core's own class and model. Only the calling core can read them - x86-64's CPUID
+    // leaf 0x1A answers about whoever executed it - so a secondary classifies itself rather
+    // than the boot CPU classifying it (docs/RESOURCE-GRAPH.md 2.4b).
+    crate::hw::classify_this_cpu(idx);
     set_online(idx, hw_id);
     // Genuine cross-core critical section: take the shared lock and write.
     {
@@ -1797,6 +1801,11 @@ pub fn start_all() -> usize {
             started += 1;
         }
     }
+    // Every core that came up has classified itself by now, so the graph can learn what the
+    // boot CPU could not read about its siblings (docs/RESOURCE-GRAPH.md 2.4b). One writer,
+    // here, with every secondary parked in its work loop.
+    crate::hw::graph_build::refresh_cpu_classes(crate::hw::inventory());
+    crate::sched::hetero::load_from_inventory(crate::hw::inventory());
     started
 }
 

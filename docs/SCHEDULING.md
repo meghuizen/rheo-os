@@ -429,7 +429,56 @@ it), the CachyOS sched-ext wiki (`wiki.cachyos.org/configuration/sched-ext`), th
 `sched-ext/scx` scheduler repository, and the EEVDF/ghOSt background in kernel
 documentation and LWN.
 
-## 12. Honest costs
+## 12. Heterogeneous cores: capacity, class, and Intel Thread Director
+
+P-cores and E-cores execute the **same** instruction set (docs/RESOURCE-GRAPH.md 2.4b), so
+nothing here is about capability and everything is about *capacity*. `sched::hetero` holds the
+per-CPU capacity table and the three decisions that read it.
+
+**Classification is observed, not inferred.** Intel Thread Director is hardware that watches a
+running thread - IPC, cache misses, memory stalls, vector mix, spin behaviour - and hands the OS a
+per-thread class. Where it exists it is the better source and the hint records that
+(`HintSource::ThreadDirector`). Where it does not, the substitute is not a heuristic: **every
+relinquish in this OS is an explicit, counted transition through a named call** (`sched::bore`), so
+"how long does this entity run before it voluntarily gives the CPU up" is a measurement rather than
+the inference Linux's CFS had to make - and that is precisely the signal Thread Director's
+`compute intensive` versus `mostly sleeping` hints carry. What is genuinely missing without the
+hardware is the *microarchitectural* half - IPC, stalls, vector mix - which needs a PMU, is modelled
+by no emulator here, and is named as absent rather than approximated.
+
+Three classes, each derivable from what is actually observed:
+
+| Class | Observed as | Placed on |
+|---|---|---|
+| `Unknown` | has never relinquished - a freshly created entity | the **fastest** core. An unknown demand over-served costs a little energy; under-served it costs a migration *and* the time already lost |
+| `Compute` | has relinquished, and its burst score is at or above the threshold | the **fastest** core - throughput |
+| `Bursty` | has relinquished, short bursts - an event loop, a shell, an I/O-bound strand | the **slowest** core, leaving the fast ones for work that can use them. Its latency comes from being *dispatched* promptly, which the burst-weighted virtual deadline already gives it (low score = high weight = earlier deadline) |
+
+**Fairness is deliberately *not* rescaled by capacity.** It would be easy to charge virtual time
+by delivered work rather than by wall-clock, so that a task on an E core is credited less. That
+changes what fairness *means* - Linux keeps vruntime wall-clock based on purpose and uses capacity
+for placement and utilization instead - and re-deciding the fairness definition is not something a
+capacity feature should do as a side effect. Capacity affects placement, steal direction and the
+reported statistics; the EEVDF ordering is untouched.
+
+**A mismatched steal is counted, never prevented.** Work conservation wins and the crossing is
+reported, the rule the locality work already holds. And this preference is real even for work that
+has **not started yet** - which is what distinguishes it from the cache-domain steal preference
+docs/RESOURCE-GRAPH.md 6.3a refuses: a cache domain is about moving a working set an unstarted
+entity does not have, where capacity is about how fast it will run for its whole life once it does.
+
+**A uniform machine must be unaffected**, and that comes out of the *tie rule* rather than a
+special case: "highest capacity, ties to the lowest CPU number" is already "the lowest CPU number"
+when every capacity is equal. A first version checked a `is_hybrid()` gate there, the check was
+observed to change no answer, and it was removed - one path cannot drift away from the case it was
+meant to preserve.
+
+Proven by `verify/hetero/` (8 deterministic properties + 20,000 random machines, 1..8 cores of
+random class and capacity, oracle by scanning the declared table) and by `hwinfo`'s assertion that
+the discovery ran and honestly found nothing. Four controls firing; one that did *not* fire is
+recorded above.
+
+## 12a. Honest costs
 
 - Partitioning wastes cores at low utilization; fair timesharing is *better*
   for a laptop. This design assumes a server whose workload mix is known and

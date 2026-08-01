@@ -87,12 +87,33 @@ pub enum TopoSource {
     DeviceTree,
 }
 
+/// Where a CPU's core class and capacity came from (docs/RESOURCE-GRAPH.md 2.4b).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ClassSource {
+    /// Nothing described them. Every core is `Unknown` at [`graph::CAPACITY_FULL`], which is
+    /// the correct description of a machine whose cores are all the same.
+    None,
+    /// x86-64 CPUID leaf `0x1A`, read **by each core about itself**.
+    Cpuid,
+    /// A device tree's `capacity-dmips-mhz`.
+    DeviceTree,
+    /// Set by a caller rather than discovered - [`declare_core_class`]. Kept as its own value
+    /// so nothing can mistake a declared asymmetry for a measured one.
+    Declared,
+}
+
 #[derive(Copy, Clone)]
 pub struct CpuInfo {
     /// Hardware id (APIC id / MPIDR affinity / hart id).
     pub hw_id: u32,
     pub node: u8,
     pub online: bool,
+    /// What kind of core this is, on a hybrid part.
+    pub class: graph::CoreClass,
+    /// Throughput relative to the fastest core **on this host**, out of
+    /// [`graph::CAPACITY_FULL`]. Every core starts at full, which is what a machine with one
+    /// kind of core genuinely is.
+    pub capacity: u16,
     /// The physical core this CPU is a thread of. Two CPUs with the same `core_id` are SMT
     /// siblings: they share execution resources, so co-scheduling two compute-bound entities
     /// on them is slower than spreading them. [`TOPO_UNKNOWN`] when undiscovered.
@@ -207,6 +228,14 @@ pub struct Inventory {
     pub cpus: [CpuInfo; MAX_CPUS],
     /// Where `cpus[..].core_id`/`llc_id` came from, or [`TopoSource::None`].
     pub topo: TopoSource,
+    /// Where `cpus[..].class`/`capacity` came from, or [`ClassSource::None`].
+    pub class_src: ClassSource,
+    /// Per-CPU model id, filled by each core about itself (0 = has not reported).
+    pub cpu_model: [u64; MAX_CPUS],
+    /// True once two cores have reported **different** model ids. The asymmetry a machine can
+    /// have that this kernel cannot name: reporting it as asymmetry is strictly better than
+    /// reporting it as uniformity.
+    pub model_divergence: bool,
     pub nmem: usize,
     pub mem: [MemRegion; MAX_MEM_REGIONS],
     pub nnodes: usize,
@@ -244,10 +273,15 @@ impl Inventory {
                 hw_id: 0,
                 node: 0,
                 online: false,
+                class: graph::CoreClass::Unknown,
+                capacity: graph::CAPACITY_FULL,
                 core_id: TOPO_UNKNOWN,
                 llc_id: TOPO_UNKNOWN,
             }; MAX_CPUS],
             topo: TopoSource::None,
+            class_src: ClassSource::None,
+            cpu_model: [0; MAX_CPUS],
+            model_divergence: false,
             nmem: 0,
             mem: [MemRegion {
                 base: 0,
@@ -293,6 +327,8 @@ impl Inventory {
                 hw_id,
                 node,
                 online: false,
+                class: graph::CoreClass::Unknown,
+                capacity: graph::CAPACITY_FULL,
                 core_id: TOPO_UNKNOWN,
                 llc_id: TOPO_UNKNOWN,
             };
@@ -416,6 +452,10 @@ pub fn detect() {
     // A machine that offers neither keeps `TOPO_UNKNOWN` and `TopoSource::None`. That is the
     // whole reason for the sentinel: defaulting the ids to 0 would tell a scheduler that
     // every CPU is a thread of one core, which is worse than telling it nothing.
+    // The boot CPU's core class, read by the boot CPU about itself. See
+    // `classify_this_cpu` for why only this one can be filled here.
+    classify_this_cpu(0);
+
     if let (TopoSource::None, Some((smt_bits, llc_bits))) = (inv.topo, arch::cpu_topology_bits()) {
         for c in inv.cpus[..inv.ncpus].iter_mut() {
             c.core_id = (c.hw_id >> smt_bits) as u16;
@@ -430,6 +470,74 @@ pub fn detect() {
     // real-PMEM path). Inert on every machine without an nvdimm, so the DDR path
     // is unchanged.
     crate::mm::frames_pmem::init_from_inventory(inv);
+}
+
+/// Record the core class of the CPU **currently executing**, at inventory index `cpu`
+/// (docs/RESOURCE-GRAPH.md 2.4b).
+///
+/// **Only the calling core can answer**, which is why this is a function every core calls for
+/// itself rather than a loop the boot CPU runs: x86-64's CPUID leaf `0x1A` reports the class of
+/// whoever executed it, and ARM64's `MIDR_EL1` the part *that* core implements. So the boot CPU
+/// fills index 0 from `detect`, and `smp::secondary_run` fills each secondary's index as it
+/// comes up. A machine whose secondaries never start keeps `Unknown` for them - correct, since
+/// nothing has asked them.
+///
+/// Also records the core's **model id** and raises `class_src` to `Cpuid` the moment two cores
+/// disagree about it. That is the part worth keeping: a machine can be asymmetric in a way this
+/// kernel cannot name - a big.LITTLE ARM part, where turning a `MIDR` into a class would need a
+/// table of every part ever shipped - and "these cores are not the same" is a fact that needs no
+/// table. An unnameable asymmetry reported as asymmetry is strictly better than one reported as
+/// uniformity.
+pub fn classify_this_cpu(cpu: usize) {
+    let inv = inventory_mut();
+    if cpu >= MAX_CPUS {
+        return;
+    }
+    if let Some((class, capacity)) = arch::cpu_class_this_cpu() {
+        inv.cpus[cpu].class = class;
+        inv.cpus[cpu].capacity = capacity;
+        inv.class_src = ClassSource::Cpuid;
+    }
+    let model = arch::cpu_model_this_cpu();
+    if cpu < MAX_CPUS {
+        inv.cpu_model[cpu] = model;
+    }
+    // Divergence against any core that has already reported. Compared against *reported* cores
+    // only (a model of 0 is "has not reported"), so a machine bringing cores up one at a time
+    // does not see a false difference against a slot nobody has filled.
+    if model != 0 {
+        for other in 0..inv.ncpus.min(MAX_CPUS) {
+            if other != cpu && inv.cpu_model[other] != 0 && inv.cpu_model[other] != model {
+                inv.model_divergence = true;
+            }
+        }
+    }
+}
+
+/// Declare a CPU's core class and capacity rather than discovering them.
+///
+/// **This exists because no emulator this tree runs on models a hybrid part** - QEMU 11
+/// implements neither x86-64's hybrid flag nor CPUID leaf `0x1A`, and never emits
+/// `capacity-dmips-mhz` (both checked in its source). A capacity-aware scheduler whose
+/// asymmetry can never be exercised is a scheduler nobody has run, so the asymmetry is
+/// *declared* and every decision that reads it is then a decision under test.
+///
+/// It sets `class_src` to [`ClassSource::Declared`], which is the whole discipline: a declared
+/// asymmetry can never be mistaken for a measured one, by a test or by a reader, and any
+/// consumer that wants to distinguish them can. The precedent is the deliberately synthetic
+/// asymmetry docs/RESOURCE-GRAPH.md 6.4d specifies for the no-FPU case.
+pub fn declare_core_class(cpu: usize, class: graph::CoreClass, capacity: u16) {
+    let inv = inventory_mut();
+    if cpu >= MAX_CPUS {
+        return;
+    }
+    inv.cpus[cpu].class = class;
+    inv.cpus[cpu].capacity = capacity.min(graph::CAPACITY_FULL);
+    inv.class_src = ClassSource::Declared;
+    // One source, two readers: the graph learns it in the same call, so nothing can read a
+    // capacity from the graph that disagrees with the inventory.
+    graph_build::refresh_cpu_classes(inv);
+    crate::sched::hetero::load_from_inventory(inv);
 }
 
 /// Opt-in BAR assignment (docs/GPU-HARDWARE.md 3): write addresses from
@@ -477,6 +585,18 @@ pub fn print_summary() {
         } else {
             crate::print!(" id{}=core{}/llc{}", c.hw_id, c.core_id, c.llc_id);
         }
+    }
+    crate::println!();
+    // Core classes and capacities. `-` for a machine whose cores are all the same, which is what
+    // every profile here is: no emulator models a hybrid part (docs/RESOURCE-GRAPH.md 2.4b).
+    crate::print!(
+        "hw: cpu classes ({:?}, divergent models {}, thread director {}):",
+        inv.class_src,
+        inv.model_divergence,
+        arch::thread_director_present()
+    );
+    for c in &inv.cpus[..inv.ncpus] {
+        crate::print!(" id{}={:?}/{}", c.hw_id, c.class, c.capacity);
     }
     crate::println!();
     for r in &inv.mem[..inv.nmem] {

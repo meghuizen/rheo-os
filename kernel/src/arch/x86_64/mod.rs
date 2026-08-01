@@ -1585,6 +1585,77 @@ pub fn cpu_topology_bits() -> Option<(u8, u8)> {
     Some((smt_bits, llc_bits.max(smt_bits)))
 }
 
+/// What kind of core **this** CPU is, if the part is hybrid (docs/RESOURCE-GRAPH.md 2.4b).
+///
+/// Two CPUID reads, in order:
+///
+/// 1. Leaf `7` subleaf 0, `edx[15]` - the **hybrid** flag. Clear means every core on this part
+///    is the same kind, and there is nothing to report.
+/// 2. Leaf `0x1A`, `eax[31:24]` - this core's type. `0x40` is an Atom (efficiency) core, `0x20`
+///    a Core (performance) core. `eax` reading 0 means the leaf is not supported for this core.
+///
+/// **It reports only the calling core, and that is a property of the hardware rather than a
+/// limitation here.** Leaf `0x1A` answers about whoever executed it, so the boot CPU cannot
+/// classify its siblings - the class has to be read by each core as it comes up, which is why
+/// `hw::detect` fills only CPU 0 and `smp::secondary_run` fills the rest. The same is true of
+/// per-CPU *feature* divergence, and it is the reason early Alder Lake's AVX-512 was disabled
+/// chip-wide: a feature only some cores have cannot be advertised to a thread the scheduler
+/// might migrate.
+///
+/// The capacity beside the class is **derived from the class, not measured**: 1024 for a
+/// performance core and 640 for an efficiency one, which is the shape of the ratio real hybrid
+/// parts report through CPPC's `highest_perf` and not a reading of it. Said here because a
+/// number that looks measured and is not is the defect this tree keeps finding.
+///
+/// Returns `None` on a part that is not hybrid, which is every machine QEMU models: QEMU 11
+/// implements neither the hybrid flag nor leaf `0x1A` (checked in its source, not inferred).
+pub fn cpu_class_this_cpu() -> Option<(crate::hw::graph::CoreClass, u16)> {
+    use crate::hw::graph::{CAPACITY_FULL, CoreClass};
+    use core::arch::x86_64::__cpuid_count;
+    let max_leaf = __cpuid_count(0, 0).eax;
+    if max_leaf < 0x1A || __cpuid_count(7, 0).edx & (1 << 15) == 0 {
+        return None;
+    }
+    match __cpuid_count(0x1A, 0).eax >> 24 {
+        0x20 => Some((CoreClass::Performance, CAPACITY_FULL)),
+        0x40 => Some((CoreClass::Efficiency, 640)),
+        _ => None,
+    }
+}
+
+/// This core's model id - CPUID leaf 1 `eax` (family/model/stepping) with the *native model*
+/// from leaf `0x1A` folded in where the part is hybrid, so two cores of a hybrid part compare
+/// unequal even though they share a family and model.
+pub fn cpu_model_this_cpu() -> u64 {
+    use core::arch::x86_64::__cpuid_count;
+    let base = __cpuid_count(1, 0).eax as u64;
+    let max_leaf = __cpuid_count(0, 0).eax;
+    if max_leaf >= 0x1A && __cpuid_count(7, 0).edx & (1 << 15) != 0 {
+        return base | ((__cpuid_count(0x1A, 0).eax as u64) << 32);
+    }
+    base
+}
+
+/// Whether this CPU offers Intel Thread Director's per-thread feedback
+/// (docs/SCHEDULING.md 12).
+///
+/// `CPUID.06H:EAX[19]` is the hardware feedback interface (the shared table of per-class
+/// performance and efficiency capabilities) and `EAX[23]` is Thread Director proper (the
+/// per-thread class the hardware assigns). **Both** are required: the table without the
+/// per-thread class says how good each core is at each class of work but never which class a
+/// thread is, and the class without the table has nowhere to be looked up.
+///
+/// False on every machine here - QEMU 11 has no hybrid support at all, so neither bit is ever
+/// set (checked in its source, not inferred from a probe returning false).
+pub fn thread_director_present() -> bool {
+    use core::arch::x86_64::__cpuid_count;
+    if __cpuid_count(0, 0).eax < 6 {
+        return false;
+    }
+    let eax = __cpuid_count(6, 0).eax;
+    eax & (1 << 19) != 0 && eax & (1 << 23) != 0
+}
+
 /// Decode CPU vendor + features via CPUID.
 pub fn cpu_report(_inv: &crate::hw::Inventory) -> crate::hw::CpuReport {
     use core::arch::x86_64::__cpuid_count;

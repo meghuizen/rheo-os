@@ -723,6 +723,32 @@ pub fn cpu_topology_bits() -> Option<(u8, u8)> {
     None
 }
 
+/// What kind of core **this** CPU is (docs/RESOURCE-GRAPH.md 2.4b).
+///
+/// RISC-V has no register for it, the same way it has none for the cache topology: `mvendorid`
+/// / `marchid` / `mimpid` are M-mode CSRs that trap in S-mode, and none of them names a
+/// *class* anyway. The device tree's `capacity-dmips-mhz` is the source, read by `hw::fdt`
+/// straight into the inventory, so there is nothing for an architectural rule to do.
+pub fn cpu_class_this_cpu() -> Option<(crate::hw::graph::CoreClass, u16)> {
+    None
+}
+
+/// This core's model id. RISC-V's are M-mode CSRs that trap in S-mode, so there is no
+/// per-core model to compare and asymmetry cannot be *detected* here either - 0 for every
+/// core, which is the truthful answer rather than a fabricated distinct value.
+pub fn cpu_model_this_cpu() -> u64 {
+    0
+}
+
+/// Whether this CPU offers a per-thread hardware class hint (docs/SCHEDULING.md 12).
+///
+/// False by construction rather than by probe: Intel Thread Director is an x86 feature and
+/// RISC-V defines no equivalent - there is no register to read and no bit to test, so a probe
+/// would be a probe of nothing. Written out so the portable caller needs no `cfg`.
+pub fn thread_director_present() -> bool {
+    false
+}
+
 /// Decode CPU features from the device-tree "riscv,isa" string (misa is an
 /// M-mode CSR and traps in S-mode, so the firmware string is the source).
 pub fn cpu_report(_inv: &crate::hw::Inventory) -> crate::hw::CpuReport {

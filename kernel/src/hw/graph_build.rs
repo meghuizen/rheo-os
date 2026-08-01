@@ -62,6 +62,11 @@ pub fn build(inv: &super::Inventory) {
             break;
         };
         g.set_isa(id, isa);
+        // What kind of core it is and how fast, relative to the fastest on this host. Every
+        // core reads `CAPACITY_FULL` on a machine that described no classes, which is what
+        // such a machine is - they are all the fastest core there is
+        // (docs/RESOURCE-GRAPH.md 2.4b).
+        g.set_core(id, c.class, c.capacity);
         let n = c.node as usize;
         if n < super::MAX_DIST_NODES && mem_node[n] != NodeId::NONE {
             g.set_locality(id, mem_node[n]);
@@ -184,6 +189,33 @@ pub fn build(inv: &super::Inventory) {
     } else {
         Source::None
     });
+}
+
+/// Re-read every CPU's core class and capacity into the graph.
+///
+/// The graph is built at boot, on the boot CPU, and **a core's class can only be read by that
+/// core** (docs/RESOURCE-GRAPH.md 2.4b): x86-64's CPUID leaf `0x1A` answers about whoever
+/// executed it. So at build time the graph knows CPU 0's class and nothing about its siblings,
+/// and this is what closes the gap once the secondaries have classified themselves.
+///
+/// Called by the primary at the end of `smp::start_all`, which is a single writer at a known
+/// point with every secondary already parked in its work loop. **Not** called from the
+/// secondaries themselves: two cores writing one graph would need the read path to take a lock,
+/// and the graph's whole cost model is that it does not (`hw::graph`'s module note). It updates
+/// existing nodes in place rather than rebuilding, because `Graph::init` sets the owner and does
+/// not reset the tables - a second `build` would append a duplicate machine.
+///
+/// Also called by a caller that has just *declared* an asymmetry (`hw::declare_core_class`), so
+/// the graph and the inventory cannot disagree about it.
+pub fn refresh_cpu_classes(inv: &super::Inventory) {
+    // SAFETY: one writer - the primary, after bring-up or after an explicit declaration, with
+    // no core inside a graph query.
+    let g = unsafe { graph() };
+    for c in &inv.cpus[..inv.ncpus] {
+        if let Some(id) = g.find(NodeKind::Cpu, c.hw_id as u64) {
+            g.set_core(id, c.class, c.capacity);
+        }
+    }
 }
 
 /// The graph's source, from the firmware that described the machine.

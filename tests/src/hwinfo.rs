@@ -27,6 +27,7 @@ extern "C" fn kernel_main() -> ! {
     assert!(inv.cpu.features != 0, "no CPU features detected");
 
     cpu_topology(inv);
+    core_classes(inv);
 
     println!("hwinfo: PASS");
     arch::exit(arch::ExitCode::Success)
@@ -204,4 +205,94 @@ fn cpu_topology(inv: &hw::Inventory) {
         );
         let _ = THREADS_PER_CORE;
     }
+}
+
+// --------------------------------------------- core classes, and an honest absence
+//
+// P-cores and E-cores execute the **same** instruction set and differ in how fast and how
+// efficiently they run it (docs/RESOURCE-GRAPH.md 2.4b), so the model carries a class and a
+// capacity per CPU and says nothing about features. What this phase asserts is that the
+// discovery **ran and honestly found nothing**, which is a real claim rather than a placeholder:
+//
+// - x86-64's probe reads CPUID leaf 7's hybrid flag and then leaf `0x1A`. QEMU 11 implements
+//   neither - it has no hybrid support at all, checked in its source - so the answer is "not a
+//   hybrid part".
+// - ARM64 has no architectural register naming a core's class (`MIDR_EL1` names the *part*, and
+//   mapping parts to classes needs a table of every part ever shipped), and a bare-ELF `virt`
+//   boot gets neither PPTT nor a device tree.
+// - riscv64's source is the device tree's `capacity-dmips-mhz`, which QEMU never emits (the
+//   string does not appear in its source).
+//
+// So every core reads `Unknown` at full capacity, the graph reports not-hybrid, and Thread
+// Director reports absent. The value of asserting an absence is that it fails the moment a
+// discovery path starts inventing an answer - which is exactly what the first version of the
+// cache-domain decode did.
+fn core_classes(inv: &hw::Inventory) {
+    use kernel::hw::graph::{self, CAPACITY_FULL, CoreClass};
+    use kernel::sched::hetero;
+
+    assert_eq!(
+        inv.class_src,
+        hw::ClassSource::None,
+        "a core class was discovered on {}; no emulator here models a hybrid part, so this is \
+         either new hardware or a discovery path inventing an answer",
+        arch::NAME
+    );
+    for c in &inv.cpus[..inv.ncpus] {
+        assert_eq!(
+            c.class,
+            CoreClass::Unknown,
+            "CPU id{} claims a class on a machine that describes none",
+            c.hw_id
+        );
+        assert_eq!(
+            c.capacity, CAPACITY_FULL,
+            "CPU id{} is not at full capacity on a machine whose cores are all the same - every \
+             core of such a machine *is* the fastest core there is",
+            c.hw_id
+        );
+    }
+    // Every core reported its model id, and none diverged - the asymmetry this kernel could
+    // notice without a table of part numbers.
+    assert!(
+        !inv.model_divergence,
+        "two cores report different models on a machine QEMU builds from one CPU type"
+    );
+    assert!(
+        !hetero::thread_director(),
+        "Intel Thread Director reported present. QEMU 11 sets neither CPUID.06H:EAX[19] nor \
+         EAX[23] - it has no hybrid support at all"
+    );
+
+    // SAFETY: built at boot; read-only here, single-threaded.
+    let g = unsafe { graph::graph() };
+    assert!(
+        !g.is_hybrid(),
+        "the graph reports a hybrid machine where the inventory reports one kind of core - the \
+         two must not be able to disagree, since the graph is built from the inventory"
+    );
+    // The placement query still answers on a uniform machine, and answers the *first* CPU:
+    // a query that refused unless the machine was hybrid would make every caller special-case it.
+    let first = g
+        .find(graph::NodeKind::Cpu, inv.cpus[0].hw_id as u64)
+        .expect("CPU 0 is not a graph node");
+    assert_eq!(
+        g.fastest_cpu(None),
+        Some(first),
+        "fastest_cpu on a uniform machine must answer its first CPU, not None"
+    );
+    assert_eq!(
+        g.fastest_cpu(Some(CoreClass::Performance)),
+        None,
+        "fastest_cpu answered for a class no CPU here claims"
+    );
+    println!(
+        "hwinfo: CORE CLASSES DISCOVERED AND HONESTLY ABSENT - {} CPUs, all Unknown at capacity \
+         {CAPACITY_FULL}, source {:?}, no model divergence, Thread Director absent. P-cores and \
+         E-cores run the SAME instruction set and differ in capacity, so the model carries a \
+         class and a capacity per CPU; QEMU models no hybrid part (no CPUID leaf 0x1A, no \
+         hybrid flag, no capacity-dmips-mhz - read out of its source), so the discovery ran and \
+         found nothing, and the graph agrees with the inventory that this machine is uniform OK",
+        inv.ncpus, inv.class_src
+    );
 }

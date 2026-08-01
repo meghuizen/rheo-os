@@ -2695,6 +2695,42 @@ the preference itself. Judged from the group actually taken against a freshly-re
 run-mark**, not where it claims: a claim can be lost to a stealer, and counting at claim
 time recorded nine claims for eight cells.
 
+**Heterogeneous cores are modelled, discovered and scheduled for** (docs/RESOURCE-GRAPH.md
+2.4b, docs/SCHEDULING.md 12): a P-core and an E-core execute the **same** instruction set and
+differ in how fast and how efficiently they run it, so the `Cpu` node carries a **class**
+(Performance/Efficiency/LowPower/Unknown) and a **capacity** (out of 1024, relative to the
+fastest core *on this host*, which is what makes the cluster case expressible) beside its
+`IsaSet` and never inside it. The one historical exception is the rule's proof - early Alder
+Lake had AVX-512 on P-cores only and Intel disabled it **chip-wide** rather than ship a machine
+where a running thread could not be migrated - so a feature some cores lack is a *correctness*
+constraint belonging in the per-CPU `IsaSet`, and `sched::hetero` deliberately says nothing about
+features. **Only a core can classify itself** (CPUID leaf `0x1A` answers about whoever executed
+it), so the boot CPU fills its own class and each secondary fills its own at bring-up, with the
+graph learning the result once from the primary at the end of `start_all` - one writer, so the
+read path stays lock-free. ARM64 gets **no class by design**: `MIDR_EL1` names the *part*, and a
+part->class table is a list of what someone thought of, so what is reported instead is
+**divergence** (each core records its model id and a flag rises when two disagree) - an asymmetry
+this kernel cannot name, reported as an asymmetry, being strictly better than one reported as
+uniformity. Classification of *work* is **observed, not inferred**: Intel Thread Director is
+probed and deferred to where present (`HintSource::ThreadDirector`), and where absent the
+substitute is not a heuristic, because every relinquish here is an explicit counted transition
+(`sched::bore`) - so `Unknown` (never relinquished) and `Compute` (long bursts) take the fastest
+core while `Bursty` (short bursts, frequent yields) takes the slowest and gets its latency from
+the run queue's ordering instead. The microarchitectural half of Thread Director's signal - IPC,
+stalls, vector mix - needs a PMU and is named absent rather than approximated. **Fairness is
+deliberately not rescaled by capacity** (that would redefine what fairness means as a side
+effect; capacity drives placement, steal direction and statistics, and the EEVDF ordering is
+untouched), and a **mismatched steal is counted, never prevented** - unlike the cache-domain
+steal preference, which is *refused* in docs/RESOURCE-GRAPH.md 6.3a because an unstarted cell has
+no working set to move, where capacity governs how fast it will run for its whole life. **QEMU
+models no hybrid part** (no CPUID leaf `0x1A`, no hybrid flag, no `capacity-dmips-mhz` - read out
+of its source), so `hwinfo` **asserts the honest absence** on all three ISAs and consumption is
+gated on a *declared* asymmetry carrying its own `ClassSource::Declared`; `verify/hetero/`
+model-checks the placement over 8 deterministic properties and 20,000 random machines QEMU cannot
+be asked for. A uniform machine is unaffected by the **tie rule** rather than by a special case -
+a first version's `is_hybrid()` gate in `pick_cpu` was observed to change no answer and was
+removed.
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
 proofs, and the hardware-lab performance numbers.

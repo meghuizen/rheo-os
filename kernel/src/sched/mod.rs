@@ -21,6 +21,7 @@
 pub mod bore;
 pub mod dispatch;
 pub mod entity;
+pub mod hetero;
 pub mod preempt;
 pub mod vcore;
 
