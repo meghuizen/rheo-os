@@ -12,6 +12,14 @@ The design lives in `docs/` and is the source of truth. Read
 `docs/ARCHITECTURE.md` first; `docs/BUILD-ORDER.md` says what gets built in
 what order; `docs/DEVELOPMENT.md` covers the day-to-day mechanics.
 
+**`docs/RESOURCE-GRAPH.md` is the machine model** - one typed graph of CPUs, memory
+nodes, devices, engines and links, with **cost vectors** rather than a scalar distance
+(HBM is low-latency *and* high-bandwidth; CXL is neither), queried rather than hardcoded,
+and generalising to remote hosts by making a cluster the same graph with larger costs. It
+names the concrete gaps today - SLIT and HMAT unparsed, a device's proximity domain unread
+so driver DMA is placed blind, LLC and SMT sets unmodelled - and its gate is **provable in
+this container**, since QEMU accepts `-numa dist` and `hmat=on`.
+
 **`docs/GREENFIELD.md` is the design rationale** - the answer to "how would you build
 an OS today, knowing everything the last fifty years produced, including the good ideas
 that never shipped". It carries the lineage already implemented, ten unlanded research

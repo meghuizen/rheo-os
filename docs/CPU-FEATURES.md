@@ -222,6 +222,33 @@ keeps every syscall, trap and interrupt free of FP save/restore (docs/SUBSTRATE.
 `#[path]`-includes librheo's dependency-free tile kernels rather than reimplementing them,
 so there is one implementation and one oracle.
 
+### 2.4a Where each unavailable feature can actually be tested - measured, not guessed
+
+The question "can we emulate FRED / AVX-512 / AMX" was answered by checking, and the answers
+differ per feature, which is why they are listed separately rather than as one deferral:
+
+| Feature | Testable here? | Evidence |
+|---|---|---|
+| **AVX-512** (F, BW, VL, CD, DQ) | **Yes, already** | The *host* CPU has them. `comparison/tiles` builds the shipped tile kernels as host programs and validates each tier bit-for-bit against the scalar oracle - 2000 random shapes per tier - then reports throughput (avx512 2.58x scalar) |
+| **AVX-512 VNNI** | **Yes, already** | `avx512_vnni` is present on the host (note the Linux flag spelling - `avx512_vnni`, not Rust's `avx512vnni`; grepping the wrong one is how this was briefly mis-read). The VNNI tier is selected only when `is_x86_feature_detected!` agrees, and it validates bit-exact at 3.60x scalar |
+| **AVX-512 in a *cell*, on the OS** | **No** | QEMU's TCG has no AVX-512 (zero mentions in `target/i386/tcg/`, confirmed in 11.0.3). So the *kernels* are proven and their use *inside a cell under emulation* is not. Those are different claims and the tree must not merge them |
+| **BF16** | **No** | absent from the host and from TCG |
+| **AMX** | **No path available here** | absent from the host (`amx_tile` not reported) and unmodelled by TCG. Intel SDE is the usual answer and `downloadmirror.intel.com` / `www.intel.com` are unreachable under this environment's network policy. Needs Sapphire Rapids-class hardware |
+| **FRED** | **No path available here** | QEMU is KVM-only for it (section 1.3) and there is no KVM; Bochs 2.7 - the version apt offers - predates the specification; Simics is commercial. Needs FRED silicon with KVM, or bare metal |
+
+Two consequences worth stating rather than leaving implicit.
+
+**AMX's fallback is already proven, which is what makes its absence tolerable.** Section
+2.3 classifies an int8 AMX matmul as translating **BitExact** to AVX-512/VNNI - integer
+accumulate is exact - and that translation is *the code that runs today* and is validated
+bit-for-bit above. So AMX is a performance tier on a proven-correct path, not an
+unimplemented feature. When hardware appears it is a fourth tier of an existing dispatch.
+
+**FRED's fallback is likewise the tested path**, and unlike AMX it will stay that way in
+this repository indefinitely, so the ordering matters: the IDT path is not a stopgap to be
+replaced but the permanent reference implementation, with FRED added beside it and gated on
+silicon.
+
 ### 2.5 Honest scope
 
 Under QEMU TCG: AVX2 is exposed and AVX-512 is not, AMX is not modelled, and TCG models no
