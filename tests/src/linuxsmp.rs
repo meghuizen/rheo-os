@@ -70,6 +70,9 @@ static CPULIST: &[u8] = fixture::linux!("cpulist");
 /// Reads the per-CPU topology files hwloc reads. Here rather than in a single-CPU kernel for
 /// the same reason `cpulist` is: on one CPU every answer is 0 and a constant passes.
 static CPUTOPO: &[u8] = fixture::linux!("cputopo");
+
+/// Reads the memory-locality files libnuma and hwloc read.
+static NUMATOPO: &[u8] = fixture::linux!("numatopo");
 const RUSTTHREADS_OUT: &[u8] = b"threads 4 total 1550 channel 1550\n";
 const RUSTTHREADS_EXIT: u64 = 4;
 
@@ -127,6 +130,7 @@ extern "C" fn kernel_main() -> ! {
     test_registry_stress_two_cores();
     test_cpu_list();
     test_cpu_topology();
+    test_node_topology();
     test_preempted_threads_two_cores();
     test_dynamic_cell_on_secondary();
 
@@ -1033,17 +1037,30 @@ fn test_cpu_topology() {
         o
     };
     let got = captured(0);
-    // Two cores of two threads: CPU 0 with CPU 1, CPU 2 with CPU 3, one package.
+    // Three expectations, because the three platforms genuinely describe three different
+    // machines from one launch line - and that difference is the finding, not a wrinkle to
+    // paper over with a looser assertion.
+    //
+    // x86-64: two cores of two threads in one package. CPUID reports the launch exactly.
     #[cfg(target_arch = "x86_64")]
     let want: &[u8] = b"cputopo: cpu0 core=0 pkg=0 threads=0,1\n\
                         cputopo: cpu2 core=1 pkg=0 threads=2,3\n\
                         cputopo: read failed\n\
                         cputopo: read failed\n";
-    // Four independent cores, one package - what the platform describes when it cannot carry
-    // the launch's `threads=2`.
-    #[cfg(not(target_arch = "x86_64"))]
+    // ARM64: four independent cores in one cluster. MPIDR is index-based (no MT bit, no thread
+    // field), and its cluster size is 16, so four CPUs are one cluster whatever `-smp` says.
+    #[cfg(target_arch = "aarch64")]
     let want: &[u8] = b"cputopo: cpu0 core=0 pkg=0 threads=0\n\
                         cputopo: cpu2 core=2 pkg=0 threads=2\n\
+                        cputopo: read failed\n\
+                        cputopo: read failed\n";
+    // riscv64: four independent cores in **two** clusters. QEMU's `virt` builds one `cpu-map`
+    // cluster per *NUMA socket* rather than from `-smp sockets=`, and this launch declares two
+    // memory nodes with the CPUs split - so cpu0 and cpu2 are in different cache domains. That
+    // is the platform describing itself more precisely than the other two, not a disagreement.
+    #[cfg(target_arch = "riscv64")]
+    let want: &[u8] = b"cputopo: cpu0 core=0 pkg=0 threads=0\n\
+                        cputopo: cpu2 core=2 pkg=1 threads=2\n\
                         cputopo: read failed\n\
                         cputopo: read failed\n";
     match outcome {
@@ -1058,25 +1075,110 @@ fn test_cpu_topology() {
         core::str::from_utf8(got),
         core::str::from_utf8(want)
     );
-    // What the transcript means differs per ISA for the reason `hwinfo` records, so the
-    // message says which claim was actually made rather than one sentence for both.
+    // What the transcript means differs per ISA, so the message says which claim was actually
+    // made rather than one sentence for three machines.
     #[cfg(target_arch = "x86_64")]
     println!(
         "linuxsmp: AN UNMODIFIED BINARY READS THE REAL CPU TOPOLOGY - a Linux cell opened \
          /sys/devices/system/cpu/cpu{{0,2}}/topology/ and read back exactly what QEMU's \
          `-smp 4,sockets=1,cores=2,threads=2` declares: cpu0 with cpu1 on core 0, cpu2 with \
-         cpu3 on core 1, one package. Synthesized from the same discovery the resource graph \
-         is built from, and a nonexistent cpu9 (inside the array, past the discovered CPUs) and cpu99 (past the array itself) are both refused rather than answered. That is the \
-         path hwloc takes, and through it Java, .NET and OpenMP OK"
+         cpu3 on core 1, one package. Synthesized from the same discovery the resource graph is \
+         built from, and a nonexistent cpu9 (inside the array, past the discovered CPUs) and \
+         cpu99 (past the array itself) are both refused rather than answered. That is the path \
+         hwloc takes, and through it Java, .NET and OpenMP OK"
     );
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
     println!(
-        "linuxsmp: AN UNMODIFIED BINARY READS THE REAL CPU TOPOLOGY - a Linux cell opened \
-         /sys/devices/system/cpu/cpu{{0,2}}/topology/ and read back four independent cores in \
-         one package, which is what this platform describes: QEMU cannot express the launch's \
-         `threads=2` to a guest here (ARM MPIDR is index-based, riscv `cpu-map` emits no \
-         thread nodes), so the SMT half is SKIPPED WITH A REASON and what is asserted is the \
-         platform's own answer, synthesized rather than seeded. A nonexistent cpu9 and cpu99 are both refused \
-         rather than answered. This is the path hwloc takes OK"
+        "linuxsmp: AN UNMODIFIED BINARY READS THE REAL CPU TOPOLOGY - four independent cores in \
+         one cluster, which is what this platform describes: QEMU builds MPIDR from the CPU \
+         index with no MT bit and no thread field, so the launch's `threads=2` cannot reach the \
+         guest and the SMT half is SKIPPED WITH A REASON. A nonexistent cpu9 and cpu99 are both \
+         refused rather than answered OK"
+    );
+    #[cfg(target_arch = "riscv64")]
+    println!(
+        "linuxsmp: AN UNMODIFIED BINARY READS THE REAL CPU TOPOLOGY - four independent cores in \
+         TWO cache domains, read out of the device tree's `cpu-map`: QEMU's `virt` builds one \
+         cluster per NUMA socket, so the launch's two memory nodes put cpu0 and cpu2 in \
+         different domains. Its `cpu-map` emits no thread nodes, so the SMT half is SKIPPED \
+         WITH A REASON. A nonexistent cpu9 and cpu99 are both refused rather than answered OK"
+    );
+}
+
+// ------------------- the memory localities, read by an unmodified Linux binary
+//
+// The other half of the `/sys` surface (docs/RESOURCE-GRAPH.md 6.3): `node/online`,
+// `nodeN/cpulist` and `nodeN/distance`. `distance` is the file the whole SLIT/`cpu-map` parse
+// exists to feed - it is how libnuma and hwloc learn that node 1 is *further* than node 0
+// rather than merely different, and it is what `numactl --hardware` prints.
+//
+// **The oracle is the launch**: two 512 MiB memory backends, CPUs 0-1 on node 0 and 2-3 on
+// node 1, and `dist,src=0,dst=1,val=20` both ways.
+//
+// Per ISA, and for the reason the `numa` kernel already records: x86-64 reads the ACPI SRAT
+// and SLIT, riscv64 the device tree, and **ARM64 is handed no firmware table at all** on a
+// bare-ELF `virt` boot - so there it is one locality holding every CPU, which is what that
+// machine genuinely is, and the transcript says so.
+
+fn test_node_topology() {
+    // SAFETY: as `test_cpu_list`.
+    let outcome = unsafe {
+        STDOUT_LEN = [0; CAP_CELLS];
+        kernel::linux::set_stdout_tap(Some(tap));
+        let o = harness::run_linux_cell(NUMATOPO, &[b"numatopo"]);
+        kernel::linux::set_stdout_tap(None);
+        o
+    };
+    let got = captured(0);
+    match outcome {
+        kernel::user::Outcome::Exited(0) => {}
+        other => panic!("numatopo exited {other:?}"),
+    }
+    // Two localities, CPUs 0-1 on node 0 and 2-3 on node 1, `distance` rows carrying the
+    // declared 20 in ACPI's units with 10 for a node to itself. Every number is off the launch.
+    #[cfg(not(target_arch = "aarch64"))]
+    let want: &[u8] = b"numatopo: online=0-1\n\
+                        numatopo: n0cpus=0,1\n\
+                        numatopo: n0dist=10 20\n\
+                        numatopo: n1cpus=2,3\n\
+                        numatopo: n1dist=20 10\n\
+                        numatopo: n9dist=<none>\n";
+    // ARM64 is handed **no firmware table** on a bare-ELF `virt` boot - checked, not assumed,
+    // and the reason the `numa` kernel skips there - so nothing describes localities and the
+    // machine has exactly one holding every CPU. That is what it *is*, so it is asserted rather
+    // than skipped: a single node whose only distance is the local one.
+    #[cfg(target_arch = "aarch64")]
+    let want: &[u8] = b"numatopo: online=0\n\
+                        numatopo: n0cpus=0,1,2,3\n\
+                        numatopo: n0dist=10\n\
+                        numatopo: n1cpus=<none>\n\
+                        numatopo: n1dist=<none>\n\
+                        numatopo: n9dist=<none>\n";
+    assert!(
+        got == want,
+        "the memory localities an unmodified binary reads out of sysfs are {:?}, want {:?}. The \
+         launch declares two 512 MiB nodes with cpus=0-1 and cpus=2-3 and dist val=20",
+        core::str::from_utf8(got),
+        core::str::from_utf8(want)
+    );
+    #[cfg(not(target_arch = "aarch64"))]
+    println!(
+        "linuxsmp: AN UNMODIFIED BINARY READS THE REAL MEMORY LOCALITIES - a Linux cell read \
+         /sys/devices/system/node/ and got two nodes, `cpulist` 0,1 and 2,3, and `distance` \
+         rows `10 20` / `20 10` - exactly what QEMU's two `-numa node` lines and \
+         `dist,val=20` declare. `distance` is the file libnuma and hwloc read to learn that a \
+         node is *further* rather than merely different, which is what the whole SLIT and \
+         device-tree distance parse exists for. `MemFree` is deliberately absent (this kernel \
+         counts free frames per node only as a search range, and a fabricated one is a number \
+         a runtime sizes a heap from), and a nonexistent node9 is refused rather than \
+         answered OK"
+    );
+    #[cfg(target_arch = "aarch64")]
+    println!(
+        "linuxsmp: AN UNMODIFIED BINARY READS THE REAL MEMORY LOCALITIES - one node holding \
+         all four CPUs, distance `10`. QEMU hands a bare-ELF `virt` boot no firmware table, so \
+         nothing describes localities here and one node is what this machine is - asserted \
+         rather than skipped, because the degraded answer has to be correct too. A nonexistent \
+         node9 is refused rather than answered OK"
     );
 }

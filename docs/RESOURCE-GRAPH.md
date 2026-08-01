@@ -505,7 +505,7 @@ correct machine view with no port:
 | `/sys/devices/system/cpu/online`, `present`, `possible` | the graph's CPU set - **done** |
 | `/sys/devices/system/cpu/cpuN/topology/{core_id,physical_package_id,thread_siblings_list}` | SMT sets and packages - **done** |
 | `/sys/devices/system/cpu/cpuN/cache/indexN/{level,size,shared_cpu_list}` | LLC domains |
-| `/sys/devices/system/node/nodeN/{cpulist,meminfo,distance}` | **`distance` is SLIT** - the file libnuma and hwloc read |
+| `/sys/devices/system/node/nodeN/{cpulist,meminfo,distance}` | **`distance` is SLIT** - the file libnuma and hwloc read - **done** |
 | `/sys/devices/system/node/nodeN/hmem_attrs/…` | HMAT bandwidth and latency |
 | `/sys/bus/pci/devices/*/numa_node` | a device's proximity domain |
 | `/proc/cpuinfo` flags | the per-node `IsaSet` |
@@ -555,9 +555,52 @@ Two details worth keeping, both of which are the "never seeded" rule doing work:
 
 `cache/indexN/` is still absent and that is deliberate: this kernel discovers who *shares* a
 cache, not how big it is (CPUID leaf 4 returns zeros under QEMU's TCG - measured), and a
-fabricated `size` is a number a reader would compute a blocking factor from. The `node/`
-half is the next rendering; its data - localities, distances, HMAT magnitudes - already
-exists.
+fabricated `size` is a number a reader would compute a blocking factor from.
+
+**The `node/` half is built too**: `online`, `nodeN/cpulist`, `nodeN/distance` and
+`nodeN/meminfo`, from the same localities and distances the graph's `MemoryNode` edges carry.
+`distance` is the one that matters - it is how libnuma and hwloc learn a node is *further*
+rather than merely different, which is the entire reason SLIT and `numa-distance-map-v1` were
+parsed. Two more of the rule's consequences:
+
+- **`MemFree` is absent, not zero.** This kernel tracks free frames per node as an allocator
+  *search range*, not as a count, and a fabricated `MemFree` is a number a runtime sizes a heap
+  from. A missing field is a signal every reader already handles; a wrong one is not.
+- **`hmem_attrs/` is still absent** even though HMAT is parsed, because that directory states
+  per-initiator attributes and this kernel reads the SLLBI for memory-side latency and
+  bandwidth only. Rendering it would be broader than what was read.
+
+One thing the launch taught, worth keeping: **the same `-numa` line produces three different
+machines**, and each ISA's rendering is that machine rather than the line. x86-64 reports two
+nodes in one CPU package. riscv64 reports two nodes *and* two cache domains, because QEMU's
+`virt` builds one `cpu-map` cluster per NUMA socket rather than from `-smp sockets=`. ARM64
+reports one node holding every CPU, because a bare-ELF `virt` boot is handed no firmware table
+at all - and that degraded answer is **asserted rather than skipped**, since a graph that is
+only correct on the well-described machine is not correct.
+
+### 6.3a A rejection: the cache-domain steal has no victim to choose yet
+
+With `siblings(cpu, Cache)` built, "steal within a cache domain first" looks like the obvious
+next slice. It was examined and **refused**, because the cost it would optimise does not exist
+in either of this tree's two steal paths:
+
+- **`smp::steal` moves only cells that have not *started***. That is the whole reason it is
+  safe (docs/SMP.md 10.0: migrating a *running* entity was attempted twice and reverted
+  twice). An unstarted cell has never executed an instruction, so **nothing of it is in the
+  victim's cache** - stealing it across a cache domain costs nothing to move, and a preference
+  would be optimising a transfer that is not happening. What *does* matter for an unstarted
+  cell is which memory node its pages are on, and that is the node-affine claim already built
+  (docs/SUBSTRATE.md pillar 6).
+- **The strand injector is one shared queue**, not per-vcore deques, so there is no *victim*
+  to prefer between: a thief takes the head of the single `TicketLock<VecDeque<_>>`
+  (docs/CONCURRENCY.md). Per-vcore deques would create the choice, and that is the change to
+  make first - together with a way for a cell to *learn* its cache domain, since the runtime
+  is userspace and has no register to read it from.
+
+So the real precondition is **E3/E4**: per-entity run state with migration, at which point a
+warm victim exists and the preference has something to be right about. Written down rather
+than built, because a preference over unstarted cells would pass a test, count zero crossings,
+and mean nothing - the shape docs/ENGINEERING.md 7 calls a stub that reports success.
 
 ## 6.4 The graph as backbone: every consumer, and what each one asks
 
@@ -569,7 +612,7 @@ per consumer, with the query each makes and what is missing before it can make i
 |---|---|---|
 | **Driver framework** (DRIVERS.md D2) | `node_of(bdf)`, `siblings(cpu, Cache)` - place queues, bounce frames and MSI-X vectors near the device | discovery: `_PXM` (the cache half is **done**) |
 | **Kernel scheduler** | `cost`, `siblings` - which core to place an entity on, which node its pages want | E2-E4 (discovery is **done**) |
-| **Work stealing** | `siblings(victim, Cache)` - **steal within a cache domain first** | nothing - this is the next slice, and the query it needs exists |
+| **Work stealing** | `siblings(victim, Cache)` - **steal within a cache domain first** | **E3/E4, and not the query** - see the rejection below |
 | **Introspection** (`cpuinfo`, `lshw`, `hwinfo`) | render the graph | nothing for CPUs; `_PXM` for devices |
 | **POSIX translation** | `/sys/devices/system/{cpu,node}`, `getcpu`, `sched_getaffinity` (6.3) | discovery + the synthesis |
 | **.NET / Java / Go task schedulers** | nothing new - they read the POSIX surface | 6.3 |

@@ -554,6 +554,13 @@ fn maybe_open_maps(st: &mut LinuxState, path_va: u64, flags: u64) -> Option<i64>
         let scratch = unsafe { &*addr_of_mut!(MAPS_SCRATCH) };
         return Some(st.fds.open_maps(&scratch[..len], flags));
     }
+    // And the memory-locality half of the same surface, from the same discovery: `distance`
+    // is the file libnuma and hwloc read to decide *how much* further another node is, which
+    // is the whole reason SLIT was parsed.
+    if let Some(len) = render_node_topology(path) {
+        let scratch = unsafe { &*addr_of_mut!(MAPS_SCRATCH) };
+        return Some(st.fds.open_maps(&scratch[..len], flags));
+    }
     if path != b"/proc/self/maps" {
         return None;
     }
@@ -2633,6 +2640,150 @@ fn render_cpu_topology(path: &[u8]) -> Option<usize> {
                 first = false;
                 w += put_num(out, w, n);
             }
+        }
+        _ => return None,
+    }
+    if w < out.len() {
+        out[w] = b'\n';
+        w += 1;
+    }
+    Some(w)
+}
+
+/// Render one of `/sys/devices/system/node/...` into `MAPS_SCRATCH`, returning its length, or
+/// `None` when the path is not one of them.
+///
+/// The four files, and what a reader does with each:
+///
+/// - `online` - which memory localities exist. `numactl --hardware` starts here.
+/// - `nodeN/cpulist` - the CPUs whose memory this node is. This is the file a NUMA-aware
+///   runtime uses to pin a worker beside the memory it will touch.
+/// - `nodeN/distance` - one row of the SLIT matrix, space separated. **This is the file the
+///   whole distance parse exists for**: it is how libnuma and hwloc learn that node 1 is
+///   further than node 0 rather than merely different.
+/// - `nodeN/meminfo` - `MemTotal` only, summed from the firmware memory map's regions tagged
+///   with this node. `MemFree` is **deliberately absent**: this kernel tracks free frames per
+///   node only as an allocator search range, not as a count, and a fabricated `MemFree` is a
+///   number a runtime sizes a heap from. A reader that needs it sees the field missing, which
+///   is the truthful signal.
+///
+/// A machine whose firmware described no localities still answers - it has exactly one, which
+/// is correct for it, and `distance` is then the single local value. That is not a fabrication:
+/// "one node, distance to itself" is what the machine *is*.
+fn render_node_topology(path: &[u8]) -> Option<usize> {
+    const ROOT: &[u8] = b"/sys/devices/system/node";
+    let rest = path.strip_prefix(ROOT)?;
+    let inv = crate::hw::inventory();
+    let nnodes = inv.nnodes.max(1);
+
+    // SAFETY: a synchronous trap; filled and copied out by the caller before returning.
+    let out = unsafe { &mut *addr_of_mut!(MAPS_SCRATCH) };
+    let mut w = 0usize;
+
+    if rest == b"/online" || rest == b"/possible" || rest == b"/has_memory" {
+        w += put_num(out, w, 0);
+        if nnodes > 1 {
+            if w < out.len() {
+                out[w] = b'-';
+                w += 1;
+            }
+            w += put_num(out, w, nnodes - 1);
+        }
+        if w < out.len() {
+            out[w] = b'\n';
+            w += 1;
+        }
+        return Some(w);
+    }
+
+    // `/nodeN/<file>`.
+    let after = rest.strip_prefix(b"/node")?;
+    let mut i = 0usize;
+    let mut node = 0usize;
+    while i < after.len() && after[i].is_ascii_digit() {
+        node = node * 10 + (after[i] - b'0') as usize;
+        i += 1;
+        if i > 6 {
+            return None;
+        }
+    }
+    if i == 0 {
+        return None;
+    }
+    // The same bound as the CPU-topology render, and for the same reason: `node` came out of a
+    // path the cell chose, and `inv.dist` is a fixed matrix.
+    if node >= nnodes {
+        return None;
+    }
+    match &after[i..] {
+        b"/cpulist" => {
+            // Comma-separated CPU **indices**, not hardware ids - the file names the CPUs the
+            // rest of this surface numbers.
+            let mut first = true;
+            for (n, c) in inv.cpus[..inv.ncpus].iter().enumerate() {
+                if c.node as usize != node {
+                    continue;
+                }
+                if !first && w < out.len() {
+                    out[w] = b',';
+                    w += 1;
+                }
+                first = false;
+                w += put_num(out, w, n);
+            }
+        }
+        b"/distance" => {
+            // One row, space separated, in ACPI's relative units. `10` for the node to itself
+            // because that is ACPI's local value and what Linux prints; a pair with no
+            // reported distance also reads 10 on a single-node machine, where it is the only
+            // true answer - and on a multi-node machine an unreported pair would read 0, which
+            // no SLIT can produce (it forbids a distance below 10), so a reader can tell the
+            // difference.
+            for to in 0..nnodes {
+                if to > 0 && w < out.len() {
+                    out[w] = b' ';
+                    w += 1;
+                }
+                let d = if to == node {
+                    10
+                } else if node < crate::hw::MAX_DIST_NODES && to < crate::hw::MAX_DIST_NODES {
+                    inv.dist[node][to]
+                } else {
+                    0
+                };
+                w += put_num(out, w, d as usize);
+            }
+        }
+        b"/meminfo" => {
+            let mut total = 0u64;
+            for r in &inv.mem[..inv.nmem] {
+                if r.node as usize == node && r.kind == crate::hw::MemKind::Ram {
+                    total += r.len;
+                }
+            }
+            // `Node <n> MemTotal:  <kB> kB` - Linux's exact spelling, because a reader parses
+            // for it.
+            for b in b"Node " {
+                if w < out.len() {
+                    out[w] = *b;
+                    w += 1;
+                }
+            }
+            w += put_num(out, w, node);
+            for b in b" MemTotal:       " {
+                if w < out.len() {
+                    out[w] = *b;
+                    w += 1;
+                }
+            }
+            w += put_num(out, w, (total / 1024) as usize);
+            for b in b" kB\n" {
+                if w < out.len() {
+                    out[w] = *b;
+                    w += 1;
+                }
+            }
+            return Some(w);
         }
         _ => return None,
     }

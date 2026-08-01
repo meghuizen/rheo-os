@@ -251,6 +251,21 @@ fn fixed_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             // to read. Inert for scheduling - same four hardware ids either way.
             "-smp",
             "4,sockets=1,cores=2,threads=2",
+            // And two memory localities with the CPUs split across them, so the
+            // `/sys/devices/system/node` phase has a `cpulist` and a `distance` row
+            // that are not the degenerate one. **These lines are that phase's oracle.**
+            "-object",
+            "memory-backend-ram,id=m0,size=512M",
+            "-numa",
+            "node,nodeid=0,memdev=m0,cpus=0-1",
+            "-object",
+            "memory-backend-ram,id=m1,size=512M",
+            "-numa",
+            "node,nodeid=1,memdev=m1,cpus=2-3",
+            "-numa",
+            "dist,src=0,dst=1,val=20",
+            "-numa",
+            "dist,src=1,dst=0,val=20",
             "-global",
             "virtio-mmio.force-legacy=false",
             "-drive",
@@ -263,6 +278,21 @@ fn fixed_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             // to read. Inert for scheduling - same four hardware ids either way.
             "-smp",
             "4,sockets=1,cores=2,threads=2",
+            // And two memory localities with the CPUs split across them, so the
+            // `/sys/devices/system/node` phase has a `cpulist` and a `distance` row
+            // that are not the degenerate one. **These lines are that phase's oracle.**
+            "-object",
+            "memory-backend-ram,id=m0,size=512M",
+            "-numa",
+            "node,nodeid=0,memdev=m0,cpus=0-1",
+            "-object",
+            "memory-backend-ram,id=m1,size=512M",
+            "-numa",
+            "node,nodeid=1,memdev=m1,cpus=2-3",
+            "-numa",
+            "dist,src=0,dst=1,val=20",
+            "-numa",
+            "dist,src=1,dst=0,val=20",
             "-global",
             "virtio-mmio.force-legacy=false",
             "-drive",
@@ -275,6 +305,21 @@ fn fixed_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             // to read. Inert for scheduling - same four hardware ids either way.
             "-smp",
             "4,sockets=1,cores=2,threads=2",
+            // And two memory localities with the CPUs split across them, so the
+            // `/sys/devices/system/node` phase has a `cpulist` and a `distance` row
+            // that are not the degenerate one. **These lines are that phase's oracle.**
+            "-object",
+            "memory-backend-ram,id=m0,size=512M",
+            "-numa",
+            "node,nodeid=0,memdev=m0,cpus=0-1",
+            "-object",
+            "memory-backend-ram,id=m1,size=512M",
+            "-numa",
+            "node,nodeid=1,memdev=m1,cpus=2-3",
+            "-numa",
+            "dist,src=0,dst=1,val=20",
+            "-numa",
+            "dist,src=1,dst=0,val=20",
             "-drive",
             "file=tests/linux-fixtures/build/x86_64/dyn-disk.img,if=none,id=blk0,format=raw",
             "-device",
@@ -1758,6 +1803,7 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         ("sysx.c", "sysx", NO_EXTRA),
         ("cpulist.c", "cpulist", NO_EXTRA),
         ("cputopo.c", "cputopo", NO_EXTRA),
+        ("numatopo.c", "numatopo", NO_EXTRA),
         ("mmapdp.c", "mmapdp", NO_EXTRA),
         ("cowfork.c", "cowfork", NO_EXTRA),
     ] {
