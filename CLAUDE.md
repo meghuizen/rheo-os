@@ -2729,7 +2729,19 @@ gated on a *declared* asymmetry carrying its own `ClassSource::Declared`; `verif
 model-checks the placement over 8 deterministic properties and 20,000 random machines QEMU cannot
 be asked for. A uniform machine is unaffected by the **tie rule** rather than by a special case -
 a first version's `is_hybrid()` gate in `pick_cpu` was observed to change no answer and was
-removed.
+removed. **And the preference is wired into the multi-core claim**, not only modelled:
+`place_cells_classed` publishes a class per cell and `claim_matching_tier` scans for work suiting
+the claiming core's tier before the ordinary cursor, safe by the same `PLACE_RUN` exchange
+`steal` uses; a core claims **one cell at a time** on a hybrid machine, because a batch is work
+held unstarted that may not suit the holder while a core that does suit it idles (restoring the
+batch of two makes the phase fail intermittently - observed). The `smp` kernel proves it on all
+three ISAs: CPUs 0-1 declared Performance and 2-3 Efficiency, two compute and two bursty cells,
+every compute cell asserted on a full-capacity core and every bursty one on a reduced core, all
+four claims through the preference, zero tier crossings, and the machine restored to uniform
+before the assertions run. One defect on the way: the queue is republished **grouped by home
+node**, so slot k is not cell k, and reading the class by slot told the preference the wrong thing
+about the cell - looked up through `PLACE_ORIGIN` now, and honestly recorded as proven by the
+observation that produced it rather than by a control the phase can reproduce on demand.
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus

@@ -250,6 +250,16 @@ pub fn pick_cpu(want: ThreadClass, idle: u64) -> Option<usize> {
     chosen
 }
 
+/// Whether CPU `cpu`'s tier suits work of class `want`, **without counting anything**.
+///
+/// The predicate on its own, for a caller that is *choosing* rather than *reporting* - the
+/// placement scan asks it once per candidate slot, and counting those would make the mismatch
+/// counter a measure of how many slots were skipped rather than of how much work landed on the
+/// wrong tier.
+pub fn tier_suits(cpu: usize, want: ThreadClass) -> bool {
+    tier_matches(cpu, want)
+}
+
 /// Whether CPU `cpu`'s tier suits work of class `want`.
 ///
 /// Always true on a uniform machine: there is one tier, so nothing can be the wrong one.

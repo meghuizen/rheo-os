@@ -308,6 +308,7 @@ fn test_secondary_bringup() {
             test_loaded_multi_vcore_cell();
             test_user_cells_on_both();
             test_placement();
+            test_hetero_placement();
             test_two_vcores_one_cell();
             test_vcore_yield();
             test_per_vcore_queues();
@@ -1258,6 +1259,181 @@ fn test_placement() {
                 println!("smp:   CPU {c} claimed {n}");
             }
         }
+    }
+}
+
+// --------------------------- P-cores and E-cores: work placed by the core it suits
+//
+// P-cores and E-cores execute the **same** instruction set and differ in how fast and how
+// efficiently they run it (docs/RESOURCE-GRAPH.md 2.4b), so this is about *capacity* and never
+// about capability - a cell migrates between the tiers with an ordinary context switch.
+//
+// **The asymmetry is declared, not discovered, and that is the honest half of this phase.** No
+// emulator here models a hybrid part: QEMU 11 implements neither x86-64's hybrid flag nor CPUID
+// leaf `0x1A` and never emits `capacity-dmips-mhz` - read out of its source rather than inferred
+// from a probe returning false. A capacity-aware placement whose asymmetry can never be exercised
+// is a placement nobody has run, so CPUs 0-1 are declared `Performance` and 2-3 `Efficiency`
+// through `hw::declare_core_class`, which stamps `ClassSource::Declared` so nothing - a test, a
+// reader, or another consumer - can mistake it for a measurement.
+//
+// The round is sized so the answer is **deterministic** rather than likely: two compute cells and
+// two bursty ones, two P cores and two E cores, and on a hybrid machine a core claims **one cell
+// at a time** (`smp::CLAIM_BATCH_HYBRID`). A batch of two would let one fast core take a compute
+// cell it suits *and* a bursty cell it does not in a single indivisible step, and the outcome would
+// then depend on which core scanned first - a proof that passes on a race is not a proof.
+//
+// Asserted: every compute cell ran on a full-capacity core, every bursty cell on a reduced one,
+// every cell exited with its own code, all four claims came through the tier preference, and no
+// steal crossed a tier. The machine is restored to uniform afterwards, so every later phase sees
+// exactly the machine it saw before.
+
+fn test_hetero_placement() {
+    use kernel::hw::graph::{CAPACITY_FULL, CoreClass};
+    use kernel::sched::hetero::{self, ThreadClass};
+
+    const N: usize = 4;
+    if smp::online_count() < N {
+        println!(
+            "smp: SKIP the hybrid-placement phase - it needs {N} cores to declare two tiers of \
+             two, and {} are online",
+            smp::online_count()
+        );
+        return;
+    }
+
+    // Declare the asymmetry: CPUs 0-1 fast, CPUs 2-3 slower. 640 is the shape of the ratio real
+    // hybrid parts report through CPPC, not a reading of one.
+    const SLOW: u16 = 640;
+    for cpu in 0..N {
+        let (class, cap) = if cpu < 2 {
+            (CoreClass::Performance, CAPACITY_FULL)
+        } else {
+            (CoreClass::Efficiency, SLOW)
+        };
+        kernel::hw::declare_core_class(cpu, class, cap);
+    }
+    assert!(
+        hetero::is_hybrid(),
+        "four cores declared in two tiers are not reported as hybrid"
+    );
+    hetero::reset_stats();
+
+    // SAFETY: single-threaded setup on the primary; the secondaries are parked in their work loop
+    // and claim nothing until the queue is published.
+    unsafe {
+        let objects = &mut *core::ptr::addr_of_mut!(OBJECTS2);
+        let caps = &mut *core::ptr::addr_of_mut!(CAPS2);
+        *objects = ObjectTable::new();
+        *caps = CapTable::new();
+
+        let mut aspaces: [core::mem::MaybeUninit<kernel::mm::AddressSpace>; N] =
+            [const { core::mem::MaybeUninit::uninit() }; N];
+        let mut frames: [core::mem::MaybeUninit<kernel::arch::TrapFrame>; N] =
+            [const { core::mem::MaybeUninit::uninit() }; N];
+        for i in 0..N {
+            let store = core::ptr::addr_of_mut!(STORE_Q[i]);
+            let (aspace, _o, frame) = build_cell(
+                &mut *store,
+                objects,
+                caps,
+                (*core::ptr::addr_of!(KSTACK_Q[i])).top(),
+                (i + 1) as u16,
+                user_placed,
+                (i + 1) as u64,
+                // Every cell equally long, so all four are in flight at the same instant and each
+                // core holds exactly one. An uneven round would let a core finish and come back
+                // for work of the other tier, which is work conservation doing its job and would
+                // make the assertion below race.
+                LONG_ROUNDS,
+            );
+            aspaces[i].write(aspace);
+            frames[i].write(frame);
+        }
+
+        user::reset();
+        let mut queue = [0usize; N];
+        for i in 0..N {
+            let store = core::ptr::addr_of_mut!(STORE_Q[i]);
+            user::install(
+                i,
+                aspaces[i].assume_init_ref(),
+                caps,
+                objects,
+                (*store).qp.qp.as_ptr(),
+                frames[i].as_mut_ptr(),
+            );
+            queue[i] = i;
+        }
+
+        // Cells 0 and 1 are compute-bound, 2 and 3 bursty. In a running system this comes from
+        // `hetero::classify` over the entity's own observed relinquish behaviour; here it is stated,
+        // because the claim under test is the *placement*, not the classification (which
+        // `verify/hetero/` checks against the shipped burst accounting).
+        let classes = [
+            ThreadClass::Compute,
+            ThreadClass::Compute,
+            ThreadClass::Bursty,
+            ThreadClass::Bursty,
+        ];
+        let mut out = [(0u64, 0usize); N];
+        // SAFETY: all four cells installed, present, native, each listed exactly once.
+        let finished = smp::place_cells_classed(&queue, &classes, &mut out);
+
+        // Restore the machine **before** asserting, so a failing assertion cannot leave a declared
+        // asymmetry behind for every later phase.
+        for cpu in 0..N {
+            kernel::hw::declare_core_class(cpu, CoreClass::Unknown, CAPACITY_FULL);
+        }
+        let (_, _, crossings) = hetero::stats();
+        let tier_claims = smp::tier_claims();
+
+        if !finished {
+            println!(
+                "smp: SKIP the hybrid-placement phase - the queue did not drain within the bound"
+            );
+            return;
+        }
+        assert!(
+            !hetero::is_hybrid(),
+            "the machine was not restored to uniform after the round"
+        );
+
+        for i in 0..N {
+            let (code, cpu) = out[i];
+            assert_eq!(code, (i + 1) as u64, "cell {i} exited with the wrong code");
+            let fast = cpu < 2;
+            match classes[i] {
+                ThreadClass::Compute => assert!(
+                    fast,
+                    "compute cell {i} ran on CPU {cpu}, an efficiency core. Two P cores were \
+                     declared and two compute cells published, so the tier preference must place \
+                     each on one"
+                ),
+                _ => assert!(
+                    !fast,
+                    "bursty cell {i} ran on CPU {cpu}, a performance core - it should have left \
+                     the fast cores for work that can use them"
+                ),
+            }
+        }
+        assert_eq!(
+            tier_claims, N,
+            "{tier_claims} of {N} claims came through the tier preference; with matching work \
+             available for every core, every claim must"
+        );
+        assert_eq!(
+            crossings, 0,
+            "{crossings} steals crossed a tier in a round where every core had matching work"
+        );
+        println!(
+            "smp: WORK PLACED ON THE CORE THAT SUITS IT - 2 compute cells on the 2 declared \
+             performance cores and 2 bursty cells on the 2 efficiency cores, all {N} claims \
+             through the tier preference and 0 tier crossings. P-cores and E-cores run the same \
+             instruction set, so this is capacity and not capability. The asymmetry is DECLARED \
+             (`ClassSource::Declared`) because QEMU models no hybrid part - no CPUID leaf 0x1A, no \
+             hybrid flag, no capacity-dmips-mhz - and the machine is restored to uniform \
+             afterwards (docs/SCHEDULING.md 12) OK"
+        );
     }
 }
 

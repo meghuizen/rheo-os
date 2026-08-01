@@ -473,10 +473,41 @@ when every capacity is equal. A first version checked a `is_hybrid()` gate there
 observed to change no answer, and it was removed - one path cannot drift away from the case it was
 meant to preserve.
 
+**Placement is wired into the multi-core claim**, not only modelled. `smp::place_cells_classed`
+publishes a class per cell and `claim_matching_tier` scans for work whose class suits the claiming
+core's tier before falling back to the ordinary cursor. Its safety is the same as `steal`'s - the
+`PLACE_RUN` exchange, which exactly one core can win - so a scan is as exclusive as a cursor. It
+claims **unclaimed** work only; taking a peer's claim is a steal, which has its own path and its own
+counter, and conflating them would report a preference as a rebalance.
+
+**A core claims one cell at a time on a hybrid machine** (`CLAIM_BATCH_HYBRID`), and that is a
+design statement rather than a test convenience: a batch is a core holding work it has not started,
+and on a hybrid machine some of it may not suit that core's tier while a core that does suit it sits
+idle. The cost is the one batching exists to avoid - a core holding one cell has nothing to preempt
+*to* - and the trade is the right way round, because a mis-tiered cell runs slowly for its whole
+life where a missed preemption costs one slice. **Observed**: with the batch restored to two, the
+`smp` phase fails on some runs and passes on others, and that intermittency *is* the finding.
+
 Proven by `verify/hetero/` (8 deterministic properties + 20,000 random machines, 1..8 cores of
-random class and capacity, oracle by scanning the declared table) and by `hwinfo`'s assertion that
-the discovery ran and honestly found nothing. Four controls firing; one that did *not* fire is
-recorded above.
+random class and capacity, oracle by scanning the declared table), by `hwinfo`'s assertion that the
+discovery ran and honestly found nothing, and by the `smp` kernel on all three ISAs: CPUs 0-1
+declared `Performance` and 2-3 `Efficiency`, two compute and two bursty cells published, and every
+compute cell asserted to have run on a full-capacity core and every bursty one on a reduced one,
+with all four claims through the preference and zero tier crossings. The machine is restored to
+uniform before the assertions, so a failure cannot leave a declared asymmetry behind for a later
+phase.
+
+One defect on the way, worth keeping because of how it presented: the queue is republished **grouped
+by home node**, so slot `k` is not the caller's cell `k`, and reading the class by slot told the
+preference the wrong thing about the cell - a compute cell landed on an efficiency core with the
+mechanism working perfectly. The class is looked up through `PLACE_ORIGIN` now. Honest about that
+one's proof: it was found by the phase failing on its first run, and a re-inserted control does not
+reliably fire, because whether slot order differs from caller order depends on the home nodes those
+four cells happen to draw.
+
+Six controls firing across the two layers; two that did **not** fire are recorded rather than
+dropped - `pick_cpu`'s uniform gate (redundant against the tie rule, so it was removed) and the
+`PLACE_ORIGIN` lookup (intermittent by construction).
 
 ## 12a. Honest costs
 

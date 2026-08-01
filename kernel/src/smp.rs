@@ -1042,6 +1042,13 @@ static PLACE_OWNER: [AtomicUsize; MAX_PLACED_CELLS] =
 #[cfg(feature = "smp")]
 static PLACE_RUN: [AtomicUsize; MAX_PLACED_CELLS] =
     [const { AtomicUsize::new(0) }; MAX_PLACED_CELLS];
+
+#[cfg(feature = "smp")]
+/// What kind of work each published slot holds, as [`crate::sched::hetero::ThreadClass`]'s
+/// discriminant (docs/SCHEDULING.md 12). 0 = `Unknown`, which is what every existing caller
+/// publishes and what makes the tier preference below inert for them.
+static PLACE_CLASS: [AtomicUsize; MAX_PLACED_CELLS] =
+    [const { AtomicUsize::new(0) }; MAX_PLACED_CELLS];
 #[cfg(feature = "smp")]
 /// Cells taken out of a peer's claim by an idle core.
 static STEALS: AtomicUsize = AtomicUsize::new(0);
@@ -1312,6 +1319,20 @@ static PLACE_TAKEN: PerCpu<AtomicUsize> =
 pub const CLAIM_BATCH: usize = 2;
 
 #[cfg(feature = "smp")]
+/// How many cells a core claims at once **on a hybrid machine** (docs/SCHEDULING.md 12).
+///
+/// **One**, and that is a design statement rather than a test convenience. A batch is a core
+/// holding work it has not started; on a hybrid machine some of that work may not suit the core's
+/// tier, while a core that *does* suit it sits idle beside it. Claiming one at a time is what makes
+/// the tier preference mean anything - a batch of two would let a fast core take a compute cell it
+/// suits and a bursty cell it does not, in one indivisible step.
+///
+/// The cost is the one [`CLAIM_BATCH`]'s own note names: a core holding a single cell has nothing
+/// to preempt *to*. That trade is the right way round here, because a mis-tiered cell runs slowly
+/// for its whole life where a missed preemption costs one slice.
+pub const CLAIM_BATCH_HYBRID: usize = 1;
+
+#[cfg(feature = "smp")]
 /// Claim and run cells until the queue is empty. Runs on **any** core.
 ///
 /// Claims come in batches of [`CLAIM_BATCH`] and the whole batch is stamped as this
@@ -1352,11 +1373,27 @@ unsafe fn drain_cells() {
         // took, which is a lost cell rather than a lost race.
         let mut marked = [false; CLAIM_BATCH];
         let mut got = 0;
-        while got < CLAIM_BATCH {
+        // One at a time on a hybrid machine - see `CLAIM_BATCH_HYBRID`.
+        let batch = if crate::sched::hetero::is_hybrid() {
+            CLAIM_BATCH_HYBRID
+        } else {
+            CLAIM_BATCH
+        };
+        while got < batch {
             // This core's own NUMA node first (docs/SUBSTRATE.md pillar 6), then any
             // other - work-conserving, since an idle core beside a runnable cell is a
             // worse outcome than a remote memory access. One `fetch_add` per group, so
             // exactly one core can obtain each slot exactly as before.
+            // On a hybrid machine, work whose class suits this core's tier first
+            // (docs/SCHEDULING.md 12). Inert on a uniform machine, where `is_hybrid()` is
+            // false and this is one comparison before the pre-existing cursor.
+            if let Some(k) = claim_matching_tier(cpu, n) {
+                slot[got] = k;
+                cell[got] = PLACE_CELLS.lock()[k];
+                marked[got] = true;
+                got += 1;
+                continue;
+            }
             let Some(k) = claim_next(n) else {
                 break;
             };
@@ -1379,6 +1416,9 @@ unsafe fn drain_cells() {
                     marked[0] = true;
                     got = 1;
                     STEALS.fetch_add(1, Ordering::AcqRel);
+                    // Measured, not prevented: a dry core takes what there is and the
+                    // tier crossing is counted (docs/SCHEDULING.md 12).
+                    crate::sched::hetero::steal_is_matched(cpu, class_of_slot(k));
                 }
                 None => return,
             }
@@ -1466,6 +1506,88 @@ fn claim_vcore_id(vid: usize, cpu: usize) {
 }
 
 #[cfg(feature = "smp")]
+/// Claim an **unclaimed** slot whose work suits this core's tier, on a hybrid machine
+/// (docs/SCHEDULING.md 12).
+///
+/// A scan rather than a cursor, because a preference cannot be expressed as a monotonic counter -
+/// and the safety comes from the same place [`steal`]'s does: the `PLACE_RUN` exchange. Exactly
+/// one core can turn a slot's run-mark 0 -> 1, and only that core may enter the cell, so the scan
+/// cannot hand one slot to two cores however many of them are scanning.
+///
+/// It claims **unclaimed** work only (`PLACE_OWNER` unset). Taking work a peer has already claimed
+/// is a *steal*, which has its own path and its own counter; conflating the two would report a
+/// preference as a rebalance.
+///
+/// The slot is returned already run-marked, so the caller must record it as marked - exactly as it
+/// does for a steal. The cursor may later hand the same slot to another core, which finds the mark
+/// set and drops it; that is the pre-existing "a peer took it" path, so nothing is stranded and
+/// work conservation is unchanged.
+///
+/// `None` when nothing unclaimed matches, and the caller then falls through to the ordinary
+/// cursor - so a core never idles beside work of the wrong tier.
+fn claim_matching_tier(cpu: usize, n: usize) -> Option<usize> {
+    use crate::sched::hetero;
+    if !hetero::is_hybrid() {
+        return None;
+    }
+    for k in 0..n.min(MAX_PLACED_CELLS) {
+        if PLACE_OWNER[k].load(Ordering::Acquire) != usize::MAX {
+            continue;
+        }
+        let want = class_of_slot(k);
+        if !hetero::tier_suits(cpu, want) {
+            continue;
+        }
+        if PLACE_RUN[k]
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            PLACE_OWNER[k].store(cpu, Ordering::Release);
+            TIER_CLAIMS.fetch_add(1, Ordering::AcqRel);
+            return Some(k);
+        }
+    }
+    None
+}
+
+#[cfg(feature = "smp")]
+/// The class of the work published at slot `k`.
+///
+/// **Indexed through `PLACE_ORIGIN`, not by the slot.** The queue is republished *grouped by home
+/// node* (docs/SUBSTRATE.md pillar 6), so slot `k` is not the caller's cell `k` - and reading
+/// `PLACE_CLASS[k]` directly gives another cell's class. That was a real defect and it presented
+/// exactly as a broken preference: a compute cell placed on an efficiency core with the mechanism
+/// working perfectly, because it had been told the wrong thing about the cell.
+///
+/// **Honest about the proof**: it was found by the phase failing on its first run, and a
+/// re-inserted control does *not* reliably fire - whether slot order differs from caller order
+/// depends on the home nodes the four cells happen to draw, and when they all land on one node the
+/// grouping is the identity and reading by slot is accidentally right. So the fix is proven by the
+/// observation that produced it, not by a control the phase can reproduce on demand.
+fn class_of_slot(k: usize) -> crate::sched::hetero::ThreadClass {
+    use crate::sched::hetero::ThreadClass;
+    let origin = PLACE_ORIGIN[k]
+        .load(Ordering::Acquire)
+        .min(MAX_PLACED_CELLS - 1);
+    match PLACE_CLASS[origin].load(Ordering::Acquire) {
+        1 => ThreadClass::Compute,
+        2 => ThreadClass::Bursty,
+        _ => ThreadClass::Unknown,
+    }
+}
+
+#[cfg(feature = "smp")]
+/// Claims made through the tier preference. Zero on a uniform machine, which is every machine
+/// QEMU models - the preference is gated on `hetero::is_hybrid()`.
+static TIER_CLAIMS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "smp")]
+/// How many claims were made because the work's class suited the claiming core's tier.
+pub fn tier_claims() -> usize {
+    TIER_CLAIMS.load(Ordering::Acquire)
+}
+
+#[cfg(feature = "smp")]
 /// Take one **claimed but not yet started** cell away from whichever peer holds it.
 ///
 /// The exchange on `PLACE_RUN[k]` is the whole protocol: exactly one core can turn a
@@ -1524,6 +1646,41 @@ pub unsafe fn place_cells(cells: &[usize], out: &mut [(u64, usize)]) -> bool {
 pub unsafe fn place_cells_preemptive(cells: &[usize], out: &mut [(u64, usize)]) -> bool {
     // SAFETY: the caller's contract.
     unsafe { place_cells_inner(cells, out, true) }
+}
+
+#[cfg(feature = "smp")]
+/// [`place_cells`], with a [`crate::sched::hetero::ThreadClass`] per cell so the claim can prefer
+/// a core whose tier suits the work (docs/SCHEDULING.md 12).
+///
+/// On a uniform machine - every machine QEMU models - this is byte-for-byte [`place_cells`]: the
+/// preference is gated on `hetero::is_hybrid()`. The classes are published for the round and
+/// cleared by the next one.
+///
+/// # Safety
+/// As [`place_cells`].
+pub unsafe fn place_cells_classed(
+    cells: &[usize],
+    classes: &[crate::sched::hetero::ThreadClass],
+    out: &mut [(u64, usize)],
+) -> bool {
+    use crate::sched::hetero::ThreadClass;
+    for (k, slot) in PLACE_CLASS.iter().enumerate() {
+        let c = classes.get(k).copied().unwrap_or(ThreadClass::Unknown);
+        slot.store(
+            match c {
+                ThreadClass::Compute => 1,
+                ThreadClass::Bursty => 2,
+                ThreadClass::Unknown => 0,
+            },
+            Ordering::Release,
+        );
+    }
+    // SAFETY: the caller's contract.
+    let r = unsafe { place_cells_inner(cells, out, false) };
+    for slot in PLACE_CLASS.iter() {
+        slot.store(0, Ordering::Release);
+    }
+    r
 }
 
 #[cfg(feature = "smp")]
@@ -1608,6 +1765,7 @@ unsafe fn place_vcores_inner(cells: &[usize], out: &mut [(u64, usize)], preempt:
         PLACE_RUN[k].store(0, Ordering::Release);
     }
     STEALS.store(0, Ordering::Release);
+    TIER_CLAIMS.store(0, Ordering::Release);
     for c in 0..MAX_CPUS {
         // SAFETY: between rounds; no core is draining.
         unsafe { PLACE_TAKEN.get(c) }.store(0, Ordering::Release);
