@@ -322,7 +322,53 @@ pub fn running(cell: usize, context: usize) -> u64 {
 /// [`super::preempt::arm`] is itself a no-op when dispatch is off or the ISA has no wired
 /// timer - so a cooperative boot is byte-for-byte unchanged and says so through its
 /// counters.
+///
+/// # Cost, measured
+///
+/// This is on the hottest path in the kernel, so its cost was measured rather than
+/// assumed (riscv64 icount, `bench_core`'s `p2_user_syscall_floor`, which crosses the
+/// real U-mode syscall boundary and runs on a boot with dispatch **off**):
+///
+/// | version | instructions per syscall |
+/// |---|---|
+/// | no re-arm at all | 178 |
+/// | out-of-line, check inside | 197 (+19) |
+/// | inlined check, cold body | **183 (+5)** |
+///
+/// +19 instructions to decide *not* to do anything is a call frame, not a decision. So
+/// the check is `#[inline]` here and the work is [`rearm_remaining_slow`], which is
+/// deliberately `#[inline(never)]`: a cooperative boot pays one load of a `bool` and a
+/// branch, and a preemptive boot pays the call it actually needs. +5 is the floor without
+/// making dispatch a `cfg`, and it is deliberately **not** a `cfg` - the two orders have
+/// to be comparable in the same binary for any proof about the ordering to mean anything
+/// (see [`ENABLED`]).
+///
+/// **What this does not measure, said plainly:** the cost on a boot where dispatch is
+/// **on**, which is the one Node, Bun and Claude Code run under. There the body executes,
+/// so each syscall return pays a timer-counter read and an arbiter registration that may
+/// program the hardware one-shot. `bench_core` runs cooperatively and therefore cannot
+/// report it, and enabling dispatch there would move every existing `p2_*`/`p5_*` number
+/// and destroy their comparability. It is a named unmeasured cost, not a claimed-free one.
+/// The trade it buys is not small: before this, a syscall-heavy cell was **never**
+/// preempted at all on ARM64, so its siblings did not run.
+///
+/// The ordering inside matters for the same reason. `preempt::arm` already declines when
+/// dispatch is off, but declining *after* the work is done is not declining - the first
+/// version read the per-CPU record, took the queue and read the timer (a CSR on RISC-V,
+/// `CNTVCT` on ARM64, APIC/TSC on x86-64) before reaching that check, so every
+/// cooperative boot paid for a value it then threw away.
+#[inline]
 pub fn rearm_remaining() {
+    if !enabled() {
+        return;
+    }
+    rearm_remaining_slow();
+}
+
+/// The body of [`rearm_remaining`], out of line so the common "dispatch is off" case
+/// costs a load and a branch at the call site rather than a call.
+#[inline(never)]
+fn rearm_remaining_slow() {
     REARM_CALLS.fetch_add(1, Ordering::Relaxed);
     let rec = *CURRENT.this();
     if rec.id.is_none() {
