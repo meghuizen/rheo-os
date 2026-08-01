@@ -441,6 +441,73 @@ kernel told them there is one core. Fixing it by editing the fixture to `0-3` wo
 same defect with a different constant; it has to come from `smp::online_count()`, which is
 the narrow first step toward this whole document.
 
+## 6.4 The graph as backbone: every consumer, and what each one asks
+
+The graph earns its place only if it is *the* answer to "where", the way the queue ABI is
+the answer to "how work moves" and the capability model is the answer to "who may". Listed
+per consumer, with the query each makes and what is missing before it can make it.
+
+| Consumer | The question it asks the graph | Blocked on |
+|---|---|---|
+| **Driver framework** (DRIVERS.md D2) | `node_of(bdf)`, `members(llc_of(node))` - place queues, bounce frames and MSI-X vectors near the device | discovery: `_PXM`, CPUID cache leaves |
+| **Kernel scheduler** | `cost`, `members` - which core to place an entity on, which node its pages want | discovery + E2-E4 |
+| **Work stealing** | `members(llc_of(victim))` - **steal within a cache domain first** | the same |
+| **Introspection** (`cpuinfo`, `lshw`, `hwinfo`) | render the graph | discovery |
+| **POSIX translation** | `/sys/devices/system/{cpu,node}`, `getcpu`, `sched_getaffinity` (6.3) | discovery + the synthesis |
+| **.NET / Java / Go task schedulers** | nothing new - they read the POSIX surface | 6.3 |
+| **Translation and optimisation layer** (CPU-FEATURES.md 2) | `IsaSet` of the *target* node - so a JIT emits for the machine it will run on, not for a baseline | nothing; the `IsaSet` exists |
+| **Tile lowering** (TILES.md) | `nearest(Matmul, Bandwidth)` with a bit-exact contract | discovery of engines |
+| **Memory placement** | `nearest(from, MemoryNode, metric)` per allocation *purpose* - see below | discovery of HMAT |
+| **Cluster / remote** | the same queries with `Host` nodes and expensive edges | the transport (N3b/N5a) |
+
+Two of those deserve their own treatment because they are where the model earns its keep
+rather than merely applying.
+
+### 6.4a Which memory for what - the decision the cost vector exists for
+
+A single "nearest memory" answer is wrong for every workload that has more than one kind of
+data. With a cost *vector* and a purpose, the answer follows from the data rather than from
+a heuristic:
+
+| Purpose | Access shape | Wants | Why |
+|---|---|---|---|
+| Inference **weights** | read-only, huge, streamed once per layer | highest **bandwidth** near the engine; HBM if it fits, else DDR on the engine's node | bandwidth-bound and read-only, so it is also the ideal candidate for one sealed grant **shared read-only across cells** - several inference cells on one host should not each hold a copy |
+| **KV cache** | grows per token, re-read every step | **bandwidth and latency**, near the engine, and **tiered as context grows** | the hot window belongs in HBM; older pages spill to DDR then CXL. The tile framework already carries paged KV (docs/TILES.md 13), so the pages exist to place |
+| **Activations** | short-lived, hot, reused | lowest **latency**, an arena reused across steps | lifetime is a step, so capacity does not matter and locality does |
+| **Cold / spill** | rarely touched | **capacity**: CXL, or pmem | paying HBM prices for cold data is what tiering exists to stop |
+| **A parked entity's stack and FP save area** | untouched until it resumes | the node of the CPU that will **resume** it | see below |
+
+The last row is the interesting one and it is a real consequence of the entity model. When
+an entity parks, its kernel stack and FP save area are untouched until something wakes it -
+so **placement should follow the wake, not the sleep**. If a woken entity will be resumed on
+another node (because its owner changed, or a stealer took it), its saved state is a small,
+cold, movable object that should move with it. The entity already carries `owner` and `node`
+in its hot line (docs/EXECUTION-MODEL.md 4.1), so the query is expressible today; what is
+missing is the discovery that makes "another node" mean anything.
+
+### 6.4b Work stealing must respect the cache domain
+
+A steal moves a working set. Stealing from a victim on the same LLC domain costs almost
+nothing; stealing across a socket moves every line the thief then touches. So the steal
+protocol - which already exists for unstarted cells (docs/SMP.md 10.0) and for the strand
+injector (docs/CONCURRENCY.md) - should prefer, in order: **this LLC domain, then this
+memory node, then anywhere**, and count the crossings.
+
+That is a *policy over the graph*, not a new mechanism, and it composes with the rule
+already recorded: when locality and work conservation conflict, **work conservation wins and
+the crossing is counted** (section 6.2's edge-case table). A thief that idles rather than
+cross a socket is a worse failure than one that crosses and says so.
+
+### 6.4c What makes it a backbone rather than another table
+
+The graph is the fifth thing in this design that everything else composes onto, beside the
+four that already are: the **queue ABI** (how work moves), the **cell and its capabilities**
+(who may), the **strong identity** (`PrincipalId`, on whose behalf), and the **telemetry
+ring plus flow context** (what happened). The test of whether it belongs in that list is
+whether it needs a kernel object of its own - and it does not. It is derived state over
+`hw::Inventory`, published by driver cells for what firmware cannot describe, queried by
+everyone, and owned by nobody.
+
 ## 7. Honesty
 
 - **Nothing here is built.** `hw::Inventory` has the data; the graph, the costs and the
