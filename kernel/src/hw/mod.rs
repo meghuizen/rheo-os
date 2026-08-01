@@ -20,6 +20,7 @@ pub mod acpi;
 pub mod block;
 pub mod fdt;
 pub mod gpu;
+pub mod graph;
 pub mod iommu;
 pub mod nvme;
 pub mod pci;
