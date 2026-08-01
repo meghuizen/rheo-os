@@ -2794,7 +2794,11 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               **unmodified static-glibc binary as a Linux cell on a secondary**,
               exact stdout + exit asserted, overlapping a native cell on the
               primary; then **two Linux cells on two cores at once**, each
-              transcript captured separately and asserted - docs/SMP.md 10.0), shell-smoke, hwinfo, rng, runtime
+              transcript captured separately and asserted; then **FOUR LINUX
+              CELLS ACROSS FOUR CORES** - the docs/SMP.md 10.2 audit's 'many
+              Linux cells' question, each with its own exact transcript and exit,
+              with the honest note that removing the personality lock does not
+              make it fail (docs/SMP.md 10.0b) - docs/SMP.md 10.0), shell-smoke, hwinfo, rng, runtime
               (the strand runtime, closing with the **measured** concurrency /
               async / sync phases: 256 strands in flight with every round a
               permutation, 63 I/O ops outstanding at one instant with one

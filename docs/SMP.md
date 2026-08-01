@@ -1163,6 +1163,36 @@ removes the number. Two vcores are proven, and so is a yield between them; a vco
 blocks, forks or takes a signal is not, and per-vcore queue pairs (docs/SUBSTRATE.md S5)
 are the next rung now that there is something to give them to.
 
+### 10.0b Many Linux cells - the 10.2 audit's own question, asked
+
+10.2 makes an audit the gate on feeding secondaries real work, and names the Linux
+personality's global state as one of its six areas: the mapped-file registry, the
+pipe/eventfd/timerfd registries, pid allocation, the unix-socket names. `linux::plock`
+covers the whole Linux dispatch plus the demand-paging entry, recursively per CPU, so the
+discipline in place is "one big lock" - the seL4 order 10.2 explicitly allows.
+
+Two Linux cells were proven above. The remaining question was **many**, because a big lock
+is exactly the kind of claim that holds for two and fails for N if anything touches a
+global outside the locked window. It is now asked: **four** Linux cells go through the
+same placement queue every other multi-core phase uses, one per core, each demand-paging
+its own copy of the same unmodified static-glibc binary, each synthesizing its own pid,
+each transcript captured separately and asserted **exactly**, all four exiting 9. It
+passes on all three ISAs with all 4 cores taking one.
+
+That widens `place_cells`' documented contract from "native" to "native, **or a Linux cell
+with no process tree**": such a cell's exit reaches `linux::proc`, which with no children
+ends the run exactly as a native cell's does. A Linux cell that **forks, pipes or signals
+across cores** is a different question and is still not asked.
+
+**And this phase does not prove the lock is load-bearing** - tested, not assumed. Forcing
+`plock` to return `PGuard::Off`, so nothing serialises the personality at all, and the
+phase still passes on all three ISAs: `chello` is a hello-world that barely touches the
+global registries, and TCG interleaves coarsely. So the claim is exactly "N Linux cells
+across N cores produce N correct transcripts", which was unproven and now is not. The
+lock's *necessity* needs a fixture that hammers the registries - many pipes and eventfds
+in a loop - and that fixture does not exist. Stated rather than left for a reader to
+assume the control fired.
+
 ### 10.1 The measured motivation (not a wish)
 
 The cooperative single-CPU scheduler switches to another context **only when the

@@ -1409,7 +1409,12 @@ fn steal(cpu: usize, n: usize) -> Option<usize> {
 /// outstanding, in which case the caller must claim nothing.
 ///
 /// # Safety
-/// As [`drain_cells`]: each entry installed, present, native, and listed once.
+/// Each entry installed, present, listed once, and either **native** or a **Linux cell
+/// with no process tree**. The Linux case is admissible because such a cell's exit
+/// reaches `linux::proc`, which with no children ends the run exactly as a native cell's
+/// does; its global personality state is serialised by `linux::plock`. A Linux cell that
+/// forks, pipes or signals across cores is a different question and is not covered here
+/// (docs/SMP.md 10.2).
 pub unsafe fn place_cells(cells: &[usize], out: &mut [(u64, usize)]) -> bool {
     // SAFETY: the caller's contract.
     unsafe { place_cells_inner(cells, out, false) }

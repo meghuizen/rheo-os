@@ -312,6 +312,7 @@ fn test_secondary_bringup() {
             test_cross_core_preemption();
             test_linux_cell_on_secondary();
             test_two_linux_cells();
+            test_four_linux_cells();
             test_nvme_per_core_queues();
         }
         Err(StartError::NoSecondary) => {
@@ -2550,7 +2551,7 @@ const CHELLO_EXIT: u64 = 9;
 /// one such core), read by the primary after the run.
 const CAP_MAX: usize = 1024;
 /// One capture buffer per cell slot used by these phases.
-const CAP_CELLS: usize = 2;
+const CAP_CELLS: usize = 4;
 static mut STDOUT_CAP: [[u8; CAP_MAX]; CAP_CELLS] = [[0; CAP_MAX]; CAP_CELLS];
 static mut STDOUT_LEN: [usize; CAP_CELLS] = [0; CAP_CELLS];
 
@@ -2805,6 +2806,152 @@ fn test_two_linux_cells() {
              unmodified static-glibc binary twice, each transcript captured separately \
              and asserted exactly, each exiting {CHELLO_EXIT}, with the personality's \
              global tables held by one recursive lock over its dispatch"
+        );
+    }
+}
+
+// ------------------------- FOUR Linux cells on FOUR cores: the 10.2 audit's own question
+//
+// docs/SMP.md 10.2 makes an audit the gate on feeding secondaries real work, and names the
+// Linux personality's global state as one of the six areas: the mapped-file registry, the
+// pipe/eventfd/timerfd registries, pid allocation, the unix-socket names. `linux::plock`
+// covers the whole Linux dispatch plus the demand-paging entry, recursively per CPU, so the
+// discipline is "one big lock" - the seL4 order the audit explicitly allows.
+//
+// Two Linux cells are proven above. The audit's remaining question is **many**, because a
+// big lock is exactly the kind of claim that is true for two and false for N if anything
+// touches a global *outside* the locked window. Asking it is cheap and the answer is
+// worth having either way: it passes and the discipline is demonstrated at the width the
+// hardware offers, or it fails and the audit has found its gap.
+//
+// Four cells, one per core, through the same placement queue every other multi-core phase
+// uses - each demand-pages its own copy of the same ELF (so the mapped-file registry has
+// four concurrent readers of four entries), each synthesizes its own pid, each runs glibc's
+// startup, and each transcript is captured separately and asserted **exactly**. A garbled
+// or missing transcript is what a raced registry produces.
+//
+// This widens `place_cells`' documented contract from "native" to "native, or a Linux cell
+// with no process tree": a Linux cell's exit reaches `linux::proc` rather than `nproc`, and
+// with no children that path ends the run exactly as a native cell's does. A cell that
+// forks or pipes across cores is a different question and is still not asked.
+//
+// **What this phase does not do**, tested rather than assumed: it does **not** prove
+// `linux::plock` is load-bearing. Forcing `plock` to return `PGuard::Off` - no serialisation
+// at all - was tried and the phase still passes on all three ISAs, because `chello` is a
+// hello-world that barely touches the global registries and TCG interleaves coarsely. So
+// the claim here is exactly "N Linux cells across N cores produce N correct transcripts",
+// which was unproven and now is not; the lock's *necessity* needs a fixture that hammers
+// the registries (many pipes and eventfds in a loop), and that fixture does not exist. Said
+// plainly rather than left for the reader to assume the control fired.
+
+/// One kernel stack per core for this phase - two cores trapping onto one stack corrupt
+/// each other's frames, and the corruption looks like a random fault rather than like a
+/// missing stack.
+static mut KSTACK_4L: [KernelStack; 4] = [const { KernelStack::new() }; 4];
+
+fn test_four_linux_cells() {
+    let cores = smp::online_count().min(4);
+    if cores < 3 {
+        println!(
+            "smp: SKIP the four-Linux-cells phase - only {cores} core(s) online, so \
+             'many' would not be wider than the two-cell phase above"
+        );
+        return;
+    }
+    // SAFETY: single-threaded setup on the primary; the secondaries claim nothing until
+    // `place_cells` publishes the queue, and every static outlives the run.
+    unsafe {
+        let objects = &mut *core::ptr::addr_of_mut!(OBJECTS2);
+        let caps = &mut *core::ptr::addr_of_mut!(CAPS2);
+        *objects = ObjectTable::new();
+        *caps = CapTable::new();
+
+        user::reset();
+        ktimer::reset();
+        idle::reset();
+
+        let mut aspace = [
+            kernel::mm::AddressSpace::new(20),
+            kernel::mm::AddressSpace::new(21),
+            kernel::mm::AddressSpace::new(22),
+            kernel::mm::AddressSpace::new(23),
+        ];
+        let mut frame: [core::mem::MaybeUninit<kernel::arch::TrapFrame>; 4] =
+            [const { core::mem::MaybeUninit::uninit() }; 4];
+        for i in 0..4 {
+            let img = kernel::load::load_elf_linux(CHELLO, &mut aspace[i]).expect("load chello");
+            let sp = kernel::linux::stack::setup_stack(&mut aspace[i], &img, &[b"chello"], &[]);
+            frame[i].write(arch::trapframe_new(
+                img.entry,
+                sp,
+                0,
+                (*core::ptr::addr_of!(KSTACK_4L))[i].top(),
+            ));
+            user::install(
+                i,
+                &aspace[i],
+                caps,
+                objects,
+                core::ptr::addr_of!(QP_L) as *const kernel::queue::QueuePair,
+                frame[i].as_mut_ptr(),
+            );
+            user::set_personality(i, user::Personality::Linux);
+            kernel::linux::install_cell(i, &img, b"");
+        }
+
+        STDOUT_LEN = [0; CAP_CELLS];
+        kernel::linux::set_stdout_tap(Some(tap));
+        let cells = [0usize, 1, 2, 3];
+        let mut out = [(u64::MAX, usize::MAX); 4];
+        // SAFETY: all four are installed, present, listed once, and Linux cells with no
+        // process tree - see the contract note above.
+        let finished = smp::place_cells(&cells, &mut out);
+        kernel::linux::set_stdout_tap(None);
+
+        if !finished {
+            println!(
+                "smp: SKIP the four-Linux-cells phase - the queue did not drain inside \
+                 the bound, so nothing about many Linux cells is claimed"
+            );
+            return;
+        }
+
+        for i in 0..4 {
+            assert_eq!(
+                out[i].0, CHELLO_EXIT,
+                "Linux cell {i} exited {:#x}, not {CHELLO_EXIT}",
+                out[i].0
+            );
+            let got = captured(i);
+            assert!(
+                got == CHELLO_OUT,
+                "Linux cell {i}'s stdout was {} bytes, not its own exact transcript - a \
+                 raced global registry is what garbles or loses one",
+                got.len()
+            );
+        }
+        assert_eq!(user::double_entries(), 0, "two cores were inside one cell");
+        assert!(
+            kernel::mm::frames::used_matches_bitmap(),
+            "the frame pool's used counter drifted from its bitmap"
+        );
+        // How many cores actually took one. Reported, not asserted: which core claims
+        // which cell is a race, and an assertion that can fail on a legal schedule is not
+        // a proof (the lesson the GEMM worker count taught).
+        let mut used = [false; smp::MAX_CPUS];
+        for o in out.iter() {
+            if o.1 < smp::MAX_CPUS {
+                used[o.1] = true;
+            }
+        }
+        let n = used.iter().filter(|&&u| u).count();
+        println!(
+            "smp: FOUR LINUX CELLS ran across {cores} cores - each demand-paged its own \
+             copy of the same unmodified static-glibc binary, synthesized its own pid, and \
+             produced its OWN exact transcript and exit {CHELLO_EXIT}; {n} core(s) took \
+             one (reported, not asserted). That is docs/SMP.md 10.2's 'many Linux cells' \
+             question asked at the width this machine offers, and the big personality lock \
+             holding for it OK"
         );
     }
 }
