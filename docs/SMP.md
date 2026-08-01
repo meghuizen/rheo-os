@@ -1310,10 +1310,25 @@ reasoning:
   identical boot was preemptive. A preemption timer is per-core hardware no trampoline sets,
   so the secondary now arms its own when the publisher asks for one - `83/6243` slices after.
 
-**Honest about what is still not shown.** Claude Code on a secondary is not run (275 MB; the
-mechanism is now the same as Bun's, so this is time rather than doubt), and *parallel* threads
-of one Linux cell still need the per-cell locking of 10.2 - a Linux cell's contexts share one
-core here, whichever core that is.
+**And so do Node.js and Claude Code** - `linuxnodesmp` and `linuxclaudesmp`, the same
+construction: same binary, same disk, same JIT authority, same preemptive dispatch, same
+strict gate, `on_secondary` the only difference. Observed:
+
+| runtime | size | block-cache fills | preemption slices on the secondary | result |
+|---|---|---|---|---|
+| Bun (JSC) | 99 MB | ~9,200 | 83 of 6,243 | `rheo:42`, exit 0 |
+| Node.js (V8 + libuv) | 124 MB | ~15,300 | 23 of 9,477 | `rheo:42`, exit 0 |
+| Claude Code (Bun-compiled) | 275 MB | ~116,300 | 1,612 of 61,701 | `2.1.220 (Claude Code)`, exit 0 |
+
+Each is its own kernel rather than a phase, deliberately: the primary-CPU proof is the
+baseline every claim about these runtimes rests on, and a boot that runs one somewhere else
+must not be able to weaken it. Six kernels, six independent results.
+
+**Honest about what is still not shown.** These are the same *cooperative-within-a-core*
+runtimes they are on the primary: their contexts are scheduled inside whichever core runs the
+cell, and running them on several cores **at once** needs the per-cell locking of 10.2, which
+is not built. What these six kernels establish is that the core a workload runs on is no
+longer special - not that one workload can use several.
 
 ### 10.1 The measured motivation (not a wish)
 

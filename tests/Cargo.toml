@@ -372,6 +372,16 @@ name = "substrate"
 path = "src/substrate.rs"
 
 [[bin]]
+name = "linuxnodesmp"
+path = "src/linuxnodesmp.rs"
+required-features = ["smp"]
+
+[[bin]]
+name = "linuxclaudesmp"
+path = "src/linuxclaudesmp.rs"
+required-features = ["smp"]
+
+[[bin]]
 name = "linuxbunsmp"
 path = "src/linuxbunsmp.rs"
 required-features = ["smp"]

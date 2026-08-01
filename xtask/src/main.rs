@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 68] = [
+const TEST_KERNELS: [&str; 70] = [
     "kernel",
     "substrate",
     "cap-invariants",
@@ -34,6 +34,8 @@ const TEST_KERNELS: [&str; 68] = [
     "smp",
     "linuxsmp",
     "linuxbunsmp",
+    "linuxnodesmp",
+    "linuxclaudesmp",
     "shell-smoke",
     "hwinfo",
     "rng",
@@ -296,6 +298,20 @@ fn fixed_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
         // built by `build_node_disk_fixture` (gitignored); a placeholder when
         // /opt/node22 or mkfs.ext4 is absent makes the test skip on x86-64 too, so CI
         // (no node binary) stays green.
+        // The same images as their primary-CPU counterparts, for the secondary-core runs
+        // (docs/SMP.md 10.0e).
+        ("linuxnodesmp", Arch::X86_64) => &[
+            "-drive",
+            "file=tests/linux-fixtures/build/x86_64/node-disk.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-pci,drive=blk0,disable-legacy=on",
+        ],
+        ("linuxclaudesmp", Arch::X86_64) => &[
+            "-drive",
+            "file=tests/linux-fixtures/build/x86_64/claude-disk.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-pci,drive=blk0,disable-legacy=on",
+        ],
         ("linuxnode", Arch::X86_64) => &[
             "-drive",
             "file=tests/linux-fixtures/build/x86_64/node-disk.img,if=none,id=blk0,format=raw",
@@ -2416,6 +2432,10 @@ fn build_smp_kernel(arch: Arch, release: bool) -> bool {
         "linuxsmp",
         "--bin",
         "linuxbunsmp",
+        "--bin",
+        "linuxnodesmp",
+        "--bin",
+        "linuxclaudesmp",
         "--features",
         "smp",
         "--target",

@@ -2025,9 +2025,17 @@ Two things the first run got wrong, both found by reading its output: `run_cell_
 reused the 2 s **rendezvous** bound to wait for a whole *program*, and reported "no secondary
 came up" for a Bun that had already taken its JIT grant (it has its own 100 s bound now); and
 the secondary ran the cell **cooperatively** (`0/24` slices) because a preemption timer is
-per-core hardware no trampoline sets - it arms its own now (`83/6243`). Still not shown: Claude
-Code on a secondary (275 MB; the mechanism is now Bun's, so that is time rather than doubt),
-and *parallel* threads of one Linux cell, which still need 10.2's per-cell locking.
+per-core hardware no trampoline sets - it arms its own now (`83/6243`). **And so do Node.js and Claude Code**
+(`linuxnodesmp`, `linuxclaudesmp`) - same construction, `on_secondary` the only difference:
+Node (124 MB, V8 + libuv) at ~15,300 block-cache fills and 23 of 9,477 slices prints `rheo:42`
+and exits 0; **Claude Code** (275 MB, Bun-compiled) at ~116,300 fills and **1,612 of 61,701
+slices** prints exactly `2.1.220 (Claude Code)` and exits 0. Each is its own kernel rather than
+a phase, deliberately: the primary-CPU proof is the baseline every claim about these runtimes
+rests on, and a boot that runs one somewhere else must not be able to weaken it. Still not
+shown: these are the same *cooperative-within-a-core* runtimes they are on the primary, so
+running one workload's threads on several cores **at once** needs 10.2's per-cell locking,
+which is not built. What the six kernels establish is that the core a workload runs on is no
+longer special - not that one workload can use several.
 
 **And a Linux cell FORKS off the boot CPU** (docs/SMP.md 10.0c) - the other half of that
 question. `fork` creates a **new cell**, and an unclaimed cell is pickable by every core
@@ -2924,7 +2932,10 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               proven off the boot CPU, docs/SMP.md 10.0e), linuxbunsmp (the REAL
               Bun binary on a SECONDARY core: same disk, JIT and preemption as
               linuxbun, 83 slices taken on that core, `rheo:42` and exit 0 -
-              x86-64 only, docs/SMP.md 10.0e), shell-smoke, hwinfo, rng, runtime
+              x86-64 only, docs/SMP.md 10.0e), linuxnodesmp + linuxclaudesmp (the
+              same for the REAL node and the REAL 275 MB Claude Code binary on a
+              secondary - `rheo:42` and `2.1.220 (Claude Code)`, 23 and 1,612
+              preemption slices taken on that core, docs/SMP.md 10.0e), shell-smoke, hwinfo, rng, runtime
               (the strand runtime, closing with the **measured** concurrency /
               async / sync phases: 256 strands in flight with every round a
               permutation, 63 I/O ops outstanding at one instant with one
