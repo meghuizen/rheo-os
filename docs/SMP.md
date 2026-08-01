@@ -1193,6 +1193,40 @@ lock's *necessity* needs a fixture that hammers the registries - many pipes and 
 in a loop - and that fixture does not exist. Stated rather than left for a reader to
 assume the control fired.
 
+### 10.0c A Linux cell that forks off the boot CPU
+
+The other half of 10.2's Linux question. `fork` creates a **new cell**, and a cell nobody
+has claimed is pickable by every core - `user::cell_on_this_cpu` treats `NO_CPU` as
+pickable, which is exactly what keeps single-core boots unchanged. So when a Linux cell on
+core B exits, its `linux::proc::reschedule` scans for a runnable cell and would find the
+child core A forked a moment ago: two cores, one cell, one trap frame.
+
+An **idle** core cannot reach it - `drain_cells` only enters cells the caller published, and
+a forked child is not in the queue - so it takes **two** Linux cells, one of which forks.
+That is why this is its own phase.
+
+The fix is the one `cell_on_this_cpu`'s own doc predicted while no boot reached this state:
+`install_forked` and `install_spawned` give the child **its parent's owner**. Not a wider
+lock - the same partitioning discipline, applied to a cell that did not exist when the round
+started. The stale "honest limitation" note in that predicate is replaced by what is now
+true.
+
+**Proven** (the `smp` kernel, all three ISAs): `af_unix` - an unmodified static-glibc
+`socketpair` + `fork` + bind/listen/connect/accept fixture, so it drives the global
+unix-socket registry and the L6 cross-cell ring from a secondary - runs on one core while
+`chello` runs on another, both exact transcripts asserted, both exit codes asserted, zero
+double entries; and `user::affinity_skips()` is asserted **nonzero**, so a scheduler really
+was offered a cell belonging to another core and declined it. That last assertion is the
+point of adding the counter: an absence is weak evidence, and "no double entry" would pass
+equally if the race never arose.
+
+**Not proven**, and recorded rather than dressed up: that the *child's* inherited owner is
+what prevented a double entry. Reverting the fork path to leave the child unclaimed still
+passes - five runs - and the refusals counted come from the two *placed* cells rather than
+from the child. The window is narrow: the peer's exit-time scan has to land between the
+child's creation and its reaping. So the inheritance closes a real window that this phase
+cannot make happen on demand.
+
 ### 10.1 The measured motivation (not a wish)
 
 The cooperative single-CPU scheduler switches to another context **only when the

@@ -2383,11 +2383,10 @@ pub fn cell_vcores(idx: usize) -> usize {
 /// what keeps every single-core boot byte-identical, since nothing there ever calls
 /// [`claim_cell`] and the predicate is then constant.
 ///
-/// Honest limitation: a cell *created* by a claimed cell (a `fork`, a `SYS_SPAWN`)
-/// is unclaimed, so it is visible to every core. No boot reaches that state today -
-/// the multi-core placement path runs only cells that neither fork nor spawn, and
-/// every boot that does fork runs on one core - but inheriting the parent's owner is
-/// the fix when one does, not a wider lock.
+/// A cell *created* by a claimed cell (a `fork`, a `SYS_SPAWN`) **inherits its parent's
+/// owner**, so it is not visible to any other core. That was the honest limitation
+/// recorded here while no boot forked off the boot CPU; the `linuxfork` phase does, and
+/// the fix is the one this note predicted - inheriting the owner, not a wider lock.
 ///
 /// The question is about **vcore 0**, because that is the context every cell-level path
 /// enters. A multi-vcore cell is answerable here for exactly that reason: entering its
@@ -2396,7 +2395,24 @@ pub fn cell_vcores(idx: usize) -> usize {
 #[inline]
 pub fn cell_on_this_cpu(idx: usize) -> bool {
     let owner = cells()[idx].vcpu[0];
-    owner == NO_CPU || owner == crate::smp::cpu_index()
+    let mine = owner == NO_CPU || owner == crate::smp::cpu_index();
+    if !mine {
+        // Counted so a test can see the affinity test **refuse**, rather than only
+        // observe that nothing went wrong. An absence is weak evidence: the window in
+        // which a scheduler could pick another core's cell is narrow, so "no double
+        // entry" can mean the check worked or that the race never came up. A nonzero
+        // count says the check was consulted and said no (docs/ENGINEERING.md 1).
+        AFFINITY_SKIPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    mine
+}
+
+/// Times a scheduler was offered a cell belonging to another core and declined it.
+static AFFINITY_SKIPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How many times [`cell_on_this_cpu`] has refused a cell this core does not own.
+pub fn affinity_skips() -> u64 {
+    AFFINITY_SKIPS.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Whether cell `idx` speaks the native ABI (docs/NETSTACK.md rheo-net N4a).
@@ -2511,7 +2527,14 @@ pub unsafe fn install_spawned(
             a
         },
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
-        vcpu: [NO_CPU; MAX_VCORES],
+        // **The parent's core, not unclaimed.** A child left `NO_CPU` is visible to every
+        // core's scheduler (`cell_on_this_cpu` treats unclaimed as pickable, which is what
+        // keeps single-core boots unchanged), so a cell spawned *on a secondary* could be
+        // entered by the primary at the same time - two cores in one cell, which is the
+        // corruption `user::double_entries` exists to name. Inheriting the owner is the fix
+        // this very predicate's doc named; it is not a wider lock, it is the same
+        // partitioning applied to a cell that did not exist when the round started.
+        vcpu: p.vcpu,
         // The parent's node, not a fresh one: a spawned child shares the parent's
         // capability bundle and usually a channel with it, so they are one working
         // set and splitting them across nodes would cost on every message.
@@ -2597,7 +2620,9 @@ pub unsafe fn install_forked(
         vqp_va: [0; MAX_VCORES],
         vqp_cap: [0; MAX_VCORES],
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
-        vcpu: [NO_CPU; MAX_VCORES],
+        // The parent's core - see `install_spawned` for why an unclaimed child is a
+        // two-cores-one-cell hazard the moment a fork happens off the boot CPU.
+        vcpu: p.vcpu,
         // The parent's node, and here it is not a preference but a fact: `fork` is
         // copy-on-write, so the child starts out mapping the parent's frames, which
         // are already placed. Anything else would be a claim the pages do not

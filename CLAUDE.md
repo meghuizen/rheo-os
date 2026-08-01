@@ -1982,7 +1982,44 @@ atomic `swap` now. The **personality lock** docs/SMP.md 10.2 names as the first 
 also in place (`linux::plock`: one lock over the whole Linux dispatch plus the
 demand-paging entry, **recursive per CPU** - a syscall reaches `fill_fault` through
 `uaccess`, so a non-reentrant lock self-deadlocks there - and **not taken at all** on a
-single-CPU boot, so every pre-existing kernel's hot path is unchanged). **And two Linux cells now run on two cores at the same time** - the same unmodified
+single-CPU boot, so every pre-existing kernel's hot path is unchanged). **And FOUR Linux cells run across four cores** (docs/SMP.md 10.0b) - the
+docs/SMP.md 10.2 audit's own remaining question, asked. The audit names the Linux
+personality's global state (the mapped-file registry, the pipe/eventfd/timerfd registries,
+pid allocation, the unix-socket names) as one of six areas, and `linux::plock` covers the
+whole dispatch plus the demand-paging entry recursively per CPU - the "one big lock" order
+10.2 explicitly allows. Two cells were proven; **many** was not, because a big lock is
+exactly the claim that holds for two and fails for N if anything touches a global outside
+the locked window. Four Linux cells now go through the same placement queue every other
+multi-core phase uses, one per core, each demand-paging its own copy of the same unmodified
+static-glibc binary, each synthesizing its own pid, each transcript captured separately and
+asserted **exactly**, all four exiting 9 - on **all three ISAs** with all 4 cores taking one.
+It widens `place_cells`' contract from "native" to "native **or a Linux cell with no process
+tree**". **Honest: this does not prove the lock load-bearing** - forcing `plock` to return
+`PGuard::Off`, so nothing serialises the personality at all, still passes on all three ISAs,
+because `chello` barely touches the registries and TCG interleaves coarsely; the lock's
+*necessity* needs a registry-hammering fixture that does not exist.
+
+**And a Linux cell FORKS off the boot CPU** (docs/SMP.md 10.0c) - the other half of that
+question. `fork` creates a **new cell**, and an unclaimed cell is pickable by every core
+(`cell_on_this_cpu` treats `NO_CPU` as pickable, which is what keeps single-core boots
+unchanged), so when a Linux cell on core B exits its `linux::proc::reschedule` scan would
+find the child core A forked a moment ago - two cores, one trap frame. An **idle** core
+cannot reach it (`drain_cells` only enters published cells), so it takes two Linux cells one
+of which forks. The fix is the one `cell_on_this_cpu`'s own doc predicted:
+`install_forked`/`install_spawned` give the child **its parent's owner** - the same
+partitioning applied to a cell that did not exist when the round started, not a wider lock.
+Proven on **all three ISAs**: `af_unix` (an unmodified static-glibc
+socketpair+fork+bind/listen/connect/accept fixture, so it also drives the global unix-socket
+registry and the L6 ring from a secondary) runs on one core while `chello` runs on another,
+both exact transcripts and exits asserted, zero double entries, and `user::affinity_skips()`
+asserted **nonzero** so a scheduler really was offered another core's cell and declined it -
+the positive form, since "no double entry" would pass equally if the race never arose.
+**Not proven, and recorded**: that the *child's* inherited owner is what prevented a double
+entry - reverting it still passes over five runs, and the refusals counted come from the two
+*placed* cells rather than the child, because the window (the peer's exit-time scan landing
+between the child's creation and its reaping) is narrow.
+
+**And two Linux cells now run on two cores at the same time** - the same unmodified
 static-glibc binary as both cells, each transcript captured separately (the stdout tap
 keys on `user::current_index()`, which is `PerCpu`) and asserted exactly, each exiting 9,
 on all three ISAs. Two defects had to go, and the first is recorded because the initial
@@ -2798,7 +2835,11 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               CELLS ACROSS FOUR CORES** - the docs/SMP.md 10.2 audit's 'many
               Linux cells' question, each with its own exact transcript and exit,
               with the honest note that removing the personality lock does not
-              make it fail (docs/SMP.md 10.0b) - docs/SMP.md 10.0), shell-smoke, hwinfo, rng, runtime
+              make it fail; then **A LINUX CELL FORKING OFF THE BOOT CPU** -
+              `af_unix` (socketpair+fork+bind/listen/connect/accept) on one core
+              beside `chello` on another, both transcripts exact, 0 double
+              entries and the affinity test asserted to have refused
+              (docs/SMP.md 10.0b/10.0c) - docs/SMP.md 10.0), shell-smoke, hwinfo, rng, runtime
               (the strand runtime, closing with the **measured** concurrency /
               async / sync phases: 256 strands in flight with every round a
               permutation, 63 I/O ops outstanding at one instant with one
