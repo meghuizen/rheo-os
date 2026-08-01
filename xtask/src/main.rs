@@ -247,6 +247,10 @@ fn fixed_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
         // demand paging - from a core that is not the boot CPU, at a fraction of their
         // size.
         ("linuxsmp", Arch::Riscv64) => &[
+            // Two cores of two threads, so the sysfs topology phase has something
+            // to read. Inert for scheduling - same four hardware ids either way.
+            "-smp",
+            "4,sockets=1,cores=2,threads=2",
             "-global",
             "virtio-mmio.force-legacy=false",
             "-drive",
@@ -255,6 +259,10 @@ fn fixed_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "virtio-blk-device,drive=blk0",
         ],
         ("linuxsmp", Arch::Aarch64) => &[
+            // Two cores of two threads, so the sysfs topology phase has something
+            // to read. Inert for scheduling - same four hardware ids either way.
+            "-smp",
+            "4,sockets=1,cores=2,threads=2",
             "-global",
             "virtio-mmio.force-legacy=false",
             "-drive",
@@ -263,6 +271,10 @@ fn fixed_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "virtio-blk-device,drive=blk0",
         ],
         ("linuxsmp", Arch::X86_64) => &[
+            // Two cores of two threads, so the sysfs topology phase has something
+            // to read. Inert for scheduling - same four hardware ids either way.
+            "-smp",
+            "4,sockets=1,cores=2,threads=2",
             "-drive",
             "file=tests/linux-fixtures/build/x86_64/dyn-disk.img,if=none,id=blk0,format=raw",
             "-device",
@@ -689,6 +701,9 @@ fn fixed_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
         // x86-64, MPIDR's MT bit on ARM64, the device tree's `cpu-map` on riscv64 - and QEMU
         // flattens threads out of the riscv `cpu-map`, which the test reports rather than
         // works around.
+        // hwinfo (docs/RESOURCE-GRAPH.md 2.4a): a CPU topology with something in it to
+        // discover. `linuxsmp` gets the same line in its own arms above - it already has one
+        // for its disk, and a later arm would never be reached.
         ("hwinfo", _) => &["-smp", "4,sockets=1,cores=2,threads=2"],
 
         ("numa", _) => &[
@@ -1742,6 +1757,7 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         ("stackx.c", "stackx", &["-Wl,-z,stack-size=12582912"]),
         ("sysx.c", "sysx", NO_EXTRA),
         ("cpulist.c", "cpulist", NO_EXTRA),
+        ("cputopo.c", "cputopo", NO_EXTRA),
         ("mmapdp.c", "mmapdp", NO_EXTRA),
         ("cowfork.c", "cowfork", NO_EXTRA),
     ] {

@@ -544,6 +544,16 @@ fn maybe_open_maps(st: &mut LinuxState, path_va: u64, flags: u64) -> Option<i64>
         let len = render_cpu_list(scratch);
         return Some(st.fds.open_maps(&scratch[..len], flags));
     }
+    // The per-CPU topology files, from the same discovered topology the resource graph is
+    // built from (docs/RESOURCE-GRAPH.md 2.4a). This is what makes an unmodified
+    // topology-aware program work: hwloc, and every runtime that uses it, reads exactly these
+    // to decide how many workers to start and where to put them. Refused - not defaulted -
+    // when nothing was discovered, because a program that gets `core_id = 0` for every CPU
+    // packs its whole worker set onto what it thinks is one core.
+    if let Some(len) = render_cpu_topology(path) {
+        let scratch = unsafe { &*addr_of_mut!(MAPS_SCRATCH) };
+        return Some(st.fds.open_maps(&scratch[..len], flags));
+    }
     if path != b"/proc/self/maps" {
         return None;
     }
@@ -2527,6 +2537,110 @@ fn render_cpu_list(out: &mut [u8]) -> usize {
         w += 1;
     }
     w
+}
+
+/// Render one of `/sys/devices/system/cpu/cpu<N>/topology/*` into `MAPS_SCRATCH`, returning its
+/// length, or `None` when the path is not one of them or the topology is unknown.
+///
+/// The four files, and what a reader does with each (docs/RESOURCE-GRAPH.md 2.4a):
+///
+/// - `core_id` / `physical_package_id` - the ids themselves. hwloc builds its tree from them.
+/// - `thread_siblings_list` - the CPUs sharing this one's core. A runtime spreads compute-bound
+///   workers across cores by *avoiding* these.
+/// - `core_siblings_list` - the CPUs in the same package. On Linux this is the package, and the
+///   cache domain is what this kernel discovers, so it renders the cache domain and the
+///   difference is stated here rather than hidden: the two coincide on every machine without a
+///   sub-package cache split, and where they differ the cache domain is the more useful answer
+///   and the *narrower* one, so a reader that treats it as a package under-shares rather than
+///   over-shares.
+///
+/// **`None` when nothing was discovered**, which makes the open fail rather than answer. A
+/// defaulted `core_id = 0` would tell a program every CPU is one core and it would pack its
+/// whole worker set onto what it thinks is a single core - strictly worse than the file being
+/// absent, which every one of these readers already handles (they fall back to a flat CPU
+/// count).
+///
+/// Deliberately not provided: the `cache/index*/` tree, which describes each cache's size and
+/// line length. This kernel discovers *who shares* a cache and not *how big* it is (CPUID leaf
+/// 4 returns zeros under QEMU's TCG - measured), so those files would be fabricated numbers
+/// that a reader would size a blocking factor from.
+fn render_cpu_topology(path: &[u8]) -> Option<usize> {
+    const PREFIX: &[u8] = b"/sys/devices/system/cpu/cpu";
+    let rest = path.strip_prefix(PREFIX)?;
+    // The CPU index, then `/topology/` then the file name.
+    let mut i = 0usize;
+    let mut idx = 0usize;
+    while i < rest.len() && rest[i].is_ascii_digit() {
+        idx = idx * 10 + (rest[i] - b'0') as usize;
+        i += 1;
+        if i > 6 {
+            return None; // a nonsense index rather than a real one
+        }
+    }
+    if i == 0 {
+        return None;
+    }
+    let file = rest[i..].strip_prefix(b"/topology/")?;
+
+    let inv = crate::hw::inventory();
+    // `idx` came out of a **path the cell chose**, so the bound is a safety check and not a
+    // tidiness one: without it `/sys/devices/system/cpu/cpu99/topology/core_id` indexes a
+    // 64-element kernel array out of range, which is a kernel panic reached from unprivileged
+    // code - the docs/ENGINEERING.md 12 F1 shape. Observed: removing it turns the `cputopo`
+    // phase into `index out of bounds: the len is 64 but the index is 99`.
+    //
+    // The `ncpus` bound and the sentinel check below **overlap on purpose**, and the honest
+    // note is that the overlap made one control weaker than it looked: a probe of `cpu9` is
+    // refused by the sentinel alone, because slots past `ncpus` hold `TOPO_UNKNOWN`, so
+    // removing the bound did *not* fail the first version of this test. The fixture probes
+    // `cpu99` as well for exactly that reason - one index past the discovered CPUs, one past
+    // the array - because a guard whose removal changes nothing is not proven to be doing
+    // anything.
+    if inv.topo == crate::hw::TopoSource::None || idx >= inv.ncpus {
+        return None;
+    }
+    let me = inv.cpus[idx];
+    if me.core_id == crate::hw::TOPO_UNKNOWN || me.llc_id == crate::hw::TOPO_UNKNOWN {
+        return None;
+    }
+
+    // SAFETY: a synchronous trap; the scratch is filled and copied out by the caller before
+    // returning, so no second user can overlap.
+    let out = unsafe { &mut *addr_of_mut!(MAPS_SCRATCH) };
+    let mut w = 0usize;
+    match file {
+        b"core_id" => w += put_num(out, w, me.core_id as usize),
+        b"physical_package_id" => w += put_num(out, w, me.llc_id as usize),
+        b"thread_siblings_list" | b"core_siblings_list" => {
+            // Every CPU sharing this one's core (or its cache domain), as a comma-separated
+            // list of **CPU indices**, which is what the file means - not hardware ids, which
+            // are what the inventory is keyed by.
+            let by_core = file == b"thread_siblings_list";
+            let mut first = true;
+            for (n, c) in inv.cpus[..inv.ncpus].iter().enumerate() {
+                let same = if by_core {
+                    c.core_id == me.core_id
+                } else {
+                    c.llc_id == me.llc_id
+                };
+                if !same {
+                    continue;
+                }
+                if !first && w < out.len() {
+                    out[w] = b',';
+                    w += 1;
+                }
+                first = false;
+                w += put_num(out, w, n);
+            }
+        }
+        _ => return None,
+    }
+    if w < out.len() {
+        out[w] = b'\n';
+        w += 1;
+    }
+    Some(w)
 }
 
 /// Write `v` in decimal at `at`, returning the bytes written. Bounded by `out`, so a buffer

@@ -1,7 +1,13 @@
 # The resource graph: one model of the machine, queried rather than hardcoded
 
-**Status:** designed, not built. Every section names what would count as evidence, and one
-of them is provable in this container today.
+**Status:** the model and its **discovery** are built; most **consumers** are not. Built and
+proven on all three ISAs: the graph itself (nodes, cost vectors, the two-phase filter-then-rank
+query, host-model-checked in `verify/graph/`), memory localities, node-to-node distances, HMAT
+latency and bandwidth, the per-CPU core and cache topology (section 2.4a), and the `/sys`
+rendering an unmodified topology-aware binary reads (section 6.3). Not built: the consumers in
+section 6.4 - a steal that prefers its cache domain, memory placed by purpose,
+`librheo::graph` - plus per-CPU feature divergence, core classes and device proximity. Every
+section still names what would count as evidence, and says which of it exists.
 
 The claim: this kernel knows *what* hardware exists and almost nothing about *how it
 relates*. Placement decisions are therefore written as constants and heuristics, which is
@@ -20,10 +26,10 @@ classifying each function into an engine kind. The **data** is there. What is mi
 |---|---|
 | Which memory node is this frame on? | **Yes** - `frames::node_of` (docs/SUBSTRATE.md pillar 6) |
 | Is this CPU on the same node as that memory? | **Yes** - SRAT CPU affinities |
-| How much *further* is node 1 from node 0 than node 0 is from itself? | **No.** SLIT is not parsed; distance is binary |
-| What bandwidth and latency does this initiator see to that target? | **No.** HMAT is not parsed |
+| How much *further* is node 1 from node 0 than node 0 is from itself? | **Yes** - SLIT (x86-64) / `numa-distance-map-v1` (riscv64) |
+| What bandwidth and latency does this initiator see to that target? | **Yes** on x86-64 - HMAT; 0 = unknown elsewhere, never derived from the distance |
 | Which node is this NIC's DMA on? | **No.** A device's proximity domain (`_PXM`) is not read |
-| Do these two CPUs share an LLC? Are they SMT siblings? | **No.** Not modelled at all |
+| Do these two CPUs share an LLC? Are they SMT siblings? | **Yes** - `graph::siblings(cpu, Cache \| Core)`, section 2.4a |
 | Which engine is nearest to the memory holding my tiles? | **No** |
 | Is that GPU local or on another host? | **Not expressible** |
 
@@ -496,8 +502,8 @@ correct machine view with no port:
 
 | Surface | Fed by |
 |---|---|
-| `/sys/devices/system/cpu/online`, `present`, `possible` | the graph's CPU set |
-| `/sys/devices/system/cpu/cpuN/topology/{core_id,physical_package_id,thread_siblings_list}` | SMT sets and packages |
+| `/sys/devices/system/cpu/online`, `present`, `possible` | the graph's CPU set - **done** |
+| `/sys/devices/system/cpu/cpuN/topology/{core_id,physical_package_id,thread_siblings_list}` | SMT sets and packages - **done** |
 | `/sys/devices/system/cpu/cpuN/cache/indexN/{level,size,shared_cpu_list}` | LLC domains |
 | `/sys/devices/system/node/nodeN/{cpulist,meminfo,distance}` | **`distance` is SLIT** - the file libnuma and hwloc read |
 | `/sys/devices/system/node/nodeN/hmem_attrs/…` | HMAT bandwidth and latency |
@@ -526,6 +532,33 @@ kernel told them there is one core. Fixing it by editing the fixture to `0-3` wo
 same defect with a different constant; it has to come from `smp::online_count()`, which is
 the narrow first step toward this whole document.
 
+**Both of those are now built** (docs/LINUX-COMPAT.md, docs/ARCHITECTURE-DEBT.md 7.2), and
+they are the first two rows of the table above:
+
+- `online`/`present`/`possible` render from `smp::online_count()`, and the seeded file is
+  **removed** from the disk image rather than corrected, so no constant can answer first.
+- `cpuN/topology/{core_id,physical_package_id,thread_siblings_list,core_siblings_list}`
+  renders from the discovered per-CPU topology (section 2.4a) - the same fields the graph's
+  `Cache` and `Core` nodes are built from, so sysfs and the graph cannot disagree, because
+  there is one source and two renderings of it.
+
+Two details worth keeping, both of which are the "never seeded" rule doing work:
+
+- **`core_siblings_list` is Linux's *package* and this kernel discovers a *cache domain*.**
+  They coincide on every machine without a sub-package cache split; where they differ the
+  cache domain is the narrower answer, so a reader that treats it as a package under-shares
+  rather than over-shares. Stated at the render site rather than papered over.
+- **An unknown topology makes the open fail, not answer.** A defaulted `core_id = 0` would
+  tell a program every CPU is one core and it would pack its whole worker set onto what it
+  thinks is a single core - strictly worse than the file being absent, which every one of
+  these readers already handles by falling back to a flat CPU count.
+
+`cache/indexN/` is still absent and that is deliberate: this kernel discovers who *shares* a
+cache, not how big it is (CPUID leaf 4 returns zeros under QEMU's TCG - measured), and a
+fabricated `size` is a number a reader would compute a blocking factor from. The `node/`
+half is the next rendering; its data - localities, distances, HMAT magnitudes - already
+exists.
+
 ## 6.4 The graph as backbone: every consumer, and what each one asks
 
 The graph earns its place only if it is *the* answer to "where", the way the queue ABI is
@@ -534,10 +567,10 @@ per consumer, with the query each makes and what is missing before it can make i
 
 | Consumer | The question it asks the graph | Blocked on |
 |---|---|---|
-| **Driver framework** (DRIVERS.md D2) | `node_of(bdf)`, `members(llc_of(node))` - place queues, bounce frames and MSI-X vectors near the device | discovery: `_PXM`, CPUID cache leaves |
-| **Kernel scheduler** | `cost`, `members` - which core to place an entity on, which node its pages want | discovery + E2-E4 |
-| **Work stealing** | `members(llc_of(victim))` - **steal within a cache domain first** | the same |
-| **Introspection** (`cpuinfo`, `lshw`, `hwinfo`) | render the graph | discovery |
+| **Driver framework** (DRIVERS.md D2) | `node_of(bdf)`, `siblings(cpu, Cache)` - place queues, bounce frames and MSI-X vectors near the device | discovery: `_PXM` (the cache half is **done**) |
+| **Kernel scheduler** | `cost`, `siblings` - which core to place an entity on, which node its pages want | E2-E4 (discovery is **done**) |
+| **Work stealing** | `siblings(victim, Cache)` - **steal within a cache domain first** | nothing - this is the next slice, and the query it needs exists |
+| **Introspection** (`cpuinfo`, `lshw`, `hwinfo`) | render the graph | nothing for CPUs; `_PXM` for devices |
 | **POSIX translation** | `/sys/devices/system/{cpu,node}`, `getcpu`, `sched_getaffinity` (6.3) | discovery + the synthesis |
 | **.NET / Java / Go task schedulers** | nothing new - they read the POSIX surface | 6.3 |
 | **Translation and optimisation layer** (CPU-FEATURES.md 2) | `IsaSet` of the *target* node - so a JIT emits for the machine it will run on, not for a baseline | nothing; the `IsaSet` exists |

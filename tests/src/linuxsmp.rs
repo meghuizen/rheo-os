@@ -66,6 +66,10 @@ static RUSTTHREADS: &[u8] = fixture::linux_cargo!("rustthreads");
 /// single-CPU kernel because the value being tested is the *online count*, and a one-core
 /// boot cannot tell a synthesized answer from the constant `0-0` it replaced.
 static CPULIST: &[u8] = fixture::linux!("cpulist");
+
+/// Reads the per-CPU topology files hwloc reads. Here rather than in a single-CPU kernel for
+/// the same reason `cpulist` is: on one CPU every answer is 0 and a constant passes.
+static CPUTOPO: &[u8] = fixture::linux!("cputopo");
 const RUSTTHREADS_OUT: &[u8] = b"threads 4 total 1550 channel 1550\n";
 const RUSTTHREADS_EXIT: u64 = 4;
 
@@ -122,6 +126,7 @@ extern "C" fn kernel_main() -> ! {
     test_linux_fork_across_cores();
     test_registry_stress_two_cores();
     test_cpu_list();
+    test_cpu_topology();
     test_preempted_threads_two_cores();
     test_dynamic_cell_on_secondary();
 
@@ -995,5 +1000,83 @@ fn test_cpu_list() {
          /sys/devices/system/cpu/online and got `0-3`, which is what QEMU's `-smp 4` \
          declared; the kernel independently reports {online} online. It was the constant \
          `0-0`, and libuv sizes its thread pool from it OK"
+    );
+}
+
+// ------------------------- the per-CPU topology, read by an unmodified Linux binary
+//
+// The other half of the claim above, and the one that makes the discovered topology
+// (docs/RESOURCE-GRAPH.md 2.4a) reachable by software nobody recompiled:
+// `/sys/devices/system/cpu/cpuN/topology/{core_id,physical_package_id,thread_siblings_list}`
+// is what hwloc reads, and hwloc is what Java, .NET, OpenMP and half the HPC world get their
+// placement from. `online` alone answers "how many"; these answer "which of them are the same
+// core", which is the difference between spreading four workers over two cores and packing
+// them onto one.
+//
+// **The oracle is the launch.** xtask starts this kernel with
+// `-smp 4,sockets=1,cores=2,threads=2`, so CPUs 0 and 1 are threads of core 0, CPUs 2 and 3 of
+// core 1, and all four are in one package. The fixture only reports what it read; the expected
+// transcript below is written from that line.
+//
+// x86-64 only for the SMT pairing, for the reason `hwinfo` records: QEMU cannot express threads
+// to a guest on the other two ISAs (ARM MPIDR is index-based, riscv `cpu-map` emits no thread
+// nodes - both read out of QEMU's source), so there each CPU is genuinely its own core and the
+// expected transcript says so.
+
+fn test_cpu_topology() {
+    // SAFETY: as `test_cpu_list`.
+    let outcome = unsafe {
+        STDOUT_LEN = [0; CAP_CELLS];
+        kernel::linux::set_stdout_tap(Some(tap));
+        let o = harness::run_linux_cell(CPUTOPO, &[b"cputopo"]);
+        kernel::linux::set_stdout_tap(None);
+        o
+    };
+    let got = captured(0);
+    // Two cores of two threads: CPU 0 with CPU 1, CPU 2 with CPU 3, one package.
+    #[cfg(target_arch = "x86_64")]
+    let want: &[u8] = b"cputopo: cpu0 core=0 pkg=0 threads=0,1\n\
+                        cputopo: cpu2 core=1 pkg=0 threads=2,3\n\
+                        cputopo: read failed\n\
+                        cputopo: read failed\n";
+    // Four independent cores, one package - what the platform describes when it cannot carry
+    // the launch's `threads=2`.
+    #[cfg(not(target_arch = "x86_64"))]
+    let want: &[u8] = b"cputopo: cpu0 core=0 pkg=0 threads=0\n\
+                        cputopo: cpu2 core=2 pkg=0 threads=2\n\
+                        cputopo: read failed\n\
+                        cputopo: read failed\n";
+    match outcome {
+        kernel::user::Outcome::Exited(0) => {}
+        other => panic!("cputopo exited {other:?}"),
+    }
+    assert!(
+        got == want,
+        "the topology an unmodified binary reads out of sysfs is {:?}, want {:?}. The launch \
+         declares -smp 4,sockets=1,cores=2,threads=2, and a synthesis returning one constant \
+         for every CPU would show the same core for cpu0 and cpu2",
+        core::str::from_utf8(got),
+        core::str::from_utf8(want)
+    );
+    // What the transcript means differs per ISA for the reason `hwinfo` records, so the
+    // message says which claim was actually made rather than one sentence for both.
+    #[cfg(target_arch = "x86_64")]
+    println!(
+        "linuxsmp: AN UNMODIFIED BINARY READS THE REAL CPU TOPOLOGY - a Linux cell opened \
+         /sys/devices/system/cpu/cpu{{0,2}}/topology/ and read back exactly what QEMU's \
+         `-smp 4,sockets=1,cores=2,threads=2` declares: cpu0 with cpu1 on core 0, cpu2 with \
+         cpu3 on core 1, one package. Synthesized from the same discovery the resource graph \
+         is built from, and a nonexistent cpu9 (inside the array, past the discovered CPUs) and cpu99 (past the array itself) are both refused rather than answered. That is the \
+         path hwloc takes, and through it Java, .NET and OpenMP OK"
+    );
+    #[cfg(not(target_arch = "x86_64"))]
+    println!(
+        "linuxsmp: AN UNMODIFIED BINARY READS THE REAL CPU TOPOLOGY - a Linux cell opened \
+         /sys/devices/system/cpu/cpu{{0,2}}/topology/ and read back four independent cores in \
+         one package, which is what this platform describes: QEMU cannot express the launch's \
+         `threads=2` to a guest here (ARM MPIDR is index-based, riscv `cpu-map` emits no \
+         thread nodes), so the SMT half is SKIPPED WITH A REASON and what is asserted is the \
+         platform's own answer, synthesized rather than seeded. A nonexistent cpu9 and cpu99 are both refused \
+         rather than answered. This is the path hwloc takes OK"
     );
 }
