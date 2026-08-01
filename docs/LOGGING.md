@@ -26,6 +26,81 @@ are dropped with a counter — the same principle as the kernel event stream
 
 ---
 
+## 0. The kernel's own console — the half this document had excluded
+
+Section 2 below says, in its own words, that "the per-cell log ring lives in userspace
+shared memory, not the kernel — the kernel is not involved in the write path at all."
+True of a *cell's* logging, and it left the **kernel's own** path as bring-up wrote it.
+`kernel/src/console.rs` formatted at the call site and handed each byte to
+`arch::serial_write_byte`, which spins on the UART's transmit-ready bit, and its module
+comment said "No locking yet — only the boot CPU runs at this stage."
+
+That stopped being true when four cores began running cells, and **the consequence was
+observed, not predicted**: two cores printing a fault report at once produced
+
+```
+linuxT: unhandled TRAP: scaRAP: uscase us0xe 0xfffcff at sepcfc 0x08060,4c0a
+```
+
+— two messages interleaved a byte at a time. It cost a real diagnosis. The garbled
+console made a single-core run *look* broken, the first write-up blamed personality
+state, and reproducing in a kernel with no secondaries showed the cells were fine and
+the noise was the secondaries (docs/SMP.md). A diagnostic that corrupts itself under
+exactly the conditions you need it for is worse than no diagnostic, because it is
+believed.
+
+It is two costs, not one, and they are fixed separately because they have different
+risk:
+
+| Cost | Fix | Always on? |
+|---|---|---|
+| **Interleaving** — concurrent producers tear each other's lines, so a multi-core log is not a log | a `SpinLock` around a whole `write` | **yes** — it changes only who waits, and the UART it protects is already the slowest thing the kernel does |
+| **Blocking** — every byte spins on a device FIFO, inline, on whatever path emitted it, including paths that run per syscall | `kernel/src/telemetry.rs`: one single-producer ring **per CPU**, drained where blocking is already acceptable | **no** — opt-in per boot |
+
+Buffering is opt-in for a stated reason rather than caution: it changes *when* output
+appears relative to a cell's own writes, so turning it on globally would reorder the
+console of all 210 boot tests and make every log in this tree incomparable with its own
+history. `console::write` consults the ring only when a boot has enabled it, and pays
+one load and a branch otherwise (the `sched::dispatch::rearm_remaining` lesson: an
+early-out placed after the work is not an early-out).
+
+Three properties the kernel ring holds, each for a reason this tree has already paid
+for:
+
+- **Never blocks.** A full ring drops the record and counts the drop. A logger that
+  waits has made the observation change the thing observed.
+- **Safe by partitioning, not locking.** The only producer of CPU *n*'s ring is CPU
+  *n* — the same argument `PerCpu`, the frame allocator's per-node ranges and the
+  per-vcore resources make. A producer is one copy and one increment with nothing to
+  contend.
+- **Merged by timestamp on drain.** Producers never coordinate; ordering is recovered
+  at the consumer from a clock they all read, ties broken by CPU index so a captured
+  transcript is deterministic and therefore assertable.
+
+And the panic handler flushes. A buffered fault report that never reaches the wire is
+this module's own failure mode arrived at from the other side — so a panic writes its
+message **raw**, bypassing the lock it may already hold (acquiring it again would turn
+a reported failure into a 120-second timeout with no output), and only then drains.
+
+**Verified by fuzzing, not by a boot test**, and that choice is the interesting part:
+the ring is free-running `u32` counters masked into a slot array, so every interesting
+case is a wrap-around. A boot emits a few hundred records and reaches none of them — it
+would pass on an implementation that breaks after four billion messages, which is a
+number a long-lived kernel reaches. `verify/telemetry/` includes the shipped module
+verbatim, starts a ring at `u32::MAX - 8` so its first pushes cross the boundary, and
+checks it against an independent `VecDeque` oracle: 2,000 runs x 4,000 operations from
+0 and again across the wrap, plus the per-CPU merge at 1..8 CPUs. **Six negative
+controls, six observed firing** (verify/README.md).
+
+One of those controls is worth recording, because it caught this document's own subject
+inside the implementation of it: a control that broke the level filter in
+`Rings::push_claimed` **passed**, because `Rings::push` had its own copy of the same
+three admission checks and the test called that one. Two places deciding one thing,
+with a test unable to tell — the defect class docs/EXECUTION-MODEL.md 1 exists for.
+`push` delegates now, so a control on the check reaches every caller.
+
+---
+
 ## 1. The four-level fix
 
 ### Level 1 — Lazy formatting (no string allocation in the producer)

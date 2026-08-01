@@ -970,7 +970,10 @@ fn print_usage() {
 /// 120-second boot to surface. Neither replaces the other, and CI runs both.
 fn verify() -> bool {
     // No target flag: this is a host program, and that is the point.
-    let drivers = [("entity", "verify/entity/fuzz.rs")];
+    let drivers = [
+        ("entity", "verify/entity/fuzz.rs"),
+        ("telemetry", "verify/telemetry/fuzz.rs"),
+    ];
     let out = std::path::Path::new("target/verify");
     if let Err(e) = std::fs::create_dir_all(out) {
         eprintln!("error: cannot create {}: {e}", out.display());
@@ -980,7 +983,7 @@ fn verify() -> bool {
         let bin = out.join(name);
         println!("[xtask] verify: building {src}");
         let built = Command::new("rustc")
-            .args(["-O", "--edition", "2021", "-o"])
+            .args(["-O", "--edition", "2021", "-A", "dead_code", "-o"])
             .arg(&bin)
             .arg(src)
             .status()

@@ -104,3 +104,36 @@ thing - reproduced inside its own test. The oracle now computes availability fro
 entity's own fields and never calls `pickable`, and with that fixed the control fires at
 op 35. Recorded because a passing test whose oracle is the implementation is worse than
 no test: it reports confidence it has not earned.
+
+## telemetry/ - the kernel's record rings
+
+`verify/telemetry/fuzz.rs` drives `kernel/src/telemetry.rs`, the per-CPU non-blocking log
+and event ring (docs/LOGGING.md 0).
+
+**Why a fuzzer rather than a boot test**, which is the interesting part: the ring is
+free-running `u32` counters masked into a slot array, so every case worth testing is a
+wrap-around - `head`/`tail` crossing `u32::MAX`, a full ring, a ring emptied and refilled
+across the boundary. A boot emits a few hundred records and reaches none of them. It would
+pass on an implementation that is wrong after four billion messages, which is a number a
+long-lived kernel reaches and a test never does. Here the boundary is *aimed at*: one run
+starts the counters at `u32::MAX - 8` so the very first pushes cross it.
+
+2,000 runs x 4,000 operations from 0, the same again across the wrap, and the per-CPU merge
+at 1..8 CPUs - each against an independent `VecDeque` oracle, never against the ring's own
+fields.
+
+| Check broken in `telemetry.rs` | Result |
+|---|---|
+| `pending()` uses plain instead of wrapping subtraction | pending 0 vs model 2, at the wrap, seed 0 |
+| `push()` indexes without masking | a record torn at the wrap, seed 0 |
+| `pop_oldest()` takes the newest | merge order inverted, 2 CPUs, seed 1 |
+| `pop_oldest()` takes the first non-empty ring | merge order wrong at record 2 |
+| the truncated flag uses the clamped length | an over-long record not marked |
+| a filtered record counted as a drop | 2 counted as dropped |
+
+Six controls, six firing. The last one is worth reading: it **did not fire** at first.
+`Rings::push` and `Rings::push_claimed` each carried their own copy of the buffered /
+threshold / CPU-range checks, so breaking one left the other intact and the test called the
+intact one. Two places deciding one thing, with a test unable to tell - the defect class
+docs/EXECUTION-MODEL.md 1 exists for, reproduced inside the module written to demonstrate
+the fix. `push` delegates now, and the control fires.

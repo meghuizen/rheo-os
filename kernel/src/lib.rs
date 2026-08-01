@@ -51,6 +51,7 @@ pub mod sched;
 /// the `smp` feature. See the module header and docs/SUBSTRATE.md pillar 3.
 pub mod smp;
 pub mod svc;
+pub mod telemetry;
 pub mod time;
 pub mod uaccess;
 pub mod user;
