@@ -136,6 +136,19 @@ pub fn parse(dtb: usize, inv: &mut Inventory) {
                 if pname == "numa-node-id" && len >= 4 && d < MAX_DEPTH {
                     numa[d] = be32(p, data) as u8;
                 }
+                // The device-tree analogue of ACPI's SLIT (`numa-distance-map-v1`): a flat
+                // array of `(from, to, distance)` u32 triples under a `distance-map` node.
+                // Matched on the property rather than on the node's `compatible`, because the
+                // property name is what carries the meaning and this walk already visits
+                // every property once - so no second pass and no node-name matching.
+                //
+                // This is what gives riscv64 real distances. Without it that ISA discovered
+                // its *nodes* from the device tree and had no *distances*, which the `numa`
+                // kernel caught the moment it started asserting them
+                // (docs/RESOURCE-GRAPH.md 2.4).
+                if pname == "distance-matrix" {
+                    parse_distance_matrix(p, data, len, inv);
+                }
                 match here {
                     NodeKind::Cpu => {
                         if pname == "reg" && len >= 4 {
@@ -219,5 +232,44 @@ fn save_riscv_isa(p: *const u8, data: usize, len: usize) {
             dst.add(i).write(p.add(data + i).read());
         }
         *core::ptr::addr_of_mut!(RISCV_ISA_LEN) = n;
+    }
+}
+
+/// `numa-distance-map-v1`'s `distance-matrix`: `(from, to, distance)` u32 triples, big-endian.
+///
+/// Refuses the same way `parse_slit` does and for the same reason: a locality beyond
+/// [`crate::hw::MAX_DIST_NODES`] sets `slit_truncated` and stores **nothing**, because a
+/// partly-filled distance matrix is worse than an empty one - a caller would read a real
+/// answer for some pairs and a fabricated one for the rest with nothing to tell them apart.
+///
+/// The device tree, unlike ACPI, does not define a minimum distance; the local value is 10 by
+/// the same convention, so anything below it is not stored and "0 means unreported" stays
+/// unambiguous.
+fn parse_distance_matrix(p: *const u8, data: usize, len: usize, inv: &mut Inventory) {
+    let triples = len / 12;
+    // First pass: does everything fit? Deciding after storing would leave a partial matrix.
+    for i in 0..triples {
+        let from = be32(p, data + i * 12) as usize;
+        let to = be32(p, data + i * 12 + 4) as usize;
+        if from >= crate::hw::MAX_DIST_NODES || to >= super::MAX_DIST_NODES {
+            inv.slit_truncated = true;
+            return;
+        }
+    }
+    for i in 0..triples {
+        let from = be32(p, data + i * 12) as usize;
+        let to = be32(p, data + i * 12 + 4) as usize;
+        let d = be32(p, data + i * 12 + 8);
+        if d >= 10 && d <= u8::MAX as u32 {
+            inv.dist[from][to] = d as u8;
+            // The device tree records one direction of a symmetric pair; ACPI records both.
+            // Filling the reverse keeps `cost(b, a)` answerable on both ISAs, which is what
+            // lets one assertion cover them - and it is a *convention*, so it never
+            // overwrites a distance the firmware stated explicitly.
+            if inv.dist[to][from] == 0 {
+                inv.dist[to][from] = d as u8;
+            }
+        }
+        inv.nnodes = inv.nnodes.max(from + 1).max(to + 1);
     }
 }

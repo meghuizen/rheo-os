@@ -651,6 +651,14 @@ fn fixed_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
             "memory-backend-ram,id=m1,size=512M",
             "-numa",
             "node,nodeid=1,memdev=m1",
+            // The SLIT distances, and **these arguments are the test's oracle**: the kernel
+            // asserts that the graph reports exactly what is declared here, never that its
+            // own parser is self-consistent (docs/RESOURCE-GRAPH.md 5). ACPI's local value
+            // is 10; 20 is the conventional one-hop remote.
+            "-numa",
+            "dist,src=0,dst=1,val=20",
+            "-numa",
+            "dist,src=1,dst=0,val=20",
         ],
         _ => &[],
     }

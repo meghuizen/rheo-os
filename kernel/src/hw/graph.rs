@@ -388,8 +388,25 @@ impl Node {
 
 /// A directed edge. **Directed on purpose**: SLIT is not required to be symmetric, and a
 /// link with different read and write bandwidth is ordinary.
+///
+/// # Why `used` exists, and it is not defensive
+///
+/// [`Funded`] grows into freshly-allocated frames, which arrive **zeroed** - that is the
+/// module's stated contract on `T`. So an "empty" value must *be* the all-zero pattern, or
+/// every slot of unfilled slack reads as real data. The first version of this struct marked
+/// emptiness with `from: NodeId::NONE` (`u16::MAX`), and the consequence was immediate and
+/// concrete: a two-node machine reported **512 edges**, because every zeroed slot read as a
+/// valid edge from node 0 to node 0 - and `add_edge`'s free-slot search, looking for
+/// `NodeId::NONE`, never found one and appended past the end on every call.
+///
+/// `Node` and `Capability` avoid this by construction because their empty discriminants are
+/// zero (`NodeKind::Free = 0`, `CapClass::None = 0`), which is the same discipline
+/// `sched::entity` follows with `State::Free`. An explicit flag is the version of that for a
+/// struct whose fields have no spare zero.
 #[derive(Copy, Clone, Debug)]
 pub struct Edge {
+    /// False in a freshly-zeroed slot, which is what makes slack distinguishable from data.
+    pub used: bool,
     pub from: NodeId,
     pub to: NodeId,
     pub cost: Cost,
@@ -397,6 +414,7 @@ pub struct Edge {
 
 impl Edge {
     pub const EMPTY: Edge = Edge {
+        used: false,
         from: NodeId::NONE,
         to: NodeId::NONE,
         cost: Cost::UNKNOWN,
@@ -453,7 +471,7 @@ impl Graph {
     pub fn edge_count(&self) -> usize {
         (0..self.edges.capacity())
             .filter_map(|i| self.edges.get(i))
-            .filter(|e| e.from != NodeId::NONE)
+            .filter(|e| e.used)
             .count()
     }
 
@@ -570,15 +588,31 @@ impl Graph {
         if let Some(i) = (0..self.edges.capacity()).find(|&i| {
             self.edges
                 .get(i)
-                .map(|e| e.from == from && e.to == to)
+                .map(|e| e.used && e.from == from && e.to == to)
                 .unwrap_or(false)
         }) {
-            return self.edges.set(i, Edge { from, to, cost });
+            return self.edges.set(
+                i,
+                Edge {
+                    used: true,
+                    from,
+                    to,
+                    cost,
+                },
+            );
         }
         let free = (0..self.edges.capacity())
-            .find(|&i| self.edges.get(i).map(|e| e.from) == Some(NodeId::NONE))
+            .find(|&i| self.edges.get(i).map(|e| !e.used).unwrap_or(false))
             .unwrap_or_else(|| self.edges.capacity());
-        self.edges.set_growing(free, Edge { from, to, cost })
+        self.edges.set_growing(
+            free,
+            Edge {
+                used: true,
+                from,
+                to,
+                cost,
+            },
+        )
     }
 
     /// Record a symmetric cost - two directed edges. Convenience for the common firmware
@@ -601,7 +635,7 @@ impl Graph {
         }
         (0..self.edges.capacity())
             .filter_map(|i| self.edges.get(i))
-            .find(|e| e.from == from && e.to == to)
+            .find(|e| e.used && e.from == from && e.to == to)
             .map(|e| e.cost)
     }
 
@@ -941,4 +975,16 @@ fn effective(cap: &Capability, edge: &Cost, by: Metric) -> u64 {
         Metric::Hops => edge.hops as u64,
         Metric::Energy => edge.energy as u64,
     }
+}
+
+/// The kernel's graph. Filled at boot by [`super::graph_build::build`].
+static mut GRAPH: Graph = Graph::new();
+
+/// # Safety
+/// Built once at boot before any secondary runs and read-only afterwards, so there is no
+/// lock on the read path. A caller that mutates it after boot breaks that.
+#[allow(clippy::mut_from_ref)]
+pub unsafe fn graph() -> &'static mut Graph {
+    // SAFETY: the caller's contract, above.
+    unsafe { &mut *core::ptr::addr_of_mut!(GRAPH) }
 }

@@ -1,7 +1,8 @@
 //! ACPI + PVH discovery (x86-64). The memory map comes straight from the
 //! PVH `hvm_start_info` the bootloader handed us; the ACPI RSDP address in
 //! that same struct leads to the XSDT and from there to the MADT (CPU
-//! list), MCFG (PCIe ECAM base), and SRAT (NUMA affinities).
+//! list), MCFG (PCIe ECAM base), SRAT (NUMA affinities), and SLIT (the
+//! node-to-node distance matrix - docs/RESOURCE-GRAPH.md 2.4).
 //!
 //! Physical addresses are read through the kernel's high linear map
 //! (`arch::phys_to_virt`; docs/MEMORY.md) - the MMU is on before discovery
@@ -109,6 +110,7 @@ fn walk_sdt(sdt: u64, is_xsdt: bool, inv: &mut Inventory) {
             b"APIC" => parse_madt(table, inv),
             b"MCFG" => parse_mcfg(table, inv),
             b"SRAT" => parse_srat(table, inv),
+            b"SLIT" => parse_slit(table, inv),
             b"NFIT" => parse_nfit(table, inv),
             b"DMAR" => parse_dmar(table, inv),
             _ => {}
@@ -311,4 +313,55 @@ fn apply_mem_node(inv: &mut Inventory, base: u64, size: u64, node: u8) {
         }
         i += 1;
     }
+}
+
+/// SLIT -> the node-to-node distance matrix (ACPI 5.2.17).
+///
+/// Layout: the standard 36-byte table header, then a `u64` locality count, then
+/// `count * count` bytes of relative distances in row-major order. ACPI defines 10 as
+/// "local" and forbids anything below it, so a stored 0 unambiguously means **not
+/// reported** - which is what lets a caller tell a missing distance from a real one without
+/// a second flag.
+///
+/// This is what turns "same node or not" into a *distance*, which is the difference between
+/// a two-node fallback and an eight-node-across-two-sockets fallback being the same code
+/// (docs/RESOURCE-GRAPH.md 1).
+///
+/// **Refuses rather than truncates.** A machine with more localities than
+/// [`super::MAX_DIST_NODES`] keeps its nodes and loses only its distances: the matrix is
+/// left empty and `slit_truncated` is set. A partly-filled matrix would be worse than none,
+/// because a caller would read a real answer for some pairs and a fabricated one for the
+/// rest, with nothing to tell them apart.
+fn parse_slit(base: u64, inv: &mut super::Inventory) {
+    let len = rd32(base + 4) as usize;
+    // Header (36) + the locality count (8). A table shorter than that is malformed.
+    if len < 44 {
+        return;
+    }
+    let count = rd64(base + 36) as usize;
+    if count == 0 {
+        return;
+    }
+    if count > super::MAX_DIST_NODES {
+        inv.slit_truncated = true;
+        return;
+    }
+    // Every byte the header claims must actually be there, or the matrix is short and the
+    // tail would read whatever follows the table.
+    if len < 44 + count * count {
+        return;
+    }
+    for from in 0..count {
+        for to in 0..count {
+            let d = rd8(base + 44 + (from * count + to) as u64);
+            // Below ACPI's local value is not a distance. Storing it would make the "0 means
+            // unreported" contract meaningless.
+            if d >= 10 {
+                inv.dist[from][to] = d;
+            }
+        }
+    }
+    // A count above what SRAT described is legitimate - firmware may describe localities
+    // with no memory or CPUs yet - so the node count rises to whichever is larger.
+    inv.nnodes = inv.nnodes.max(count);
 }

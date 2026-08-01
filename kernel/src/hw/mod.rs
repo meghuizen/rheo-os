@@ -21,6 +21,7 @@ pub mod block;
 pub mod fdt;
 pub mod gpu;
 pub mod graph;
+pub mod graph_build;
 pub mod iommu;
 pub mod nvme;
 pub mod pci;
@@ -32,6 +33,15 @@ pub mod virtio_net;
 use crate::arch;
 
 pub const MAX_CPUS: usize = 64;
+
+/// Memory-locality ceiling for the **distance matrix** only.
+///
+/// Not a limit on nodes - `nnodes` is whatever firmware reports. It bounds the SLIT matrix
+/// this Inventory carries, and a machine with more localities than this keeps its nodes and
+/// loses only its *distances*, degrading to "everything equally near" with the loss reported
+/// (`slit_truncated`) rather than to a wrong answer. 8 covers a four-socket machine with
+/// HBM and CXL localities beside DDR.
+pub const MAX_DIST_NODES: usize = 8;
 pub const MAX_MEM_REGIONS: usize = 24;
 pub const MAX_NUMA_NODES: usize = 8;
 pub const MAX_PCI_DEVICES: usize = 48;
@@ -170,6 +180,15 @@ pub struct Inventory {
     pub nmem: usize,
     pub mem: [MemRegion; MAX_MEM_REGIONS],
     pub nnodes: usize,
+    /// SLIT node-to-node distances, `dist[from][to]`, ACPI's relative units where 10 is
+    /// "local". 0 means "not reported", which is distinguishable from any real distance
+    /// because SLIT forbids a distance below 10.
+    pub dist: [[u8; MAX_DIST_NODES]; MAX_DIST_NODES],
+    /// True when firmware reported distances for more localities than `MAX_DIST_NODES`
+    /// holds. The matrix is then **not** used, because a partly-filled distance matrix is
+    /// worse than none: a caller would read a real answer for some pairs and a fabricated
+    /// one for others (docs/ENGINEERING.md 11 - a field left constant is a field that lies).
+    pub slit_truncated: bool,
     pub ecam_base: u64,
     /// VT-d remapping-hardware register base (first DRHD in the ACPI DMAR
     /// table), 0 if no IOMMU was discovered (docs/GPU-HARDWARE.md 4).
@@ -199,6 +218,8 @@ impl Inventory {
                 node: 0,
             }; MAX_MEM_REGIONS],
             nnodes: 0,
+            dist: [[0; MAX_DIST_NODES]; MAX_DIST_NODES],
+            slit_truncated: false,
             ecam_base: 0,
             iommu_base: 0,
             npci: 0,

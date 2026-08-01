@@ -54,7 +54,18 @@ impl<T: Copy> Funded<T> {
         if index >= CAP_LIMIT {
             return false;
         }
-        while index >= self.slots.len() {
+        // **Page-granular growth, and this is the fix for a bug the shim was hiding.** The
+        // kernel's `Funded` grows by a whole frame of elements, so an under-filled table has
+        // ZEROED SLACK after the last written slot. Growing element-by-element - which the
+        // first version of this shim did, because it was convenient - left no slack at all,
+        // so an "empty" marker that was not the zero pattern read as valid data in the
+        // kernel and as nothing here. A two-node machine reported 512 edges on the real
+        // thing while this driver passed.
+        //
+        // A shim may be simpler than what it stands in for; it may not be *kinder*.
+        let page = 64usize;
+        let want = ((index / page) + 1) * page;
+        while self.slots.len() < want {
             self.slots.push(unsafe { std::mem::zeroed() });
         }
         self.set(index, value)

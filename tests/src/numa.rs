@@ -82,10 +82,12 @@ extern "C" fn kernel_main() -> ! {
 
     if inv.nnodes < 2 {
         single_node(inv);
+        graph_degraded();
         println!("numa: PASS");
         arch::exit(arch::ExitCode::Success)
     }
     numa_two_nodes(inv);
+    graph_distances(inv);
     println!("numa: PASS");
     arch::exit(arch::ExitCode::Success)
 }
@@ -347,4 +349,126 @@ fn single_node(inv: &hw::Inventory) {
     frames::free(pa);
     assert!(frames::used_matches_bitmap());
     println!("numa: single-node path unchanged (alloc_on degenerates to alloc)");
+}
+
+/// The **resource graph's distances**, asserted against the numbers the *launch* named
+/// (docs/RESOURCE-GRAPH.md 5).
+///
+/// The oracle is `xtask`'s `-numa dist,src=,dst=,val=` arguments, which is the same
+/// discipline the rest of this kernel uses: assert against what the launch declared, never
+/// against the code's own tables, because a parser compared with itself is self-consistent
+/// and can still be wrong.
+///
+/// Four claims:
+///
+/// 1. A memory locality exists as a graph node for every locality firmware reported.
+/// 2. `cost(n, n)` is `LOCAL` - which SLIT's own local value of 10 corroborates.
+/// 3. `cost(0, 1)` carries the **declared** distance, in ACPI's relative units, in `hops`.
+/// 4. Latency and bandwidth are **0 = unknown**, because SLIT does not report them. HMAT
+///    does and is not parsed; claiming them here would fabricate the two fields a caller is
+///    most likely to rank by, which is the failure the whole graph exists to avoid.
+fn graph_distances(inv: &hw::Inventory) {
+    use kernel::hw::graph::{self, NodeKind, Source};
+    // SAFETY: built at boot; read-only here, single-threaded.
+    let g = unsafe { graph::graph() };
+
+    let a = g
+        .find(NodeKind::MemoryNode, 0)
+        .expect("locality 0 is not a graph node");
+    let b = g
+        .find(NodeKind::MemoryNode, 1)
+        .expect("locality 1 is not a graph node");
+
+    let local = g.cost(a, a).expect("a locality has no cost to itself");
+    assert_eq!(
+        local,
+        graph::Cost::LOCAL,
+        "a node to itself is not LOCAL - every locality-aware decision starts from this"
+    );
+
+    let across = g
+        .cost(a, b)
+        .expect("no distance between locality 0 and 1 - SLIT was not parsed");
+    // The oracle: xtask launches this kernel with `-numa dist,src=0,dst=1,val=20`.
+    const DECLARED: u8 = 20;
+    assert_eq!(
+        across.hops, DECLARED,
+        "the graph reports distance {} between nodes 0 and 1; the launch declared {DECLARED}",
+        across.hops
+    );
+    // And the reverse direction, because edges are directed and SLIT is not required to be
+    // symmetric - so a builder that recorded only one direction must fail here.
+    let back = g
+        .cost(b, a)
+        .expect("no distance from locality 1 back to 0 - only one direction was recorded");
+    assert_eq!(back.hops, DECLARED, "the reverse distance disagrees");
+
+    assert_eq!(
+        (across.latency_ns, across.bandwidth_mbs),
+        (0, 0),
+        "the graph claims a latency or bandwidth SLIT does not report - HMAT is not parsed, \
+         so these must read as unknown rather than as a fabricated number"
+    );
+    // ACPI on x86-64 via SLIT, the device tree on riscv64 via `numa-distance-map-v1`. The
+    // assertion is that the graph names the source it actually read from - not which one,
+    // since that is a property of the machine.
+    assert!(
+        matches!(g.source(), Source::Acpi | Source::DeviceTree),
+        "distances were recorded but the source reads {:?}",
+        g.source()
+    );
+    assert!(
+        !inv.slit_truncated,
+        "SLIT was truncated on a {}-node machine",
+        inv.nnodes
+    );
+    println!(
+        "numa: THE RESOURCE GRAPH CARRIES REAL DISTANCES - {} nodes, {} edges, and \
+         cost(0,1).hops == {} which is exactly what the launch declared with \
+         `-numa dist,val={}`; cost(n,n) is LOCAL; latency and bandwidth read 0 because SLIT \
+         does not report them and HMAT is not parsed, so nothing is fabricated; source={:?} OK",
+        g.node_count(),
+        g.edge_count(),
+        across.hops,
+        DECLARED,
+        g.source()
+    );
+}
+
+/// The **degraded** case, asserted rather than assumed: a machine whose firmware describes
+/// no localities must answer "everything is equally near" and must say so.
+///
+/// This is the half that keeps the feature honest. Without it, "topology landed" could
+/// quietly alter a machine that has none - which is the rule the NUMA work already follows
+/// and the reason ARM64 reaches this path here (no firmware describes memory to a bare-ELF
+/// `virt` boot, checked rather than assumed).
+fn graph_degraded() {
+    use kernel::hw::graph::{self, NodeKind, Source};
+    // SAFETY: as above.
+    let g = unsafe { graph::graph() };
+    let only = g
+        .find(NodeKind::MemoryNode, 0)
+        .expect("even a single-locality machine must have one memory node");
+    assert_eq!(
+        g.cost(only, only),
+        Some(graph::Cost::LOCAL),
+        "a single locality is not local to itself"
+    );
+    assert_eq!(
+        g.source(),
+        Source::None,
+        "a graph with no distances claims a firmware source it did not read from"
+    );
+    assert_eq!(
+        g.edge_count(),
+        0,
+        "a machine with one locality has {} distance edges",
+        g.edge_count()
+    );
+    println!(
+        "numa: the graph DEGRADES HONESTLY - one locality, {} nodes, 0 distance edges, \
+         source=None, and cost(n,n) is LOCAL, so 'everything is equally near' is the answer \
+         rather than a fabricated matrix OK",
+        g.node_count()
+    );
 }

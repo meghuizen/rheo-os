@@ -34,6 +34,10 @@ pub fn init() {
     // before any firmware table has been read, so the question is unanswerable there
     // (docs/SUBSTRATE.md pillar 6).
     crate::mm::frames::init_numa(crate::hw::inventory());
+    // The resource graph, from the same inventory and for the same reason it is here rather
+    // than in `arch::init` (docs/RESOURCE-GRAPH.md). Additive: nothing reads it yet, so a
+    // boot that ignores it behaves exactly as it did.
+    crate::hw::graph_build::build(crate::hw::inventory());
     crate::rng::init();
     crate::svc::init();
     // Pre-fund every cell's recorded address-space layout, so the frames its table
