@@ -12,6 +12,15 @@ The design lives in `docs/` and is the source of truth. Read
 `docs/ARCHITECTURE.md` first; `docs/BUILD-ORDER.md` says what gets built in
 what order; `docs/DEVELOPMENT.md` covers the day-to-day mechanics.
 
+**`docs/GREENFIELD.md` is the design rationale** - the answer to "how would you build
+an OS today, knowing everything the last fifty years produced, including the good ideas
+that never shipped". It carries the lineage already implemented, ten unlanded research
+ideas judged one at a time against three tests (does it beat what we have, does it fit or
+fight, can it be proven here), a refusals table with reasons, and a ranked list of what it
+changes. Read it to understand *why* the design is shaped as it is, and before proposing
+anything that adds a kernel object - the exercise's own result is that none of the ten
+needed one.
+
 **`docs/EXECUTION-MODEL.md` is the execution framework** - what a thread, a
 process, a task and a CPU each are here, drawn as a hierarchy and as a
 dependency graph, with the information budget each carries, the defaults a cell
