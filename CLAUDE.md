@@ -1998,6 +1998,26 @@ tree**". **That phase alone does not prove the lock load-bearing** - forcing `pl
 return `PGuard::Off` still passes on all three ISAs, because `chello` barely touches the
 registries and TCG interleaves coarsely - **but the fixture that closes it now exists**, below.
 
+**And the Node/Bun/Claude-Code load path runs off the boot CPU** (docs/SMP.md 10.0e): the
+other Linux multi-core phases run static binaries out of the kernel image, while the real
+workloads stream off a live ext4 disk, have `ld.so` map `libc.so.6` with file-backed `mmap`,
+and take every page by fault - so "can those run on a secondary" is a question about **that
+load path**, askable with `dhello` (the 20 KB dynamic hello `linuxdyn` proves on the primary)
+for a fraction of their size. Proven on **all three ISAs**: `dhello` is loaded off the live
+`dyn-disk.img` and run as a Linux cell **on a secondary**, overlapping a static `chello` on
+the primary, exact transcript and exit 12 asserted, with ~576 block-cache fills *during the
+run* - so its interpreter and libc really came off the device on demand from that core.
+Exercised off the boot CPU: virtio-blk, the bounded block cache, `ext4plus` path resolution,
+`PT_INTERP` + the ELF interpreter, file-backed `MAP_PRIVATE`/`MAP_FIXED`, and demand paging,
+with the faults taken on a secondary's trap path using its own kernel stack. It uses
+`run_cells_on_both` (a **named** cell to a secondary) rather than `place_cells` (where which
+core takes which is a race), and that was not cosmetic: the first version used `place_cells`
+and asserted only that the cells landed on *different* cores - the run put the dynamic cell on
+the **primary**, so the assertion passed while its own message was false. Honest about the
+distance: this says the load path works off the boot CPU; it does **not** run Bun or Claude
+Code there (99 MB and 275 MB, JIT arenas behind the W^X exception, worker contexts - none of
+it touched). What it removes is doubt about the mechanism underneath them.
+
 **And a Linux cell FORKS off the boot CPU** (docs/SMP.md 10.0c) - the other half of that
 question. `fork` creates a **new cell**, and an unclaimed cell is pickable by every core
 (`cell_on_this_cpu` treats `NO_CPU` as pickable, which is what keeps single-core boots
@@ -2887,7 +2907,10 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               HAMMERING THE GLOBAL REGISTRIES** - `regstress`, 256 rounds each of
               pipe + eventfd create/use/free on two cores, every value keyed on the
               caller's pid, whose control DOES fire: `plock` off gives
-              `regstress FAIL 5`, docs/SMP.md 10.0d), shell-smoke, hwinfo, rng, runtime
+              `regstress FAIL 5`, docs/SMP.md 10.0d; and a **DYNAMIC cell off a
+              LIVE ext4 DISK on a SECONDARY** - the Node/Bun/Claude-Code load path
+              (block device, ext4, PT_INTERP, file-backed mmap, demand paging)
+              proven off the boot CPU, docs/SMP.md 10.0e), shell-smoke, hwinfo, rng, runtime
               (the strand runtime, closing with the **measured** concurrency /
               async / sync phases: 256 strands in flight with every round a
               permutation, 63 I/O ops outstanding at one instant with one

@@ -237,6 +237,34 @@ fn fixed_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
         // and `execve`d. Same two transports as blockfs. If the image is a
         // placeholder (no e2fsprogs/toolchain), the test detects a non-ext4 disk
         // and skips phase 3.
+        // linuxsmp's disk phase (docs/SMP.md 10.0e): the same `dyn-disk.img` linuxdyn
+        // uses, so a *dynamically linked* Linux cell can be loaded off a live ext4 disk
+        // and placed on a **secondary** core. That exercises the whole load path Node,
+        // Bun and Claude Code depend on - block device, ext4, ld.so, file-backed mmap,
+        // demand paging - from a core that is not the boot CPU, at a fraction of their
+        // size.
+        ("linuxsmp", Arch::Riscv64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-drive",
+            "file=tests/linux-fixtures/build/riscv64/dyn-disk.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-device,drive=blk0",
+        ],
+        ("linuxsmp", Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-drive",
+            "file=tests/linux-fixtures/build/aarch64/dyn-disk.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-device,drive=blk0",
+        ],
+        ("linuxsmp", Arch::X86_64) => &[
+            "-drive",
+            "file=tests/linux-fixtures/build/x86_64/dyn-disk.img,if=none,id=blk0,format=raw",
+            "-device",
+            "virtio-blk-pci,drive=blk0,disable-legacy=on",
+        ],
         ("linuxdyn", Arch::Riscv64) => &[
             "-global",
             "virtio-mmio.force-legacy=false",

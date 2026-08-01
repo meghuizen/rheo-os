@@ -1259,6 +1259,35 @@ serialised under genuine concurrent load. It is still one big lock, so it serial
 whole dispatch rather than only the tables - the finer per-cell locking 10.2 describes, which
 is what threads of *one* Linux cell on several cores would need, is not built.
 
+### 10.0e The Node/Bun/Claude Code load path, off the boot CPU
+
+The three phases above run static-glibc binaries out of the kernel image. The real workloads
+do none of that: `node`, `bun` and `claude` stream off a live ext4 disk, their `ld.so` maps
+`libc.so.6` and friends with file-backed `mmap`, and every page arrives by fault. So "can
+those run on a secondary" is really a question about **that load path**, and it can be asked
+with `dhello` - the same 20 KB dynamic hello `linuxdyn` proves on the primary - for a fraction
+of their size and time.
+
+**Proven** (`linuxsmp`, all three ISAs): `dhello` is loaded off the live `dyn-disk.img` and run
+as a Linux cell **on a secondary**, overlapping a static `chello` on the primary, with its
+exact transcript and exit 12 asserted and ~576 block-cache fills *during the run* - so its
+interpreter and libc really came off the device, on demand, from that core. Exercised off the
+boot CPU: the virtio-blk driver, the bounded block cache, `ext4plus` path resolution,
+`PT_INTERP` + the ELF interpreter, file-backed `MAP_PRIVATE`/`MAP_FIXED`, and demand paging -
+with the faults taken on a secondary's trap path using that core's own kernel stack.
+
+It uses `run_cells_on_both`, which hands a **named** cell to a secondary, rather than
+`place_cells`, where which core takes which is a race. That distinction was not cosmetic: the
+first version used `place_cells` and asserted only that the two cells landed on *different*
+cores, and the run put the dynamic cell on the **primary** - the assertion passed while the
+claim in its own message was false. "The dynamic cell ran off the boot CPU" has to be the
+deterministic form.
+
+**Honest about the distance this closes.** It says the load path works off the boot CPU. It
+does **not** run Bun or Claude Code there: those are 99 MB and 275 MB, they bring up JIT
+arenas behind the W^X exception, and they spawn worker contexts - none of which this touches.
+What it removes is doubt about the mechanism underneath them.
+
 ### 10.1 The measured motivation (not a wish)
 
 The cooperative single-CPU scheduler switches to another context **only when the

@@ -104,6 +104,7 @@ extern "C" fn kernel_main() -> ! {
     test_four_linux_cells();
     test_linux_fork_across_cores();
     test_registry_stress_two_cores();
+    test_dynamic_cell_on_secondary();
 
     println!("linuxsmp: PASS");
     arch::exit(arch::ExitCode::Success)
@@ -533,6 +534,190 @@ fn test_linux_fork_across_cores() {
              reschedule could not see it, and the affinity test was consulted and \
              refused {skips} time(s) (docs/SMP.md 10.2) OK",
             out[0].1, out[1].1
+        );
+    }
+}
+
+// ------------- a DYNAMICALLY LINKED Linux cell off a LIVE DISK, on a SECONDARY core
+//
+// The three phases above run static-glibc binaries out of the kernel image. Node, Bun and
+// Claude Code do none of that: they stream off a live ext4 disk, their `ld.so` maps
+// `libc.so.6` and friends with file-backed `mmap`, and every page arrives by fault. So
+// "can those run on a secondary" is really a question about that load path, and it can be
+// asked with `dhello` - the same 20 KB dynamic hello `linuxdyn` proves on the primary -
+// for a fraction of their size and time.
+//
+// What this exercises from a core that is not the boot CPU: the virtio-blk driver, the
+// bounded block cache, `ext4plus` path resolution, `PT_INTERP` + the ELF interpreter,
+// file-backed `MAP_PRIVATE`/`MAP_FIXED`, and demand paging - the whole of it, driven by a
+// cell whose faults are taken on a secondary's trap path with that core's own kernel stack.
+//
+// A `chello` cell runs beside it so placement has two cells to spread, and the phase
+// asserts the two landed on **different** CPUs - which is what makes at least one of them a
+// secondary. Asserting a specific CPU would be asserting a race; asserting *different* is a
+// property the claim genuinely needs.
+//
+// Honest about the distance this does and does not close: it says the load path works off
+// the boot CPU. It does not run Bun or Claude Code there - those are 99 MB and 275 MB, they
+// bring up JIT arenas behind the W^X exception, and they spawn worker contexts, none of
+// which this touches. What it removes is the doubt about the mechanism underneath them.
+
+/// `dhello`'s exact transcript and exit, as `linuxdyn` asserts them on the primary.
+const DHELLO_OUT: &[u8] = b"hello from dynamic glibc\n";
+const DHELLO_EXIT: u64 = 12;
+
+static mut KSTACK_DYN: [KernelStack; 2] = [const { KernelStack::new() }; 2];
+
+/// The block-cache-backed ext4 source, as `linuxdyn` wires it.
+struct Cached(kernel::hw::block::BlockCache<kernel::hw::virtio_blk::VirtioBlk>);
+impl posix::BlockSource for Cached {
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<(), posix::Errno> {
+        self.0.read_at(off, buf).map_err(|_| posix::Errno::Io)
+    }
+}
+
+fn test_dynamic_cell_on_secondary() {
+    if smp::online_count() < 2 {
+        println!("linuxsmp: SKIP the disk phase - one core online");
+        return;
+    }
+    let Some(dev) = kernel::hw::virtio_blk::probe() else {
+        println!(
+            "linuxsmp: SKIP the disk phase on {} - no virtio-blk disk attached",
+            arch::NAME
+        );
+        return;
+    };
+    let disk = match ext4fs::Ext4Fs::new(alloc::boxed::Box::new(Cached(
+        kernel::hw::block::BlockCache::new(dev),
+    ))) {
+        Ok(fs) => fs,
+        Err(_) => {
+            println!(
+                "linuxsmp: SKIP the disk phase on {} - the disk holds no ext4 image \
+                 (placeholder; no e2fsprogs at build time)",
+                arch::NAME
+            );
+            return;
+        }
+    };
+
+    posix::reset();
+    posix::mount::mount("/", alloc::rc::Rc::new(disk));
+    kernel::svc::set_file_ops(vfs_personality::ops());
+
+    // The program's own bytes come off the disk here; its **interpreter and libraries**
+    // are opened and mmapped by `ld.so` from the same disk, on whichever core runs the
+    // cell - which is the part this phase is about.
+    let img = match posix::fs::read("/bin/dhello") {
+        Ok(b) => b,
+        Err(_) => {
+            println!("linuxsmp: SKIP the disk phase - /bin/dhello not on the disk");
+            return;
+        }
+    };
+
+    let fills_before = kernel::hw::block::cache_fills();
+    // SAFETY: single-threaded setup on the primary; the secondaries claim nothing until
+    // `place_cells` publishes the queue, and every static outlives the run.
+    unsafe {
+        let objects = &mut *core::ptr::addr_of_mut!(OBJECTS2);
+        let caps = &mut *core::ptr::addr_of_mut!(CAPS2);
+        *objects = ObjectTable::new();
+        *caps = CapTable::new();
+
+        user::reset();
+        ktimer::reset();
+        idle::reset();
+
+        let mut aspace = [
+            kernel::mm::AddressSpace::new(50),
+            kernel::mm::AddressSpace::new(51),
+        ];
+        let mut frame: [core::mem::MaybeUninit<kernel::arch::TrapFrame>; 2] =
+            [const { core::mem::MaybeUninit::uninit() }; 2];
+        // **Cell 1 is the dynamic one, and cell 1 is the secondary's.** `run_cells_on_both`
+        // hands a *named* cell to a secondary, unlike `place_cells` where which core takes
+        // which is a race - and "the dynamic cell ran off the boot CPU" is the claim, so it
+        // has to be the deterministic form. Cell 0 (the static hello) runs on the primary
+        // so the two genuinely overlap.
+        let images: [&[u8]; 2] = [CHELLO, &img];
+        let argv: [&[u8]; 2] = [b"chello", b"dhello"];
+        let envs: [&[&[u8]]; 2] = [&[], &[b"LD_LIBRARY_PATH=/lib", b"PATH=/bin"]];
+        for i in 0..2 {
+            let li = kernel::load::load_elf_linux(images[i], &mut aspace[i]).expect("load image");
+            let sp = kernel::linux::stack::setup_stack(&mut aspace[i], &li, &[argv[i]], envs[i]);
+            frame[i].write(arch::trapframe_new(
+                li.entry,
+                sp,
+                0,
+                (*core::ptr::addr_of!(KSTACK_DYN))[i].top(),
+            ));
+            user::install(
+                i,
+                &aspace[i],
+                caps,
+                objects,
+                core::ptr::addr_of!(QP_L) as *const kernel::queue::QueuePair,
+                frame[i].as_mut_ptr(),
+            );
+            user::set_personality(i, user::Personality::Linux);
+            kernel::linux::install_cell(i, &li, b"");
+        }
+
+        STDOUT_LEN = [0; CAP_CELLS];
+        kernel::linux::set_stdout_tap(Some(tap));
+        // SAFETY: both installed, present, distinct, Linux cells with no process tree.
+        let (met, finished, sec_code, own_code) = smp::run_cells_on_both(0, 1);
+        kernel::linux::set_stdout_tap(None);
+
+        if !finished {
+            println!(
+                "linuxsmp: SKIP the disk phase - the secondary did not finish its cell \
+                 inside the bound, so nothing about the load path off the boot CPU is \
+                 claimed"
+            );
+            return;
+        }
+        assert!(
+            met && !smp::rendezvous_timed_out(),
+            "the two cores never met, so the two cells did not overlap"
+        );
+        // Cell 1 - the dynamic one - is the secondary's.
+        let got = captured(1);
+        assert!(
+            got == DHELLO_OUT,
+            "the dynamic cell on the secondary printed {:?}, not {:?}",
+            core::str::from_utf8(got),
+            core::str::from_utf8(DHELLO_OUT)
+        );
+        assert_eq!(
+            sec_code as u64, DHELLO_EXIT,
+            "the dynamic cell on the secondary exited {sec_code:#x}"
+        );
+        assert!(
+            captured(0) == CHELLO_OUT,
+            "the primary's static peer transcript"
+        );
+        assert_eq!(
+            own_code, CHELLO_EXIT,
+            "the primary's peer exited {own_code:#x}"
+        );
+        assert_eq!(user::double_entries(), 0, "two cores were inside one cell");
+        // The libraries genuinely came off the device, on demand, during the run.
+        let fills = kernel::hw::block::cache_fills() - fills_before;
+        assert!(
+            fills > 0,
+            "no device reads during the run - ld.so did not stream its libraries"
+        );
+        println!(
+            "linuxsmp: a DYNAMICALLY LINKED Linux cell ran OFF A LIVE ext4 DISK ON A \
+             SECONDARY core, overlapping a static cell on the primary - its ld.so opened \
+             and mmapped the interpreter and libc off the disk from that core, {fills} \
+             block-cache fills during the run, exact transcript and exit {DHELLO_EXIT} \
+             asserted. That is the load path Node, Bun and Claude Code depend on - block \
+             device, ext4, PT_INTERP, file-backed mmap, demand paging - proven off the \
+             boot CPU (docs/SMP.md 10.0e) OK"
         );
     }
 }
