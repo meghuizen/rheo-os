@@ -1994,10 +1994,9 @@ multi-core phase uses, one per core, each demand-paging its own copy of the same
 static-glibc binary, each synthesizing its own pid, each transcript captured separately and
 asserted **exactly**, all four exiting 9 - on **all three ISAs** with all 4 cores taking one.
 It widens `place_cells`' contract from "native" to "native **or a Linux cell with no process
-tree**". **Honest: this does not prove the lock load-bearing** - forcing `plock` to return
-`PGuard::Off`, so nothing serialises the personality at all, still passes on all three ISAs,
-because `chello` barely touches the registries and TCG interleaves coarsely; the lock's
-*necessity* needs a registry-hammering fixture that does not exist.
+tree**". **That phase alone does not prove the lock load-bearing** - forcing `plock` to
+return `PGuard::Off` still passes on all three ISAs, because `chello` barely touches the
+registries and TCG interleaves coarsely - **but the fixture that closes it now exists**, below.
 
 **And a Linux cell FORKS off the boot CPU** (docs/SMP.md 10.0c) - the other half of that
 question. `fork` creates a **new cell**, and an unclaimed cell is pickable by every core
@@ -2018,6 +2017,27 @@ the positive form, since "no double entry" would pass equally if the race never 
 entry - reverting it still passes over five runs, and the refusals counted come from the two
 *placed* cells rather than the child, because the window (the peer's exit-time scan landing
 between the child's creation and its reaping) is narrow.
+
+**And the registries are proven serialised under load** (docs/SMP.md 10.0d) - what makes
+`linux::plock` a *proven* mechanism rather than a present one. Both phases above pass with the
+lock removed, and said so; the reason is the workload, since a lock that is never contended is
+indistinguishable from no lock. `tests/linux-fixtures/regstress.c` aims at the two registries
+whose allocators are **find-a-free-slot-then-claim-it** (`linux/pipe.rs`, `linux/eventfd.rs`),
+a shape that races directly - two cores can both find the same free index and both claim it,
+leaving two processes holding one object, whose detectable consequence is not a fault but
+*someone else's bytes*. So every value it writes is keyed on its own pid and every read is
+checked against it: 256 rounds of pipe create/write/read/close and eventfd
+create/write/read/close. Two of them run on two **different** cores (asserted, so they really
+are inside the allocators together) and each reads back exactly what it wrote, on all three
+ISAs - **and the control fires**: with `plock` forced off, a cell prints `regstress FAIL 5`,
+five rounds in which it read a byte the *other* cell wrote. Honest about the reach: the global
+registries are now shown serialised under genuine concurrent load, but it is still one big lock
+over the whole dispatch - the finer per-cell locking docs/SMP.md 10.2 describes, which threads
+of *one* Linux cell across cores would need, is not built. All three Linux multi-core phases
+live in their own **`linuxsmp`** kernel (the 67th) rather than in `smp`, for a measured reason:
+each runs several static-glibc images through a full glibc startup with demand paging, and
+adding them to `smp` pushed **riscv64** past the 120 s boot budget - observed, timing out inside
+the four-cell phase before the other two ran.
 
 **And two Linux cells now run on two cores at the same time** - the same unmodified
 static-glibc binary as both cells, each transcript captured separately (the stdout tap
@@ -2839,7 +2859,13 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               `af_unix` (socketpair+fork+bind/listen/connect/accept) on one core
               beside `chello` on another, both transcripts exact, 0 double
               entries and the affinity test asserted to have refused
-              (docs/SMP.md 10.0b/10.0c) - docs/SMP.md 10.0), shell-smoke, hwinfo, rng, runtime
+              (docs/SMP.md 10.0b/10.0c) - docs/SMP.md 10.0; these three now live
+              in their own **linuxsmp** kernel, since together they pushed riscv64
+              past the 120 s budget inside `smp`, and they close with **TWO CELLS
+              HAMMERING THE GLOBAL REGISTRIES** - `regstress`, 256 rounds each of
+              pipe + eventfd create/use/free on two cores, every value keyed on the
+              caller's pid, whose control DOES fire: `plock` off gives
+              `regstress FAIL 5`, docs/SMP.md 10.0d), shell-smoke, hwinfo, rng, runtime
               (the strand runtime, closing with the **measured** concurrency /
               async / sync phases: 256 strands in flight with every round a
               permutation, 63 I/O ops outstanding at one instant with one

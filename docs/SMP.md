@@ -1184,14 +1184,18 @@ with no process tree**": such a cell's exit reaches `linux::proc`, which with no
 ends the run exactly as a native cell's does. A Linux cell that **forks, pipes or signals
 across cores** is a different question and is still not asked.
 
-**And this phase does not prove the lock is load-bearing** - tested, not assumed. Forcing
-`plock` to return `PGuard::Off`, so nothing serialises the personality at all, and the
-phase still passes on all three ISAs: `chello` is a hello-world that barely touches the
-global registries, and TCG interleaves coarsely. So the claim is exactly "N Linux cells
-across N cores produce N correct transcripts", which was unproven and now is not. The
-lock's *necessity* needs a fixture that hammers the registries - many pipes and eventfds
-in a loop - and that fixture does not exist. Stated rather than left for a reader to
-assume the control fired.
+**This phase alone does not prove the lock is load-bearing** - tested, not assumed. Forcing
+`plock` to return `PGuard::Off`, so nothing serialises the personality at all, and it still
+passes on all three ISAs: `chello` is a hello-world that barely touches the global
+registries, and TCG interleaves coarsely. So its own claim is exactly "N Linux cells across
+N cores produce N correct transcripts". **The fixture that closes it now exists** - see
+10.0d.
+
+All three Linux multi-core phases live in their own **`linuxsmp`** kernel rather than in
+`smp`, for a measured reason: each runs several static-glibc images through a full glibc
+startup with demand paging, and adding them to `smp` pushed **riscv64** past the 120 s
+boot-test budget - observed, timing out inside the four-cell phase before the other two
+ran. One kernel per concern is the tree's shape anyway; this is what forced it.
 
 ### 10.0c A Linux cell that forks off the boot CPU
 
@@ -1226,6 +1230,34 @@ passes - five runs - and the refusals counted come from the two *placed* cells r
 from the child. The window is narrow: the peer's exit-time scan has to land between the
 child's creation and its reaping. So the inheritance closes a real window that this phase
 cannot make happen on demand.
+
+### 10.0d The registries under load - what makes `plock` testable
+
+10.0b and 10.0c both pass with the personality lock removed, and said so. The reason is the
+workload: `chello` and `af_unix` start glibc, do a little, and exit, so they barely touch the
+global tables. A lock that is never contended is indistinguishable from no lock.
+
+`tests/linux-fixtures/regstress.c` is the missing workload. It aims at the two registries
+whose allocators are **find-a-free-slot-then-claim-it** (`linux/pipe.rs`, `linux/eventfd.rs`)
+- a shape that races directly, because two cores can both find the same free index and both
+claim it, leaving two processes holding one object. The detectable consequence is not a fault
+but *someone else's bytes*, so every value it writes is derived from its own pid and every
+read is checked against it: 256 rounds of pipe create/write/read/close and eventfd
+create/write/read/close, one line of output (`regstress OK`, or `regstress FAIL <n>`).
+
+**Proven** (`linuxsmp`, all three ISAs): two of these run on two different cores at once -
+asserted to be different cores, so they really are inside the allocators together - and each
+reads back exactly what it wrote, with its own exact transcript and exit 0.
+
+**And the control fires.** With `plock` forced to `PGuard::Off`, a cell prints
+`regstress FAIL 5` - five rounds in which it read a byte the *other* cell had written. That
+is the corruption named at the top of this section, produced on demand, and it is what makes
+`linux::plock` a proven mechanism rather than a present one.
+
+What that licenses, and what it does not: the personality's global registries are now shown
+serialised under genuine concurrent load. It is still one big lock, so it serialises the
+whole dispatch rather than only the tables - the finer per-cell locking 10.2 describes, which
+is what threads of *one* Linux cell on several cores would need, is not built.
 
 ### 10.1 The measured motivation (not a wish)
 

@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 66] = [
+const TEST_KERNELS: [&str; 67] = [
     "kernel",
     "substrate",
     "cap-invariants",
@@ -32,6 +32,7 @@ const TEST_KERNELS: [&str; 66] = [
     "pmem",
     "numa",
     "smp",
+    "linuxsmp",
     "shell-smoke",
     "hwinfo",
     "rng",
@@ -1513,6 +1514,12 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         // AF_UNIX (L8, docs/LINUX-COMPAT.md): socketpair+fork + bind/listen/
         // connect/accept, the `linuxunix` proof.
         ("af_unix.c", "af_unix", NO_EXTRA),
+        // The personality's GLOBAL registries under concurrent load (docs/SMP.md 10.2):
+        // pipes and eventfds allocated/used/freed in a tight loop, every value keyed on
+        // the caller's own pid so another process's bytes are detected rather than
+        // tolerated. The `smp` kernel runs two of these on two cores, which is what makes
+        // `linux::plock` testable rather than merely present.
+        ("regstress.c", "regstress", NO_EXTRA),
         // AF_INET/AF_INET6 loopback (L8-INET, docs/LINUX-COMPAT.md): TCP+UDP+epoll
         // over 127.0.0.1 and TCP over ::1, the `linuxinet` proof.
         ("inet.c", "inet", NO_EXTRA),
@@ -2359,7 +2366,7 @@ fn kernel_rustflags(arch: Arch) -> Option<&'static str> {
 /// RUSTFLAGS as the main kernel build.
 fn build_smp_kernel(arch: Arch, release: bool) -> bool {
     println!(
-        "[xtask] building the smp test kernel (kernel/smp feature) for {}",
+        "[xtask] building the smp test kernels (kernel/smp feature) for {}",
         arch.name()
     );
     let mut cmd = Command::new("cargo");
@@ -2369,6 +2376,8 @@ fn build_smp_kernel(arch: Arch, release: bool) -> bool {
         "qemu-tests",
         "--bin",
         "smp",
+        "--bin",
+        "linuxsmp",
         "--features",
         "smp",
         "--target",
