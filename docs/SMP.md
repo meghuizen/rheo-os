@@ -1355,6 +1355,49 @@ this phase, and it is the single largest lever named by the productivity goal:
 multicore throughput, per-core tuning, memory locality, and "high performance
 bun/Claude Code" all sit behind it.
 
+### 10.1a Run it against a newer emulator: what QEMU 11 found
+
+QEMU 11.0.3 was built from source in this container (three softmmu targets, libslirp built
+alongside because QEMU 7.2+ externalised it and every rheo-net proof uses `-netdev user`)
+and the x86-64 suite run against it. The reason for doing it is section 5's own thesis:
+this kernel **observes** the LAPIC access mode rather than assuming it, and QEMU 8.2's TCG
+reports no x2APIC - so *the x2APIC path had never once executed*. A fallback that is always
+taken is a fallback that has never been tested against the thing it falls back from.
+
+Predicted from reading QEMU 11's source before running it: `CPUID_EXT_X2APIC` and
+`CPUID_EXT_PCID` are in `TCG_EXT_FEATURES` and `INVPCID` is in the leaf-7 word (8.2 had
+none of the three), and `hw/riscv/riscv-iommu-pci.c` is a real device. FRED and AVX-512 are
+**still absent from TCG** and are KVM-only or unmodelled (docs/CPU-FEATURES.md 1.3).
+
+**It found a real defect immediately, and the shape is one this file has recorded three
+times already.** `lapic_probe` latched `EXTD` on the boot CPU for the first time, so
+`apic_mode()` became `X2Apic` machine-wide - and the first secondary took a **#GP at
+`RDMSR 0x802`** before it could report anything. The cause: `IA32_APIC_BASE` is a
+**per-CPU** MSR, the AP trampoline carries CR0, CR4 and EFER but not that, so a secondary
+in x2APIC mode starts with `EXTD` clear. And the very first thing a secondary does is ask
+which CPU it is - which on this ISA *is* a LAPIC access (`lapic_id()`, which in x2APIC mode
+is `RDMSR 0x802`). So the fault lands before the core has an identity to name itself with.
+
+That is the fourth instance of one pattern: **per-CPU register state that no trampoline
+sets** - after the LAPIC software-enable, CR4/EFER, and the SYSCALL MSRs. It was
+*unreachable* on 8.2 rather than absent, because the xAPIC MMIO path has no per-core enable
+to forget: the register file is memory, and memory is shared. `lapic_adopt_this_cpu()` now
+runs as the AP's first Rust action, before `secondary_trap_init` and before anything asks
+for a CPU index, and 4 CPUs come online on QEMU 11.
+
+**Still failing under QEMU 11, and not yet diagnosed:** the 4-core GEMM barrier phase
+reports that not all four online cores met inside one interval, where it passes on 8.2. It
+is a *different* failure from the one above - every phase up to and including two cells in
+user mode on two cores passes - and it is recorded here as an open question rather than
+guessed at, because the last four defects in this branch were each settled by a counter
+rather than by a story.
+
+**What this licenses, stated narrowly.** The x2APIC fix is verified in both directions: the
+#GP is gone on QEMU 11, and `smp`, `preempt`, `librheoipc` and `netwait` still pass on
+QEMU 8.2 (where the new function is a no-op by construction, since the mode is never
+`X2Apic` there). The full 210-boot matrix under QEMU 11 has **not** been run, so QEMU 8.2
+remains the reference emulator for every claim in this repository until it has.
+
 ### 10.2 The gate: an SMP-safety audit of shared `static mut` state
 
 The bring-up parks each secondary precisely because the kernel's mutable statics are

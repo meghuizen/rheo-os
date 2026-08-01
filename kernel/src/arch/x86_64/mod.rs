@@ -630,6 +630,50 @@ pub fn user_mode_init_this_cpu() {
     paging::pcid_init();
 }
 
+/// Adopt the LAPIC access mode the boot CPU settled on, **on this core**.
+///
+/// `lapic_probe` runs once on the boot CPU and records the mode globally, which is right -
+/// the mode is a property of the machine. Turning it *on* is not: `IA32_APIC_BASE` is a
+/// per-CPU MSR and the AP trampoline carries CR0, CR4 and EFER but not this, so a
+/// secondary in x2APIC mode starts with `EXTD` clear. Reading an x2APIC MSR then is a
+/// **#GP**, and the first thing a secondary does is ask which CPU it is - which on this
+/// ISA is `lapic_id()`, which in x2APIC mode is `RDMSR 0x802`. So the fault lands before
+/// the core has any identity to report it with.
+///
+/// **Found by running against QEMU 11, and unreachable before it.** QEMU 8.2's TCG
+/// reports no x2APIC, so `lapic_probe` always fell through to the xAPIC MMIO path, where
+/// there is no per-core enable to forget - the register file is memory, shared. QEMU
+/// 11.0.3 models x2APIC, the probe latches `EXTD` on the boot CPU for the first time, and
+/// the defect this omission had been hiding since SMP phase 1 became a #GP at
+/// `RDMSR 0x802` on the first secondary (docs/SMP.md, docs/CPU-FEATURES.md 1.2). It is
+/// the fourth instance of one pattern in this file: **per-CPU register state that no
+/// trampoline sets** - after the LAPIC software-enable, CR4/EFER, and the SYSCALL MSRs.
+///
+/// Idempotent, and a no-op in xAPIC mode, where the MMIO window is already mapped into
+/// every root.
+///
+/// `smp`-gated because its only caller is the AP entry: the boot CPU enables the mode as
+/// part of probing it, so there is nothing to adopt there.
+#[cfg(feature = "smp")]
+fn lapic_adopt_this_cpu() {
+    if apic_mode() != ApicMode::X2Apic {
+        return;
+    }
+    // SAFETY: kernel context; `IA32_APIC_BASE` is architectural on every x86-64.
+    unsafe {
+        let base = paging_rdmsr(MSR_APIC_BASE);
+        if base & APIC_BASE_EXTD != 0 {
+            return;
+        }
+        // The SDM forbids a disabled -> x2APIC transition, so xAPIC first, exactly as the
+        // probe does it. Keeping the two in the same shape is deliberate: they are the
+        // same hardware sequence and a divergence between them would be per-core-only,
+        // which is the hardest kind to see.
+        paging_wrmsr(MSR_APIC_BASE, base | APIC_BASE_EN);
+        paging_wrmsr(MSR_APIC_BASE, base | APIC_BASE_EN | APIC_BASE_EXTD);
+    }
+}
+
 pub fn enable_timer_irq() {
     lapic_probe();
     set_idt_gate(VEC_TIMER, timer_irq_stub as *const () as u64);
@@ -1401,6 +1445,12 @@ extern "C" fn x86_secondary_main() -> ! {
     // SYSCALL MSRs, CR0/CR4/XCR0 and GS_BASE all live in the core, not in
     // memory (docs/SMP.md 10.0). The tables' *contents* are the primary's -
     // only the descriptor a core loads and the block GS points at are its own.
+    //
+    // **This comes first, and `IA32_APIC_BASE` is the register the list above missed.**
+    // Everything below asks which CPU it is, and on this ISA that question is *itself* a
+    // LAPIC access - so the LAPIC has to be usable before the first `lapic_id()`, not
+    // after `user_init` has already placed this core's blocks by slot.
+    lapic_adopt_this_cpu();
     secondary_trap_init();
     user_init();
     crate::smp::secondary_run(lapic_id());
