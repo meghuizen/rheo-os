@@ -109,11 +109,6 @@ struct Proc {
     /// would idle the machine with work available. It is the defect the Linux side
     /// already fixed one level up with per-context `pblock` (docs/LINUX-COMPAT.md).
     vblock: [Block; user::MAX_VCORES],
-    /// Per vcore: parked - the per-vcore analogue of `state == PState::Blocked`, kept
-    /// separate from `vblock` for the same reason the cell-level pair is separate:
-    /// `wake_satisfiable` clears the *parked* flag while `complete_block` clears the
-    /// *block* later, with the woken context's address space active.
-    vparked: [bool; user::MAX_VCORES],
     /// Exit code while `Zombie` (0..=255, or `FAULT_EXIT` for a faulted child).
     code: u64,
 }
@@ -125,15 +120,40 @@ impl Proc {
             parent: -1,
             vwait: [0; user::MAX_VCORES],
             vblock: [Block::None; user::MAX_VCORES],
-            vparked: [false; user::MAX_VCORES],
             code: 0,
         }
     }
 }
 
 /// Whether vcore `v` of cell `i` is parked.
+///
+/// **Read from the entity table** (docs/EXECUTION-MODEL.md 9, E3): parked-ness is one fact and
+/// it lives on the entity beside its owner, rather than in a per-personality array that the
+/// scheduler and the personality each had to keep in step. The *reason* stays here in
+/// [`Proc::vblock`] - the table's `wake` is an index, and the detail of a wake source belongs to
+/// whoever owns the source.
 fn parked(i: usize, v: usize) -> bool {
-    procs()[i].vparked[v]
+    // SAFETY: a read of an entity this core is deciding about.
+    unsafe { crate::sched::entity::table() }
+        .get(user::entity_of(i, v))
+        .map(|e| e.state == crate::sched::entity::State::Parked)
+        .unwrap_or(false)
+}
+
+/// The wake-source index recorded on the entity when a vcore parks.
+///
+/// Nonzero for every real source, because invariant I4 is "parked with nothing that can ever
+/// wake it" and `NO_WAKE` is what that violation looks like. The values are opaque outside this
+/// module by design: the table carries *that* there is a source, this module carries *what* it
+/// is.
+fn wake_index(block: Block) -> u32 {
+    match block {
+        Block::None => crate::sched::entity::NO_WAKE,
+        Block::Wait { .. } => 1,
+        Block::Timer { .. } => 2,
+        Block::Console { .. } => 3,
+        Block::Net { .. } => 4,
+    }
 }
 
 /// Whether every **live** vcore of cell `i` is parked - the condition for the cell-level
@@ -143,9 +163,13 @@ fn parked(i: usize, v: usize) -> bool {
 /// nor runnable, and counting it as unparked would leave the cell `Runnable` with nothing
 /// to enter.
 fn all_parked(i: usize) -> bool {
-    (0..user::cell_vcores(i).max(1))
-        .filter(|&v| user::vcore_live(i, v))
-        .all(|v| parked(i, v))
+    // One implementation, in the table (E3). It differs from the loop this replaced in one
+    // case, and the table's answer is the right one: a cell whose vcores have **all exited** is
+    // *finished*, not blocked, where `.all()` over an empty set said blocked. Unreachable from
+    // the caller below - the vcore that just parked is live - and correct for any caller that
+    // is not.
+    // SAFETY: a read.
+    unsafe { crate::sched::entity::table() }.all_parked(i as u16)
 }
 
 /// The first vcore of cell `i` this CPU may enter that is not parked, preferring the
@@ -201,7 +225,6 @@ fn ensure_top(cell: usize) {
             parent: -1,
             vwait: [0; user::MAX_VCORES],
             vblock: [Block::None; user::MAX_VCORES],
-            vparked: [false; user::MAX_VCORES],
             code: 0,
         };
     }
@@ -396,7 +419,6 @@ pub fn spawn(
         parent: cur as i32,
         vwait: [0; user::MAX_VCORES],
         vblock: [Block::None; user::MAX_VCORES],
-        vparked: [false; user::MAX_VCORES],
         code: 0,
     };
     child as u64
@@ -588,7 +610,8 @@ fn park(cur: usize, block: Block) -> Option<*mut TrapFrame> {
 /// seeing it - the whole point (docs/SUBSTRATE.md pillar 3).
 fn park_vcore(cur: usize, v: usize, block: Block) -> *mut TrapFrame {
     procs()[cur].vblock[v] = block;
-    procs()[cur].vparked[v] = true;
+    // SAFETY: this core is parking the vcore it is inside.
+    unsafe { crate::sched::entity::table() }.park(user::entity_of(cur, v), wake_index(block));
     if all_parked(cur) {
         procs()[cur].state = PState::Blocked;
     }
@@ -817,7 +840,9 @@ pub fn retire_vcore(cur: usize, code: u64) -> Option<*mut TrapFrame> {
     // An exited vcore is not parked, so its slot needs clearing: `refresh_deadlines` and
     // `blocked_sources` iterate parked vcores, and a stale entry would arm a deadline for
     // a context that can never be entered.
-    procs()[cur].vparked[v] = false;
+    // `retire_vcore` above already set the entity `Exited`, which is neither parked nor
+    // runnable - so the parked flag has nowhere left to be stale. The block detail is still
+    // this module's and is cleared here.
     procs()[cur].vblock[v] = Block::None;
     procs()[cur].vwait[v] = 0;
     Some(reschedule(cur))
@@ -937,7 +962,8 @@ fn wake_satisfiable() {
         let mut woke = false;
         for v in 0..user::cell_vcores(i).max(1) {
             if parked(i, v) && satisfiable(i, v) {
-                procs()[i].vparked[v] = false;
+                // SAFETY: waking an entity whose source this core has just judged satisfiable.
+                unsafe { crate::sched::entity::table() }.wake(user::entity_of(i, v));
                 woke = true;
             }
         }

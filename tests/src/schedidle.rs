@@ -467,6 +467,58 @@ extern "C" fn kernel_main() -> ! {
         core::str::from_utf8(ord).unwrap_or("?")
     );
 
+    // ---- E3: the personality and the scheduler cannot disagree about who is parked ----
+    //
+    // Parked-ness used to be two facts: a `vparked[]` array on `nproc::Proc` and, since E1, a
+    // `state` on the entity that nothing read. Two copies of one truth is the shape that makes
+    // "a runnable sibling looks blocked" possible, and that defect has already been paid for
+    // once at the cell level (docs/SUBSTRATE.md pillar 3).
+    //
+    // In E3 the array is **gone**: `nproc::parked` reads the entity, `park`/`wake` write it, and
+    // `all_parked` is the table's own implementation. What is asserted here is what that buys -
+    // after three phases of parking on a timer, on the console and on a network wait, and waking
+    // from each, the table's own invariants hold and nothing is left parked with no way out.
+    //
+    // I4 in particular is the one this stage makes checkable: **parked with no wake source** is a
+    // state a personality-side boolean could not even express, because a bare flag carries no
+    // source. On the entity it is `state == Parked && wake == NO_WAKE`, and `check` reports it.
+    {
+        use kernel::sched::entity;
+        // SAFETY: between phases, with no core inside a cell.
+        let t = unsafe { entity::table() };
+        assert!(
+            t.check().is_none(),
+            "the entity table violates an invariant after the park/wake phases: {:?}",
+            t.check()
+        );
+        let mut parked = 0usize;
+        let mut live = 0usize;
+        for id in 0..t.capacity() {
+            let Some(e) = t.get(id) else { continue };
+            if !e.live() {
+                continue;
+            }
+            live += 1;
+            if e.state == entity::State::Parked {
+                parked += 1;
+                assert_ne!(
+                    e.wake,
+                    entity::NO_WAKE,
+                    "entity {id} is parked with no wake source - I4, and the state a \
+                     personality-side boolean could not express because a flag carries no source"
+                );
+            }
+        }
+        println!(
+            "schedidle: E3 - PARKED-NESS IS ONE FACT: after parking on a timer, on the console \
+             and on a network wait and waking from each, the entity table holds every invariant \
+             it can check, and of {live} live entities the {parked} parked ones each name a wake \
+             source. `nproc` no longer keeps its own copy - `parked` reads the entity, park/wake \
+             write it, and `all_parked` is the table's own implementation \
+             (docs/EXECUTION-MODEL.md 9, E3) OK"
+        );
+    }
+
     // ---- phase 4: the deadlock classifier ----
     //
     // The run loop's decision is: nothing runnable, and `wake_sources()` has no
