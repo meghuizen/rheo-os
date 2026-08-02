@@ -2743,6 +2743,24 @@ node**, so slot k is not cell k, and reading the class by slot told the preferen
 about the cell - looked up through `PLACE_ORIGIN` now, and honestly recorded as proven by the
 observation that produced it rather than by a control the phase can reproduce on demand.
 
+**And features are per CPU, with the AVX-512 rule made mechanical** (docs/RESOURCE-GRAPH.md
+2.4b): `CpuInfo.features` is read by each core about itself, and the machine advertises the
+**intersection** of the cores that have reported, not the union - because a thread can be
+migrated, so a feature only some cores have is a promise the machine cannot keep. That is
+exactly what Intel did with early Alder Lake's AVX-512, disabling it chip-wide rather than
+shipping a migration hazard. The union is kept beside it so "exists somewhere" stays
+distinguishable from "safe to advertise", and the graph's **per-CPU `IsaSet`** keeps each core's
+real set so a *pinned* placement can still use it - which is the other half of the rule
+("restrict placement to those cores, or do not advertise it"). Proven by `hwinfo` on all three
+ISAs under a declared divergence: the machine stops advertising the feature, the union still
+shows it, and the graph's provider query returns exactly the cores that kept it, so a placement
+following the graph cannot walk into a SIGILL. It also asserts that **a core which never started
+reports nothing rather than a copy** of the boot CPU's answer (filling it in is the tempting
+fabrication), while `smp` asserts the four cores that *do* come up read their own and agree -
+the first place a per-core read can be shown to answer about the right core. Three controls
+firing; a fourth is recorded as a non-result, because breaking either `set_isa` site alone
+changes no answer - the two are one claim and each corrects the other.
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
 proofs, and the hardware-lab performance numbers.

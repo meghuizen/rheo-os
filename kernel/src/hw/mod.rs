@@ -110,6 +110,13 @@ pub struct CpuInfo {
     pub online: bool,
     /// What kind of core this is, on a hybrid part.
     pub class: graph::CoreClass,
+    /// **This core's own** instruction-set features, as a mask over
+    /// [`arch::cpu_feature_names`]. Read by the core itself, because that is the only core
+    /// that can: CPUID answers about whoever executed it (docs/RESOURCE-GRAPH.md 2.4b).
+    ///
+    /// 0 means this core has not reported yet - distinguishable from "no features", which no
+    /// real CPU has.
+    pub features: u64,
     /// Throughput relative to the fastest core **on this host**, out of
     /// [`graph::CAPACITY_FULL`]. Every core starts at full, which is what a machine with one
     /// kind of core genuinely is.
@@ -232,6 +239,24 @@ pub struct Inventory {
     pub class_src: ClassSource,
     /// Per-CPU model id, filled by each core about itself (0 = has not reported).
     pub cpu_model: [u64; MAX_CPUS],
+    /// Features **every** reporting core has - the intersection. See [`Inventory::features_any`]
+    /// for why this, and not the union, is what the machine may advertise.
+    pub features_common: u64,
+    /// Features **some** core has - the union.
+    ///
+    /// The difference between this and [`Inventory::features_common`] is the set of features
+    /// that exist on part of the machine, and the rule for them is not a preference:
+    ///
+    /// > A feature present on some cores and not others must either restrict placement to those
+    /// > cores, or not be advertised at all.
+    ///
+    /// This is what Intel did on early Alder Lake, where AVX-512 existed only on the P-cores:
+    /// they disabled it **chip-wide** rather than ship a machine where a thread using it could
+    /// not be migrated. `CpuReport::features` therefore carries the *intersection*, so a program
+    /// that asks the machine what it can do gets an answer that stays true wherever the scheduler
+    /// puts it, while the per-CPU `IsaSet` in the graph keeps each core's real set for a
+    /// placement that is *pinned* (docs/RESOURCE-GRAPH.md 2.4b).
+    pub features_any: u64,
     /// True once two cores have reported **different** model ids. The asymmetry a machine can
     /// have that this kernel cannot name: reporting it as asymmetry is strictly better than
     /// reporting it as uniformity.
@@ -275,12 +300,15 @@ impl Inventory {
                 online: false,
                 class: graph::CoreClass::Unknown,
                 capacity: graph::CAPACITY_FULL,
+                features: 0,
                 core_id: TOPO_UNKNOWN,
                 llc_id: TOPO_UNKNOWN,
             }; MAX_CPUS],
             topo: TopoSource::None,
             class_src: ClassSource::None,
             cpu_model: [0; MAX_CPUS],
+            features_common: 0,
+            features_any: 0,
             model_divergence: false,
             nmem: 0,
             mem: [MemRegion {
@@ -329,6 +357,7 @@ impl Inventory {
                 online: false,
                 class: graph::CoreClass::Unknown,
                 capacity: graph::CAPACITY_FULL,
+                features: 0,
                 core_id: TOPO_UNKNOWN,
                 llc_id: TOPO_UNKNOWN,
             };
@@ -498,6 +527,12 @@ pub fn classify_this_cpu(cpu: usize) {
         inv.cpus[cpu].capacity = capacity;
         inv.class_src = ClassSource::Cpuid;
     }
+    // **This core's own** feature set, read by this core. `cpu_report` is a pure decode of the
+    // executing core's registers (CPUID / ID_AA64* / the device-tree ISA string), so calling it
+    // here answers about *this* CPU rather than about the machine.
+    inv.cpus[cpu].features = arch::cpu_report(inv).features;
+    recompute_feature_sets(inv);
+
     let model = arch::cpu_model_this_cpu();
     if cpu < MAX_CPUS {
         inv.cpu_model[cpu] = model;
@@ -512,6 +547,58 @@ pub fn classify_this_cpu(cpu: usize) {
             }
         }
     }
+}
+
+/// Recompute the machine-wide feature intersection and union from the cores that have reported.
+///
+/// **The intersection is what the machine advertises** (`inv.cpu.features`), and that is the rule
+/// rather than a conservative choice: a thread can be migrated to any core, so a feature only some
+/// cores have is a promise the machine cannot keep. Early Alder Lake is the precedent - AVX-512 on
+/// the P-cores only, disabled chip-wide rather than shipped as a migration hazard.
+///
+/// A core that has not reported (`features == 0`) is skipped, so a machine bringing cores up one at
+/// a time does not intersect against an empty set and advertise nothing.
+fn recompute_feature_sets(inv: &mut Inventory) {
+    let mut common = 0u64;
+    let mut any = 0u64;
+    let mut first = true;
+    for c in &inv.cpus[..inv.ncpus.min(MAX_CPUS)] {
+        if c.features == 0 {
+            continue;
+        }
+        any |= c.features;
+        if first {
+            common = c.features;
+            first = false;
+        } else {
+            common &= c.features;
+        }
+    }
+    if first {
+        return; // nothing has reported yet - leave what discovery put there
+    }
+    inv.features_common = common;
+    inv.features_any = any;
+    inv.cpu.features = common;
+}
+
+/// Declare that a CPU has exactly `features`, rather than discovering it.
+///
+/// The feature twin of [`declare_core_class`], and it exists for the same measured reason: no
+/// emulator here models a machine whose cores differ, so the rule above - *a feature some cores
+/// lack must restrict placement or not be advertised* - could not be exercised at all. QEMU builds
+/// every CPU of a machine from one model, checked in its source.
+///
+/// It recomputes the intersection, so the advertised set drops the divergent feature immediately,
+/// which is the behaviour under test.
+pub fn declare_cpu_features(cpu: usize, features: u64) {
+    let inv = inventory_mut();
+    if cpu >= MAX_CPUS {
+        return;
+    }
+    inv.cpus[cpu].features = features;
+    recompute_feature_sets(inv);
+    graph_build::refresh_cpu_classes(inv);
 }
 
 /// Declare a CPU's core class and capacity rather than discovering them.

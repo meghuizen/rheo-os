@@ -257,6 +257,34 @@ ranks *within* a host and chooses the host by some other means - and since class
 the `Cpu` node, a remote host's cores carry theirs with no new mechanism, exactly as a remote
 memory bank carries its own locality.
 
+#### Per-CPU features, and the rule the AVX-512 story wrote
+
+A core class is not an instruction set - but a hybrid part *can* differ in features, and when it
+does the consequence is not a preference:
+
+> **A feature present on some cores and not others must either restrict placement to those cores,
+> or not be advertised at all.**
+
+So `CpuInfo` carries a feature set **per CPU**, read by that core, and the inventory carries both
+the **intersection** (`features_common`) and the **union** (`features_any`). What the machine
+advertises - `inv.cpu.features`, the answer a program gets when it asks what this machine can do -
+is the **intersection**, because a thread can be migrated and a feature only some cores have is a
+promise the machine cannot keep. The union is kept beside it so the difference between "exists
+somewhere" and "safe to advertise" stays visible, and the graph's per-CPU `IsaSet` keeps each
+core's real set, so a *pinned* placement can still use what a particular core actually has.
+
+That is what Intel did: AVX-512 on early Alder Lake's P-cores only, disabled **chip-wide** rather
+than shipped as a migration hazard. Here it is mechanical rather than remembered - the
+`hwinfo` phase declares one core to lack a feature the boot CPU has and asserts the machine stops
+advertising it, the union still shows it, and the graph's provider query returns exactly the cores
+that kept it (so a placement following the graph cannot walk into a `SIGILL`).
+
+**A core that has never started reports nothing, not a copy.** `hwinfo` starts no secondaries, so
+exactly one core has ever read its own registers, and the other three carry 0 - asserted, because
+filling them with the boot CPU's answer is the tempting shortcut and it is a fabrication. The
+multi-core agreement is asserted in `smp`, where all four genuinely come up and report; that is the
+first place a per-core read can be shown to answer about the *right* core.
+
 #### Discovery, and why only a core can classify itself
 
 | Source | x86-64 | ARM64 | RISC-V |

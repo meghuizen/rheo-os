@@ -28,6 +28,7 @@ extern "C" fn kernel_main() -> ! {
 
     cpu_topology(inv);
     core_classes(inv);
+    cpu_features(inv);
 
     println!("hwinfo: PASS");
     arch::exit(arch::ExitCode::Success)
@@ -294,5 +295,158 @@ fn core_classes(inv: &hw::Inventory) {
          hybrid flag, no capacity-dmips-mhz - read out of its source), so the discovery ran and \
          found nothing, and the graph agrees with the inventory that this machine is uniform OK",
         inv.ncpus, inv.class_src
+    );
+}
+
+// ------------------- per-CPU features, and the rule the AVX-512 story wrote
+//
+// A core class is not an instruction set (docs/RESOURCE-GRAPH.md 2.4b) - but a hybrid part *can*
+// differ in features, and when it does the consequence is not a preference. Early Alder Lake had
+// AVX-512 on the P-cores only, and Intel disabled it **chip-wide** rather than ship a machine where
+// a thread using it could not be migrated. The rule that follows:
+//
+//   A feature present on some cores and not others must either restrict placement to those cores,
+//   or not be advertised at all.
+//
+// So the inventory carries a feature set **per CPU** (read by that core, because CPUID answers
+// about whoever executed it), and what the machine advertises - `inv.cpu.features` - is the
+// **intersection**. The union is kept beside it, so the difference between the two is exactly the
+// set of features that exist on part of the machine, and a caller can tell the two apart.
+//
+// Two halves, because QEMU builds every CPU of a machine from one model (checked in its source) and
+// the interesting case therefore cannot be booted:
+//
+//  1. **Discovered**: every core reports, they all agree, and the intersection equals the union
+//     equals what the machine advertises. That fails the moment a per-core read starts answering
+//     about the wrong core, which is the defect this shape is prone to.
+//  2. **Declared**: one core is declared to lack a feature the others have, and the rule is then
+//     asserted - the machine stops advertising it, the union still has it, and the graph's provider
+//     query returns exactly the cores that kept it. Restored afterwards.
+fn cpu_features(inv: &hw::Inventory) {
+    use kernel::hw::graph::{self, CapClass, IsaSet, NodeKind, Request};
+
+    // 1. Discovered. **This boot starts no secondaries**, so exactly one core has reported - and
+    // that is the first thing asserted, because the tempting shortcut is to fill every core with
+    // the boot CPU's answer. A core that has never executed an instruction has not told anyone
+    // what it can do, and saying so with 0 is what lets the intersection be computed over
+    // *reporting* cores rather than over guesses (docs/ENGINEERING.md 11). The multi-core
+    // agreement is asserted in `smp`, where the secondaries genuinely come up and report.
+    assert!(
+        inv.cpus[0].features != 0,
+        "the boot CPU reported no features of its own"
+    );
+    for c in &inv.cpus[1..inv.ncpus] {
+        assert_eq!(
+            c.features, 0,
+            "CPU id{} carries a feature set on a boot that never started it. Only a core can read \
+             its own CPUID, so anything here was copied from another core",
+            c.hw_id
+        );
+    }
+    assert_eq!(
+        inv.features_common, inv.features_any,
+        "one reporting core, and its features are not both the intersection and the union"
+    );
+    assert_eq!(
+        inv.cpu.features, inv.features_common,
+        "the machine advertises a feature set that is not the intersection of its cores'"
+    );
+
+    // 2. Declared: take a feature every core has and remove it from CPU 1 alone.
+    if inv.ncpus < 2 || inv.features_common == 0 {
+        println!("hwinfo: SKIP the feature-divergence half - it needs two cores and a feature");
+        return;
+    }
+    let bit = 1u64 << inv.features_common.trailing_zeros();
+    let kept = inv.cpus[0].features;
+    kernel::hw::declare_cpu_features(1, kept & !bit);
+
+    let after = hw::inventory();
+    let common_ok = after.features_common & bit == 0;
+    let any_ok = after.features_any & bit != 0;
+    let advertised_ok = after.cpu.features & bit == 0;
+
+    // The graph's own answer: which CPUs can run code that needs the feature?
+    // SAFETY: read-only, single-threaded, and `declare_cpu_features` has just refreshed it.
+    let g = unsafe { graph::graph() };
+    let req = Request {
+        class: CapClass::FloatSimd,
+        bytes: 0,
+        isa: IsaSet {
+            arch: graph::Arch::Unknown,
+            baseline: 0,
+            features: bit,
+        },
+        bit_exact: false,
+        detail_mask: 0,
+    };
+    // `Arch::Unknown` would filter everything out, so ask with the arch the nodes carry.
+    let arch_of = g
+        .get(g.find(NodeKind::Cpu, after.cpus[0].hw_id as u64).unwrap())
+        .unwrap()
+        .isa
+        .arch;
+    let req = Request {
+        isa: IsaSet {
+            arch: arch_of,
+            ..req.isa
+        },
+        ..req
+    };
+    let providers: usize = g.providers(&req).count();
+    let excluded_listed = g
+        .find(NodeKind::Cpu, after.cpus[1].hw_id as u64)
+        .map(|id| g.providers(&req).any(|p| p == id))
+        .unwrap_or(true);
+
+    // Restore before asserting, so a failure cannot leave a declared divergence behind.
+    kernel::hw::declare_cpu_features(1, kept);
+    let restored = hw::inventory();
+
+    assert!(
+        common_ok,
+        "a feature one core lacks is still in the intersection - the machine would advertise a \
+         promise it cannot keep for a thread the scheduler migrates"
+    );
+    assert!(
+        any_ok,
+        "the union lost a feature that one core still has, so the difference between what exists \
+         and what is safe to advertise is no longer visible"
+    );
+    assert!(
+        advertised_ok,
+        "the machine still advertises a feature only some of its cores have. That is the early \
+         Alder Lake hazard, and Intel's answer was to disable it chip-wide"
+    );
+    // **One**, and the oracle is the boot rather than the inventory: this kernel starts no
+    // secondaries, so the boot CPU is the only core that ever reported a feature set, and CPU 1
+    // has just been declared to lack this one. Counting cores whose recorded features contain the
+    // bit would ask the same data the graph was built from - self-consistency, not a check.
+    assert_eq!(
+        providers, 1,
+        "the graph offers the feature on {providers} CPUs. Only the boot CPU reported one (no \
+         secondary is started here) and CPU 1 was just declared to lack it, so exactly one core \
+         can provide it"
+    );
+    assert!(
+        !excluded_listed,
+        "the core that lacks the feature is still offered as a provider of it - a placement \
+         following that answer produces a SIGILL, which is the outcome the ISA filter exists to \
+         make impossible"
+    );
+    assert_eq!(
+        restored.cpu.features, kept,
+        "the machine was not restored after the declared divergence"
+    );
+    println!(
+        "hwinfo: PER-CPU FEATURES, AND THE MIGRATION RULE - the boot CPU reports its own set and \
+         the {} cores this boot never starts report NOTHING rather than a copy of it. With one \
+         core declared to lack a feature the boot CPU has, the machine STOPS ADVERTISING it (the \
+         intersection, not the union), the union still shows it exists, and the graph offers it on \
+         exactly the one core that kept it - the core that lacks it is not a provider, so a \
+         placement cannot follow the graph into a SIGILL. That is the early Alder Lake rule - \
+         AVX-512 on P-cores only, disabled chip-wide rather than shipped as a migration hazard - \
+         made mechanical rather than remembered OK",
+        restored.ncpus - 1
     );
 }

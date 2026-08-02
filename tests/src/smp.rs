@@ -1316,6 +1316,45 @@ fn test_hetero_placement() {
         hetero::is_hybrid(),
         "four cores declared in two tiers are not reported as hybrid"
     );
+
+    // **Every online core reported its own feature set, and they agree.** `hwinfo` can only
+    // check the boot CPU - it starts no secondaries, so nothing else has ever executed an
+    // instruction to read its own CPUID with. Here all four are up, so this is the first place
+    // the per-core read can be shown to answer about the *right* core: QEMU builds every CPU of a
+    // machine from one model (checked in its source), so a disagreement means a core read
+    // somebody else's registers, and a zero means a core never read its own
+    // (docs/RESOURCE-GRAPH.md 2.4b).
+    {
+        let inv = kernel::hw::inventory();
+        for c in &inv.cpus[..inv.ncpus] {
+            assert!(
+                c.features != 0,
+                "CPU id{} is online but reported no features of its own",
+                c.hw_id
+            );
+            assert_eq!(
+                c.features, inv.cpus[0].features,
+                "CPU id{} reports different features from the boot CPU on a machine QEMU builds \
+                 from one CPU model",
+                c.hw_id
+            );
+        }
+        assert_eq!(
+            inv.features_common, inv.features_any,
+            "four agreeing cores produced an intersection that differs from the union"
+        );
+        assert_eq!(
+            inv.cpu.features, inv.features_common,
+            "the machine advertises something other than the intersection of its cores"
+        );
+        println!(
+            "smp: all {} online cores read their OWN features and agree - the per-core read \
+             answers about the core that made it (only that core can: CPUID reports whoever \
+             executed it), and the machine advertises the INTERSECTION, which is what stays true \
+             for work the scheduler may migrate OK",
+            inv.ncpus
+        );
+    }
     hetero::reset_stats();
 
     // SAFETY: single-threaded setup on the primary; the secondaries are parked in their work loop

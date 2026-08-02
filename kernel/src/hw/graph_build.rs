@@ -49,19 +49,23 @@ pub fn build(inv: &super::Inventory) {
         g.set_locality(id, id);
     }
 
-    // One node per CPU, tagged with its locality, carrying the ISA the whole machine
-    // reports. Per-CPU feature divergence (a hybrid part) is a later refinement and would
-    // arrive here rather than anywhere else.
-    let isa = IsaSet {
-        arch: this_arch(),
-        baseline: 0,
-        features: 0,
-    };
+    // One node per CPU, tagged with its locality, carrying **that core's own** feature set
+    // (docs/RESOURCE-GRAPH.md 2.4b). Per-CPU rather than machine-wide, because on a part whose
+    // cores differ the machine-wide set is the *intersection* - what is safe to advertise to work
+    // the scheduler may migrate - while a pinned placement can still use what a particular core
+    // actually has, and only a per-CPU `IsaSet` can express both.
     for c in &inv.cpus[..inv.ncpus] {
         let Some(id) = g.add_node(NodeKind::Cpu, c.hw_id as u64) else {
             break;
         };
-        g.set_isa(id, isa);
+        g.set_isa(
+            id,
+            IsaSet {
+                arch: this_arch(),
+                baseline: 0,
+                features: c.features,
+            },
+        );
         // What kind of core it is and how fast, relative to the fastest on this host. Every
         // core reads `CAPACITY_FULL` on a machine that described no classes, which is what
         // such a machine is - they are all the fastest core there is
@@ -207,6 +211,10 @@ pub fn build(inv: &super::Inventory) {
 ///
 /// Also called by a caller that has just *declared* an asymmetry (`hw::declare_core_class`), so
 /// the graph and the inventory cannot disagree about it.
+/// **Both `set_isa` sites are one claim, not two.** Breaking either alone does not change any
+/// answer - the boot-time one is corrected by this refresh, and this one is corrected by the
+/// boot-time one for a core whose set has not changed - so a control has to break the claim rather
+/// than a site. Observed while checking exactly that.
 pub fn refresh_cpu_classes(inv: &super::Inventory) {
     // SAFETY: one writer - the primary, after bring-up or after an explicit declaration, with
     // no core inside a graph query.
@@ -214,6 +222,14 @@ pub fn refresh_cpu_classes(inv: &super::Inventory) {
     for c in &inv.cpus[..inv.ncpus] {
         if let Some(id) = g.find(NodeKind::Cpu, c.hw_id as u64) {
             g.set_core(id, c.class, c.capacity);
+            g.set_isa(
+                id,
+                IsaSet {
+                    arch: this_arch(),
+                    baseline: 0,
+                    features: c.features,
+                },
+            );
         }
     }
 }
