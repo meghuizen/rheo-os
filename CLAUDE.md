@@ -136,10 +136,34 @@ randomness device attached, by `librheoterm` (24 console bytes reach the pool on
 all three ISAs) and by `linuxproc`'s `sysx` (an unmodified static-glibc binary
 writes 64 bytes to `/dev/urandom` and the kernel asserts exactly 64 more mixed
 bytes and exactly zero more credited bits - a number the program cannot see and
-so cannot fake); eight controls observed firing, one of which earned its keep
+so cannot fake); ten controls observed firing, one of which earned its keep
 twice, since its first two versions passed - removing one jitter check let the
 next one catch the same window, and the test asserted `distinct` but not
 `longest_run` when crediting.
+
+Three more RNG items came out of a second pass over the unmerged branches.
+**Fast key erasure has two rules and only one was implemented**: the DRBG
+re-keyed on every refill (rule 1) but did not erase a byte as it was handed out
+(rule 2), so up to 256 bytes of *already-delivered* output sat in the buffer
+until the next refill and an attacker who captured the state recovered them -
+djb's recording attacker, the exact case the construction defeats. `fill_bytes`
+wipes as it copies now, `refill` wipes its whole keystream local and `reseed`
+wipes the buffer tail it abandons, word-wide where alignment allows (a per-byte
+volatile loop measured ~2x slower on bulk draws); honest limit, `Drbg` is `Copy`
+so a caller that copied the struct leaves a stale image no wipe reaches. **The
+firmware boot seed** (`/chosen/rng-seed`) is now read - device-tree platforms
+hand a kernel entropy before any device is up, `hw::fdt` captures it in the walk
+it already performs and `rng::init` absorbs it first, credited in full for the
+reason Linux credits it (a bootloader that lied had already loaded the kernel);
+QEMU's riscv64 `virt` supplies 32 bytes = 256 bits, while x86-64 and an ARM64
+bare-ELF boot have no device tree and are asserted to report it *absent*. And
+the interrupt hook's cost is **measured**, not read off the source:
+`entropy_mix_event` is **15** icount ticks against 367 for a single `rng_next_u64`
+draw and 1,422 for the locked `entropy_absorb_32B` path - ~24x cheaper than one
+draw, which is what a handler that quietly grew a lock would break. One control
+here is recorded as **self-defeating and replaced**: disabling the seed capture
+also made `rng_seed()` return `None`, so the test took its "no device tree"
+branch and passed - the same switch flipped the source and the detector.
 
 A **hardware-discovery** layer (`kernel/src/hw/`) builds one portable
 machine `Inventory` at boot: firmware source (ACPI on x86-64 via the PVH
@@ -2442,6 +2466,23 @@ docs/SMP.md 10.2 names as "`AddressSpace` mutation races a concurrent fault", wh
 per-switch flush had been covering by accident. `librheoipc` asserts the exact claim -
 **flushes < switches**, which were *equal by construction* before - observing 25 switches
 at 4 flushes, all four from real mutations; restoring the per-switch flush makes it fail.
+
+**Two more global allocators are locked** (docs/SMP.md 10.0f): re-reading the shared
+`static mut` list after `frames` was locked turned up its twin **`mm::frames_pmem`**
+(same bitmap-plus-hint read-modify-write) and **`sched::SYSTEM`**, the machine-wide
+admission ledger, which was reached through a `pub fn system() -> &'static mut
+Admission` - a `&mut` handed to every caller on every core, over a read-modify-write
+whose lost add is precisely the over-commit the ledger exists to prevent. Both are
+behind a `SpinLock` now, **unconditionally** rather than `#[cfg(feature = "smp")]`,
+and the ledger's `&'static mut` accessor is gone in favour of
+`system_admit`/`system_release`/`system_committed_ppm` so the check and the commit
+happen under one acquire. The `smp` kernel runs both cores through 4096
+admit/sample/release rounds with exact oracles (every admit succeeds, the total
+sampled *inside* the hold is always one or two holders' worth, the ledger returns to
+0 ppm) - but this is an **honest non-result**: removing the lock and running 400,000
+pairs produced zero lost updates, because the critical section is a handful of
+instructions and TCG's interleaving is far coarser, so the phase asserts the invariant
+while the lock's necessity stays argued from the structure and gated at the lab.
 
 **Honest scope:** preemption is *within* a core's own claim and rebalancing moves only
 **unstarted** cells. Migrating a *running* one was **attempted twice and reverted twice**, with four findings

@@ -303,6 +303,7 @@ fn test_secondary_bringup() {
             println!("smp: real second core on {} confirmed", arch::NAME);
             test_parallel_gemm(idx);
             test_shared_heap();
+            test_shared_ledger();
             test_vcore_identity();
             test_strands_across_vcores();
             test_loaded_multi_vcore_cell();
@@ -2036,6 +2037,136 @@ fn test_per_vcore_queues() {
             out[0].1, out[1].1
         );
     }
+}
+
+// --------------------------- TWO CORES ADMITTING AGAINST ONE LEDGER AT THE SAME TIME
+//
+// `sched::SYSTEM` is the machine-wide admission ledger (docs/ARCHITECTURE-DEBT.md 2.5):
+// every cell's reservation is charged to it, so it is genuinely global - a second core
+// races it whatever the scheduler is doing. It was a `static mut` reached through a
+// `pub fn system() -> &'static mut Admission`, which hands a `&mut` to every caller on
+// every core. Found by re-reading the globals after `frames` was locked; the same class
+// as the heap phase above, and the same inherited "single CPU today" comment.
+//
+// `admit` is a read-modify-write: read `committed_ppm`, check the sum fits, add. Two
+// cores inside it lose an update, and the damage is not a fault - it is a ledger that
+// disagrees with what is actually admitted, in either direction. A lost *add* lets the
+// machine admit more than 100% (the exact defect the ledger exists to prevent); a lost
+// *subtract* leaks utilisation until nothing can ever be admitted again.
+//
+// So both cores hammer admit -> sample -> release with the same 10% reservation, and the
+// oracles are exact rather than statistical:
+//
+//   A. every admit succeeds - two cores at 10% each can never reach 100%, so a refusal
+//      would mean the ledger had drifted upward;
+//   B. the total sampled **while this core is holding its own reservation** is always
+//      100,000 or 200,000 ppm - one or both cores holding. Anything else is a lost
+//      update, caught inside the window rather than inferred afterwards;
+//   C. the ledger returns to exactly 0 when both cores are done.
+//
+// The ledger is behind a `SpinLock` now, unconditionally, for the reason `frames` and
+// `runtime::Heap` are: whether a structure needs a lock is a property of the structure,
+// not of which cargo features are enabled.
+//
+// **Honest non-result** (docs/ENGINEERING.md 7): this phase does *not* demonstrate the
+// lock is load-bearing. Removing it and running **400,000** admit/release pairs across
+// two cores produced zero lost updates - the critical section is a handful of
+// instructions and TCG's interleaving is far coarser than that, so the window is never
+// hit here. What the phase does is assert the invariant continuously under genuine
+// two-core traffic; the lock's necessity is argued from the structure (a
+// read-modify-write on shared state, the same shape as `frames`, whose lock the
+// four-core GEMM phase *does* exercise) and is a lab claim on real hardware, where
+// out-of-order execution and true concurrency make the window reachable.
+
+/// Rounds per core.
+const LEDGER_ROUNDS: usize = 4096;
+/// The reservation each round admits: 1 of every 10 units = 100,000 ppm.
+const LEDGER_PPM: u64 = 100_000;
+
+/// Admissions that were refused. Must be zero (oracle A).
+static LEDGER_REFUSED: AtomicUsize = AtomicUsize::new(0);
+/// Samples taken inside the hold that were neither one nor two holders (oracle B).
+static LEDGER_BAD_TOTAL: AtomicUsize = AtomicUsize::new(0);
+/// Rounds completed, per core.
+static LEDGER_ROUNDS_DONE: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+
+/// One core's share: admit 10%, look at the machine total, release.
+fn ledger_hammer(slot: usize) {
+    for _ in 0..LEDGER_ROUNDS {
+        match kernel::sched::system_admit(1, 10, 10) {
+            Ok(r) => {
+                let total = kernel::sched::system_committed_ppm();
+                if total != LEDGER_PPM && total != 2 * LEDGER_PPM {
+                    LEDGER_BAD_TOTAL.fetch_add(1, Ordering::Relaxed);
+                }
+                kernel::sched::system_release(&r);
+            }
+            Err(_) => {
+                LEDGER_REFUSED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        LEDGER_ROUNDS_DONE[slot].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn ledger_hammer_primary() {
+    ledger_hammer(0);
+}
+fn ledger_hammer_secondary() {
+    ledger_hammer(1);
+}
+
+fn test_shared_ledger() {
+    kernel::sched::reset_system();
+    LEDGER_REFUSED.store(0, Ordering::Release);
+    LEDGER_BAD_TOTAL.store(0, Ordering::Release);
+    for c in LEDGER_ROUNDS_DONE.iter() {
+        c.store(0, Ordering::Release);
+    }
+
+    let (met, finished) =
+        smp::run_fn_with_secondary(ledger_hammer_secondary, ledger_hammer_primary);
+    if !finished {
+        println!(
+            "smp: SKIP the shared-ledger phase - the secondary did not finish inside the \
+             bound, so nothing about two cores in one ledger is claimed"
+        );
+        kernel::sched::reset_system();
+        return;
+    }
+    assert!(
+        met && !smp::rendezvous_timed_out(),
+        "the two cores never met, so they did not admit at the same time"
+    );
+
+    let (p, s) = (
+        LEDGER_ROUNDS_DONE[0].load(Ordering::Acquire),
+        LEDGER_ROUNDS_DONE[1].load(Ordering::Acquire),
+    );
+    assert_eq!(p, LEDGER_ROUNDS, "the primary lost rounds");
+    assert_eq!(s, LEDGER_ROUNDS, "the secondary lost rounds");
+    assert_eq!(
+        LEDGER_REFUSED.load(Ordering::Acquire),
+        0,
+        "the ledger refused a 10% reservation it had room for - it had drifted upward"
+    );
+    assert_eq!(
+        LEDGER_BAD_TOTAL.load(Ordering::Acquire),
+        0,
+        "a core holding its own 10% saw a machine total that was neither one nor two \
+         holders - an admission was lost"
+    );
+    assert_eq!(
+        kernel::sched::system_committed_ppm(),
+        0,
+        "the ledger did not return to zero after every reservation was released"
+    );
+    println!(
+        "smp: TWO CORES ADMITTED AGAINST ONE LEDGER at the same time - {} rounds each of \
+         admit/sample/release, 0 refusals, 0 impossible totals sampled from inside the \
+         hold, ledger back to 0 ppm OK",
+        LEDGER_ROUNDS
+    );
 }
 
 // ------------------------------- TWO CORES ALLOCATING FROM ONE HEAP AT THE SAME TIME

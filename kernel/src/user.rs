@@ -2123,7 +2123,7 @@ fn reserve_admit(
     // schedulable, the system ledger is what stops N cells each admitting 90% of one
     // CPU - which used to all succeed, because nothing above the per-cell controller
     // existed. On either refusal nothing is left charged.
-    let sys_res = match crate::sched::system().admit(budget, period, deadline) {
+    let sys_res = match crate::sched::system_admit(budget, period, deadline) {
         Ok(r) => r,
         Err(AdmitError::BadParams) => return 1,
         Err(AdmitError::Overcommit) => return 2,
@@ -2131,11 +2131,11 @@ fn reserve_admit(
     let res = match cell_admission(cur).admit(budget, period, deadline) {
         Ok(r) => r,
         Err(AdmitError::BadParams) => {
-            crate::sched::system().release(&sys_res);
+            crate::sched::system_release(&sys_res);
             return 1;
         }
         Err(AdmitError::Overcommit) => {
-            crate::sched::system().release(&sys_res);
+            crate::sched::system_release(&sys_res);
             return 2;
         }
     };
@@ -2148,14 +2148,14 @@ fn reserve_admit(
         let caps = &mut *cell.caps;
         let Ok(obj) = objects.create(ObjectKind::Reservation) else {
             cell_admission(cur).release(&res);
-            crate::sched::system().release(&sys_res);
+            crate::sched::system_release(&sys_res);
             return 1;
         };
         match caps.mint(objects, obj, READ, BUDGET_UNLIMITED) {
             Ok(h) => h.raw_low32(),
             Err(_) => {
                 cell_admission(cur).release(&res);
-                crate::sched::system().release(&sys_res);
+                crate::sched::system_release(&sys_res);
                 return 1;
             }
         }
@@ -2206,7 +2206,7 @@ fn reserve_release(cur: usize, cap_id: u32) -> u64 {
     let sys_res = slot.sys_res;
     slot.in_use = false;
     cell_admission(cur).release(&res);
-    crate::sched::system().release(&sys_res);
+    crate::sched::system_release(&sys_res);
     0
 }
 

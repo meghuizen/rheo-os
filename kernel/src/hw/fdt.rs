@@ -161,6 +161,16 @@ pub fn parse(dtb: usize, inv: &mut Inventory) {
                 if pname == "distance-matrix" {
                     parse_distance_matrix(p, data, len, inv);
                 }
+                // The **firmware boot seed** (`/chosen/rng-seed`): random bytes the
+                // bootloader or hypervisor put in the device tree, which is how a
+                // device-tree platform hands entropy to a kernel that has not yet
+                // brought up any device. Matched on the property name for the same
+                // reason `distance-matrix` above is - the name carries the meaning,
+                // and this walk already visits every property once
+                // (docs/TIME-IDENTITY.md 4a).
+                if pname == "rng-seed" && len > 0 {
+                    save_rng_seed(p, data, len);
+                }
                 match here {
                     NodeKind::Cpu => {
                         if pname == "reg" && len >= 4 {
@@ -242,6 +252,41 @@ fn apply_capacities(dmips: &[u32], inv: &mut Inventory) {
         };
     }
     inv.class_src = super::ClassSource::DeviceTree;
+}
+
+/// The firmware boot seed from `/chosen/rng-seed`, captured during discovery.
+/// 64 bytes is what QEMU and common bootloaders supply; a longer property is
+/// truncated, which costs nothing because the pool credits at most a full seed.
+static mut RNG_SEED: [u8; 64] = [0; 64];
+static mut RNG_SEED_LEN: usize = 0;
+
+/// The `/chosen/rng-seed` bytes, if the firmware provided any.
+pub fn rng_seed() -> Option<&'static [u8]> {
+    // SAFETY: written once during single-threaded discovery, read-only after.
+    unsafe {
+        let len = *core::ptr::addr_of!(RNG_SEED_LEN);
+        if len == 0 {
+            return None;
+        }
+        Some(core::slice::from_raw_parts(
+            core::ptr::addr_of!(RNG_SEED) as *const u8,
+            len,
+        ))
+    }
+}
+
+/// Copy the seed property out of the device-tree blob, which is not kept mapped.
+fn save_rng_seed(p: *const u8, data: usize, len: usize) {
+    // SAFETY: `data + len` is inside the blob the caller validated, and the
+    // destination is a private static written once during discovery.
+    unsafe {
+        let dst = core::ptr::addr_of_mut!(RNG_SEED) as *mut u8;
+        let n = len.min(64);
+        for i in 0..n {
+            dst.add(i).write(p.add(data + i).read());
+        }
+        *core::ptr::addr_of_mut!(RNG_SEED_LEN) = n;
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]

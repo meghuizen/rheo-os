@@ -56,6 +56,7 @@
 //! | [`Source::Cpu`] | full | RDSEED / RNDR, after the SP 800-90B health tests |
 //! | [`Source::Device`] | full | a dedicated RNG device (virtio-rng, a TPM/TRNG chip) |
 //! | [`Source::Jitter`] | 1 bit/sample | CPU execution-time jitter, **only** if its own health tests pass |
+//! | [`Source::Firmware`] | full | `/chosen/rng-seed`; a lying bootloader already loaded the kernel |
 //! | [`Source::Interrupt`] | none | NIC / NVMe / disk / UART arrival times - real but unmeasured |
 //! | [`Source::User`] | none | writes to `/dev/urandom`; exactly Linux's rule |
 //! | [`Source::Boot`] | none | the cycle-counter floor, deterministic under emulation |
@@ -114,7 +115,7 @@
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
-use super::chacha;
+use super::{chacha, wipe};
 use crate::arch;
 use crate::smp::{MAX_CPUS, SpinLock, cpu_index};
 
@@ -146,6 +147,10 @@ pub enum Source {
     /// The software-only CPU execution-time jitter source ([`super::jitter`]),
     /// health-tested before any of it is counted.
     Jitter,
+    /// The **firmware boot seed** - `/chosen/rng-seed` in the device tree, which
+    /// a bootloader or hypervisor fills from its own randomness. The only source
+    /// available before any device is up.
+    Firmware,
     /// Timing of a device event: NIC receive, NVMe/disk completion, UART byte.
     Interrupt,
     /// A program writing to `/dev/urandom`.
@@ -156,16 +161,17 @@ pub enum Source {
 
 impl Source {
     /// How many sources there are; the width of the per-source counters.
-    pub const COUNT: usize = 6;
+    pub const COUNT: usize = 7;
     /// Index into the per-source counters.
     pub fn index(self) -> usize {
         match self {
             Source::Cpu => 0,
             Source::Device => 1,
             Source::Jitter => 2,
-            Source::Interrupt => 3,
-            Source::User => 4,
-            Source::Boot => 5,
+            Source::Firmware => 3,
+            Source::Interrupt => 4,
+            Source::User => 5,
+            Source::Boot => 6,
         }
     }
     /// Human-readable, for the boot report.
@@ -174,6 +180,7 @@ impl Source {
             Source::Cpu => "cpu",
             Source::Device => "device",
             Source::Jitter => "jitter",
+            Source::Firmware => "firmware",
             Source::Interrupt => "interrupt",
             Source::User => "user",
             Source::Boot => "boot",
@@ -186,8 +193,16 @@ impl Source {
     /// its own health tests pass - which they do not on an emulated machine
     /// with a deterministic cycle counter. Being on this list is permission to
     /// count, not a claim to have something worth counting.
+    ///
+    /// [`Source::Firmware`] is credited for the reason Linux credits it: a
+    /// bootloader that lied about the seed had already loaded the kernel, so it
+    /// could have compromised the boot far more directly. Trusting it adds no
+    /// attacker who was not already inside.
     pub fn creditable(self) -> bool {
-        matches!(self, Source::Cpu | Source::Device | Source::Jitter)
+        matches!(
+            self,
+            Source::Cpu | Source::Device | Source::Jitter | Source::Firmware
+        )
     }
 }
 
@@ -519,13 +534,4 @@ fn drain_this_cpu() {
     DRAINS.fetch_add(1, Relaxed);
     absorb(Source::Interrupt, &chunk, 0);
     wipe(&mut chunk);
-}
-
-/// Overwrite a buffer, in a way the compiler may not remove.
-fn wipe(b: &mut [u8]) {
-    for x in b.iter_mut() {
-        // SAFETY: a plain write through a valid mutable reference; volatile only
-        // so it is not optimised away.
-        unsafe { core::ptr::write_volatile(x, 0) };
-    }
 }

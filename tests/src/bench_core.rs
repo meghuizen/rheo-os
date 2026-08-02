@@ -287,6 +287,31 @@ extern "C" fn kernel_main() -> ! {
         arch::doorbell_trap();
     });
 
+    // ----------------------------------------------- the entropy input pool
+    // The *feed* side, which is a different question from the draw above:
+    // what does it cost to put entropy in, rather than to take randomness out
+    // (docs/TIME-IDENTITY.md 4a).
+    //
+    // `entropy_mix_event` is the one that matters. It is what a NIC, NVMe,
+    // disk or UART interrupt handler calls on every event, and the claim made
+    // for it is "two atomic operations into this core's own scratch, no lock".
+    // Measured here rather than read off the source, because a handler that
+    // quietly grew a lock is a latency bug nothing else would catch.
+    //
+    // `entropy_absorb_32B` is the thread-context path: take the pool lock and
+    // run one 32-byte chunk through ChaCha20. It happens on a `/dev/urandom`
+    // write and once every 1024 draws, so it is allowed to be far dearer.
+    // `entropy_pool_health_64w` is the SP 800-90B batch over 64 hwrng words,
+    // paid once per seeding attempt.
+    bench("entropy_mix_event", || {
+        kernel::rng::feed_interrupt(core::hint::black_box(0x5EED_5EED_5EED_5EEDu64), 0);
+    });
+    let echunk = unsafe { &mut *core::ptr::addr_of_mut!(RNG_BUF32) };
+    drbg.fill_bytes(echunk);
+    bench("entropy_absorb_32B", || {
+        kernel::rng::entropy::absorb(kernel::rng::entropy::Source::User, echunk, 0);
+    });
+
     // ------------------------------------------------------------- P4
     // Strand spawn/teardown and context switch (docs/CONCURRENCY.md,
     // BUILD-ORDER step 7). These are the "light thread" path lengths: a

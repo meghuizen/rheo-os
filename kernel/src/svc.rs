@@ -79,9 +79,8 @@ pub fn handle(nr: u64, args: &[u64; 6]) -> Option<u64> {
         SYS_RESERVE => {
             let budget = arg >> 32;
             let period = arg & 0xFFFF_FFFF;
-            let admission = crate::sched::system();
-            match admission.admit(budget, period, period) {
-                Ok(_) => Some(admission.committed_ppm()),
+            match crate::sched::system_admit(budget, period, period) {
+                Ok(_) => Some(crate::sched::system_committed_ppm()),
                 Err(_) => Some(u64::MAX),
             }
         }

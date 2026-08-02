@@ -133,24 +133,40 @@ impl Default for Admission {
 /// controller stays because it is what makes a *cell's* own set schedulable
 /// (docs/SCHEDULING.md 4) and what `SYS_RESERVE_QUERY` reports.
 ///
-/// Single CPU today (task #27). Under SMP a reservation is admitted against a
-/// *core*, so this becomes one ledger per core plus a placement decision; the shape
-/// - admit against the resource, not against the requester - is what matters here.
-static mut SYSTEM: Admission = Admission::new();
+/// Under SMP a reservation is eventually admitted against a *core*, so this
+/// becomes one ledger per core plus a placement decision (task #27); the shape -
+/// admit against the resource, not against the requester - is what matters here.
+///
+/// It is a **truly global** static: every cell's reservation is charged here, so
+/// a second core races it whatever the scheduler is doing. It therefore lives
+/// behind a `SpinLock` and is reached only through the guarded operations below.
+/// The old `&'static mut` accessor is gone, because handing a `&mut` to two cores
+/// is unsound however careful the callers are. Unconditional, not
+/// `#[cfg(feature = "smp")]`, for the reason `frames::POOL_LOCK` is: whether a
+/// structure needs a lock is a property of the structure, not of which features
+/// are enabled.
+static SYSTEM: crate::smp::SpinLock<Admission> = crate::smp::SpinLock::new(Admission::new());
 
-/// The machine-wide admission ledger. Every reservation is charged here as well as
-/// to its own cell.
-pub fn system() -> &'static mut Admission {
-    // SAFETY: single CPU, synchronous traps; no concurrent access.
-    unsafe { &mut *core::ptr::addr_of_mut!(SYSTEM) }
+/// Admit a reservation against the machine-wide ledger (charged in addition to
+/// the caller's own per-cell controller). Atomic: the check and the commit happen
+/// under one acquire, so two cores cannot both slip past a nearly-full ledger.
+pub fn system_admit(budget: u64, period: u64, deadline: u64) -> Result<Reservation, AdmitError> {
+    SYSTEM.lock().admit(budget, period, deadline)
+}
+
+/// Release a reservation previously admitted against the machine-wide ledger.
+pub fn system_release(r: &Reservation) {
+    SYSTEM.lock().release(r);
+}
+
+/// Utilisation currently committed machine-wide, in parts per million.
+pub fn system_committed_ppm() -> u64 {
+    SYSTEM.lock().committed_ppm()
 }
 
 /// Clear the system-wide ledger (called from `user::reset`, between runs).
 pub fn reset_system() {
-    // SAFETY: single CPU, between runs.
-    unsafe {
-        *core::ptr::addr_of_mut!(SYSTEM) = Admission::new();
-    }
+    *SYSTEM.lock() = Admission::new();
 }
 
 // ------------------------------------------------------- the per-CPU run queue

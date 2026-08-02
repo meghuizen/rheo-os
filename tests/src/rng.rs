@@ -23,6 +23,7 @@ extern "C" fn kernel_main() -> ! {
     test_independence();
     test_reseed();
     test_next_u64_matches_fill();
+    test_erase_on_read();
     test_statistical_sanity();
     test_boot_health();
     // Before the phases below, which deliberately reset the pool: this one is
@@ -103,6 +104,31 @@ fn test_next_u64_matches_fill() {
         );
     }
     println!("rng: next_u64/fill_bytes consistency OK");
+}
+
+/// **Fast key erasure, rule 2**: a byte is erased from the buffer as it is
+/// handed out, so capturing the DRBG state later reveals nothing about output
+/// already delivered (cr.yp.to 2017.07.23, the recording-attacker case). Rule 1
+/// - re-key on every refill - was already implemented; this half was not, and
+/// up to 256 bytes of delivered output stayed in the buffer until the next
+/// refill.
+///
+/// Drawn in odd sizes so the spent region ends mid-word and spans a refill.
+fn test_erase_on_read() {
+    let mut d = Drbg::from_key([0x3cu8; 32]);
+    let mut buf = [0u8; 37];
+    let mut drawn = 0usize;
+    // 37 * 20 = 740 bytes, so this crosses the 256-byte buffer twice.
+    for round in 0..20 {
+        d.fill_bytes(&mut buf);
+        drawn += buf.len();
+        assert!(
+            d.spent_is_erased(),
+            "round {round}: delivered bytes still in the buffer"
+        );
+    }
+    assert!(drawn == 740);
+    println!("rng: erase-on-read OK (740 bytes drawn, spent buffer always zero)");
 }
 
 /// Output is close to unbiased: over a large buffer the set-bit fraction is
@@ -350,10 +376,11 @@ fn test_hwrng_and_seed_source() {
         c.seeded
     );
     println!(
-        "rng: credited bits cpu={} device={} jitter={} (uncredited bytes interrupt={} user={} boot={})",
+        "rng: credited bits cpu={} device={} jitter={} firmware={} (uncredited bytes interrupt={} user={} boot={})",
         c.credited[entropy::Source::Cpu.index()],
         c.credited[entropy::Source::Device.index()],
         c.credited[entropy::Source::Jitter.index()],
+        c.credited[entropy::Source::Firmware.index()],
         c.bytes[entropy::Source::Interrupt.index()],
         c.bytes[entropy::Source::User.index()],
         c.bytes[entropy::Source::Boot.index()],
@@ -368,13 +395,47 @@ fn test_hwrng_and_seed_source() {
         "a randomness device is present but the pool never reached a full seed"
     );
     assert!(
-        matches!(src, SeedSource::Hwrng | SeedSource::Device),
+        matches!(
+            src,
+            SeedSource::Hwrng | SeedSource::Device | SeedSource::Firmware
+        ),
         "seeded, but the recorded source is {src:?}"
     );
     assert!(
         c.credited[entropy::Source::Device.index()] > 0,
         "the randomness device contributed no credited bits"
     );
+
+    // The firmware boot seed, on the platforms that have one. Asserted where the
+    // device tree carries `/chosen/rng-seed` (QEMU's riscv64 `virt` does), and
+    // reported as absent where there is no device tree at all - x86-64 has none,
+    // and an ARM64 bare-ELF `-kernel` boot is handed no pointer to one.
+    match kernel::hw::fdt::rng_seed() {
+        Some(seed) => {
+            assert!(
+                seed.len() >= 8,
+                "firmware supplied a {}-byte seed - too short to be one",
+                seed.len()
+            );
+            assert!(
+                c.credited[entropy::Source::Firmware.index()] > 0,
+                "the firmware supplied {} seed bytes but none were credited",
+                seed.len()
+            );
+            println!(
+                "rng: firmware boot seed /chosen/rng-seed present ({} bytes, {} bits credited) OK",
+                seed.len(),
+                c.credited[entropy::Source::Firmware.index()]
+            );
+        }
+        None => {
+            assert!(
+                c.credited[entropy::Source::Firmware.index()] == 0,
+                "no firmware seed on this platform, but firmware bits were credited"
+            );
+            println!("rng: no device tree here, so no firmware boot seed (expected)");
+        }
+    }
 
     if arch::has_hwrng() {
         // The CPU instruction is asked first, so on an ISA that has one it is
@@ -409,8 +470,11 @@ fn test_hwrng_and_seed_source() {
     } else {
         // No CPU instruction: the device is the only credited source, and it
         // is what the report must name. This is the RISC-V case.
+        // The firmware boot seed is asked for first, so on a device-tree platform
+        // that supplies one it is what pays; otherwise the device does. Both are
+        // real sources - which one it was is reported, not assumed.
         assert!(
-            src == SeedSource::Device,
+            matches!(src, SeedSource::Device | SeedSource::Firmware),
             "no CPU hwrng and a device present, but source is {src:?}"
         );
         assert!(

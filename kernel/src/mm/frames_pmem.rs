@@ -35,6 +35,22 @@ static mut WINDOW_VA: usize = 0;
 static mut READY: bool = false;
 static mut NEXT_HINT: usize = 0;
 
+/// Serialises the mutable pmem state - the bitmap and the search hint - which
+/// one operation reads and writes together, so two cores could otherwise both
+/// see a bit clear and both claim the frame.
+///
+/// **Unconditional, not `#[cfg(feature = "smp")]`.** Whether a structure needs a
+/// lock is a property of the structure, not of which cargo features are enabled.
+/// That is the call `frames::POOL_LOCK` and the NVMe driver already made, and the
+/// lesson the `SYS_YIELD` FP defect taught: state whose safety depends on a build
+/// configuration gets written twice and diverges. An uncontended acquire is one
+/// atomic exchange, unmeasurable next to the bitmap scan.
+///
+/// `BASE_PA`/`NFRAMES`/`WINDOW_VA`/`READY` are written once by `init` before any
+/// secondary starts, so reading them needs no lock. Every acquire below is in a
+/// leaf function, so this non-reentrant lock is never taken twice on one core.
+static PMEM_LOCK: crate::smp::SpinLock<()> = crate::smp::SpinLock::new(());
+
 /// Bring up the allocator over a discovered persistent-memory region
 /// `[base_pa, base_pa + len)`. Called once from `hw::detect` when firmware
 /// surfaced a `MemKind::Pmem` region; a no-op (and left `!ready`) otherwise.
@@ -98,6 +114,7 @@ pub fn alloc() -> Option<usize> {
     if !ready() {
         return None;
     }
+    let _g = PMEM_LOCK.lock();
     let base = unsafe { *core::ptr::addr_of!(BASE_PA) };
     let n = unsafe { *core::ptr::addr_of!(NFRAMES) };
     let hint = unsafe { *core::ptr::addr_of!(NEXT_HINT) };
@@ -121,9 +138,18 @@ pub fn free(pa: usize) {
     if !contains(pa) {
         return;
     }
+    let _g = PMEM_LOCK.lock();
     let base = unsafe { *core::ptr::addr_of!(BASE_PA) };
     let frame = (pa - base) / FRAME_SIZE;
     let bitmap = unsafe { &mut *core::ptr::addr_of_mut!(BITMAP) };
+    // A live pmem frame has its bit set, so a clear bit here is a double free -
+    // which is exactly what an unserialised alloc handing one frame to two cores
+    // produces. Asserting it (as the DDR pool does) is what lets a contention
+    // proof catch a broken lock instead of silently tolerating the damage.
+    assert!(
+        bitmap[frame / 64] & (1 << (frame % 64)) != 0,
+        "pmem double free at {pa:#x}"
+    );
     bitmap[frame / 64] &= !(1 << (frame % 64));
 }
 
@@ -132,6 +158,7 @@ pub fn stats() -> (usize, usize) {
     if !ready() {
         return (0, 0);
     }
+    let _g = PMEM_LOCK.lock();
     let n = unsafe { *core::ptr::addr_of!(NFRAMES) };
     let bitmap = unsafe { &*core::ptr::addr_of!(BITMAP) };
     let used: usize = bitmap.iter().map(|w| w.count_ones() as usize).sum();

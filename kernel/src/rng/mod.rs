@@ -88,20 +88,30 @@ impl Drbg {
             ks[off..off + 64].copy_from_slice(&blk);
             ctr += 1;
             off += 64;
+            wipe(&mut blk);
         }
-        // Fast key erasure: the first 32 bytes become the new key, so the
-        // old key (and all past output) can never be recovered from the
+        // Fast key erasure rule 1: the first 32 bytes become the new key, so
+        // the old key (and all past output) can never be recovered from the
         // state that remains.
         self.key.copy_from_slice(&ks[..32]);
         self.buf.copy_from_slice(&ks[32..32 + OUT]);
         self.pos = 0;
-        // Wipe the local keystream copy of the new key.
-        for b in ks[..32].iter_mut() {
-            unsafe { core::ptr::write_volatile(b, 0) };
-        }
+        // The whole local keystream, not just the new key: the rest of it is
+        // the output buffer's contents, which rule 2 below exists to erase.
+        wipe(&mut ks);
     }
 
     /// Fill `dst` with random bytes.
+    ///
+    /// **Fast key erasure rule 2** (cr.yp.to 2017.07.23): a byte is erased from
+    /// the buffer as it is handed out, so capturing the DRBG state later reveals
+    /// nothing about output already delivered. Rule 1 (re-key every refill) is in
+    /// [`Drbg::refill`]; without rule 2 as well, up to `OUT` bytes of delivered
+    /// output sat in `buf` until the next refill.
+    ///
+    /// Honest limit: `Drbg` is `Copy`, so a caller that copied the struct leaves a
+    /// stale image these wipes cannot reach. The wipe covers the state this
+    /// generator owns.
     pub fn fill_bytes(&mut self, dst: &mut [u8]) {
         let mut i = 0;
         while i < dst.len() {
@@ -110,9 +120,17 @@ impl Drbg {
             }
             let n = core::cmp::min(dst.len() - i, OUT - self.pos);
             dst[i..i + n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+            wipe(&mut self.buf[self.pos..self.pos + n]);
             self.pos += n;
             i += n;
         }
+    }
+
+    /// How many bytes of the current buffer have been handed out and erased.
+    /// A hook for the proof kernel, which cannot see `buf` from outside.
+    #[doc(hidden)]
+    pub fn spent_is_erased(&self) -> bool {
+        self.buf[..self.pos].iter().all(|&b| b == 0)
     }
 
     /// Next 64 random bits.
@@ -136,6 +154,11 @@ impl Drbg {
             self.key[i] = blk[i] ^ seed[i];
             i += 1;
         }
+        // The buffer is abandoned here (pos = OUT forces a refill), so its
+        // undelivered tail must be erased rather than left behind - rule 2
+        // applied to output that will now never be handed out.
+        wipe(&mut self.buf);
+        wipe(&mut blk);
         self.pos = OUT;
     }
 
@@ -145,6 +168,28 @@ impl Drbg {
         let mut k = [0u8; 32];
         self.fill_bytes(&mut k);
         Drbg::from_key(k)
+    }
+}
+
+/// Overwrite a buffer so the compiler may not remove the store.
+///
+/// Word-wide where it can be: a per-byte volatile loop measured about twice as
+/// slow on bulk draws, and erasure is a property of the bytes being gone, not of
+/// how many stores it took.
+pub(crate) fn wipe(b: &mut [u8]) {
+    let (head, words, tail) = unsafe { b.align_to_mut::<u64>() };
+    for x in head.iter_mut() {
+        // SAFETY: a plain write through a valid reference; volatile only so it
+        // is not optimised away.
+        unsafe { core::ptr::write_volatile(x, 0) };
+    }
+    for w in words.iter_mut() {
+        // SAFETY: as above.
+        unsafe { core::ptr::write_volatile(w, 0) };
+    }
+    for x in tail.iter_mut() {
+        // SAFETY: as above.
+        unsafe { core::ptr::write_volatile(x, 0) };
     }
 }
 
@@ -168,6 +213,9 @@ pub enum SeedSource {
     /// says which one actually paid for the seed - on RISC-V there is no CPU
     /// instruction available to S-mode, so a device is the only real source.
     Device,
+    /// Seeded from the firmware boot seed (`/chosen/rng-seed`), the only source
+    /// available before a device is up. Device-tree platforms only.
+    Firmware,
     /// Seeded from the software-only CPU execution-time jitter source, which
     /// passed its own health tests. The fallback for a machine with no
     /// randomness hardware at all - and a real source, not the old floor,
@@ -234,7 +282,18 @@ pub fn init() {
     let mut floor = [0u8; 32];
     fallback_key(&mut floor);
     entropy::absorb(entropy::Source::Boot, &floor, 0);
-    zero(&mut floor);
+    wipe(&mut floor);
+
+    // The firmware boot seed, where the platform has one. First because it is
+    // free - the bytes are already in hand from device-tree discovery - and
+    // because it is the only source that exists before a device is up.
+    if let Some(seed) = crate::hw::fdt::rng_seed() {
+        entropy::absorb(
+            entropy::Source::Firmware,
+            seed,
+            (seed.len() as u32).saturating_mul(8),
+        );
+    }
 
     // Every source that can be asked, in order: the CPU instruction, a
     // randomness device, and - only if those left the pool short - the software
@@ -255,7 +314,7 @@ pub fn init() {
         *root() = Drbg::from_key(key);
         *SOURCES.this_mut() = src;
     }
-    zero(&mut key);
+    wipe(&mut key);
 }
 
 /// Seed a **secondary** CPU's root, called on that CPU as it comes up.
@@ -434,7 +493,7 @@ fn feed_cpu_hwrng() -> Feed {
     let ok = got >= 4 && health_ok(&words[..got]);
     let credit = if ok { got as u32 * BITS_PER_HW_WORD } else { 0 };
     entropy::absorb(entropy::Source::Cpu, &bytes[..got * 8], credit);
-    zero(&mut bytes);
+    wipe(&mut bytes);
     for w in words.iter_mut() {
         // SAFETY: plain write through a valid reference, volatile so it stays.
         unsafe { core::ptr::write_volatile(w, 0) };
@@ -451,18 +510,12 @@ fn credited_source() -> Option<SeedSource> {
         Some(SeedSource::Hwrng)
     } else if c.credited[entropy::Source::Device.index()] > 0 {
         Some(SeedSource::Device)
+    } else if c.credited[entropy::Source::Firmware.index()] > 0 {
+        Some(SeedSource::Firmware)
     } else if c.credited[entropy::Source::Jitter.index()] > 0 {
         Some(SeedSource::Jitter)
     } else {
         None
-    }
-}
-
-/// Overwrite a buffer, in a way the compiler may not remove.
-fn zero(b: &mut [u8]) {
-    for x in b.iter_mut() {
-        // SAFETY: plain write through a valid reference, volatile so it stays.
-        unsafe { core::ptr::write_volatile(x, 0) };
     }
 }
 

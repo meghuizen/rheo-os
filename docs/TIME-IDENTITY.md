@@ -128,6 +128,22 @@ driver. **The output algorithm did not change** - it is still the ChaCha20
 fast-key-erasure DRBG, because that is what makes a read cheap, and the read
 path still touches only the calling core's own root with no lock.
 
+### Fast key erasure has two rules, and only one was implemented
+
+The construction (cr.yp.to 2017.07.23) says: re-key from the output on every
+refill, **and** erase each random byte from the buffer as it is handed out. Rule
+1 was here; rule 2 was not, so up to 256 bytes of *already-delivered* output sat
+in the buffer until the next refill, and an attacker who captured the DRBG state
+recovered them - djb's recording attacker, exactly the case the construction
+exists to defeat.
+
+`Drbg::fill_bytes` wipes as it copies now, `refill` wipes its whole keystream
+local rather than just the new key, and `reseed` wipes the buffer tail it
+abandons. The wipe is word-wide where alignment allows; a per-byte volatile loop
+measured about twice as slow on bulk draws, and the guarantee is that the bytes
+are gone, not that it took one store each. Honest limit: `Drbg` is `Copy`, so a
+caller that copied the struct leaves a stale image no wipe can reach.
+
 ### Absorbing cannot reduce entropy
 
 For each 32-byte chunk `C` of input, with `K` the pool's 256-bit state:
@@ -161,6 +177,7 @@ source seed the machine.
 |---|---|---|
 | CPU instruction (RDSEED / RNDR / Zkr `seed`) | full | after the SP 800-90B health tests |
 | RNG device (virtio-rng, TRNG/TPM chip) | full | a device whose whole purpose is randomness |
+| Firmware boot seed (`/chosen/rng-seed`) | full | a bootloader that lied had already loaded the kernel |
 | Jitter (`rng::jitter`) | 1 bit/sample | **only** when its own health tests pass |
 | NIC / NVMe / disk / UART event timing | none | real, but unmeasured |
 | A program writing `/dev/urandom` | none | exactly Linux's rule |
@@ -206,6 +223,24 @@ these emulated machines jitter contributes but never seeds alone. On real
 hardware it is expected to reach the target; that is a lab claim, not one made
 here.
 
+### The firmware boot seed
+
+Device-tree platforms hand a kernel entropy before any device is up, in
+`/chosen/rng-seed`, filled by the bootloader or hypervisor. `hw::fdt` captures it
+during the discovery walk it already performs - matched on the property name, the
+same way `distance-matrix` is - and `rng::init` absorbs it first, because the
+bytes are already in hand.
+
+It is **credited in full**, for the reason Linux credits it: a bootloader that
+lied about the seed had already loaded the kernel, so it could have compromised
+the boot far more directly. Trusting it admits no attacker who was not already
+inside.
+
+Measured: QEMU's riscv64 `virt` supplies **32 bytes**, credited as 256 bits.
+x86-64 has no device tree, and an ARM64 bare-ELF `-kernel` boot is handed no
+pointer to one, so both report the seed absent - asserted as absent rather than
+assumed, so a platform that starts supplying one cannot go unnoticed.
+
 ### Per-ISA seeding, and the hole that is now closed
 
 | ISA | CPU instruction | Device | Seed source reached |
@@ -245,6 +280,19 @@ louder than a log line.
 
 ### Performance
 
+Measured by `cargo xtask bench` (icount, x86-64), per operation:
+
+| Bench | ticks | what it is |
+|---|---|---|
+| `entropy_mix_event` | **15** | what every NIC / NVMe / disk / UART interrupt pays |
+| `rng_next_u64` | 367 | one 64-bit draw from a root DRBG |
+| `entropy_absorb_32B` | 1,422 | the thread-context path: lock + ChaCha20 |
+
+The interrupt hook is ~24x cheaper than a single `u64` draw, which is what makes
+"two atomic operations, no lock" a measurement rather than a reading of the
+source - a handler that quietly grew a lock is a latency bug nothing else here
+would catch.
+
 - The read path is unchanged: this core's root DRBG, no lock.
 - An interrupt handler calls `absorb_fast` - two atomic operations into **this
   core's own** scratch words. No lock, no ChaCha20. The split exists so a
@@ -267,8 +315,15 @@ to each launch. Six controls observed firing:
 | Jitter never credits without passing its checks | delete the three checks -> "credited 17 bits with a run of 5 identical deltas" |
 | The boot KAT catches a broken ChaCha20 | flip one byte of the vector -> every boot panics |
 | The device is what seeds RISC-V | detach it -> `seed_source=Fallback seeded=false` |
+| A delivered byte is erased from the buffer | drop the wipe in `fill_bytes` -> "delivered bytes still in the buffer" |
+| The firmware seed is fed, not just captured | keep the capture, skip the absorb -> "32 seed bytes but none were credited" |
 
-The fourth control earned its keep: its first two versions **passed**, because
+One control is recorded as **self-defeating and replaced**: disabling
+`save_rng_seed` also made `rng_seed()` return `None`, so the test took its
+"no device tree here" branch and passed. The same switch flipped the source and
+the detector. Breaking only the *feed* fires it.
+
+The jitter control earned its keep: its first two versions **passed**, because
 removing one check let the next one catch the same window, and then because the
 test asserted `distinct` but not `longest_run` when crediting. The assertion is
 tighter now for that reason.

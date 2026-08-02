@@ -1365,6 +1365,58 @@ cell, and running them on several cores **at once** needs the per-cell locking o
 is not built. What these six kernels establish is that the core a workload runs on is no
 longer special - not that one workload can use several.
 
+### 10.0f Two more global allocators - the pmem pool and the admission ledger
+
+The 10.2 audit names shared `static mut` state as the gate, and `frames` was
+locked first because it is the one every path touches. Re-reading the list
+afterwards turned up two more that are just as global and were missed:
+
+- **`mm::frames_pmem`** - the persistent-memory allocator. Its bitmap and search
+  hint are read and written together by one operation, so two cores could both
+  see a bit clear and both claim the frame. Identical in structure to `frames`,
+  which is why it was easy to overlook: the DDR pool got the attention and its
+  twin did not.
+- **`sched::SYSTEM`** - the machine-wide admission ledger
+  (docs/ARCHITECTURE-DEBT.md 2.5). It was reached through
+  `pub fn system() -> &'static mut Admission`, which hands a `&mut` to every
+  caller on every core, and `admit` is a read-modify-write on the committed
+  total. A lost add lets the machine admit past 100%, which is the exact defect
+  the ledger exists to prevent; a lost subtract leaks utilisation until nothing
+  can be admitted again.
+
+Both are behind a `SpinLock` now, and **unconditionally** rather than
+`#[cfg(feature = "smp")]`: whether a structure needs a lock is a property of the
+structure, not of which cargo features are enabled - the call `frames`,
+`runtime::Heap` and the NVMe driver already made, and the lesson the `SYS_YIELD`
+FP defect taught, that state whose safety depends on a build configuration gets
+written twice and diverges. The `&'static mut` accessor is gone; the ledger is
+reached only through `system_admit` / `system_release` / `system_committed_ppm`,
+so the check and the commit happen under one acquire.
+
+`frames_pmem::free` also gained the double-free assertion the DDR pool has, since
+a clear bit there is precisely what an unserialised alloc handing one frame to
+two cores produces.
+
+**The proof, and its honest limit.** `smp`'s new phase runs both cores through
+admit / sample-the-machine-total / release, 4096 rounds each, with three exact
+oracles: every admit succeeds (two cores at 10% can never reach 100%, so a
+refusal means upward drift), the total sampled *while this core holds its own
+reservation* is always one or two holders' worth, and the ledger returns to
+exactly 0 ppm.
+
+It does **not** demonstrate the lock is load-bearing. Removing it and running
+**400,000** admit/release pairs across two cores produced zero lost updates: the
+critical section is a handful of instructions and TCG's interleaving is far
+coarser than that, so the window is never hit under emulation. The phase asserts
+the invariant continuously under genuine two-core traffic; the lock's necessity
+is argued from the structure - the same shape as `frames`, whose lock the
+four-core GEMM phase *does* exercise - and confirming it is a lab claim on real
+hardware, where out-of-order execution and true concurrency make the window
+reachable. `frames_pmem` gets the same treatment for the same reason, and with no
+phase of its own: an nvdimm is x86-64-only here, and adding one to the `smp`
+launch would perturb the tree's most assertion-dense kernel to buy a control that
+would not fire either.
+
 ### 10.1 The measured motivation (not a wish)
 
 The cooperative single-CPU scheduler switches to another context **only when the
