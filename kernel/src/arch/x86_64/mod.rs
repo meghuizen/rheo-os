@@ -1738,6 +1738,33 @@ pub fn cpu_report(_inv: &crate::hw::Inventory) -> crate::hw::CpuReport {
 // q35 has no virtio-mmio transport (virtio is PCIe here). virtio-blk on x86
 // needs the virtio-pci transport - a follow-on - so there are no slots to
 // scan and `virtio_blk::probe` finds nothing.
+/// Read a 32-bit device register.
+///
+/// Always `Some` here: this ISA has no candidate-probe path, because its TPM
+/// register base comes from firmware (the ACPI TPM2 table on x86-64, the device
+/// tree on RISC-V) rather than from a built-in guess. The ARM64 version catches
+/// a bus abort; see its doc comment for why only that ISA needs one.
+///
+/// # Safety
+/// `va` must be a mapped device address.
+pub unsafe fn mmio_probe_u32(va: usize) -> Option<u32> {
+    // SAFETY: delegated to the caller.
+    Some(unsafe { (va as *const u32).read_volatile() })
+}
+
+/// A TPM's TIS register base to **probe** where no firmware table describes one.
+///
+/// 0 means "nothing to try": on x86-64 the ACPI TPM2 table answers, and on
+/// RISC-V the device tree does. ARM64 is the exception - a bare-ELF `-kernel`
+/// boot on `virt` is handed no device-tree pointer at all (docs/SMP.md), so its
+/// machine profile is built in here, as the rest of that profile already is.
+///
+/// It is a **candidate, not a claim**: `hw::tpm` maps it and reads
+/// `TPM_DID_VID`, and a window with no chip behind it reads all-ones or
+/// all-zeros and is reported absent. So a wrong constant, or a machine with no
+/// TPM, produces "no TPM" rather than a fabricated one.
+pub const TPM_TIS_CANDIDATE: u64 = 0;
+
 pub const VIRTIO_MMIO_BASE: usize = 0;
 pub const VIRTIO_MMIO_STRIDE: usize = 0;
 pub const VIRTIO_MMIO_COUNT: usize = 0;

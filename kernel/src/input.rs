@@ -144,13 +144,26 @@ pub fn scripted() -> bool {
     matches!(unsafe { &*core::ptr::addr_of!(SOURCE) }, Source::Script(..))
 }
 
+/// Console bytes seen, used only as the sequence number handed to the entropy
+/// pool - never the byte itself.
+static mut RX_SEQ: u64 = 0;
+
 /// Push a received byte into the RX ring - the UART RX interrupt handler's sink
 /// (and the poll path's). Portable so per-ISA trap code never names the ring.
 pub fn rx_push(b: u8) {
-    // Which byte arrived and when are both unpredictable when a human is
-    // typing. Mixed into the entropy pool, never counted
-    // (docs/TIME-IDENTITY.md 4a).
-    crate::rng::feed_interrupt(b as u64, 0);
+    // **When** a byte arrived is unpredictable while a human is typing; mixed
+    // into the entropy pool, never counted (docs/TIME-IDENTITY.md 4a). The byte
+    // itself is deliberately *not* passed: `feed_hid` reads the cycle counter and
+    // takes only a sequence number, so console input cannot leak into the entropy
+    // path as content. The timing is the entropy; the character is what a person
+    // typed.
+    // SAFETY: a counter this module owns; the same single-CPU-at-a-time
+    // discipline as the ring beside it.
+    let seq = unsafe {
+        RX_SEQ = (*addr_of!(RX_SEQ)).wrapping_add(1);
+        *addr_of!(RX_SEQ)
+    };
+    crate::rng::feed_hid(seq);
     ring().push(b);
 }
 

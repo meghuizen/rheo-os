@@ -165,6 +165,74 @@ here is recorded as **self-defeating and replaced**: disabling the seed capture
 also made `rng_seed()` return `None`, so the test took its "no device tree"
 branch and passed - the same switch flipped the source and the detector.
 
+**A TPM and HID devices are entropy sources too, and both are driven.** The pool
+now **names no driver**: a randomness device *registers* with it
+(`entropy::register_device_source`) and the pool asks every registered one - it
+used to call `hw::virtio_rng::refill()` by name, which put a driver's name inside
+the entropy subsystem, so adding the TPM changed no line of the pool.
+**`kernel/src/hw/tpm.rs`** drives the FIFO/TIS interface from the TCG PC Client
+Platform TPM Profile plus one TPM 2.0 command, `TPM2_GetRandom` - a TPM is
+required by its own specification to contain a hardware RNG and is the one source
+on a server that is neither the CPU vendor's instruction nor a paravirtual device.
+Discovery is firmware's: the ACPI **TPM2** table on x86-64 (start method 6 = TIS at
+the PTP's fixed `0xFED4_0000`, 7/8 = CRB, which is recognised and *not* driven), a
+`tcg,tpm-tis-mmio` device-tree node on RISC-V, and on ARM64 - which gets no device
+tree at all on a bare-ELF boot - a built-in `arch::TPM_TIS_CANDIDATE` that is
+**probed, not asserted** (map it, read `TPM_DID_VID`, report absent on all-ones or
+all-zeros). That read is *guarded* (`arch::mmio_probe_u32`, reusing the temporary
+exception vector the PSCI conduit probe installs), because an undecoded address
+raises an external abort on ARM64 that killed the boot in the first version - found
+by the control that changes the constant. RISC-V needed a real device-tree fix: the
+TPM sits on a `platform-bus`, so its `reg` is **bus-relative** and read as absolute
+it was physical 0 - the walker now applies a one-level `ranges` translation with
+per-depth `#address-cells`, resolved *lazily* when a child asks, since QEMU writes
+`ranges` before `#address-cells`. Proven on **all three ISAs** against a real
+`swtpm` backend: `TPM2_Startup` (the chip arrives unstarted, so the
+`TPM_RC_INITIALIZE` retry runs every time) then `TPM2_GetRandom` giving 32 bytes and
+then 32 different ones, vendor/device `0x00011014`.
+**`kernel/src/hw/virtio_input.rs`** is the HID half - a person pressing a key is
+unpredictable in a way no deterministic machine reproduces, the source Linux has
+collected since its first `/dev/random`. `rng::feed_hid` is named apart from
+`feed_interrupt` because they are different claims (a machine's own timing versus a
+person); both are mixed and credited **zero**. And it is proven with **real
+keystrokes**: a keyboard nobody types on produces no events, so `xtask` attaches a
+virtio keyboard and presses keys over QEMU's monitor protocol - hand-written JSON
+over a Unix socket, four fixed messages, nothing parsed back, so xtask stays
+dependency-free - repeatedly over a window, since nothing signals when the guest has
+posted its buffers. All three ISAs read the device's own name from config space
+(`QEMU Virtio Keyboard`) and take **4 key events** into the pool; the wait is a
+deadline and a run with no keystroke reports that rather than failing. Three more
+controls observed firing (a changed TPM command code -> `rc 0x95`; an ARM64
+candidate pointed at an undecoded address -> "no TPM" with the boot surviving; the
+`feed_hid` call removed -> "4 HID events arrived but none reached the pool").
+
+**The input path is not a keylogger, by construction, and a captured key does not
+last forever.** Two hardening passes over the above. (1) `rng::feed_hid` takes a
+**sequence number and no event**, so a caller cannot pass a key code even by
+mistake - a property a reviewer checks in one line rather than a promise about
+what callers do - and the console byte path, which used to pass the byte, follows
+the same rule; the HID DMA buffer is wiped as it is drained, asserted by
+`virtio_input::buffers_clear`. It costs nothing, because the unpredictability is
+in *when* a key was pressed, not which one, and mixing a key code would put what a
+person typed into kernel state for a source credited zero. (2) Against an attacker
+who captures the pool or a root: past output is already safe (fast key erasure,
+both rules), *future* output needed a fix - a re-key only happened at a full 256
+**credited** bits, so a machine whose sources went quiet kept a captured key for
+the whole boot, and a root is now re-keyed after at most `REKEY_EVERY` derivations
+**whatever the pool holds**, mixing everything absorbed since (honest: a *chance*
+of recovery, not a guarantee, since uncredited input may be predictable - what it
+removes is "compromised forever"). Influence is already handled by the credit rule,
+and the remaining real risk - an attacker controlling *every* credited source - is
+met by independence at the one key that matters: `entropy::seed_from_all()` asks
+the CPU instruction **and** every device **and** jitter before the first extract
+rather than stopping at whichever answered first. On **quantum**: Shor does not
+apply (no public-key structure, just a stream cipher), Grover halves symmetric
+strength so the 256-bit key gives ~128 bits, which is why the pool's target is the
+full key width and `CREDIT_TARGET == 256` is asserted rather than assumed; and
+ChaCha20 here is pure integer ARX with no tables and no secret-dependent branches,
+so there is no timing or cache channel. Two more controls firing (the HID wipe
+removed; the lifetime bound removed).
+
 A **hardware-discovery** layer (`kernel/src/hw/`) builds one portable
 machine `Inventory` at boot: firmware source (ACPI on x86-64 via the PVH
 RSDP, a flattened device tree on RISC-V, **PSCI `AFFINITY_INFO`** on ARM64 - which
@@ -3173,7 +3241,11 @@ kernel/       the no_std kernel library + boot demo bin
               docs/ARCHITECTURE-DEBT.md 3.2), hw (ACPI/FDT/PCIe
               discovery + the machine Inventory; block BlockDevice trait +
               virtio_blk + **nvme** drivers; virtio_rng randomness
-              device driver (docs/TIME-IDENTITY.md 4a); virtio_net raw-frame NIC driver -
+              device driver + **tpm** (TPM 2.0 over FIFO/TIS: the TCG PC Client
+              Platform TPM Profile handshake and TPM2_GetRandom, discovered from
+              the ACPI TPM2 table / a tcg,tpm-tis-mmio device-tree node / a
+              guarded ARM64 candidate probe) + **virtio_input** (HID keyboard/
+              mouse events as entropy) - docs/TIME-IDENTITY.md 4a; virtio_net raw-frame NIC driver -
               docs/NETWORKING.md; virtio_gpu 2D display driver -
               docs/DISPLAY.md), elf + load (ELF loader for native
               programs), user run loop (with per-cell syscall

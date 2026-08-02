@@ -81,6 +81,41 @@ smp_after_call:
     ldp x19, x20, [sp], #48
     ret
 
+/* A **guarded 32-bit MMIO read**, using the same temporary vector table as the
+ * PSCI probe above (docs/TIME-IDENTITY.md 4a).
+ *
+ * Reading a device register at an address nothing decodes raises a synchronous
+ * external abort on ARM64, which would kill the boot. The one caller that needs
+ * this is the TPM probe on a machine with no firmware table, where the register
+ * base comes from a built-in machine profile - so a wrong constant, or a
+ * different board, must be *observed* as "no chip" rather than being fatal.
+ *
+ *   x0 = virtual address to read
+ *   returns x0 = the value, or 0xFFFF_FFFF_FFFF_FFFF if the access aborted.
+ */
+.global mmio_probe_u32_guarded
+mmio_probe_u32_guarded:
+    stp x19, x20, [sp, #-48]!
+    stp x21, x22, [sp, #16]
+    stp x23, x30, [sp, #32]
+
+    mov  x19, x0                 /* the address */
+    mrs  x22, vbar_el1
+    mrs  x23, daif
+    msr  daifset, #0xf
+
+    adrp x9, smp_tmp_vectors
+    add  x9, x9, :lo12:smp_tmp_vectors
+    msr  vbar_el1, x9
+    isb
+
+    ldr  w0, [x19]
+    /* An external abort can be asynchronous, so force it to be taken here
+       rather than after the vectors are put back. */
+    dsb  sy
+    isb
+    b    smp_after_call           /* shared restore-and-return epilogue */
+
 /* Temporary vectors: 2 KiB aligned, 16 slots of 128 bytes. Every slot redirects
    to smp_catch; only the current-EL SPx synchronous slot (the HVC/SMC trap) is
    expected to fire (interrupts are masked around the call). */

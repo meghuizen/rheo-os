@@ -78,6 +78,31 @@ pub fn parse(dtb: usize, inv: &mut Inventory) {
     let mut kind = [NodeKind::Other; MAX_DEPTH];
     let mut numa = [0u8; MAX_DEPTH]; // per-depth numa-node-id (inherited)
     let mut cpu_hwid = 0u32;
+    let mut node_is_tpm = false;
+    let mut node_reg_base = 0u64;
+    // **Per-depth address cells and bus translation**, used by the TPM lookup
+    // only (docs/TIME-IDENTITY.md 4a). A device on a `platform-bus` states its
+    // `reg` relative to that bus, and the bus's `ranges` says where the bus sits
+    // in the parent's address space - so a bus-relative `reg` read as an absolute
+    // address points at the wrong place entirely. QEMU's riscv64 `virt` puts the
+    // TPM at bus offset 0 on a bus based at `0x400_0000`, which without this
+    // would read as physical 0.
+    //
+    // Deliberately not applied to the existing memory/CPU decoding: those nodes
+    // are children of the root, where the translation is the identity, and
+    // changing how they decode would be a change nothing here asked for.
+    //
+    // `acells[d]` is the `#address-cells` a node at depth `d` declares for *its
+    // children*; `xlate[d]` is the address a child of depth `d` must add.
+    let mut acells = [2u32; MAX_DEPTH];
+    let mut xlate = [0u64; MAX_DEPTH];
+    // A node's `ranges` cannot be decoded when it is seen, because it needs that
+    // node's own `#address-cells` and the device tree may write the two in either
+    // order - QEMU writes `ranges` first. So the property's location is parked
+    // here and resolved when a *child* asks, by which point the spec guarantees
+    // every property of the parent has been read (properties precede child nodes).
+    let mut ranges_at = [0usize; MAX_DEPTH];
+    let mut ranges_len = [0usize; MAX_DEPTH];
     // `capacity-dmips-mhz` per cpu node, in the device tree's own arbitrary units, indexed by
     // the order cpu nodes are added. Normalised to `CAPACITY_FULL` after the walk, because the
     // ratio is the only thing the numbers mean - the property's own documentation says they are
@@ -112,9 +137,28 @@ pub fn parse(dtb: usize, inv: &mut Inventory) {
                     cpu_hwid = 0;
                     cur_dmips = 0;
                 }
+                // Per-node TPM scratch. A device tree may write `compatible`
+                // before `reg` or after it, so both are collected while inside
+                // the node and judged at its end.
+                node_is_tpm = false;
+                node_reg_base = 0;
+                if depth < MAX_DEPTH {
+                    // Defaults until the node says otherwise, and a translation
+                    // inherited from the parent so a two-level bus composes.
+                    acells[depth] = 2;
+                    xlate[depth] = if depth > 0 { xlate[depth - 1] } else { 0 };
+                    ranges_at[depth] = 0;
+                    ranges_len[depth] = 0;
+                }
                 depth += 1;
             }
             FDT_END_NODE => {
+                if node_is_tpm && node_reg_base != 0 && inv.tpm_base == 0 {
+                    inv.tpm_base = node_reg_base;
+                    inv.tpm_iface = super::TpmInterface::Tis;
+                }
+                node_is_tpm = false;
+                node_reg_base = 0;
                 depth = depth.saturating_sub(1);
                 if depth < MAX_DEPTH && kind[depth] == NodeKind::Cpu {
                     inv.add_cpu(cpu_hwid, numa[depth]);
@@ -170,6 +214,53 @@ pub fn parse(dtb: usize, inv: &mut Inventory) {
                 // (docs/TIME-IDENTITY.md 4a).
                 if pname == "rng-seed" && len > 0 {
                     save_rng_seed(p, data, len);
+                }
+                // A TPM on a device-tree platform. The TCG binding names the
+                // FIFO/TIS register file `tcg,tpm-tis-mmio`; QEMU's
+                // `tpm-tis-device` publishes exactly that
+                // (docs/TIME-IDENTITY.md 4a).
+                if pname == "compatible" && prop_has_string(p, data, len, "tcg,tpm-tis-mmio") {
+                    node_is_tpm = true;
+                }
+                // This node's own cells, which govern its children.
+                if pname == "#address-cells" && len >= 4 && d < MAX_DEPTH {
+                    acells[d] = be32(p, data);
+                }
+                // A bus translation for this node's children: `ranges` is a list
+                // of (child address, parent address, size). Only the first entry
+                // is used, and only when it is a simple offset - which is what a
+                // `platform-bus` publishes. An empty `ranges` means the identity,
+                // and anything more elaborate is left untranslated rather than
+                // guessed at.
+                if pname == "ranges" && len > 0 && d < MAX_DEPTH {
+                    ranges_at[d] = data;
+                    ranges_len[d] = len;
+                }
+                if pname == "reg" && node_reg_base == 0 && len >= 4 && d > 0 && d < MAX_DEPTH {
+                    // The parent's translation, resolved now that all of the
+                    // parent's properties have been read.
+                    let pd = d - 1;
+                    if ranges_len[pd] > 0 {
+                        let child_cells = acells[pd] as usize;
+                        let parent_cells = if pd > 0 {
+                            acells[pd - 1] as usize
+                        } else {
+                            addr_cells as usize
+                        };
+                        if ranges_len[pd] >= (child_cells + parent_cells) * 4 {
+                            let child = read_cells(p, ranges_at[pd], child_cells as u32);
+                            let parent =
+                                read_cells(p, ranges_at[pd] + child_cells * 4, parent_cells as u32);
+                            xlate[pd] = xlate[pd].wrapping_add(parent.wrapping_sub(child));
+                        }
+                        ranges_len[pd] = 0; // resolved once
+                    }
+                    // A node's `reg` is decoded with its **parent's** cells.
+                    let pc = acells[pd] as usize;
+                    if len >= pc * 4 {
+                        let a = read_cells(p, data, pc as u32);
+                        node_reg_base = a.wrapping_add(xlate[pd]);
+                    }
                 }
                 match here {
                     NodeKind::Cpu => {
@@ -295,6 +386,26 @@ enum NodeKind {
     Cpu,
     Memory,
     Pci,
+}
+
+/// Whether a device-tree string-list property contains `want` exactly.
+///
+/// `compatible` is a list of NUL-separated strings, most specific first, so a
+/// substring search over the whole blob would match the wrong thing; this walks
+/// the entries.
+fn prop_has_string(p: *const u8, data: usize, len: usize, want: &str) -> bool {
+    let mut off = 0;
+    while off < len {
+        let s = cstr(p, data + off, 64);
+        if s == want {
+            return true;
+        }
+        off += s.len() + 1;
+        if s.is_empty() {
+            break;
+        }
+    }
+    false
 }
 
 /// Decode a `reg` property as (address, size) pairs and call `f` per pair.

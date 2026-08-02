@@ -295,11 +295,11 @@ pub fn init() {
         );
     }
 
-    // Every source that can be asked, in order: the CPU instruction, a
-    // randomness device, and - only if those left the pool short - the software
-    // jitter source. A machine with none of them stays uncredited and says so.
+    // **Every** source, not just enough of them. This is the one key where
+    // stopping early would let whichever source answered first decide the whole
+    // machine's starting state on its own (docs/TIME-IDENTITY.md 4a).
     let fed = feed_cpu_hwrng();
-    entropy::replenish();
+    entropy::seed_from_all();
 
     let (mut key, credited) = entropy::take_seed();
     let src = if credited {
@@ -399,10 +399,26 @@ pub fn derive_cell_drbg() -> Drbg {
 /// into the pool and re-keys if the pool is full.
 const PUMP_EVERY: u32 = 1024;
 
+/// How many derivations a core makes before it re-keys its root from the pool
+/// **whether or not** the pool has credited entropy.
+///
+/// This bounds how long a compromised root stays compromised
+/// (docs/TIME-IDENTITY.md 4a). Fast key erasure already means an attacker who
+/// captures the state learns nothing about *past* output; this is the other
+/// direction - recovery - and without it a machine whose sources have all gone
+/// quiet would keep a captured key for the rest of the boot.
+///
+/// A larger multiple of [`PUMP_EVERY`] than 1 because a re-key that mixes only
+/// uncredited input is a *chance* of recovery, not a guarantee, and it costs a
+/// pool lock: often enough to bound the window, rarely enough to be free.
+const REKEY_EVERY: u32 = 16 * PUMP_EVERY;
+
 /// Per-core countdown to the next [`entropy::pump`]. Plain, not atomic: a core
 /// only ever touches its own slot, and the worst a lost update could do is
 /// delay a reseed.
 static PUMP_TICK: crate::smp::PerCpu<u32> = crate::smp::PerCpu::new(0);
+/// Per-core countdown to the next unconditional re-key. See [`REKEY_EVERY`].
+static REKEY_TICK: crate::smp::PerCpu<u32> = crate::smp::PerCpu::new(0);
 
 /// Drive continuous reseeding off the *consume* path rather than a timer.
 ///
@@ -419,6 +435,41 @@ fn maybe_pump() {
         *tick = 0;
         entropy::pump();
     }
+    // SAFETY: as above.
+    let rk = unsafe { REKEY_TICK.this_mut() };
+    *rk += 1;
+    if *rk >= REKEY_EVERY {
+        *rk = 0;
+        rekey_root_unconditional();
+    }
+}
+
+/// Re-key this core's root from the pool even when the pool has no *credited*
+/// entropy to offer, and count it.
+///
+/// The point is recovery from a state compromise. Everything that has happened
+/// since the last re-key - every device interrupt, every HID arrival, every
+/// `/dev/urandom` write, every cycle counter read - has been absorbed into the
+/// pool, and none of it is counted because none of it can be measured. That is
+/// the right rule for deciding whether a machine is *seeded*; it is the wrong
+/// rule for deciding whether to move a key an attacker may already hold.
+///
+/// Honest about the strength: this is a **chance** of recovery, not a guarantee.
+/// On a machine whose every input is predictable to the attacker it changes the
+/// key to another one they can compute. On any machine with real activity it
+/// closes the window. [`rekeys`] counts them so the claim is measurable.
+fn rekey_root_unconditional() {
+    let (mut seed, _credited) = entropy::take_seed();
+    reseed_this_root(&seed);
+    wipe(&mut seed);
+    REKEYS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+static REKEYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How many times a root has been re-keyed by the bounded-lifetime rule.
+pub fn rekeys() -> u64 {
+    REKEYS.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Pull fresh entropy from every source that has any - the CPU's hardware RNG
@@ -451,6 +502,35 @@ pub fn feed_device(bytes: &[u8]) {
 #[inline]
 pub fn feed_interrupt(a: u64, b: u64) {
     entropy::absorb_fast(a, b);
+}
+
+/// Feed the **arrival of a HID event** - a keystroke, a mouse move - into this
+/// core's scratch.
+///
+/// # This is not a keylogger, by construction
+///
+/// The parameter is a **sequence number, not the event**. There is no way for a
+/// caller to pass a key code, a character or a coordinate through this function,
+/// because the signature does not carry one - which is a property a reviewer can
+/// check in one line, rather than a promise about what callers do.
+///
+/// That costs nothing, because what carries the unpredictability is **when** a
+/// key was pressed, not which one: the cycle counter [`entropy::absorb_fast`]
+/// reads is the entropy, and a key code is at most a few bits of highly skewed,
+/// highly guessable text. Mixing keystroke content would put what a person typed
+/// into kernel state for a source that is credited **zero** anyway - all cost, no
+/// benefit.
+///
+/// Named apart from [`feed_interrupt`] even though both land in the same
+/// uncredited scratch, because they are different claims: a device completion is
+/// a machine's own timing, while a HID event is a *person*, which is the classic
+/// source Linux has collected since its first `/dev/random`. A reader asking
+/// "does this OS collect input entropy" should find the answer by name.
+///
+/// Mixed, never credited: this kernel cannot tell a typist from an auto-repeat.
+#[inline]
+pub fn feed_hid(seq: u64) {
+    entropy::absorb_fast(seq, 0);
 }
 
 /// Feed bytes a program wrote to `/dev/urandom`. Mixed, never credited -

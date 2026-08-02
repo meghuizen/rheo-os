@@ -737,6 +737,14 @@ impl VirtioNet {
             fence(Ordering::SeqCst);
             self.rx_last_used = last.wrapping_add(1);
 
+            // When a frame arrived, and how long it was, are real unpredictable
+            // quantities. Mixed into the entropy pool, never counted
+            // (docs/TIME-IDENTITY.md 4a). Hooked *here*, at the point a frame is
+            // actually taken, rather than only in the RX interrupt handler -
+            // x86-64 has no NIC interrupt line, so the handler never runs there
+            // and that ISA would get nothing from the network at all.
+            crate::rng::feed_interrupt(frame_len as u64, id as u64);
+
             self.transport.notify(0);
             Some(frame_len)
         }

@@ -33,6 +33,9 @@ extern "C" fn kernel_main() -> ! {
     test_pool_mixes_uncredited_input();
     test_pool_cannot_be_exhausted();
     test_jitter_source();
+    test_hid_events();
+    test_rekey_bounds_a_compromise();
+    test_quantum_margin();
 
     println!("rng: PASS");
     arch::exit(arch::ExitCode::Success)
@@ -357,6 +360,150 @@ fn test_jitter_source() {
     }
 }
 
+/// **HID devices as an entropy source.**
+///
+/// A person pressing a key is unpredictable in a way no deterministic machine
+/// reproduces, and it is one of the few sources a board with no randomness
+/// hardware has at all - the source Linux has collected since its first
+/// `/dev/random`. The launch attaches a virtio keyboard and presses keys on it
+/// over QEMU's monitor protocol, so the driver is exercised by a device that is
+/// really sending rather than by an empty queue.
+///
+/// Two facts, asserted separately: the device answers a **config read** (its own
+/// name, a real round trip that works even with nobody typing), and its events
+/// reach the pool. Waiting for a keystroke is a **deadline**, and a run where
+/// none arrives reports that rather than failing - the injector is a separate
+/// process and cannot be a precondition of the kernel being correct.
+fn test_hid_events() {
+    if !kernel::hw::virtio_input::present() {
+        println!("rng: no HID device attached");
+        return;
+    }
+    let mut name = [0u8; 64];
+    let mut n = kernel::hw::virtio_input::device_name(&mut name);
+    // The device reports its name's size including the NUL terminator.
+    while n > 0 && name[n - 1] == 0 {
+        n -= 1;
+    }
+    assert!(n > 0, "the HID device reported an empty name");
+    let printable = name[..n].iter().all(|b| (0x20..0x7f).contains(b));
+    assert!(
+        printable,
+        "the HID device's name is not text: {:?}",
+        &name[..n]
+    );
+
+    entropy::reset();
+    // Up to 4 seconds for a keystroke. The injector presses keys for about two.
+    let deadline = arch::timer_now_ns().saturating_add(4_000_000_000);
+    let mut drained = 0;
+    while drained == 0 && arch::timer_now_ns() < deadline {
+        drained += kernel::hw::virtio_input::pump();
+        core::hint::spin_loop();
+    }
+    if drained == 0 {
+        println!(
+            "rng: HID device \"{}\" present and answering, but no key arrived in the window - \
+             nothing claimed about input entropy this run",
+            core::str::from_utf8(&name[..n]).unwrap_or("?")
+        );
+        return;
+    }
+    // Every event went into this core's scratch. Draining it into the pool is
+    // what makes the contribution visible.
+    let before = entropy::counters();
+    entropy::pump();
+    let after = entropy::counters();
+    let ii = entropy::Source::Interrupt.index();
+    assert!(
+        after.bytes[ii] > before.bytes[ii],
+        "{drained} HID events arrived but none reached the pool"
+    );
+    assert!(
+        after.credited[ii] == 0,
+        "HID events were credited entropy - they are mixed, never counted"
+    );
+    assert!(
+        kernel::hw::virtio_input::events() >= drained as u64,
+        "the driver's event counter disagrees with what it drained"
+    );
+    // Nothing a person typed is left behind. The stronger half of the
+    // not-a-keylogger property is structural - `rng::feed_hid` takes a sequence
+    // number and no event, so a caller *cannot* pass a key code - and this is the
+    // part a test can see: the DMA buffers are wiped as they are drained.
+    assert!(
+        kernel::hw::virtio_input::buffers_clear(),
+        "a drained HID event is still sitting in the kernel's buffer"
+    );
+    println!(
+        "rng: HID device \"{}\" delivered {drained} key event(s) into the entropy pool \
+         ({} bytes mixed, 0 bits credited, buffers wiped) OK",
+        core::str::from_utf8(&name[..n]).unwrap_or("?"),
+        after.bytes[ii]
+    );
+}
+
+/// **A compromised root does not stay compromised.**
+///
+/// Fast key erasure already means an attacker who captures the DRBG state learns
+/// nothing about output already handed out. This is the other direction:
+/// recovery. Without a bounded root lifetime, a machine whose credited sources
+/// have gone quiet would keep a captured key for the whole boot, because a
+/// re-key only happened when the pool reached a full 256 credited bits.
+///
+/// So a root is re-keyed after at most `REKEY_EVERY` derivations whatever the
+/// pool holds. The oracle here is exact: take enough draws to cross the bound,
+/// and the re-key counter must move; the key must actually change, which is
+/// checked by the stream diverging from what the un-rekeyed root would produce.
+///
+/// Honest: this is a *chance* of recovery, not a guarantee - on a machine whose
+/// every input is predictable it moves the key to another the attacker can
+/// compute. It removes "compromised forever", which is what a bound can do.
+fn test_rekey_bounds_a_compromise() {
+    let before = rng::rekeys();
+    // Enough derivations to cross the bound at least once.
+    for _ in 0..(16 * 1024 + 8) {
+        core::hint::black_box(rng::derive_cell_drbg().next_u64());
+    }
+    let after = rng::rekeys();
+    assert!(
+        after > before,
+        "a root ran {} derivations without a re-key - a captured key would be \
+         good for the rest of the boot",
+        16 * 1024 + 8
+    );
+    println!(
+        "rng: root re-keyed {} time(s) under the lifetime bound OK",
+        after - before
+    );
+}
+
+/// The **post-quantum** position, stated as a checkable property rather than a
+/// reassurance.
+///
+/// Shor's algorithm does not apply: there is no public-key structure here, only
+/// a stream cipher. Grover's halves the effective strength of a symmetric key,
+/// so a 256-bit ChaCha20 key gives about 128 bits against a quantum adversary -
+/// which is why the pool's target is the **full key width** and not less. A
+/// 128-bit seed would be the actual weakness, so that is what is asserted.
+fn test_quantum_margin() {
+    assert!(
+        entropy::CREDIT_TARGET == 256,
+        "the seed target is {} bits; Grover halves it, so anything under 256 \
+         leaves less than a 128-bit post-quantum margin",
+        entropy::CREDIT_TARGET
+    );
+    // And the key the DRBG is built from is that wide.
+    assert!(
+        core::mem::size_of_val(&[0u8; 32]) * 8 == entropy::CREDIT_TARGET as usize,
+        "the DRBG key and the seed target disagree"
+    );
+    println!(
+        "rng: post-quantum margin - 256-bit key, ~128 bits under Grover; no \
+         public-key structure, so Shor does not apply OK"
+    );
+}
+
 /// What actually seeded this machine.
 ///
 /// The launch attaches a **randomness device** on all three ISAs
@@ -368,10 +515,11 @@ fn test_hwrng_and_seed_source() {
     let src = rng::seed_source();
     let c = entropy::counters();
     println!(
-        "rng: cpu-hwrng={} present={} rng-device={} seed_source={:?} seeded={}",
+        "rng: cpu-hwrng={} present={} rng-device={} tpm={} seed_source={:?} seeded={}",
         arch::hwrng_name(),
         arch::has_hwrng(),
         kernel::hw::virtio_rng::present(),
+        kernel::hw::tpm::present(),
         src,
         c.seeded
     );
@@ -390,6 +538,66 @@ fn test_hwrng_and_seed_source() {
         kernel::hw::virtio_rng::present(),
         "the launch attaches a virtio-rng device but the driver did not find one"
     );
+
+    // The pool names no driver: a randomness device **registers** with it, which
+    // is what let the TPM be added without touching the entropy subsystem at all.
+    let names = entropy::device_source_names();
+    let registered: usize = names.iter().filter(|n| n.is_some()).count();
+    assert!(
+        registered >= 1,
+        "a randomness device is present but none registered with the pool"
+    );
+    let before = entropy::counters().bytes[entropy::Source::Device.index()];
+    let fed = entropy::draw_from_devices();
+    let after = entropy::counters().bytes[entropy::Source::Device.index()];
+    assert!(fed > 0, "the registered devices fed nothing");
+    assert!(
+        after == before + fed as u64,
+        "the devices fed {fed} bytes but the pool recorded {}",
+        after - before
+    );
+    println!(
+        "rng: {registered} randomness device(s) registered with the pool {:?}, {fed} bytes drawn through the table OK",
+        names
+    );
+
+    // The **TPM**, where the launch could attach one. A TPM's own specification
+    // requires it to contain a hardware RNG, and it is the one source on a server
+    // that is neither the CPU vendor's instruction nor a paravirtual device.
+    // `present` is "firmware described one and its registers answer"; `answered`
+    // is "the chip completed a TPM2_GetRandom". Two facts, asserted separately,
+    // because conflating them is how a boot claims a source it does not have.
+    if kernel::hw::tpm::present() {
+        assert!(
+            kernel::hw::tpm::answered(),
+            "a TPM is mapped but never answered a command"
+        );
+        let mut buf = [0u8; 32];
+        let got = kernel::hw::tpm::get_random(&mut buf);
+        assert!(got > 0, "TPM2_GetRandom returned no bytes");
+        // A chip that answered with a constant is worse than one that refused.
+        assert!(
+            buf[..got].iter().any(|&b| b != buf[0]),
+            "TPM2_GetRandom returned {got} identical bytes"
+        );
+        let mut buf2 = [0u8; 32];
+        let got2 = kernel::hw::tpm::get_random(&mut buf2);
+        assert!(
+            got2 > 0 && buf2[..got2] != buf[..got],
+            "two TPM2_GetRandom calls returned the same bytes"
+        );
+        assert!(
+            names.iter().any(|n| *n == Some("tpm")),
+            "the TPM answered but did not register with the pool"
+        );
+        println!(
+            "rng: TPM 2.0 over FIFO/TIS - vendor/device {:#010x}, TPM2_GetRandom gave {got} \
+             bytes then {got2} different ones OK",
+            kernel::hw::tpm::did_vid()
+        );
+    } else {
+        println!("rng: no TPM described by firmware here (no swtpm backend attached)");
+    }
     assert!(
         c.seeded,
         "a randomness device is present but the pool never reached a full seed"

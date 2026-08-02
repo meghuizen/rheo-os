@@ -497,6 +497,72 @@ pub fn seeded() -> bool {
     POOL.lock().seeded
 }
 
+// ------------------------------------------------- registered device sources
+
+/// A randomness **device** the pool can ask for more bytes.
+///
+/// Returns how many bytes it fed (through [`super::feed_device`]); zero if the
+/// device had nothing. The pool never sees the bytes - a driver reads its own
+/// device and hands them over, and the pool decides mixing and credit. One owner
+/// per decision.
+pub type DeviceSource = fn() -> usize;
+
+/// How many randomness devices can register. Four is more than any machine here
+/// has; a fifth is refused with a printed reason rather than silently dropped.
+const MAX_DEVICE_SOURCES: usize = 4;
+
+static mut DEVICE_SOURCES: [Option<(&'static str, DeviceSource)>; MAX_DEVICE_SOURCES] =
+    [None; MAX_DEVICE_SOURCES];
+
+/// Register a randomness device with the pool.
+///
+/// **This is why the pool does not name a driver.** It used to call
+/// `hw::virtio_rng::refill()` by name, which put a device driver's name inside
+/// the entropy subsystem - the shape `svc::Bridge` exists to avoid, and the same
+/// reason the queue's opcode dispatch names no driver. A TPM, a board TRNG or an
+/// I/O device with a randomness function is then a *driver* that registers here,
+/// not a change to the pool.
+///
+/// Called from boot, before any secondary starts.
+pub fn register_device_source(name: &'static str, f: DeviceSource) -> bool {
+    // SAFETY: boot, single-threaded, before any cell or secondary runs.
+    let table = unsafe { &mut *core::ptr::addr_of_mut!(DEVICE_SOURCES) };
+    for slot in table.iter_mut() {
+        if slot.is_none() {
+            *slot = Some((name, f));
+            return true;
+        }
+    }
+    crate::println!("rng: no free source slot for {name} - not registered");
+    false
+}
+
+/// The names of the registered randomness devices, for the boot report.
+pub fn device_source_names() -> [Option<&'static str>; MAX_DEVICE_SOURCES] {
+    // SAFETY: written at boot, read-only after.
+    let table = unsafe { &*core::ptr::addr_of!(DEVICE_SOURCES) };
+    let mut out = [None; MAX_DEVICE_SOURCES];
+    for (o, s) in out.iter_mut().zip(table.iter()) {
+        *o = s.map(|(n, _)| n);
+    }
+    out
+}
+
+/// Ask every registered randomness device for bytes. Returns the total fed.
+///
+/// Every device is asked, not just the first: a machine with two of them has two
+/// independent sources, and taking only one would waste the other for no reason.
+pub fn draw_from_devices() -> usize {
+    // SAFETY: the table is written at boot and read-only after; the function
+    // pointers are called here in thread context.
+    let table = unsafe { &*core::ptr::addr_of!(DEVICE_SOURCES) };
+    let mut total = 0;
+    for (_, f) in table.iter().flatten() {
+        total += f();
+    }
+    total
+}
+
 /// Ask every source that can be asked for more entropy.
 ///
 /// The order is cheapest-and-best first: the CPU instruction, then a randomness
@@ -512,11 +578,31 @@ pub fn seeded() -> bool {
 pub fn replenish() -> u32 {
     super::feed_cpu_hwrng();
     if !ready() {
-        crate::hw::virtio_rng::refill();
+        draw_from_devices();
     }
     if !ready() && !seeded() {
         super::jitter::gather();
     }
+    POOL.lock().credit
+}
+
+/// Ask **every** source, whether or not the pool is already full, and return the
+/// credit held afterwards.
+///
+/// The difference from [`replenish`] is the early exits, and it matters exactly
+/// once - at boot, for the key every root DRBG starts from. `replenish` stops as
+/// soon as the counter is satisfied, which means the *first* source to answer
+/// decides the initial key on its own. That is the one place where a single
+/// backdoored source would own the machine, so the first seed mixes the CPU
+/// instruction **and** every randomness device **and** the jitter source, and an
+/// attacker has to have compromised all of them rather than any one.
+///
+/// It cannot go wrong in the other direction: absorbing more can never reduce
+/// entropy (see the module docs), and the credit counter saturates.
+pub fn seed_from_all() -> u32 {
+    super::feed_cpu_hwrng();
+    draw_from_devices();
+    super::jitter::gather();
     POOL.lock().credit
 }
 

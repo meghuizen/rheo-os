@@ -42,7 +42,9 @@ pub fn init() {
     // the entropy pool when the key is drawn. Additive: a machine without one
     // probes, finds nothing and continues (docs/TIME-IDENTITY.md 4a). It has to
     // be after `hw::detect` because the PCI path needs the discovered ECAM base.
+    crate::hw::tpm::init();
     crate::hw::virtio_rng::init();
+    crate::hw::virtio_input::init();
     crate::rng::init();
     // Power-on self test for the generator itself (docs/TIME-IDENTITY.md 4a):
     // the ChaCha20 known-answer vector, the FIPS 140-2 continuous test, and an

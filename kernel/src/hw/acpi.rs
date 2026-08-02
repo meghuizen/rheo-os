@@ -118,10 +118,58 @@ fn walk_sdt(sdt: u64, is_xsdt: bool, inv: &mut Inventory) {
             b"HMAT" => parse_hmat(table, inv),
             b"NFIT" => parse_nfit(table, inv),
             b"DMAR" => parse_dmar(table, inv),
+            b"TPM2" => parse_tpm2(table, inv),
             _ => {}
         }
     }
 }
+
+/// The TCG ACPI `TPM2` table (TCG ACPI Specification 2.0, table 7): the
+/// firmware's description of a TPM 2.0 device.
+///
+/// ```text
+///   36  u16  Platform Class
+///   38  u16  Reserved
+///   40  u64  Address of Control Area
+///   48  u32  Start Method
+/// ```
+///
+/// The **start method** is what says which register interface the TPM speaks.
+/// Only the two QEMU and real PC-client platforms use are decoded:
+///
+/// - 6 = memory-mapped, i.e. the FIFO/TIS register file at its fixed location;
+/// - 7 = Command Response Buffer, whose control area the table points at.
+///
+/// A TIS TPM's registers are **not** in this table: the PC Client Platform TPM
+/// Profile fixes locality 0 at `0xFED4_0000`, which is why that constant appears
+/// here rather than being read from firmware.
+fn parse_tpm2(t: u64, inv: &mut Inventory) {
+    let len = rd32(t + 4) as u64;
+    if len < 52 {
+        return;
+    }
+    let control_area = rd64(t + 40);
+    let start_method = rd32(t + 48);
+    match start_method {
+        // FIFO/TIS at the architecturally fixed base.
+        6 => {
+            inv.tpm_base = TIS_LOCALITY0_BASE;
+            inv.tpm_iface = super::TpmInterface::Tis;
+        }
+        // CRB (7), and "CRB with ACPI Start" (8), both described by the control
+        // area. Recognised so the boot can *say* a TPM is present and undriven,
+        // which is a better answer than reporting no TPM at all.
+        7 | 8 => {
+            inv.tpm_base = control_area;
+            inv.tpm_iface = super::TpmInterface::Crb;
+        }
+        _ => {}
+    }
+}
+
+/// Locality 0 of a FIFO/TIS TPM. Fixed by the TCG PC Client Platform TPM
+/// Profile, not discoverable.
+const TIS_LOCALITY0_BASE: u64 = 0xFED4_0000;
 
 /// The ACPI GUID for "byte-addressable persistent memory" SPA ranges
 /// (NFIT SPA Range Structure), stored in the mixed-endian GUID layout QEMU

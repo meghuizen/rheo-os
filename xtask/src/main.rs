@@ -105,10 +105,126 @@ fn extra_qemu_args(arch: Arch, kernel: &str) -> Vec<String> {
     if kernel == "gpuhw" {
         return gpu_device_args(arch);
     }
-    fixed_qemu_args(arch, kernel)
+    let mut args: Vec<String> = fixed_qemu_args(arch, kernel)
         .iter()
         .map(|s| s.to_string())
-        .collect()
+        .collect();
+    if kernel == "rng" {
+        args.extend(tpm_device_args(arch));
+        args.extend(hid_device_args(arch));
+    }
+    args
+}
+
+/// A **HID keyboard** for the `rng` kernel, plus the QMP socket used to press
+/// keys on it (docs/TIME-IDENTITY.md 4a).
+///
+/// A keyboard nobody types on produces no events, and an entropy source that is
+/// never exercised is untested code. QEMU can be told to deliver a keystroke
+/// over its monitor protocol, so the test really does receive HID events - the
+/// driver's drain path runs against a device that is actually sending.
+///
+/// The socket path is per ISA so three parallel boots cannot collide.
+fn hid_device_args(arch: Arch) -> Vec<String> {
+    let dev = match arch {
+        Arch::X86_64 => "virtio-keyboard-pci,disable-legacy=on",
+        _ => "virtio-keyboard-device",
+    };
+    let mut args: Vec<String> = Vec::new();
+    if arch != Arch::X86_64 {
+        // The modern virtio-mmio layout, as every other mmio device here needs.
+        args.push("-global".into());
+        args.push("virtio-mmio.force-legacy=false".into());
+    }
+    args.push("-device".into());
+    args.push(dev.into());
+    args.push("-qmp".into());
+    args.push(format!("unix:{},server=on,wait=off", qmp_path(arch)));
+    args
+}
+
+/// Where the QMP socket for this ISA's `rng` boot lives.
+fn qmp_path(arch: Arch) -> String {
+    format!("target/qmp-{}.sock", arch.name())
+}
+
+/// A **real TPM 2.0** for the `rng` kernel, so the TPM driver is executed rather
+/// than only written (docs/TIME-IDENTITY.md 4a).
+///
+/// QEMU models the chip but not its behaviour: a `tpm-tis` device needs a
+/// *backend*, and the one that works headlessly is `swtpm`, a software TPM
+/// speaking the same protocol over a socket. So this starts one per ISA (its own
+/// state directory and socket, so three parallel boots cannot collide) and hands
+/// QEMU the chardev.
+///
+/// If `swtpm` is not installed the reason is printed and no TPM is attached: the
+/// kernel then reports firmware describing no TPM, which is true of that machine,
+/// and the phase says so rather than failing. That is the same
+/// observe-what-is-there rule `gpu_device_args` follows for QXL.
+fn tpm_device_args(arch: Arch) -> Vec<String> {
+    if which("swtpm").is_none() {
+        println!(
+            "[xtask] swtpm not installed - no TPM attached, the rng kernel will report one absent"
+        );
+        return Vec::new();
+    }
+    let dir = format!("target/swtpm-{}", arch.name());
+    let sock = format!("{dir}/sock");
+    let _ = std::fs::create_dir_all(&dir);
+    // A stale socket from a previous run points at a dead process, and QEMU's
+    // connect then fails at launch with a zero-byte log - the failure shape the
+    // GPU catalogue comment above warns about.
+    let _ = std::fs::remove_file(&sock);
+    // `--terminate` makes the daemon exit when QEMU disconnects, so a test run
+    // leaves nothing behind.
+    let started = std::process::Command::new("swtpm")
+        .args([
+            "socket",
+            "--tpmstate",
+            &format!("dir={dir}"),
+            "--ctrl",
+            &format!("type=unixio,path={sock}"),
+            "--tpm2",
+            "--daemon",
+            "--terminate",
+        ])
+        .status();
+    // Wait for the socket to appear rather than sleeping a guessed amount: a
+    // deadline, not an iteration count.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !std::path::Path::new(&sock).exists() {
+        if std::time::Instant::now() > deadline {
+            println!("[xtask] swtpm did not create {sock} ({started:?}) - no TPM attached");
+            return Vec::new();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // x86-64 q35 puts the TIS chip on the ISA bus at the architectural
+    // 0xFED40000; arm/riscv `virt` take the MMIO variant, which the machine
+    // places and describes in the device tree.
+    let dev = match arch {
+        Arch::X86_64 => "tpm-tis,tpmdev=tpm0",
+        _ => "tpm-tis-device,tpmdev=tpm0",
+    };
+    [
+        "-chardev",
+        &format!("socket,id=chrtpm,path={sock}"),
+        "-tpmdev",
+        "emulator,id=tpm0,chardev=chrtpm",
+        "-device",
+        dev,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Where a program is on `PATH`, or `None`.
+fn which(prog: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|d| d.join(prog))
+        .find(|p| p.is_file())
 }
 
 /// The GPU device models `gpuhw` attaches, minus the ones this QEMU cannot make.
@@ -3081,6 +3197,60 @@ fn bench(arch: Arch, release: bool) -> bool {
 
 /// Headless boot of one kernel binary: capture serial output, enforce a
 /// timeout, and map the QEMU exit code back to pass/fail.
+/// Press a handful of keys on the guest over QEMU's monitor protocol.
+///
+/// Hand-written JSON over a Unix socket: the four messages are fixed strings and
+/// nothing is parsed back beyond waiting for the greeting, so this needs no JSON
+/// library and xtask stays dependency-free (docs/SUBSTRATE.md 11, Tier K).
+///
+/// Keys are sent **repeatedly over a window** rather than once, because there is
+/// no signal saying when the guest's driver has posted its buffers - an event
+/// delivered before that is dropped by the device. Repeating is free and is
+/// what a person typing looks like anyway.
+fn send_keystrokes(path: &str) {
+    use std::io::{Read, Write};
+    // Wait for QEMU to create the socket. A deadline, not a fixed sleep.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut sock = loop {
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(s) => break s,
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return,
+        }
+    };
+    let _ = sock.set_read_timeout(Some(Duration::from_millis(500)));
+    // QMP sends a greeting, then wants capabilities negotiated before commands.
+    let mut buf = [0u8; 4096];
+    let _ = sock.read(&mut buf);
+    if sock
+        .write_all(b"{\"execute\":\"qmp_capabilities\"}\n")
+        .is_err()
+    {
+        return;
+    }
+    let _ = sock.read(&mut buf);
+
+    // A press and a release of a few different keys, spread over a few seconds.
+    const KEYS: [&str; 4] = ["a", "b", "spc", "ret"];
+    for round in 0..12 {
+        let key = KEYS[round % KEYS.len()];
+        for down in [true, false] {
+            let msg = format!(
+                "{{\"execute\":\"input-send-event\",\"arguments\":{{\"events\":\
+                 [{{\"type\":\"key\",\"data\":{{\"down\":{down},\"key\":\
+                 {{\"type\":\"qcode\",\"data\":\"{key}\"}}}}}}]}}}}\n"
+            );
+            if sock.write_all(msg.as_bytes()).is_err() {
+                return;
+            }
+            let _ = sock.read(&mut buf);
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
 fn boot_expect_pass(arch: Arch, release: bool, bin: &str, extra_args: &[&str]) -> bool {
     let log_path = PathBuf::from(format!("target/qemu-{}-{bin}.log", arch.name()));
     let mut cmd = qemu_command(arch, release, bin);
@@ -3090,6 +3260,11 @@ fn boot_expect_pass(arch: Arch, release: bool, bin: &str, extra_args: &[&str]) -
         .arg(format!("file:{}", log_path.display()));
     cmd.stdin(Stdio::null());
 
+    // A stale QMP socket from a previous run makes QEMU's bind fail at launch.
+    if bin == "rng" {
+        let _ = std::fs::remove_file(qmp_path(arch));
+    }
+
     println!("[xtask] booting {bin} on {} in QEMU", arch.name());
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -3098,6 +3273,15 @@ fn boot_expect_pass(arch: Arch, release: bool, bin: &str, extra_args: &[&str]) -
             return false;
         }
     };
+
+    // Press keys on the guest's HID keyboard, so the virtio-input driver is
+    // exercised by a device that is actually sending (docs/TIME-IDENTITY.md 4a).
+    // In a thread, because the boot must not wait on it: a run where QMP never
+    // answers reports no HID events rather than hanging.
+    if bin == "rng" {
+        let path = qmp_path(arch);
+        std::thread::spawn(move || send_keystrokes(&path));
+    }
 
     // Poll for exit with a deadline; kill on timeout so CI never hangs.
     let deadline = Instant::now() + TEST_TIMEOUT;

@@ -848,6 +848,9 @@ unsafe extern "C" {
     /// `smc #0`, behind a temporary exception vector that catches a trap. Returns
     /// the PSCI return value, or [`PSCI_TRAPPED`] if the conduit trapped.
     fn psci_call_guarded(conduit: u64, fnid: u64, a1: u64, a2: u64, a3: u64) -> u64;
+    /// A 32-bit MMIO read behind the same temporary exception vector; returns
+    /// [`PSCI_TRAPPED`] when the access aborted.
+    fn mmio_probe_u32_guarded(va: u64) -> u64;
 }
 
 #[cfg(feature = "smp")]
@@ -857,6 +860,28 @@ unsafe extern "C" {
     /// `.boot.bss` slots (identity low) where the primary publishes MAIR/TCR/SCTLR
     /// for the secondary to adopt verbatim - see the header of smp.S.
     static AP_SYSREGS: u64;
+}
+
+/// Read a 32-bit device register, catching a fault instead of dying on it.
+///
+/// `None` when the access aborted - which is what an address nothing decodes
+/// produces on ARM64. Used by the TPM probe, whose register base on this ISA
+/// comes from a built-in machine profile rather than a firmware table, so a
+/// wrong constant must be observed rather than fatal.
+///
+/// # Safety
+/// `va` must be a mapped address; the guard catches an *external* abort from a
+/// device that is not there, not a translation fault from an unmapped page.
+pub unsafe fn mmio_probe_u32(va: usize) -> Option<u32> {
+    // SAFETY: delegated to the caller; the helper installs a temporary vector
+    // table so a bus abort returns a sentinel instead of reaching the fatal
+    // synchronous handler.
+    let v = unsafe { mmio_probe_u32_guarded(va as u64) };
+    if v == PSCI_TRAPPED {
+        None
+    } else {
+        Some(v as u32)
+    }
 }
 
 /// Sentinel returned by [`psci_call_guarded`] when the conduit trapped to EL1.
@@ -1086,6 +1111,19 @@ pub fn cpu_report(_inv: &crate::hw::Inventory) -> crate::hw::CpuReport {
 // ---------------------------------------------------- virtio-mmio slots
 // QEMU arm `virt`: 32 virtio-mmio transports at 0x0a00_0000, stride 0x200
 // (within the 1 GiB device block the kernel identity-maps).
+/// A TPM's TIS register base to **probe** where no firmware table describes one.
+///
+/// 0 means "nothing to try": on x86-64 the ACPI TPM2 table answers, and on
+/// RISC-V the device tree does. ARM64 is the exception - a bare-ELF `-kernel`
+/// boot on `virt` is handed no device-tree pointer at all (docs/SMP.md), so its
+/// machine profile is built in here, as the rest of that profile already is.
+///
+/// It is a **candidate, not a claim**: `hw::tpm` maps it and reads
+/// `TPM_DID_VID`, and a window with no chip behind it reads all-ones or
+/// all-zeros and is reported absent. So a wrong constant, or a machine with no
+/// TPM, produces "no TPM" rather than a fabricated one.
+pub const TPM_TIS_CANDIDATE: u64 = 0x0c00_0000;
+
 pub const VIRTIO_MMIO_BASE: usize = 0x0a00_0000 | KERNEL_VA_BASE;
 pub const VIRTIO_MMIO_STRIDE: usize = 0x200;
 pub const VIRTIO_MMIO_COUNT: usize = 32;

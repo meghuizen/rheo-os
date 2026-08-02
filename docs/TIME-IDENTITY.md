@@ -176,10 +176,11 @@ source seed the machine.
 | Source | Credited | Why |
 |---|---|---|
 | CPU instruction (RDSEED / RNDR / Zkr `seed`) | full | after the SP 800-90B health tests |
-| RNG device (virtio-rng, TRNG/TPM chip) | full | a device whose whole purpose is randomness |
+| RNG device (virtio-rng, **TPM**) | full | a device whose whole purpose is randomness |
 | Firmware boot seed (`/chosen/rng-seed`) | full | a bootloader that lied had already loaded the kernel |
 | Jitter (`rng::jitter`) | 1 bit/sample | **only** when its own health tests pass |
 | NIC / NVMe / disk / UART event timing | none | real, but unmeasured |
+| **HID events** (keyboard, mouse) | none | a person typing - real, and no way to measure it |
 | A program writing `/dev/urandom` | none | exactly Linux's rule |
 | Boot cycle counter | none | deterministic under emulation |
 
@@ -257,6 +258,157 @@ uses (virtio-mmio on arm/riscv `virt`, virtio-pci through the
 a driver, not a per-ISA workaround, which is what TARGET-ARCHITECTURES.md 4
 requires.
 
+### The pool names no driver
+
+A randomness device **registers** with the pool
+(`entropy::register_device_source`) and the pool asks every registered one. It
+used to call `hw::virtio_rng::refill()` by name, which put a driver's name
+inside the entropy subsystem - the shape `svc::Bridge` exists to avoid, and the
+same reason the queue's opcode dispatch names no driver. Adding the TPM below
+therefore changed **no line** of the pool.
+
+### The TPM
+
+`kernel/src/hw/tpm.rs` drives the **FIFO/TIS** register interface from the TCG
+*PC Client Platform TPM Profile*, and one command from the TPM 2.0 Library
+specification: `TPM2_GetRandom`. That is the whole driver - its job is to ask the
+chip for random bytes, not to be a TPM stack.
+
+A TPM is required by its own specification to contain a hardware RNG, and it is
+the one randomness source on a server that is neither the CPU vendor's
+instruction nor a paravirtual device. That independence is exactly why the pool
+exists.
+
+Discovery is firmware's:
+
+| ISA | Where the register base comes from |
+|---|---|
+| x86-64 | the ACPI `TPM2` table; start method 6 is FIFO/TIS at the PTP's fixed `0xFED4_0000`, 7 and 8 are CRB |
+| RISC-V | a device-tree node whose `compatible` contains `tcg,tpm-tis-mmio` |
+| ARM64 | **no firmware table exists** - a bare-ELF `-kernel` boot gets no device tree - so `arch::TPM_TIS_CANDIDATE` carries the built-in machine profile, as the rest of that ISA's profile already does |
+
+The ARM64 candidate is **probed, not asserted**: the driver maps it and reads
+`TPM_DID_VID`, and a window with no chip reads all-ones or all-zeros and is
+reported absent. That read is *guarded* (`arch::mmio_probe_u32`), because an
+address nothing decodes raises an external abort on ARM64 that would kill the
+boot - the first version did exactly that when the constant was changed, which
+is how the guard came to exist. It reuses the temporary exception vector the
+PSCI conduit probe already installs.
+
+The RISC-V path needed one real fix on the way: the TPM sits on a
+`platform-bus`, so its `reg` is **bus-relative** and needs the parent's `ranges`
+translation. Read as an absolute address it was physical 0. The device-tree
+walker now applies a one-level `ranges` offset with per-depth `#address-cells` -
+and resolves it *lazily*, when a child asks, because QEMU writes `ranges` before
+`#address-cells` and a device tree may write them in either order. Deliberately
+scoped to this lookup: the memory and CPU nodes are children of the root, where
+the translation is the identity.
+
+CRB is **recognised and not driven**: a different register file with a different
+handshake. Firmware reporting it makes the boot say "a TPM is present and
+undriven", which is truer than reporting no TPM.
+
+Measured on **all three ISAs** with `swtpm` as the backend: `TPM2_Startup` (the
+chip is handed to us unstarted, so the `TPM_RC_INITIALIZE` retry is exercised
+every run) then `TPM2_GetRandom` returning 32 bytes, then 32 *different* ones.
+Vendor/device `0x00011014`.
+
+### HID devices
+
+`kernel/src/hw/virtio_input.rs` drives virtio-input (keyboard, mouse, tablet).
+When a person presses a key, and which key, is unpredictable in a way no
+deterministic machine reproduces - the source Linux has collected since its
+first `/dev/random`, and one of the few a board with no randomness hardware has
+at all. `rng::feed_hid` is named apart from `feed_interrupt` even though both
+land in the same uncredited scratch, because they are different claims: one is a
+machine's own timing, the other is a person.
+
+Two virtqueues in the spec, one used: the driver posts writable buffers on the
+**eventq** and drains eight-byte events, handing each buffer straight back. It
+does not interpret key codes - it is an entropy tap, not a keyboard driver. No
+interrupt, deliberately: a line raised on every keystroke of a busy typist, for
+a source credited **zero**, buys nothing the drain-time cycle counter does not.
+
+**It is not a keylogger, by construction.** Only the *arrival* of an event is
+mixed, never what the event said: `rng::feed_hid` takes a **sequence number and
+no event**, so a caller cannot pass a key code even by mistake - a property a
+reviewer checks in one line, rather than a promise about what callers do. The
+same rule applies to the console byte path, which used to pass the byte. The
+event buffer is wiped as it is drained, so a keystroke does not sit in kernel
+memory waiting for the device to overwrite it (asserted:
+`virtio_input::buffers_clear`).
+
+That costs nothing. The unpredictability is in *when* a key was pressed, not
+which one - a key code is a few bits of highly skewed, guessable text. Mixing it
+would put what a person typed into kernel state for a source credited **zero**.
+
+**Proven with real keystrokes.** A keyboard nobody types on produces no events,
+and an entropy source never exercised is untested code - so `xtask` attaches a
+virtio keyboard and presses keys on it over QEMU's monitor protocol (hand-written
+JSON over a Unix socket; four fixed messages and nothing parsed back, so xtask
+stays dependency-free). Keys are sent repeatedly over a window rather than once,
+because nothing signals when the guest has posted its buffers and an event
+delivered before that is dropped. On all three ISAs the kernel reads the device's
+own name out of config space (`QEMU Virtio Keyboard` - a real round trip that
+works even with nobody typing) and receives **4 key events** into the pool. The
+wait is a deadline and a run with no keystroke reports that rather than failing:
+the injector is a separate process and cannot be a precondition of the kernel
+being correct.
+
+### An attacker who knows the state
+
+Three different attacks, three different answers.
+
+**Past output, after the state is captured.** Fast key erasure covers it, in both
+its rules: the key is replaced from its own output on every refill, and each byte
+is erased from the buffer as it is handed out. An attacker holding the state
+learns nothing about anything already delivered.
+
+**Future output, after the state is captured.** This is recovery, and it needed a
+fix. A re-key only happened when the pool reached a full 256 *credited* bits, so a
+machine whose credited sources had gone quiet would keep a captured key for the
+rest of the boot. A root is now re-keyed after at most `REKEY_EVERY` derivations
+**whatever the pool holds** - everything absorbed since the last re-key (every
+device interrupt, HID arrival, `/dev/urandom` write, cycle-counter read) goes into
+the new key, none of it counted, because "is this machine seeded" and "should this
+key move" are different questions.
+
+Honest about the strength: a re-key that mixes only uncredited input is a *chance*
+of recovery, not a guarantee - on a machine whose every input is predictable to
+the attacker it moves the key to another one they can compute. What it removes is
+"compromised forever", which is what a bound can do. `rng::rekeys()` counts them,
+and the `rng` kernel asserts the counter moves.
+
+**Influencing the outcome.** An attacker who can write to the pool cannot weaken
+it: the absorb step is non-decreasing in both directions, and a source they
+control credits **zero**, so it cannot make the machine claim to be seeded. What
+no design can survive is an attacker who controls *every* credited source - if
+RDSEED is backdoored and it is the only source, the machine is theirs. The answer
+is independence, and the first key is where it matters most: `seed_from_all()`
+asks the CPU instruction **and** every randomness device **and** the jitter source
+before the first extract, rather than stopping at whichever answered first. So
+compromising one source is not enough.
+
+### Quantum computers
+
+- **Shor's algorithm does not apply.** There is no public-key structure anywhere
+  in this path - no RSA, no elliptic curve, no discrete log. It is a stream
+  cipher and a mixing function.
+- **Grover's algorithm halves symmetric strength.** A 256-bit ChaCha20 key gives
+  about 128 bits against a quantum adversary, which is the margin NIST treats as
+  adequate and the reason the pool's target is the **full key width**. A 128-bit
+  seed would be the actual weakness, so `CREDIT_TARGET == 256` is asserted rather
+  than assumed.
+- **The primitive is unchanged and stays unchanged.** Post-quantum work belongs
+  in *key exchange* (N3b's TLS), not here; swapping ChaCha20 for something
+  heavier would cost the speed that makes a read a library call and buy nothing
+  Grover has not already been accounted for.
+
+Two side channels worth naming as handled: ChaCha20 here is pure integer ARX with
+**no lookup tables and no secret-dependent branches**, so a timing or cache
+observer learns nothing; and the read path takes **no lock**, so one core's draw
+rate tells another nothing.
+
 ### The boot health check
 
 `rng::health::check()` runs on **every** boot, right after the root is keyed.
@@ -315,6 +467,11 @@ to each launch. Six controls observed firing:
 | Jitter never credits without passing its checks | delete the three checks -> "credited 17 bits with a run of 5 identical deltas" |
 | The boot KAT catches a broken ChaCha20 | flip one byte of the vector -> every boot panics |
 | The device is what seeds RISC-V | detach it -> `seed_source=Fallback seeded=false` |
+| The TPM really executes a command | change the command code -> `GetRandom returned rc 0x95` |
+| The ARM64 candidate is a candidate | point it at an undecoded address -> "no TPM", boot survives |
+| HID events reach the pool | drop the `feed_hid` call -> "4 HID events arrived but none reached the pool" |
+| A drained keystroke is wiped | remove the wipe -> "still sitting in the kernel's buffer" |
+| A root cannot stay compromised | remove the lifetime bound -> "16392 derivations without a re-key" |
 | A delivered byte is erased from the buffer | drop the wipe in `fill_bytes` -> "delivered bytes still in the buffer" |
 | The firmware seed is fed, not just captured | keep the capture, skip the absorb -> "32 seed bytes but none were credited" |
 

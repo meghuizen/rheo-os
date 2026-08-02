@@ -26,8 +26,10 @@ pub mod iommu;
 pub mod nvme;
 pub mod pci;
 pub mod smmuv3;
+pub mod tpm;
 pub mod virtio_blk;
 pub mod virtio_gpu;
+pub mod virtio_input;
 pub mod virtio_net;
 pub mod virtio_rng;
 
@@ -287,6 +289,24 @@ pub struct Inventory {
     pub pci: [PciDevice; MAX_PCI_DEVICES],
     pub ngpu: usize,
     pub gpus: [gpu::GpuDevice; MAX_GPUS],
+    /// Base address of the TPM's register file, 0 if firmware reported none.
+    /// From the ACPI TPM2 table on x86-64, or a `tcg,tpm-tis-mmio` device-tree
+    /// node on arm/riscv (docs/TIME-IDENTITY.md 4a).
+    pub tpm_base: u64,
+    /// Which register interface that base speaks.
+    pub tpm_iface: TpmInterface,
+}
+
+/// The TPM's register interface, per the TCG PC Client Platform TPM Profile.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum TpmInterface {
+    /// No TPM reported by firmware.
+    None,
+    /// FIFO / TIS: the classic register file with a byte-at-a-time data FIFO.
+    Tis,
+    /// CRB: the Command Response Buffer interface. Recognised and **not**
+    /// driven - see `hw::tpm`, which says so rather than pretending.
+    Crb,
 }
 
 impl Inventory {
@@ -345,6 +365,8 @@ impl Inventory {
                 pcie: false,
                 flr: false,
             }; MAX_PCI_DEVICES],
+            tpm_base: 0,
+            tpm_iface: TpmInterface::None,
             ngpu: 0,
             gpus: [gpu::GpuDevice::EMPTY; MAX_GPUS],
         }
