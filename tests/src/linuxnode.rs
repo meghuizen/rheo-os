@@ -30,12 +30,19 @@ extern "C" fn kernel_main() -> ! {
     disk_runtime::prove(
         "linuxnode",
         "/bin/node",
-        &[
-            b"node",
-            b"--no-expose-wasm",
-            b"-e",
-            b"console.log(\"rheo:\"+(40+2))",
-        ],
+        // A real multi-file program off the disk rather than an inline `-e` string:
+        // `/app/main.js` does `require('greeter')`, a **bare specifier**, which drives
+        // Node's full npm-style module resolution - walk `node_modules`, read the
+        // package's `package.json`, follow its `main` field to `index.js` - plus the
+        // `path` builtin. That is how an npm-installed dependency loads, so it proves
+        // the resolver npm and Claude Code stand on, reading a package's metadata and
+        // entry file off the live ext4 disk.
+        //
+        // The assertion is unchanged (`rheo:42` = `path.basename('/bin/rheo')` + ':' +
+        // the reduce of `[10,20,12]`), so this is strictly more demanding than the
+        // string it replaces rather than a different claim. The `/app` tree is seeded
+        // into the image by xtask's `build_node_disk_fixture`.
+        &[b"node", b"--no-expose-wasm", b"/app/main.js"],
         &[
             b"LD_LIBRARY_PATH=/lib:/lib64",
             b"PATH=/bin",

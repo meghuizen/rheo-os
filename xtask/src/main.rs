@@ -2289,6 +2289,32 @@ fn build_dyn_disk_fixture(arch: Arch, out_dir: &str) {
 /// off a live virtio-blk disk by the `linuxnode` test. Thin caller of
 /// [`build_runtime_disk_fixture`].
 fn build_node_disk_fixture(arch: Arch, out_dir: &str) {
+    // A real multi-file program resolving an **npm-style package**, staged on the host
+    // and written into the image below. `/app/main.js` does `require('greeter')` - a
+    // *bare specifier*, which drives Node's full resolution: walk `node_modules`, read
+    // the package's `package.json`, follow its `main` field to `index.js`. That is how
+    // an npm-installed dependency loads, so it exercises the resolver npm and Claude
+    // Code stand on, reading a package's metadata and entry file off the live disk
+    // rather than evaluating an inline `-e` string.
+    //
+    // Ported from the `claude-md-test-pipelines` branch. A cherry-pick was not possible:
+    // that branch's `linuxnode` predates this one's JIT-enabled run, so its version of
+    // the test would have reverted `node` to `--jitless`.
+    if arch == Arch::X86_64 {
+        let main_js = "const greeter = require('greeter');\n\
+             const path = require('path');\n\
+             console.log(path.basename('/bin/rheo') + ':' + greeter.answer([10, 20, 12]));\n";
+        let greeter_index =
+            "module.exports = { answer: (arr) => arr.reduce((a, b) => a + b, 0) };\n";
+        let greeter_pkg =
+            "{ \"name\": \"greeter\", \"version\": \"1.0.0\", \"main\": \"index.js\" }\n";
+        let _ = std::fs::write(format!("{out_dir}/node-main.js"), main_js);
+        let _ = std::fs::write(format!("{out_dir}/node-greeter-index.js"), greeter_index);
+        let _ = std::fs::write(format!("{out_dir}/node-greeter-pkg.json"), greeter_pkg);
+    }
+    let main_src = format!("{out_dir}/node-main.js");
+    let gi_src = format!("{out_dir}/node-greeter-index.js");
+    let gp_src = format!("{out_dir}/node-greeter-pkg.json");
     build_runtime_disk_fixture(
         arch,
         out_dir,
@@ -2304,7 +2330,11 @@ fn build_node_disk_fixture(arch: Arch, out_dir: &str) {
             "libstdc++.so.6",
             "libgcc_s.so.1",
         ],
-        &[],
+        &[
+            (main_src.as_str(), "app/main.js"),
+            (gi_src.as_str(), "app/node_modules/greeter/index.js"),
+            (gp_src.as_str(), "app/node_modules/greeter/package.json"),
+        ],
     );
 }
 
@@ -2484,6 +2514,24 @@ fn build_runtime_disk_fixture(
     debugfs(&format!("write {INTERP_SRC} lib64/ld-linux-x86-64.so.2"));
     for l in libs {
         debugfs(&format!("write {LIBDIR}/{l} lib/{l}"));
+    }
+    // Create every parent directory of every destination, **shallowest first**:
+    // `debugfs mkdir` does not create parents, so a nested payload like
+    // `app/node_modules/greeter/index.js` needs each level made in order. Ported from
+    // the `claude-md-test-pipelines` branch, which needed it for the same reason.
+    let mut dirs: Vec<String> = Vec::new();
+    for (_, dest) in extras {
+        let parts: Vec<&str> = dest.split('/').collect();
+        for i in 1..parts.len() {
+            let d = parts[..i].join("/");
+            if !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+    }
+    dirs.sort_by_key(|d| d.matches('/').count());
+    for d in &dirs {
+        debugfs(&format!("mkdir /{d}"));
     }
     for (src, dstpath) in extras {
         if exists(src) {
