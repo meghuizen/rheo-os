@@ -1057,6 +1057,8 @@ fn main() -> ExitCode {
         "check" => arches.iter().all(|&a| check(a)),
         // Host-side model checking of kernel state machines (see `verify`).
         "verify" => verify(),
+        // Report the kernel's largest static allocations (see `sizes`).
+        "sizes" => arches.iter().all(|&a| sizes(a, &bin)),
         // Patch the toolchain's vendored rust-src to add `target_os = "rheo"`
         // so `std` can be built for the rheo-os target (docs/USERLAND.md M4).
         // Idempotent; run once per toolchain before building std programs.
@@ -1076,9 +1078,85 @@ fn main() -> ExitCode {
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo xtask <build|check|run|test|bench|verify|std-patch> \
+        "usage: cargo xtask <build|check|run|test|bench|verify|sizes|std-patch> \
          [--arch x86_64|aarch64|riscv64|all] [--bin <kernel>[,<kernel>...]] [--release]"
     );
+}
+
+/// Report the largest **static allocations** in a built kernel, biggest last.
+///
+/// Why this is a command rather than a thing you work out each time: a recurring question
+/// in this tree is "what is this fixed table actually costing", because the answer decides
+/// whether a ceiling is worth removing and what shape the replacement should be
+/// (docs/EXECUTION-MODEL.md 9.3 refused the obvious design on exactly such a number - one
+/// funded table per cell would have spent 256 KiB of frames to save 21 KiB of `.bss`).
+///
+/// The way that question kept getting answered was by adding a throwaway
+/// `const _: [(); 0] = [(); size_of::<T>()];`, reading the size out of the compile error,
+/// and deleting it again - which is slow, tells you about one type at a time rather than
+/// about the binary, and has a genuine failure mode: undoing it with `git checkout <file>`
+/// discards every other edit in the file, which happened once in this tree and cost a
+/// completed refactor.
+///
+/// `nm` already knows. This reads the symbol table of a kernel that is already built and
+/// prints the `.bss`/`.data` symbols by size, so the question is one command and touches
+/// no source at all.
+fn sizes(arch: Arch, bin: &str) -> bool {
+    // `smp` by default: it links the widest set of kernel subsystems, so its statics are
+    // the closest thing to "the kernel's".
+    let bin = if bin.is_empty() { "smp" } else { bin };
+    let path = format!("target/{}/release/{bin}", arch.target());
+    if !std::path::Path::new(&path).exists() {
+        eprintln!(
+            "[xtask] {} {bin}: not built - run `cargo xtask build --arch {}` first",
+            arch.name(),
+            arch.name()
+        );
+        return false;
+    }
+    // `-C` demangles, `-S` prints sizes, `--size-sort` orders by them. Symbols with no
+    // size (most code labels) are omitted by `-S`, which is what leaves the tables.
+    let out = match Command::new("nm")
+        .args(["-C", "-S", "--size-sort", &path])
+        .output()
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => {
+            eprintln!("[xtask] {}: `nm` failed on {path}", arch.name());
+            return false;
+        }
+    };
+    let text = String::from_utf8_lossy(&out);
+    let mut rows: Vec<(u64, &str, char)> = Vec::new();
+    for line in text.lines() {
+        // "<addr> <size> <kind> <name>"; kind b/B is .bss, d/D/g/G is .data.
+        let mut f = line.splitn(4, ' ');
+        let (_, size, kind, name) = match (f.next(), f.next(), f.next(), f.next()) {
+            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+            _ => continue,
+        };
+        let kind = kind.chars().next().unwrap_or('?');
+        if !matches!(kind, 'b' | 'B' | 'd' | 'D' | 'g' | 'G') {
+            continue;
+        }
+        let Ok(size) = u64::from_str_radix(size.trim(), 16) else {
+            continue;
+        };
+        rows.push((size, name.trim(), kind));
+    }
+    rows.sort_by_key(|r| r.0);
+    let total: u64 = rows.iter().map(|r| r.0).sum();
+    // Biggest last, so the interesting end is next to the prompt.
+    let shown = rows.len().min(25);
+    println!(
+        "[xtask] {} {bin}: {} static symbol(s), {total} bytes",
+        arch.name(),
+        rows.len()
+    );
+    for (size, name, kind) in rows.iter().skip(rows.len() - shown) {
+        println!("  {size:>10}  {kind}  {name}");
+    }
+    true
 }
 
 /// Host-side model checking of the kernel state machines that are integer-only and

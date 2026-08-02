@@ -2988,6 +2988,7 @@ cargo xtask test  --arch all                            # boot every test kernel
 cargo xtask test  --arch riscv64 --bin schedidle,netwait # boot only these (iterate)
 cargo xtask bench --arch all                            # icount path lengths (always release)
 cargo xtask verify                                      # host model-check the kernel state machines (seconds, no QEMU)
+cargo xtask sizes --arch x86_64 [--bin smp]             # the kernel's largest static allocations, biggest last
 cargo fmt --all                                         # format (CI-gated)
 cargo clippy -p xtask -- -D warnings                    # lint host code (CI-gated)
 ```
