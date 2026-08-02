@@ -527,6 +527,23 @@ pub fn release_cell(cell: usize) {
     set_cur_thread(cell, 0);
 }
 
+/// How many contexts across all cells currently hold a scheduler entity.
+///
+/// Counted from the **thread** side, so a proof about the entity table can compare two
+/// independently computed numbers rather than asking one structure about itself. It
+/// exists because retiring the derived-id band left native and Linux ids in one range,
+/// and "which of these entities are Linux contexts" stopped being answerable by
+/// arithmetic (docs/EXECUTION-MODEL.md 9.4).
+pub fn live_entities() -> usize {
+    (0..MAX_CELLS)
+        .map(|cell| {
+            (0..capacity(cell))
+                .filter(|&i| threads(cell)[i].entity != 0)
+                .count()
+        })
+        .sum()
+}
+
 /// Hand back every context's entity for `cell`.
 ///
 /// **The same lesson as the frames above, one level along**: `release_cell`'s own comment

@@ -765,12 +765,83 @@ whole `vqp` array while setting `nvcores: 1`, so slots `1..` held live pointers 
 parent's other rings that nothing could reach and nothing cleared. A record makes that
 impossible to write by accident.
 
-**What this stage does *not* do.** `MAX_VCORES` is still a bound, in three remaining places:
-the assert in `install_vcore`, the entity id stride `cell * MAX_VCORES + vcore`, and the
-placement queue's vid packing in `smp`. The last two are the same encoding written twice -
-two places deciding one thing, the defect class this whole section exists to remove - and
-retiring them is what actually lifts the ceiling. That is the next stage, and its gate is a
-cell with **more than 16** contexts running.
+### 9.4 `MAX_VCORES` is gone
+
+9.3 left the constant bounding three things. Retiring them is what actually lifts the
+ceiling, and it turned out to be four, because the largest one was hiding in plain sight.
+
+**The 1 MiB E4 claimed to remove was still being paid.** `CELL_FP` was
+`[FpArea; MAX_CELLS * MAX_VCORES]` - one 4 KiB area per *possible* context - and it stayed on
+as a fallback after the areas became funded. So the static E4 exists to delete was still
+there, in full, and the frame each context funds was on top of it. It is now a **single**
+area, and single deliberately: sharing one between two live contexts is not a degraded mode,
+it is the `SYS_YIELD` FP defect exactly (each core saving over the other's register image, no
+fault, no log), so no size of fallback table is correct and keeping 256 of them only made the
+bug rarer. `attach_entity` refuses to create a context whose area cannot be funded, so nothing
+reaches it, and `user::fp_fallbacks()` is how "nothing reaches it" is *measured* rather than
+assumed.
+
+**The id stride was the real ceiling.** `entity_of(cell, v) = cell * MAX_VCORES + vcore` is
+what E2 called "the identity, not a mapping", and that was true and worth having - but a
+derived id is a **stride**, and a stride is a hard cap on contexts per cell that no amount of
+funding can lift. Worse, the same arithmetic was written a *second* time, in `smp`'s placement
+queue, which packed and unpacked `cell * MAX_VCORES + vcore` independently. Two places
+deciding one thing is the defect class this whole section exists to remove, so the derivation
+had already failed at the one job it was doing.
+
+Ids are **allocated** now, by the same `EntityTable::create` the Linux side already used, and
+stored in the context's own record. A stored id is not a second copy of a fact; it is a
+handle, the way a page-table base is. The reverse direction needs no mapping either, because
+the entity records `(cell, context)` itself - which is what lets the placement queue carry
+entity ids instead of a second encoding. So E3's "two ways of obtaining an id" collapses back
+to one: one allocator, one table, `create_at` and the reserved band deleted.
+
+**Id 0 means "no context"**, and that is load-bearing rather than a convention: an id is
+stored in a funded table, a funded table grows into *zeroed* frames, so the value a fresh slot
+reads must be the one that means empty.
+
+Reserving it immediately found a latent defect no allocation pattern had produced before, and
+`verify/entity` found it rather than a boot: `Funded` grows by whole frames, and an all-zero
+`Entity` is **not** `Entity::EMPTY` - `owner` and `inside` want `NO_CPU`/`NOT_INSIDE`, which
+are `u16::MAX` - so a slot grown past but never written reads as "free, owned by CPU 0,
+entered by CPU 0". Invariant I7 exists for exactly that and fired on nine scenarios. `create`
+now initialises every slot a growth adds, which is the same rule 9.3 applied to `Vcore` and
+`Wait`: **write the record, never trust the frame**.
+
+`nproc::Proc`'s two arrays got 9.3's treatment at the same time - 656 bytes to 56.
+
+**Measured, end to end:**
+
+| | before | after |
+|---|---|---|
+| `RunCell` | 840 B | 184 B |
+| `nproc::Proc` | 656 B | 56 B |
+| per-cell scaffolding, `.bss` | 21,504 B | 1,408 B |
+| `CELL_FP` fallback, `.bss` | 1,048,576 B | 4,096 B |
+
+**The one bound that survived is a real one**, and it says so where it lives: each context
+that wants a *mapped queue ring* needs `QueuePair::REGION_SIZE` of the cell's address space,
+and the window is 4 GiB. That is `load::MAX_QUEUE_VCORES` now. `MAX_VCORES` was the wrong home
+for it twice over - it made an address-space question look like a scheduler question, and it
+bounded the contexts *without* rings by the same number.
+
+What bounds a cell's context count now is the cell's own frame budget, refused cleanly by
+`Funded::reserve` and `fund_fp`.
+
+**Proven** by `smp`'s E4 phase with **25 contexts on one cell** - past where the constant was -
+costing 26 frames (2 table frames once, then one FP area each) and returning all 27, on all
+three ISAs; and by the entity round trip, which replaced "the id decomposes arithmetically"
+with "the entity's `(cell, context)` and that context's recorded id agree, in both
+directions". Four controls observed firing: skipping the grown-slot initialisation fails 9
+`verify/entity` scenarios; restoring the stride in `entity_of` panics `smp`; not storing the
+allocated id panics `smp`; not releasing the funded tail fails the frame oracle by name
+(`returned 25, want 27`).
+
+One test-side consequence worth recording, because it changed what a proof could ask: with one
+allocator, "which of these entities are Linux contexts" stopped being an arithmetic question,
+and a Linux cell holds *two* entities (its native vcore 0 and its context 0). `linuxthreads`
+now counts contexts on the **thread** side and entities on the **table** side and compares two
+independently computed numbers, which is a better proof than the id-band filter it replaced.
 
 ---
 

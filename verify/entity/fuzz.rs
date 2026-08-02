@@ -391,7 +391,7 @@ fn gen_op(st: &mut u64, cap: usize) -> Op {
 
 fn run(seq: &[Op], edges: &mut HashSet<&'static str>) -> Result<(), (usize, String)> {
     let mut t = EntityTable::new();
-    t.init(Owner::cell(0), CPUS, 0);
+    t.init(Owner::cell(0), CPUS);
     let mut m = Model::new();
     for (i, &op) in seq.iter().enumerate() {
         if let Err(e) = apply(&mut t, &mut m, op) {
@@ -444,7 +444,7 @@ type Scenario = (&'static str, fn() -> Result<(), String>);
 
 fn fresh() -> (EntityTable, Model) {
     let mut t = EntityTable::new();
-    t.init(Owner::cell(0), CPUS, 0);
+    t.init(Owner::cell(0), CPUS);
     (t, Model::new())
 }
 
@@ -632,8 +632,12 @@ fn sc_budget_exhaustion() -> Result<(), String> {
             return Err("creation never refused - the budget cap is not enforced".into());
         }
     }
-    if made != MAX_ENTITIES {
-        return Err(format!("created {made}, expected exactly {MAX_ENTITIES}"));
+    // One short of the table, because **id 0 is reserved as "no context"**: an entity id is
+    // stored in a funded table and a funded table grows into zeroed frames, so the value a
+    // fresh slot reads has to be the one that means empty (docs/EXECUTION-MODEL.md 9.4).
+    let want = MAX_ENTITIES - 1;
+    if made != want {
+        return Err(format!("created {made}, expected exactly {want}"));
     }
     if let Some(v) = t.check() {
         return Err(format!("the table is inconsistent after a refused create: {v:?}"));

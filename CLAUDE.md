@@ -2818,6 +2818,39 @@ each one after it exactly 1), since one batch could not tell "the table is amort
 "every context allocates a table". It also removed a latent wrong value nothing could see:
 `install_forked` copied the parent's whole `vqp` array while setting `nvcores: 1`, leaving
 live pointers into the parent's other rings that nothing could reach and nothing cleared.
+**And then `MAX_VCORES` was removed outright** (docs/EXECUTION-MODEL.md 9.4). It bounded
+four things, and the largest was hiding in plain sight: `CELL_FP` was still
+`[FpArea; MAX_CELLS * MAX_VCORES]` - **the 1 MiB E4 exists to remove, still paid in full**,
+kept on as a fallback after the areas became funded. It is a *single* counted area now, and
+single deliberately, because sharing one between two live contexts is not a degraded mode -
+it is the `SYS_YIELD` FP defect exactly, so no size of fallback table is correct and keeping
+256 of them only made the bug rarer. The **id stride** was the real ceiling: `entity_of` was
+`cell * MAX_VCORES + vcore`, which E2 rightly called "the identity, not a mapping", but a
+derived id is a stride and a stride caps contexts per cell however much is funded - and the
+same arithmetic was written a *second* time in `smp`'s placement queue, so the derivation had
+already failed at the one job it was doing. Ids are **allocated** now by the one
+`EntityTable::create` the Linux side already used and **stored in the context's own record**;
+the queue carries entity ids; the reverse direction needs no mapping because the entity
+records `(cell, context)` itself; and E3's "two ways of obtaining an id" collapses back to one
+(`create_at` and the reserved band deleted). `nproc::Proc`'s two arrays got the same treatment,
+656 -> 56 bytes. **Id 0 means "no context"**, load-bearing rather than conventional since a
+funded table grows into zeroed frames - and reserving it immediately surfaced a latent defect
+**`verify/entity` caught rather than a boot**: `Funded` grows by whole frames and an all-zero
+`Entity` is *not* `Entity::EMPTY` (`owner`/`inside` want `u16::MAX`), so a slot grown past but
+never written read as "free, owned by CPU 0, entered by CPU 0"; invariant I7 fired on nine
+scenarios, and `create` now initialises every slot a growth adds - the same rule as
+"write the record, never trust the frame". Measured: per-cell scaffolding `.bss` 21,504 ->
+1,408 bytes, `CELL_FP` 1,048,576 -> 4,096 bytes. The **one** surviving per-context bound is a
+real resource and says so where it lives - a mapped queue ring needs address space and the
+window is 4 GiB (`load::MAX_QUEUE_VCORES`); `MAX_VCORES` was the wrong home for it twice over,
+making an address-space question look like a scheduler question and bounding the contexts
+*without* rings by the same number. What bounds a cell's contexts now is its own frame budget,
+refused cleanly. Proven by `smp` with **25 contexts on one cell** - past where the constant was
+- costing 26 frames (2 table frames once, then one area each) and returning all 27, on all
+three ISAs, plus an entity round trip in **both** directions replacing "the id decomposes
+arithmetically". Four controls observed firing: skipping the grown-slot init fails 9
+`verify/entity` scenarios, restoring the stride panics `smp`, not storing the id panics `smp`,
+not releasing the funded tail fails the frame oracle by name.
 **And E3's Linux half landed with it**: `Thread::state` is gone too, `TState`
 surviving only as a *view* computed from the entity, with what stays on the thread being the
 **reason** (`pblock`, `fut_addr`) because a wake source's detail belongs to whoever owns the

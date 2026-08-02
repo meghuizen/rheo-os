@@ -1445,7 +1445,7 @@ unsafe fn drain_cells() {
             // be lost to a stealer, which would count a cell twice and make the
             // counters disagree with where the cell actually ran (observed: 9 claims
             // counted for 8 cells, one of them stolen).
-            count_claim(cell[pos] / crate::user::MAX_VCORES);
+            count_claim(crate::user::entity_pair(cell[pos]).map_or(0, |p| p.0));
             // **Stamp ownership here, not at claim time.** Past the run-mark this core
             // *will* run this vcore and no peer can take it; a batch-time stamp is a
             // claim a stealer can invalidate, and the previous owner has no way to learn
@@ -1473,11 +1473,9 @@ unsafe fn drain_cells() {
             }
             // The caller's contract holds here: a present native cell this core owns
             // exclusively, because the `fetch_add` handed its index to nobody else.
-            let (ec, ev, outcome) = crate::user::run_vcore(
-                cell[pos] / crate::user::MAX_VCORES,
-                cell[pos] % crate::user::MAX_VCORES,
-            );
-            let exited = ec * crate::user::MAX_VCORES + ev;
+            let (rc, rv) = crate::user::entity_pair(cell[pos]).expect("a claimed entity");
+            let (ec, ev, outcome) = crate::user::run_vcore(rc, rv);
+            let exited = crate::user::entity_of(ec, ev);
             let code = code_of(outcome);
             // Attribute the outcome to whichever vcore of the batch ended the run.
             let Some(done) = (0..got).find(|&i| cell[i] == exited && slot[i] != usize::MAX) else {
@@ -1496,13 +1494,11 @@ unsafe fn drain_cells() {
 }
 
 #[cfg(feature = "smp")]
-/// Give the `(cell, vcore)` a queue entry names to CPU `cpu`.
+/// Give the context a queue entry names to CPU `cpu`.
 fn claim_vcore_id(vid: usize, cpu: usize) {
-    crate::user::claim_vcore(
-        vid / crate::user::MAX_VCORES,
-        vid % crate::user::MAX_VCORES,
-        cpu,
-    );
+    if let Some((c, v)) = crate::user::entity_pair(vid) {
+        crate::user::claim_vcore(c, v, cpu);
+    }
 }
 
 #[cfg(feature = "smp")]
@@ -1687,19 +1683,22 @@ pub unsafe fn place_cells_classed(
 /// # Safety
 /// As [`place_cells`].
 unsafe fn place_cells_inner(cells: &[usize], out: &mut [(u64, usize)], preempt: bool) -> bool {
-    // A cell index is the vcore id of its vcore 0, so publishing cells is publishing
-    // vcore ids - one queue, one drain loop (docs/SUBSTRATE.md pillar 3).
+    // Publishing a cell is publishing its vcore 0 - one queue, one drain loop
+    // (docs/SUBSTRATE.md pillar 3). The queue carries **entity ids**: it used to carry
+    // `cell * MAX_VCORES + vcore`, a second copy of the id arithmetic `user::entity_of`
+    // also had, which is the drift that derivation was supposed to prevent
+    // (docs/EXECUTION-MODEL.md 9.4).
     let mut vids = [0usize; MAX_PLACED_CELLS];
     let k = cells.len().min(MAX_PLACED_CELLS);
     for (d, &c) in vids.iter_mut().zip(cells.iter()).take(k) {
-        *d = c * crate::user::MAX_VCORES;
+        *d = crate::user::entity_of(c, 0);
     }
     // SAFETY: the caller's contract.
     unsafe { place_vcores_inner(&vids[..k], out, preempt) }
 }
 
 #[cfg(feature = "smp")]
-/// [`place_cells`], over **vcore ids** (`cell * MAX_VCORES + vcore`) rather than cells.
+/// [`place_cells`], over **entity ids** rather than cells.
 ///
 /// This is what lets one cell occupy several cores: publish two vcores of the same cell
 /// and each is claimed, run and reported independently, because the frame, the kernel
@@ -1731,7 +1730,7 @@ unsafe fn place_vcores_inner(cells: &[usize], out: &mut [(u64, usize)], preempt:
         let mut w = 0usize;
         for (g, end) in PLACE_GROUP_END.iter().enumerate().take(groups) {
             for (i, &c) in cells[..n].iter().enumerate() {
-                let node = crate::user::cell_node(c / crate::user::MAX_VCORES);
+                let node = crate::user::cell_node(crate::user::entity_pair(c).map_or(0, |p| p.0));
                 // A cell with no node - every cell on a single-node machine - belongs
                 // to group 0, the only group there is.
                 let cg = if (node as usize) < groups {

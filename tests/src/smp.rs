@@ -1634,7 +1634,7 @@ fn test_two_vcores_one_cell() {
         assert_eq!(user::cell_vcores(0), 2, "cell 0 does not hold two vcores");
 
         // Publish both vcores of cell 0 as the runnable set.
-        let vids = [0 * user::MAX_VCORES, 0 * user::MAX_VCORES + 1];
+        let vids = [user::entity_of(0, 0), user::entity_of(0, 1)];
         let mut out = [(u64::MAX, usize::MAX); 2];
         let before = user::double_entries();
         // SAFETY: cell 0 is installed, present and native, and each vcore is listed once.
@@ -1972,7 +1972,7 @@ fn test_per_vcore_queues() {
         assert_eq!(vi, 1, "the second vcore did not land at index 1");
         user::set_vcore_queue_info(0, 1, region1 as u64, cap1.raw_low32());
 
-        let vids = [user::MAX_VCORES * 0, user::MAX_VCORES * 0 + 1];
+        let vids = [user::entity_of(0, 0), user::entity_of(0, 1)];
         let mut out = [(u64::MAX, usize::MAX); 2];
         // SAFETY: cell 0 is installed, present and native, each vcore listed once.
         let finished = smp::place_vcores(&vids, &mut out);
@@ -2249,7 +2249,7 @@ fn test_vcore_identity() {
         // ring, which this phase never rings - the identity question is not about queues.
         user::install_vcore(0, (*f).as_mut_ptr(), (*i0).qp.qp.as_ptr());
 
-        let vids = [user::MAX_VCORES * 0, user::MAX_VCORES * 0 + 1];
+        let vids = [user::entity_of(0, 0), user::entity_of(0, 1)];
         let mut out = [(u64::MAX, usize::MAX); 2];
         // SAFETY: cell 0 is installed, present and native, each vcore listed once.
         if !smp::place_vcores(&vids, &mut out) {
@@ -2407,7 +2407,7 @@ fn test_loaded_multi_vcore_cell() {
         assert_eq!(vi, 1, "the second vcore did not land at index 1");
         user::set_vcore_queue_info(0, 1, load::vcore_queue_va(1) as u64, cap1);
 
-        let vids = [user::MAX_VCORES * 0, user::MAX_VCORES * 0 + 1];
+        let vids = [user::entity_of(0, 0), user::entity_of(0, 1)];
         let mut out = [(u64::MAX, usize::MAX); 2];
         // SAFETY: cell 0 is installed, present and native, each vcore listed once.
         if !smp::place_vcores(&vids, &mut out) {
@@ -3233,7 +3233,7 @@ fn test_nvme_per_core_queues() {
 //     express by being cleared on every path - a path that forgot left a core permanently
 //     "inside" a cell nobody was running.
 //  3. Every live entity's owner is a **real CPU or nobody**, and the ids line up with the cells:
-//     an entity is `cell * MAX_VCORES + vcore` rather than an allocated handle, so there is no
+//     an entity id round-trips against the record that holds it, so there is no
 //     mapping to drift.
 fn test_entity_authority() {
     use kernel::sched::entity;
@@ -3270,15 +3270,24 @@ fn test_entity_authority() {
                 );
             }
         }
-        // The id is the identity, not a handle: it must decompose back to the cell and vcore it
-        // was created for. A mapping that drifted would show up here and nowhere else.
+        // The id **round-trips**: the entity says it is `(cell, context)`, and that context's
+        // own record says its entity is this id. It used to be arithmetic (`cell * MAX_VCORES +
+        // vcore`), and the round trip is the same check for an allocated id - one allocator, one
+        // table, and the two directions must agree or something is holding a stale handle.
         assert_eq!(
             id,
             kernel::user::entity_of(e.cell as usize, e.context as usize),
-            "entity {id} says it is cell {} vcore {}, which is entity {}",
+            "entity {id} says it is cell {} context {}, but that context's record names entity {}",
             e.cell,
             e.context,
             kernel::user::entity_of(e.cell as usize, e.context as usize)
+        );
+        // And the reverse direction, which is what replaced the arithmetic: the entity table
+        // alone can say which context an id names, with no mapping kept anywhere else.
+        assert_eq!(
+            kernel::user::entity_pair(id),
+            Some((e.cell as usize, e.context as usize)),
+            "entity {id} does not report the pair it holds"
         );
     }
     assert_eq!(
@@ -3305,8 +3314,8 @@ fn test_entity_authority() {
 
 // ------------- E4: a context's FP area is funded, so the context count is not a constant
 //
-// `MAX_VCORES` was 4, and the reason was not the scheduler: it was the FP/SIMD save areas, a
-// fixed `MAX_CELLS * MAX_VCORES` static at `FP_AREA_LEN` each. On x86-64 that is 256 KiB of
+// `MAX_VCORES` is **gone**, and the reason it existed was never the scheduler: it was the
+// FP/SIMD save areas, a fixed `MAX_CELLS * MAX_VCORES` static at `FP_AREA_LEN` each. On x86-64 that is 256 KiB of
 // `.bss` at four contexts and **4 MiB at sixty-four**, and `.bss` growth in this tree has a scar
 // - moving it once broke an unrelated kernel (docs/ENGINEERING.md 11). So the number was a
 // statement about a static array, defended as though it were a design limit.
@@ -3330,7 +3339,13 @@ fn test_funded_contexts() {
         total - free
     }
 
-    const EXTRA: usize = 6;
+    /// Contexts added past vcore 0. **Deliberately more than the old `MAX_VCORES` of 16**:
+    /// that constant is gone, and the way to show it is gone is to walk past where it was
+    /// (docs/EXECUTION-MODEL.md 9.4). 24 rather than 24,000 because the claim is that the
+    /// bound is the cell's frame budget, and 25 contexts is already past every array
+    /// dimension that used to exist while still costing a measurable, hand-computable
+    /// number of frames.
+    const EXTRA: usize = 24;
 
     // SAFETY: single-threaded setup on the primary; the secondaries are parked in their work
     // loop, and cell slot 1 is free between phases.
@@ -3453,10 +3468,12 @@ fn test_funded_contexts() {
             "smp: E4 - A CONTEXT IS FUNDED, NOT A STATIC - {} contexts on one cell (past the \
              old ceiling of 4) cost {cost} frames from that cell's own budget: {} table frames \
              once, then exactly one FP area per context, each area its own, and all {} returned \
-             when the slot was. `MAX_VCORES` was 4 because the areas were {} bytes of .bss per \
-             context times every cell, and the five per-vcore arrays beside them were another \
-             704 of `RunCell`'s 840 bytes; both are gone and the ceiling is the cell's frame \
-             budget (docs/EXECUTION-MODEL.md 9.3, E4) OK",
+             when the slot was - which is MORE CONTEXTS THAN `MAX_VCORES` EVER ALLOWED, and \
+             that constant no longer exists. It bounded four things: the FP areas ({} bytes \
+             of .bss per context times every cell), the five per-context arrays in `RunCell` \
+             (704 of its 840 bytes), the entity id STRIDE, and a second copy of that stride \
+             in `smp`'s placement queue. All four are gone; a context's ceiling is its cell's \
+             frame budget (docs/EXECUTION-MODEL.md 9.3, 9.4) OK",
             EXTRA + 1,
             TABLE_FRAMES,
             want_back,

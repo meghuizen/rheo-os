@@ -89,6 +89,77 @@ enum Block {
     },
 }
 
+/// What one execution context of a cell is waiting on (docs/EXECUTION-MODEL.md 9.4).
+///
+/// `Block` is the *reason* and stays here rather than on the scheduler entity, because
+/// the entity owns whether a context is parked while the detail of a wake source belongs
+/// to whoever owns the source (the E3 split).
+#[derive(Copy, Clone)]
+struct Wait {
+    /// What this context is parked on.
+    block: Block,
+    /// The child cell it is blocked in `SYS_WAIT` for. Kept beside `block` because
+    /// `complete_block` reaps an awaited zombie on **every** switch-in, including a
+    /// plain `SYS_YIELD` (pre-existing behaviour).
+    child: usize,
+}
+
+impl Wait {
+    const EMPTY: Wait = Wait {
+        block: Block::None,
+        child: 0,
+    };
+}
+
+/// Contexts **past context 0**, funded per cell - the `user::CELL_VCORES` shape, and for
+/// the same reasons: `Proc` is `Copy` while a `Funded` descriptor must never be
+/// raw-copied, a single-context cell must allocate nothing, and a `Wait` is 40 bytes so
+/// funding one table per cell would cost far more than the array it replaces.
+static mut PROC_WAITS: [crate::mm::kmeta::Funded<Wait>; MAX_CELLS] =
+    [const { crate::mm::kmeta::Funded::new() }; MAX_CELLS];
+
+/// Cell `i`'s funded wait tail.
+fn waits(i: usize) -> &'static mut crate::mm::kmeta::Funded<Wait> {
+    // SAFETY: single CPU per cell; a cell belongs to one core.
+    unsafe { &mut (*core::ptr::addr_of_mut!(PROC_WAITS))[i] }
+}
+
+/// Context `v` of cell `i`'s wait record. A context with no record has never blocked,
+/// which reads the same as `Wait::EMPTY`.
+fn wait_of(i: usize, v: usize) -> Wait {
+    if v == 0 {
+        return procs()[i].w0;
+    }
+    waits(i).get(v - 1).unwrap_or(Wait::EMPTY)
+}
+
+/// [`wait_of`], for writing, growing the tail on first use by context `v`.
+///
+/// Growth here rather than at context creation because most contexts never block, and a
+/// table funded for a cell that never parks is a frame spent on nothing. An unfundable
+/// growth returns a scratch record: the caller is registering a wait it cannot record,
+/// so the context stays runnable and retries rather than parking on a condition nobody
+/// would remember - the survivable half of the same refusal `attach_entity` makes fatal.
+fn wait_mut(i: usize, v: usize) -> &'static mut Wait {
+    if v == 0 {
+        return &mut procs()[i].w0;
+    }
+    let t = waits(i);
+    if v > t.capacity() && !t.reserve(v) {
+        // SAFETY: a single static scratch, used only on the refusal path above.
+        return unsafe { &mut *core::ptr::addr_of_mut!(WAIT_SCRATCH) };
+    }
+    // Written whole on first use: `Funded` grows into zeroed frames, and all-zero is a
+    // valid `Wait` only by accident of `Block`'s layout.
+    if t.get(v - 1).is_none() {
+        t.set(v - 1, Wait::EMPTY);
+    }
+    t.get_mut(v - 1).expect("wait slot reserved above")
+}
+
+/// Where an unfundable wait record goes. Never read back as this context's state.
+static mut WAIT_SCRATCH: Wait = Wait::EMPTY;
+
 #[derive(Copy, Clone)]
 struct Proc {
     /// The **cell's** state. `Blocked` means *every* vcore is parked - the condition
@@ -97,18 +168,19 @@ struct Proc {
     state: PState,
     /// Parent cell index, or -1 for the top of the tree (the first spawner).
     parent: i32,
-    /// Per vcore: the child cell this context is blocked in `SYS_WAIT` for.
-    /// Kept alongside `vblock` because `complete_block` reaps an awaited zombie on
-    /// **every** switch-in, including a plain `SYS_YIELD` (pre-existing behaviour).
-    vwait: [usize; user::MAX_VCORES],
-    /// Per vcore: what that context is parked on (docs/SUBSTRATE.md pillar 3).
+    /// **Context 0's** wait record, inline (docs/EXECUTION-MODEL.md 9.4).
     ///
-    /// **Per vcore, not per cell**, and that is the whole of "a vcore can block": with
+    /// This and its funded tail were two `[_; MAX_VCORES]` arrays - 640 of `Proc`'s 656
+    /// bytes - for the same reason `RunCell`'s five were, and they are one record here
+    /// for the same reason: an array dimension is a ceiling, and a cell's context count
+    /// is bounded by its frame budget now.
+    ///
+    /// **Per context, not per cell**, and that is the whole of "a vcore can block": with
     /// one `Block` for the cell, one context parking on a timer would record the wait
     /// for all of them, so a runnable sibling would look blocked and the scheduler
     /// would idle the machine with work available. It is the defect the Linux side
     /// already fixed one level up with per-context `pblock` (docs/LINUX-COMPAT.md).
-    vblock: [Block; user::MAX_VCORES],
+    w0: Wait,
     /// Exit code while `Zombie` (0..=255, or `FAULT_EXIT` for a faulted child).
     code: u64,
 }
@@ -118,8 +190,7 @@ impl Proc {
         Proc {
             state: PState::Free,
             parent: -1,
-            vwait: [0; user::MAX_VCORES],
-            vblock: [Block::None; user::MAX_VCORES],
+            w0: Wait::EMPTY,
             code: 0,
         }
     }
@@ -130,7 +201,7 @@ impl Proc {
 /// **Read from the entity table** (docs/EXECUTION-MODEL.md 9, E3): parked-ness is one fact and
 /// it lives on the entity beside its owner, rather than in a per-personality array that the
 /// scheduler and the personality each had to keep in step. The *reason* stays here in
-/// [`Proc::vblock`] - the table's `wake` is an index, and the detail of a wake source belongs to
+/// [`Wait::block`] - the table's `wake` is an index, and the detail of a wake source belongs to
 /// whoever owns the source.
 fn parked(i: usize, v: usize) -> bool {
     // SAFETY: a read of an entity this core is deciding about.
@@ -223,8 +294,7 @@ fn ensure_top(cell: usize) {
         procs()[cell] = Proc {
             state: PState::Runnable,
             parent: -1,
-            vwait: [0; user::MAX_VCORES],
-            vblock: [Block::None; user::MAX_VCORES],
+            w0: Wait::EMPTY,
             code: 0,
         };
     }
@@ -417,8 +487,7 @@ pub fn spawn(
     procs()[child] = Proc {
         state: PState::Runnable,
         parent: cur as i32,
-        vwait: [0; user::MAX_VCORES],
-        vblock: [Block::None; user::MAX_VCORES],
+        w0: Wait::EMPTY,
         code: 0,
     };
     child as u64
@@ -502,7 +571,7 @@ pub fn wait(cur: usize, handle: u64, _frame: *mut TrapFrame) -> Sched {
     // Park the calling **vcore** and hand the CPU on (to the child, or to a sibling
     // vcore of this cell that is still runnable).
     let v = user::current_vcore();
-    procs()[cur].vwait[v] = child;
+    wait_mut(cur, v).child = child;
     Sched::Switch(park_vcore(cur, v, Block::Wait { child }))
 }
 
@@ -609,7 +678,7 @@ fn park(cur: usize, block: Block) -> Option<*mut TrapFrame> {
 /// them all. A cell with a runnable sibling stays `Runnable`, so the scheduler keeps
 /// seeing it - the whole point (docs/SUBSTRATE.md pillar 3).
 fn park_vcore(cur: usize, v: usize, block: Block) -> *mut TrapFrame {
-    procs()[cur].vblock[v] = block;
+    wait_mut(cur, v).block = block;
     // SAFETY: this core is parking the vcore it is inside.
     unsafe { crate::sched::entity::table() }.park(user::entity_of(cur, v), wake_index(block));
     if all_parked(cur) {
@@ -843,8 +912,7 @@ pub fn retire_vcore(cur: usize, code: u64) -> Option<*mut TrapFrame> {
     // `retire_vcore` above already set the entity `Exited`, which is neither parked nor
     // runnable - so the parked flag has nowhere left to be stale. The block detail is still
     // this module's and is cleared here.
-    procs()[cur].vblock[v] = Block::None;
-    procs()[cur].vwait[v] = 0;
+    *wait_mut(cur, v) = Wait::EMPTY;
     Some(reschedule(cur))
 }
 
@@ -977,7 +1045,7 @@ fn wake_satisfiable() {
 
 /// Whether parked vcore `v` of cell `i` has its condition met now.
 fn satisfiable(i: usize, v: usize) -> bool {
-    match procs()[i].vblock[v] {
+    match wait_of(i, v).block {
         Block::None => false,
         // Pre-existing behaviour, now expressed through `Block`: a `SYS_WAIT`er wakes
         // when its awaited child is a zombie.
@@ -1007,7 +1075,7 @@ fn refresh_deadlines() {
     let mut nearest = [u64::MAX; ktimer::CLIENTS];
     let mut net_nearest = u64::MAX;
     for (i, v) in parked_vcores() {
-        match procs()[i].vblock[v] {
+        match wait_of(i, v).block {
             Block::Timer {
                 deadline_ns,
                 client,
@@ -1083,7 +1151,7 @@ fn parked_vcores() -> impl Iterator<Item = (usize, usize)> {
 
 /// The wake sources vcore `v` of cell `i`'s current block can be satisfied by.
 fn sources_of(i: usize, v: usize) -> idle::Sources {
-    match procs()[i].vblock[v] {
+    match wait_of(i, v).block {
         Block::None => 0,
         Block::Wait { .. } => idle::PEER,
         Block::Timer { .. } => idle::TIMER,
@@ -1123,7 +1191,7 @@ fn report_deadlock(leaving: usize, src: idle::Sources) -> *mut TrapFrame {
 
 /// The name of vcore `v` of cell `i`'s block, for the deadlock diagnostic.
 fn block_name(i: usize, v: usize) -> &'static str {
-    match procs()[i].vblock[v] {
+    match wait_of(i, v).block {
         Block::None => "nothing",
         Block::Wait { .. } => "SYS_WAIT (child exit)",
         Block::Timer { .. } => "SYS_ARM_TIMER (deadline)",
@@ -1139,21 +1207,20 @@ fn block_name(i: usize, v: usize) -> &'static str {
 /// for is reaped on **every** switch-in (including a plain `SYS_YIELD`), keyed on
 /// `wait_for`, because that is what the Phase F/N4a proofs observe.
 fn complete_block(n: usize, v: usize) {
-    let child = procs()[n].vwait[v];
+    let child = wait_of(n, v).child;
     if child < MAX_CELLS
         && procs()[child].state == PState::Zombie
         && procs()[child].parent == n as i32
     {
         let code = reap(child);
-        procs()[n].vwait[v] = 0;
-        procs()[n].vblock[v] = Block::None;
+        *wait_mut(n, v) = Wait::EMPTY;
         let frame = user::vcore_frame(n, v);
         // SAFETY: `frame` is the saved trap frame of `n`'s vcore `v`.
         unsafe { arch::set_syscall_ret(&mut *frame, code) };
         return;
     }
-    let block = procs()[n].vblock[v];
-    procs()[n].vblock[v] = Block::None;
+    let block = wait_of(n, v).block;
+    wait_mut(n, v).block = Block::None;
     let r: u64 = match block {
         Block::None | Block::Wait { .. } => return,
         Block::Timer { client, .. } => {

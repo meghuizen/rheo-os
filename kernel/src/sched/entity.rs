@@ -280,38 +280,30 @@ pub struct EntityTable {
     /// How many CPUs are online, for I2. Set once by the caller; 0 means "unknown",
     /// and I2 is then not checked rather than checked against a wrong bound.
     cpus: u16,
-    /// Ids below this are **derived** - `cell * MAX_VCORES + vcore`, placed by
-    /// [`EntityTable::create_at`] - and [`EntityTable::create`] never allocates one
-    /// (docs/EXECUTION-MODEL.md 9.1).
-    ///
-    /// Two ways of obtaining an id, one table, one authority. A native vcore's id is
-    /// computed from the identity it already has, which is what removes the mapping E2
-    /// exists to delete; a Linux thread's is allocated and stored on the thread, because
-    /// its contexts are bounded by the cell's frame budget rather than by a small stride,
-    /// and widening the stride to cover them costs 1 MiB of dense funded metadata - a
-    /// static array in disguise, measured and refused.
-    ///
-    /// The floor is the correctness half of that split: without it `create` hands out an id
-    /// inside some native cell's reserved range, and a later `create_at` silently overwrites
-    /// a live context.
-    reserved: usize,
 }
+
+/// The lowest id [`EntityTable::create`] will hand out.
+///
+/// **Id 0 means "no context"**, and that is a load-bearing choice rather than a
+/// convention: an entity id is stored in a funded table (`Vcore.entity`,
+/// `Thread.entity`) and a funded table grows into *zeroed* frames, so the value a fresh
+/// slot reads must be the one that means "empty". Reserving 0 is what makes the zero
+/// pattern safe (docs/EXECUTION-MODEL.md 9.4).
+const FIRST_ID: usize = 1;
 
 impl EntityTable {
     pub const fn new() -> EntityTable {
         EntityTable {
             slots: Funded::new(),
             cpus: 0,
-            reserved: 0,
         }
     }
 
     /// Charge this table's frames to `owner`, and record how many CPUs exist so I2
     /// has a bound to check against.
-    pub fn init(&mut self, owner: Owner, cpus: u16, reserved: usize) {
+    pub fn init(&mut self, owner: Owner, cpus: u16) {
         self.slots.set_owner(owner);
         self.cpus = cpus;
-        self.reserved = reserved;
     }
 
     pub fn capacity(&self) -> usize {
@@ -355,18 +347,30 @@ impl EntityTable {
     /// clean `-EAGAIN` naming the cell, never a global "table full"
     /// (docs/MEMORY.md 7, no OOM killer).
     pub fn create(&mut self, cell: u16, context: u16) -> Option<usize> {
-        let id = match (self.reserved..self.capacity())
+        let id = match (FIRST_ID..self.capacity())
             .find(|&i| self.slots.get(i).map(|e| e.state) == Some(State::Free))
         {
             Some(i) => i,
             None => {
-                // Never below the reserved floor: ids under it belong to the derived band and
-                // a `create_at` would overwrite whatever `create` put there.
-                let want = self.capacity().max(self.reserved) + 1;
-                if !self.slots.set_growing(want - 1, Entity::EMPTY) {
+                // Never below the floor, so id 0 stays the "no context" value even on the
+                // very first allocation into an empty table.
+                let want = self.capacity().max(FIRST_ID);
+                let was = self.capacity();
+                if !self.slots.set_growing(want, Entity::EMPTY) {
                     return None;
                 }
-                want - 1
+                // **Initialise every slot the growth added, not just the one being
+                // allocated.** `Funded` grows by whole frames and those arrive zeroed, and
+                // an all-zero `Entity` is *not* `Entity::EMPTY`: `owner` and `inside` want
+                // `NO_CPU`/`NOT_INSIDE`, which are `u16::MAX`, so a zeroed slot reads as
+                // "free, owned by CPU 0, entered by CPU 0". Invariant I7 exists to catch
+                // exactly that and did - `verify/entity` failed nine scenarios the moment
+                // reserving id 0 left a slot grown but never written, which no allocation
+                // pattern had produced before (docs/EXECUTION-MODEL.md 9.4).
+                for i in was..self.capacity() {
+                    self.slots.set(i, Entity::EMPTY);
+                }
+                want
             }
         };
         let mut e = Entity::EMPTY;
@@ -377,26 +381,6 @@ impl EntityTable {
             return None;
         }
         Some(id)
-    }
-
-    /// Create the entity **at a chosen id**, growing the table if needed.
-    ///
-    /// The kernel's entity id is not allocated - it *is* `cell * MAX_VCORES + vcore`, the
-    /// identity every existing path already carries. One identity rather than a table mapping
-    /// one to the other, because two identities for one thing is the shape that produced the
-    /// ownership defects this stage exists to remove (docs/EXECUTION-MODEL.md 9, E2).
-    ///
-    /// Idempotent for a slot that already holds this `(cell, context)`: `install` runs again for
-    /// a cell slot that is being reused, and refusing there would make reuse a special case.
-    pub fn create_at(&mut self, id: usize, cell: u16, context: u16) -> bool {
-        if id >= self.capacity() && !self.slots.set_growing(id, Entity::EMPTY) {
-            return false;
-        }
-        let mut e = Entity::EMPTY;
-        e.cell = cell;
-        e.context = context;
-        e.state = State::Runnable;
-        self.slots.set(id, e)
     }
 
     /// Give `id` a funded FP/SIMD save area, charged to the cell that owns it.
@@ -768,9 +752,8 @@ pub fn affinity_skips() -> u64 {
     AFFINITY_SKIPS.load(core::sync::atomic::Ordering::Acquire)
 }
 
-/// Clear the table between runs, and give it the two bounds it needs: the CPU count invariant
-/// I2 checks against, and the floor below which ids are derived rather than allocated.
-pub fn reset_table(cpus: u16, reserved: usize) {
+/// Clear the table between runs, and give it the bound invariant I2 checks against.
+pub fn reset_table(cpus: u16) {
     // SAFETY: between runs, with no core inside a cell.
     let t = unsafe { table() };
     for id in 0..t.capacity() {
@@ -787,5 +770,5 @@ pub fn reset_table(cpus: u16, reserved: usize) {
         // a running machine and wrong for a reset, where the point is that nothing is running.
         t.force_free(id);
     }
-    t.init(Owner::KERNEL, cpus, reserved);
+    t.init(Owner::KERNEL, cpus);
 }

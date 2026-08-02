@@ -50,12 +50,26 @@ pub const fn vcore_queue_va(v: usize) -> usize {
     USER_QUEUE_VA + v * QueuePair::REGION_SIZE
 }
 
+/// How many contexts of one cell can be given a **mapped queue ring**.
+///
+/// The one per-context limit that survived retiring `MAX_VCORES`, and it survived
+/// because it is a real resource rather than an array dimension: each ring needs its own
+/// `QueuePair::REGION_SIZE` of the cell's address space, and the window between
+/// [`USER_QUEUE_VA`] and the next fixed region is 4 GiB. A cell may hold more contexts
+/// than this - the scheduler, the FP areas and the per-context records are all bounded
+/// by its frame budget now - it just cannot give every one of them a ring here.
+///
+/// Stated as a named constant so the limit says what it is. `MAX_VCORES` was the wrong
+/// place for it twice over: it made an address-space question look like a scheduler
+/// question, and it bounded the contexts *without* rings by the same number.
+pub const MAX_QUEUE_VCORES: usize = 0x1_0000_0000 / QueuePair::REGION_SIZE;
+
 // The whole per-vcore queue window has to stay inside the region the cell's recorded
-// layout reserves for it, which `user::install` sizes from `MAX_CELL_CHANNELS` at the
-// channel base. A compile-time check rather than a comment, since the two constants
-// live in different files.
+// layout reserves for it, which `user::install` sizes at the channel base. A
+// compile-time check rather than a comment, since the two constants live in different
+// files.
 const _: () = assert!(
-    vcore_queue_va(crate::user::MAX_VCORES) <= USER_QUEUE_VA + 0x1_0000_0000,
+    vcore_queue_va(MAX_QUEUE_VCORES) <= USER_QUEUE_VA + 0x1_0000_0000,
     "the per-vcore queue window must not reach the next fixed region"
 );
 

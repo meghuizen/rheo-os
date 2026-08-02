@@ -213,10 +213,12 @@ extern "C" fn kernel_main() -> ! {
     // detail belongs to whoever owns the source.
     //
     // The id is **allocated and stored**, not derived, and that was the decision this stage
-    // forced: a native vcore's id is `cell * MAX_VCORES + vcore`, but a Linux cell's contexts are
+    // forced: it used to be `cell * MAX_VCORES + vcore`, but a Linux cell's contexts are
     // bounded by its frame budget rather than by that stride, and widening the stride to reach
     // `CONTEXT_CEILING` costs 1 MiB of dense funded metadata - measured and refused
-    // (docs/EXECUTION-MODEL.md 9.1). Two ways of obtaining an id, one table, one authority.
+    // (docs/EXECUTION-MODEL.md 9.1). E4's second stage then removed the stride for **native**
+    // contexts too, so there is now one allocator and one way to obtain an id, and the
+    // reserved band this phase used to check for is gone with it (9.4).
     //
     // This phase runs after 4 threads, 12 threads, a rayon-threaded sort and two condvar
     // timeouts have all created, parked, woken and exited contexts. Three properties:
@@ -228,18 +230,29 @@ extern "C" fn kernel_main() -> ! {
     //     this kernel does show about the wake source is behavioural - forcing every park to
     //     `NO_WAKE` makes `condwait` fail with "the futex facility returned an unexpected error
     //     code", because an unsatisfiable park is refused rather than hung (observed).
-    //  2. Every context that ran was allocated **above the derived band**, so a Linux thread's id
-    //     can never collide with a native vcore's computed one - the collision would be silent,
-    //     a `create_at` overwriting a live context.
+    //  2. Every context that ran holds a **nonzero** id. Zero is the "no context" value, and
+    //     it is load-bearing rather than a convention: an id is stored in a funded table, a
+    //     funded table grows into zeroed frames, so the value a fresh slot reads must be the
+    //     one meaning empty. A collision with a native context is no longer expressible -
+    //     there is one allocator.
     //  3. The teardown hands every entity back. This is measured across the teardown rather than
     //     after it, because the harness resets at the *start* of a run, not the end: the last
     //     cell's contexts are still live here, which is exactly what makes the check
     //     non-vacuous - a run with nothing left to release would pass an "all free" assertion
     //     while proving nothing. So the phase counts before, calls the teardown, and counts
     //     again. A slot-handback path that is not a release path is the S1' leak.
+    //
+    //     The two numbers are computed from **different structures**: how many contexts hold
+    //     an entity is counted on the thread side, and how many entities are live is counted
+    //     on the table side, so the assertion compares two independent answers rather than
+    //     asking one structure about itself. That became necessary rather than merely nicer
+    //     when the derived-id band went away: native vcores and Linux contexts allocate from
+    //     one table now, so "which of these are Linux" is no longer an arithmetic question
+    //     (docs/EXECUTION-MODEL.md 9.4) - and a Linux cell holds two entities, its native
+    //     vcore 0 and its context 0, which is why an "all free" count would be wrong here
+    //     even with the leak fixed.
     {
         use kernel::sched::entity;
-        let derived_band = kernel::user::MAX_CELLS * kernel::user::MAX_VCORES;
 
         // Count the live Linux contexts *before* the teardown, and check the invariants while
         // there is still something in the table to check.
@@ -250,16 +263,20 @@ extern "C" fn kernel_main() -> ! {
             "the entity table violates an invariant after the thread phases: {:?}",
             t.check()
         );
-        let mut before = 0usize;
+        /// Live entities, counted on the table side.
+        fn live_entities(t: &entity::EntityTable) -> usize {
+            (0..t.capacity())
+                .filter_map(|id| t.get(id))
+                .filter(|e| e.live())
+                .count()
+        }
         let mut inside = 0usize;
         for id in 0..t.capacity() {
             let Some(e) = t.get(id) else { continue };
             if e.state == entity::State::Free {
                 continue;
             }
-            if e.live() && id >= derived_band {
-                before += 1;
-            }
+            assert_ne!(id, 0, "id 0 was allocated - it is the `no context` value");
             if e.inside != u16::MAX {
                 inside += 1;
             }
@@ -275,28 +292,31 @@ extern "C" fn kernel_main() -> ! {
             inside, 0,
             "{inside} entities still record a CPU inside them"
         );
+
+        // The thread side's answer, and the table side's, taken before the teardown.
+        let ctx = kernel::linux::thread::live_entities();
+        let before = live_entities(t);
         assert!(
-            before > 0,
-            "no Linux context entity is live before the teardown - the release below would be \
-             testing nothing"
+            ctx > 0,
+            "no Linux context holds an entity before the teardown - the release below would \
+             be testing nothing"
         );
 
         kernel::linux::thread::reset();
 
         // SAFETY: as above.
         let t = unsafe { entity::table() };
-        let mut after = 0usize;
-        for id in derived_band..t.capacity() {
-            if let Some(e) = t.get(id)
-                && e.live()
-            {
-                after += 1;
-            }
-        }
+        let after = live_entities(t);
+        let released = before - after;
         assert_eq!(
-            after, 0,
-            "{after} of {before} Linux context entities survived the teardown - a context that \
-             never handed its entity back is the S1' leak"
+            released, ctx,
+            "the teardown released {released} entities but {ctx} Linux contexts held one - a \
+             context that never handed its entity back is the S1' leak"
+        );
+        assert_eq!(
+            kernel::linux::thread::live_entities(),
+            0,
+            "a Linux context still holds an entity after the teardown"
         );
         println!(
             "linuxthreads: E3 - A LINUX CONTEXT'S STATE IS ITS ENTITY'S - `Thread::state` is \
@@ -305,12 +325,14 @@ extern "C" fn kernel_main() -> ! {
              to its owner. After 4 threads, 12 threads, a rayon sort and two condvar timeouts, \
              the table holds every invariant it can check (I4, parked-with-no-source, is checked \
              but vacuous here - nothing is left parked; verify/entity exercises it) \
-             and the teardown hands back all {before} \
+             and the teardown hands back all {ctx} \
              live contexts, measured across it rather than after because the harness resets at \
-             the start of a run. Ids are ALLOCATED above the derived band ({derived_band}) \
-             rather than computed, because a Linux cell's contexts are bounded by its frame \
-             budget and widening the native stride to reach them costs 1 MiB of dense metadata - \
-             measured and refused (docs/EXECUTION-MODEL.md 9.1) OK"
+             the start of a run - and counted on the thread side against the table side, since \
+             one allocator means which of these entities are Linux is no longer arithmetic. Ids are ALLOCATED rather than computed, because a stride is a \
+             ceiling on contexts per cell and widening it to reach `CONTEXT_CEILING` costs 1 MiB \
+             of dense metadata - measured and refused; native contexts allocate from the same \
+             one table now, so there is a single way to name a context \
+             (docs/EXECUTION-MODEL.md 9.1, 9.4) OK"
         );
     }
 
