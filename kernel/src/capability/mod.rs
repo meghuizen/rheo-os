@@ -250,30 +250,71 @@ const EMPTY_SLOT: CapSlot = CapSlot {
     in_use: false,
 };
 
-pub const MAX_CAPS_PER_CELL: usize = 256;
+/// Capability slots a cell gets **inline**, before its table funds a frame
+/// (docs/EXECUTION-MODEL.md 9.7).
+///
+/// This was `MAX_CAPS_PER_CELL = 256` and a fixed `[CapSlot; 256]` per cell, which at 16
+/// cells is **131,072 bytes of `.bss`** - by a wide margin the largest fixed table left,
+/// and a hard ceiling on how many objects one cell could ever reach. 32 covers the
+/// ordinary cell at zero frames; past that the table grows into frames charged to the
+/// cell itself, so the answer to "how many capabilities may a cell hold" is its budget.
+pub const CAPS_INLINE: usize = 32;
 
 /// A cell's capability table. The *only* path from a cell to a kernel
 /// object - which is what makes the isolation lemma checkable: disjoint
 /// tables mean disjoint reachable objects.
 pub struct CapTable {
-    slots: [CapSlot; MAX_CAPS_PER_CELL],
+    slots: crate::mm::kmeta::Elastic<CapSlot, CAPS_INLINE>,
 }
 
 impl CapTable {
     pub const fn new() -> CapTable {
         CapTable {
-            slots: [EMPTY_SLOT; MAX_CAPS_PER_CELL],
+            slots: crate::mm::kmeta::Elastic::with_inline([EMPTY_SLOT; CAPS_INLINE]),
         }
     }
 
+    /// Charge this table's growth to `owner`, transferring anything it already holds.
+    ///
+    /// A capability table is built by whatever launches a cell and **adopted** by the
+    /// cell at `install`, so the frames genuinely change hands - which is why
+    /// `Funded::set_owner` transfers rather than relabels.
+    pub fn set_owner(&mut self, owner: crate::mm::kmeta::Owner) {
+        self.slots.set_owner(owner);
+    }
+
+    /// Frames this table holds beyond its inline half.
+    pub fn frames_held(&self) -> usize {
+        self.slots.frames_held()
+    }
+
+    /// Release the funded tail. **Every path that hands a cell slot back must call
+    /// this**, or the frames leak until the next boot - the S1' scar, which this session
+    /// hit a third time by teaching one release path and not its siblings.
+    pub fn release(&mut self) {
+        self.slots.reset(EMPTY_SLOT);
+    }
+
+    /// Slots addressable right now (the inline half plus any funded tail).
+    pub fn capacity(&self) -> usize {
+        self.slots.capacity()
+    }
+
+    fn slot(&self, i: usize) -> Option<&CapSlot> {
+        self.slots.get(i)
+    }
+
+    fn slot_mut(&mut self, i: usize) -> Option<&mut CapSlot> {
+        self.slots.get_mut(i)
+    }
+
     fn alloc_slot(&mut self) -> Result<usize, CapError> {
-        // Linear scan is fine at this size; a free list comes with scale.
-        for (i, slot) in self.slots.iter().enumerate() {
-            if !slot.in_use {
-                return Ok(i);
-            }
-        }
-        Err(CapError::TableFull)
+        // Linear scan of what exists, then grow. `TableFull` now means "this cell's
+        // budget refused another frame", which is attributable, rather than "the fixed
+        // array is full", which was not (docs/MEMORY.md 7, no OOM killer).
+        self.slots
+            .alloc(EMPTY_SLOT, |s| !s.in_use)
+            .ok_or(CapError::TableFull)
     }
 
     /// Mint the root capability for an object into this table. In the full
@@ -287,8 +328,8 @@ impl CapTable {
         budget: u64,
     ) -> Result<Handle, CapError> {
         let slot = self.alloc_slot()?;
-        let generation = self.slots[slot].generation + 1;
-        self.slots[slot] = CapSlot {
+        let generation = self.slot(slot).map_or(0, |s| s.generation) + 1;
+        let write = CapSlot {
             object: object.0,
             rights,
             epoch: objects.epoch(object),
@@ -296,6 +337,9 @@ impl CapTable {
             budget,
             in_use: true,
         };
+        if !self.slots.set(slot, write) {
+            return Err(CapError::TableFull);
+        }
         Ok(Handle::new(slot, generation))
     }
 
@@ -310,10 +354,9 @@ impl CapTable {
         required: u32,
     ) -> Result<ObjectId, CapError> {
         let index = handle.slot();
-        if index >= MAX_CAPS_PER_CELL {
+        let Some(slot) = self.slot_mut(index) else {
             return Err(CapError::BadHandle);
-        }
-        let slot = &mut self.slots[index];
+        };
         if !slot.in_use || slot.generation != handle.generation() {
             return Err(CapError::BadHandle);
         }
@@ -344,10 +387,9 @@ impl CapTable {
         required: u32,
     ) -> Result<ObjectId, CapError> {
         let index = (cap_id & 0xFFFF) as usize;
-        if index >= MAX_CAPS_PER_CELL {
+        let Some(slot) = self.slot_mut(index) else {
             return Err(CapError::BadHandle);
-        }
-        let slot = &mut self.slots[index];
+        };
         if !slot.in_use || slot.generation as u32 & 0xFFFF != cap_id >> 16 {
             return Err(CapError::BadHandle);
         }
@@ -378,7 +420,7 @@ impl CapTable {
         budget: u64,
     ) -> Result<Handle, CapError> {
         let object = self.grant_check(objects, parent, 0)?;
-        let parent_rights = self.slots[parent.slot()].rights;
+        let parent_rights = self.slot(parent.slot()).ok_or(CapError::BadHandle)?.rights;
         if rights & parent_rights != rights {
             return Err(CapError::WidenAttempt);
         }
@@ -395,7 +437,7 @@ impl CapTable {
         target: &mut CapTable,
     ) -> Result<Handle, CapError> {
         let object = self.grant_check(objects, handle, 0)?;
-        let slot = &self.slots[handle.slot()];
+        let slot = self.slot(handle.slot()).ok_or(CapError::BadHandle)?;
         if slot.rights & DELEGATE == 0 {
             return Err(CapError::NotDelegatable);
         }
@@ -408,11 +450,11 @@ impl CapTable {
     /// Drop a capability (RAII release in the typed layer).
     pub fn free(&mut self, handle: Handle) {
         let index = handle.slot();
-        if index < MAX_CAPS_PER_CELL
-            && self.slots[index].in_use
-            && self.slots[index].generation == handle.generation()
+        if let Some(slot) = self.slot_mut(index)
+            && slot.in_use
+            && slot.generation == handle.generation()
         {
-            self.slots[index].in_use = false;
+            slot.in_use = false;
         }
     }
 
@@ -436,10 +478,8 @@ impl CapTable {
     /// handle still names that object.
     fn slot_of_low32(&self, objects: &ObjectTable, cap_id: u32) -> Result<usize, CapError> {
         let index = (cap_id & 0xFFFF) as usize;
-        if index >= MAX_CAPS_PER_CELL {
-            return Err(CapError::BadHandle);
-        }
-        let slot = &self.slots[index];
+
+        let slot = self.slot(index).ok_or(CapError::BadHandle)?;
         if !slot.in_use || slot.generation as u32 & 0xFFFF != cap_id >> 16 {
             return Err(CapError::BadHandle);
         }
@@ -463,7 +503,9 @@ impl CapTable {
         cap_id: u32,
     ) -> Result<(ObjectId, u32, u64), CapError> {
         let i = self.slot_of_low32(objects, cap_id)?;
-        let s = &self.slots[i];
+        let Some(s) = self.slot(i) else {
+            return Err(CapError::BadHandle);
+        };
         Ok((ObjectId(s.object), s.rights, s.budget))
     }
 
@@ -483,13 +525,16 @@ impl CapTable {
         budget: u64,
     ) -> Result<u32, CapError> {
         let i = self.slot_of_low32(objects, parent)?;
-        let (parent_rights, object) = (self.slots[i].rights, ObjectId(self.slots[i].object));
+        let (parent_rights, object) = {
+            let p = self.slot(i).ok_or(CapError::BadHandle)?;
+            (p.rights, ObjectId(p.object))
+        };
         if rights & parent_rights != rights {
             return Err(CapError::WidenAttempt);
         }
         // A derivation may narrow the budget but never exceed the parent's
         // remaining one - otherwise metering would be escapable by deriving.
-        let parent_budget = self.slots[i].budget;
+        let parent_budget = self.slot(i).ok_or(CapError::BadHandle)?.budget;
         if parent_budget != BUDGET_UNLIMITED
             && (budget == BUDGET_UNLIMITED || budget > parent_budget)
         {
@@ -504,7 +549,9 @@ impl CapTable {
     /// success (docs/ENGINEERING.md 7).
     pub fn free_low32(&mut self, objects: &ObjectTable, cap_id: u32) -> Result<(), CapError> {
         let i = self.slot_of_low32(objects, cap_id)?;
-        self.slots[i].in_use = false;
+        if let Some(x) = self.slot_mut(i) {
+            x.in_use = false;
+        }
         Ok(())
     }
 
@@ -518,19 +565,43 @@ impl CapTable {
     /// on the *object*, not on the table - which is exactly the fork semantics
     /// POSIX describes for descriptors (the table is copied, the thing behind it
     /// is shared).
-    pub fn copy_from(&mut self, other: &CapTable) {
-        self.slots = other.slots;
+    /// Returns false when the child's table could not be grown to hold the parent's -
+    /// a `fork` the caller must **refuse**, not complete with a truncated table. A
+    /// silently short capability table is a cell missing authority it believes it has,
+    /// which is worse than a refused fork.
+    ///
+    /// A deep copy, slot by slot. It used to be `self.slots = other.slots`, a raw copy of
+    /// the whole array - which becomes a copy of a `Funded` *descriptor* the moment the
+    /// table is funded, giving two owners of one directory frame. That is the S1' scar
+    /// exactly (`fork`'s `copy_nonoverlapping` of `LinuxState`), and it is why `Elastic`
+    /// is not `Copy`: the compiler refuses the old line rather than letting it compile
+    /// into a double free.
+    #[must_use]
+    pub fn copy_from(&mut self, other: &CapTable) -> bool {
+        self.release();
+        for i in 0..other.capacity() {
+            let Some(&src) = other.slot(i) else { continue };
+            if !src.in_use {
+                continue;
+            }
+            if self.slots.grow_to(i, EMPTY_SLOT).is_none() || !self.slots.set(i, src) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Empty this table. Used when a cell slot is reused, so a new cell can
     /// never inherit a dead one's capabilities by accident.
     pub fn clear(&mut self) {
-        self.slots = [EMPTY_SLOT; MAX_CAPS_PER_CELL];
+        self.slots.reset(EMPTY_SLOT);
     }
 
     /// Count of live capabilities (used by tests).
     pub fn live_count(&self) -> usize {
-        self.slots.iter().filter(|s| s.in_use).count()
+        (0..self.capacity())
+            .filter(|&i| self.slot(i).is_some_and(|s| s.in_use))
+            .count()
     }
 
     /// True if this table holds a live capability of `kind` carrying all of
@@ -539,7 +610,8 @@ impl CapTable {
     /// capability with WRITE, so a cell without one cannot create cells (no
     /// ambient authority). A read-only scan; no budget is decremented.
     pub fn holds(&self, objects: &ObjectTable, kind: ObjectKind, required: u32) -> bool {
-        self.slots.iter().any(|s| {
+        (0..self.capacity()).any(|i| {
+            let Some(s) = self.slot(i) else { return false };
             if !s.in_use || s.rights & required != required {
                 return false;
             }
@@ -556,8 +628,8 @@ impl CapTable {
         budget: u64,
     ) -> Result<Handle, CapError> {
         let slot = self.alloc_slot()?;
-        let generation = self.slots[slot].generation + 1;
-        self.slots[slot] = CapSlot {
+        let generation = self.slot(slot).map_or(0, |s| s.generation) + 1;
+        let write = CapSlot {
             object: object.0,
             rights,
             epoch: objects.epoch(object),
@@ -565,6 +637,9 @@ impl CapTable {
             budget,
             in_use: true,
         };
+        if !self.slots.set(slot, write) {
+            return Err(CapError::TableFull);
+        }
         Ok(Handle::new(slot, generation))
     }
 }

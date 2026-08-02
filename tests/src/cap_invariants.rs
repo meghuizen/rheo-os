@@ -171,6 +171,93 @@ extern "C" fn kernel_main() -> ! {
     assert!(narrow.grant_check(&mut cell_a.caps, &objects).is_ok());
     println!("cap-invariants: typed rights layer OK");
 
+    // ---- The table has no fixed ceiling (docs/EXECUTION-MODEL.md 9.7) -------
+    //
+    // `MAX_CAPS_PER_CELL = 256` was a `[CapSlot; 256]` per cell - 131,072 bytes of `.bss`
+    // at 16 cells, by a wide margin the largest fixed table left, and a hard cap on how
+    // many objects one cell could ever reach. It is an inline half plus a tail funded from
+    // the cell's own budget now.
+    //
+    // Minting **past the old ceiling** is the claim, so the number is deliberately larger
+    // than 256: at 300 the old table returned `TableFull` and this could not have run at
+    // all. The frame side is asserted too - the table must actually have grown - because
+    // an inline half quietly enlarged to 300 would pass the mint loop and prove nothing.
+    {
+        let owner = kernel::mm::kmeta::Owner::cell(9);
+        cell_a.caps.clear();
+        cell_a.caps.set_owner(owner);
+        let obj = objects.create(ObjectKind::MemoryGrant).unwrap();
+        let mut held = 0usize;
+        for _ in 0..300 {
+            match cell_a.caps.mint(&objects, obj, READ, 0) {
+                Ok(_) => held += 1,
+                Err(e) => panic!("mint {held} of 300 failed: {e:?}"),
+            }
+        }
+        assert_eq!(held, 300, "only {held} of 300 capabilities were minted");
+        assert_eq!(
+            cell_a.caps.live_count(),
+            300,
+            "the table reports {} live capabilities, want 300",
+            cell_a.caps.live_count()
+        );
+        let frames = cell_a.caps.frames_held();
+        assert!(
+            frames > 0,
+            "300 capabilities in one table cost 0 frames - the inline half absorbed them \
+             all, so this is still a fixed array and the funded path never ran"
+        );
+        // Charged to the cell that caused the growth, which is what makes exhaustion
+        // attributable instead of a global "table full" (docs/SUBSTRATE.md pillar 1).
+        assert_eq!(
+            kernel::mm::kmeta::charged(owner),
+            frames,
+            "the table holds {frames} frame(s) but the owner is charged {}",
+            kernel::mm::kmeta::charged(owner)
+        );
+        // **The charge follows the table when it changes hands.** This is the case the
+        // conversion was held back on: a capability table is built by whatever launches a
+        // cell and adopted by the cell at `install`, so `set_owner` can land on a table
+        // that has *already grown*. `Funded::release` credits the owner recorded at
+        // release time, so relabelling instead of transferring would credit a ledger that
+        // was never charged - exhaustion attributed to the wrong cell, which is the one
+        // thing the per-owner ledger exists to get right (docs/EXECUTION-MODEL.md 9.7).
+        //
+        // Asserted here rather than left to the install path, because `set_owner` on an
+        // *empty* table has nothing to move and passes either way - which is exactly what
+        // the first version of this control did.
+        let adopter = kernel::mm::kmeta::Owner::cell(10);
+        cell_a.caps.set_owner(adopter);
+        assert_eq!(
+            kernel::mm::kmeta::charged(owner),
+            0,
+            "the previous owner is still charged {} frame(s) after the table was adopted",
+            kernel::mm::kmeta::charged(owner)
+        );
+        assert_eq!(
+            kernel::mm::kmeta::charged(adopter),
+            frames,
+            "the adopting owner is charged {} of the table's {frames} frame(s)",
+            kernel::mm::kmeta::charged(adopter)
+        );
+
+        cell_a.caps.release();
+        assert_eq!(
+            kernel::mm::kmeta::charged(adopter),
+            0,
+            "the owner is still charged after the table was released - a table handed back \
+             without releasing its frames is the S1' leak"
+        );
+        println!(
+            "cap-invariants: THE CAPABILITY TABLE HAS NO CEILING - 300 capabilities in one \
+             cell, past the old `MAX_CAPS_PER_CELL` of 256 where this returned TableFull, \
+             costing {frames} frame(s) charged to that cell, MOVED to the cell that \
+             adopted the table (the launcher-builds/cell-adopts lifecycle this conversion \
+             was held back on), and all returned on release. It was a fixed \
+             [CapSlot; 256] per cell = 131,072 bytes of .bss OK"
+        );
+    }
+
     println!("cap-invariants: PASS");
     arch::exit(arch::ExitCode::Success)
 }

@@ -937,14 +937,59 @@ sizes an address-space window (`USER_CHANNEL_VA + N * QueuePair::REGION_SIZE`) -
 needs a mapped ring region whether or not the slot array is elastic. That is the
 `MAX_QUEUE_VCORES` category: a real resource bound, correctly a constant.
 
-**Still fixed, and named rather than implied:** `MAX_CAPS_PER_CELL = 256`
-(`[CapTable; MAX_CELLS]` is **131,072 bytes**, by far the largest remaining, and `CapSlot`'s
-all-zero pattern is already its empty value so the conversion itself is clean) and
-`MAX_OBJECTS = 512` and `MAX_CELLS = 16`. The capability table has one real design question
-holding it: it has no cell at construction, and test kernels mint into a `static mut CapTable`
-before `install`, so a growth could be charged to `KERNEL` and a later `set_owner` would credit
-the frames back to a different ledger than was charged - `Funded::release` credits the owner
-recorded at release time. That has to be answered before the conversion, not during it.
+**Still fixed, and named rather than implied:** `MAX_OBJECTS = 512` and `MAX_CELLS = 16`.
+`MAX_CAPS_PER_CELL` was the third and is done - see 9.7.
+
+### 9.7 The capability table, and the question that held it back
+
+`MAX_CAPS_PER_CELL = 256` was a `[CapSlot; 256]` per cell: at 16 cells, **131,072 bytes of
+`.bss`**, by a wide margin the largest fixed table left and a hard cap on how many objects one
+cell could ever reach. `CapSlot`'s all-zero pattern is already its empty value, so the
+conversion itself was never the difficulty.
+
+**The difficulty was ownership.** A `CapTable` has no cell at construction - a launcher
+declares one and mints into it *before* `install` - so a growth can happen while the table is
+still unowned, and `Funded::release` credits the owner recorded **at release time**. Charging
+one ledger and crediting another is not a crash; it is exhaustion attributed to the wrong
+cell, which is the single thing the per-owner ledger exists to get right.
+
+Reading `Funded::set_owner` showed the existing behaviour was to *silently do nothing* when
+frames were already held. Safe for the ledger, and wrong about the owner without saying so.
+
+**The answer is to model the transfer.** `set_owner` moves the charge (`move_charge`, ten
+lines over a per-owner counter the module already keeps), because the operation is real: a
+launcher builds the table and the cell adopts it at `install`. That also deletes an ordering
+rule - "set the owner before the first growth" - that a capability table cannot obey, and it
+retroactively removes the same rule from the grant and reservation tables of 9.6.
+
+Two further things fell out, both of which the compiler or a test found rather than review:
+
+- **`copy_from` was `self.slots = other.slots`** - a raw copy of the whole array, which
+  becomes a copy of a `Funded` *descriptor* the moment the table is funded: two owners of one
+  directory frame, the S1' scar exactly. `Elastic` is not `Copy`, so the old line stops
+  compiling instead of turning into a double free. It is a deep copy now, and **fallible**,
+  so `fork` refuses with `-EAGAIN` rather than completing with a child missing authority it
+  believes it has - the shape `dup_state`'s funded VMA copy on the very next line already had.
+- **Release is scoped to the kernel's own tables.** A first version released the cell's table
+  at `user::reset`, which is wrong: the harnesses mint into their table *before* calling
+  `reset`, so it wiped capabilities that had just been created (observed - `security` failing
+  with `the OP_NOP after the attempt completed with status 5`, BAD_HANDLE). A launcher's table
+  is not the kernel's to reclaim; it holds its frames for the life of the boot, exactly as the
+  array it replaced did, and is reused rather than regrown across runs.
+
+**Measured**: `[CapTable; MAX_CELLS]` 131,072 -> 16,896 bytes.
+
+**Proven** by `cap-invariants` on all three ISAs: **300 capabilities in one cell**, past the
+old ceiling of 256 where the mint returned `TableFull`, costing 4 frames charged to that cell,
+**moved** to the cell that adopts the table, and all returned on release. Two controls firing -
+the inline half enlarged to 320 (`300 capabilities in one table cost 0 frames`), and
+`set_owner` relabelling instead of transferring (`the previous owner is still charged 4
+frame(s) after the table was adopted`).
+
+The second control is worth recording as a method note: its **first** version did not fire,
+because the test called `set_owner` on an empty table, where there is nothing to move and
+relabelling and transferring are the same thing. The assertion had to be moved to a table that
+had already grown - which is the only configuration the design question was ever about.
 
 ---
 

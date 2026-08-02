@@ -2251,12 +2251,17 @@ pub unsafe fn install(
     // entity with no owner - pickable by any core, which is the single-CPU behaviour exactly.
     attach_entity(idx, 0);
     cell_grants(idx).reset(EMPTY_GRANT);
-    // Charge any growth to this cell, before the first one: `Elastic::release` credits
-    // the owner recorded at release time, so an owner set across a growth would credit
-    // one ledger for what another was charged.
     cell_grants(idx).set_owner(crate::mm::kmeta::Owner::cell(idx));
     cell_res(idx).reset(EMPTY_RES);
     cell_res(idx).set_owner(crate::mm::kmeta::Owner::cell(idx));
+    // **The cell adopts its capability table.** A launcher builds it and may already
+    // have minted into it - a test kernel's `static mut CapTable` is the ordinary case -
+    // so this can happen after the table has grown, and `set_owner` therefore transfers
+    // the charge rather than relabelling the descriptor. Getting that wrong is not a
+    // crash: it is exhaustion attributed to the wrong cell, which is the one thing the
+    // per-owner ledger exists to get right (docs/EXECUTION-MODEL.md 9.7).
+    // SAFETY: the caller's pointer, valid for the run.
+    unsafe { (*cells()[idx].caps).set_owner(crate::mm::kmeta::Owner::cell(idx)) };
     // A fresh cell starts with an empty recorded layout. `clear`, not `init`: the
     // table's frames are a boot cost this slot reuses (see `init_layouts`).
     // Place this cell's kernel metadata - page tables, capability tables, its VA
@@ -2825,12 +2830,17 @@ pub unsafe fn install_spawned(
         node: p.node,
     };
     cell_grants(idx).reset(EMPTY_GRANT);
-    // Charge any growth to this cell, before the first one: `Elastic::release` credits
-    // the owner recorded at release time, so an owner set across a growth would credit
-    // one ledger for what another was charged.
     cell_grants(idx).set_owner(crate::mm::kmeta::Owner::cell(idx));
     cell_res(idx).reset(EMPTY_RES);
     cell_res(idx).set_owner(crate::mm::kmeta::Owner::cell(idx));
+    // **The cell adopts its capability table.** A launcher builds it and may already
+    // have minted into it - a test kernel's `static mut CapTable` is the ordinary case -
+    // so this can happen after the table has grown, and `set_owner` therefore transfers
+    // the charge rather than relabelling the descriptor. Getting that wrong is not a
+    // crash: it is exhaustion attributed to the wrong cell, which is the one thing the
+    // per-owner ledger exists to get right (docs/EXECUTION-MODEL.md 9.7).
+    // SAFETY: the caller's pointer, valid for the run.
+    unsafe { (*cells()[idx].caps).set_owner(crate::mm::kmeta::Owner::cell(idx)) };
     // SAFETY: single CPU; a fresh cell starts with no frames charged.
     unsafe { (*core::ptr::addr_of_mut!(CELL_FRAMES))[idx] = 0 };
     // The child inherits the parent's burst state rather than arriving with a fresh
@@ -2888,16 +2898,33 @@ pub fn switch_to_cell(idx: usize) {
 ///
 /// # Safety
 /// `aspace`/`frame` must outlive the child's run; `parent` must be present.
+/// Returns **false** when the child's capability table could not be funded - a `fork` the
+/// caller must undo and refuse, never complete with a table missing the parent's
+/// capabilities.
+#[must_use]
 pub unsafe fn install_forked(
     idx: usize,
     aspace: *const AddressSpace,
     frame: *mut TrapFrame,
     parent: usize,
-) {
+) -> bool {
     let p = cells()[parent];
     // SAFETY: single CPU; slot `idx` is free and `parent` is present, so the two
     // tables are distinct and uniquely owned for the trap.
-    unsafe { (*owned_caps(idx)).copy_from(&*p.caps) };
+    // Charge the child's table to the child before it grows, and deep-copy the parent's
+    // into it. **Fallible**: the copy can need frames the child's budget refuses, and a
+    // truncated capability table is a cell missing authority it believes it has - worse
+    // than a refused fork. The caller undoes and returns `-EAGAIN`, the same shape
+    // `dup_state`'s funded VMA copy beside it already has.
+    // SAFETY: the child's slot is free and the parent is present, so the two tables are
+    // distinct and uniquely owned for the trap.
+    unsafe {
+        (*owned_caps(idx)).set_owner(crate::mm::kmeta::Owner::cell(idx));
+        if !(*owned_caps(idx)).copy_from(&*p.caps) {
+            (*owned_caps(idx)).release();
+            return false;
+        }
+    }
     // Same as `install`: the child's metadata follows the child's node, set before
     // its tables are funded. Needed on this path too because a slot is reused - a
     // stale entry would place this cell's tables on the previous occupant's node.
@@ -2949,6 +2976,7 @@ pub unsafe fn install_forked(
         unsafe { crate::sched::entity::table() }.claim(id, parent_owner);
     }
     crate::sched::dispatch::track(idx, 0, Some(parent));
+    true
 }
 
 /// Free cell slot `idx` (a reaped zombie). The slot becomes reusable by a
@@ -2988,6 +3016,22 @@ pub fn free_cell(idx: usize) {
     vcores(idx).release();
     cell_grants(idx).reset(EMPTY_GRANT);
     cell_res(idx).reset(EMPTY_RES);
+    // The capability table, **only when it is the kernel's own**.
+    //
+    // A cell's `caps` may point at `owned_caps(idx)` (a `fork`ed or spawned child) or at a
+    // table its launcher supplied and still owns. Releasing the launcher's would be the
+    // kernel reclaiming someone else's storage, and it is not hypothetical: the test
+    // harnesses mint into their table *before* calling `user::reset`, so a release on that
+    // path wipes capabilities that were just created - observed, as `security` failing with
+    // `the OP_NOP after the attempt completed with status 5` (BAD_HANDLE).
+    //
+    // A launcher's table therefore holds its frames for the life of the boot, which is
+    // exactly what the fixed array it replaced did, and it is reused rather than regrown
+    // across runs, so nothing accumulates.
+    if core::ptr::eq(cells()[idx].caps, owned_caps(idx)) {
+        // SAFETY: the cell is finished; this table is the kernel's own.
+        unsafe { (*owned_caps(idx)).release() };
+    }
     cells()[idx] = EMPTY;
     // SAFETY: single CPU, synchronous traps.
     unsafe {

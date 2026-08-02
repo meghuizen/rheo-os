@@ -390,12 +390,13 @@ pub fn fork(cur: usize, parent_frame: *mut TrapFrame) -> i64 {
     // Install the child (shares the parent's capability bundle), then deep-copy
     // the fd table / brk / cwd / mmap bookkeeping and the signal dispositions.
     // SAFETY: pointers are kernel-owned statics that outlive the run.
-    unsafe { user::install_forked(child, aspace_ptr, frame_ptr, cur) };
-    // The child's personality state includes a **funded** VMA table, so copying it
-    // can genuinely fail on the child's frame budget. A half-copied table would
-    // leave the child faulting on mappings it believes it has, so the fork is undone
+    let installed = unsafe { user::install_forked(child, aspace_ptr, frame_ptr, cur) };
+    // Two funded tables are copied into the child and either can be refused by its frame
+    // budget: its **capability** table (in `install_forked`) and its VMA table (in
+    // `dup_state`). A half-copied one leaves the child either missing authority it
+    // believes it has or faulting on mappings it believes it has, so the fork is undone
     // and refused - the errno Linux uses when it cannot fund a new process.
-    if !super::dup_state(cur, child) {
+    if !installed || !super::dup_state(cur, child) {
         // SAFETY: the child was installed above and has not run; this is the same
         // teardown `process_exit` performs, before the slot is handed back.
         unsafe { (*user::cell_aspace(child)).free_user_frames() };

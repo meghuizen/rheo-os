@@ -232,6 +232,27 @@ fn alloc_frame(owner: Owner) -> Option<usize> {
     Some(arch::phys_to_virt(pa))
 }
 
+/// Move the charge for `n` frames from one owner's ledger to another's.
+///
+/// The accounting half of a table changing hands. A [`Funded`] credits frames back to the
+/// owner recorded **at release time**, so a table that grew under one owner and is later
+/// adopted by another would credit a ledger that was never charged - a silent corruption
+/// of the very accounting that makes exhaustion attributable (docs/SUBSTRATE.md pillar 1).
+/// Modelling the transfer explicitly is what lets a launcher build a table and a cell
+/// adopt it, which is the real lifecycle of a capability table.
+fn move_charge(from: Owner, to: Owner, n: usize) {
+    if from == to || n == 0 {
+        return;
+    }
+    // SAFETY: single CPU; plain counter updates.
+    unsafe {
+        let charged = &mut *addr_of_mut!(CHARGED);
+        let (f, t) = (from.ledger_slot(), to.ledger_slot());
+        charged[f] = charged[f].saturating_sub(n as u32);
+        charged[t] = charged[t].saturating_add(n as u32);
+    }
+}
+
 /// Release a metadata frame taken by [`alloc_frame`], by its kernel VA.
 fn free_frame(va: usize, owner: Owner) {
     let pa = arch::virt_to_phys(va);
@@ -317,10 +338,18 @@ impl<T: Copy> Funded<T> {
     /// Point this table's future charges at `owner`. Call before the first
     /// [`Funded::reserve`]; changing it while frames are held would misattribute
     /// the release, so it is refused then (the table keeps its current owner).
+    /// Charge this table's frames to `owner`, **transferring** any it already holds.
+    ///
+    /// It used to change the owner only while the table was still empty and otherwise do
+    /// nothing at all - safe for the ledger, but silently wrong about who owns the
+    /// frames, which is the one thing the per-owner ledger exists to get right
+    /// (docs/SUBSTRATE.md pillar 1: exhaustion must be attributable). Silence there also
+    /// forced an ordering rule on every caller - "set the owner before the first growth" -
+    /// that a capability table cannot obey, because a launcher builds it and a cell adopts
+    /// it at `install` (docs/EXECUTION-MODEL.md 9.7).
     pub fn set_owner(&mut self, owner: Owner) {
-        if self.pages == 0 && self.dir == 0 {
-            self.owner = owner;
-        }
+        move_charge(self.owner, owner, self.frames_held());
+        self.owner = owner;
     }
 
     /// Who is charged for this table's frames.
@@ -625,11 +654,8 @@ impl<T: Copy, const N: usize> Elastic<T, N> {
         }
     }
 
-    /// Charge any frames the tail takes to `owner`.
-    ///
-    /// Must be set **before** the first growth: [`Funded::release`] credits frames back to
-    /// the owner recorded at release time, so moving the owner across a growth would
-    /// credit one ledger for what another was charged.
+    /// Charge the tail's frames to `owner`, transferring any it already holds
+    /// ([`Funded::set_owner`]).
     pub fn set_owner(&mut self, owner: Owner) {
         self.tail.set_owner(owner);
     }
@@ -687,6 +713,25 @@ impl<T: Copy, const N: usize> Elastic<T, N> {
             }
         }
         self.grow(empty)
+    }
+
+    /// Write `value` at `i`. False when `i` is past the capacity.
+    pub fn set(&mut self, i: usize, value: T) -> bool {
+        match self.get_mut(i) {
+            Some(x) => {
+                *x = value;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Grow until index `i` is addressable, returning the capacity reached.
+    pub fn grow_to(&mut self, i: usize, empty: T) -> Option<usize> {
+        while i >= self.capacity() {
+            self.grow(empty)?;
+        }
+        Some(self.capacity())
     }
 
     /// The index of the first slot satisfying `pred`.
