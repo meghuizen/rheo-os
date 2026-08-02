@@ -613,8 +613,8 @@ unchanged. The order is forced by the dependency graph, not chosen.
 | E1 | Introduce the entity table beside the current three representations; `sched::Vcore` grows the hot line's fields. Nothing reads it yet. | **Done.** `kernel/src/sched/entity.rs`; the suite unchanged because nothing reads it | E6 |
 | E6' | The host fuzzer, brought forward - it belongs *before* the hot paths depend on the table, not after | **Done.** `verify/entity/`, `cargo xtask verify`: 8M operations, 7 invariants, 7 firing controls | E2-E5 can be refactors with an oracle already in place |
 | E2 | Move `owner` and the entered-guard into the table; the claim and the run-mark become one compare-exchange. Delete the two predicates, leaving one. | I1, I3; the 8 predicate sites become 1, and the 4 claim sites become 0 - the claim happens where the entity is entered | removes defects 1, 2, 5 by construction |
-| E3 | Move `runnable`/`parked` into the table; the personality declares transitions and stops keeping copies. | I5, I8 - both currently unasserted | removes defect 3's class |
-| E4 | Per-entity resources: `kstack_top`, funded FP area, frame. `MAX_VCORES` deleted. | one cell's two entities on two cores with a per-round trap, which the current phase admits it cannot detect | Linux threads across cores; FA3 overlap |
+| E3 | Move `runnable`/`parked` into the table; the personality declares transitions and stops keeping copies. | I4, asserted in a real boot for the first time - "parked with no wake source" is a state a personality-side boolean cannot express | removes defect 3's class |
+| E4 | Per-entity resources: funded FP area. `MAX_VCORES` stops being the resource limit. | frames measured per context, and returned with the slot | Linux threads across cores; FA3 overlap |
 | E5 | Arm the slice at the single return-to-user site. | **Done.** `on_user_trap` is a wrapper over `on_user_trap_inner`'s eight return paths; `dispatch::rearm_remaining` arms the slice's **remainder**. ARM64 went from 2 armed slices and 0 timer interrupts to 819 and 156, and now takes 55 preemptions where it took none | preemption independent of workload |
 | E6 | Extend the fuzzer as E2-E5 land, adding I6, I8 and I10 (each needs state E1 does not hold yet). | I1..I10, with edge coverage asserted | the defect class, caught early |
 | E7 | Cross-entity signal + wake IPI. | a signal to an entity another core is running | cross-core signals, migration expressible |
@@ -623,6 +623,45 @@ unchanged. The order is forced by the dependency graph, not chosen.
 E2 and E3 are the ones that pay for the document: they turn nine hand-maintained
 agreements into one, and they are pure refactors with the existing suite as the
 regression gate.
+
+### 9.1 What E2-E4 landed, and the one decision they surfaced
+
+E2, E3's native half and E4's binding constraint are **done**; the register carries the
+per-row detail. What is worth recording here is a design question none of the three could be
+finished without answering, because it was invisible until the table had real users.
+
+**The entity id is derived, and a derived id is a stride.** `entity_of(cell, vcore)` is
+`cell * MAX_VCORES + vcore`, which is what removes the mapping E2 exists to delete - there is
+no second identity to drift. But a stride *bounds contexts per cell*, and the two personalities
+disagree about that bound by two orders of magnitude:
+
+| Side | Contexts per cell | Bounded by |
+|---|---|---|
+| Native vcores | `MAX_VCORES` = 16 | the constant, now an array bound rather than a resource limit |
+| Linux threads | `CONTEXT_CEILING` = 1024 | the cell's frame budget; the ceiling is only a runaway-`clone` backstop |
+
+So the Linux half of E3 cannot simply join: its contexts do not fit the stride.
+
+**The obvious fix is measured and refused.** Raising the stride to 1024 makes the id space
+`MAX_CELLS * 1024` = 16384 entities, and `Funded::reserve` is **dense** - it allocates every
+page up to the highest index touched, not the pages actually used. At 64 bytes per `Entity`
+that is 256 frames, **1 MiB of funded kernel metadata**, allocated the moment the last cell
+installs, for a table that will hold a few dozen live entities. That is a static array in
+disguise, which is precisely what E4 removed from the FP areas; adopting it here would undo the
+stage that just landed.
+
+**The decision, for whoever lands the Linux half:** keep the derived id for native vcores, and
+give a Linux thread an id **allocated** by `EntityTable::create` and stored on its `Thread`.
+Two ways of *obtaining* an id, one table and one authority - which is the distinction E2 was
+actually about. A stored id is not a second copy of a fact; it is a handle, the way a page-table
+base is. One implementation note that is a correctness requirement rather than a preference:
+allocation must start **above** the derived band (`MAX_CELLS * MAX_VCORES`), or `create` will
+hand out an id inside some native cell's reserved range and a later `create_at` will overwrite
+it.
+
+This was written down rather than forced, because the Linux personality is the path Node, Bun
+and Claude Code run on, and a half-migrated state machine there is the one place in this tree
+where "it compiles and the suite is green" would not be evidence of much.
 
 ---
 

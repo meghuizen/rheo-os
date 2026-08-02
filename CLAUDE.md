@@ -2797,7 +2797,17 @@ release-once. Honest remainders, named rather than implied: the **Linux** side o
 (`Thread::state` + `pblock` + `linux::Proc::state`) still keeps its own copies, and deleting
 `MAX_VCORES` outright needs `vframe`/`vqp`/`vqp_va`/`vqp_cap`/`voutcome` moved onto the entity
 too - about 11 KiB of `.bss` at 16 contexts, against the 1 MiB the FP areas alone were, so the
-constant is a bound on an array rather than the resource limit it used to be.
+constant is a bound on an array rather than the resource limit it used to be. **The Linux half
+is blocked on one decision the work surfaced** (docs/EXECUTION-MODEL.md 9.1): the entity id is
+*derived* (`cell * MAX_VCORES + vcore`), which is what removes the mapping E2 exists to delete -
+but a derived id is a **stride**, and a stride bounds contexts per cell, where native vcores are
+bounded at 16 and Linux threads at `CONTEXT_CEILING` = 1024. Raising the stride is measured and
+refused: `Funded::reserve` is dense, so it would allocate **1 MiB** of kernel metadata the moment
+the last cell installs, for a table holding a few dozen live entities - a static array in
+disguise, which is exactly what E4 just removed. The decision recorded for whoever lands it:
+keep the derived id for native and give a Linux thread an id **allocated** by `create` and stored
+on its `Thread`, above the derived band so `create_at` cannot overwrite it. Two ways to *obtain*
+an id, one table and one authority - which is the distinction E2 was actually about.
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
