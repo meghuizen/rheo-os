@@ -1365,6 +1365,42 @@ fn ap_page_conflict() -> Option<&'static str> {
     None
 }
 
+#[cfg(feature = "smp")]
+unsafe extern "C" {
+    /// The stack pointer the next AP loads (smp.S). The primary sets it before
+    /// each SIPI; bring-up is sequential, so there is no race.
+    static mut secondary_sp: u64;
+    /// Tops of the two AP stacks (smp.S).
+    static ap_stack_top: u8;
+    static ap_stack2_top: u8;
+}
+
+/// How many secondaries this ISA brings up in the start-all proof. x86-64 has two
+/// AP stacks + the `secondary_sp` hand-off (docs/SMP.md 10), so two secondaries -
+/// three cores online at once.
+#[cfg(feature = "smp")]
+pub fn smp_secondary_count() -> usize {
+    2
+}
+
+/// Set `secondary_sp` to the top of AP stack `index` so the next SIPI hands that
+/// AP its own stack. Sequential bring-up; `mfence` publishes the write (x86 TSO
+/// already orders stores, but the AP starts fresh and this is belt-and-suspenders)
+/// before the SIPI releases the reader.
+#[cfg(feature = "smp")]
+pub fn smp_prepare_secondary(index: usize) {
+    let top = if index == 0 {
+        core::ptr::addr_of!(ap_stack_top) as u64
+    } else {
+        core::ptr::addr_of!(ap_stack2_top) as u64
+    };
+    // SAFETY: single writer (the primary), sequential bring-up.
+    unsafe {
+        core::ptr::addr_of_mut!(secondary_sp).write(top);
+        core::arch::asm!("mfence", options(nostack, preserves_flags));
+    }
+}
+
 /// Start the application processor with APIC id `hw_id`: stage the real-mode
 /// trampoline in low memory, then release the AP with INIT-SIPI-SIPI. Returns
 /// `Ok(())` once the SIPI has been sent (the portable `smp::bring_up_one` then

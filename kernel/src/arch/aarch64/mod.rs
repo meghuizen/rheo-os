@@ -938,6 +938,42 @@ fn publish_ap_sysregs() {
     }
 }
 
+#[cfg(feature = "smp")]
+unsafe extern "C" {
+    /// The stack pointer the next secondary loads (smp.S). The primary sets it
+    /// before each PSCI `CPU_ON`; bring-up is sequential, so there is no race.
+    static mut secondary_sp: u64;
+    /// Tops of the two secondary stacks (smp.S).
+    static ap_stack_top: u8;
+    static ap_stack2_top: u8;
+}
+
+/// How many secondaries this ISA brings up in the start-all proof. ARM64 has two
+/// AP stacks + the `secondary_sp` hand-off (docs/SMP.md 10), so two secondaries -
+/// three cores online at once.
+#[cfg(feature = "smp")]
+pub fn smp_secondary_count() -> usize {
+    2
+}
+
+/// Set `secondary_sp` to the top of AP stack `index` so the next `CPU_ON` hands
+/// that core its own stack. Sequential bring-up; the `dsb`+`isb` publish the write
+/// before the PSCI call releases the reader.
+#[cfg(feature = "smp")]
+pub fn smp_prepare_secondary(index: usize) {
+    let top = if index == 0 {
+        core::ptr::addr_of!(ap_stack_top) as u64
+    } else {
+        core::ptr::addr_of!(ap_stack2_top) as u64
+    };
+    // SAFETY: single writer (the primary), sequential bring-up; the barrier orders
+    // the write before the CPU_ON that releases the reader.
+    unsafe {
+        core::ptr::addr_of_mut!(secondary_sp).write(top);
+        core::arch::asm!("dsb sy", "isb", options(nostack, preserves_flags));
+    }
+}
+
 /// Start the secondary core with MPIDR affinity `hw_id` via PSCI `CPU_ON`, over
 /// whichever conduit the probe found. Returns `Ok(())` once PSCI accepted the
 /// call (the portable `smp::bring_up_one` then waits, bounded, for the core to run

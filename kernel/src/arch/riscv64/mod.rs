@@ -614,6 +614,40 @@ unsafe extern "C" {
     /// as a high .rodata word by smp.S (an absolute reloc the high-half kernel
     /// can read - it cannot form the low address PC-relatively under medany).
     static SECONDARY_ENTRY_PA: u64;
+    /// The stack pointer the next secondary loads (smp.S). The primary sets it
+    /// before each hart_start; bring-up is sequential so there is no race.
+    static mut secondary_sp: u64;
+    /// Tops of the three secondary stacks (smp.S).
+    static secondary_stack_top: u8;
+    static secondary_stack2_top: u8;
+    static secondary_stack3_top: u8;
+}
+
+/// How many secondaries this ISA can bring up in the start-all proof. RISC-V has
+/// three AP stacks + the `secondary_sp` hand-off (docs/SMP.md 10), so it brings up
+/// all three secondaries QEMU's `-smp 4` provides - four cores online at once.
+#[cfg(feature = "smp")]
+pub fn smp_secondary_count() -> usize {
+    3
+}
+
+/// Set `secondary_sp` to the top of secondary stack `index`, so the next
+/// `smp_start_secondary` hands that hart its own stack. Called by the portable
+/// bring-up loop before each start; the `fence` publishes the write before the
+/// SBI ecall releases the hart.
+#[cfg(feature = "smp")]
+pub fn smp_prepare_secondary(index: usize) {
+    let top = match index {
+        0 => core::ptr::addr_of!(secondary_stack_top) as u64,
+        1 => core::ptr::addr_of!(secondary_stack2_top) as u64,
+        _ => core::ptr::addr_of!(secondary_stack3_top) as u64,
+    };
+    // SAFETY: single writer (the primary), sequential bring-up; the fence orders
+    // the write before the hart_start ecall that releases the reader.
+    unsafe {
+        core::ptr::addr_of_mut!(secondary_sp).write(top);
+        asm!("fence w, w", options(nostack, preserves_flags));
+    }
 }
 
 /// The per-hart CPU index for this hart. The kernel keeps it in `tp` (the thread
