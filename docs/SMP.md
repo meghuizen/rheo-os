@@ -1548,9 +1548,14 @@ preemptions were genuinely taken - 47 of 322 slices on x86-64, 27 of 150 on risc
 one of them into a **sibling context**, which is `linux::thread::preempt_context` executing
 from trap context on two cores at once. Three things it does not claim:
 
-- `linux::proc::preempt_cell` is still unexercised. A 4-thread cell always has a ready
+- `linux::proc::preempt_cell` is not exercised *here*. A 4-thread cell always has a ready
   sibling, so the first arm always answers; executing the second needs a single-context
-  cell that outlives its slice, and no fixture here is one.
+  cell that outlives its slice, and no fixture in this kernel is one. It is proven
+  elsewhere, single-core: `linuxproc`'s `preemptfork` phase forks and spins on **both**
+  sides, so neither cell has a sibling to move to and 392-930 preemptions go to the other
+  *cell* on all three ISAs, against 0 in the cooperative control
+  (docs/ARCHITECTURE-DEBT.md 7.6). What stays unclaimed is that arm on **two cores at
+  once**, which is what this kernel would have to show.
 - The *locking* has no deterministic negative control, because removing it leaves a race
   rather than a failure (docs/ENGINEERING.md 7 - reasoned and reviewed, not proven by
   revert).

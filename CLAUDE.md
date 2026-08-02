@@ -3146,7 +3146,12 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               (an empty counter is NOT pollable-readable, a dup shares it,
               EFD_SEMAPHORE decrements), a real sysinfo, sched_setscheduler
               refusing real-time with EPERM, close_range, and clone3/rseq refused
-              deliberately),
+              deliberately; and `preemptfork`, two single-context Linux
+              processes spinning at once with no syscall between them - the
+              only shape that reaches `linux::proc::preempt_cell`, the
+              move-to-another-*cell* arm every other preemption proof skips,
+              with the same binary under cooperative dispatch as the control
+              at 0 cross-cell preemptions),
               linuxclaude (GOAL-CLAUDE: the real 275 MB Claude Code binary - a
               Bun-compiled single-file executable - streamed off a live ext4 disk,
               JIT enabled, preemptive, printing its exact version string and

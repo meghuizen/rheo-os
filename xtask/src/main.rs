@@ -1812,6 +1812,10 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         ("numatopo.c", "numatopo", NO_EXTRA),
         ("mmapdp.c", "mmapdp", NO_EXTRA),
         ("cowfork.c", "cowfork", NO_EXTRA),
+        // Two single-context processes spinning at once, which is the only shape
+        // that reaches `linux::proc::preempt_cell` - the move-to-another-cell arm.
+        // The last `linuxproc` phase.
+        ("preemptfork.c", "preemptfork", NO_EXTRA),
     ] {
         let mut sc = Command::new(cc);
         sc.arg("-static").arg("-no-pie");

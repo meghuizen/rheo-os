@@ -52,6 +52,7 @@ static STACKX: &[u8] = fixture::linux!("stackx");
 static SYSX: &[u8] = fixture::linux!("sysx");
 static MMAPDP: &[u8] = fixture::linux!("mmapdp");
 static COWFORK: &[u8] = fixture::linux!("cowfork");
+static PREEMPTFORK: &[u8] = fixture::linux!("preemptfork");
 static COREUTILS: &[u8] = fixture::linux!("cu/bin/coreutils");
 
 // -- stdout capture, wired to the Linux personality's stdout tap --
@@ -640,6 +641,87 @@ extern "C" fn kernel_main() -> ! {
          privated on write and parent and child stayed isolated in both directions \
          (an eager fork would have copied all {shared})"
     );
+
+    // --- preemption moves the CPU to **another Linux cell**
+    //     (docs/ARCHITECTURE-DEBT.md 7.6, which recorded this arm as unexercised).
+    //
+    // `user::on_user_interrupt` tries a ready sibling *context* of the interrupted
+    // cell first and only then another cell, and every preemption proof in the tree
+    // reached the first arm: `preempt` runs native cells (which have one context, so
+    // they take `nproc`'s own path), and `linuxnode`/`linuxbun` run multi-threaded
+    // cells, where a ready sibling always answers. So `linux::proc::preempt_cell` -
+    // the second arm - had never executed.
+    //
+    // The shape that reaches it is a fork where **both** sides are compute-bound at
+    // once: two single-context cells, neither with a sibling to move to, and
+    // cooperatively the child cannot run at all until the parent reaches `waitpid`.
+    // The fixture therefore spins in the parent *before* waiting.
+    //
+    // Two phases, control first. The control is what makes the claim mean something:
+    // the identical program with dispatch off must take **zero** cross-cell
+    // preemptions, or an interleave in phase two could be evidence of preemption or
+    // of the two having been interleaved all along - the same reasoning the
+    // `preempt` kernel's cooperative round already carries.
+    let want_pf: &[u8] = b"preemptfork parent done child 7\n";
+
+    kernel::sched::preempt::reset();
+    let (code, out) = run_capture(PREEMPTFORK, &[b"preemptfork"]);
+    assert!(
+        out == want_pf && code == 0,
+        "preemptfork (cooperative): exit {code}, stdout {:?}",
+        core::str::from_utf8(out),
+    );
+    let (_, _, _, _, coop_to_cell) = kernel::sched::preempt::counters();
+    assert_eq!(
+        coop_to_cell, 0,
+        "cooperative control: {coop_to_cell} cross-cell preemption(s) with dispatch \
+         off - this phase is not the control it claims to be"
+    );
+
+    // Now with the slice armed. Everything else about the run is identical.
+    arch::enable_timer_irq();
+    kernel::sched::dispatch::enable(true);
+    kernel::sched::preempt::reset();
+    let (code, out) = run_capture(PREEMPTFORK, &[b"preemptfork"]);
+    let (armed, taken, unarmable, to_sibling, to_cell) = kernel::sched::preempt::counters();
+    // Off again before anything else runs: preemption changes *when* a cell stops,
+    // and the phases after this one were written against the cooperative order.
+    kernel::sched::dispatch::enable(false);
+    // The correctness half, asserted first and unconditionally: preempting a Linux
+    // cell at an arbitrary instruction inside its own compute loop must not change
+    // what the program computes. A counter that went up beside a broken transcript
+    // would be the wrong result reported as the right one.
+    assert!(
+        out == want_pf && code == 0,
+        "preemptfork (preemptive): exit {code}, stdout {:?} - preemption changed what \
+         the program produced",
+        core::str::from_utf8(out),
+    );
+    if !arch::timer_irq_enabled() || armed == 0 {
+        println!(
+            "linuxproc: SKIP the cross-cell preemption claim - no slice could be armed \
+             on this ISA ({unarmable} unarmable); the transcript above is still exact, \
+             so the fixture ran cooperatively and correctly"
+        );
+    } else {
+        assert!(
+            to_cell > 0,
+            "no cross-cell preemption in {armed} armed slice(s) ({taken} taken, \
+             {to_sibling} to a sibling context) - the two spinning processes never \
+             took the CPU from each other, so `linux::proc::preempt_cell` is still \
+             unexercised"
+        );
+        println!(
+            "linuxproc: CROSS-CELL PREEMPTION OK - two single-context Linux processes \
+             spin at once with no syscall between them, and {to_cell} of {taken} \
+             preemption(s) across {armed} armed slice(s) moved the CPU to the *other \
+             cell* ({to_sibling} to a sibling context, which a single-context cell has \
+             none of - so this is `linux::proc::preempt_cell`, the arm every other \
+             preemption proof skips). The control above, the same binary with dispatch \
+             off, took 0. The transcript is byte-identical either way, so preempting \
+             the loop changed nothing it computed"
+        );
+    }
 
     // The pre-fault path's cost, measured rather than assumed (docs/ENGINEERING.md 1).
     // Presence is ensured only on the helpers that hand back something to
