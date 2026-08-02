@@ -73,15 +73,26 @@ impl FpArea {
     }
 }
 
+/// What a context is doing.
+///
+/// **Not stored** (E3, docs/EXECUTION-MODEL.md 9): it is read from the context's entity, which
+/// is the one authority on runnability. `Free` is the slot's own condition - no entity has been
+/// allocated for it - and the other two are the entity's state.
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum TState {
-    /// Slot unused.
+    /// Slot unused: no entity allocated.
     Free,
     /// Runnable (currently running, or waiting for its turn).
     Ready,
-    /// Parked on a futex word.
+    /// Parked - on a futex word, or on a proc-level block.
     Blocked,
 }
+
+/// Wake-source indices recorded on the entity. Nonzero for every real source, because I4 is
+/// "parked with nothing that can ever wake it" and `NO_WAKE` is what that violation looks like.
+/// Distinct per kind so the two reasons a Linux context parks stay tellable apart.
+const WAKE_FUTEX: u32 = 1;
+const WAKE_PBLOCK: u32 = 2;
 
 /// `Copy` because it lives in a [`Funded`] table, whose storage is raw frames
 /// with no drop glue (docs/SUBSTRATE.md pillar 1). Every field already is: a raw
@@ -91,7 +102,15 @@ struct Thread {
     /// Saved register state. Context 0 points at the cell's installed frame;
     /// others point into `FRAMES`.
     frame: *mut TrapFrame,
-    state: TState,
+    /// This context's entity id, or 0 when the slot is unused.
+    ///
+    /// **Allocated**, not derived, and stored here (docs/EXECUTION-MODEL.md 9.1). A native
+    /// vcore's id is computed from `cell * MAX_VCORES + vcore`; a Linux cell's contexts are
+    /// bounded by its frame budget rather than by that stride, and widening the stride to cover
+    /// them costs 1 MiB of dense funded metadata - measured and refused. A stored id is a
+    /// handle, not a second copy of a fact: the entity remains the only authority on what this
+    /// context is *doing*.
+    entity: u32,
     /// Thread id (gettid). Context 0 is the tgid (== getpid, 1000).
     tid: u32,
     /// CLONE_CHILD_CLEARTID address: on this context's exit, the word here is
@@ -123,7 +142,7 @@ impl Thread {
     const fn new() -> Thread {
         Thread {
             frame: core::ptr::null_mut(),
-            state: TState::Free,
+            entity: 0,
             tid: 0,
             clear_child_tid: 0,
             fs_base: 0,
@@ -296,6 +315,81 @@ impl core::ops::IndexMut<usize> for ContextTable {
     }
 }
 
+/// A context's state, **read from its entity** rather than stored beside it (E3).
+///
+/// `Free` is the slot's own condition - no entity allocated - and the other two are the
+/// entity's. One authority: a context cannot be `Ready` here and parked there.
+fn tstate_of(entity: u32) -> TState {
+    if entity == 0 {
+        return TState::Free;
+    }
+    // SAFETY: a read of a context this core is deciding about.
+    match unsafe { crate::sched::entity::table() }.get(entity as usize) {
+        Some(e) => match e.state {
+            crate::sched::entity::State::Parked => TState::Blocked,
+            crate::sched::entity::State::Runnable => TState::Ready,
+            _ => TState::Free,
+        },
+        None => TState::Free,
+    }
+}
+
+/// Slot `idx` of cell `cell`'s state.
+fn tstate(cell: usize, idx: usize) -> TState {
+    tstate_of(threads(cell)[idx].entity)
+}
+
+/// Allocate an entity for slot `idx` and record it. False when the cell's frame budget
+/// refuses, which the caller turns into `-EAGAIN` - what Linux reports when a process cannot
+/// create another thread.
+///
+/// **Allocated above the derived band**, so it can never collide with a native vcore's
+/// computed id (`sched::entity`'s `reserved` floor, docs/EXECUTION-MODEL.md 9.1).
+fn attach_entity(cell: usize, idx: usize) -> bool {
+    // SAFETY: the core creating this context.
+    let t = unsafe { crate::sched::entity::table() };
+    match t.create(cell as u16, idx as u16) {
+        Some(id) => {
+            threads(cell)[idx].entity = id as u32;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Mark slot `idx` runnable.
+fn set_ready(cell: usize, idx: usize) {
+    let e = threads(cell)[idx].entity;
+    if e != 0 {
+        // SAFETY: the core waking this context.
+        unsafe { crate::sched::entity::table() }.wake(e as usize);
+    }
+}
+
+/// Park slot `idx` on `wake`, which must be nonzero (I4).
+fn set_parked(cell: usize, idx: usize, wake: u32) {
+    let e = threads(cell)[idx].entity;
+    if e != 0 {
+        // SAFETY: the core parking this context.
+        unsafe { crate::sched::entity::table() }.park(e as usize, wake);
+    }
+}
+
+/// End slot `idx`'s context and hand its entity back.
+///
+/// Exit **then** release, in that order: `release` refuses a live entity, which is the check
+/// that separates a leak from a use-after-free.
+fn detach_entity(cell: usize, idx: usize) {
+    let e = threads(cell)[idx].entity;
+    threads(cell)[idx].entity = 0;
+    if e != 0 {
+        // SAFETY: the core retiring this context; no core is inside it.
+        let t = unsafe { crate::sched::entity::table() };
+        t.exit(e as usize);
+        t.release(e as usize);
+    }
+}
+
 fn threads(cell: usize) -> &'static mut ContextTable {
     // SAFETY: single CPU, synchronous traps; one context runs at a time.
     unsafe { &mut (*addr_of_mut!(THREADS))[cell] }
@@ -398,7 +492,8 @@ pub fn init_cell(cell: usize) {
     let t = threads(cell);
     t.for_each_mut(|th| *th = Thread::new());
     t[0].frame = f0;
-    t[0].state = TState::Ready;
+    // Context 0's entity, allocated with the cell (E3).
+    attach_entity(cell, 0);
     t[0].tid = 1000; // main thread tid == tgid (getpid)
     set_cur_thread(cell, 0);
     // SAFETY: single CPU.
@@ -420,6 +515,7 @@ pub fn init_cell(cell: usize) {
 /// unrelated cell failing to get a frame (docs/SUBSTRATE.md pillar 1: exhaustion
 /// must be attributable, and a leak is the one condition that makes it not).
 pub fn release_cell(cell: usize) {
+    detach_all(cell);
     threads(cell).release();
     // SAFETY: single CPU; the slot is being handed back and nothing is running in
     // it, so no live pointer into these frames survives (a context's `frame`
@@ -429,6 +525,19 @@ pub fn release_cell(cell: usize) {
         (*addr_of_mut!(FPAREAS))[cell].release();
     }
     set_cur_thread(cell, 0);
+}
+
+/// Hand back every context's entity for `cell`.
+///
+/// **The same lesson as the frames above, one level along**: `release_cell`'s own comment
+/// records that its absence was a real leak once the context *tables* became funded, because a
+/// slot handed back without a release path leaks until the next boot. A context's **entity** is
+/// now the same kind of resource, and it needed the same treatment - found by the `linuxthreads`
+/// phase asserting no Linux context outlives its cell, which failed by two.
+fn detach_all(cell: usize) {
+    for idx in 0..capacity(cell) {
+        detach_entity(cell, idx);
+    }
 }
 
 /// Clear every cell's thread table (called from `linux::reset`).
@@ -441,6 +550,7 @@ pub fn reset() {
     for cell in 0..MAX_CELLS {
         // Release rather than clear: these tables hold frames now, and a reset that
         // only zeroed them would leak every context slot every run.
+        detach_all(cell);
         threads(cell).release();
         // SAFETY: single CPU, between runs.
         unsafe {
@@ -470,7 +580,7 @@ pub fn current_tid(cell: usize) -> u32 {
 pub(crate) fn set_current_pblock(cell: usize, b: Block) {
     let ci = cur_thread(cell);
     threads(cell)[ci].pblock = b;
-    threads(cell)[ci].state = TState::Blocked;
+    set_parked(cell, ci, WAKE_PBLOCK);
 }
 
 /// A `Ready` sibling context to run instead of parking the whole cell (round-robin
@@ -497,7 +607,7 @@ pub(crate) fn pblock_of(cell: usize, idx: usize) -> Block {
 /// not running, not a futex wait) - a candidate for the scheduler to wake.
 pub(crate) fn is_pblocked(cell: usize, idx: usize) -> bool {
     let th = &threads(cell)[idx];
-    th.state == TState::Blocked && !matches!(th.pblock, Block::None)
+    tstate_of(th.entity) == TState::Blocked && !matches!(th.pblock, Block::None)
 }
 
 /// Make proc-blocked context `idx` current for an **intra-cell** resume (a sibling
@@ -532,7 +642,7 @@ pub(crate) fn set_current(cell: usize, idx: usize) {
 /// `Ready`. The block's syscall return is written by `proc.rs` into `idx`'s frame.
 pub(crate) fn clear_pblock_ready(cell: usize, idx: usize) {
     threads(cell)[idx].pblock = Block::None;
-    threads(cell)[idx].state = TState::Ready;
+    set_ready(cell, idx);
 }
 
 /// Diagnostic: print each live context's state for the deadlock reporter, so a
@@ -542,7 +652,7 @@ pub fn dump_contexts(cell: usize) {
     let cur = cur_thread(cell);
     for i in 0..capacity(cell) {
         let th = &threads(cell)[i];
-        let s = match th.state {
+        let s = match tstate_of(th.entity) {
             TState::Free => continue,
             TState::Ready => "ready",
             TState::Blocked => "blocked-on-futex",
@@ -568,7 +678,7 @@ pub fn current_context(cell: usize) -> usize {
 pub fn index_of_tid(cell: usize, tid: u32) -> Option<usize> {
     let n = capacity(cell);
     let t = threads(cell);
-    (0..n).find(|&i| t[i].state != TState::Free && t[i].tid == tid)
+    (0..n).find(|&i| tstate_of(t[i].entity) != TState::Free && t[i].tid == tid)
 }
 
 /// The saved `TrapFrame` of context `idx` in `cell` (for delivering a signal to
@@ -635,7 +745,8 @@ pub fn init_forked(
     let t = threads(cell);
     t.for_each_mut(|th| *th = Thread::new());
     t[0].frame = cf;
-    t[0].state = TState::Ready;
+    // Context 0's entity, allocated with the cell (E3).
+    attach_entity(cell, 0);
     t[0].tid = tid;
     t[0].fs_base = fs_base;
     t[0].clear_child_tid = clear_child_tid;
@@ -670,7 +781,7 @@ pub fn reset_after_exec(cell: usize, tid: u32, frame: TrapFrame) -> *mut TrapFra
 
 /// Whether context `idx` in `cell` is a live (non-free) context.
 pub fn is_active(cell: usize, idx: usize) -> bool {
-    threads(cell)[idx].state != TState::Free
+    tstate(cell, idx) != TState::Free
 }
 
 /// Record the current context's `clear_child_tid` (from `set_tid_address`) and
@@ -715,7 +826,7 @@ pub fn clone(
     // count stops being a constant: growth is charged to the cell, and `-EAGAIN` -
     // the errno `pthread_create` surfaces - now means "this cell is out of budget"
     // rather than "the kernel was built with room for eight".
-    let slot = match (1..capacity(cell)).find(|&i| threads(cell)[i].state == TState::Free) {
+    let slot = match (1..capacity(cell)).find(|&i| tstate(cell, i) == TState::Free) {
         Some(i) => i,
         None => {
             // Grow by exactly one and take *that* index. Deriving it from the
@@ -732,7 +843,7 @@ pub fn clone(
     };
     // The grown slot must actually be free; if the growth arithmetic ever picked an
     // occupied one, a `clone` would silently overwrite a live context.
-    if threads(cell)[slot].state != TState::Free {
+    if tstate(cell, slot) != TState::Free {
         return -EAGAIN;
     }
     let tid = next_tid(cell);
@@ -743,9 +854,16 @@ pub fn clone(
         let child = arch::clone_child_frame(&*parent_frame, child_stack, tls);
         cf.write(child);
     }
+    // The child's entity, which is what makes it runnable (E3): there is no separate `state`
+    // field to set any more, so a slot with no entity is a slot that does not run. Allocated
+    // before anything else is written, so a refusal here leaves the slot exactly as free as it
+    // was rather than half-built.
+    if !attach_entity(cell, slot) {
+        return -EAGAIN;
+    }
     let th = &mut threads(cell)[slot];
     th.frame = cf;
-    th.state = TState::Ready;
+
     th.tid = tid;
     th.fs_base = tls; // x86-64 SETTLS; ignored elsewhere
     th.clear_child_tid = if flags & CLONE_CHILD_CLEARTID != 0 {
@@ -827,7 +945,7 @@ pub fn futex(cell: usize, uaddr: u64, op: u64, val: u32, timeout_va: u64) -> Ctl
                 }
             };
             let ci = cur_thread(cell);
-            threads(cell)[ci].state = TState::Blocked;
+            set_parked(cell, ci, WAKE_FUTEX);
             threads(cell)[ci].fut_addr = uaddr;
             threads(cell)[ci].fut_deadline = deadline;
             match next_runnable_or_wait(cell) {
@@ -852,7 +970,7 @@ pub fn futex(cell: usize, uaddr: u64, op: u64, val: u32, timeout_va: u64) -> Ctl
                     // and counts it, so the spin is visible at its cause.
                     // Remaining work: with timer preemption + a cross-cell futex
                     // this becomes a real block (docs/CONCURRENCY.md, task #27).
-                    threads(cell)[ci].state = TState::Ready;
+                    set_ready(cell, ci);
                     threads(cell)[ci].fut_addr = 0;
                     threads(cell)[ci].fut_deadline = 0;
                     note_deadlock(uaddr);
@@ -927,7 +1045,7 @@ fn wait_deadline(cmd: u64, op: u64, timeout_va: u64) -> Deadline {
 fn nearest_deadline(cell: usize) -> Option<u64> {
     let t = threads(cell);
     t.iter_values()
-        .filter(|th| th.state == TState::Blocked && th.fut_deadline != 0)
+        .filter(|th| tstate_of(th.entity) == TState::Blocked && th.fut_deadline != 0)
         .map(|th| th.fut_deadline)
         .min()
 }
@@ -941,12 +1059,14 @@ fn expire_timeouts(cell: usize) -> usize {
         let (due, frame) = {
             let th = &threads(cell)[i];
             (
-                th.state == TState::Blocked && th.fut_deadline != 0 && now >= th.fut_deadline,
+                tstate_of(th.entity) == TState::Blocked
+                    && th.fut_deadline != 0
+                    && now >= th.fut_deadline,
                 th.frame,
             )
         };
         if due {
-            threads(cell)[i].state = TState::Ready;
+            set_ready(cell, i);
             threads(cell)[i].fut_addr = 0;
             threads(cell)[i].fut_deadline = 0;
             // SAFETY: `frame` is this context's saved state.
@@ -1053,12 +1173,12 @@ fn wake(cell: usize, uaddr: u64, max: u32) -> u32 {
         let (blocked, frame) = {
             let th = &threads(cell)[i];
             (
-                th.state == TState::Blocked && th.fut_addr == uaddr,
+                tstate_of(th.entity) == TState::Blocked && th.fut_addr == uaddr,
                 th.frame,
             )
         };
         if blocked {
-            threads(cell)[i].state = TState::Ready;
+            set_ready(cell, i);
             threads(cell)[i].fut_addr = 0;
             threads(cell)[i].fut_deadline = 0;
             // SAFETY: `frame` is this context's saved state.
@@ -1111,7 +1231,7 @@ pub fn exit_thread(cell: usize, code: u64) -> Ctl {
         unsafe { (cct as *mut u32).write(0) };
         wake(cell, cct, 1);
     }
-    threads(cell)[ci].state = TState::Free;
+    detach_entity(cell, ci);
     threads(cell)[ci].fut_addr = 0;
     threads(cell)[ci].fut_deadline = 0;
     // A sibling parked on a futex *with a deadline* is not gone - the process is
@@ -1135,7 +1255,7 @@ fn pick_next(cell: usize, from: usize) -> Option<usize> {
     let t = threads(cell);
     (1..=n).find_map(|k| {
         let i = (from + k) % n;
-        (t[i].state == TState::Ready).then_some(i)
+        (tstate_of(t[i].entity) == TState::Ready).then_some(i)
     })
 }
 

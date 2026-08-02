@@ -970,7 +970,12 @@ pub fn reset() {
     // The entities go with the cells. `MAX_CPUS` rather than the online count, because this
     // runs before `start_all` and a bound of 1 would make invariant I2 reject a legitimate
     // owner the moment a secondary claimed something.
-    crate::sched::entity::reset_table(crate::smp::MAX_CPUS as u16);
+    crate::sched::entity::reset_table(
+        crate::smp::MAX_CPUS as u16,
+        // Ids below this are the native derived band, `cell * MAX_VCORES + vcore`. A Linux
+        // thread's id is allocated above it (docs/EXECUTION-MODEL.md 9.1).
+        MAX_CELLS * MAX_VCORES,
+    );
     // SAFETY: single CPU, between runs.
     unsafe {
         *core::ptr::addr_of_mut!(CELL_GRANTS) = [[EMPTY_GRANT; MAX_GRANTS_PER_CELL]; MAX_CELLS];

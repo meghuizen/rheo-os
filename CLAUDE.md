@@ -2793,21 +2793,35 @@ rather than an element of a `MAX_CELLS * MAX_VCORES` static; that static was the
 `MAX_VCORES` was 4 (256 KiB of `.bss` at four contexts, 4 MiB at sixty-four), so it is 16 now
 with the `.bss` cost *falling*, and the ceiling is the cell's frame budget. `smp` measures the
 per-context frame cost and its return, `verify/entity` checks fund-once / distinct /
-release-once. Honest remainders, named rather than implied: the **Linux** side of E3
-(`Thread::state` + `pblock` + `linux::Proc::state`) still keeps its own copies, and deleting
-`MAX_VCORES` outright needs `vframe`/`vqp`/`vqp_va`/`vqp_cap`/`voutcome` moved onto the entity
-too - about 11 KiB of `.bss` at 16 contexts, against the 1 MiB the FP areas alone were, so the
-constant is a bound on an array rather than the resource limit it used to be. **The Linux half
-is blocked on one decision the work surfaced** (docs/EXECUTION-MODEL.md 9.1): the entity id is
-*derived* (`cell * MAX_VCORES + vcore`), which is what removes the mapping E2 exists to delete -
-but a derived id is a **stride**, and a stride bounds contexts per cell, where native vcores are
-bounded at 16 and Linux threads at `CONTEXT_CEILING` = 1024. Raising the stride is measured and
-refused: `Funded::reserve` is dense, so it would allocate **1 MiB** of kernel metadata the moment
-the last cell installs, for a table holding a few dozen live entities - a static array in
-disguise, which is exactly what E4 just removed. The decision recorded for whoever lands it:
-keep the derived id for native and give a Linux thread an id **allocated** by `create` and stored
-on its `Thread`, above the derived band so `create_at` cannot overwrite it. Two ways to *obtain*
-an id, one table and one authority - which is the distinction E2 was actually about.
+release-once. **And E3's Linux half landed with it**: `Thread::state` is gone too, `TState`
+surviving only as a *view* computed from the entity, with what stays on the thread being the
+**reason** (`pblock`, `fut_addr`) because a wake source's detail belongs to whoever owns the
+source while *whether it is waiting* is the scheduler's fact. That half forced a design
+question the native side hid (docs/EXECUTION-MODEL.md 9.1): the entity id is **derived**
+(`cell * MAX_VCORES + vcore`), which is what removes the mapping E2 exists to delete - but a
+derived id is a **stride**, and a stride bounds contexts per cell, where native vcores are
+bounded at 16 and Linux threads at `CONTEXT_CEILING` = 1024. Raising the stride is measured
+and refused: `Funded::reserve` is dense, so it would allocate **1 MiB** of kernel metadata the
+moment the last cell installs, for a table holding a few dozen live entities - a static array
+in disguise, which is exactly what E4 just removed. So there are **two ways to obtain an id,
+one table and one authority**: native keeps the derived id, a Linux thread gets one
+**allocated** by `create` and stored on its `Thread` - `0` meaning "no context", because a
+funded table grows into *zeroed* frames so an empty value must be the all-zero pattern - and
+the floor is enforced in `EntityTable::init`/`create` rather than by the caller, since an
+allocation landing inside a native cell's range would be overwritten by a later `create_at`
+with no fault and no log. Two paths became release paths (`release_cell` on a `wait4` reap,
+`reset` between runs), which is S1's lesson one level along, and `clone` gained the matching
+`-EAGAIN` - a thread that cannot be scheduled must not be created. Proven by `linuxthreads` on
+all three ISAs **across** the teardown rather than after it, because the harness resets at the
+*start* of a run, so an "all free" assertion after the last one would have passed while
+proving nothing; control observed firing. Honest remainders, named rather than implied: **I4
+is vacuous in that kernel** (nothing is left parked by then - `verify/entity` exercises it
+directly, and forcing every park to `NO_WAKE` fails `condwait` behaviourally rather than
+through the assertion); `linux::Proc::state`, the *cell*-level copy above the contexts, is
+untouched; and deleting `MAX_VCORES` outright needs
+`vframe`/`vqp`/`vqp_va`/`vqp_cap`/`voutcome` moved onto the entity too - about 11 KiB of
+`.bss` at 16 contexts, against the 1 MiB the FP areas alone were, so the constant is a bound
+on an array rather than the resource limit it used to be.
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus

@@ -626,9 +626,10 @@ regression gate.
 
 ### 9.1 What E2-E4 landed, and the one decision they surfaced
 
-E2, E3's native half and E4's binding constraint are **done**; the register carries the
-per-row detail. What is worth recording here is a design question none of the three could be
-finished without answering, because it was invisible until the table had real users.
+E2, E3 (**both halves** - see 9.2 for the Linux one) and E4's binding constraint are **done**;
+the register carries the per-row detail. What is worth recording here is a design question
+none of the three could be finished without answering, because it was invisible until the
+table had real users.
 
 **The entity id is derived, and a derived id is a stride.** `entity_of(cell, vcore)` is
 `cell * MAX_VCORES + vcore`, which is what removes the mapping E2 exists to delete - there is
@@ -662,6 +663,52 @@ it.
 This was written down rather than forced, because the Linux personality is the path Node, Bun
 and Claude Code run on, and a half-migrated state machine there is the one place in this tree
 where "it compiles and the suite is green" would not be evidence of much.
+
+### 9.2 E3's Linux half, landed as decided above
+
+`Thread::state` is **gone**. A Linux context is `Ready` or `Blocked` because its entity says
+so - the same authority the native vcores use - and `TState` survives only as a *view*
+computed from the entity, never stored. What stays on the `Thread` is the **reason**: `pblock`
+(which proc-level source it is waiting on) and `fut_addr` (which futex word), because a wake
+source's detail belongs to whoever owns the source, while *whether it is waiting* is the
+scheduler's fact.
+
+The id follows 9.1's decision exactly: `Thread.entity: u32`, allocated by
+`EntityTable::create` above the derived band, `0` meaning "this slot holds no context". Zero
+is the free marker rather than a sentinel because a funded table grows into **zeroed** frames,
+so an empty value must *be* the all-zero pattern (the `mm::kmeta` contract, and the same rule
+that shaped `Entity::EMPTY`). The floor is enforced in the table, not by the caller:
+`EntityTable::init` takes a `reserved` count, `create` searches and grows only above it, so a
+Linux id can never land inside a native cell's `create_at` range where the overwrite would be
+silent.
+
+Two paths had to become release paths, which is the S1' lesson one level along - a funded
+resource handed back needs somewhere that hands it back:
+
+- `release_cell` (a `wait4` reaping a zombie, or an unfundable `fork`) detaches every
+  context's entity before releasing the tables.
+- `reset` does the same for every cell between runs.
+
+`clone` gained the matching failure path: `attach_entity` before the child slot is written,
+and `-EAGAIN` if the table cannot fund one - a thread that cannot be scheduled must not be
+created.
+
+**Proven** by `linuxthreads` on all three ISAs, after four threads, twelve threads, a
+rayon-threaded `sort` and two condvar timeouts have all created, parked, woken and exited
+contexts: the table holds every invariant it can check, no entity records a CPU inside it, and
+the teardown hands back every live context. The count is taken **across** the teardown rather
+than after it, because the harness resets at the *start* of a run - after the last run the
+final cell's contexts are still live, so an "all free" assertion would have passed while
+proving nothing. Control observed firing: removing `detach_all` from `reset` leaves the
+context live (`1 of 1 Linux context entities survived the teardown`).
+
+Two honest limits. **I4 is checked but vacuous in that kernel** - nothing is left parked by
+the time the phase runs, so the invariant's real exercise is `verify/entity`, which drives
+park and wake directly; what this kernel does show about the wake source is behavioural,
+since forcing every park to `NO_WAKE` makes `condwait` fail with glibc's "the futex facility
+returned an unexpected error code" rather than hang. And `linux::Proc::state` - the *cell*
+level Linux state, beside the per-context one this stage moved - is still its own copy; E3 is
+done for contexts, not for the cell above them.
 
 ---
 

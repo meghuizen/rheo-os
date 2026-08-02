@@ -280,6 +280,21 @@ pub struct EntityTable {
     /// How many CPUs are online, for I2. Set once by the caller; 0 means "unknown",
     /// and I2 is then not checked rather than checked against a wrong bound.
     cpus: u16,
+    /// Ids below this are **derived** - `cell * MAX_VCORES + vcore`, placed by
+    /// [`EntityTable::create_at`] - and [`EntityTable::create`] never allocates one
+    /// (docs/EXECUTION-MODEL.md 9.1).
+    ///
+    /// Two ways of obtaining an id, one table, one authority. A native vcore's id is
+    /// computed from the identity it already has, which is what removes the mapping E2
+    /// exists to delete; a Linux thread's is allocated and stored on the thread, because
+    /// its contexts are bounded by the cell's frame budget rather than by a small stride,
+    /// and widening the stride to cover them costs 1 MiB of dense funded metadata - a
+    /// static array in disguise, measured and refused.
+    ///
+    /// The floor is the correctness half of that split: without it `create` hands out an id
+    /// inside some native cell's reserved range, and a later `create_at` silently overwrites
+    /// a live context.
+    reserved: usize,
 }
 
 impl EntityTable {
@@ -287,14 +302,16 @@ impl EntityTable {
         EntityTable {
             slots: Funded::new(),
             cpus: 0,
+            reserved: 0,
         }
     }
 
     /// Charge this table's frames to `owner`, and record how many CPUs exist so I2
     /// has a bound to check against.
-    pub fn init(&mut self, owner: Owner, cpus: u16) {
+    pub fn init(&mut self, owner: Owner, cpus: u16, reserved: usize) {
         self.slots.set_owner(owner);
         self.cpus = cpus;
+        self.reserved = reserved;
     }
 
     pub fn capacity(&self) -> usize {
@@ -338,12 +355,14 @@ impl EntityTable {
     /// clean `-EAGAIN` naming the cell, never a global "table full"
     /// (docs/MEMORY.md 7, no OOM killer).
     pub fn create(&mut self, cell: u16, context: u16) -> Option<usize> {
-        let id = match (0..self.capacity())
+        let id = match (self.reserved..self.capacity())
             .find(|&i| self.slots.get(i).map(|e| e.state) == Some(State::Free))
         {
             Some(i) => i,
             None => {
-                let want = self.capacity() + 1;
+                // Never below the reserved floor: ids under it belong to the derived band and
+                // a `create_at` would overwrite whatever `create` put there.
+                let want = self.capacity().max(self.reserved) + 1;
                 if !self.slots.set_growing(want - 1, Entity::EMPTY) {
                     return None;
                 }
@@ -749,8 +768,9 @@ pub fn affinity_skips() -> u64 {
     AFFINITY_SKIPS.load(core::sync::atomic::Ordering::Acquire)
 }
 
-/// Clear the table between runs, and give it the CPU bound invariant I2 checks against.
-pub fn reset_table(cpus: u16) {
+/// Clear the table between runs, and give it the two bounds it needs: the CPU count invariant
+/// I2 checks against, and the floor below which ids are derived rather than allocated.
+pub fn reset_table(cpus: u16, reserved: usize) {
     // SAFETY: between runs, with no core inside a cell.
     let t = unsafe { table() };
     for id in 0..t.capacity() {
@@ -767,5 +787,5 @@ pub fn reset_table(cpus: u16) {
         // a running machine and wrong for a reset, where the point is that nothing is running.
         t.force_free(id);
     }
-    t.init(Owner::KERNEL, cpus);
+    t.init(Owner::KERNEL, cpus, reserved);
 }

@@ -391,7 +391,7 @@ fn gen_op(st: &mut u64, cap: usize) -> Op {
 
 fn run(seq: &[Op], edges: &mut HashSet<&'static str>) -> Result<(), (usize, String)> {
     let mut t = EntityTable::new();
-    t.init(Owner::cell(0), CPUS);
+    t.init(Owner::cell(0), CPUS, 0);
     let mut m = Model::new();
     for (i, &op) in seq.iter().enumerate() {
         if let Err(e) = apply(&mut t, &mut m, op) {
@@ -444,7 +444,7 @@ type Scenario = (&'static str, fn() -> Result<(), String>);
 
 fn fresh() -> (EntityTable, Model) {
     let mut t = EntityTable::new();
-    t.init(Owner::cell(0), CPUS);
+    t.init(Owner::cell(0), CPUS, 0);
     (t, Model::new())
 }
 
