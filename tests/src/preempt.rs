@@ -331,6 +331,8 @@ extern "C" fn kernel_main() -> ! {
          and cell 1 never got the CPU"
     );
 
+    observability();
+
     // ---- phase 2: preemption takes the CPU from a cell that never traps ----
     let (outcome, a_done, b_marks) = run_pair(true);
     let (armed, taken, unarmable, to_sibling, to_cell) = preempt::counters();
@@ -449,5 +451,147 @@ fn scratch_phase() {
     let (_, taken, _, to_sibling, to_cell) = preempt::counters();
     println!(
         "preempt: a preempted cell resumed by a sibling's {yields} SYS_YIELDs kept          RCX and R11 intact ({taken} preemptions, {to_sibling} sibling, {to_cell}          cell) OK"
+    );
+}
+
+// ------------------------------- the observability path, finally in a real boot
+//
+// `telemetry` and the buffered console were built with a host model-checker and **no
+// in-kernel user at all** - the module was referenced by nothing outside its own file. A
+// non-blocking logging path that no boot has ever enabled is a path nobody has run, which is
+// the same category of gap as a scheduler whose asymmetry can never be exercised.
+//
+// This is the console's *performance* fix, and it is opt-in for a stated reason: buffering
+// changes **when** output appears, so turning it on globally would make 210 existing boots
+// stop being comparable with their own history. Here it is enabled for one phase and turned
+// off again.
+//
+// What is asserted, all against hand-computed numbers:
+//
+//  1. A buffered write **does not touch the UART**: the record lands in this CPU's ring and
+//     the pending count says so. That is the whole claim - the emitting path pays a copy and
+//     an increment instead of spinning on a transmit-ready bit per byte.
+//  2. **Identical consecutive lines fold** rather than each taking a slot, which is what keeps
+//     a ring useful under a storm of one repeated message - the case where a blocking console
+//     is most damaging and most useless.
+//  3. **Overflow is counted, not silent.** More records than the ring holds must report the
+//     loss; a diagnostic that quietly drops the middle of a burst is worse than one that says
+//     it did.
+//  4. The flush **drains and renders**, and buffering is off again afterwards, so the rest of
+//     this boot behaves exactly as it did before the phase.
+fn observability() {
+    use kernel::telemetry;
+
+    telemetry::reset();
+    let (w0, d0, c0, b0) = telemetry::counters();
+    assert_eq!(
+        (w0, d0, c0, b0),
+        (0, 0, 0, 0),
+        "the telemetry rings are not clear after a reset"
+    );
+
+    // With buffering off the console goes straight to the wire and **nothing** reaches a ring.
+    // Asserted as "no record", not as "a bypass was counted": `console::write` asks whether it
+    // is buffering *before* doing any work and returns, so it never calls into the ring at all -
+    // which is what makes the off path cost one load and a branch. The bypass counter belongs to
+    // a direct API caller, checked at the end of this phase.
+    println!("preempt: observability - this line is NOT buffered");
+    let (written, _, _, _) = telemetry::counters();
+    assert_eq!(written, 0, "a record was buffered while buffering is off");
+    assert_eq!(
+        telemetry::pending(),
+        0,
+        "a console write with buffering off left something in a ring"
+    );
+
+    // 1 + 2: buffered writes land in the ring, and identical ones fold.
+    telemetry::set_buffered(true);
+    const DISTINCT: usize = 5;
+    const REPEATS: usize = 8;
+    for i in 0..DISTINCT {
+        println!("preempt: obs line {i}");
+    }
+    for _ in 0..REPEATS {
+        println!("preempt: obs repeated");
+    }
+    let (written, dropped, folded, _) = telemetry::counters();
+    let pending = telemetry::pending();
+    assert_eq!(
+        dropped,
+        0,
+        "{dropped} records dropped from a ring holding {} slots by {} writes",
+        telemetry::SLOTS,
+        DISTINCT + REPEATS
+    );
+    // The first of the repeated run takes a slot; the other seven fold into it.
+    assert_eq!(
+        folded as usize,
+        REPEATS - 1,
+        "{folded} of {} identical consecutive lines folded, want {}",
+        REPEATS,
+        REPEATS - 1
+    );
+    assert_eq!(
+        written as usize,
+        DISTINCT + 1,
+        "{written} records written for {DISTINCT} distinct lines plus one folded run"
+    );
+    assert_eq!(
+        pending,
+        DISTINCT + 1,
+        "{pending} records pending, want the {} that were written and not drained",
+        DISTINCT + 1
+    );
+
+    // 3: overflow is counted. Fill past the ring and check the loss is reported.
+    for i in 0..telemetry::SLOTS + 4 {
+        println!("preempt: obs overflow {i}");
+    }
+    let (_, dropped, _, _) = telemetry::counters();
+    assert!(
+        dropped > 0,
+        "{} writes into a {}-slot ring dropped nothing - a full ring that silently overwrites \
+         loses the middle of a burst without saying so",
+        telemetry::SLOTS + 4,
+        telemetry::SLOTS
+    );
+
+    // 4: the flush drains, and the phase leaves the console as it found it.
+    kernel::console::flush();
+    assert_eq!(
+        telemetry::pending(),
+        0,
+        "the flush left {} records in the rings",
+        telemetry::pending()
+    );
+    telemetry::set_buffered(false);
+    let before = telemetry::counters().0;
+    println!("preempt: observability - buffering is off again");
+    assert_eq!(
+        telemetry::counters().0,
+        before,
+        "a write after disabling buffering still went into a ring"
+    );
+    // And the API's own guard, which is the one thing the console cannot exercise: a *direct*
+    // push into a disabled ring is refused and counted, so a caller that is not the console
+    // cannot write into a ring nobody will drain.
+    let bypass_before = telemetry::counters().3;
+    // SAFETY: single-threaded here, and this is this CPU's own ring.
+    let took =
+        unsafe { telemetry::rings().push(telemetry::Level::Info, 0, 1, b"direct push while off") };
+    assert!(!took, "a disabled ring accepted a direct push");
+    assert_eq!(
+        telemetry::counters().3,
+        bypass_before + 1,
+        "a refused direct push was not counted, so the API cannot distinguish 'nobody wrote' \
+         from 'a write was refused'"
+    );
+    println!(
+        "preempt: THE OBSERVABILITY PATH RAN IN A REAL BOOT - {DISTINCT} distinct buffered \
+         lines took {DISTINCT} slots, {REPEATS} identical ones folded into 1 ({folded} folds), \
+         {dropped} records were reported lost when the ring overflowed rather than silently \
+         overwritten, the flush drained every one, and buffering is off again so the rest of \
+         this boot is byte-for-byte what it was. A buffered write costs a copy and an \
+         increment where the direct path spins on the UART per byte OK"
     );
 }

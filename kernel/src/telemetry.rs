@@ -333,6 +333,15 @@ pub struct Rings {
     buffered: bool,
     /// Records offered while buffering was off, so "nothing was buffered" and "buffering
     /// was never on" are distinguishable.
+    /// Records offered to a disabled ring.
+    ///
+    /// **Not reachable from the console**, and that is deliberate rather than an oversight:
+    /// `console::write` asks `buffering()` first and returns before it ever calls in here,
+    /// because an early-out placed after the work is not an early-out. So this counts only a
+    /// *direct* caller of [`Rings::push_claimed`] or [`Rings::push`] - the API's own guard
+    /// against writing into a ring that is off. Said here because a counter that reads 0 on
+    /// every real boot invites the reading that nothing happened, when the truth is that
+    /// nothing came this way (docs/ENGINEERING.md 11).
     bypassed: u32,
 }
 

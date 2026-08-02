@@ -2761,6 +2761,22 @@ the first place a per-core read can be shown to answer about the right core. Thr
 firing; a fourth is recorded as a non-result, because breaking either `set_isa` site alone
 changes no answer - the two are one claim and each corrects the other.
 
+**The observability path runs in a real boot** (docs/LOGGING.md, the `preempt` kernel): the
+buffered console and `telemetry`'s per-CPU record ring were built with a host model-checker and
+**no in-kernel user at all** - the module was referenced by nothing outside its own file, which
+is the same category of gap as a scheduler whose asymmetry can never be exercised. `preempt` now
+enables buffering for one phase on all three ISAs and asserts against hand-computed numbers: a
+buffered write reaches the ring rather than the UART (5 distinct lines, 5 slots), **identical
+consecutive lines fold** (8 into 1, 7 folds) so a storm of one repeated message cannot fill the
+ring, an overflow is **counted and reported** rather than silently overwriting the middle of a
+burst, the flush drains every record, and buffering is off again afterwards so the rest of the
+boot is byte-for-byte what it was - which is why it is opt-in, since buffering changes *when*
+output appears and would make 210 existing logs incomparable with their own history. Two
+controls firing. It also turned up a counter that could never be nonzero: `Rings::bypassed` is
+unreachable from the console, because `console::write` asks whether it is buffering *before*
+doing any work and returns - the right design, so the counter is documented as belonging to a
+direct API caller and the phase asserts that path instead of the impossible one.
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
 proofs, and the hardware-lab performance numbers.
