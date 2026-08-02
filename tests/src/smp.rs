@@ -3332,6 +3332,12 @@ fn test_entity_authority() {
 //  3. Freeing the cell **returns every frame**, so the pool is where it started. A slot-handback
 //     path that is not also a release path is the S1' leak, and two of those existed.
 fn test_funded_contexts() {
+    // Narrate this phase (docs/LOGGING.md 5, `kernel::trace`). It is the natural first
+    // user: it funds and returns per-context frames, so the `--ledger` view of this boot
+    // must balance - and where it does not, the tool names the sequence number of the
+    // acquire that went unreturned instead of leaving a total to be explained.
+    let traced = kernel::trace::enable();
+
     /// Frames taken out of the pool. `stats()` reports `(free, total)`, so used is the
     /// difference - and `total` is a constant, which is why reading `.1` measures nothing.
     fn used_frames() -> usize {
@@ -3479,5 +3485,31 @@ fn test_funded_contexts() {
             want_back,
             kernel::arch::FP_AREA_LEN
         );
+
+        // The structured trace of what just happened, in the form `cargo xtask trace`
+        // parses. Asserted, not merely printed: this phase funds and returns per-context
+        // frames, so the stream and the frame oracle above are two independent accounts
+        // of one thing and must agree.
+        if traced {
+            let (written, dropped) = kernel::trace::counters();
+            assert!(
+                written > 0,
+                "tracing was enabled but recorded nothing - the ledger is not wired"
+            );
+            assert_eq!(
+                dropped, 0,
+                "{dropped} traced event(s) were dropped - the ring is too small for this \
+                 phase, so a balance taken from the stream below would lie"
+            );
+            kernel::trace::dump();
+            println!(
+                "smp: TRACE - {written} structured event(s), 0 dropped; \
+                 `cargo xtask trace --arch <isa> --bin smp --ledger` balances them per \
+                 owner and names the sequence of any acquire that went unreturned OK"
+            );
+            kernel::trace::reset();
+        } else {
+            println!("smp: SKIP the trace phase - the pool refused the event ring");
+        }
     }
 }

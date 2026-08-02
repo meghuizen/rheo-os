@@ -961,6 +961,8 @@ fn main() -> ExitCode {
 
     let mut arches = vec![Arch::X86_64];
     let mut release = false;
+    let mut trace_window = String::new();
+    let mut trace_ledger = false;
     let mut bin = String::from("kernel");
     // Set only when `--bin` is passed explicitly, so `test` can tell "run just
     // this kernel" apart from the `run` default (which is also a valid kernel
@@ -993,6 +995,16 @@ fn main() -> ExitCode {
                 bin = value.clone();
                 bin_filter = Some(value.clone());
             }
+            // `trace` only: show one subsystem's window rather than the summary.
+            "--window" => {
+                let Some(value) = iter.next() else {
+                    eprintln!("error: --window needs a subsystem name");
+                    return ExitCode::FAILURE;
+                };
+                trace_window = value.clone();
+            }
+            // `trace` only: balance acquires against releases per owner.
+            "--ledger" => trace_ledger = true,
             "--release" => release = true,
             other => {
                 eprintln!("error: unknown flag '{other}'");
@@ -1059,6 +1071,10 @@ fn main() -> ExitCode {
         "verify" => verify(),
         // Report the kernel's largest static allocations (see `sizes`).
         "sizes" => arches.iter().all(|&a| sizes(a, &bin)),
+        // Window and query a boot's structured trace (see `trace`).
+        "trace" => arches
+            .iter()
+            .all(|&a| trace(a, &bin, &trace_window, trace_ledger)),
         // Patch the toolchain's vendored rust-src to add `target_os = "rheo"`
         // so `std` can be built for the rheo-os target (docs/USERLAND.md M4).
         // Idempotent; run once per toolchain before building std programs.
@@ -1078,9 +1094,239 @@ fn main() -> ExitCode {
 
 fn print_usage() {
     eprintln!(
-        "usage: cargo xtask <build|check|run|test|bench|verify|sizes|std-patch> \
-         [--arch x86_64|aarch64|riscv64|all] [--bin <kernel>[,<kernel>...]] [--release]"
+        "usage: cargo xtask <build|check|run|test|bench|verify|sizes|trace|std-patch> \
+         [--arch x86_64|aarch64|riscv64|all] [--bin <kernel>[,<kernel>...]] [--release]\n\
+         \x20 trace: [--window <subsys>] [--ledger]"
     );
+}
+
+/// One parsed `@E` line from a boot's structured trace ([`kernel::trace`]).
+struct Ev {
+    seq: u64,
+    ts: u64,
+    cpu: u64,
+    subsys: String,
+    kind: u8,
+    owner: u64,
+    a: u64,
+    b: u64,
+}
+
+/// Window and query the structured trace a boot left in its serial log.
+///
+/// The host half of [`kernel::trace`], and the reason it is a tool rather than an eyeball
+/// exercise: a boot's log is one interleaved scrollback in which the three lines that
+/// matter sit thousands apart from anything related to them. This groups the stream by
+/// **subsystem** and by **owner** - a navigable buffer per source, the treatment cat9
+/// gives a command's output - so the question "what did cell 3 do to its frames" is a
+/// query rather than a grep.
+///
+/// Three views, in the order they are usually wanted:
+///
+/// - **summary** (default): one line per subsystem window - how many events, over what
+///   span, and how the acquires and releases balance. A nonzero balance is a leak and
+///   says which window to open.
+/// - `--window <subsys>`: that window's events, in order.
+/// - `--ledger`: per **owner**, acquires against releases, with the surviving balance and
+///   the sequence number of the first unmatched acquire. That last number is the point: a
+///   leak stops being "the total did not return to zero" and becomes "sequence 412 took a
+///   frame nobody gave back", which is a place to look rather than a fact to explain.
+///
+/// **Loss is located, not counted.** Every event carries a sequence number, so a gap is
+/// reported with the range it spans; a reader is told where the record is incomplete
+/// rather than being handed a total and left to assume the rest is sound.
+fn trace(arch: Arch, bin: &str, window: &str, ledger: bool) -> bool {
+    let bin = if bin.is_empty() { "smp" } else { bin };
+    let path = format!("target/qemu-{}-{bin}.log", arch.name());
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        eprintln!(
+            "[xtask] no log at {path} - run `cargo xtask test --arch {} --bin {bin}` first",
+            arch.name()
+        );
+        return false;
+    };
+    let mut evs: Vec<Ev> = Vec::new();
+    let mut header = String::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("@E# ") {
+            header = rest.to_string();
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("@E ") else {
+            continue;
+        };
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        if f.len() != 8 {
+            continue;
+        }
+        let num = |i: usize| f[i].parse::<u64>().ok();
+        let (Some(seq), Some(ts), Some(cpu), Some(kind), Some(owner), Some(a), Some(b)) =
+            (num(0), num(1), num(2), num(4), num(5), num(6), num(7))
+        else {
+            continue;
+        };
+        evs.push(Ev {
+            seq,
+            ts,
+            cpu,
+            subsys: f[3].to_string(),
+            kind: kind as u8,
+            owner,
+            a,
+            b,
+        });
+    }
+    if evs.is_empty() {
+        println!(
+            "[xtask] {} {bin}: no trace in the log - the boot did not call `trace::enable()`",
+            arch.name()
+        );
+        return true;
+    }
+    println!(
+        "[xtask] {} {bin}: {} event(s) {header}",
+        arch.name(),
+        evs.len()
+    );
+
+    // Loss, located: a gap in the sequence is where the record is incomplete.
+    let mut gaps = 0usize;
+    for w in evs.windows(2) {
+        if w[1].seq != w[0].seq + 1 {
+            println!(
+                "  LOST  seq {}..{} ({} event(s) overwritten)",
+                w[0].seq,
+                w[1].seq,
+                w[1].seq - w[0].seq - 1
+            );
+            gaps += 1;
+        }
+    }
+    if gaps > 0 {
+        println!(
+            "  ({gaps} gap(s) - the ring wrapped; raise `trace::CAPACITY` or narrow what is traced)"
+        );
+    }
+
+    if ledger {
+        return trace_ledger_view(&evs);
+    }
+    if !window.is_empty() {
+        let base = evs.iter().map(|e| e.ts).min().unwrap_or(0);
+        let mut n = 0usize;
+        for e in evs.iter().filter(|e| e.subsys == window) {
+            println!(
+                "  {:>6} +{:>10}ns cpu{} {:<8} owner {:<5} a={} b={:#x}",
+                e.seq,
+                e.ts.saturating_sub(base),
+                e.cpu,
+                kind_name(e.kind),
+                owner_name(e.owner),
+                e.a,
+                e.b
+            );
+            n += 1;
+        }
+        if n == 0 {
+            println!("  window `{window}` is empty - nothing in this boot traced it");
+        }
+        return true;
+    }
+
+    // Summary: one line per window. Sorted by name so two runs are diffable.
+    let mut names: Vec<&str> = evs.iter().map(|e| e.subsys.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        let w: Vec<&Ev> = evs.iter().filter(|e| e.subsys == name).collect();
+        let acq: u64 = w.iter().filter(|e| e.kind == 0).map(|e| e.a).sum();
+        let rel: u64 = w.iter().filter(|e| e.kind == 1).map(|e| e.a).sum();
+        let span = w.last().map(|e| e.ts).unwrap_or(0) - w.first().map(|e| e.ts).unwrap_or(0);
+        let bal = acq as i64 - rel as i64;
+        // A **positive** balance is a leak: taken inside the window, never returned. A
+        // negative one is not, and saying so matters - it means frames acquired *before*
+        // tracing started were released inside it, the ordinary consequence of enabling
+        // the trace part-way through a boot. The first version called both a leak, and
+        // the tool's own first run duly reported four cells leaking when nothing was
+        // wrong. A diagnostic that cries wolf is worse than no diagnostic.
+        let note = match bal {
+            0 => "",
+            b if b > 0 => "   <-- LEAK: taken inside the window, never returned",
+            _ => "   (negative: released frames taken before tracing began)",
+        };
+        println!(
+            "  {name:<8} {:>5} event(s)  acquired {acq:<6} released {rel:<6} balance {bal:<6} over {span}ns{note}",
+            w.len(),
+        );
+    }
+    println!("  (`--window <name>` for one window's events, `--ledger` for per-owner balances)");
+    true
+}
+
+fn kind_name(k: u8) -> &'static str {
+    match k {
+        0 => "acquire",
+        1 => "release",
+        2 => "transfer",
+        3 => "refuse",
+        _ => "note",
+    }
+}
+
+fn owner_name(o: u64) -> String {
+    if o == u16::MAX as u64 {
+        "kernel".to_string()
+    } else {
+        format!("cell{o}")
+    }
+}
+
+/// Per-owner acquire/release balance, with the first unmatched acquire named.
+fn trace_ledger_view(evs: &[Ev]) -> bool {
+    let mut owners: Vec<u64> = evs.iter().map(|e| e.owner).collect();
+    owners.sort_unstable();
+    owners.dedup();
+    let mut leaked = 0i64;
+    for o in owners {
+        let mut bal = 0i64;
+        // The sequence at which the balance last rose from zero: where an unmatched
+        // acquire began, which is the line a leak hunt should start from.
+        let mut first_unmatched = None;
+        let mut peak = 0i64;
+        for e in evs.iter().filter(|e| e.owner == o) {
+            match e.kind {
+                0 => {
+                    if bal == 0 {
+                        first_unmatched = Some(e.seq);
+                    }
+                    bal += e.a as i64;
+                }
+                1 => bal -= e.a as i64,
+                _ => {}
+            }
+            peak = peak.max(bal);
+        }
+        // Only a **positive** balance is unreturned; see the note in the summary view. The
+        // sequence number is reported only for that case, because "first unmatched" has no
+        // meaning for an owner that released more than it took inside the window.
+        let tail = match (bal, first_unmatched) {
+            (b, Some(s)) if b > 0 => format!("   <-- {b} unreturned, first unmatched at seq {s}"),
+            (b, _) if b > 0 => format!("   <-- {b} unreturned"),
+            (b, _) if b < 0 => format!("   ({} released from before the window)", -b),
+            _ => String::new(),
+        };
+        leaked += bal.max(0);
+        println!(
+            "  {:<8} peak {peak:<6} balance {bal:<6}{tail}",
+            owner_name(o)
+        );
+    }
+    if leaked == 0 {
+        println!("  no owner has an unreturned acquire in this window");
+    } else {
+        println!("  {leaked} frame(s) taken inside this window were never returned");
+    }
+    true
 }
 
 /// Report the largest **static allocations** in a built kernel, biggest last.
@@ -2829,11 +3075,26 @@ fn boot_expect_pass(arch: Arch, release: bool, bin: &str, extra_args: &[&str]) -
                 println!("[xtask] {} {bin}: PASS", arch.name());
                 true
             } else {
-                eprintln!(
-                    "[xtask] {} {bin}: FAIL (qemu exit code {code}, expected {})",
-                    arch.name(),
-                    arch.success_exit_code()
-                );
+                // **Keep the failing run's log.** `target/qemu-<arch>-<bin>.log` is
+                // overwritten by the next boot, and in a full-matrix run the next boot is
+                // seconds away - so the evidence for a failure is routinely gone before
+                // anyone reads it. That is not hypothetical: an intermittent `netdns`
+                // failure in this tree was diagnosed by *reading the source* rather than
+                // the log, because the log had already been replaced by a passing run
+                // (docs/ARCHITECTURE-DEBT.md 7.6).
+                let keep = format!("target/qemu-{}-{bin}.fail.log", arch.name());
+                match std::fs::copy(&log_path, &keep) {
+                    Ok(_) => eprintln!(
+                        "[xtask] {} {bin}: FAIL (qemu exit code {code}, expected {}) - log kept at {keep}",
+                        arch.name(),
+                        arch.success_exit_code()
+                    ),
+                    Err(_) => eprintln!(
+                        "[xtask] {} {bin}: FAIL (qemu exit code {code}, expected {})",
+                        arch.name(),
+                        arch.success_exit_code()
+                    ),
+                }
                 false
             }
         }

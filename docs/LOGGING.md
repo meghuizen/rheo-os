@@ -431,6 +431,60 @@ init, the same pattern as the .NET implementation.
 
 ---
 
+## 4b. `kernel::trace` — the structured stream, built
+
+Sections 5 and 6 below specify structured events and a subscriber. This is the part of
+them that exists, and what it is for.
+
+`telemetry` carries **text**: formatted, coalesced, per-CPU, loss recorded in place. That
+is right for "what happened, in words" and wrong for "what is this resource doing over
+time" — and the second question is the one this tree kept failing to answer cheaply.
+From one session's work on the fixed-table ceilings: frame costs were measured **six
+times** by hand as pool deltas around an operation; **three** separate leaks were found
+by an assertion noticing a nonzero total rather than by seeing the missing release; and
+**three** assertions were written at the end of a kernel where the harness resets at the
+*start* of a run, so they were vacuous — invisible, because a final total cannot show
+that the thing it counts was destroyed before it looked.
+
+All the same missing capability: **the lifecycle is not observable, only its endpoints
+are.**
+
+So `kernel::trace` is a stream of six-integer events — `ts`, `cpu`, `subsys`, `kind`,
+`owner`, `a`, `b`. Numeric, so emitting one is a bounds check and six stores and the
+tracer does not perturb what it measures. Off by default (one relaxed load); the ring is
+**funded**, not static, so a kernel that never enables it pays nothing at all.
+
+Two fields carry the design: `subsys` and `owner` are the **window keys**. A window is a
+navigable buffer per source — the treatment cat9 gives a command's output — rather than
+one interleaved scrollback in which the interesting line sits three thousand from
+anything related to it.
+
+The stream leaves QEMU on the ordinary console as `@E` lines, which needs no new device
+and is identical on all three ISAs, and `cargo xtask trace` reads it back:
+
+- **summary**: one line per window — events, span, and how acquires balance releases.
+- `--window <subsys>`: that window's events in order.
+- `--ledger`: per **owner**, with the sequence number of the first unmatched acquire.
+  That number is the point — a leak stops being "the total did not return to zero" and
+  becomes "sequence 412 took a frame nobody gave back".
+
+**Loss is located, not counted**: every event carries a sequence number, so a gap is
+reported with the range it spans.
+
+One correction the tool made to itself on its first run, worth keeping: it reported four
+cells leaking when nothing was wrong. A **negative** balance is not a leak — it is frames
+acquired *before* tracing began being released inside the window, the ordinary
+consequence of enabling a trace part-way through a boot. Only a positive balance is
+unreturned. A diagnostic that cries wolf is worse than no diagnostic.
+
+Alongside it, `cargo xtask test` now **keeps a failing run's serial log** as
+`target/qemu-<arch>-<bin>.fail.log`. In a full-matrix run the next boot is seconds away,
+so the evidence for a failure was routinely gone before it was read — an intermittent
+`netdns` failure in this tree had to be diagnosed by reading the source, because the log
+had already been replaced by a passing run.
+
+---
+
 ## 5. Structured logging — the right primitive
 
 For new code, the structured path is preferable to raw strings:

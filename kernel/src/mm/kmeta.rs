@@ -229,7 +229,30 @@ fn alloc_frame(owner: Owner) -> Option<usize> {
         *addr_of_mut!(META_FRAMES) += 1;
         *addr_of_mut!(META_ALLOCS) = (*addr_of!(META_ALLOCS)).wrapping_add(1);
     }
+    // The ledger, as a *stream*. A per-owner total says a number changed; this says who
+    // caused it and when, which is the difference between "the pool is 2 frames short"
+    // and "cell 3 took two and never gave them back" (docs/LOGGING.md 5).
+    trace_owner(crate::trace::Kind::Acquire, owner, 1, pa as u64);
     Some(arch::phys_to_virt(pa))
+}
+
+/// The trace tag for an owner: the cell index, or [`crate::trace::OWNER_KERNEL`].
+fn owner_tag(owner: Owner) -> u16 {
+    match owner.cell_index() {
+        Some(i) => i as u16,
+        None => crate::trace::OWNER_KERNEL,
+    }
+}
+
+/// Record one metadata-frame movement against `owner`.
+fn trace_owner(kind: crate::trace::Kind, owner: Owner, n: u64, detail: u64) {
+    crate::trace::emit(
+        crate::trace::Subsys::Kmeta,
+        kind,
+        owner_tag(owner),
+        n,
+        detail,
+    );
 }
 
 /// Move the charge for `n` frames from one owner's ledger to another's.
@@ -244,6 +267,13 @@ fn move_charge(from: Owner, to: Owner, n: usize) {
     if from == to || n == 0 {
         return;
     }
+    crate::trace::emit(
+        crate::trace::Subsys::Kmeta,
+        crate::trace::Kind::Transfer,
+        owner_tag(to),
+        n as u64,
+        owner_tag(from) as u64,
+    );
     // SAFETY: single CPU; plain counter updates.
     unsafe {
         let charged = &mut *addr_of_mut!(CHARGED);
@@ -256,6 +286,7 @@ fn move_charge(from: Owner, to: Owner, n: usize) {
 /// Release a metadata frame taken by [`alloc_frame`], by its kernel VA.
 fn free_frame(va: usize, owner: Owner) {
     let pa = arch::virt_to_phys(va);
+    trace_owner(crate::trace::Kind::Release, owner, 1, pa as u64);
     // SAFETY: single CPU; plain counter updates.
     unsafe {
         let charged = &mut *addr_of_mut!(CHARGED);

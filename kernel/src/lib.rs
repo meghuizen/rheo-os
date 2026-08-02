@@ -53,6 +53,7 @@ pub mod smp;
 pub mod svc;
 pub mod telemetry;
 pub mod time;
+pub mod trace;
 pub mod uaccess;
 pub mod user;
 pub mod user_progs;
