@@ -285,6 +285,103 @@ pub enum Outcome {
     Faulted(usize),
 }
 
+/// Everything the kernel holds about **one execution context** of a cell
+/// (docs/EXECUTION-MODEL.md 9.3).
+///
+/// This was five parallel `[_; MAX_VCORES]` arrays in [`RunCell`], which is the shape
+/// that made `MAX_VCORES` a resource limit rather than a default: **704 of `RunCell`'s
+/// 840 bytes were those arrays**, paid for every slot whether or not a second context
+/// ever existed. Five arrays indexed by the same number are one record; saying so is
+/// what lets the *tail* of them be funded per cell instead of reserved for all of them.
+///
+/// Vcore 0 lives inline in `RunCell` because it is the one every non-vcore path reads,
+/// and an inline read has no indirection at all.
+///
+/// **What this did and did not buy, measured.** `RunCell` went 840 -> 184 bytes, so the
+/// `.bss` for the cell table fell by about 10 KiB. The prediction written down first was
+/// that the *hot path* would get cheaper too, since `RunCell` is `Copy` and every
+/// syscall dispatch starts `let cell = cells()[cur]` - and that was **wrong**: the
+/// icount path lengths are flat (`p2_user_syscall_floor` and `p5_crosscell_roundtrip`
+/// unchanged to the instruction, `p2_user_roundtrip` 345007 -> 343007 milliticks). The
+/// compiler was already reading the fields it needed rather than copying the struct, so
+/// the copy being priced did not exist. The size is the result; the speed was not.
+#[derive(Copy, Clone)]
+struct Vcore {
+    /// This context's saved trap frame. Null for a slot holding no context.
+    frame: *mut TrapFrame,
+    /// This context's **own** queue pair (docs/SUBSTRATE.md S5), or null.
+    ///
+    /// Per context because a submission ring is single-producer: two contexts sharing
+    /// one would have to serialise, and once they run on two cores that serialisation
+    /// is a cross-core write to shared indices - the cost the io_uring-per-thread shape
+    /// exists to avoid.
+    qp: *const QueuePair,
+    /// Base VA of that ring as mapped into the cell, reported by `SYS_QUEUE_INFO`.
+    /// 0 = this context has no mapped queue.
+    qp_va: u64,
+    /// How this context's run ended, or `None` while it is live or handing off.
+    outcome: Option<Outcome>,
+    /// 32-bit ABI id of the ring's QueuePair capability, reported alongside `qp_va`.
+    qp_cap: u32,
+}
+
+impl Vcore {
+    /// A slot holding no context.
+    const EMPTY: Vcore = Vcore {
+        frame: core::ptr::null_mut(),
+        qp: core::ptr::null(),
+        qp_va: 0,
+        outcome: None,
+        qp_cap: 0,
+    };
+}
+
+/// The contexts **past vcore 0**, funded per cell (docs/SUBSTRATE.md pillar 1).
+///
+/// Its own static rather than a field of [`RunCell`], for a reason the FP-area comment
+/// below already states about itself: `RunCell` is `Copy` and copied on every switch,
+/// while a `Funded` descriptor must never be raw-copied - duplicating it gives two
+/// owners of one directory frame, which is the S1' scar (`fork`'s
+/// `copy_nonoverlapping` of `LinuxState`). So the per-cell funded tables live beside
+/// the array and are reached by index, exactly as `linux::thread`'s `FRAMES`/`FPAREAS`
+/// do.
+///
+/// **Empty for a single-vcore cell**, which is every cell in almost every boot: a
+/// `Funded` holds no frames until something calls `reserve`, so the common case pays
+/// nothing at all. A cell that asks for more pays one frame for ~80 further contexts,
+/// charged to its own budget - which is what makes the ceiling the budget rather than a
+/// constant. The alternative was measured and refused: funding *all* of it, one table
+/// per cell, would have spent a directory frame plus a data frame per cell - 256 KiB of
+/// frames to save 21 KiB of `.bss`, because a `Vcore` is 48 bytes and a frame is 4096.
+static mut CELL_VCORES: [crate::mm::kmeta::Funded<Vcore>; MAX_CELLS] =
+    [const { crate::mm::kmeta::Funded::new() }; MAX_CELLS];
+
+/// Cell `idx`'s funded context tail.
+fn vcores(idx: usize) -> &'static mut crate::mm::kmeta::Funded<Vcore> {
+    // SAFETY: a cell belongs to one core (`claim_vcore`), and this table is grown only
+    // by a launcher setting the cell up and read only by the core running it.
+    unsafe { &mut (*core::ptr::addr_of_mut!(CELL_VCORES))[idx] }
+}
+
+/// Context `v` of cell `idx`, or `None` if it does not exist.
+///
+/// Vcore 0 is a direct field read - no indirection - so the path every single-context
+/// cell takes is cheaper than the array index it replaces, not dearer.
+fn vcore(idx: usize, v: usize) -> Option<Vcore> {
+    if v == 0 {
+        return Some(cells()[idx].v0);
+    }
+    vcores(idx).get(v - 1)
+}
+
+/// [`vcore`], for writing.
+fn vcore_mut(idx: usize, v: usize) -> Option<&'static mut Vcore> {
+    if v == 0 {
+        return Some(&mut cells()[idx].v0);
+    }
+    vcores(idx).get_mut(v - 1)
+}
+
 /// Which syscall ABI a cell speaks (docs/LINUX-COMPAT.md 2). Dispatch
 /// branches on this BEFORE interpreting the syscall number - native numbers
 /// 1-30 collide with Linux numbers (Linux x86-64 `write` = 1 is native
@@ -302,39 +399,26 @@ struct RunCell {
     aspace: *const AddressSpace,
     caps: *mut CapTable,
     objects: *const ObjectTable,
-    /// One **queue pair per vcore** (docs/SUBSTRATE.md S5). Slot 0 is the ring `install`
-    /// was handed; a vcore added by [`install_vcore`] brings its own.
+    /// **Vcore 0**, inline (docs/EXECUTION-MODEL.md 9.3).
     ///
-    /// Per vcore because a ring is a single-producer structure: two contexts submitting
-    /// into one would have to serialise, and once they run on two cores that serialisation
-    /// is a cross-core write to shared indices - the cost the io_uring-per-thread shape
-    /// exists to avoid. With one ring each, a submission never leaves its own core.
-    vqp: [*const QueuePair; MAX_VCORES],
-    /// One execution context per vcore (docs/SUBSTRATE.md pillar 3, [`MAX_VCORES`]).
+    /// The cell's original context - the frame `install` was handed, and the one the
+    /// Linux personality, `nproc` and `SYS_SWITCH` all mean when they say "the cell's
+    /// frame". Every further context lives in [`CELL_VCORES`], funded on demand.
     ///
-    /// Slot 0 is the cell's original context - the frame `install` was handed, and the
-    /// one the Linux personality, `nproc` and `SYS_SWITCH` all mean when they say "the
-    /// cell's frame". Slots `1..nvcores` exist only for a cell some launcher gave them
-    /// to with [`install_vcore`].
+    /// Inline because every cell has exactly one and almost every cell has only one, so
+    /// this is the read the hot path makes; and because `RunCell` is `Copy` while a
+    /// `Funded` descriptor must never be raw-copied.
     ///
-    /// **This is what makes one cell runnable on two cores.** Two cores in one cell
+    /// **Contexts are what make one cell runnable on two cores.** Two cores in one cell
     /// would otherwise share one trap frame, one kernel stack and one FP save area,
     /// none of which is locked - which is why the claim used to be per *cell*
     /// (docs/SMP.md 10.0). Per vcore the three are disjoint again, and the claim moves
     /// down with them.
-    vframe: [*mut TrapFrame; MAX_VCORES],
-    /// How each vcore's run ended, or `None` while it is live or handing off.
-    voutcome: [Option<Outcome>; MAX_VCORES],
-    /// How many vcores this cell holds. 1 unless [`install_vcore`] added more.
+    v0: Vcore,
+    /// How many contexts this cell holds. 1 unless [`install_vcore`] added more.
     nvcores: usize,
     present: bool,
     personality: Personality,
-    /// Base VA of the cell's mapped queue-pair region, reported by
-    /// `SYS_QUEUE_INFO` (docs/LIBRHEO.md), **per vcore**: the calling context is told
-    /// about its own ring. 0 = that vcore has no mapped queue.
-    vqp_va: [u64; MAX_VCORES],
-    /// 32-bit ABI id of each vcore's QueuePair capability, reported alongside.
-    vqp_cap: [u32; MAX_VCORES],
     /// Next free VA for a typed memory-grant reservation (`SYS_GRANT`,
     /// docs/LIBRHEO.md Phase B). Per-cell so two cells' grants never collide.
     /// Next free VA for a file mmap (`SYS_MMAP_FILE`).
@@ -429,14 +513,10 @@ const EMPTY: RunCell = RunCell {
     aspace: core::ptr::null(),
     caps: core::ptr::null_mut(),
     objects: core::ptr::null(),
-    vqp: [core::ptr::null(); MAX_VCORES],
-    vframe: [core::ptr::null_mut(); MAX_VCORES],
-    voutcome: [None; MAX_VCORES],
+    v0: Vcore::EMPTY,
     nvcores: 0,
     present: false,
     personality: Personality::Native,
-    vqp_va: [0; MAX_VCORES],
-    vqp_cap: [0; MAX_VCORES],
     chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
     _ownership_moved_to_entity_table: (),
     node: frames::NODE_ANY,
@@ -895,7 +975,7 @@ pub fn switch_native_vcore(cell: usize, from: usize, to: usize) -> *mut TrapFram
     enter_vcore(cell, to);
     // SAFETY: this CPU's own slot. `CURRENT` does not change - same cell.
     unsafe { *CUR_VCORE.this_mut() = to };
-    cells()[cell].vframe[to]
+    vcore_frame(cell, to)
 }
 
 /// Whether vcore `v` of cell `idx` still exists to be run - it has not exited.
@@ -912,7 +992,7 @@ pub fn vcore_live(idx: usize, v: usize) -> bool {
 /// How many vcores of cell `idx` have not exited.
 pub fn live_vcores(idx: usize) -> usize {
     (0..cells()[idx].nvcores)
-        .filter(|&v| cells()[idx].voutcome[v].is_none())
+        .filter(|&v| vcore(idx, v).is_some_and(|x| x.outcome.is_none()))
         .count()
 }
 
@@ -922,7 +1002,9 @@ pub fn live_vcores(idx: usize) -> usize {
 /// process/thread split the Linux personality already has one level up (`exit` vs
 /// `exit_group`), and without it a cell with four vcores dies when the first finishes.
 pub fn retire_vcore(idx: usize, v: usize, outcome: Outcome) {
-    cells()[idx].voutcome[v] = Some(outcome);
+    if let Some(x) = vcore_mut(idx, v) {
+        x.outcome = Some(outcome);
+    }
     // The entity is the authority on *liveness*; `voutcome` keeps the exit value, which the
     // table does not carry. One fact each rather than two answers to one question.
     // SAFETY: the core that ran this vcore is the one retiring it.
@@ -966,6 +1048,13 @@ fn cells() -> &'static mut [RunCell; MAX_CELLS] {
 
 /// Clear the run table (call before installing a fresh set of cells).
 pub fn reset() {
+    // Release before overwriting, never after: nothing owns a funded table's frames but
+    // the descriptor that names them, and `[EMPTY; MAX_CELLS]` would drop every
+    // descriptor on the floor with no drop glue to notice (the S1' rule, stated in
+    // `linux::reset` for the same reason).
+    for idx in 0..MAX_CELLS {
+        vcores(idx).release();
+    }
     *cells() = [EMPTY; MAX_CELLS];
     // The entities go with the cells. `MAX_CPUS` rather than the online count, because this
     // runs before `start_all` and a bound of 1 would make invariant I2 reject a legitimate
@@ -1006,13 +1095,13 @@ pub fn current_index() -> usize {
 /// table uses this as its initial (thread 0) execution context
 /// (docs/LINUX-COMPAT.md L4); clone-created threads get kernel-owned frames.
 pub fn cell_frame(idx: usize) -> *mut TrapFrame {
-    cells()[idx].vframe[0]
+    cells()[idx].v0.frame
 }
 
 /// The frame of vcore `v` of cell `idx` (docs/SUBSTRATE.md pillar 3). `cell_frame(idx)`
 /// is `vcore_frame(idx, 0)`.
 pub fn vcore_frame(idx: usize, v: usize) -> *mut TrapFrame {
-    cells()[idx].vframe[v]
+    vcore(idx, v).map_or(core::ptr::null_mut(), |x| x.frame)
 }
 
 /// Run `f` against the current cell's address space, then re-activate it so
@@ -2037,24 +2126,16 @@ pub unsafe fn install(
         aspace,
         caps,
         objects,
-        vqp: {
-            let mut q = [core::ptr::null(); MAX_VCORES];
-            q[0] = qp;
-            q
-        },
         // Vcore 0 is the frame the caller built; a fresh cell holds exactly one vcore,
         // and a launcher that wants more adds them with `install_vcore`.
-        vframe: {
-            let mut f = [core::ptr::null_mut(); MAX_VCORES];
-            f[0] = frame;
-            f
+        v0: Vcore {
+            frame,
+            qp,
+            ..Vcore::EMPTY
         },
-        voutcome: [None; MAX_VCORES],
         nvcores: 1,
         present: true,
         personality: Personality::Native,
-        vqp_va: [0; MAX_VCORES],
-        vqp_cap: [0; MAX_VCORES],
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
         _ownership_moved_to_entity_table: (),
         // Round-robin across the nodes the pool holds, so cells spread their
@@ -2146,14 +2227,33 @@ pub unsafe fn install(
 /// `frame` must outlive the cell's run, and no other vcore may share its user stack,
 /// kernel stack or queue ring.
 pub unsafe fn install_vcore(idx: usize, frame: *mut TrapFrame, qp: *const QueuePair) -> usize {
-    let c = &mut cells()[idx];
-    assert!(c.present, "install_vcore on empty slot {idx}");
-    let v = c.nvcores;
+    assert!(cells()[idx].present, "install_vcore on empty slot {idx}");
+    let v = cells()[idx].nvcores;
     assert!(v < MAX_VCORES, "cell {idx} already holds {v} vcore(s)");
-    c.vframe[v] = frame;
-    c.vqp[v] = qp;
-    c.voutcome[v] = None;
-    c.nvcores = v + 1;
+    // Grow the funded tail to hold slot `v` (stored at `v - 1`, since vcore 0 is
+    // inline), charged to this cell's own budget - which is what makes the ceiling the
+    // budget. A cell that cannot fund the frame cannot have the context, and this is a
+    // *launcher* path - the kernel setting a cell up, not a cell asking - so it fails
+    // the way the asserts above do, naming the cell rather than returning a code
+    // nobody on this path would read.
+    let t = vcores(idx);
+    assert!(
+        t.reserve(v),
+        "cell {idx} cannot fund a context table for vcore {v}"
+    );
+    // **Write the whole record; never rely on the zeroed frame.** `Funded` grows into
+    // freshly allocated frames, which arrive zeroed, and all-zero is a valid `Vcore`
+    // only by accident of layout - `Option<Outcome>` has no guaranteed niche, so a
+    // zeroed slot is not guaranteed to read as `outcome: None`.
+    t.set(
+        v - 1,
+        Vcore {
+            frame,
+            qp,
+            ..Vcore::EMPTY
+        },
+    );
+    cells()[idx].nvcores = v + 1;
     // SAFETY: as `install`.
     unsafe {
         let t = crate::sched::entity::table();
@@ -2182,8 +2282,9 @@ pub fn set_queue_info(idx: usize, qp_va: u64, cap_id: u32) {
 /// own `SYS_QUEUE_INFO` reports and its own `SYS_DOORBELL` drains.
 pub fn set_vcore_queue_info(idx: usize, v: usize, qp_va: u64, cap_id: u32) {
     assert!(cells()[idx].present, "set_queue_info on empty slot {idx}");
-    cells()[idx].vqp_va[v] = qp_va;
-    cells()[idx].vqp_cap[v] = cap_id;
+    let x = vcore_mut(idx, v).expect("set_queue_info for a context that does not exist");
+    x.qp_va = qp_va;
+    x.qp_cap = cap_id;
     if v > 0 {
         // Vcore 0's region is recorded by `install`; a later vcore's is recorded here.
         // Recording matters: `SYS_MUNMAP` classifies an address by asking the cell's
@@ -2279,7 +2380,9 @@ pub fn run_vcore(idx: usize, v: usize) -> (usize, usize, Outcome) {
     (
         exited,
         ev,
-        cells()[exited].voutcome[ev].expect("no outcome recorded"),
+        vcore(exited, ev)
+            .and_then(|x| x.outcome)
+            .expect("no outcome recorded"),
     )
 }
 
@@ -2334,7 +2437,7 @@ pub fn double_entries() -> u32 {
 }
 
 /// Enter cell `idx` and return when some cell's run on this CPU ends. The reason is in
-/// `cells()[EXITED].voutcome[EXITED_VCORE]`: `Some` for an exit or fault, `None` for a
+/// the exited context's recorded outcome: `Some` for an exit or fault, `None` for a
 /// hand-off.
 fn run_inner(idx: usize, v: usize) {
     let cell = cells()[idx];
@@ -2357,7 +2460,7 @@ fn run_inner(idx: usize, v: usize) {
         // The first entry into a cell does not go through either scheduler, so it is
         // the one place a slice has to be armed explicitly (docs/SUBSTRATE.md pillar 3).
         crate::sched::dispatch::running(idx, 0);
-        arch::enter_user_first(cell.vframe[v]);
+        arch::enter_user_first(vcore_frame(idx, v));
     }
     // enter_user_first returns via return_to_kernel after an exit, a fault, or a
     // hand-off. Restore the kernel address space so setup code can again reach all of
@@ -2394,7 +2497,9 @@ fn linux_ctl(ctl: crate::linux::Ctl, frame: *mut TrapFrame) -> *mut TrapFrame {
 fn finish(outcome: Outcome) -> *mut TrapFrame {
     let cur = cur_cpu_cell();
     let v = current_vcore();
-    cells()[cur].voutcome[v] = Some(outcome);
+    if let Some(x) = vcore_mut(cur, v) {
+        x.outcome = Some(outcome);
+    }
     unsafe {
         *EXITED.this_mut() = cur;
         *EXITED_VCORE.this_mut() = v;
@@ -2601,32 +2706,18 @@ pub unsafe fn install_spawned(
         // authority. Reaching an object still needs a capability in this cell's
         // own table.
         objects: p.objects,
-        vqp: {
-            let mut q = [core::ptr::null(); MAX_VCORES];
-            q[0] = qp;
-            q
-        },
         // Vcore 0 is the frame the caller built; a fresh cell holds exactly one vcore,
         // and a launcher that wants more adds them with `install_vcore`.
-        vframe: {
-            let mut f = [core::ptr::null_mut(); MAX_VCORES];
-            f[0] = frame;
-            f
+        v0: Vcore {
+            frame,
+            qp,
+            qp_va,
+            outcome: None,
+            qp_cap: qp_cap_id,
         },
-        voutcome: [None; MAX_VCORES],
         nvcores: 1,
         present: true,
         personality: Personality::Native,
-        vqp_va: {
-            let mut a = [0; MAX_VCORES];
-            a[0] = qp_va;
-            a
-        },
-        vqp_cap: {
-            let mut a = [0; MAX_VCORES];
-            a[0] = qp_cap_id;
-            a
-        },
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
         // **The parent's core, not unclaimed.** A child left `NO_CPU` is visible to every
         // core's scheduler (`cell_on_this_cpu` treats unclaimed as pickable, which is what
@@ -2672,7 +2763,7 @@ pub unsafe fn install_spawned(
 
 /// Repoint cell `idx` at a new context-0 frame (after `execve`).
 pub fn set_cell_frame(idx: usize, frame: *mut TrapFrame) {
-    cells()[idx].vframe[0] = frame;
+    cells()[idx].v0.frame = frame;
 }
 
 /// Make cell `idx` the current cell and activate its address space - the
@@ -2725,20 +2816,22 @@ pub unsafe fn install_forked(
         aspace,
         caps: owned_caps(idx),
         objects: p.objects,
-        vqp: p.vqp,
         // Vcore 0 is the frame the caller built; a fresh cell holds exactly one vcore,
         // and a launcher that wants more adds them with `install_vcore`.
-        vframe: {
-            let mut f = [core::ptr::null_mut(); MAX_VCORES];
-            f[0] = frame;
-            f
+        //
+        // The child inherits the parent's **vcore 0** ring and nothing else. The array
+        // version copied the parent's whole `vqp` while setting `nvcores: 1`, so slots
+        // 1.. held live pointers into the parent's other rings that nothing could reach
+        // and nothing cleared - invisible, and exactly the kind of thing a record makes
+        // impossible to write by accident.
+        v0: Vcore {
+            frame,
+            qp: p.v0.qp,
+            ..Vcore::EMPTY
         },
-        voutcome: [None; MAX_VCORES],
         nvcores: 1,
         present: true,
         personality: Personality::Linux,
-        vqp_va: [0; MAX_VCORES],
-        vqp_cap: [0; MAX_VCORES],
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
         // The parent's core - see `install_spawned` for why an unclaimed child is a
         // two-cores-one-cell hazard the moment a fork happens off the boot CPU.
@@ -2790,6 +2883,11 @@ pub fn free_cell(idx: usize) {
             t.force_free(entity_of(idx, v));
         }
     }
+    // The funded context tail is the same kind of resource one level along, so this is
+    // its release path too. Without it a cell that ever held a second context leaks its
+    // table frame until the next boot - the leak S1' found twice, each time in a
+    // slot-handback path that had not also become a release path.
+    vcores(idx).release();
     cells()[idx] = EMPTY;
     // SAFETY: single CPU, synchronous traps.
     unsafe {
@@ -3023,7 +3121,7 @@ fn on_user_trap_inner(
             let cell = cells()[cur];
             // **This vcore's own ring** (docs/SUBSTRATE.md S5): a doorbell drains the ring
             // the caller submitted into, which is the caller's, not the cell's first.
-            let qp = cell.vqp[current_vcore()];
+            let qp = vcore(cur, current_vcore()).map_or(core::ptr::null(), |x| x.qp);
             // SAFETY: the pointers were validated at install time. During the
             // trap the cell's address space is active, so a queue mapped at a
             // user VA (a loaded librheo cell) is reachable here.
@@ -3032,9 +3130,9 @@ fn on_user_trap_inner(
             frame
         }
         SYS_QUEUE_INFO => {
-            let cell = cells()[cur];
             let v = current_vcore();
-            let ret = match (cell.vqp_va[v], user_out::<QueueInfo>(arg)) {
+            let vc = vcore(cur, v).unwrap_or(Vcore::EMPTY);
+            let ret = match (vc.qp_va, user_out::<QueueInfo>(arg)) {
                 // SAFETY: `out` was checked by `user_out` (non-null, aligned,
                 // inside the running cell's user VA range) and the cell's
                 // address space is active for the trap.
@@ -3042,7 +3140,7 @@ fn on_user_trap_inner(
                     unsafe {
                         out.write(QueueInfo {
                             qp_va,
-                            cap_id: cell.vqp_cap[v] as u64,
+                            cap_id: vc.qp_cap as u64,
                         });
                     }
                     0
@@ -3229,7 +3327,7 @@ fn on_user_trap_inner(
             // The one native cross-cell switch: address space **and** FP/SIMD
             // register file (docs/LIBRHEO.md).
             switch_native_cell(cur, peer);
-            peer_cell.vframe[0]
+            peer_cell.v0.frame
         }
         // A spawned native child's exit makes it a zombie and reschedules
         // (docs/LIBRHEO.md Phase F); the top cell's exit unwinds `run`.

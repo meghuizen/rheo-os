@@ -3364,20 +3364,51 @@ fn test_funded_contexts() {
 
         // Add contexts past the old ceiling of four. They are never run - the claim under test
         // is the *storage*, and running them would measure the scheduler instead.
-        for _ in 0..EXTRA {
+        //
+        // In **two batches**, because a context now costs two different things and only one of
+        // them is per context (docs/EXECUTION-MODEL.md 9.3):
+        //
+        //  - its FP save area, one frame each, always; and
+        //  - a share of the cell's funded context table, which is a directory frame plus one
+        //    data page, allocated on the **first** context past vcore 0 and then reused - a
+        //    `Vcore` is 48 bytes, so one page holds 85 of them.
+        //
+        // Measuring one batch would conflate the two and could not tell "the table is
+        // amortised" from "every context allocates a table". So the first context is measured
+        // alone (1 area + 2 table = 3) and the next five together (5 areas + 0 table = 5), and
+        // the second number is the one that says the marginal cost of a context is one frame -
+        // which is what makes "the ceiling is the cell's budget" a statement about frames
+        // rather than a slogan.
+        const TABLE_FRAMES: usize = 2;
+        user::install_vcore(0, core::ptr::addr_of_mut!(frame), (*store).qp.qp.as_ptr());
+        let after_first = used_frames();
+        for _ in 1..EXTRA {
             user::install_vcore(0, core::ptr::addr_of_mut!(frame), (*store).qp.qp.as_ptr());
         }
         let after_contexts = used_frames();
 
-        // 1. Contexts cost frames, one each.
-        let cost = after_contexts - after_install;
+        // 1. The first context costs its own area plus the cell's one-off table.
+        let cost_first = after_first - after_install;
         assert_eq!(
-            cost, EXTRA,
-            "{EXTRA} contexts cost {cost} frames, want one each. A cost of 0 would mean the \
-             areas are still the static array and nothing was funded"
+            cost_first,
+            1 + TABLE_FRAMES,
+            "the first added context cost {cost_first} frames, want 1 area + {TABLE_FRAMES} \
+             table. A cost of 0 would mean the areas are still the static array and nothing \
+             was funded"
         );
+        // 2. Every context after it costs exactly one frame - the table is not re-paid.
+        let cost_rest = after_contexts - after_first;
+        assert_eq!(
+            cost_rest,
+            EXTRA - 1,
+            "{} further contexts cost {cost_rest} frames, want one each - a table re-allocated \
+             per context would make the context count a frame-count question instead of a \
+             capacity one",
+            EXTRA - 1
+        );
+        let cost = after_contexts - after_install;
 
-        // 2. Every area is distinct, and none is null.
+        // 3. Every area is distinct, and none is null.
         let t = kernel::sched::entity::table();
         let n = user::cell_vcores(0);
         assert_eq!(
@@ -3399,7 +3430,7 @@ fn test_funded_contexts() {
             }
         }
 
-        // 3. The context frames come back when the slot does.
+        // 4. The context frames come back when the slot does.
         //
         // Measured as a **delta against the contexts**, not against the phase's start: building
         // a cell also funds its page tables, its capability table and its recorded VA layout,
@@ -3409,20 +3440,26 @@ fn test_funded_contexts() {
         user::free_cell(0);
         let after_free = used_frames();
         let returned = after_contexts - after_free;
+        // Vcore 0's area, the six added ones, and the cell's context table: every funded thing
+        // a context brought with it.
+        let want_back = EXTRA + 1 + TABLE_FRAMES;
         assert_eq!(
-            returned,
-            EXTRA + 1,
-            "freeing the cell returned {returned} frames, want the {} its contexts hold - a slot \
-             handed back without releasing its funded frames is the S1' leak",
-            EXTRA + 1
+            returned, want_back,
+            "freeing the cell returned {returned} frames, want the {want_back} its contexts and \
+             their table hold - a slot handed back without releasing its funded frames is the \
+             S1' leak, and the table was a second one of exactly that shape"
         );
         println!(
-            "smp: E4 - A CONTEXT'S FP AREA IS FUNDED, NOT A STATIC - {} contexts on one cell \
-             (past the old ceiling of 4), each costing exactly one frame from that cell's own \
-             budget, each with its own area, and every frame returned when the slot was. \
-             `MAX_VCORES` was 4 because the areas were {} bytes of .bss per context times every \
-             cell; the ceiling is the cell's frame budget now (docs/EXECUTION-MODEL.md 9, E4) OK",
+            "smp: E4 - A CONTEXT IS FUNDED, NOT A STATIC - {} contexts on one cell (past the \
+             old ceiling of 4) cost {cost} frames from that cell's own budget: {} table frames \
+             once, then exactly one FP area per context, each area its own, and all {} returned \
+             when the slot was. `MAX_VCORES` was 4 because the areas were {} bytes of .bss per \
+             context times every cell, and the five per-vcore arrays beside them were another \
+             704 of `RunCell`'s 840 bytes; both are gone and the ceiling is the cell's frame \
+             budget (docs/EXECUTION-MODEL.md 9.3, E4) OK",
             EXTRA + 1,
+            TABLE_FRAMES,
+            want_back,
             kernel::arch::FP_AREA_LEN
         );
     }

@@ -710,6 +710,68 @@ returned an unexpected error code" rather than hang. And `linux::Proc::state` - 
 level Linux state, beside the per-context one this stage moved - is still its own copy; E3 is
 done for contexts, not for the cell above them.
 
+### 9.3 E4's remainder: five arrays are one record
+
+E4 funded the FP save areas and left the rest of a context's storage as five parallel
+`[_; MAX_VCORES]` arrays in `RunCell`. That was named as a remainder rather than finished,
+and the number that decides whether it is worth finishing is a measurement: **704 of
+`RunCell`'s 840 bytes were those arrays**, and `nproc::Proc`'s two more were 640 of its 656,
+so the per-cell scaffolding was **21,504 bytes of `.bss`** at `MAX_VCORES = 16` - paid for
+every slot whether or not a second context ever existed.
+
+Five arrays indexed by the same number are one record. Saying so is what lets the *tail* of
+them be funded per cell rather than reserved for all of them.
+
+**Two designs were simulated before anything was written, and the first was wrong.** The
+obvious one - "one `Funded<Vcore>` per cell", which is what S1' did for every other table -
+costs a directory frame plus a data frame per table: two tables times two frames times
+`MAX_CELLS` is **256 KiB of frames to save 21 KiB of `.bss`**. A `Vcore` is 48 bytes and a
+frame is 4096, so funding a whole cell's contexts is 80x overhead. The FP areas were worth
+funding because each one *is* a frame; these are not.
+
+The design that works keeps **vcore 0 inline and funds only the tail**:
+
+- every cell has exactly one context and almost every cell has only one, so the common case
+  allocates nothing at all and vcore 0 stays a direct field read;
+- a cell that asks for more pays one directory frame plus one data page for ~85 further
+  contexts, charged to its own budget - which is what makes the ceiling the budget.
+
+The funded tail lives in its own static (`CELL_VCORES`) rather than as a field of `RunCell`,
+and that is not a style choice: `RunCell` is `Copy`, and a `Funded` descriptor must never be
+raw-copied - two owners of one directory frame is the S1' scar (`fork`'s
+`copy_nonoverlapping` of `LinuxState`). `linux::thread`'s `FRAMES`/`FPAREAS` already have
+exactly this shape, and the FP-area comment in `user.rs` already gave the reason for keeping
+multi-KiB state out of a struct that is copied per switch.
+
+**Measured**: `RunCell` 840 -> 184 bytes, about 10 KiB of `.bss` back. **The prediction that
+went with it was wrong and is recorded as such**: the hot path was expected to get cheaper
+too, since every syscall dispatch starts `let cell = cells()[cur]` - but the icount path
+lengths are flat (`p2_user_syscall_floor` and `p5_crosscell_roundtrip` unchanged to the
+instruction, `p2_user_roundtrip` 345007 -> 343007 milliticks). The compiler was already
+reading the fields it needed instead of copying the struct, so the copy being priced did not
+exist.
+
+The proof is `smp`'s E4 phase, restructured because the cost is now **two different things**
+and only one of them is per context. It adds the first context alone and the next five
+together: the first costs 1 FP area + 2 table frames, the rest cost exactly 1 each. One batch
+would have conflated them and could not tell "the table is amortised" from "every context
+allocates a table" - and the marginal 1 is the number that makes "the ceiling is the cell's
+budget" a statement about frames rather than a slogan. Freeing the cell returns all nine,
+because a slot-handback path that is not also a release path is the S1' leak and the table
+was a second one of exactly that shape.
+
+It also removed a latent wrong value nothing could see: `install_forked` copied the parent's
+whole `vqp` array while setting `nvcores: 1`, so slots `1..` held live pointers into the
+parent's other rings that nothing could reach and nothing cleared. A record makes that
+impossible to write by accident.
+
+**What this stage does *not* do.** `MAX_VCORES` is still a bound, in three remaining places:
+the assert in `install_vcore`, the entity id stride `cell * MAX_VCORES + vcore`, and the
+placement queue's vid packing in `smp`. The last two are the same encoding written twice -
+two places deciding one thing, the defect class this whole section exists to remove - and
+retiring them is what actually lifts the ceiling. That is the next stage, and its gate is a
+cell with **more than 16** contexts running.
+
 ---
 
 ## 10. What does not change

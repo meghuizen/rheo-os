@@ -2800,7 +2800,25 @@ rather than an element of a `MAX_CELLS * MAX_VCORES` static; that static was the
 `MAX_VCORES` was 4 (256 KiB of `.bss` at four contexts, 4 MiB at sixty-four), so it is 16 now
 with the `.bss` cost *falling*, and the ceiling is the cell's frame budget. `smp` measures the
 per-context frame cost and its return, `verify/entity` checks fund-once / distinct /
-release-once. **And E3's Linux half landed with it**: `Thread::state` is gone too, `TState`
+release-once. **E4's remainder landed too** (docs/EXECUTION-MODEL.md 9.3): the five
+per-vcore arrays beside the FP areas were **704 of `RunCell`'s 840 bytes**, and five arrays
+indexed by the same number are one record - vcore 0 inline, the tail a `Funded<Vcore>`
+charged to the cell, so a single-context cell allocates nothing and a cell that wants more
+pays one page for ~85. The obvious design was **simulated and refused** before anything was
+written: one funded table per cell costs 256 KiB of frames to save 21 KiB of `.bss`, because
+a `Vcore` is 48 bytes against a 4096-byte frame - the FP areas were worth funding because
+each one *is* a frame, and these are not. The tail lives in its own static rather than in
+`RunCell` because `RunCell` is `Copy` and a `Funded` descriptor must never be raw-copied (the
+S1' scar), which is the shape `linux::thread`'s `FRAMES`/`FPAREAS` already have. Measured:
+`RunCell` 840 -> 184 bytes; **the prediction that went with it was wrong and is recorded as
+such** - the hot path was expected to get cheaper too, and the icount path lengths are flat,
+because the compiler was already reading the fields it needed instead of copying the struct.
+The `smp` phase measures the two costs *separately* (first context 1 area + 2 table frames,
+each one after it exactly 1), since one batch could not tell "the table is amortised" from
+"every context allocates a table". It also removed a latent wrong value nothing could see:
+`install_forked` copied the parent's whole `vqp` array while setting `nvcores: 1`, leaving
+live pointers into the parent's other rings that nothing could reach and nothing cleared.
+**And E3's Linux half landed with it**: `Thread::state` is gone too, `TState`
 surviving only as a *view* computed from the entity, with what stays on the thread being the
 **reason** (`pblock`, `fut_addr`) because a wake source's detail belongs to whoever owns the
 source while *whether it is waiting* is the scheduler's fact. That half forced a design
