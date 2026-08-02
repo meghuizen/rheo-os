@@ -1808,6 +1808,7 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         ("stackx.c", "stackx", &["-Wl,-z,stack-size=12582912"]),
         ("sysx.c", "sysx", NO_EXTRA),
         ("cpulist.c", "cpulist", NO_EXTRA),
+        ("procstat.c", "procstat", NO_EXTRA),
         ("cputopo.c", "cputopo", NO_EXTRA),
         ("numatopo.c", "numatopo", NO_EXTRA),
         ("mmapdp.c", "mmapdp", NO_EXTRA),
@@ -2186,12 +2187,6 @@ fn build_runtime_disk_fixture(
 /// - `/proc/self/cgroup` = `0::/`. There are no cgroups, and that is the cgroup-v2
 ///   spelling of "the root, unconstrained" - the answer an unconstrained Linux process
 ///   gets, not a placeholder.
-/// - `/proc/stat` = one `cpu` aggregate line plus `cpu0`. The jiffy fields are zero
-///   because this kernel keeps no per-CPU jiffy accounting. The `cpuN` line count is
-///   **still one whatever the boot's CPU count is**, which is the same defect the
-///   `online` file above had and is named in docs/ARCHITECTURE-DEBT.md 7.6 rather than
-///   fixed here - synthesizing it needs per-CPU time accounting to put in the fields,
-///   and a right line count with fabricated numbers beside it is not an improvement.
 ///
 /// Deliberately **not** provided: `/proc/self/maps`, which Bun also probes. A static
 /// file there would be a fabricated memory map, and the honest version is generated
@@ -2201,6 +2196,13 @@ fn build_runtime_disk_fixture(
 /// constant `0-0`, and are now **synthesized by the personality** from
 /// `smp::online_count()`, for exactly the reason `maps` is - a static topology file is
 /// a fabricated machine, and libuv sizes its thread pool from it. Same for
+/// **`/proc/stat`**, which was seeded here with a single `cpu0` line whatever the boot's
+/// CPU count was: counting `cpuN` lines is how the portable readers count CPUs, so the
+/// count now comes from `smp::online_count()` too, and the seeded file is gone so a
+/// constant cannot answer first. Its jiffy fields stay 0 in the synthesized version,
+/// which is the honest answer and not a placeholder - this kernel keeps no per-CPU
+/// user/system/idle accounting, and a fabricated breakdown is what a reader would
+/// compute a CPU percentage from. Same for
 /// `/etc/localtime`: glibc falls back to UTC on `ENOENT`, which is correct, since this
 /// kernel has no timezone database and inventing one would be worse than the fallback.
 fn seed_runtime_procfs(out_dir: &str, debugfs: &dyn Fn(&str)) {
@@ -2224,10 +2226,6 @@ fn seed_runtime_procfs(out_dir: &str, debugfs: &dyn Fn(&str)) {
         // told `0::/` above). A number would be a fabricated limit.
         ("memory_max", "max\n"),
         ("memory_high", "max\n"),
-        (
-            "stat",
-            "cpu  0 0 0 0 0 0 0 0 0 0\ncpu0 0 0 0 0 0 0 0 0 0 0\nintr 0\nctxt 0\nbtime 0\nprocesses 1\n",
-        ),
     ];
     for (name, body) in files {
         let path = format!("{out_dir}/procseed-{name}");

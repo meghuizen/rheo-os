@@ -66,6 +66,7 @@ static RUSTTHREADS: &[u8] = fixture::linux_cargo!("rustthreads");
 /// single-CPU kernel because the value being tested is the *online count*, and a one-core
 /// boot cannot tell a synthesized answer from the constant `0-0` it replaced.
 static CPULIST: &[u8] = fixture::linux!("cpulist");
+static PROCSTAT: &[u8] = fixture::linux!("procstat");
 
 /// Reads the per-CPU topology files hwloc reads. Here rather than in a single-CPU kernel for
 /// the same reason `cpulist` is: on one CPU every answer is 0 and a constant passes.
@@ -129,6 +130,7 @@ extern "C" fn kernel_main() -> ! {
     test_linux_fork_across_cores();
     test_registry_stress_two_cores();
     test_cpu_list();
+    test_proc_stat();
     test_cpu_topology();
     test_node_topology();
     test_preempted_threads_two_cores();
@@ -1004,6 +1006,49 @@ fn test_cpu_list() {
          /sys/devices/system/cpu/online and got `0-3`, which is what QEMU's `-smp 4` \
          declared; the kernel independently reports {online} online. It was the constant \
          `0-0`, and libuv sizes its thread pool from it OK"
+    );
+}
+
+// ------------------------------ the same claim for /proc/stat, the older CPU-count file
+//
+// `online` is the sysfs answer; `/proc/stat` is the one that predates it, and counting its
+// `cpuN` lines is what every libc's `get_nprocs` falls back to. It was seeded here too - one
+// `cpu0` line whatever the boot's CPU count - so a program taking the portable route was told
+// there was one core while `online` said four. Both are now rendered from
+// `smp::online_count()`, and the seeded file is gone so a constant cannot answer first.
+//
+// Same oracle, same reason: `-smp 4` in the launch, so the count is 4.
+
+fn test_proc_stat() {
+    let online = smp::online_count();
+    // SAFETY: as `test_cpu_list` above.
+    let outcome = unsafe {
+        STDOUT_LEN = [0; CAP_CELLS];
+        kernel::linux::set_stdout_tap(Some(tap));
+        let o = harness::run_linux_cell(PROCSTAT, &[b"procstat"]);
+        kernel::linux::set_stdout_tap(None);
+        o
+    };
+    let got = captured(0);
+    let want: &[u8] = b"procstat: cpus=4\n";
+    match outcome {
+        kernel::user::Outcome::Exited(0) => {}
+        other => panic!("procstat exited {other:?} (kernel reports {online} online)"),
+    }
+    assert!(
+        got == want,
+        "the kernel's /proc/stat has {:?} cpuN lines; QEMU launched this kernel with -smp 4 \
+         so it must have four. The seeded file had one, and counting these lines is how the \
+         portable CPU-count path works",
+        core::str::from_utf8(got)
+    );
+    println!(
+        "linuxsmp: /proc/stat IS SYNTHESIZED TOO - a Linux cell counted four `cpuN` lines, \
+         which is what QEMU's `-smp 4` declared; the kernel independently reports {online} \
+         online. The seeded file had exactly one however many cores were up, and \
+         `get_nprocs` counts these lines. Its jiffy fields stay 0, which is the honest \
+         answer - this kernel keeps no per-CPU user/system/idle accounting, and a \
+         fabricated breakdown is what a reader would compute a CPU percentage from OK"
     );
 }
 

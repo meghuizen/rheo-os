@@ -730,11 +730,18 @@ gets one consistent snapshot; every line comes from a record the personality act
 holds, which is why it is generated rather than seeded as a file - a static `maps` would
 be a fabricated memory layout, and a runtime reading it to locate its own code would be
 misled rather than refused. Alongside it, the disk fixture seeds the handful of `/proc`
-and `/sys` values this kernel genuinely has (`cpu/online` = `0-0`,
-`overcommit_memory` = 0 - accurate, since `mmap` reserves and frames arrive on fault -
-`mmap_min_addr` = 65536, `cgroup` = `0::/`, cgroup `memory.max`/`memory.high` = `max`,
-and a `/proc/stat` whose `cpuN` line count is right while its jiffy fields are 0 because
-this kernel keeps no jiffy accounting).
+and `/sys` values this kernel genuinely has (`overcommit_memory` = 0 - accurate, since
+`mmap` reserves and frames arrive on fault - `mmap_min_addr` = 65536, `cgroup` = `0::/`,
+cgroup `memory.max`/`memory.high` = `max`). **Two files that were seeded are not any
+more**, for the same reason `maps` never was: `cpu/online` was the constant `0-0` and
+`/proc/stat` had one `cpu0` line however many cores were up, and both are **synthesized
+from `smp::online_count()`** now with the seeded copies deleted so a constant cannot
+answer first - libuv sizes its thread pool from the first, and counting the second's
+`cpuN` lines is what every libc's `get_nprocs` falls back to. `/proc/stat`'s ten jiffy
+fields stay **0**: `sched::dispatch` charges a vcore the ns it ran, aggregated across
+CPUs with no user-versus-kernel split, so there is nothing to convert into them, and
+splitting the charged time across them would invent a breakdown a reader would compute a
+CPU percentage from.
 
 The lesson is the cheapness of the fix relative to the guesses: two large,
 correctly-built mechanisms were driven to completion on the strength of a plausible

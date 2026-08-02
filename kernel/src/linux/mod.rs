@@ -544,6 +544,14 @@ fn maybe_open_maps(st: &mut LinuxState, path_va: u64, flags: u64) -> Option<i64>
         let len = render_cpu_list(scratch);
         return Some(st.fds.open_maps(&scratch[..len], flags));
     }
+    // `/proc/stat`, for the same reason and from the same count: a program counting its
+    // `cpuN` lines is counting CPUs, and the seeded file has exactly one however many are up.
+    if path == b"/proc/stat" {
+        // SAFETY: as above.
+        let scratch = unsafe { &mut *addr_of_mut!(MAPS_SCRATCH) };
+        let len = render_proc_stat(scratch);
+        return Some(st.fds.open_maps(&scratch[..len], flags));
+    }
     // The per-CPU topology files, from the same discovered topology the resource graph is
     // built from (docs/RESOURCE-GRAPH.md 2.4a). This is what makes an unmodified
     // topology-aware program work: hwloc, and every runtime that uses it, reads exactly these
@@ -2544,6 +2552,52 @@ fn render_cpu_list(out: &mut [u8]) -> usize {
         w += 1;
     }
     w
+}
+
+/// Render `/proc/stat` with **one `cpuN` line per online core**.
+///
+/// The same defect as `/sys/devices/system/cpu/online` had, in the same seeded file set: the
+/// disk image carries a static `/proc/stat` with a single `cpu0` line, so on a four-core boot
+/// a program counting `cpuN` lines - which is exactly how the portable ones count CPUs, since
+/// `/proc/stat` predates the sysfs tree and every libc's `get_nprocs` falls back to it - is
+/// told there is one. Editing the seeded file to four lines would be the same constant with a
+/// different value, so the line count comes from `smp::online_count()`, from which the
+/// personality already answers `online`/`present`/`possible`.
+///
+/// **Every jiffy field is 0, and that is the honest answer rather than a placeholder.** This
+/// kernel keeps no per-CPU user/system/idle accounting: `sched::dispatch` charges a vcore the
+/// nanoseconds it ran, aggregated across CPUs and with no user-versus-kernel split, so there
+/// is nothing here to convert into the ten fields Linux prints. Splitting the charged time
+/// across them would be inventing a breakdown, which is worse than a zero - a reader seeing 0
+/// learns "no accounting", where a reader seeing a fabricated `user` figure computes a CPU
+/// percentage from it. The line count is the part that is knowable, so it is the part that is
+/// answered; the fields stay 0 until per-CPU time accounting exists to fill them
+/// (docs/ARCHITECTURE-DEBT.md 7.6).
+///
+/// `intr`/`ctxt`/`btime`/`processes` are carried at 0/1 exactly as the seeded file had them.
+fn render_proc_stat(out: &mut [u8]) -> usize {
+    /// The ten per-CPU fields Linux prints, all zero here.
+    const ZEROS: &[u8] = b" 0 0 0 0 0 0 0 0 0 0\n";
+    fn put(out: &mut [u8], mut w: usize, bytes: &[u8]) -> usize {
+        for &b in bytes {
+            if w < out.len() {
+                out[w] = b;
+                w += 1;
+            }
+        }
+        w
+    }
+    let n = crate::smp::online_count().max(1);
+    // The aggregate line first, as Linux does. Its second space is not a typo: the real file
+    // pads `cpu` to the width of the longest `cpuN` label.
+    let mut w = put(out, 0, b"cpu ");
+    w = put(out, w, ZEROS);
+    for i in 0..n {
+        w = put(out, w, b"cpu");
+        w += put_num(out, w, i);
+        w = put(out, w, ZEROS);
+    }
+    put(out, w, b"intr 0\nctxt 0\nbtime 0\nprocesses 1\n")
 }
 
 /// Render one of `/sys/devices/system/cpu/cpu<N>/topology/*` into `MAPS_SCRATCH`, returning its
