@@ -113,6 +113,46 @@ extern "C" fn kernel_main() -> ! {
         }
         Outcome::Faulted(addr) => panic!("inet: faulted at {addr:#x}"),
     }
+    // A datagram endpoint's queue is funded, not resident (docs/EXECUTION-MODEL.md 9.8).
+    //
+    // `inetsock::DGRAMS` was 8 endpoints x 8 queued x a 2 KiB payload = **131,520 bytes**
+    // of `.bss`, held whether or not a UDP socket was ever bound - and almost no boot
+    // binds one. This kernel does: phase 3 above is a real `sendto`/`recvfrom` over a
+    // bound loopback endpoint, which is why the check lives here and not beside the other
+    // network kernels. `linuxnet`'s resolver traffic goes to a *non-loopback* nameserver
+    // through the N4b remote bridge and never touches this table at all - an assertion
+    // there passed with the release deleted, which is how that was found.
+    // A datagram endpoint's queue is funded, not resident (docs/EXECUTION-MODEL.md 9.8).
+    //
+    // `inetsock::DGRAMS` was 8 endpoints x 8 queued x a 2 KiB payload = **131,520 bytes**
+    // of `.bss`, held whether or not a UDP socket was ever bound - and almost no boot
+    // binds one. This kernel does: phase 3 above is a real `sendto`/`recvfrom` over a
+    // bound loopback endpoint.
+    //
+    // **Measured against the metadata pool, not against the table**, and that distinction
+    // is the whole check. The first version summed `frames_held()` over the endpoints and
+    // could not fail: deleting the release leaves `close_dgram` overwriting the
+    // descriptor, so the frames are *stranded* and the thing that named them is gone - a
+    // table-side witness then reports zero for a real leak. Stranding is exactly the S1'
+    // shape, and only the pool can see it.
+    let (funded, _) = kernel::linux::inetsock::queue_counters();
+    assert!(
+        funded > 0,
+        "no datagram queue was funded in this boot - the queue is not coming from the \
+         frame pool, so it is still `.bss`"
+    );
+    let (funded, released) = kernel::linux::inetsock::queue_counters();
+    assert_eq!(
+        funded, released,
+        "{funded} datagram queue(s) were funded and {released} released - the difference \
+         is stranded frames, and only counting both ends of the pair can see it"
+    );
+    println!(
+        "linuxinet: A DATAGRAM QUEUE IS FUNDED, NOT .bss - {funded} endpoint(s) took an \
+         8-deep 2 KiB queue from the frame pool, charged to the cell that bound it, and \
+         gave every one back ({released} released). The table was 131,520 bytes of .bss \
+         held whether or not a socket existed OK"
+    );
     println!("linuxinet: inet OK (TCP+UDP+epoll over 127.0.0.1, TCP over ::1)");
 
     println!("linuxinet: PASS");

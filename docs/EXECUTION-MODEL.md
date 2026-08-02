@@ -1043,6 +1043,38 @@ Two method notes, both from controls that did **not** fire first time:
   the same three lines. A control that edits the wrong function is indistinguishable from a
   control that does not fire.
 
+**Two more from the same ranking.** `inetsock::DGRAMS` (131,520 B) is 8 endpoints x 8 queued
+x a 2 KiB payload, held whether or not a UDP socket was ever bound; the queue is
+`Funded<Datagram>` now - `Datagram` is 2,056 bytes and fits a frame, so no page wrapper was
+needed - reserved on bind and released on close. And `FdTable::maps`, the 8 KiB
+`/proc/self/maps` snapshot every cell carried whether or not it ever read its own memory map
+(almost none do - it is JavaScriptCore's probe), is funded on first read, taking
+`LINUX_STATE` 427,776 -> **296,704 B**.
+
+The `maps` conversion is where the type system did the arguing: `FdTable` is `Copy`, so
+putting a `Funded` inside it **stops compiling**. That is the S1' scar enforced by the
+compiler rather than by review, and the resolution is the one `user::CELL_VCORES` already
+uses - the funded storage sits beside the `Copy` record, keyed by the running cell.
+
+**A control that could not fire, and what it taught.** The datagram check first summed
+`frames_held()` over the endpoints. Deleting the release did not fail it - because
+`close_dgram` overwrites the descriptor, so the frames are **stranded** and the thing that
+named them is gone; a table-side witness then reports zero for a real leak. Stranding is
+exactly the S1' shape and is invisible from the table. Measuring the *pool* instead was too
+broad (a Linux cell's other metadata moves it by 23 frames), so the check counts **both ends
+of the pair** - queues funded against queues released - which is the only witness that sees a
+strand without being confounded. Control fires: `2 datagram queue(s) were funded and 0
+released`.
+
+**Examined and refused: `signal::ACTIONS`** (33,280 B). It looks like the same defect and is
+not: it is `[[SigAction; NSIG + 1]; MAX_CELLS]`, and `NSIG` is the number of signals the
+Linux ABI defines - a dense array fixed by contract, with no ceiling anyone can hit. The
+`MAX_CELL_CHANNELS` category.
+
+**Still fixed, and named**: `FdKind::Vfs` carries a `[u8; PATH_MAX]` inline, making
+`[FdKind; NFD]` 17,408 bytes per cell - what now remains of `LINUX_STATE`. `FdKind` is `Copy`
+and matched at dozens of sites, so it is its own slice rather than a rider on this one.
+
 ---
 
 ## 10. What does not change

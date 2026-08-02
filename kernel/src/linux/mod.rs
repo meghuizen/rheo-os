@@ -208,6 +208,9 @@ pub fn reset() {
     eventfd::reset();
     timerfd::reset();
     filemap::reset();
+    // The per-cell /proc/self/maps snapshots hold frames now (docs/EXECUTION-MODEL.md
+    // 9.8), so this is their release path - every slot-handback path must also be one.
+    fd::reset_maps();
     reset_trace();
 }
 

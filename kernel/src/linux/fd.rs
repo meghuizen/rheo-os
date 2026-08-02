@@ -268,9 +268,62 @@ pub struct FdTable {
     /// the stack (with its auxv) is built.
     auxv: [u8; AUXV_MAX],
     auxv_len: usize,
-    /// The rendered `/proc/self/maps` snapshot, and its length.
-    maps: [u8; MAPS_MAX],
+    /// Length of the rendered `/proc/self/maps` snapshot; the bytes are in
+    /// [`CELL_MAPS`], funded per cell (docs/EXECUTION-MODEL.md 9.8).
     maps_len: usize,
+}
+
+/// One frame of a `/proc/self/maps` snapshot. A frame exactly, so `Funded` holds one
+/// element per frame - the shape the pipe ring takes, for the same reason.
+#[derive(Copy, Clone)]
+#[repr(C, align(8))]
+struct MapsPage([u8; MAPS_PAGE]);
+
+const MAPS_PAGE: usize = crate::mm::frames::FRAME_SIZE;
+/// Frames a full snapshot occupies.
+const MAPS_PAGES: usize = MAPS_MAX.div_ceil(MAPS_PAGE);
+
+/// The rendered `/proc/self/maps` bytes, **funded per cell**.
+///
+/// This was `[u8; 8192]` inline in every `FdTable` - 131 KiB across the table, resident
+/// in every cell whether or not it ever reads its own memory map. Almost none do: it is
+/// JavaScriptCore's probe, which is the only reason the file is synthesized at all
+/// (docs/LINUX-COMPAT.md). A cell that never asks now pays nothing.
+///
+/// Its own static rather than a field of `FdTable`, and the compiler settled that:
+/// `FdTable` is `Copy`, a `Funded` descriptor must never be raw-copied, and putting one
+/// inside simply stops compiling. That is the S1' scar enforced by the type system rather
+/// than by review - the same reason `user::CELL_VCORES` sits beside `RunCell`.
+static mut CELL_MAPS: [crate::mm::kmeta::Funded<MapsPage>; crate::user::MAX_CELLS] =
+    [const { crate::mm::kmeta::Funded::new() }; crate::user::MAX_CELLS];
+
+/// The running cell's snapshot storage.
+///
+/// Keyed on the **running** cell rather than an argument, for the reason `pipe::alloc`
+/// is: every path here services a syscall for that cell, so it is the owner by
+/// construction, and threading an index through `FdTable`'s methods would be a chance to
+/// pass the wrong one.
+fn cell_maps() -> &'static mut crate::mm::kmeta::Funded<MapsPage> {
+    let idx = crate::user::current_index().min(crate::user::MAX_CELLS - 1);
+    // SAFETY: single CPU per cell; a cell belongs to one core.
+    unsafe { &mut (*core::ptr::addr_of_mut!(CELL_MAPS))[idx] }
+}
+
+/// Frames every cell's `/proc/self/maps` snapshot holds. **0 once released** - the
+/// property a slot-handback path that is not a release path breaks.
+pub fn maps_frames() -> usize {
+    (0..crate::user::MAX_CELLS)
+        // SAFETY: a read.
+        .map(|i| unsafe { (*core::ptr::addr_of!(CELL_MAPS))[i].frames_held() })
+        .sum()
+}
+
+/// Release every cell's snapshot storage (called from `linux::reset`).
+pub fn reset_maps() {
+    for i in 0..crate::user::MAX_CELLS {
+        // SAFETY: between runs.
+        unsafe { (*core::ptr::addr_of_mut!(CELL_MAPS))[i].release() };
+    }
 }
 
 impl Default for FdTable {
@@ -286,7 +339,6 @@ impl FdTable {
             flags: [FdFlags::new(ACC_RDWR); NFD],
             auxv: [0; AUXV_MAX],
             auxv_len: 0,
-            maps: [0; MAPS_MAX],
             maps_len: 0,
         }
     }
@@ -341,7 +393,20 @@ impl FdTable {
             return -EMFILE;
         };
         let n = snapshot.len().min(MAPS_MAX);
-        self.maps[..n].copy_from_slice(&snapshot[..n]);
+        // Fund the frames on first use. A cell that cannot afford them cannot read its
+        // own map, and that is a refusal rather than a short answer: a truncated
+        // `/proc/self/maps` is a fabricated memory layout, which is the one thing this
+        // file must never be (docs/LINUX-COMPAT.md).
+        let store = cell_maps();
+        store.set_owner(crate::mm::kmeta::Owner::cell(crate::user::current_index()));
+        if !store.reserve(MAPS_PAGES) {
+            return -EMFILE;
+        }
+        for (i, chunk) in snapshot[..n].chunks(MAPS_PAGE).enumerate() {
+            if let Some(pg) = store.get_mut(i) {
+                pg.0[..chunk.len()].copy_from_slice(chunk);
+            }
+        }
         self.maps_len = n;
         self.fds[slot] = FdKind::ProcMaps { pos: 0 };
         self.set_open_flags(slot, flags);
@@ -528,11 +593,24 @@ impl FdTable {
             FdKind::ProcMaps { pos } => {
                 let end = self.maps_len;
                 let n = (end - pos.min(end)).min(count as usize);
-                if !crate::uaccess::copy_out(buf_va, &self.maps[pos..pos + n]) {
-                    return -EFAULT;
+                // Copied page by page: the snapshot is frames now, so no single slice
+                // spans it. Bounded by `n`, already clamped to what was stored.
+                let store = cell_maps();
+                let mut done = 0usize;
+                while done < n {
+                    let at = pos + done;
+                    let Some(pg) = store.get_ref(at / MAPS_PAGE) else {
+                        break;
+                    };
+                    let off = at % MAPS_PAGE;
+                    let take = (MAPS_PAGE - off).min(n - done);
+                    if !crate::uaccess::copy_out(buf_va + done as u64, &pg.0[off..off + take]) {
+                        return -EFAULT;
+                    }
+                    done += take;
                 }
-                self.fds[slot] = FdKind::ProcMaps { pos: pos + n };
-                n as i64
+                self.fds[slot] = FdKind::ProcMaps { pos: pos + done };
+                done as i64
             }
             FdKind::ProcAuxv { pos } => {
                 let end = self.auxv_len;

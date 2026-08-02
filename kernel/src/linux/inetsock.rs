@@ -256,7 +256,14 @@ struct DgramEp {
     refs: u16,
     v6: bool,
     port: u16,
-    q: [Datagram; DGRAM_QUEUE],
+    /// The queued datagrams, **funded when the endpoint binds** rather than resident
+    /// (docs/EXECUTION-MODEL.md 9.8).
+    ///
+    /// This was `[Datagram; 8]` inline, and with a 2 KiB payload each that made `DGRAMS`
+    /// **131,520 bytes** of `.bss` - eight endpoints' worth of queue held whether or not
+    /// a single UDP socket was ever bound. Almost no boot binds one. The queue is a real
+    /// resource, so the cell that binds the endpoint pays for it while it is bound.
+    q: crate::mm::kmeta::Funded<Datagram>,
     qhead: usize,
     qlen: usize,
 }
@@ -268,7 +275,7 @@ impl DgramEp {
             refs: 0,
             v6: false,
             port: 0,
-            q: [const { Datagram::new() }; DGRAM_QUEUE],
+            q: crate::mm::kmeta::Funded::new(),
             qhead: 0,
             qlen: 0,
         }
@@ -298,12 +305,52 @@ pub fn register_dgram(v6: bool, port: u16) -> Option<u8> {
     let es = dgrams();
     let idx = (0..DGRAM_EPS).find(|&i| !es[i].used)?;
     let e = &mut es[idx];
-    *e = DgramEp::new();
+    // The slot is free, so its queue was released; fund a fresh one, charged to the cell
+    // that is binding. A cell that cannot afford the queue cannot have the endpoint -
+    // `None` here is the caller's existing "no endpoint available" answer.
+    e.q.set_owner(crate::mm::kmeta::Owner::cell(crate::user::current_index()));
+    if !e.q.reserve(DGRAM_QUEUE) {
+        e.q.release();
+        return None;
+    }
+    // SAFETY: single CPU, synchronous trap.
+    unsafe { *core::ptr::addr_of_mut!(QUEUES_FUNDED) += 1 };
+    e.qhead = 0;
+    e.qlen = 0;
     e.used = true;
     e.refs = 1;
     e.v6 = v6;
     e.port = port;
     Some(idx as u8)
+}
+
+/// Datagram queues funded since boot - the witness that the endpoint path runs at all.
+///
+/// Not cleared by `reset`: a harness resets at the *start* of a run, so a per-run counter
+/// reports only the last phase (the lesson this tree relearned four times).
+static mut QUEUES_FUNDED: u64 = 0;
+
+/// Queues released. Paired with [`QUEUES_FUNDED`] on purpose: a leak here **strands**
+/// the frames - `close_dgram` overwrites the descriptor that named them - so the table
+/// cannot see it and a `frames_held()` witness reports zero for a real leak. Counting
+/// both ends of the pair is what makes the release observable at all.
+static mut QUEUES_RELEASED: u64 = 0;
+
+/// (queues funded, queues released) since boot. Equal once every endpoint is closed.
+pub fn queue_counters() -> (u64, u64) {
+    // SAFETY: reads.
+    unsafe {
+        (
+            *core::ptr::addr_of!(QUEUES_FUNDED),
+            *core::ptr::addr_of!(QUEUES_RELEASED),
+        )
+    }
+}
+
+/// Frames every bound datagram endpoint's queue holds. **0 once every endpoint is
+/// closed** - the release-path property.
+pub fn dgram_frames() -> usize {
+    dgrams().iter().map(|e| e.q.frames_held()).sum()
 }
 
 /// The `(v6, port)` an endpoint is bound to.
@@ -323,6 +370,13 @@ pub fn close_dgram(ep: u8) {
     let e = &mut dgrams()[ep as usize];
     e.refs = e.refs.saturating_sub(1);
     if e.refs == 0 {
+        // Release before overwriting: the queue holds frames now, and assigning a fresh
+        // `DgramEp` over the descriptor would strand them with no drop glue to notice.
+        if e.q.frames_held() > 0 {
+            // SAFETY: single CPU, synchronous trap.
+            unsafe { *core::ptr::addr_of_mut!(QUEUES_RELEASED) += 1 };
+        }
+        e.q.release();
         *e = DgramEp::new();
     }
 }
@@ -356,7 +410,9 @@ pub fn send_dgram(v6: bool, dst_port: u16, src_port: u16, bytes: &[u8]) -> Dgram
     }
     let slot = (e.qhead + e.qlen) % DGRAM_QUEUE;
     let n = bytes.len().min(DGRAM_MAX);
-    let d = &mut e.q[slot];
+    let Some(d) = e.q.get_mut(slot) else {
+        return DgramSend::Dropped;
+    };
     d.src_port = src_port;
     d.len = n as u16;
     d.buf[..n].copy_from_slice(&bytes[..n]);
@@ -377,7 +433,9 @@ pub fn recv_dgram(ep: u8, out: &mut [u8]) -> Option<(u16, usize)> {
     if e.qlen == 0 {
         return None;
     }
-    let d = e.q[e.qhead];
+    let Some(d) = e.q.get(e.qhead) else {
+        return None;
+    };
     e.qhead = (e.qhead + 1) % DGRAM_QUEUE;
     e.qlen -= 1;
     let n = (d.len as usize).min(out.len());
@@ -391,6 +449,12 @@ pub fn reset() {
         *l = Listener::new();
     }
     for e in dgrams().iter_mut() {
+        // Release before overwriting - the queue is frames now (the S1' rule).
+        if e.q.frames_held() > 0 {
+            // SAFETY: between runs.
+            unsafe { *core::ptr::addr_of_mut!(QUEUES_RELEASED) += 1 };
+        }
+        e.q.release();
         *e = DgramEp::new();
     }
     // SAFETY: single CPU, between runs.
