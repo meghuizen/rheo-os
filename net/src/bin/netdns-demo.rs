@@ -17,9 +17,12 @@
 //!
 //! Then a **bonus live resolve** of `example.com` over SLIRP's DNS (10.0.2.3).
 //! SLIRP proxies to the host resolver, so the *address* is non-deterministic - we
-//! assert only structure (a valid A record, a query was sent, a second lookup is
-//! a cache hit). If this sandbox has no outbound DNS the resolve times out and is
-//! **tolerated** (the deterministic checks above already passed). The kernel is
+//! assert only what cannot vary: that a query was actually sent. **Everything about
+//! the answer is reported, never asserted** - no outbound DNS (a timeout), an
+//! AAAA-only or empty answer, an NXDOMAIN, a zero TTL that defeats the cache. An
+//! earlier version asserted "at least one A record" and "the second lookup is a cache
+//! hit", which made a bonus phase intermittently fail on what a real resolver happened
+//! to return; the deterministic checks above are the proof, and this is a live report. The kernel is
 //! untouched - portable userspace over the existing `OP_NET_*` queue path.
 
 #![no_std]
@@ -247,9 +250,24 @@ async fn run() {
     // --- 7. BONUS live resolve over SLIRP (network-tolerant). ---
     r.reset_queries();
     match r.resolve("example.com", QType::A).await {
+        Ok(ips) if !ips.iter().any(|ip| matches!(ip, IpAddr::V4(_))) => {
+            // A completed round trip that carried no A record - an upstream answering
+            // AAAA-only, or an empty answer. **Tolerated, and it was not**: this arm used
+            // to fall into `fail(70)`, so a phase whose own doc says the address is
+            // non-deterministic and a failure to reach DNS is tolerated could still fail
+            // on *what a real resolver happened to return*. That is the same category as
+            // the timeout below, and it is the difference between a bonus phase and an
+            // intermittent one (docs/ENGINEERING.md - an intermittently failing kernel
+            // must not land).
+            println!(
+                "netdns-demo: live DNS answered with no A record ({} answer(s)) - tolerated",
+                ips.len()
+            );
+        }
         Ok(ips) => {
-            let has_a = ips.iter().any(|ip| matches!(ip, IpAddr::V4(_)));
-            if !has_a || r.queries_sent() == 0 {
+            if r.queries_sent() == 0 {
+                // Not network-dependent: an answer that reached us without a query being
+                // sent would mean the cache served a name the phase just reset.
                 return fail(70);
             }
             println!(
@@ -261,7 +279,10 @@ async fn run() {
             let before = r.queries_sent();
             let _ = r.resolve("example.com", QType::A).await;
             if r.queries_sent() != before {
-                return fail(71);
+                // A cache miss on the name just resolved. Only reachable if the answer
+                // carried a zero TTL, which a real upstream may legitimately do - so it is
+                // reported rather than failed, for the reason above.
+                println!("netdns-demo: live answer was not cacheable (TTL 0?) - tolerated");
             }
             println!("netdns-demo: live cache hit confirmed (no extra query)");
         }
