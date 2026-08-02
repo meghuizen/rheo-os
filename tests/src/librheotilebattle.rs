@@ -135,6 +135,44 @@ extern "C" fn kernel_main() -> ! {
                 "librheo-tilebattle exited {code:#x}, expected {EXPECTED_EXIT:#x}"
             );
             println!("librheotilebattle: tile framework proof, exit {code:#x} OK");
+
+            // The per-cell grant table has an inline half and funds the rest from the
+            // cell's own budget (docs/EXECUTION-MODEL.md 9.6). It was a fixed
+            // `[[GrantSlot; 64]; MAX_CELLS]` - 24,576 bytes of `.bss`, already raised
+            // 16 -> 64 once for this very kernel, with docs/TILES.md 12 recording
+            // "whether 64 suffices for the largest real cell is an open sizing
+            // question". It is not a sizing question now, and this is the measurement
+            // that says so rather than the absence of a failure: the cell held twelve
+            // grants at once, past the inline half, so the table had to grow.
+            //
+            // Asserted on the **kernel** side because a cell cannot see a frame. A
+            // growth count of 0 would mean the inline half absorbed everything and the
+            // funded path never ran - which is exactly what happens if `GRANTS_INLINE`
+            // is quietly raised back to the old ceiling, and is the control.
+            let growths = user::grant_growths();
+            assert!(
+                growths > 0,
+                "the grant table never grew past its inline half - the cell held 12 \
+                 grants at once, so either the inline half is back to a fixed ceiling \
+                 or the funded path is unreachable"
+            );
+            // And the frames go back with the cell. A funded table whose slot-handback
+            // path is not also a release path leaks until the next boot (the S1' scar,
+            // found twice).
+            user::free_cell(0);
+            assert_eq!(
+                user::grant_frames(0),
+                0,
+                "the grant table kept its funded frames after the cell was freed"
+            );
+            println!(
+                "librheotilebattle: THE GRANT TABLE HAS NO CEILING - 12 grants held at \
+                 once past the {} inline slots, {growths} growth(s) into frames charged \
+                 to the cell's own budget, all returned when the cell was freed. It was \
+                 a fixed 64-slot array (24,576 bytes of .bss) raised 16 -> 64 for this \
+                 kernel, with the sizing left open in docs/TILES.md 12 OK",
+                user::grants_inline()
+            );
         }
         Outcome::Faulted(addr) => panic!("librheo-tilebattle faulted at {addr:#x}"),
     }

@@ -890,6 +890,62 @@ context 0's), so `linuxthreads` asserts it **directly** - context 0's entity mus
 cell's vcore 0 - rather than leaving a cleanup nothing checks. That assertion fires under the
 revert: `cell 0: Linux context 0 holds entity 2 but the cell's vcore 0 is entity 1`.
 
+### 9.6 `Elastic<T, N>`: the pattern, written once
+
+By this point the inline-plus-funded-tail shape had been written **three** times by hand -
+`user::CELL_VCORES`, `nproc::PROC_WAITS`, and the FP areas before them - and three more fixed
+per-cell tables were waiting for it. Three hazards come with the shape, each easy to get right
+once and easy to forget in the fifth copy:
+
+- **growth arrives zeroed**, and all-zero is a valid `T` only by accident of layout (the
+  defect invariant I7 caught in `sched::entity`, nine scenarios);
+- **every slot-handback path must also be a release path**, or the frames leak until the next
+  boot (the S1' scar, found twice);
+- **the descriptor must never be raw-copied**, which is why these tables live beside the
+  `Copy` per-cell record rather than inside it.
+
+`mm::kmeta::Elastic<T, N>` is that shape as a type. `grow` writes the empty value over *every*
+slot a growth added, not just the one requested; `reset` releases rather than clears; the type
+is deliberately not `Copy`.
+
+**Converted with it, measured:**
+
+| table | was | ceiling | now |
+|---|---|---|---|
+| `CELL_GRANTS` | 24,576 B | `MAX_GRANTS_PER_CELL = 64` | 8 inline, tail funded |
+| `CELL_RES` | 9,216 B | `MAX_RES_PER_CELL = 8` | 4 inline, tail funded |
+
+The grant table is the one that had already been raised, 16 -> 64, for the tile battle tier,
+with docs/TILES.md 12 recording "whether 64 suffices for the largest real cell is an open
+sizing question". It is not a sizing question now.
+
+**Proven** by `librheotilebattle` on all three ISAs, and the proof is deliberately not the
+existing churn loop: that allocates and drops one grant at a time, so it never holds more than
+one slot and would pass at any table size. The cell now holds **twelve at once**, past the
+inline half, and asserts they are distinct buffers; the kernel side asserts the table grew into
+frames charged to that cell and that the frames came back when the cell was freed. Two controls
+firing - the inline half restored to the old ceiling of 64 (`the grant table never grew past
+its inline half`), and the release removed from `free_cell`.
+
+That second control was not hypothetical: **the release was genuinely missing**, a third
+instance of the S1' shape in the same session. `free_cell` had been taught to release the
+context tail and covered only that; the frame assertion caught it (`left: 2, right: 0`).
+
+**Examined and refused: `MAX_CELL_CHANNELS`.** It looks like the same defect and is not. It
+lives in `abi/`, so it is part of the `SYS_CONNECT` contract a cell compiles against, and it
+sizes an address-space window (`USER_CHANNEL_VA + N * QueuePair::REGION_SIZE`) - each channel
+needs a mapped ring region whether or not the slot array is elastic. That is the
+`MAX_QUEUE_VCORES` category: a real resource bound, correctly a constant.
+
+**Still fixed, and named rather than implied:** `MAX_CAPS_PER_CELL = 256`
+(`[CapTable; MAX_CELLS]` is **131,072 bytes**, by far the largest remaining, and `CapSlot`'s
+all-zero pattern is already its empty value so the conversion itself is clean) and
+`MAX_OBJECTS = 512` and `MAX_CELLS = 16`. The capability table has one real design question
+holding it: it has no cell at construction, and test kernels mint into a `static mut CapTable`
+before `install`, so a growth could be charged to `KERNEL` and a later `set_owner` would credit
+the frames back to a different ledger than was charged - `Funded::release` credits the owner
+recorded at release time. That has to be answered before the conversion, not during it.
+
 ---
 
 ## 10. What does not change

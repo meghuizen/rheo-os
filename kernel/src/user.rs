@@ -604,19 +604,54 @@ const EMPTY_GRANT: GrantSlot = GrantSlot {
     cap_id: 0,
 };
 
-// Live typed-memory grants a cell may hold at once (docs/TILES.md 12): a
-// fixed per-cell table, not a proof-relevant limit, so sized for real
-// workloads - a tile attention program holds ~11 buffers, a warehouse or
-// compositor cell more. Raised 16 -> 64 (still small: ~40 B/slot). Whether
-// 64 suffices for the largest real cell is an open sizing question flagged
-// in docs/TILES.md 12.
-const MAX_GRANTS_PER_CELL: usize = 64;
-static mut CELL_GRANTS: [[GrantSlot; MAX_GRANTS_PER_CELL]; MAX_CELLS] =
-    [[EMPTY_GRANT; MAX_GRANTS_PER_CELL]; MAX_CELLS];
+/// Typed-memory grant slots kept **inline** per cell; a cell that wants more grows into
+/// frames charged to its own budget (docs/EXECUTION-MODEL.md 9.6).
+///
+/// This was `MAX_GRANTS_PER_CELL = 64`, a fixed `[[GrantSlot; 64]; MAX_CELLS]` of 24,576
+/// bytes, and it had already been raised 16 -> 64 for the tile battle tier with
+/// docs/TILES.md 12 recording "whether 64 suffices for the largest real cell is an open
+/// sizing question". It is not a sizing question any more: 8 inline covers the ordinary
+/// cell at zero frames, and the answer past that is the cell's frame budget.
+const GRANTS_INLINE: usize = 8;
+static mut CELL_GRANTS: [crate::mm::kmeta::Elastic<GrantSlot, GRANTS_INLINE>; MAX_CELLS] =
+    [const { crate::mm::kmeta::Elastic::with_inline([EMPTY_GRANT; GRANTS_INLINE]) }; MAX_CELLS];
 
-fn cell_grants(cur: usize) -> &'static mut [GrantSlot; MAX_GRANTS_PER_CELL] {
+fn cell_grants(cur: usize) -> &'static mut crate::mm::kmeta::Elastic<GrantSlot, GRANTS_INLINE> {
     // SAFETY: single CPU, synchronous traps; no concurrent access.
     unsafe { &mut (*core::ptr::addr_of_mut!(CELL_GRANTS))[cur] }
+}
+
+/// The index of a free grant slot for `cur`, growing the table if every one is taken.
+fn grant_slot(cur: usize) -> Option<usize> {
+    let t = cell_grants(cur);
+    let before = t.frames_held();
+    let i = t.alloc(EMPTY_GRANT, |s| !s.in_use)?;
+    if t.frames_held() > before {
+        GRANT_GROWTHS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    Some(i)
+}
+
+/// Times a cell's grant table grew past its inline half into a funded frame.
+///
+/// The witness that the ceiling is gone rather than merely raised: a test can hold more
+/// grants than `GRANTS_INLINE` and check that the extra ones cost a frame charged to the
+/// cell, which is a thing no fixed array could report (docs/EXECUTION-MODEL.md 9.6).
+static GRANT_GROWTHS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// See [`GRANT_GROWTHS`].
+pub fn grant_growths() -> u64 {
+    GRANT_GROWTHS.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// How many grant slots a cell gets before its table funds a frame.
+pub fn grants_inline() -> usize {
+    GRANTS_INLINE
+}
+
+/// Frames cell `idx`'s grant table currently holds beyond its inline half.
+pub fn grant_frames(idx: usize) -> usize {
+    cell_grants(idx).frames_held()
 }
 
 /// Free the grant slot whose reservation base is `va` (an exact match on a
@@ -624,11 +659,8 @@ fn cell_grants(cur: usize) -> &'static mut [GrantSlot; MAX_GRANTS_PER_CELL] {
 /// slots as it drops grants. A `va` that matches no grant (an ordinary anon
 /// `SYS_MMAP` region) is a no-op.
 fn release_grant_at(cur: usize, va: usize) {
-    for slot in cell_grants(cur).iter_mut() {
-        if slot.in_use && slot.base == va {
-            *slot = EMPTY_GRANT;
-            return;
-        }
+    if let Some(slot) = cell_grants(cur).find_mut(|s| s.in_use && s.base == va) {
+        *slot = EMPTY_GRANT;
     }
 }
 
@@ -655,16 +687,18 @@ const EMPTY_RES: ResSlot = ResSlot {
     cap_id: 0,
 };
 
-const MAX_RES_PER_CELL: usize = 8;
-static mut CELL_RES: [[ResSlot; MAX_RES_PER_CELL]; MAX_CELLS] =
-    [[EMPTY_RES; MAX_RES_PER_CELL]; MAX_CELLS];
+/// Reservation slots kept inline per cell, growing past that into the cell's own budget
+/// (docs/EXECUTION-MODEL.md 9.6) - the grant table's reasoning at a smaller size.
+const RES_INLINE: usize = 4;
+static mut CELL_RES: [crate::mm::kmeta::Elastic<ResSlot, RES_INLINE>; MAX_CELLS] =
+    [const { crate::mm::kmeta::Elastic::with_inline([EMPTY_RES; RES_INLINE]) }; MAX_CELLS];
 
 /// Per-cell EDF admission controller (docs/SCHEDULING.md 4): tracks the cell's
 /// committed CPU utilization and refuses a set it cannot guarantee.
 const EMPTY_ADMISSION: Admission = Admission::new();
 static mut CELL_ADMISSION: [Admission; MAX_CELLS] = [EMPTY_ADMISSION; MAX_CELLS];
 
-fn cell_res(cur: usize) -> &'static mut [ResSlot; MAX_RES_PER_CELL] {
+fn cell_res(cur: usize) -> &'static mut crate::mm::kmeta::Elastic<ResSlot, RES_INLINE> {
     // SAFETY: single CPU, synchronous traps; no concurrent access.
     unsafe { &mut (*core::ptr::addr_of_mut!(CELL_RES))[cur] }
 }
@@ -1134,8 +1168,14 @@ pub fn reset() {
     crate::sched::entity::reset_table(crate::smp::MAX_CPUS as u16);
     // SAFETY: single CPU, between runs.
     unsafe {
-        *core::ptr::addr_of_mut!(CELL_GRANTS) = [[EMPTY_GRANT; MAX_GRANTS_PER_CELL]; MAX_CELLS];
-        *core::ptr::addr_of_mut!(CELL_RES) = [[EMPTY_RES; MAX_RES_PER_CELL]; MAX_CELLS];
+        // `reset`, not an overwrite: these hold frames now, and assigning a fresh table
+        // over the descriptor would strand them with no drop glue to notice (the S1'
+        // rule, and the reason `Elastic::reset` releases rather than clears).
+        for i in 0..MAX_CELLS {
+            (*core::ptr::addr_of_mut!(CELL_GRANTS))[i].reset(EMPTY_GRANT);
+            (*core::ptr::addr_of_mut!(CELL_RES))[i].reset(EMPTY_RES);
+        }
+        GRANT_GROWTHS.store(0, core::sync::atomic::Ordering::Release);
         *core::ptr::addr_of_mut!(CELL_ADMISSION) = [EMPTY_ADMISSION; MAX_CELLS];
         *core::ptr::addr_of_mut!(CELL_FRAMES) = [0; MAX_CELLS];
     }
@@ -1644,10 +1684,12 @@ fn grant_create(cur: usize, out_va: u64, len: usize, kind: u64, node_hint: u64) 
         }
     };
     // Record the reservation in the per-cell grant table.
-    let table = cell_grants(cur);
-    let Some(slot) = table.iter_mut().find(|s| !s.in_use) else {
+    let Some(slot_idx) = grant_slot(cur) else {
         return u64::MAX;
     };
+    let slot = cell_grants(cur)
+        .get_mut(slot_idx)
+        .expect("the slot `grant_slot` just returned");
     // **Placed, not bumped.** The address is now the allocator's answer: first-fit
     // inside the grant window, around what this cell already holds, with guard gaps and
     // overlap refused (docs/SUBSTRATE.md pillar 2). The window's ceiling is enforced by
@@ -1739,9 +1781,8 @@ fn sys_munmap(cur: usize, va: usize, len: usize) -> u64 {
     // (1) A typed memory grant of this cell, addressed by its reservation VA.
     if base >= GRANT_BASE {
         let slot = cell_grants(cur)
-            .iter()
-            .copied()
-            .find(|s| s.in_use && base >= s.base && end <= s.base + s.len);
+            .find(|s| s.in_use && base >= s.base && end <= s.base + s.len)
+            .copied();
         let Some(slot) = slot else {
             return u64::MAX; // no such reservation in this cell
         };
@@ -1807,9 +1848,7 @@ fn grant_resolve(cur: usize, cap_id: u32) -> Option<(usize, usize, bool)> {
     if !ok {
         return None;
     }
-    let slot = cell_grants(cur)
-        .iter()
-        .find(|s| s.in_use && s.cap_id == cap_id)?;
+    let slot = cell_grants(cur).find(|s| s.in_use && s.cap_id == cap_id)?;
     Some((slot.base, slot.len, slot.sealed))
 }
 
@@ -1827,7 +1866,6 @@ fn grant_commit(cur: usize, cap_id: u32, offset: usize, len: usize) -> u64 {
     // commit went to DDR and a `Pmem` grant was a silent lie
     // (docs/ARCHITECTURE-DEBT.md 3.6).
     let (kind, node) = cell_grants(cur)
-        .iter()
         .find(|s| s.in_use && s.cap_id == cap_id)
         .map(|s| (s.kind, s.node))
         .unwrap_or((0, frames::NODE_ANY));
@@ -1865,10 +1903,7 @@ fn grant_seal(cur: usize, cap_id: u32) -> u64 {
         return u64::MAX;
     };
     protect_range(base, glen, MapPerm::UserRo);
-    if let Some(slot) = cell_grants(cur)
-        .iter_mut()
-        .find(|s| s.in_use && s.cap_id == cap_id)
-    {
+    if let Some(slot) = cell_grants(cur).find_mut(|s| s.in_use && s.cap_id == cap_id) {
         slot.sealed = true;
     }
     0
@@ -1915,7 +1950,6 @@ fn grant_share(cur: usize, cap_id: u32, out_va: u64) -> u64 {
     };
     // Only a *sealed* (immutable) grant is shareable - the object-5 doctrine.
     let Some(slot) = cell_grants(cur)
-        .iter()
         .find(|s| s.in_use && s.cap_id == cap_id)
         .copied()
     else {
@@ -1962,7 +1996,7 @@ fn grant_share(cur: usize, cap_id: u32, out_va: u64) -> u64 {
     };
     // Record a peer grant slot: sealed (read-only) and its frames owned by the
     // client, so the peer never decommits/frees them (no double free).
-    if let Some(pslot) = cell_grants(peer).iter_mut().find(|s| !s.in_use) {
+    if let Some(pslot) = grant_slot(peer).and_then(|i| cell_grants(peer).get_mut(i)) {
         *pslot = GrantSlot {
             in_use: true,
             base: peer_base,
@@ -2079,7 +2113,10 @@ fn reserve_admit(
         return 3;
     }
     // Find a free reservation slot before mutating the admission total.
-    if cell_res(cur).iter().all(|s| s.in_use) {
+    // Reserve capacity for the slot before charging admission, growing the table if
+    // every slot is taken. A refusal here is "this cell cannot fund another reservation
+    // slot", which is the honest replacement for the old "the fixed table is full".
+    if cell_res(cur).alloc(EMPTY_RES, |s| !s.in_use).is_none() {
         return 1;
     }
     // Charge the **machine** first, then the cell (docs/ARCHITECTURE-DEBT.md 2.5).
@@ -2124,7 +2161,9 @@ fn reserve_admit(
             }
         }
     };
-    let slot = cell_res(cur).iter_mut().find(|s| !s.in_use).unwrap();
+    let slot = cell_res(cur)
+        .find_mut(|s| !s.in_use)
+        .expect("a free reservation slot was reserved above");
     *slot = ResSlot {
         in_use: true,
         res,
@@ -2161,10 +2200,7 @@ fn reserve_release(cur: usize, cap_id: u32) -> u64 {
     if !ok {
         return u64::MAX;
     }
-    let Some(slot) = cell_res(cur)
-        .iter_mut()
-        .find(|s| s.in_use && s.cap_id == cap_id)
-    else {
+    let Some(slot) = cell_res(cur).find_mut(|s| s.in_use && s.cap_id == cap_id) else {
         return u64::MAX;
     };
     let res = slot.res;
@@ -2214,7 +2250,13 @@ pub unsafe fn install(
     // (docs/EXECUTION-MODEL.md 9, E2), so a cell that is installed but never claimed is an
     // entity with no owner - pickable by any core, which is the single-CPU behaviour exactly.
     attach_entity(idx, 0);
-    *cell_grants(idx) = [EMPTY_GRANT; MAX_GRANTS_PER_CELL];
+    cell_grants(idx).reset(EMPTY_GRANT);
+    // Charge any growth to this cell, before the first one: `Elastic::release` credits
+    // the owner recorded at release time, so an owner set across a growth would credit
+    // one ledger for what another was charged.
+    cell_grants(idx).set_owner(crate::mm::kmeta::Owner::cell(idx));
+    cell_res(idx).reset(EMPTY_RES);
+    cell_res(idx).set_owner(crate::mm::kmeta::Owner::cell(idx));
     // A fresh cell starts with an empty recorded layout. `clear`, not `init`: the
     // table's frames are a boot cost this slot reuses (see `init_layouts`).
     // Place this cell's kernel metadata - page tables, capability tables, its VA
@@ -2782,7 +2824,13 @@ pub unsafe fn install_spawned(
         // set and splitting them across nodes would cost on every message.
         node: p.node,
     };
-    *cell_grants(idx) = [EMPTY_GRANT; MAX_GRANTS_PER_CELL];
+    cell_grants(idx).reset(EMPTY_GRANT);
+    // Charge any growth to this cell, before the first one: `Elastic::release` credits
+    // the owner recorded at release time, so an owner set across a growth would credit
+    // one ledger for what another was charged.
+    cell_grants(idx).set_owner(crate::mm::kmeta::Owner::cell(idx));
+    cell_res(idx).reset(EMPTY_RES);
+    cell_res(idx).set_owner(crate::mm::kmeta::Owner::cell(idx));
     // SAFETY: single CPU; a fresh cell starts with no frames charged.
     unsafe { (*core::ptr::addr_of_mut!(CELL_FRAMES))[idx] = 0 };
     // The child inherits the parent's burst state rather than arriving with a fresh
@@ -2930,11 +2978,16 @@ pub fn free_cell(idx: usize) {
             t.force_free(id);
         }
     }
-    // The funded context tail is the same kind of resource one level along, so this is
-    // its release path too. Without it a cell that ever held a second context leaks its
-    // table frame until the next boot - the leak S1' found twice, each time in a
-    // slot-handback path that had not also become a release path.
+    // The funded tails are the same kind of resource one level along, so this is their
+    // release path too. Without it a cell that ever grew one leaks its table frames until
+    // the next boot - the leak S1' found twice, each time in a slot-handback path that
+    // had not also become a release path. It happened a **third** time here: the grant
+    // and reservation tables became elastic and this line covered only the contexts,
+    // caught by `librheotilebattle` asserting the frames come back ("the grant table kept
+    // its funded frames after the cell was freed", left 2, right 0).
     vcores(idx).release();
+    cell_grants(idx).reset(EMPTY_GRANT);
+    cell_res(idx).reset(EMPTY_RES);
     cells()[idx] = EMPTY;
     // SAFETY: single CPU, synchronous traps.
     unsafe {

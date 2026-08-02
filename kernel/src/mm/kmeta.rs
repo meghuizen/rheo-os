@@ -580,3 +580,151 @@ pub fn ledger_consistent() -> bool {
         sum == *addr_of!(META_FRAMES)
     }
 }
+
+/// A per-cell table that is **`N` slots inline and unbounded after that**
+/// (docs/EXECUTION-MODEL.md 9.6).
+///
+/// # Why this exists as a type rather than as a pattern
+///
+/// Every fixed `[[Slot; K]; MAX_CELLS]` in this kernel is the same defect: an array
+/// dimension standing in for a resource limit, raised reactively when a real workload
+/// pushed against it (the grant table went 16 -> 64 for the tile battle tier, the object
+/// table 128 -> 512). And every one of them has the same *wrong* obvious fix - a
+/// [`Funded`] table per cell - which was measured and refused for the vcore records: a
+/// directory frame plus a data frame per cell is 8 KiB to hold a few dozen bytes, so
+/// funding all of it costs more than the array it replaces.
+///
+/// The shape that works is inline-plus-tail, and it had been written twice by hand
+/// (`user::CELL_VCORES`, `nproc::PROC_WAITS`) before it was written once here. Three
+/// hazards come with it and each is easy to get right in one place and easy to forget in
+/// the fifth copy:
+///
+/// - **Growth arrives zeroed.** [`Funded`] hands back freshly allocated frames, and
+///   all-zero is a valid `T` only by accident of layout. [`Elastic::grow`] therefore
+///   writes `empty` over *every* slot the growth added, not just the one being returned.
+///   Skipping that is what invariant I7 caught in `sched::entity` (nine scenarios).
+/// - **A release path is needed wherever a slot is handed back**, or the frames leak
+///   until the next boot. That is the S1' scar, found twice.
+/// - **The descriptor must not be raw-copied.** `Elastic` is deliberately not `Copy`, so
+///   a struct holding one cannot be either - which is what forces these tables to live
+///   beside the `Copy` per-cell record rather than inside it.
+///
+/// The common case - a cell using no more than `N` slots - allocates **nothing**, which
+/// is what makes the inline half worth its `.bss`.
+pub struct Elastic<T: Copy, const N: usize> {
+    inline: [T; N],
+    tail: Funded<T>,
+}
+
+impl<T: Copy, const N: usize> Elastic<T, N> {
+    /// A table whose inline half is `inline` and whose tail is empty (holds no frames).
+    pub const fn with_inline(inline: [T; N]) -> Elastic<T, N> {
+        Elastic {
+            inline,
+            tail: Funded::new(),
+        }
+    }
+
+    /// Charge any frames the tail takes to `owner`.
+    ///
+    /// Must be set **before** the first growth: [`Funded::release`] credits frames back to
+    /// the owner recorded at release time, so moving the owner across a growth would
+    /// credit one ledger for what another was charged.
+    pub fn set_owner(&mut self, owner: Owner) {
+        self.tail.set_owner(owner);
+    }
+
+    /// Slots addressable right now: the inline half plus whatever the tail has grown to.
+    pub fn capacity(&self) -> usize {
+        N + self.tail.capacity()
+    }
+
+    /// Frames the tail currently holds. 0 for a cell that never exceeded `N`.
+    pub fn frames_held(&self) -> usize {
+        self.tail.frames_held()
+    }
+
+    pub fn get(&self, i: usize) -> Option<&T> {
+        if i < N {
+            return self.inline.get(i);
+        }
+        self.tail.get_ref(i - N)
+    }
+
+    pub fn get_mut(&mut self, i: usize) -> Option<&mut T> {
+        if i < N {
+            return self.inline.get_mut(i);
+        }
+        self.tail.get_mut(i - N)
+    }
+
+    /// Append one slot and return its index, or `None` when the owner's budget refuses
+    /// the frame - a clean refusal naming the cell, never a global "table full"
+    /// (docs/MEMORY.md 7, no OOM killer).
+    pub fn grow(&mut self, empty: T) -> Option<usize> {
+        let want = self.tail.capacity();
+        let was = want;
+        if !self.tail.set_growing(want, empty) {
+            return None;
+        }
+        // Initialise every slot the growth added, not just the one asked for: `Funded`
+        // grows by whole frames and those arrive zeroed.
+        for i in was..self.tail.capacity() {
+            self.tail.set(i, empty);
+        }
+        Some(N + want)
+    }
+
+    /// The first slot for which `is_free` holds, growing by one if none is.
+    ///
+    /// The allocation shape every caller of a fixed per-cell table already had -
+    /// "scan for a free slot, fail if there is none" - with the failure replaced by
+    /// growth.
+    pub fn alloc(&mut self, empty: T, is_free: impl Fn(&T) -> bool) -> Option<usize> {
+        for i in 0..self.capacity() {
+            if self.get(i).is_some_and(&is_free) {
+                return Some(i);
+            }
+        }
+        self.grow(empty)
+    }
+
+    /// The index of the first slot satisfying `pred`.
+    pub fn position(&self, pred: impl Fn(&T) -> bool) -> Option<usize> {
+        (0..self.capacity()).find(|&i| self.get(i).is_some_and(&pred))
+    }
+
+    /// The first slot satisfying `pred`.
+    pub fn find(&self, pred: impl Fn(&T) -> bool) -> Option<&T> {
+        self.get(self.position(pred)?)
+    }
+
+    /// [`Elastic::find`], for writing.
+    pub fn find_mut(&mut self, pred: impl Fn(&T) -> bool) -> Option<&mut T> {
+        let i = self.position(pred)?;
+        self.get_mut(i)
+    }
+
+    /// Whether `pred` holds for every slot.
+    pub fn all(&self, pred: impl Fn(&T) -> bool) -> bool {
+        (0..self.capacity()).all(|i| self.get(i).is_some_and(&pred))
+    }
+
+    /// Run `f` over every slot, for writing.
+    pub fn for_each_mut(&mut self, mut f: impl FnMut(&mut T)) {
+        for i in 0..self.capacity() {
+            if let Some(x) = self.get_mut(i) {
+                f(x);
+            }
+        }
+    }
+
+    /// Clear the inline half and **release the tail's frames**.
+    ///
+    /// One call, so a slot-handback path cannot reset the table while leaking its frames -
+    /// which is exactly the pair of leaks S1' found.
+    pub fn reset(&mut self, empty: T) {
+        self.inline = [empty; N];
+        self.tail.release();
+    }
+}

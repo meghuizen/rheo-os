@@ -428,6 +428,32 @@ async fn work() {
             }
         }
         println!("battle: grant-slot churn (20x alloc/drop past the 16-slot table) OK");
+
+        // And **held at once**, which the churn above does not test: it allocates and
+        // drops one at a time, so it never holds more than one slot and would pass with
+        // any table size at all. Twelve simultaneous grants is past the inline half of
+        // the per-cell table, so the kernel has to fund a frame for the rest - the
+        // property that replaced the fixed ceiling (docs/EXECUTION-MODEL.md 9.6). The
+        // test kernel checks the frame side; this checks that all twelve are real and
+        // distinct, since a table that silently reused a slot would hand back the same
+        // buffer twice.
+        {
+            let mut held = alloc::vec::Vec::new();
+            for _ in 0..12 {
+                match TileBuf::<I8>::alloc(MemKind::Ddr, 32, 32) {
+                    Some(b) => held.push(b),
+                    None => return fail(56),
+                }
+            }
+            for i in 0..held.len() {
+                for j in (i + 1)..held.len() {
+                    if held[i].as_slice().as_ptr() == held[j].as_slice().as_ptr() {
+                        return fail(57); // two grants share one buffer
+                    }
+                }
+            }
+            println!("battle: 12 grants held at once, all distinct (past the inline half) OK");
+        }
     }
 
     // ================= Boundary shapes vs naive ========================
