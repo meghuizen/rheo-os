@@ -55,15 +55,19 @@
 //! [`super::TpmInterface::Crb`] and the boot says a TPM is present and undriven,
 //! which is a truer answer than reporting no TPM at all.
 //!
-//! # What is proven, and what is not
+//! # What is proven
 //!
-//! QEMU models `tpm-tis` / `tpm-crb` on x86-64 and `tpm-tis-device` on
-//! arm/riscv, but every one of them needs a **backend** - either `swtpm` or a
-//! host `/dev/tpm0` - and this container has neither. So firmware here describes
-//! no TPM, the probe correctly finds none, and the driver's command path is
-//! **written to the specification and not executed**. That is stated rather than
-//! implied; the moment a backend exists the path runs with no change to anything
-//! above it.
+//! QEMU models the chip but not its behaviour: `tpm-tis` / `tpm-crb` on x86-64
+//! and `tpm-tis-device` on arm/riscv all need a **backend**. `xtask` starts one
+//! (`swtpm`, a software TPM speaking the same protocol over a socket) per ISA for
+//! the `rng` kernel, so the command path really executes: `TPM2_Startup` - the
+//! chip arrives unstarted, so the `TPM_RC_INITIALIZE` retry below runs every time
+//! - then `TPM2_GetRandom` giving 32 bytes and then 32 different ones, on **all
+//! three ISAs**, vendor/device `0x00011014`.
+//!
+//! Where `swtpm` is not installed no TPM is attached, firmware describes none,
+//! the probe finds none, and the boot says so. That is a true statement about
+//! that machine rather than a gap in the driver.
 
 use crate::arch;
 

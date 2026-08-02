@@ -3,10 +3,11 @@
 //!
 //! # Why HID events are entropy
 //!
-//! When a human presses a key, and which key, are unpredictable in a way no
-//! deterministic machine can reproduce. Linux has collected this since its first
-//! `/dev/random` (`add_input_randomness`), and it is one of the few sources that
-//! exists on a machine with no randomness hardware at all.
+//! **When** a human presses a key is unpredictable in a way no deterministic
+//! machine can reproduce. Linux has collected this since its first `/dev/random`
+//! (`add_input_randomness`), and it is one of the few sources that exists on a
+//! machine with no randomness hardware at all. Only the timing is used here -
+//! see "This is not a keylogger" below.
 //!
 //! It is **mixed and never credited**, like every other device-timing source
 //! here: this kernel has no entropy estimator, and a keyboard sending an
