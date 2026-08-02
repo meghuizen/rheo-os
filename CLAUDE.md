@@ -2777,6 +2777,28 @@ unreachable from the console, because `console::write` asks whether it is buffer
 doing any work and returns - the right design, so the counter is documented as belonging to a
 direct API caller and the phase asserts that path instead of the impossible one.
 
+**The execution entity is the authority** (docs/EXECUTION-MODEL.md 9, stages E2-E4). Three
+facts each used to live in two places, and every one of the five vcore/preemption defects was
+one of those agreements being wrong. **E2**: ownership left `RunCell.vcpu[]` and the
+entered-guard left its per-CPU array; both are one word on the entity, the entity id **is**
+`cell * MAX_VCORES + vcore` so there is no mapping to drift, and `leave_cpu` is keyed on the
+**CPU** because a cross-cell hand-off means the entity a core returns from is not the one it
+entered. Both halves of the guard are proven load-bearing (removing the exit-side clear leaves
+four entities recording a CPU inside them; removing the entry-side one panics by name).
+**E3**: `nproc`'s `vparked[]` is gone - `parked()` reads the entity, park/wake write it,
+`all_parked` is the table's own implementation - and **I4 becomes checkable for the first
+time**, because "parked with no wake source" is a state a personality-side boolean could not
+express. **E4**: a context's FP save area is **one funded frame charged to its own cell**
+rather than an element of a `MAX_CELLS * MAX_VCORES` static; that static was the entire reason
+`MAX_VCORES` was 4 (256 KiB of `.bss` at four contexts, 4 MiB at sixty-four), so it is 16 now
+with the `.bss` cost *falling*, and the ceiling is the cell's frame budget. `smp` measures the
+per-context frame cost and its return, `verify/entity` checks fund-once / distinct /
+release-once. Honest remainders, named rather than implied: the **Linux** side of E3
+(`Thread::state` + `pblock` + `linux::Proc::state`) still keeps its own copies, and deleting
+`MAX_VCORES` outright needs `vframe`/`vqp`/`vqp_va`/`vqp_cap`/`voutcome` moved onto the entity
+too - about 11 KiB of `.bss` at 16 contexts, against the 1 MiB the FP areas alone were, so the
+constant is a bound on an array rather than the resource limit it used to be.
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
 proofs, and the hardware-lab performance numbers.

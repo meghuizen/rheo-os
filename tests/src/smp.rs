@@ -310,6 +310,7 @@ fn test_secondary_bringup() {
             test_placement();
             test_hetero_placement();
             test_entity_authority();
+            test_funded_contexts();
             test_two_vcores_one_cell();
             test_vcore_yield();
             test_per_vcore_queues();
@@ -3300,4 +3301,129 @@ fn test_entity_authority() {
          two places holding one fact; they are one word each on the entity now \
          (docs/EXECUTION-MODEL.md 9, E2) OK"
     );
+}
+
+// ------------- E4: a context's FP area is funded, so the context count is not a constant
+//
+// `MAX_VCORES` was 4, and the reason was not the scheduler: it was the FP/SIMD save areas, a
+// fixed `MAX_CELLS * MAX_VCORES` static at `FP_AREA_LEN` each. On x86-64 that is 256 KiB of
+// `.bss` at four contexts and **4 MiB at sixty-four**, and `.bss` growth in this tree has a scar
+// - moving it once broke an unrelated kernel (docs/ENGINEERING.md 11). So the number was a
+// statement about a static array, defended as though it were a design limit.
+//
+// In E4 each entity funds **one frame** from its own cell's budget (docs/SUBSTRATE.md pillar 1),
+// exactly as every other funded table does, and the ceiling becomes that cell's frame budget.
+// What this phase measures is that claim, in frames:
+//
+//  1. Creating contexts **costs frames**, and the cost is per context - so the storage is real
+//     and per entity, not a static that was there all along.
+//  2. Each context's area is **its own**: no two entities share a VA. One area between two
+//     contexts is the `SYS_YIELD` FP defect exactly - each core saves over the other's image,
+//     with no fault and no log (docs/LIBRHEO.md).
+//  3. Freeing the cell **returns every frame**, so the pool is where it started. A slot-handback
+//     path that is not also a release path is the S1' leak, and two of those existed.
+fn test_funded_contexts() {
+    /// Frames taken out of the pool. `stats()` reports `(free, total)`, so used is the
+    /// difference - and `total` is a constant, which is why reading `.1` measures nothing.
+    fn used_frames() -> usize {
+        let (free, total) = kernel::mm::frames::stats();
+        total - free
+    }
+
+    const EXTRA: usize = 6;
+
+    // SAFETY: single-threaded setup on the primary; the secondaries are parked in their work
+    // loop, and cell slot 1 is free between phases.
+    unsafe {
+        let objects = &mut *core::ptr::addr_of_mut!(OBJECTS2);
+        let caps = &mut *core::ptr::addr_of_mut!(CAPS2);
+        *objects = ObjectTable::new();
+        *caps = CapTable::new();
+        user::reset();
+
+        let store = core::ptr::addr_of_mut!(STORE_Q[0]);
+        let (aspace, _o, mut frame) = build_cell(
+            &mut *store,
+            objects,
+            caps,
+            (*core::ptr::addr_of!(KSTACK_Q[0])).top(),
+            1,
+            user_placed,
+            1,
+            SHORT_ROUNDS,
+        );
+        user::install(
+            0,
+            &aspace,
+            caps,
+            objects,
+            (*store).qp.qp.as_ptr(),
+            core::ptr::addr_of_mut!(frame),
+        );
+        let after_install = used_frames();
+
+        // Add contexts past the old ceiling of four. They are never run - the claim under test
+        // is the *storage*, and running them would measure the scheduler instead.
+        for _ in 0..EXTRA {
+            user::install_vcore(0, core::ptr::addr_of_mut!(frame), (*store).qp.qp.as_ptr());
+        }
+        let after_contexts = used_frames();
+
+        // 1. Contexts cost frames, one each.
+        let cost = after_contexts - after_install;
+        assert_eq!(
+            cost, EXTRA,
+            "{EXTRA} contexts cost {cost} frames, want one each. A cost of 0 would mean the \
+             areas are still the static array and nothing was funded"
+        );
+
+        // 2. Every area is distinct, and none is null.
+        let t = kernel::sched::entity::table();
+        let n = user::cell_vcores(0);
+        assert_eq!(
+            n,
+            EXTRA + 1,
+            "cell 0 holds {n} contexts, want {}",
+            EXTRA + 1
+        );
+        for a in 0..n {
+            let va = t.fp_of(user::entity_of(0, a));
+            assert_ne!(va, 0, "context {a} has no FP save area");
+            for b in (a + 1)..n {
+                assert_ne!(
+                    va,
+                    t.fp_of(user::entity_of(0, b)),
+                    "contexts {a} and {b} share one FP save area. Two cores running them would \
+                     each save over the other's register image - no fault, no log, wrong numbers"
+                );
+            }
+        }
+
+        // 3. The context frames come back when the slot does.
+        //
+        // Measured as a **delta against the contexts**, not against the phase's start: building
+        // a cell also funds its page tables, its capability table and its recorded VA layout,
+        // and `free_cell` does not return those (the address space is the launcher's). Comparing
+        // to the start would fold those in and measure something other than the claim - which
+        // the first version of this line did, and it read as a five-frame leak.
+        user::free_cell(0);
+        let after_free = used_frames();
+        let returned = after_contexts - after_free;
+        assert_eq!(
+            returned,
+            EXTRA + 1,
+            "freeing the cell returned {returned} frames, want the {} its contexts hold - a slot \
+             handed back without releasing its funded frames is the S1' leak",
+            EXTRA + 1
+        );
+        println!(
+            "smp: E4 - A CONTEXT'S FP AREA IS FUNDED, NOT A STATIC - {} contexts on one cell \
+             (past the old ceiling of 4), each costing exactly one frame from that cell's own \
+             budget, each with its own area, and every frame returned when the slot was. \
+             `MAX_VCORES` was 4 because the areas were {} bytes of .bss per context times every \
+             cell; the ceiling is the cell's frame budget now (docs/EXECUTION-MODEL.md 9, E4) OK",
+            EXTRA + 1,
+            kernel::arch::FP_AREA_LEN
+        );
+    }
 }

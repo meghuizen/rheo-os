@@ -592,12 +592,26 @@ pub const MAX_CELLS: usize = 16;
 /// vcore holds `nvcores == 1` and every path below behaves exactly as it did before
 /// vcores existed.
 ///
-/// Four rather than "as many as there are CPUs" because the FP save areas are a fixed
-/// static here (`MAX_CELLS * MAX_VCORES` of them, 4 KiB each on x86-64 = 256 KiB of
-/// `.bss`). Funding them out of the owning cell's own frame budget - the `mm::kmeta`
-/// mechanism S1' already built for the other tables - is what removes the number, and
-/// is a named follow-on rather than something this slice needs.
-pub const MAX_VCORES: usize = 4;
+/// **E4 removed what pinned this at four.** It was the FP save areas: a fixed
+/// `MAX_CELLS * MAX_VCORES` static at 4 KiB each on x86-64, which is 256 KiB of `.bss` at
+/// four contexts and 4 MiB at sixty-four - and `.bss` growth in this tree has a scar, since
+/// moving it once broke an unrelated kernel. Each entity now funds **one frame** out of its
+/// own cell's budget (`sched::entity::fund_fp`), so a context costs a frame taken when it is
+/// created and returned when its slot is, and the ceiling is the cell's frame budget rather
+/// than an array dimension.
+///
+/// What remains at this dimension is small and per *cell*: five fields of 4-8 bytes each in
+/// `RunCell` (the frame pointer, the queue pointer and its VA and cap id, the outcome). At 16
+/// cells and 16 contexts that is about 11 KiB of `.bss` in total, against the 1 MiB the FP
+/// areas alone would have cost - so the constant is a *bound on the array*, not the resource
+/// limit it used to be. Deleting it entirely means moving those five onto the entity too; it
+/// is named in docs/EXECUTION-MODEL.md 9 as the remainder rather than done here, because each
+/// is a distinct migration and this slice's claim is the one that was load-bearing.
+///
+/// 16 rather than 4: enough for a strand pool or a JS runtime's workers on a machine with
+/// more cores than this one, and chosen as a number the *test* can push against rather than
+/// as a new limit to defend.
+pub const MAX_VCORES: usize = 16;
 
 static mut CELLS: [RunCell; MAX_CELLS] = [EMPTY; MAX_CELLS];
 
@@ -733,14 +747,37 @@ static mut CELL_FP: [FpArea; MAX_CELLS * MAX_VCORES] =
     [const { FpArea([0; arch::FP_AREA_LEN]) }; MAX_CELLS * MAX_VCORES];
 
 /// Pointer to vcore `v` of cell `idx`'s FP save area.
+///
+/// **The entity's own funded frame** (E4), not an element of a `MAX_CELLS * MAX_VCORES`
+/// static. That static was the whole reason `MAX_VCORES` was 4: 4 KiB each on x86-64 is
+/// 256 KiB of `.bss` at four contexts and 4 MiB at sixty-four. The frame is charged to the
+/// cell that asked for the context and returned when its slot is.
+///
+/// Falls back to the static area only for an entity that has none, which after
+/// `install`/`install_vcore` means a context nobody created - and returning a shared area
+/// there is strictly better than a null dereference in a save path.
 fn cell_fp(idx: usize, v: usize) -> *mut u8 {
-    // SAFETY: `idx < MAX_CELLS` and `v < MAX_VCORES`, so the index is in bounds; each
-    // area belongs to one vcore, which belongs to one CPU at a time.
+    // SAFETY: a read of this vcore's own entity.
+    let va = unsafe { crate::sched::entity::table() }.fp_of(entity_of(idx, v));
+    if va != 0 {
+        return va as *mut u8;
+    }
+    // SAFETY: `idx < MAX_CELLS` and `v < MAX_VCORES`, so the index is in bounds.
     unsafe {
         (*core::ptr::addr_of_mut!(CELL_FP))[idx * MAX_VCORES + v]
             .0
             .as_mut_ptr()
     }
+}
+
+/// The FP save area **the save/restore path will actually use** for vcore `v` of cell `idx`.
+///
+/// Exposed for a test rather than for the kernel, and for a reason worth recording: a proof
+/// that asserted the *entity field* was distinct per context passed with `cell_fp` reverted to
+/// the shared static, because the field and the path are two different things. A proof of a
+/// resource has to ask the code that uses it.
+pub fn vcore_fp_va(idx: usize, v: usize) -> u64 {
+    cell_fp(idx, v) as u64
 }
 
 /// Count of native FP/SIMD register-file swaps performed by
@@ -2024,7 +2061,15 @@ pub unsafe fn install(
     // (docs/EXECUTION-MODEL.md 9, E2), so a cell that is installed but never claimed is an
     // entity with no owner - pickable by any core, which is the single-CPU behaviour exactly.
     // SAFETY: install runs on the core setting the cell up, with nothing inside it.
-    unsafe { crate::sched::entity::table() }.create_at(entity_of(idx, 0), idx as u16, 0);
+    unsafe {
+        let t = crate::sched::entity::table();
+        t.create_at(entity_of(idx, 0), idx as u16, 0);
+        t.fund_fp(
+            entity_of(idx, 0),
+            crate::mm::kmeta::Owner::cell(idx),
+            arch::FP_AREA_LEN,
+        );
+    }
     *cell_grants(idx) = [EMPTY_GRANT; MAX_GRANTS_PER_CELL];
     // A fresh cell starts with an empty recorded layout. `clear`, not `init`: the
     // table's frames are a boot cost this slot reuses (see `init_layouts`).
@@ -2105,7 +2150,15 @@ pub unsafe fn install_vcore(idx: usize, frame: *mut TrapFrame, qp: *const QueueP
     c.voutcome[v] = None;
     c.nvcores = v + 1;
     // SAFETY: as `install`.
-    unsafe { crate::sched::entity::table() }.create_at(entity_of(idx, v), idx as u16, v as u16);
+    unsafe {
+        let t = crate::sched::entity::table();
+        t.create_at(entity_of(idx, v), idx as u16, v as u16);
+        t.fund_fp(
+            entity_of(idx, v),
+            crate::mm::kmeta::Owner::cell(idx),
+            arch::FP_AREA_LEN,
+        );
+    }
     // Clean FP state for this vcore's first entry, exactly as `install` does for vcore
     // 0 - a zeroed area is not an ABI-default FPU (docs/LIBRHEO.md).
     // SAFETY: `cell_fp(idx, v)` is a valid, aligned `FP_AREA_LEN` area.
@@ -2599,6 +2652,11 @@ pub unsafe fn install_spawned(
     {
         let t = unsafe { crate::sched::entity::table() };
         t.create_at(entity_of(idx, 0), idx as u16, 0);
+        t.fund_fp(
+            entity_of(idx, 0),
+            crate::mm::kmeta::Owner::cell(idx),
+            arch::FP_AREA_LEN,
+        );
         t.claim(entity_of(idx, 0), parent_owner);
     }
     crate::sched::dispatch::track(idx, 0, Some(parent));
@@ -2697,6 +2755,11 @@ pub unsafe fn install_forked(
     {
         let t = unsafe { crate::sched::entity::table() };
         t.create_at(entity_of(idx, 0), idx as u16, 0);
+        t.fund_fp(
+            entity_of(idx, 0),
+            crate::mm::kmeta::Owner::cell(idx),
+            arch::FP_AREA_LEN,
+        );
         t.claim(entity_of(idx, 0), parent_owner);
     }
     crate::sched::dispatch::track(idx, 0, Some(parent));
@@ -2712,6 +2775,16 @@ pub fn free_cell(idx: usize) {
     // longer exists would be asked about that cell forever and never be runnable -
     // a permanently blocked vcore holding a slot (docs/SUBSTRATE.md pillar 3).
     crate::sched::dispatch::untrack(idx);
+    // Every slot-handback path is also a release path (the S1' lesson - two leaks existed
+    // because it was not). The entity's funded FP frame goes back to the cell's budget here.
+    // SAFETY: the cell is finished; no core is inside it.
+    unsafe {
+        let t = crate::sched::entity::table();
+        for v in 0..MAX_VCORES {
+            t.release_fp(entity_of(idx, v), crate::mm::kmeta::Owner::cell(idx));
+            t.force_free(entity_of(idx, v));
+        }
+    }
     cells()[idx] = EMPTY;
     // SAFETY: single CPU, synchronous traps.
     unsafe {

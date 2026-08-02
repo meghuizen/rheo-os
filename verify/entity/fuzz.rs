@@ -87,6 +87,35 @@ const MAX_ENTITIES: usize = 24;
 mod mm {
     pub mod kmeta {
         pub use crate::{Funded, Owner};
+
+        /// A frame charged to `owner`, as `mm::kmeta` hands out for a single-frame table.
+        ///
+        /// Shimmed as a **bump counter over a fake address space** rather than a real
+        /// allocation: what the driver checks is the entity's bookkeeping - that an area is
+        /// funded once, is distinct per entity, and is handed back exactly once - and that is
+        /// arithmetic, not memory. `1` is skipped so 0 keeps meaning "no area".
+        pub fn alloc_metric_frame(_owner: Owner) -> Option<usize> {
+            // SAFETY: the driver is single-threaded.
+            unsafe {
+                NEXT_FRAME += 4096;
+                LIVE_FRAMES += 1;
+                Some(NEXT_FRAME)
+            }
+        }
+
+        pub fn free_metric_frame(_va: usize, _owner: Owner) {
+            // SAFETY: as above.
+            unsafe { LIVE_FRAMES -= 1 };
+        }
+
+        pub static mut NEXT_FRAME: usize = 0x1000;
+        pub static mut LIVE_FRAMES: isize = 0;
+
+        /// Frames handed out and not returned - the leak check the driver asserts on.
+        pub fn live_frames() -> isize {
+            // SAFETY: as above.
+            unsafe { LIVE_FRAMES }
+        }
     }
 }
 
@@ -612,7 +641,68 @@ fn sc_budget_exhaustion() -> Result<(), String> {
     Ok(())
 }
 
+/// E4: a context's FP save area is **funded once and returned once**.
+///
+/// The kernel's `MAX_VCORES` was 4 because these areas were a fixed static; funded, the ceiling
+/// is the owning cell's frame budget. The three properties that has to satisfy are arithmetic,
+/// so they belong here rather than in a boot: fund is **idempotent** (an `install` that runs
+/// again for a reused slot must not leak the previous frame), every area is **distinct**, and
+/// release is **exact** - the count returns to zero and a second release is a no-op rather than
+/// a double free.
+fn sc_funded_fp_areas() -> Result<(), String> {
+    let (mut t, _m) = fresh();
+    let owner = Owner::cell(0);
+    let before = crate::mm::kmeta::live_frames();
+
+    let mut ids = Vec::new();
+    for c in 0..6u16 {
+        let id = t.create(0, c).ok_or("create")?;
+        if !t.fund_fp(id, owner, 512) {
+            return Err(format!("entity {id} could not be funded"));
+        }
+        ids.push(id);
+    }
+    if crate::mm::kmeta::live_frames() - before != ids.len() as isize {
+        return Err(format!(
+            "{} entities took {} frames",
+            ids.len(),
+            crate::mm::kmeta::live_frames() - before
+        ));
+    }
+    // Idempotent: funding again must not take a second frame.
+    for &id in &ids {
+        t.fund_fp(id, owner, 512);
+    }
+    if crate::mm::kmeta::live_frames() - before != ids.len() as isize {
+        return Err("funding an entity twice took a second frame - a reused slot would leak".into());
+    }
+    // Distinct.
+    for (i, &a) in ids.iter().enumerate() {
+        if t.fp_of(a) == 0 {
+            return Err(format!("entity {a} has no area after being funded"));
+        }
+        for &b in &ids[i + 1..] {
+            if t.fp_of(a) == t.fp_of(b) {
+                return Err(format!("entities {a} and {b} share one FP area"));
+            }
+        }
+    }
+    // Released exactly once, and a second release is a no-op.
+    for &id in &ids {
+        t.release_fp(id, owner);
+        t.release_fp(id, owner);
+    }
+    if crate::mm::kmeta::live_frames() != before {
+        return Err(format!(
+            "{} frames outstanding after releasing every area",
+            crate::mm::kmeta::live_frames() - before
+        ));
+    }
+    Ok(())
+}
+
 const SCENARIOS: &[Scenario] = &[
+    ("a context's FP area is funded once, returned once", sc_funded_fp_areas),
     ("threads of one cell across 4 cores", sc_threads_across_cores),
     ("Node teardown: peer wakes a parked main", sc_node_wake_peer),
     ("cell blocked when every entity is", sc_cell_blocked_and_woken),

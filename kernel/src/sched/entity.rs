@@ -153,6 +153,22 @@ pub struct Entity {
     pub migrate: u16,
 
     // ---- cold: read on entry and exit, not on a pick ----
+    /// Kernel VA of this entity's FP/SIMD save area, or 0 if it has none.
+    ///
+    /// **One frame per entity, charged to the owning cell** (docs/SUBSTRATE.md pillar 1),
+    /// rather than an element of a `MAX_CELLS * MAX_VCORES` static. That static was the whole
+    /// reason `MAX_VCORES` was 4: at `FP_AREA_LEN` of 4 KiB on x86-64 it is 256 KiB of `.bss`
+    /// at four vcores and 4 MiB at sixty-four, and `.bss` growth in this tree has a scar
+    /// (moving it once broke an unrelated kernel). Funded, the cost is a frame taken by a cell
+    /// that asked for a context and returned when it exits, and the ceiling is that cell's
+    /// frame budget rather than a compile-time array dimension.
+    pub fp: u64,
+    /// Kernel VA of the top of this entity's kernel stack, or 0 when it uses the launcher's.
+    ///
+    /// Recorded here so the stack is a property of the *context* rather than of whatever
+    /// installed it - the three things a context cannot share are its frame, its kernel stack
+    /// and its FP area (docs/SMP.md 10.0a), and two of the three now live together.
+    pub kstack_top: u64,
     /// Cumulative CPU nanoseconds this entity has been given.
     pub service_ns: u64,
     /// Times entered.
@@ -168,7 +184,7 @@ pub struct Entity {
 /// enums), 4 (wake), 4 (slice), 4 (weight + migrate) = 24 bytes. Well inside one cache
 /// line, which leaves room for the fields E2-E5 add without spilling into a second.
 pub const HOT_BYTES: usize = 24;
-const _: () = assert!(core::mem::offset_of!(Entity, service_ns) == HOT_BYTES);
+const _: () = assert!(core::mem::offset_of!(Entity, fp) == HOT_BYTES);
 const _: () = assert!(core::mem::size_of::<Entity>() <= 64);
 
 impl Entity {
@@ -186,6 +202,8 @@ impl Entity {
         slice_ns: DEFAULT_SLICE_NS,
         weight: DEFAULT_WEIGHT,
         migrate: 0,
+        fp: 0,
+        kstack_top: 0,
         service_ns: 0,
         dispatches: 0,
         preemptions: 0,
@@ -360,6 +378,53 @@ impl EntityTable {
         e.context = context;
         e.state = State::Runnable;
         self.slots.set(id, e)
+    }
+
+    /// Give `id` a funded FP/SIMD save area, charged to the cell that owns it.
+    ///
+    /// One frame, taken through the same `mm::kmeta` path every other funded table uses, so
+    /// exhaustion is a clean refusal naming the cell rather than a global "table full"
+    /// (docs/MEMORY.md 7). Returns false when the cell's budget cannot fund it, and the caller
+    /// must then refuse to create the context - a context with nowhere to save its vector
+    /// registers would corrupt whatever ran before it, silently.
+    ///
+    /// Idempotent: an entity that already has an area keeps it, because `install` runs again for
+    /// a reused cell slot and re-allocating would leak the previous frame.
+    pub fn fund_fp(&mut self, id: usize, owner: Owner, len: usize) -> bool {
+        let Some(mut e) = self.slots.get(id) else {
+            return false;
+        };
+        if e.fp != 0 {
+            return true;
+        }
+        // A frame is the unit `kmeta` hands out, so an area larger than one would silently use
+        // memory it was not given.
+        debug_assert!(len <= 4096, "an FP area must fit a frame");
+        let Some(va) = crate::mm::kmeta::alloc_metric_frame(owner) else {
+            return false;
+        };
+        e.fp = va as u64;
+        self.slots.set(id, e)
+    }
+
+    /// Return `id`'s FP area to the pool. Called where the slot is handed back, which is the
+    /// only place that knows the context is finished with it - the S1' lesson that every
+    /// slot-handback path is also a release path, and that two of them existed and leaked.
+    pub fn release_fp(&mut self, id: usize, owner: Owner) {
+        let Some(mut e) = self.slots.get(id) else {
+            return;
+        };
+        if e.fp == 0 {
+            return;
+        }
+        crate::mm::kmeta::free_metric_frame(e.fp as usize, owner);
+        e.fp = 0;
+        self.slots.set(id, e);
+    }
+
+    /// The VA of `id`'s FP save area, or 0.
+    pub fn fp_of(&self, id: usize) -> u64 {
+        self.slots.get(id).map(|e| e.fp).unwrap_or(0)
     }
 
     /// The CPU that owns `id`, or [`NO_CPU`] - including for a slot that does not exist, which
@@ -689,6 +754,15 @@ pub fn reset_table(cpus: u16) {
     // SAFETY: between runs, with no core inside a cell.
     let t = unsafe { table() };
     for id in 0..t.capacity() {
+        // **Release the funded frame before clearing the slot**, in that order: the slot is
+        // where the owner is recorded, so a cleared slot has nobody to credit the frame back
+        // to. Between-runs resets happen once per test phase, so a leak here would be a frame
+        // per entity per phase - the S1' shape exactly, where two slot-handback paths were
+        // never made release paths and leaked until the next boot.
+        let owner = t.get(id).map(|e| Owner::cell(e.cell as usize));
+        if let Some(o) = owner {
+            t.release_fp(id, o);
+        }
         // Force the slot clean: `release` refuses a live or entered entity, which is right for
         // a running machine and wrong for a reset, where the point is that nothing is running.
         t.force_free(id);
