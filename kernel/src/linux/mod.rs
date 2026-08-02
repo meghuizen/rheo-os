@@ -211,6 +211,7 @@ pub fn reset() {
     // The per-cell /proc/self/maps snapshots hold frames now (docs/EXECUTION-MODEL.md
     // 9.8), so this is their release path - every slot-handback path must also be one.
     fd::reset_maps();
+    fd::reset_paths();
     reset_trace();
 }
 
@@ -264,6 +265,17 @@ pub(crate) fn dup_state(from: usize, to: usize) -> bool {
     // consequence lands on the *parent*: the child's records named entries it held no
     // reference to, the child's exit released one per record and drove the count to zero,
     // and the parent then faulted against a freed entry and got a zero page.
+    // The fd **paths** are a funded side table now (docs/EXECUTION-MODEL.md 9.8), so the
+    // raw copy above gave the child `path_len` for every inherited fd while its own path
+    // table is empty. A by-fd `getdents64` or `fstatat` in the child would then read a
+    // zeroed path and act on it - no fault, no log. Same shape as the VMA table above,
+    // same treatment.
+    if !fd::dup_paths(from, to) {
+        crate::println!("linux: fork refused - no frame budget for the child's fd paths");
+        state(to).vmas.teardown();
+        fd::reset_paths_for(to);
+        return false;
+    }
     state(to).fds.inherit_pipe_ends();
     state(to).vmas.inherit_files();
     true

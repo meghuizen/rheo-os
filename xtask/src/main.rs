@@ -2141,6 +2141,9 @@ fn build_linux_fixtures(arch: Arch) -> bool {
         // that reaches `linux::proc::preempt_cell` - the move-to-another-cell arm.
         // The last `linuxproc` phase.
         ("preemptfork.c", "preemptfork", NO_EXTRA),
+        // A directory fd used by-fd in a forked child - the only shape that notices
+        // whether `fork` deep-copies the funded fd-path table.
+        ("forkdir.c", "forkdir", NO_EXTRA),
     ] {
         let mut sc = Command::new(cc);
         sc.arg("-static").arg("-no-pie");

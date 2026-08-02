@@ -1071,9 +1071,45 @@ not: it is `[[SigAction; NSIG + 1]; MAX_CELLS]`, and `NSIG` is the number of sig
 Linux ABI defines - a dense array fixed by contract, with no ceiling anyone can hit. The
 `MAX_CELL_CHANNELS` category.
 
-**Still fixed, and named**: `FdKind::Vfs` carries a `[u8; PATH_MAX]` inline, making
-`[FdKind; NFD]` 17,408 bytes per cell - what now remains of `LINUX_STATE`. `FdKind` is `Copy`
-and matched at dozens of sites, so it is its own slice rather than a rider on this one.
+**And then the fd paths, which were the rest of `LINUX_STATE`.** `FdKind::Vfs` carried a
+`[u8; PATH_MAX]` inline, so `FdKind` was 272 bytes and `[FdKind; NFD]` 17,408 per cell -
+every descriptor paying for a path whether or not it was a file. Only *two* sites read it,
+so the bytes moved to a per-cell funded table indexed by fd slot, grown to the highest slot
+that needs one (slots are handed out lowest-first, so a few open files cost one frame and a
+cell that opens none costs nothing). `LINUX_STATE` 296,704 -> **34,560 bytes**.
+
+**That conversion creates an obligation `fork` did not have**, and it is the interesting
+part: `dup_state` raw-copies `LinuxState`, so the child inherits `path_len` for every fd
+while its own path table is empty. The child then reads a **zeroed path** and acts on it -
+no fault, no log. The same shape as the VMA table beside it, which is why that one is
+already deep-copied there.
+
+**Nothing in the suite noticed.** Deleting the deep copy left `linuxproc`, `linuxtools` and
+`linuxdyn` all green, so the claim "this copy is required" had no evidence. `forkdir.c` is
+the fixture that gives it some: a directory fd inherited across `fork` and used **by-fd** in
+the child, `getdents64` being the operation that re-enters the VFS by the stored path.
+Control fires (`forkdir: child read no entries`).
+
+Writing it produced one more note worth keeping. The first version had the *parent* read
+first, "so a child failure cannot be blamed on the directory being unreadable" - and it
+failed against correct code, because `getdents64` keeps a per-fd cursor the child inherits
+and `lseek` does not reset it, so the parent's read left the child at end-of-directory. The
+fixture was wrong, not the kernel. The child reads first now and the parent afterwards on
+its own cursor, which keeps the original intent without the confound.
+
+**The size ranking, end to end:**
+
+| symbol | before | after |
+|---|---|---|
+| `linux::pipe::PIPES` | 1,048,960 | gone |
+| `linux::LINUX_STATE` | 427,776 | 34,560 |
+| `linux::inetsock::DGRAMS` | 131,520 | gone |
+| `[CapTable; MAX_CELLS]` | 131,072 | 16,896 |
+| `CELL_GRANTS` + `CELL_RES` | 33,792 | ~1,500 |
+
+What is left at the top is `arch::imp::SYSCALL_KSTACK` (524,288 - per-CPU kernel stacks) and
+`mm::frames::REFS` (131,072 - one refcount byte per frame). Both are real and sized by the
+hardware, and both are marked as such rather than queued.
 
 ---
 

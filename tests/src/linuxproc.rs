@@ -53,6 +53,7 @@ static SYSX: &[u8] = fixture::linux!("sysx");
 static MMAPDP: &[u8] = fixture::linux!("mmapdp");
 static COWFORK: &[u8] = fixture::linux!("cowfork");
 static PREEMPTFORK: &[u8] = fixture::linux!("preemptfork");
+static FORKDIR: &[u8] = fixture::linux!("forkdir");
 static COREUTILS: &[u8] = fixture::linux!("cu/bin/coreutils");
 
 // -- stdout capture, wired to the Linux personality's stdout tap --
@@ -754,6 +755,33 @@ extern "C" fn kernel_main() -> ! {
              the loop changed nothing it computed"
         );
     }
+
+    // --- an fd's path survives `fork` (docs/EXECUTION-MODEL.md 9.8).
+    //
+    // An open VFS descriptor's path is a per-cell **funded side table** now, not inline in
+    // the descriptor - `FdKind` was 272 bytes because of it, making `[FdKind; NFD]` 17,408
+    // per cell. `fork` raw-copies the fd table, so the child inherits `path_len` for every
+    // fd while its own path table is empty unless the fork deep-copies it.
+    //
+    // That failure is **silent** - the child reads a zeroed path and acts on it - and the
+    // suite did not notice: removing the deep copy left `linuxproc`, `linuxtools` and
+    // `linuxdyn` all green. So this fixture exists rather than a comment claiming the copy
+    // is needed. `getdents64` is the operation that re-enters the VFS by the stored path,
+    // and the parent does it first so a child failure cannot be blamed on the directory.
+    let want_fd: &[u8] = b"forkdir: child ok\nforkdir: parent ok\n";
+    let (code, out) = run_capture(FORKDIR, &[b"forkdir"]);
+    assert!(
+        out == want_fd && code == 0,
+        "forkdir: exit {code}, stdout {:?} - a directory fd inherited across fork read no \
+         entries, which is what an un-copied fd-path table looks like",
+        core::str::from_utf8(out)
+    );
+    println!(
+        "linuxproc: AN FD'S PATH SURVIVES FORK - a directory fd read by-fd in the child \
+         returned entries, so the funded path table was deep-copied. The path used to be \
+         a [u8; 256] inline in every descriptor (17,408 bytes per cell); moving it out is \
+         what made this copy necessary, and its absence is silent OK"
+    );
 
     // The pre-fault path's cost, measured rather than assumed (docs/ENGINEERING.md 1).
     // Presence is ensured only on the helpers that hand back something to

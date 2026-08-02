@@ -46,7 +46,13 @@ enum FdKind {
     /// by-fd `getdents64`/`fstatat`.
     Vfs {
         vfs_fd: i64,
-        path: [u8; PATH_MAX],
+        /// Length of the path in [`CELL_PATHS`] for this fd slot.
+        ///
+        /// The **bytes** used to sit here as a `[u8; PATH_MAX]` inline, which made
+        /// `FdKind` 272 bytes and `[FdKind; NFD]` 17,408 per cell - 278 KiB across the
+        /// table, and after the other conversions essentially all of what `LINUX_STATE`
+        /// still cost. Every fd paid for a path whether or not it was a file
+        /// (docs/EXECUTION-MODEL.md 9.8).
         path_len: u16,
         /// Bytes of the packed `linux_dirent64` stream already returned by
         /// `getdents64` for this fd, so repeated calls advance and finally
@@ -282,6 +288,83 @@ struct MapsPage([u8; MAPS_PAGE]);
 const MAPS_PAGE: usize = crate::mm::frames::FRAME_SIZE;
 /// Frames a full snapshot occupies.
 const MAPS_PAGES: usize = MAPS_MAX.div_ceil(MAPS_PAGE);
+
+/// One fd's stored path. Sized so several fit a frame (a frame holds 15).
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct PathEntry([u8; PATH_MAX]);
+
+/// The paths of open VFS descriptors, **funded per cell** and indexed by fd slot.
+///
+/// Grown only as far as the highest slot that needs one, and fd slots are handed out
+/// lowest-first, so a cell with a handful of open files pays one frame and a cell that
+/// opens none pays nothing.
+static mut CELL_PATHS: [crate::mm::kmeta::Funded<PathEntry>; crate::user::MAX_CELLS] =
+    [const { crate::mm::kmeta::Funded::new() }; crate::user::MAX_CELLS];
+
+fn paths_of(cell: usize) -> &'static mut crate::mm::kmeta::Funded<PathEntry> {
+    // SAFETY: single CPU per cell.
+    unsafe { &mut (*core::ptr::addr_of_mut!(CELL_PATHS))[cell] }
+}
+
+/// The running cell's path storage - keyed on the running cell for the reason
+/// `pipe::alloc` is: every path here services a syscall for that cell.
+fn cell_paths() -> &'static mut crate::mm::kmeta::Funded<PathEntry> {
+    paths_of(crate::user::current_index().min(crate::user::MAX_CELLS - 1))
+}
+
+/// Store `name` as fd slot `slot`'s path, returning its length, or `None` when the
+/// cell's budget cannot fund the storage.
+fn set_path(slot: usize, name: &[u8]) -> Option<usize> {
+    let idx = crate::user::current_index().min(crate::user::MAX_CELLS - 1);
+    let t = paths_of(idx);
+    t.set_owner(crate::mm::kmeta::Owner::cell(idx));
+    if slot >= t.capacity() && !t.reserve(slot + 1) {
+        return None;
+    }
+    let n = name.len().min(PATH_MAX);
+    let e = t.get_mut(slot)?;
+    e.0[..n].copy_from_slice(&name[..n]);
+    Some(n)
+}
+
+/// Copy every stored path from cell `from` to cell `to` - the `fork` half.
+///
+/// **Required, and its absence is silent**: `dup_state` raw-copies `LinuxState`, so the
+/// child inherits `path_len` for each fd while its own path table is empty. A by-fd
+/// `getdents64` or `fstatat` in the child would then read a zeroed path and act on it.
+/// The same shape as the VMA table beside it, which is why that one is deep-copied there.
+pub fn dup_paths(from: usize, to: usize) -> bool {
+    let n = paths_of(from).capacity();
+    paths_of(to).release();
+    if n == 0 {
+        return true;
+    }
+    let t = paths_of(to);
+    t.set_owner(crate::mm::kmeta::Owner::cell(to));
+    if !t.reserve(n) {
+        return false;
+    }
+    for i in 0..n {
+        let Some(e) = paths_of(from).get(i) else {
+            continue;
+        };
+        paths_of(to).set(i, e);
+    }
+    true
+}
+
+/// Release one cell's path storage (a refused `fork`'s rollback).
+pub fn reset_paths_for(cell: usize) {
+    paths_of(cell).release();
+}
+
+/// Release every cell's path storage (called from `linux::reset`).
+pub fn reset_paths() {
+    for i in 0..crate::user::MAX_CELLS {
+        paths_of(i).release();
+    }
+}
 
 /// The rendered `/proc/self/maps` bytes, **funded per cell**.
 ///
@@ -771,9 +854,10 @@ impl FdTable {
     pub fn vfs_path(&self, fd: i64, out: &mut [u8]) -> Option<usize> {
         let slot = usize_fd(fd)?;
         match self.fds[slot] {
-            FdKind::Vfs { path, path_len, .. } => {
+            FdKind::Vfs { path_len, .. } => {
                 let n = (path_len as usize).min(out.len());
-                out[..n].copy_from_slice(&path[..n]);
+                let e = cell_paths().get_ref(slot)?;
+                out[..n].copy_from_slice(&e.0[..n]);
                 Some(n)
             }
             _ => None,
@@ -835,12 +919,11 @@ impl FdTable {
         if vfs_fd < 0 {
             return vfs_fd;
         }
-        let mut path = [0u8; PATH_MAX];
-        let plen = name.len().min(PATH_MAX);
-        path[..plen].copy_from_slice(&name[..plen]);
+        let Some(plen) = set_path(slot, name) else {
+            return -ENFILE;
+        };
         self.fds[slot] = FdKind::Vfs {
             vfs_fd,
-            path,
             path_len: plen as u16,
             dir_off: 0,
         };
@@ -1260,16 +1343,17 @@ impl FdTable {
         let Some(slot) = usize_fd(fd) else {
             return -EBADF;
         };
-        let (path, path_len, dir_off) = match &self.fds[slot] {
+        let (path_len, dir_off) = match &self.fds[slot] {
             FdKind::Vfs {
-                path,
-                path_len,
-                dir_off,
-                ..
-            } => (*path, *path_len as usize, *dir_off as usize),
+                path_len, dir_off, ..
+            } => (*path_len as usize, *dir_off as usize),
             FdKind::Closed => return -EBADF,
             _ => return -ENOTDIR,
         };
+        let Some(path) = cell_paths().get(slot) else {
+            return -EBADF;
+        };
+        let path = path.0;
         let Some(o) = svc::file_ops() else {
             return -EBADF;
         };
