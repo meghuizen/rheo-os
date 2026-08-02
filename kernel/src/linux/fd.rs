@@ -794,7 +794,22 @@ impl FdTable {
                 super::tap_stdout(buf);
                 count as i64
             }
-            FdKind::Null | FdKind::Zero | FdKind::Urandom => count as i64,
+            FdKind::Null | FdKind::Zero => count as i64,
+            // A write to /dev/urandom seeds the pool. It used to be discarded
+            // while reporting success, which is the shape docs/ENGINEERING.md 7
+            // rejects: the program asked for something and was told it happened.
+            // Mixed, never credited - the kernel cannot tell real entropy from a
+            // constant, which is exactly Linux's rule for this path.
+            FdKind::Urandom => {
+                if crate::uaccess::buf(buf_va, count as usize).is_none() {
+                    return -EFAULT;
+                }
+                // SAFETY: `uaccess::buf` validated the range readable in the active cell.
+                let buf =
+                    unsafe { core::slice::from_raw_parts(buf_va as *const u8, count as usize) };
+                crate::rng::feed_user(buf);
+                count as i64
+            }
             FdKind::ProcMaps { .. } | FdKind::ProcAuxv { .. } => -EBADF, // read-only
             FdKind::Pipe { writer: false, .. } => -EBADF,                // read end not writable
             FdKind::Pipe { idx, writer: true } => match pipe::write(idx as usize, buf_va, count) {

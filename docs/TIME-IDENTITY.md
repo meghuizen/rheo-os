@@ -105,6 +105,181 @@ Replaces Linux's global-pool / blocking-lore / random-vs-urandom confusion:
 - VMs get virtio-rng feeding plus their own jitter + mandatory reseed - trust
   but supplement (VIRTUALIZATION.md, EMULATION.md 3).
 
+## 4a. The entropy pool - built (`kernel/src/rng/`)
+
+Section 4 is the design; this is what is in the tree, and what each part is
+allowed to claim.
+
+### The shape
+
+```
+  CPU instruction  ─┐
+  RNG device       ─┤ credited          ┌──────────────┐      per-CPU
+  jitter source    ─┘ (health-tested)   │  input pool  │  ──► root DRBG ──► getrandom
+                                        │  (ChaCha20,  │      (ChaCha20,   (no lock)
+  NIC/NVMe/disk/UART ─┐                 │   256-bit,   │       fast key
+  /dev/urandom write ─┤ mixed,          │   credited)  │       erasure)
+  boot cycle counter ─┘ never counted   └──────────────┘
+```
+
+`kernel/src/rng/entropy.rs` is the pool, `jitter.rs` the software source,
+`health.rs` the boot self test, `kernel/src/hw/virtio_rng.rs` the device
+driver. **The output algorithm did not change** - it is still the ChaCha20
+fast-key-erasure DRBG, because that is what makes a read cheap, and the read
+path still touches only the calling core's own root with no lock.
+
+### Absorbing cannot reduce entropy
+
+For each 32-byte chunk `C` of input, with `K` the pool's 256-bit state:
+
+```
+K_new = ChaCha20_block(key = K, nonce = seq++)[0..32]  XOR  C
+```
+
+Both directions hold:
+
+- An attacker who **chose `C`** but does not know `K` cannot predict
+  `ChaCha20_block(K, ..)`, and XORing a known value into an unknown one leaves
+  it unknown. The pool is no weaker than before.
+- An attacker who **knows `K`** (the pool was compromised) gets no help if `C`
+  carries real entropy: `K_new` is then as unpredictable as `C`. The pool
+  *recovers*.
+
+Non-decreasing in both directions is what "seeding must not reduce entropy"
+means. (Up to the collision loss of a random function on 256 bits, which is
+negligible - the same caveat Linux's pool carries.)
+
+### Mixing is not counting
+
+Every source is mixed. Only some are counted towards the 256 credited bits a
+re-key needs. A source this kernel cannot measure contributes **zero** - still
+mixed, because mixing can only help, but unable to declare the pool ready.
+There is no entropy estimator here and inventing one would let a predictable
+source seed the machine.
+
+| Source | Credited | Why |
+|---|---|---|
+| CPU instruction (RDSEED / RNDR / Zkr `seed`) | full | after the SP 800-90B health tests |
+| RNG device (virtio-rng, TRNG/TPM chip) | full | a device whose whole purpose is randomness |
+| Jitter (`rng::jitter`) | 1 bit/sample | **only** when its own health tests pass |
+| NIC / NVMe / disk / UART event timing | none | real, but unmeasured |
+| A program writing `/dev/urandom` | none | exactly Linux's rule |
+| Boot cycle counter | none | deterministic under emulation |
+
+`/dev/urandom` **writes now do something**. They used to be discarded while
+returning success - the stub-reporting-success shape ENGINEERING.md 7 rejects.
+
+### The pool cannot run out
+
+Two things could be called exhaustion; only one is real.
+
+- **The pool state** cannot be exhausted. Extraction runs the state through
+  ChaCha20 and keeps the first half as the new state, so it is refreshed, not
+  consumed. A read of random bytes always succeeds; there is no blocking
+  `/dev/random` here and no need for one.
+- **The credit counter** can reach zero, which only means "nothing fresh has
+  arrived since the last re-key". It never weakens the generator.
+
+Two guards keep the second from mattering: `seeded` is **sticky** (once a full
+seed has ever been held, the machine is seeded for the boot, and nothing can
+put it back), and `replenish` actively asks every source rather than waiting -
+`pump` calls it whenever credit falls below half a seed. The jitter source is
+gated on *not yet seeded*, because its job is a machine's first seed, not
+steady-state supply, and it is the expensive one.
+
+### The software jitter source
+
+The fallback for a machine with no randomness hardware at all. Times a
+data-dependent walk over a scratch buffer, 256 times, and takes the low bits of
+each cycle-count delta - the `jitterentropy`/`haveged` idea.
+
+It **cannot fabricate entropy**, which matters here because under QEMU
+`-icount` the cycle counter is deterministic. Three checks run before any of it
+counts: no long run of identical deltas, no single delta dominating the window,
+and enough distinct values. Failing any of them credits **zero** and reports
+which one failed; the samples are still mixed. Credit is at most one bit per
+sample and never more than the number of distinct values observed.
+
+Measured here: aarch64 refuses (`longest_run=9`, "deltas repeat"), x86-64
+credits 42 bits, riscv64 credits 20 - all far below the 256-bit target, so on
+these emulated machines jitter contributes but never seeds alone. On real
+hardware it is expected to reach the target; that is a lab claim, not one made
+here.
+
+### Per-ISA seeding, and the hole that is now closed
+
+| ISA | CPU instruction | Device | Seed source reached |
+|---|---|---|---|
+| x86-64 | RDSEED | virtio-rng-pci | `Hwrng` |
+| ARM64 | RNDR | virtio-rng-device | `Hwrng` |
+| riscv64 | **none** (Zkr `seed` needs an M-mode `mseccfg` grant this firmware does not give) | virtio-rng-device | `Device` |
+
+RISC-V previously reached `Fallback` - a cycle-counter loop, which is not a
+source. `kernel/src/hw/virtio_rng.rs` closes it: the standard paravirtual
+randomness device, over the same two transports every other virtio driver here
+uses (virtio-mmio on arm/riscv `virt`, virtio-pci through the
+`VIRTIO_PCI_CAP_PCI_CFG` tunnel on x86-64 q35, so no BAR is needed). The fix is
+a driver, not a per-ISA workaround, which is what TARGET-ARCHITECTURES.md 4
+requires.
+
+### The boot health check
+
+`rng::health::check()` runs on **every** boot, right after the root is keyed.
+Three integrity tests, each a panic on failure because a broken generator must
+not reach a cell:
+
+1. **Known-answer test** - ChaCha20 against the RFC 8439 section 2.3.2 block.
+   Catches a miscompiled or mis-linked primitive, which is not hypothetical in
+   this tree (NETSTACK.md, the N3a AES miscompile).
+2. **Continuous test** - two consecutive live root outputs differ (FIPS 140-2
+   CRNGT).
+3. **Window test** - 64 words of live output pass the SP 800-90B checks.
+
+It also *reports* whether the pool is seeded and which source paid. That half
+is never asserted at boot: a machine may genuinely have no source, and saying
+so is the honest answer.
+
+The healthy path prints nothing. A line on every boot would say the same thing
+in all ~210 logs, and the failure path is a panic naming the test, which is
+louder than a log line.
+
+### Performance
+
+- The read path is unchanged: this core's root DRBG, no lock.
+- An interrupt handler calls `absorb_fast` - two atomic operations into **this
+  core's own** scratch words. No lock, no ChaCha20. The split exists so a
+  handler can never wait on a thread holding the pool lock.
+- The pool lock is taken from thread context only: on a `/dev/urandom` write,
+  and once every 1024 DRBG derivations when `pump` drains the scratch. Driving
+  reseed off the *consume* path rather than a timer costs an increment and a
+  compare on the hot path.
+
+### Proof
+
+`cargo xtask test --bin rng`, all three ISAs, with a randomness device attached
+to each launch. Six controls observed firing:
+
+| Claim | Control that breaks it |
+|---|---|
+| A chosen-input source cannot seed the pool (1 MiB of chosen bytes = 0 credited bits) | make `Source::User` creditable -> "user writes credited 256 bits" |
+| `seeded` is sticky, so credit can never un-seed a machine | drop the sticky write -> the exhaustion phase fails |
+| Uncredited input is still mixed | skip mixing when credit is zero -> "an uncredited write did not change the pool" |
+| Jitter never credits without passing its checks | delete the three checks -> "credited 17 bits with a run of 5 identical deltas" |
+| The boot KAT catches a broken ChaCha20 | flip one byte of the vector -> every boot panics |
+| The device is what seeds RISC-V | detach it -> `seed_source=Fallback seeded=false` |
+
+The fourth control earned its keep: its first two versions **passed**, because
+removing one check let the next one catch the same window, and then because the
+test asserted `distinct` but not `longest_run` when crediting. The assertion is
+tighter now for that reason.
+
+Honest remainders: the credited jitter figures above are emulated-machine
+numbers; `/dev/urandom` writes are proven at the kernel API (`rng::feed_user`)
+and through the fd path by inspection, not yet by a Linux fixture; there is no
+`RNDADDENTROPY` ioctl, so a program cannot credit its own writes (which is the
+right default); and nothing seals a seed across reboots, so a diskless node
+still depends on having a source at boot.
+
 ## 5. How it hangs together
 
 Authenticated time bounds make leases and capability TTLs safe; HLCs make the

@@ -38,7 +38,17 @@ pub fn init() {
     // than in `arch::init` (docs/RESOURCE-GRAPH.md). Additive: nothing reads it yet, so a
     // boot that ignores it behaves exactly as it did.
     crate::hw::graph_build::build(crate::hw::inventory());
+    // A randomness *device*, before the root DRBG is keyed, so its bytes are in
+    // the entropy pool when the key is drawn. Additive: a machine without one
+    // probes, finds nothing and continues (docs/TIME-IDENTITY.md 4a). It has to
+    // be after `hw::detect` because the PCI path needs the discovered ECAM base.
+    crate::hw::virtio_rng::init();
     crate::rng::init();
+    // Power-on self test for the generator itself (docs/TIME-IDENTITY.md 4a):
+    // the ChaCha20 known-answer vector, the FIPS 140-2 continuous test, and an
+    // SP 800-90B window over live output. Silent when healthy; a failure panics
+    // naming the test, because a broken generator must not reach a cell.
+    crate::rng::health::check();
     crate::svc::init();
     // Pre-fund every cell's recorded address-space layout, so the frames its table
     // needs are a boot cost rather than being charged to whichever operation happens to

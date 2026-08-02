@@ -241,16 +241,6 @@ struct Datagram {
     buf: [u8; DGRAM_MAX],
 }
 
-impl Datagram {
-    const fn new() -> Datagram {
-        Datagram {
-            src_port: 0,
-            len: 0,
-            buf: [0; DGRAM_MAX],
-        }
-    }
-}
-
 struct DgramEp {
     used: bool,
     refs: u16,
@@ -433,9 +423,7 @@ pub fn recv_dgram(ep: u8, out: &mut [u8]) -> Option<(u16, usize)> {
     if e.qlen == 0 {
         return None;
     }
-    let Some(d) = e.q.get(e.qhead) else {
-        return None;
-    };
+    let d = e.q.get(e.qhead)?;
     e.qhead = (e.qhead + 1) % DGRAM_QUEUE;
     e.qlen -= 1;
     let n = (d.len as usize).min(out.len());

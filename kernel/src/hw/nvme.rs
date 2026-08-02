@@ -593,6 +593,11 @@ impl Nvme {
                 fence(Ordering::SeqCst);
                 let cid = (cqe.status & 0xFFFF) as u16;
                 let status = (cqe.status >> 17) as u16;
+                // Which command the controller finished first, and when, is a
+                // real unpredictable quantity - QEMU's controller genuinely
+                // reorders, and real hardware more so. Mixed into the entropy
+                // pool, never counted (docs/TIME-IDENTITY.md 4a).
+                crate::rng::feed_interrupt(cid as u64, head as u64);
                 let slot = cid.wrapping_sub(base_cid);
                 if slot as usize >= n {
                     // A completion for a command this batch did not submit. Nothing

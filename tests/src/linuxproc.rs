@@ -521,7 +521,8 @@ extern "C" fn kernel_main() -> ! {
         close_range: closed the range and nothing beyond it\n\
         clone3: implemented (EINVAL on bad args); rseq: refused ENOSYS\n\
         capget: empty caps, version probe answered\n\
-        io_uring: refused ENOSYS deliberately\n";
+        io_uring: refused ENOSYS deliberately\n\
+        urandom: 64-byte write accepted, reads still vary\n";
     // The legacy `time` syscall exists only on x86-64 (asm-generic glibc uses
     // clock_gettime), so the clocks line differs per ISA, like `open`.
     let clocks_line: &[u8] = if cfg!(target_arch = "x86_64") {
@@ -529,7 +530,24 @@ extern "C" fn kernel_main() -> ! {
     } else {
         b"clocks: gettimeofday + clock_getres OK (no legacy time on this ABI)\n"
     };
+    // The `/dev/urandom` write is proven from *outside* the program: it writes
+    // 64 bytes, and the entropy pool must record exactly 64 more bytes from
+    // `Source::User` and exactly zero more credited bits (docs/TIME-IDENTITY.md
+    // 4a - a program's own bytes are mixed and never counted). The fixture
+    // cannot see these counters, so it cannot fake them.
+    let ent_before = kernel::rng::entropy::counters();
     let (code, out) = run_capture(SYSX, &[b"sysx"]);
+    let ent_after = kernel::rng::entropy::counters();
+    let ui = kernel::rng::entropy::Source::User.index();
+    assert!(
+        ent_after.bytes[ui] == ent_before.bytes[ui] + 64,
+        "urandom write: pool gained {} user bytes, expected 64",
+        ent_after.bytes[ui] - ent_before.bytes[ui]
+    );
+    assert!(
+        ent_after.credited[ui] == ent_before.credited[ui],
+        "a program's own /dev/urandom write was credited entropy"
+    );
     let matched = out.starts_with(open_line) && {
         let r1 = &out[open_line.len()..];
         r1.starts_with(want_rest) && {

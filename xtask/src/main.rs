@@ -178,6 +178,19 @@ fn qemu_device_listing(arch: Arch) -> String {
 
 fn fixed_qemu_args(arch: Arch, kernel: &str) -> &'static [&'static str] {
     match (kernel, arch) {
+        // rng (docs/TIME-IDENTITY.md 4a): a **randomness device**, so the entropy
+        // pool has a credited source that is not the CPU. It is what makes RISC-V
+        // seedable at all - its `seed` CSR needs an M-mode grant this firmware does
+        // not give - and it is attached on all three ISAs so the driver is proven
+        // everywhere rather than only where the CPU instruction is missing.
+        // Same two transports as every other virtio device here.
+        ("rng", Arch::Riscv64 | Arch::Aarch64) => &[
+            "-global",
+            "virtio-mmio.force-legacy=false",
+            "-device",
+            "virtio-rng-device",
+        ],
+        ("rng", Arch::X86_64) => &["-device", "virtio-rng-pci,disable-legacy=on"],
         ("blockfs", Arch::Riscv64 | Arch::Aarch64) => &[
             // Present the modern (version 2) virtio-mmio transport, which the
             // driver implements; QEMU defaults to the legacy version-1 layout.

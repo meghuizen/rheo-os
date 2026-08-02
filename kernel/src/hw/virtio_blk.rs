@@ -602,6 +602,9 @@ impl VirtioBlk {
                 core::hint::spin_loop();
             }
             *core::ptr::addr_of_mut!(LAST_USED) = (*vq).used.idx;
+            // How long a disk took to answer is a real, unpredictable quantity.
+            // Mixed into the entropy pool, never counted (docs/TIME-IDENTITY.md 4a).
+            crate::rng::feed_interrupt(spins, (*vq).used.idx as u64);
 
             if *core::ptr::addr_of!(STATUS_BYTE) == 0 {
                 Ok(())

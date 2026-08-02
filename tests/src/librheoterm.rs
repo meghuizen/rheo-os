@@ -178,6 +178,33 @@ extern "C" fn kernel_main() -> ! {
         println!("librheoterm: poll input path (no UART RX interrupt on this ISA)");
     }
 
+    // Device events feed the entropy pool (docs/TIME-IDENTITY.md 4a). Every byte
+    // that arrived above went through `input::rx_push`, which mixes the byte and
+    // the cycle count into **this core's** scratch words - two atomic operations,
+    // no lock, because a handler must never wait on a thread holding the pool.
+    //
+    // The scratch is drained into the pool by `pump`, so pumping is what makes
+    // the contribution visible. Asserted rather than assumed: writing the hook
+    // and never checking it is how a wire ends up disconnected.
+    let before = kernel::rng::entropy::counters();
+    kernel::rng::entropy::pump();
+    let after = kernel::rng::entropy::counters();
+    let src = kernel::rng::entropy::Source::Interrupt.index();
+    assert!(
+        after.drains > before.drains,
+        "console bytes arrived but no core had interrupt scratch to drain"
+    );
+    assert!(
+        after.bytes[src] > before.bytes[src],
+        "the scratch drained but nothing reached the pool"
+    );
+    println!(
+        "librheoterm: {} console bytes fed the entropy pool ({} bytes mixed, {} drain(s), 0 bits credited - timing is real but unmeasured)",
+        SCRIPT.len(),
+        after.bytes[src],
+        after.drains
+    );
+
     println!("librheoterm: PASS");
     arch::exit(arch::ExitCode::Success)
 }

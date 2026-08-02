@@ -740,7 +740,6 @@ pub const MAX_CELLS: usize = 16;
 /// cleanly by `Funded::reserve` and `fund_fp` (docs/MEMORY.md 7, no OOM killer). The one
 /// remaining per-context *resource* limit is the queue-ring VA window, which is a real
 /// resource and says so where it lives (`load::MAX_QUEUE_VCORES`).
-
 static mut CELLS: [RunCell; MAX_CELLS] = [EMPTY; MAX_CELLS];
 
 /// The cell each CPU is currently running, the cell each entered `run` with, and the

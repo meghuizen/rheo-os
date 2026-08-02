@@ -428,6 +428,11 @@ pub fn on_irq() {
     unsafe {
         *addr_of_mut!(IRQS) = (*addr_of!(IRQS)).wrapping_add(1);
     }
+    // When a frame arrived is a real, unpredictable quantity. Mixed into the
+    // entropy pool, never counted (docs/TIME-IDENTITY.md 4a). Two atomic
+    // operations - a handler must never wait for the pool lock.
+    // SAFETY: reading the counter we just wrote, on this CPU.
+    crate::rng::feed_interrupt(unsafe { *addr_of!(IRQS) }, 0);
     note_activity();
 }
 

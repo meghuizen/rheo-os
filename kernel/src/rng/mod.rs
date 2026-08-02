@@ -20,6 +20,9 @@
 //!   shared pool, no cross-cell side channel, no syscall on the fast path.
 
 pub mod chacha;
+pub mod entropy;
+pub mod health;
+pub mod jitter;
 
 use crate::arch;
 
@@ -158,8 +161,18 @@ fn splitmix(seed: u64) -> u64 {
 /// the boot attestation story - a host must be able to say what seeded it).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum SeedSource {
-    /// Seeded from the hardware RNG, health tests passed.
+    /// Seeded from the CPU's hardware RNG instruction, health tests passed.
     Hwrng,
+    /// Seeded from a hardware RNG **device** (virtio-rng, a TRNG chip) through
+    /// the entropy pool. Distinct from [`SeedSource::Hwrng`] so a boot report
+    /// says which one actually paid for the seed - on RISC-V there is no CPU
+    /// instruction available to S-mode, so a device is the only real source.
+    Device,
+    /// Seeded from the software-only CPU execution-time jitter source, which
+    /// passed its own health tests. The fallback for a machine with no
+    /// randomness hardware at all - and a real source, not the old floor,
+    /// because it is only counted when the timing variation is measured.
+    Jitter,
     /// Hardware RNG present but failed health/liveness - fell back.
     HwrngRejected,
     /// No usable hardware RNG; documented weak floor.
@@ -208,17 +221,41 @@ unsafe fn root() -> &'static mut Drbg {
 
 /// Seed **this CPU's** root DRBG. Called once during boot on the primary, before
 /// any cell runs.
+///
+/// Everything goes through the entropy pool now: the boot floor is mixed in
+/// uncredited, the CPU's hardware RNG is health-tested and mixed in credited,
+/// and the root is keyed from whatever the pool then holds. The reported
+/// [`SeedSource`] is decided by whether the pool had *credited* entropy - so a
+/// machine with no real source still gets a keyed root, and still says so.
 pub fn init() {
-    let mut key = [0u8; 32];
-    let src = gather_seed(&mut key);
+    // The cycle-counter floor. Always mixed (it can only help), never counted:
+    // under QEMU `-icount` it is deterministic, so counting it would let an
+    // emulated boot claim it was properly seeded.
+    let mut floor = [0u8; 32];
+    fallback_key(&mut floor);
+    entropy::absorb(entropy::Source::Boot, &floor, 0);
+    zero(&mut floor);
+
+    // Every source that can be asked, in order: the CPU instruction, a
+    // randomness device, and - only if those left the pool short - the software
+    // jitter source. A machine with none of them stays uncredited and says so.
+    let fed = feed_cpu_hwrng();
+    entropy::replenish();
+
+    let (mut key, credited) = entropy::take_seed();
+    let src = if credited {
+        credited_source().unwrap_or(SeedSource::Hwrng)
+    } else if fed == Feed::Rejected {
+        SeedSource::HwrngRejected
+    } else {
+        SeedSource::Fallback
+    };
     // SAFETY: short setup on this CPU's own state.
     unsafe {
         *root() = Drbg::from_key(key);
         *SOURCES.this_mut() = src;
     }
-    for b in key.iter_mut() {
-        unsafe { core::ptr::write_volatile(b, 0) };
-    }
+    zero(&mut key);
 }
 
 /// Seed a **secondary** CPU's root, called on that CPU as it comes up.
@@ -226,9 +263,9 @@ pub fn init() {
 /// Keys from `parent` (an already-seeded root, normally the boot CPU's) by
 /// derivation rather than by copy - fast key erasure means the derived key does
 /// not reveal the parent's state and, critically, the parent's own state advances,
-/// so no two cores can be handed the same key. Then folds in this core's own
-/// hardware entropy if it passes the health tests, which is why the reported
-/// [`SeedSource`] is per-core.
+/// so no two cores can be handed the same key. Then folds in whatever the pool
+/// can offer this core - its own hardware RNG reading, plus anything a device
+/// has contributed since - which is why the reported [`SeedSource`] is per-core.
 ///
 /// Returns the seed source recorded for this CPU.
 pub fn init_secondary(parent: &mut Drbg) -> SeedSource {
@@ -237,23 +274,13 @@ pub fn init_secondary(parent: &mut Drbg) -> SeedSource {
     unsafe {
         *root() = derived;
     }
-    let mut pool = [0u64; 8];
-    let got = gather_hwrng(&mut pool);
-    let src = if got >= 4 && health_ok(&pool[..got]) {
-        let mut chunk = [0u8; 32];
-        fold(&pool[..got], &mut chunk);
-        // SAFETY: as above.
-        unsafe {
-            root().reseed(&chunk);
-        }
-        for b in chunk.iter_mut() {
-            unsafe { core::ptr::write_volatile(b, 0) };
-        }
-        SeedSource::Hwrng
-    } else if got > 0 {
+    let fed = feed_cpu_hwrng();
+    let src = if entropy::pump() {
+        credited_source().unwrap_or(SeedSource::Hwrng)
+    } else if fed == Feed::Rejected {
         SeedSource::HwrngRejected
     } else {
-        // No hardware entropy of its own, but the derived key is genuinely
+        // No credited entropy of its own, but the derived key is genuinely
         // independent of every other core's, so this is not the documented weak
         // floor - it is inherited strength. Reported as such.
         SeedSource::Fallback
@@ -263,6 +290,15 @@ pub fn init_secondary(parent: &mut Drbg) -> SeedSource {
         *SOURCES.this_mut() = src;
     }
     src
+}
+
+/// Re-key **this CPU's** root from a 256-bit pool extract. The one place the
+/// entropy pool is allowed to touch a root DRBG.
+pub(crate) fn reseed_this_root(seed: &[u8; 32]) {
+    // SAFETY: short use of this CPU's own root.
+    unsafe {
+        root().reseed(seed);
+    }
 }
 
 /// Take a derived DRBG from this CPU's root, for seeding another core (see
@@ -295,26 +331,138 @@ pub unsafe fn seed_source_of(cpu: usize) -> SeedSource {
 /// userspace DRBG, which is what `MADV_WIPEONFORK` exists to handle
 /// (docs/SUBSTRATE.md 10a).
 pub fn derive_cell_drbg() -> Drbg {
+    maybe_pump();
     // SAFETY: short use of this CPU's own root.
     unsafe { root().derive() }
 }
 
-/// Pull fresh entropy from the hardware RNG (if any) and fold it into **this
-/// CPU's** root. Continuous reseeding; safe to call periodically. Returns true if
-/// hardware entropy was actually mixed in.
+/// How many derivations a core makes before it drains its interrupt scratch
+/// into the pool and re-keys if the pool is full.
+const PUMP_EVERY: u32 = 1024;
+
+/// Per-core countdown to the next [`entropy::pump`]. Plain, not atomic: a core
+/// only ever touches its own slot, and the worst a lost update could do is
+/// delay a reseed.
+static PUMP_TICK: crate::smp::PerCpu<u32> = crate::smp::PerCpu::new(0);
+
+/// Drive continuous reseeding off the *consume* path rather than a timer.
+///
+/// Entropy that a device interrupt put in this core's scratch has to reach the
+/// pool somehow, and the natural moment is when randomness is actually being
+/// used. The cost on the hot path is an increment and a compare; the pool lock
+/// is touched once every [`PUMP_EVERY`] derivations, not per byte.
+#[inline]
+fn maybe_pump() {
+    // SAFETY: this CPU's own slot, read and written in one straight line.
+    let tick = unsafe { PUMP_TICK.this_mut() };
+    *tick += 1;
+    if *tick >= PUMP_EVERY {
+        *tick = 0;
+        entropy::pump();
+    }
+}
+
+/// Pull fresh entropy from every source that has any - the CPU's hardware RNG
+/// plus this core's accumulated device-interrupt scratch - and re-key **this
+/// CPU's** root if that adds up to a full seed. Safe to call periodically.
+/// Returns true if the root was actually re-keyed.
 pub fn reseed_root() -> bool {
-    let mut pool = [0u64; 8];
-    let got = gather_hwrng(&mut pool);
-    if got >= 4 && health_ok(&pool[..got]) {
-        let mut chunk = [0u8; 32];
-        fold(&pool[..got], &mut chunk);
-        // SAFETY: short use of this CPU's own root.
-        unsafe {
-            root().reseed(&chunk);
-        }
-        true
+    feed_cpu_hwrng();
+    entropy::pump()
+}
+
+/// Feed a hardware RNG **device** (virtio-rng, a TRNG or TPM chip) into the
+/// pool. The driver supplies bytes it read from the device; they are credited
+/// in full, the same trust the CPU instruction gets, because a device whose
+/// whole purpose is randomness is not a guess about a side effect.
+///
+/// This is the entry point that lets an ISA with no usable CPU instruction -
+/// RISC-V, whose `seed` CSR needs an M-mode grant - be properly seeded.
+pub fn feed_device(bytes: &[u8]) {
+    entropy::absorb(
+        entropy::Source::Device,
+        bytes,
+        (bytes.len() as u32).saturating_mul(8),
+    );
+}
+
+/// Feed the timing of a device event into this core's scratch, from an
+/// interrupt handler. Two atomic operations; no lock, no ChaCha20. Never
+/// credited - see the table in [`entropy`].
+#[inline]
+pub fn feed_interrupt(a: u64, b: u64) {
+    entropy::absorb_fast(a, b);
+}
+
+/// Feed bytes a program wrote to `/dev/urandom`. Mixed, never credited -
+/// exactly Linux's rule, and for the same reason: the kernel cannot tell
+/// whether a program wrote real entropy or a constant.
+pub fn feed_user(bytes: &[u8]) {
+    let n = core::cmp::min(bytes.len(), entropy::MAX_USER_ABSORB);
+    entropy::absorb(entropy::Source::User, &bytes[..n], 0);
+}
+
+/// What a read of the CPU's hardware RNG produced.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Feed {
+    /// No hardware RNG on this ISA, or it returned nothing.
+    Absent,
+    /// Read and health-tested; mixed in and counted.
+    Credited,
+    /// Read but failed the health tests; mixed in **uncredited**. Mixing a
+    /// suspect source can only help; counting it could let a stuck source
+    /// declare the pool ready, which is the one thing that must not happen.
+    Rejected,
+}
+
+/// Bits credited per health-tested 64-bit hardware word. A hardware RNG that
+/// passes its health tests is treated as full entropy, the same default Linux
+/// uses (`random.trust_cpu=1`).
+const BITS_PER_HW_WORD: u32 = 64;
+
+/// Read this CPU's hardware RNG and feed it to the pool.
+fn feed_cpu_hwrng() -> Feed {
+    let mut words = [0u64; 8];
+    let got = gather_hwrng(&mut words);
+    if got == 0 {
+        return Feed::Absent;
+    }
+    let mut bytes = [0u8; 64];
+    for i in 0..got {
+        bytes[i * 8..i * 8 + 8].copy_from_slice(&words[i].to_le_bytes());
+    }
+    let ok = got >= 4 && health_ok(&words[..got]);
+    let credit = if ok { got as u32 * BITS_PER_HW_WORD } else { 0 };
+    entropy::absorb(entropy::Source::Cpu, &bytes[..got * 8], credit);
+    zero(&mut bytes);
+    for w in words.iter_mut() {
+        // SAFETY: plain write through a valid reference, volatile so it stays.
+        unsafe { core::ptr::write_volatile(w, 0) };
+    }
+    if ok { Feed::Credited } else { Feed::Rejected }
+}
+
+/// Which credited source the pool has been paid by, if any. Cumulative over the
+/// boot: it answers "has a real source ever contributed", which is exactly the
+/// question a seed-source report is asking.
+fn credited_source() -> Option<SeedSource> {
+    let c = entropy::counters();
+    if c.credited[entropy::Source::Cpu.index()] > 0 {
+        Some(SeedSource::Hwrng)
+    } else if c.credited[entropy::Source::Device.index()] > 0 {
+        Some(SeedSource::Device)
+    } else if c.credited[entropy::Source::Jitter.index()] > 0 {
+        Some(SeedSource::Jitter)
     } else {
-        false
+        None
+    }
+}
+
+/// Overwrite a buffer, in a way the compiler may not remove.
+fn zero(b: &mut [u8]) {
+    for x in b.iter_mut() {
+        // SAFETY: plain write through a valid reference, volatile so it stays.
+        unsafe { core::ptr::write_volatile(x, 0) };
     }
 }
 
@@ -334,23 +482,6 @@ fn gather_hwrng(pool: &mut [u64]) -> usize {
         }
     }
     got
-}
-
-/// Build a 256-bit seed key. Prefers the hardware RNG; validates it with
-/// SP 800-90B style health tests before trusting it.
-fn gather_seed(key: &mut [u8; 32]) -> SeedSource {
-    if arch::has_hwrng() {
-        let mut pool = [0u64; 64];
-        let got = gather_hwrng(&mut pool);
-        if got >= 32 && health_ok(&pool[..got]) {
-            fold(&pool[..got], key);
-            return SeedSource::Hwrng;
-        }
-        fallback_key(key);
-        return SeedSource::HwrngRejected;
-    }
-    fallback_key(key);
-    SeedSource::Fallback
 }
 
 /// SP 800-90B style health checks on full-entropy 64-bit words: Repetition
@@ -391,33 +522,6 @@ fn health_ok(s: &[u64]) -> bool {
         andv &= v;
     }
     orv != 0 && andv != u64::MAX
-}
-
-/// Absorb `pool` entropy into a 256-bit key by ChaCha20 diffusion: seed a
-/// working DRBG from the first words, then reseed it with the rest so every
-/// sample influences the output, and squeeze out 32 bytes.
-fn fold(pool: &[u64], key: &mut [u8; 32]) {
-    let mut k = [0u8; 32];
-    let mut i = 0;
-    while i < 4 {
-        let v = pool[i % pool.len()];
-        k[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
-        i += 1;
-    }
-    let mut d = Drbg::from_key(k);
-    let mut idx = 0;
-    while idx < pool.len() {
-        let mut chunk = [0u8; 32];
-        let mut j = 0;
-        while j < 4 {
-            let v = pool[(idx + j) % pool.len()];
-            chunk[j * 8..j * 8 + 8].copy_from_slice(&v.to_le_bytes());
-            j += 1;
-        }
-        d.reseed(&chunk);
-        idx += 4;
-    }
-    d.fill_bytes(key);
 }
 
 /// Last-resort seed with no hardware RNG. Mixes the cycle counter through a

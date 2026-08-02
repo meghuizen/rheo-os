@@ -73,9 +73,7 @@ ring 3), isolation MMU-enforced, with a cross-cell directed switch.
 The full single-host **kernel object model** is implemented: memory grants
 (typed, commit/decommit/seal), a monotonic clock + interval wall clock +
 **cryptographic per-cell entropy** (a ChaCha20 DRBG with fast key erasure,
-seeded from the hardware RNG - RDSEED/RDRAND on x86-64, RNDR on ARM64 -
-after SP 800-90B health tests, non-blocking, falling back to a documented
-floor where no hwrng exists; the design's "library call over the cell's own
+non-blocking; the design's "library call over the cell's own
 DRBG state, not a syscall" path is proven at the primitive level in the host
 comparison, while the lsh `rand` builtin currently draws via `SYS_RANDOM` -
 linking the full DRBG into a U-mode cell awaits the runtime's `.user` heap +
@@ -89,6 +87,59 @@ objects (`uptime`, `rand`, `meminfo`, `caps`, `ps`, `event`, `graph`,
 `reserve`, `lease`) and the machine inventory (`cpuinfo`, `lspci`, `numa`);
 a pipeline is a dependency graph submitted to the kernel (docs/SHELL.md).
 Run it: `cargo xtask run --bin lsh --arch <isa>`.
+
+**The DRBG is fed by a multi-source entropy pool, and every ISA is now really
+seeded** (docs/TIME-IDENTITY.md 4a, `kernel/src/rng/`). Seeding used to read the
+CPU's hardware RNG and nothing else, which is fine on x86-64 (RDSEED) and ARM64
+(RNDR) and gives **nothing** on RISC-V, whose Zkr `seed` CSR needs an M-mode
+`mseccfg` grant this firmware does not give - so that ISA reported
+`root_seed_source=Fallback`, a cycle-counter loop that is deterministic under
+QEMU and therefore not a source at all. The output algorithm is **unchanged**
+(ChaCha20 fast key erasure - it is what makes a read cheap) and the read path
+still touches only the calling core's own root with no lock; what is new is
+everything upstream of it. **`rng::entropy`** is a 256-bit ChaCha20 pool whose
+absorb step is `K' = ChaCha20_block(K, seq++)[0..32] XOR C`, which **cannot
+reduce entropy in either direction** - an attacker who chose `C` but does not
+know `K` cannot predict the first term, and an attacker who knows `K` gets a
+pool that *recovers* to whatever `C` carries. Every source is **mixed**; only
+some are **counted**, because this kernel has no entropy estimator and inventing
+one would let a predictable source declare the pool ready: a CPU instruction and
+a randomness device credit in full after their health tests, the jitter source
+credits at most 1 bit per sample and **only when its own tests pass**, and NIC /
+NVMe / disk / UART event timings, `/dev/urandom` writes and the boot cycle
+counter credit **zero**. **`kernel/src/hw/virtio_rng.rs`** is a new virtio-rng
+driver over the same two transports every other virtio driver here uses, so
+riscv64 now reports `seed_source=Device` - the fix is a driver, not a per-ISA
+workaround. **`rng::jitter`** is the software-only fallback for a machine with
+no randomness hardware at all (a data-dependent scratch walk timed 256 times,
+the `jitterentropy`/`haveged` idea) and it is measured before it is counted:
+aarch64 refuses here with "deltas repeat", x86-64 credits 42 bits and riscv64
+20, all far below the 256-bit target, which is the honest answer on a machine
+whose cycle counter is deterministic. **The pool cannot run out**: extraction
+re-keys the state rather than consuming it, so a read always succeeds (there is
+no blocking `/dev/random` and no need for one), `seeded` is **sticky** so
+draining the credit counter can never un-seed a machine, and `replenish` tops
+the pool up from every askable source whenever credit falls below half a seed
+(jitter gated on *not yet seeded*, since its job is a first seed, not
+steady-state supply). **`/dev/urandom` writes now do something** - they used to
+be discarded while returning success, the stub-reporting-success shape
+docs/ENGINEERING.md 7 rejects. And **`rng::health::check()` runs on every boot**:
+the ChaCha20 RFC 8439 known-answer test, the FIPS 140-2 continuous test, and an
+SP 800-90B window over live output, each a panic on failure because a broken
+generator must not reach a cell - silent when healthy, since a line in all ~210
+logs saying the same thing is noise. Performance is unchanged where it matters:
+an interrupt handler calls `absorb_fast`, two atomic operations into **this
+core's own** scratch (no lock, so a handler can never wait on a thread holding
+the pool lock), and the pool is drained once every 1024 DRBG derivations off the
+*consume* path rather than by a timer. Proven by `rng` on all three ISAs with a
+randomness device attached, by `librheoterm` (24 console bytes reach the pool on
+all three ISAs) and by `linuxproc`'s `sysx` (an unmodified static-glibc binary
+writes 64 bytes to `/dev/urandom` and the kernel asserts exactly 64 more mixed
+bytes and exactly zero more credited bits - a number the program cannot see and
+so cannot fake); eight controls observed firing, one of which earned its keep
+twice, since its first two versions passed - removing one jitter check let the
+next one catch the same window, and the test asserted `distinct` but not
+`longest_run` when crediting.
 
 A **hardware-discovery** layer (`kernel/src/hw/`) builds one portable
 machine `Inventory` at boot: firmware source (ACPI on x86-64 via the PVH
@@ -3036,15 +3087,17 @@ kernel/       the no_std kernel library + boot demo bin
               itself), capability core, queue ABI, cells, mm
               (frames + frames_pmem real-nvdimm allocator + grants; frames carries a
               per-frame refcount so `fork` is copy-on-write - `free` is a decrement,
-              `share`/`refs` the COW primitives), uaccess (**the one seam kernel code
+              `share`/`refs` the COW primitives - **and** the per-NUMA-node frame
+              ranges `alloc_on` places against, docs/SUBSTRATE.md pillar 6), uaccess (**the one seam kernel code
               touches a cell's memory through**: bounds + presence + copy-on-write
               resolution, so every lazy-mapping feature is one change here rather than a
               ~98-site audit - docs/LINUX-COMPAT.md), time (clock), rng (ChaCha20 DRBG +
-              hwrng seeding), event streams,
-              (frames carries the per-frame refcount COW needs **and** the
-              per-NUMA-node frame ranges `alloc_on` places against -
-              docs/SUBSTRATE.md pillar 6), time (clock), rng (ChaCha20 DRBG +
-              hwrng seeding), event streams,
+              **the multi-source entropy pool**: rng/entropy.rs mixes CPU/device/
+              jitter/interrupt/user sources with an absorb that cannot reduce
+              entropy and a credit rule that only counts what it can measure,
+              rng/jitter.rs is the software-only source, rng/health.rs the
+              every-boot power-on self test - docs/TIME-IDENTITY.md 4a),
+              event streams,
               sched (reservations + the **system-wide admission ledger**:
               a reservation must fit its cell AND the machine -
               docs/ARCHITECTURE-DEBT.md 2.5; plus bore/vcore - the BORE burst
@@ -3078,7 +3131,8 @@ kernel/       the no_std kernel library + boot demo bin
               into the same slot later - docs/NETSTACK.md 18,
               docs/ARCHITECTURE-DEBT.md 3.2), hw (ACPI/FDT/PCIe
               discovery + the machine Inventory; block BlockDevice trait +
-              virtio_blk + **nvme** drivers; virtio_net raw-frame NIC driver -
+              virtio_blk + **nvme** drivers; virtio_rng randomness
+              device driver (docs/TIME-IDENTITY.md 4a); virtio_net raw-frame NIC driver -
               docs/NETWORKING.md; virtio_gpu 2D display driver -
               docs/DISPLAY.md), elf + load (ELF loader for native
               programs), user run loop (with per-cell syscall

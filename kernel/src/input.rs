@@ -147,6 +147,10 @@ pub fn scripted() -> bool {
 /// Push a received byte into the RX ring - the UART RX interrupt handler's sink
 /// (and the poll path's). Portable so per-ISA trap code never names the ring.
 pub fn rx_push(b: u8) {
+    // Which byte arrived and when are both unpredictable when a human is
+    // typing. Mixed into the entropy pool, never counted
+    // (docs/TIME-IDENTITY.md 4a).
+    crate::rng::feed_interrupt(b as u64, 0);
     ring().push(b);
 }
 

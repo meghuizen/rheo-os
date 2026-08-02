@@ -29,6 +29,7 @@ pub mod smmuv3;
 pub mod virtio_blk;
 pub mod virtio_gpu;
 pub mod virtio_net;
+pub mod virtio_rng;
 
 use crate::arch;
 

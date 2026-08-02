@@ -283,6 +283,42 @@ int main(void) {
   }
   puts("io_uring: refused ENOSYS deliberately");
 
+  /* 9a. Writing to /dev/urandom seeds the kernel entropy pool
+   *     (docs/TIME-IDENTITY.md 4a). It used to be discarded while returning
+   *     success - the stub-reporting-success shape docs/ENGINEERING.md 7
+   *     rejects. From in here all that can be checked is that the write is
+   *     accepted and the device still reads; that the bytes reached the pool is
+   *     asserted kernel-side by the counters, which this program cannot see and
+   *     therefore cannot fake. Exactly URANDOM_WRITE bytes, because the kernel
+   *     side asserts that number. */
+  {
+    unsigned char seed[64];
+    for (unsigned i = 0; i < sizeof seed; i++) {
+      seed[i] = (unsigned char)(0x5a ^ i);
+    }
+    int uf = open("/dev/urandom", O_RDWR);
+    if (uf < 0) {
+      puts("urandom: open failed");
+      return 1;
+    }
+    if (write(uf, seed, sizeof seed) != (ssize_t)sizeof seed) {
+      puts("urandom: write not accepted");
+      return 1;
+    }
+    unsigned char a[16], b[16];
+    if (read(uf, a, sizeof a) != (ssize_t)sizeof a ||
+        read(uf, b, sizeof b) != (ssize_t)sizeof b) {
+      puts("urandom: read failed");
+      return 1;
+    }
+    if (memcmp(a, b, sizeof a) == 0) {
+      puts("urandom: two reads returned the same bytes");
+      return 1;
+    }
+    close(uf);
+    puts("urandom: 64-byte write accepted, reads still vary");
+  }
+
   /* 10. The legacy clock reads the real `node` binary calls at startup (V8 +
    *     libuv): gettimeofday, clock_getres, and (x86-64 only) time. libuv's
    *     uv_gettimeofday *asserts* gettimeofday returns 0, so a stub that refused
