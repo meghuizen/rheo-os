@@ -382,6 +382,12 @@ fn set_parked(cell: usize, idx: usize, wake: u32) {
 fn detach_entity(cell: usize, idx: usize) {
     let e = threads(cell)[idx].entity;
     threads(cell)[idx].entity = 0;
+    // Context 0's entity is the **cell's** vcore 0, adopted in `init_cell` and released by
+    // `user::free_cell`. Clearing the field is this side's whole job; releasing it here as
+    // well would be two owners of one release, which is how a double free gets written.
+    if idx == 0 {
+        return;
+    }
     if e != 0 {
         // SAFETY: the core retiring this context; no core is inside it.
         let t = unsafe { crate::sched::entity::table() };
@@ -492,8 +498,23 @@ pub fn init_cell(cell: usize) {
     let t = threads(cell);
     t.for_each_mut(|th| *th = Thread::new());
     t[0].frame = f0;
-    // Context 0's entity, allocated with the cell (E3).
-    attach_entity(cell, 0);
+    // **Context 0 adopts the cell's vcore-0 entity rather than allocating a second one.**
+    //
+    // It used to allocate, and that was a genuine "two names for one thing": context 0's
+    // frame is `user::cell_frame(cell)` - the line above - so the cell's vcore 0 and this
+    // context are *the same execution context*, and it held two entities. Invisible while
+    // native ids were derived and Linux ids allocated above them, because the two lived in
+    // different ranges; visible the moment there was one allocator
+    // (docs/EXECUTION-MODEL.md 9.4).
+    //
+    // It cost an entity and an FP frame per Linux cell, and it cost something worse: the
+    // native entity is created `Runnable` and nothing ever parks it, so
+    // `EntityTable::all_parked(cell)` - "every live context of this cell is parked", which
+    // is what a cell-level blocked state means - could never be true for a Linux cell.
+    //
+    // Adopted, not owned: `user::free_cell` releases vcore 0's entity, so `detach_entity`
+    // below clears this field without releasing. One creator, one releaser.
+    t[0].entity = user::entity_of(cell, 0) as u32;
     t[0].tid = 1000; // main thread tid == tgid (getpid)
     set_cur_thread(cell, 0);
     // SAFETY: single CPU.
@@ -535,9 +556,31 @@ pub fn release_cell(cell: usize) {
 /// and "which of these entities are Linux contexts" stopped being answerable by
 /// arithmetic (docs/EXECUTION-MODEL.md 9.4).
 pub fn live_entities() -> usize {
+    count_entities(0)
+}
+
+/// Context 0's entity id for `cell`, for a proof that it is the cell's own vcore 0 rather
+/// than a second name for the same execution context.
+pub fn context0_entity(cell: usize) -> usize {
+    if capacity(cell) == 0 {
+        return 0;
+    }
+    threads(cell)[0].entity as usize
+}
+
+/// How many of those entities this side **owns** - contexts 1 and up.
+///
+/// Context 0 adopts the cell's vcore-0 entity (see [`init_cell`]), so it is counted by
+/// [`live_entities`] but released by `user::free_cell`. A proof about what the *thread*
+/// teardown hands back has to ask for this number, not that one.
+pub fn owned_entities() -> usize {
+    count_entities(1)
+}
+
+fn count_entities(from: usize) -> usize {
     (0..MAX_CELLS)
         .map(|cell| {
-            (0..capacity(cell))
+            (from..capacity(cell))
                 .filter(|&i| threads(cell)[i].entity != 0)
                 .count()
         })
@@ -598,6 +641,20 @@ pub(crate) fn set_current_pblock(cell: usize, b: Block) {
     let ci = cur_thread(cell);
     threads(cell)[ci].pblock = b;
     set_parked(cell, ci, WAKE_PBLOCK);
+}
+
+/// Whether **any** context of `cell` is `Ready` on the entity table.
+///
+/// The half of "this cell can run" the entity table owns. `proc.rs` adds the other half -
+/// a parked context whose condition is now satisfiable - and between them they replace the
+/// cached `PState::Blocked` bit (docs/EXECUTION-MODEL.md 9.5).
+///
+/// A scan of **this cell's** contexts, not of the entity table: `EntityTable::all_parked`
+/// answers the same question but walks every entity in the machine, which is the wrong cost
+/// for a predicate a pick evaluates per candidate cell.
+pub(crate) fn any_ready(cell: usize) -> bool {
+    let t = threads(cell);
+    (0..capacity(cell)).any(|i| tstate_of(t[i].entity) == TState::Ready)
 }
 
 /// A `Ready` sibling context to run instead of parking the whole cell (round-robin

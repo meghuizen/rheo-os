@@ -127,13 +127,21 @@ fn pollset(cell: usize) -> &'static mut [PollReq; POLL_MAX] {
     unsafe { &mut (*addr_of_mut!(POLLSET))[cell] }
 }
 
+/// A process's **lifecycle**, which is all this side still decides
+/// (docs/EXECUTION-MODEL.md 9.5).
+///
+/// `Runnable` and `Blocked` used to be two more variants here, and they were a cached
+/// summary of the contexts' states maintained by a wake scan on every reschedule. That is
+/// the E-stage defect shape exactly - a second place holding a fact the entity table
+/// already holds - and a stale cache here is either a hang (the cell is never picked) or a
+/// spin (it is picked with nothing able to proceed). Runnability is **derived** now, by
+/// [`runnable`]; what is left is the part no entity can answer: whether this slot holds a
+/// process at all, and whether it has exited and is waiting to be reaped.
 #[derive(Copy, Clone, PartialEq)]
 enum PState {
     Free,
-    /// Runnable (running now, or waiting for its turn).
-    Runnable,
-    /// Parked (see `Block`).
-    Blocked,
+    /// Holds a live process. Whether it can *run* is [`runnable`]'s question.
+    Live,
     /// Exited, awaiting `wait4` by the parent (holds the encoded status).
     Zombie,
 }
@@ -196,7 +204,7 @@ pub fn reset() {
 /// `linux::install_cell`): pid 1000, no parent, runnable.
 pub fn init_top(cell: usize) {
     procs()[cell] = Proc {
-        state: PState::Runnable,
+        state: PState::Live,
         parent: -1,
         pid: 1000,
         wstatus: 0,
@@ -224,7 +232,7 @@ pub fn ppid(cell: usize) -> u32 {
 pub fn cell_of_pid(pid: u32) -> Option<usize> {
     (0..MAX_CELLS).find(|&i| {
         let p = &procs()[i];
-        p.pid == pid && matches!(p.state, PState::Runnable | PState::Blocked)
+        p.pid == pid && p.state == PState::Live
     })
 }
 
@@ -244,7 +252,7 @@ pub fn for_each_live(skip_top: bool, mut f: impl FnMut(usize)) {
         if skip_top && i == user::top_cell() {
             continue;
         }
-        if matches!(procs()[i].state, PState::Runnable | PState::Blocked) {
+        if procs()[i].state == PState::Live {
             f(i);
         }
     }
@@ -401,7 +409,7 @@ pub fn fork(cur: usize, parent_frame: *mut TrapFrame) -> i64 {
     apply_fork_advice(cur, child);
 
     procs()[child] = Proc {
-        state: PState::Runnable,
+        state: PState::Live,
         parent: cur as i32,
         pid: child_pid,
         wstatus: 0,
@@ -693,12 +701,8 @@ fn process_exit(cell: usize, status: u32, top_code: u64) -> Ctl {
 /// both ends), the caller returns -EAGAIN instead of blocking, matching the L3
 /// non-blocking pipe (docs/LINUX-COMPAT.md L6).
 pub fn runnable_peer_exists(cur: usize) -> bool {
-    (0..MAX_CELLS).any(|i| {
-        i != cur
-            && user::cell_present(i)
-            && user::cell_on_this_cpu(i)
-            && procs()[i].state == PState::Runnable
-    })
+    (0..MAX_CELLS)
+        .any(|i| i != cur && user::cell_present(i) && user::cell_on_this_cpu(i) && runnable(i))
 }
 
 /// Park `cur` on an empty pipe read; the scheduler completes the read (with
@@ -784,17 +788,12 @@ pub(crate) fn preempt_cell(cur: usize) -> Option<*mut TrapFrame> {
     // preemption lands at an arbitrary instruction inside the cell's own vector code
     // (`user::on_user_interrupt` carries the argument).
     thread::save_current_fp(cur);
-    for i in 0..MAX_CELLS {
-        if procs()[i].state == PState::Blocked && satisfiable(i) {
-            procs()[i].state = PState::Runnable;
-        }
-    }
     let n = crate::sched::dispatch::pick_excluding_self(cur, MAX_CELLS, |i| {
         // A cell belongs to one core (docs/SMP.md 10.0): without this the core that
         // finishes first can switch *into* the cell another core is running, sharing
         // its trap frame and kernel stack. Constant-true on every single-core boot,
         // because nothing there claims a cell.
-        user::cell_present(i) && user::cell_on_this_cpu(i) && procs()[i].state == PState::Runnable
+        user::cell_present(i) && user::cell_on_this_cpu(i) && runnable(i)
     })?;
     let idx = first_satisfiable_context(n).unwrap_or_else(|| thread::current_context(n));
     thread::set_current(n, idx);
@@ -817,21 +816,12 @@ fn reschedule(leaving: usize) -> Ctl {
     crate::sched::dispatch::relinquish();
 
     loop {
-        // Wake blocked cells whose condition now holds.
-        for i in 0..MAX_CELLS {
-            if procs()[i].state == PState::Blocked && satisfiable(i) {
-                procs()[i].state = PState::Runnable;
-            }
-        }
-
         // The **order** comes from the EEVDF+BORE ready queue when it is enabled;
         // the predicate below remains the sole authority on *whether* a cell may
         // run. With dispatch disabled this is the pre-migration round-robin,
         // expression for expression (docs/SUBSTRATE.md 15).
         let next = crate::sched::dispatch::pick(leaving, MAX_CELLS, |i| {
-            user::cell_present(i)
-                && user::cell_on_this_cpu(i)
-                && procs()[i].state == PState::Runnable
+            user::cell_present(i) && user::cell_on_this_cpu(i) && runnable(i)
         });
         if let Some(n) = next {
             // Resume the context whose per-context block is satisfiable (a
@@ -934,7 +924,9 @@ fn park_or_switch(cell: usize) -> Ctl {
         complete_pblock(cell, idx);
         return Ctl::Switch(frame);
     }
-    procs()[cell].state = PState::Blocked;
+    // No state to write: the calling context is already `Parked` on its entity
+    // (`thread::set_current_pblock`), and "every context parked" is what `is_blocked`
+    // reads. The line that used to be here was the cache.
     reschedule(cell)
 }
 
@@ -961,11 +953,28 @@ fn first_satisfiable_context(cell: usize) -> Option<usize> {
     })
 }
 
+/// Whether cell `i` can be picked: it holds a live process, and either one of its
+/// contexts is `Ready` or one of its parked contexts can be woken right now
+/// (docs/EXECUTION-MODEL.md 9.5).
+///
+/// The second half is what the wake scan used to do by *writing* `PState::Runnable` before
+/// the pick. Asking instead of caching is the whole change: there is no window in which the
+/// bit and the contexts disagree, because there is no bit.
+fn runnable(i: usize) -> bool {
+    procs()[i].state == PState::Live && (thread::any_ready(i) || satisfiable(i))
+}
+
+/// Whether cell `i` is a live process with **no** context able to run - the state the
+/// cached `PState::Blocked` used to name. Derived, so it cannot go stale.
+fn is_blocked(i: usize) -> bool {
+    procs()[i].state == PState::Live && !thread::any_ready(i)
+}
+
 /// The union of wake sources every blocked cell is waiting on ([`crate::idle`]).
 fn blocked_sources() -> crate::idle::Sources {
     let mut src = 0;
     for i in 0..MAX_CELLS {
-        if procs()[i].state == PState::Blocked {
+        if is_blocked(i) {
             src |= sources_of(i);
         }
     }
@@ -1019,7 +1028,7 @@ fn report_deadlock(src: crate::idle::Sources) -> Ctl {
         crate::idle::describe(src)
     );
     for i in 0..MAX_CELLS {
-        if procs()[i].state == PState::Blocked {
+        if is_blocked(i) {
             crate::println!(
                 "linux:   pid {} (cell {i}) blocked on {}",
                 procs()[i].pid,

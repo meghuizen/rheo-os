@@ -2875,11 +2875,35 @@ all three ISAs **across** the teardown rather than after it, because the harness
 proving nothing; control observed firing. Honest remainders, named rather than implied: **I4
 is vacuous in that kernel** (nothing is left parked by then - `verify/entity` exercises it
 directly, and forcing every park to `NO_WAKE` fails `condwait` behaviourally rather than
-through the assertion); `linux::Proc::state`, the *cell*-level copy above the contexts, is
-untouched; and deleting `MAX_VCORES` outright needs
+through the assertion); and deleting `MAX_VCORES` outright needs
 `vframe`/`vqp`/`vqp_va`/`vqp_cap`/`voutcome` moved onto the entity too - about 11 KiB of
 `.bss` at 16 contexts, against the 1 MiB the FP areas alone were, so the constant is a bound
-on an array rather than the resource limit it used to be.
+on an array rather than the resource limit it used to be. **And the cell-level Linux state
+followed** (docs/EXECUTION-MODEL.md 9.5): `linux::Proc`'s `PState` carried `Runnable` and
+`Blocked` as a *cache* of the contexts' states, written by a wake scan over every cell before
+every pick, and a stale cache there is a hang (the cell is never picked) or a spin (it is
+picked with nothing able to proceed). The enum is `Free | Live | Zombie` now - the lifecycle,
+which is the part no entity can answer - and runnability is derived (`Live && (any context
+Ready || any parked context satisfiable)`), so the scan and the `state = Blocked` write in
+`park_or_switch` are both deleted; there is no window in which the bit and the contexts
+disagree because there is no bit. The Ready half scans **that cell's** contexts rather than
+calling `EntityTable::all_parked`, which answers the same question by walking every entity in
+the machine - the wrong cost for a predicate a pick evaluates per candidate cell. Proven by
+the whole Linux suite on all three ISAs *including* `linuxnode`/`linuxbun`/`linuxclaude`,
+which is the evidence that counts, since this is the scheduler predicate Node, Bun and Claude
+Code are picked by; control fires (dropping the `satisfiable` half deadlocks `linuxproc`).
+That work found a **second** defect: a Linux cell held **two entities for one execution
+context** - `thread::init_cell` sets context 0's frame to `user::cell_frame(cell)`, so the
+cell's vcore 0 and Linux context 0 are the same context, and it allocated an entity beside the
+one `install` had already made - invisible while native ids were derived and Linux ids
+allocated above them, and a counting discrepancy the moment 9.4 gave both one id space.
+Context 0 **adopts** now: one creator (`install`), one releaser (`free_cell`), `detach_entity`
+clearing the field without releasing because two owners of one release is how a double free
+gets written. Honest **non-result**: the adoption is not load-bearing for the derivation, since
+`any_ready` scans the cell rather than calling `all_parked`, so restoring the duplicate breaks
+no other phase - `linuxthreads` therefore asserts it *directly* (context 0's entity must equal
+the cell's vcore 0) rather than leaving a cleanup nothing checks, and that assertion fires
+under the revert.
 
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus

@@ -293,12 +293,48 @@ extern "C" fn kernel_main() -> ! {
             "{inside} entities still record a CPU inside them"
         );
 
-        // The thread side's answer, and the table side's, taken before the teardown.
+        // **One context, one entity.** A Linux cell's context 0 and its native vcore 0 are the
+        // same execution context - `thread::init_cell` sets context 0's frame to
+        // `user::cell_frame(cell)` - and context 0 used to *allocate* an entity beside the one
+        // `user::install` had already made for that vcore. Two names for one thing, which is
+        // the defect shape this whole section exists to remove, and it was invisible while
+        // native ids were derived and Linux ids allocated above them: they simply lived in
+        // different ranges (docs/EXECUTION-MODEL.md 9.4). It cost an entity and an FP frame
+        // per Linux cell and it leaked the entity, since the adopted-vs-owned split means
+        // `detach_entity` does not release context 0's.
+        //
+        // Asserted directly, because it is not otherwise load-bearing: the runnability
+        // derivation below scans this cell's contexts rather than calling
+        // `EntityTable::all_parked`, so restoring the duplicate does not fail any other
+        // phase. A cleanup nothing checks is a cleanup that comes back.
+        for cell in 0..kernel::user::MAX_CELLS {
+            let c0 = kernel::linux::thread::context0_entity(cell);
+            if c0 == 0 {
+                continue;
+            }
+            assert_eq!(
+                c0,
+                kernel::user::entity_of(cell, 0),
+                "cell {cell}: Linux context 0 holds entity {c0} but the cell's vcore 0 is \
+                 entity {} - two entities naming one execution context",
+                kernel::user::entity_of(cell, 0)
+            );
+        }
+
+        // The thread side's answers, and the table side's, taken before the teardown.
+        //
+        // **Two numbers on the thread side, because a context 0 is adopted, not owned.** Its
+        // entity is the cell's own vcore 0 (`user::install` created it; `user::free_cell`
+        // releases it), so the thread teardown clears the field without releasing - one
+        // creator, one releaser. Asserting the table dropped by *every* context would demand
+        // a release this side must not perform, which is the double free the split exists to
+        // prevent (docs/EXECUTION-MODEL.md 9.4).
         let ctx = kernel::linux::thread::live_entities();
+        let owned = kernel::linux::thread::owned_entities();
         let before = live_entities(t);
         assert!(
             ctx > 0,
-            "no Linux context holds an entity before the teardown - the release below would \
+            "no Linux context holds an entity before the teardown - the checks below would \
              be testing nothing"
         );
 
@@ -308,11 +344,17 @@ extern "C" fn kernel_main() -> ! {
         let t = unsafe { entity::table() };
         let after = live_entities(t);
         let released = before - after;
+        // What the teardown owed the table: exactly its own contexts.
         assert_eq!(
-            released, ctx,
-            "the teardown released {released} entities but {ctx} Linux contexts held one - a \
-             context that never handed its entity back is the S1' leak"
+            released, owned,
+            "the teardown released {released} entities but owned {owned} - a context that \
+             never handed its entity back is the S1' leak, and one that handed back an \
+             adopted id would be a double free"
         );
+        // And what it owed every context, adopted or owned: a cleared field. This half is
+        // never vacuous - a single-context cell still has one to clear - and a stale id is
+        // not merely untidy, it names an entity `create` may since have handed to another
+        // cell.
         assert_eq!(
             kernel::linux::thread::live_entities(),
             0,
@@ -325,8 +367,13 @@ extern "C" fn kernel_main() -> ! {
              to its owner. After 4 threads, 12 threads, a rayon sort and two condvar timeouts, \
              the table holds every invariant it can check (I4, parked-with-no-source, is checked \
              but vacuous here - nothing is left parked; verify/entity exercises it) \
-             and the teardown hands back all {ctx} \
-             live contexts, measured across it rather than after because the harness resets at \
+             and the teardown clears all {ctx} context fields - the half that is never \
+             vacuous, since a stale id names an entity `create` may since have given to \
+             another cell. Context 0 ADOPTS the cell's vcore-0 entity rather than holding a \
+             second name for the same execution context (one creator, one releaser), and the \
+             thread-owned count here is {owned} because every worker detached at its own \
+             exit - so the release half is stated, not exercised, and lives in \
+             verify/entity's fund-once/release-once scenario.\n             Measured measured across it rather than after because the harness resets at \
              the start of a run - and counted on the thread side against the table side, since \
              one allocator means which of these entities are Linux is no longer arithmetic. Ids are ALLOCATED rather than computed, because a stride is a \
              ceiling on contexts per cell and widening it to reach `CONTEXT_CEILING` costs 1 MiB \

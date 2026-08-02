@@ -838,10 +838,57 @@ allocated id panics `smp`; not releasing the funded tail fails the frame oracle 
 (`returned 25, want 27`).
 
 One test-side consequence worth recording, because it changed what a proof could ask: with one
-allocator, "which of these entities are Linux contexts" stopped being an arithmetic question,
-and a Linux cell holds *two* entities (its native vcore 0 and its context 0). `linuxthreads`
-now counts contexts on the **thread** side and entities on the **table** side and compares two
-independently computed numbers, which is a better proof than the id-band filter it replaced.
+allocator, "which of these entities are Linux contexts" stopped being an arithmetic question.
+`linuxthreads` now counts contexts on the **thread** side and entities on the **table** side
+and compares two independently computed numbers, which is a better proof than the id-band
+filter it replaced - and writing it is what surfaced 9.5.
+
+### 9.5 E3's last remainder: the cell-level Linux state
+
+Two things, and the first was found by the second.
+
+**A Linux cell held two entities for one execution context.** `thread::init_cell` sets context
+0's frame to `user::cell_frame(cell)` - so the cell's vcore 0 and Linux context 0 are the
+*same* context - and then allocated an entity for it beside the one `user::install` had
+already made. Two names for one thing, which is the shape this whole section exists to remove.
+It was invisible while native ids were derived and Linux ids allocated above them, because the
+two simply lived in different ranges; 9.4's single allocator made it a counting discrepancy in
+the first proof that looked. Context 0 **adopts** the cell's vcore-0 entity now: one creator
+(`user::install`), one releaser (`user::free_cell`), and `detach_entity` clears the field
+without releasing, because two owners of one release is how a double free gets written.
+
+**`linux::Proc::state` cached what the entities already knew.** `Runnable` and `Blocked` were
+two of its four variants, maintained by a wake scan that ran over every cell on every
+reschedule and wrote the bit before the pick. A stale cache there is a hang (the cell is never
+picked) or a spin (it is picked with nothing able to proceed). The enum is now `Free | Live |
+Zombie` - the lifecycle, which is the part no entity can answer - and runnability is derived:
+
+```
+runnable(i)   = Live && (any context Ready  ||  any parked context satisfiable)
+is_blocked(i) = Live && no context Ready
+```
+
+The wake scan is gone, and so is the `state = Blocked` write in `park_or_switch`: the calling
+context is already `Parked` on its entity, which is what `is_blocked` reads. There is no window
+in which the bit and the contexts disagree, because there is no bit.
+
+The `any context Ready` half is `thread::any_ready`, a scan of **that cell's** contexts, not
+`EntityTable::all_parked`, which answers the same question by walking every entity in the
+machine - the wrong cost for a predicate a pick evaluates per candidate cell. That choice has a
+consequence recorded below.
+
+**Proven** by the whole Linux suite on all three ISAs, including the three strict
+production-runtime gates (`linuxnode`, `linuxbun`, `linuxclaude`), which is the evidence that
+matters here: this is the scheduler predicate Node, Bun and Claude Code are picked by. Control
+observed firing: dropping the `satisfiable` half of `runnable` deadlocks `linuxproc`.
+
+**An honest non-result.** The adoption fix is *not* load-bearing for the derivation, because
+`any_ready` scans the cell's contexts rather than calling `all_parked` - restoring the
+duplicate entity broke no other phase. It is still a real fix (an entity and an FP frame per
+Linux cell, and a leak, since the adopted-vs-owned split means `detach_entity` does not release
+context 0's), so `linuxthreads` asserts it **directly** - context 0's entity must equal the
+cell's vcore 0 - rather than leaving a cleanup nothing checks. That assertion fires under the
+revert: `cell 0: Linux context 0 holds entity 2 but the cell's vcore 0 is entity 1`.
 
 ---
 
