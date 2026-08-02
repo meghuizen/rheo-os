@@ -991,6 +991,58 @@ because the test called `set_owner` on an empty table, where there is nothing to
 relabelling and transferring are the same thing. The assertion had to be moved to a table that
 had already grown - which is the only configuration the design question was ever about.
 
+### 9.8 The largest static was not a `MAX_*` at all
+
+Everything up to 9.7 was aimed at the ceilings *already named in docs*, which is a list of
+what someone had previously noticed. Building `cargo xtask sizes` - which reads `nm` on a
+built kernel rather than a constant in a source file - produced a different list on its first
+run, and the top of it was:
+
+| symbol | bytes |
+|---|---|
+| `linux::pipe::PIPES` | **1,048,960** |
+| `arch::imp::SYSCALL_KSTACK` | 524,288 |
+| `linux::LINUX_STATE` | 427,776 |
+| `linux::inetsock::DGRAMS` | 131,520 |
+| `mm::frames::REFS` | 131,072 |
+
+`PIPES` is larger than every `MAX_*` table removed before it **put together**, and it carries
+no `MAX_*` name, which is exactly why reading constants never found it: 16 pipes with a
+`[u8; 64 * 1024]` ring inline in each, resident on all three ISAs whether or not a pipe was
+ever opened.
+
+**`Elastic` does not apply here**, and the reason is worth stating because it is the first
+table in this sequence where the obvious shape is not expressible: a whole `Pipe` is 65,552
+bytes and `Funded<T>` requires `T` to fit in one frame. So the *buffer* becomes the funded
+thing rather than the record - `Funded<PipePage>`, one 4 KiB page per element, reserved whole
+at `alloc` and released when the last end closes. Two byte accessors (`byte`/`set_byte`) are
+the entire call-site change, because the ring had exactly two byte accesses.
+
+The owner is the **running** cell rather than an argument. Every path that opens a pipe is a
+syscall being serviced for that cell, so it is the creator by construction, and threading an
+index through `FdTable::pipe2` and two `alloc_ring_pair` helpers would have been three chances
+to pass the wrong one. The other end may be held by a different cell after `fork`; the frames
+stay charged to the creator, which is what `release` credits when the last end closes.
+
+**Measured**: `PIPES` 1,048,960 -> a descriptor per slot; the symbol no longer appears in the
+ranking at all. An open pipe costs 16 frames plus a directory, charged to the cell that opened
+it - which is *more* than the zero it used to appear to cost, and is the honest number: the
+memory was always there, it was just unattributed and paid whether or not anyone wanted a pipe.
+
+**Proven** by `linuxproc` on all three ISAs, straight after the P11 shell suite: 7 rings
+funded across pipelines, `pipe2`, `dup2` and cross-cell fork pipes, and every frame returned.
+
+Two method notes, both from controls that did **not** fire first time:
+
+- The assertion was originally at the **end** of the kernel, where it is vacuous - the harness
+  resets at the *start* of each run, so by the last phase (which opens no pipe) every ring has
+  been released regardless. Moved to just after the suite, the control fires (`17 frame(s) are
+  still held by pipe rings after every pipe closed`). This is the third time in this document
+  that "the harness resets at the start of a run" has invalidated a check written at the end.
+- The first attempt at the control patched `reset` rather than `close_end`, because both end in
+  the same three lines. A control that edits the wrong function is indistinguishable from a
+  control that does not fire.
+
 ---
 
 ## 10. What does not change

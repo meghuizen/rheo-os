@@ -13,6 +13,7 @@
 //! the CPU only at a syscall boundary and a writer must eventually block or
 //! exit, a parked reader always gets its turn (docs/LINUX-COMPAT.md L6).
 
+use crate::mm::kmeta::{Funded, Owner};
 use core::ptr::addr_of_mut;
 
 /// Number of live pipes across all cells. Enough for several concurrent shell
@@ -25,8 +26,32 @@ const PIPE_COUNT: usize = 16;
 /// `fcntl(F_GETPIPE_SZ)` - a real answer, not a guess.
 pub const PIPE_CAP: usize = 64 * 1024;
 
+/// One frame of a pipe's ring.
+///
+/// A frame exactly, so `Funded<PipePage>` holds one element per frame - which is the only
+/// shape that works here: a whole `Pipe` was 65,552 bytes and `Funded<T>` requires `T` to
+/// fit in one frame, so the *buffer* had to become the funded thing, not the record.
+#[derive(Copy, Clone)]
+#[repr(C, align(8))]
+struct PipePage([u8; PAGE]);
+
+const PAGE: usize = crate::mm::frames::FRAME_SIZE;
+/// Frames one pipe's ring occupies.
+const PIPE_PAGES: usize = PIPE_CAP / PAGE;
+
 struct Pipe {
-    buf: [u8; PIPE_CAP],
+    /// The ring, **funded from the frame pool and charged to the cell that opened the
+    /// pipe** (docs/EXECUTION-MODEL.md 9.8).
+    ///
+    /// This was `[u8; PIPE_CAP]` inline, which made the `PIPES` table **1,048,960 bytes
+    /// of `.bss`** - the largest static in the kernel, resident on every ISA whether or
+    /// not a pipe was ever opened, and larger than every `MAX_*` table removed before it
+    /// put together. It carried no `MAX_*` name, which is why reading constants never
+    /// found it and `cargo xtask sizes` did.
+    ///
+    /// A pipe's buffer is a real resource, so a cell paying for it while it is open is
+    /// the honest accounting; an unopened slot now costs a descriptor.
+    buf: Funded<PipePage>,
     head: usize,
     len: usize,
     readers: u8,
@@ -37,13 +62,35 @@ struct Pipe {
 impl Pipe {
     const fn new() -> Pipe {
         Pipe {
-            buf: [0; PIPE_CAP],
+            buf: Funded::new(),
             head: 0,
             len: 0,
             readers: 0,
             writers: 0,
             used: false,
         }
+    }
+
+    /// Byte `i` of the ring. 0 for an index with no page behind it, which cannot happen
+    /// while `used` - `alloc` reserves the whole ring or refuses.
+    fn byte(&self, i: usize) -> u8 {
+        self.buf.get_ref(i / PAGE).map_or(0, |p| p.0[i % PAGE])
+    }
+
+    fn set_byte(&mut self, i: usize, v: u8) {
+        if let Some(p) = self.buf.get_mut(i / PAGE) {
+            p.0[i % PAGE] = v;
+        }
+    }
+
+    /// Give the ring's frames back and make the slot free.
+    fn release(&mut self) {
+        self.buf.release();
+        self.head = 0;
+        self.len = 0;
+        self.readers = 0;
+        self.writers = 0;
+        self.used = false;
     }
 }
 
@@ -54,19 +101,63 @@ fn pipes() -> &'static mut [Pipe; PIPE_COUNT] {
     unsafe { &mut *addr_of_mut!(PIPES) }
 }
 
+/// Rings funded **since boot** - the witness that a pipe's buffer really comes from the
+/// frame pool rather than from `.bss` (docs/EXECUTION-MODEL.md 9.8).
+///
+/// Deliberately *not* cleared by [`reset`], unlike the pipes themselves: a test harness
+/// resets at the **start** of each run, so a per-run counter reports only the last phase -
+/// which for most kernels opens no pipe at all and makes the witness read zero. The
+/// resource being counted is boot-lifetime, so the counter is too.
+static mut RINGS_FUNDED: u64 = 0;
+
+/// See [`RINGS_FUNDED`].
+pub fn rings_funded() -> u64 {
+    // SAFETY: single CPU, synchronous traps.
+    unsafe { *core::ptr::addr_of!(RINGS_FUNDED) }
+}
+
+/// Frames every live pipe's ring holds. **0 once every pipe is closed**, which is the
+/// property a slot-handback path that is not a release path breaks.
+pub fn frames_held() -> usize {
+    pipes().iter().map(|p| p.buf.frames_held()).sum()
+}
+
 /// Clear every pipe (called from `linux::reset`).
+///
+/// `release`, not an overwrite: the ring holds frames now, and assigning a fresh `Pipe`
+/// over the descriptor would strand them with no drop glue to notice - the S1' rule.
 pub fn reset() {
     for p in pipes().iter_mut() {
-        *p = Pipe::new();
+        p.release();
     }
 }
 
-/// Allocate a fresh pipe with one read end and one write end; None if the table
-/// is full.
+/// Allocate a fresh pipe with one read end and one write end.
+///
+/// `None` when no slot is free **or** when the calling cell's budget cannot fund the ring -
+/// the second is new and is the honest answer: a pipe's buffer is 16 frames, and a cell
+/// that cannot afford them cannot have the pipe. Every caller already handles `None`.
+///
+/// The owner is the **running** cell rather than an argument, and that is not a shortcut:
+/// every path here is a syscall being serviced for that cell, so it is the creator by
+/// construction, and threading an index through `FdTable::pipe2` and two `alloc_ring_pair`
+/// helpers would be three chances to pass the wrong one. The *other* end may later be held
+/// by a different cell after `fork`; the frames stay charged to the creator, which is what
+/// `Funded::release` credits when the last end closes.
 pub fn alloc() -> Option<usize> {
+    let owner = Owner::cell(crate::user::current_index());
     let ps = pipes();
     let idx = (0..PIPE_COUNT).find(|&i| !ps[i].used)?;
-    ps[idx] = Pipe::new();
+    // The slot is free, so its ring was released; charge the new owner before reserving.
+    ps[idx].buf.set_owner(owner);
+    if !ps[idx].buf.reserve(PIPE_PAGES) {
+        ps[idx].buf.release();
+        return None;
+    }
+    // SAFETY: single CPU, synchronous traps.
+    unsafe { *core::ptr::addr_of_mut!(RINGS_FUNDED) += 1 };
+    ps[idx].head = 0;
+    ps[idx].len = 0;
     ps[idx].used = true;
     ps[idx].readers = 1;
     ps[idx].writers = 1;
@@ -93,9 +184,8 @@ pub fn close_end(idx: usize, writer: bool) {
         p.readers = p.readers.saturating_sub(1);
     }
     if p.readers == 0 && p.writers == 0 {
-        p.used = false;
-        p.len = 0;
-        p.head = 0;
+        // Both ends gone: the ring's frames go back to the pool and the owner's ledger.
+        p.release();
     }
 }
 
@@ -149,7 +239,7 @@ pub fn read(idx: usize, buf_va: u64, count: u64) -> ReadNb {
         return ReadNb::Done(-crate::linux::errno::EFAULT);
     };
     for b in buf.iter_mut() {
-        *b = p.buf[p.head];
+        *b = p.byte(p.head);
         p.head = (p.head + 1) % PIPE_CAP;
     }
     p.len -= n;
@@ -187,7 +277,7 @@ pub fn write(idx: usize, buf_va: u64, count: u64) -> WriteNb {
     let buf = unsafe { core::slice::from_raw_parts(buf_va as *const u8, n) };
     for &b in buf {
         let tail = (p.head + p.len) % PIPE_CAP;
-        p.buf[tail] = b;
+        p.set_byte(tail, b);
         p.len += 1;
     }
     WriteNb::Done(n as i64)

@@ -206,6 +206,38 @@ extern "C" fn kernel_main() -> ! {
     println!("linuxproc: P11 coreutils suite {passed}/{total} = {pct}% (gate >= 80%)");
     assert!(pct >= 80, "P11 gate not met: {passed}/{total} = {pct}%");
 
+    // --- a pipe's ring is funded, not `.bss` (docs/EXECUTION-MODEL.md 9.8).
+    //
+    // `linux::pipe::PIPES` was `[Pipe; 16]` with a `[u8; 64 * 1024]` inline in each -
+    // **1,048,960 bytes**, the largest static in the kernel, resident on every ISA whether
+    // or not a pipe was ever opened, and larger than every `MAX_*` table removed before it
+    // put together. It carried no `MAX_*` name, which is why reading constants never found
+    // it; `cargo xtask sizes` did.
+    //
+    // The ring is 16 funded frames now, charged to the cell that opens the pipe and
+    // returned when the last end closes. This run has just driven the P11 shell suite over
+    // real pipelines, `pipe2`, `dup2` and cross-cell fork pipes, so the funded path has
+    // been exercised hard - and every one of those pipes is closed by now.
+    let funded = linux::pipe::rings_funded();
+    assert!(
+        funded > 0,
+        "no pipe ring was funded in this boot - the buffer is not coming from the frame \
+         pool, so it is still `.bss`"
+    );
+    assert_eq!(
+        linux::pipe::frames_held(),
+        0,
+        "{} frame(s) are still held by pipe rings after every pipe closed - a
+         slot-handback path that is not a release path is the S1' leak",
+        linux::pipe::frames_held()
+    );
+    println!(
+        "linuxproc: A PIPE'S RING IS FUNDED, NOT .bss - {funded} ring(s) took their 16 \
+         frames from the pool, charged to the cell that opened the pipe, and every one was \
+         returned when its last end closed. The table was 1,048,960 bytes of .bss, the \
+         largest static in the kernel, resident whether or not a pipe was ever opened OK"
+    );
+
     // --- `fcntl` honesty (docs/LINUX-COMPAT.md, the `fcntl` row). This lands
     // here because its last phase needs `execve`: the fixture marks one
     // descriptor FD_CLOEXEC, leaves another alone, and execve's ITSELF from the
