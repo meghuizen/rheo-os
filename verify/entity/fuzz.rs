@@ -34,6 +34,8 @@ use std::collections::HashSet;
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct Owner(u16);
 impl Owner {
+    /// The kernel's own charge, used by `reset_table`.
+    pub const KERNEL: Owner = Owner(u16::MAX);
     pub const fn cell(index: usize) -> Owner {
         Owner(index as u16)
     }

@@ -355,7 +355,13 @@ struct RunCell {
     ///
     /// **Per vcore**, so two cores can own two contexts of the same cell. For a
     /// single-vcore cell only slot 0 is ever read, which is the pre-vcore behaviour.
-    vcpu: [usize; MAX_VCORES],
+    ///
+    /// **Gone in E2** (docs/EXECUTION-MODEL.md 9): ownership now lives in
+    /// `sched::entity`, one word on the entity itself, beside the entered-guard that used to
+    /// be a separate per-CPU array. The two were one fact kept in two places, which is what
+    /// made the claim/enter ordering something a caller could get wrong. `entity_of(idx, v)`
+    /// is the id.
+    _ownership_moved_to_entity_table: (),
     /// The NUMA node this cell's memory is placed on (docs/SUBSTRATE.md pillar 6),
     /// or [`frames::NODE_ANY`] on a machine with one node.
     ///
@@ -432,7 +438,7 @@ const EMPTY: RunCell = RunCell {
     vqp_va: [0; MAX_VCORES],
     vqp_cap: [0; MAX_VCORES],
     chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
-    vcpu: [NO_CPU; MAX_VCORES],
+    _ownership_moved_to_entity_table: (),
     node: frames::NODE_ANY,
 };
 
@@ -862,7 +868,8 @@ pub fn switch_native_vcore(cell: usize, from: usize, to: usize) -> *mut TrapFram
 /// exit (docs/SMP.md 10.0a) and entering a dead context resumes it at its own `SYS_EXIT`.
 #[inline]
 pub fn vcore_live(idx: usize, v: usize) -> bool {
-    v < cells()[idx].nvcores && cells()[idx].voutcome[v].is_none()
+    // SAFETY: a read.
+    v < cells()[idx].nvcores && unsafe { crate::sched::entity::table() }.live_id(entity_of(idx, v))
 }
 
 /// How many vcores of cell `idx` have not exited.
@@ -879,6 +886,20 @@ pub fn live_vcores(idx: usize) -> usize {
 /// `exit_group`), and without it a cell with four vcores dies when the first finishes.
 pub fn retire_vcore(idx: usize, v: usize, outcome: Outcome) {
     cells()[idx].voutcome[v] = Some(outcome);
+    // The entity is the authority on *liveness*; `voutcome` keeps the exit value, which the
+    // table does not carry. One fact each rather than two answers to one question.
+    // SAFETY: the core that ran this vcore is the one retiring it.
+    unsafe { crate::sched::entity::table() }.exit(entity_of(idx, v));
+}
+
+/// The entity id of `(cell, vcore)` - `cell * MAX_VCORES + vcore`.
+///
+/// **The identity, not a mapping.** The scheduler's entity table is indexed by exactly the
+/// number every path here already carries, so there is nothing to keep in step
+/// (docs/EXECUTION-MODEL.md 9, E2).
+#[inline]
+pub fn entity_of(idx: usize, v: usize) -> usize {
+    idx * MAX_VCORES + v
 }
 
 /// Whether the calling CPU may enter vcore `v` of cell `idx`.
@@ -892,8 +913,9 @@ pub fn vcore_on_this_cpu(idx: usize, v: usize) -> bool {
     if !vcore_live(idx, v) {
         return false;
     }
-    let owner = cells()[idx].vcpu[v];
-    owner == NO_CPU || owner == crate::smp::cpu_index()
+    // SAFETY: a read of the entity this core is deciding about.
+    let owner = unsafe { crate::sched::entity::table() }.owner_of(entity_of(idx, v));
+    owner == crate::sched::entity::NO_CPU || owner as usize == crate::smp::cpu_index()
 }
 /// The cell `run` was entered with (docs/LINUX-COMPAT.md L6): the top of the
 /// Linux process tree. Only its exit ends the whole run; a forked child's exit
@@ -908,6 +930,10 @@ fn cells() -> &'static mut [RunCell; MAX_CELLS] {
 /// Clear the run table (call before installing a fresh set of cells).
 pub fn reset() {
     *cells() = [EMPTY; MAX_CELLS];
+    // The entities go with the cells. `MAX_CPUS` rather than the online count, because this
+    // runs before `start_all` and a bound of 1 would make invariant I2 reject a legitimate
+    // owner the moment a secondary claimed something.
+    crate::sched::entity::reset_table(crate::smp::MAX_CPUS as u16);
     // SAFETY: single CPU, between runs.
     unsafe {
         *core::ptr::addr_of_mut!(CELL_GRANTS) = [[EMPTY_GRANT; MAX_GRANTS_PER_CELL]; MAX_CELLS];
@@ -1988,12 +2014,17 @@ pub unsafe fn install(
         vqp_va: [0; MAX_VCORES],
         vqp_cap: [0; MAX_VCORES],
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
-        vcpu: [NO_CPU; MAX_VCORES],
+        _ownership_moved_to_entity_table: (),
         // Round-robin across the nodes the pool holds, so cells spread their
         // memory bandwidth (docs/SUBSTRATE.md pillar 6). `NODE_ANY` on a
         // single-node machine, which is every allocation path unchanged.
         node: next_home_node(),
     };
+    // The scheduler's entity for vcore 0. Ownership and the entered-guard live there now
+    // (docs/EXECUTION-MODEL.md 9, E2), so a cell that is installed but never claimed is an
+    // entity with no owner - pickable by any core, which is the single-CPU behaviour exactly.
+    // SAFETY: install runs on the core setting the cell up, with nothing inside it.
+    unsafe { crate::sched::entity::table() }.create_at(entity_of(idx, 0), idx as u16, 0);
     *cell_grants(idx) = [EMPTY_GRANT; MAX_GRANTS_PER_CELL];
     // A fresh cell starts with an empty recorded layout. `clear`, not `init`: the
     // table's frames are a boot cost this slot reuses (see `init_layouts`).
@@ -2072,8 +2103,9 @@ pub unsafe fn install_vcore(idx: usize, frame: *mut TrapFrame, qp: *const QueueP
     c.vframe[v] = frame;
     c.vqp[v] = qp;
     c.voutcome[v] = None;
-    c.vcpu[v] = NO_CPU;
     c.nvcores = v + 1;
+    // SAFETY: as `install`.
+    unsafe { crate::sched::entity::table() }.create_at(entity_of(idx, v), idx as u16, v as u16);
     // Clean FP state for this vcore's first entry, exactly as `install` does for vcore
     // 0 - a zeroed area is not an ABI-default FPU (docs/LIBRHEO.md).
     // SAFETY: `cell_fp(idx, v)` is a valid, aligned `FP_AREA_LEN` area.
@@ -2193,21 +2225,6 @@ pub fn run_vcore(idx: usize, v: usize) -> (usize, usize, Outcome) {
     )
 }
 
-/// Which **vcore** each CPU is inside (`cell * MAX_VCORES + vcore`), or [`NO_CPU`].
-///
-/// **Per CPU, not per cell**, and the difference is the whole point: a first attempt
-/// counted entries per cell and produced false positives, because under preemption a
-/// batch sibling exits without ever passing through `run_inner`, so the exit decrements
-/// a cell the counter never incremented. Asking "does another CPU already report this
-/// cell" is immune to that - it names two cores or it names none.
-///
-/// Checked rather than assumed because every multi-core defect on this path has
-/// presented as corruption somewhere else entirely (a core executing a data symbol, an
-/// instruction fetch at 0), which says nothing about where the second entry happened.
-/// One store per cell dispatch; nothing on a syscall path.
-static INSIDE: crate::smp::PerCpu<usize> =
-    crate::smp::PerCpu::from_array([NO_CPU; crate::smp::MAX_CPUS]);
-
 /// Mark this CPU as inside vcore `v` of cell `idx`, refusing if a peer already is.
 ///
 /// The guard is on the **vcore**, not the cell: two cores inside two vcores of one cell is
@@ -2223,26 +2240,39 @@ static INSIDE: crate::smp::PerCpu<usize> =
 /// The **cross-cell** switch is deliberately not a third caller - see the note in
 /// `switch_native_cell` for why marking there produces a false positive.
 fn enter_vcore(idx: usize, v: usize) {
-    let vid = idx * MAX_VCORES + v;
-    let me = crate::smp::cpu_index();
-    for cpu in 0..crate::smp::MAX_CPUS {
-        // SAFETY: a plain read of another CPU's slot.
-        if cpu != me && unsafe { *INSIDE.get(cpu) } == vid {
-            DOUBLE_ENTRY.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-            panic!("cell {idx} vcore {v} entered by CPU {me} while CPU {cpu} is already inside it");
+    let id = entity_of(idx, v);
+    let me = crate::smp::cpu_index() as u16;
+    // SAFETY: this core is about to run this entity; the entity it is leaving is its own.
+    let t = unsafe { crate::sched::entity::table() };
+    // Leave whatever this core was inside first. A cross-cell or sibling-vcore hand-off keeps
+    // the core in kernel context between the two, so without this the core would be recorded
+    // inside two entities and its own next entry would look like a peer's.
+    //
+    // **Charged 0 ns here on purpose**: CPU time is charged by `sched::dispatch` at its own
+    // transitions, and adding a second charge at this one would double-count every hand-off.
+    // E3 moves that accounting into the table with the runnability it belongs to.
+    t.leave_cpu(me, 0, false);
+    match t.enter(id, me) {
+        Ok(()) => {}
+        Err(crate::sched::entity::EnterError::Occupied) => {
+            crate::sched::entity::note_double_entry();
+            let other = t.get(id).map(|e| e.inside).unwrap_or(0);
+            panic!(
+                "cell {idx} vcore {v} entered by CPU {me} while CPU {other} is already inside it"
+            );
         }
+        Err(e) => panic!("cell {idx} vcore {v} refused to CPU {me}: {e:?}"),
     }
-    // SAFETY: this CPU's own slot.
-    unsafe { *INSIDE.this_mut() = vid };
 }
 
-/// Cores observed inside one cell at once, and the pair that did it. Recorded rather
-/// than only panicked so the report names both.
-static DOUBLE_ENTRY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-
-/// `(count, cell, cpu)` of the most recent double entry, for a test to assert on.
+/// Cores observed inside one entity at once.
+///
+/// **The guard and its counter moved into `sched::entity` in E2** (docs/EXECUTION-MODEL.md 9).
+/// It was a scan over a per-CPU array asking "does another core report this vcore"; it is now
+/// one word on the entity, which is cheaper and stronger - a scan can only see what the other
+/// cores had published, where the field *is* the fact.
 pub fn double_entries() -> u32 {
-    DOUBLE_ENTRY.load(core::sync::atomic::Ordering::Acquire)
+    crate::sched::entity::double_entries()
 }
 
 /// Enter cell `idx` and return when some cell's run on this CPU ends. The reason is in
@@ -2275,9 +2305,11 @@ fn run_inner(idx: usize, v: usize) {
     // hand-off. Restore the kernel address space so setup code can again reach all of
     // RAM (a cell root only maps that cell's user pages).
     arch::paging_activate_kernel();
-    // This CPU is now inside no cell, whichever of its batch ended the run.
-    // SAFETY: this CPU's own slot.
-    unsafe { *INSIDE.this_mut() = NO_CPU };
+    // This CPU is now inside no entity, whichever of its batch ended the run - keyed on the
+    // CPU rather than on `(idx, v)`, because a cross-cell hand-off means the entity it returns
+    // from is not the one it entered.
+    // SAFETY: this core's own entry.
+    unsafe { crate::sched::entity::table() }.leave_cpu(crate::smp::cpu_index() as u16, 0, false);
 }
 
 /// Turn a Linux personality `Ctl` into the frame to resume (or a null-frame
@@ -2347,8 +2379,10 @@ pub fn cell_present(idx: usize) -> bool {
 /// separately with [`claim_vcore`].
 pub fn claim_cell(idx: usize, cpu: usize) {
     let n = cells()[idx].nvcores;
+    // SAFETY: the caller is the core taking the cell, or setup between runs.
+    let t = unsafe { crate::sched::entity::table() };
     for v in 0..n {
-        cells()[idx].vcpu[v] = cpu;
+        t.claim(entity_of(idx, v), cpu as u16);
     }
 }
 
@@ -2359,17 +2393,24 @@ pub fn claim_cell(idx: usize, cpu: usize) {
 /// kernel stack, FP area - are per vcore, so the partitioning discipline holds one
 /// level down (docs/SUBSTRATE.md pillar 3).
 pub fn claim_vcore(idx: usize, v: usize, cpu: usize) {
-    cells()[idx].vcpu[v] = cpu;
+    // SAFETY: the caller is the core taking the vcore.
+    unsafe { crate::sched::entity::table() }.claim(entity_of(idx, v), cpu as u16);
 }
 
 /// The CPU that owns vcore 0 of cell `idx`, or [`NO_CPU`].
 pub fn cell_cpu(idx: usize) -> usize {
-    cells()[idx].vcpu[0]
+    vcore_cpu(idx, 0)
 }
 
 /// The CPU that owns vcore `v` of cell `idx`, or [`NO_CPU`].
 pub fn vcore_cpu(idx: usize, v: usize) -> usize {
-    cells()[idx].vcpu[v]
+    // SAFETY: a read.
+    let owner = unsafe { crate::sched::entity::table() }.owner_of(entity_of(idx, v));
+    if owner == crate::sched::entity::NO_CPU {
+        NO_CPU
+    } else {
+        owner as usize
+    }
 }
 
 /// How many vcores cell `idx` holds (1 unless a launcher added more).
@@ -2394,7 +2435,7 @@ pub fn cell_vcores(idx: usize) -> usize {
 /// A path that enters a *named* vcore asks [`vcore_on_this_cpu`] instead.
 #[inline]
 pub fn cell_on_this_cpu(idx: usize) -> bool {
-    let owner = cells()[idx].vcpu[0];
+    let owner = vcore_cpu(idx, 0);
     let mine = owner == NO_CPU || owner == crate::smp::cpu_index();
     if !mine {
         // Counted so a test can see the affinity test **refuse**, rather than only
@@ -2402,17 +2443,16 @@ pub fn cell_on_this_cpu(idx: usize) -> bool {
         // which a scheduler could pick another core's cell is narrow, so "no double
         // entry" can mean the check worked or that the race never came up. A nonzero
         // count says the check was consulted and said no (docs/ENGINEERING.md 1).
-        AFFINITY_SKIPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        crate::sched::entity::note_affinity_skip();
     }
     mine
 }
 
-/// Times a scheduler was offered a cell belonging to another core and declined it.
-static AFFINITY_SKIPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
 /// How many times [`cell_on_this_cpu`] has refused a cell this core does not own.
+///
+/// Counted in `sched::entity` with the ownership it is about (E2).
 pub fn affinity_skips() -> u64 {
-    AFFINITY_SKIPS.load(core::sync::atomic::Ordering::Acquire)
+    crate::sched::entity::affinity_skips()
 }
 
 /// Whether cell `idx` speaks the native ABI (docs/NETSTACK.md rheo-net N4a).
@@ -2492,6 +2532,9 @@ pub unsafe fn install_spawned(
     // its tables are funded. Needed on this path too because a slot is reused - a
     // stale entry would place this cell's tables on the previous occupant's node.
     crate::mm::kmeta::set_owner_node(crate::mm::kmeta::Owner::cell(idx), p.node);
+    // Read before the child's slot is written: it is the *parent's* owner that is inherited.
+    // SAFETY: a read.
+    let parent_owner = unsafe { crate::sched::entity::table() }.owner_of(entity_of(parent, 0));
     cells()[idx] = RunCell {
         aspace,
         caps: owned_caps(idx),
@@ -2534,7 +2577,7 @@ pub unsafe fn install_spawned(
         // corruption `user::double_entries` exists to name. Inheriting the owner is the fix
         // this very predicate's doc named; it is not a wider lock, it is the same
         // partitioning applied to a cell that did not exist when the round started.
-        vcpu: p.vcpu,
+        _ownership_moved_to_entity_table: (),
         // The parent's node, not a fresh one: a spawned child shares the parent's
         // capability bundle and usually a channel with it, so they are one working
         // set and splitting them across nodes would cost on every message.
@@ -2547,6 +2590,17 @@ pub unsafe fn install_spawned(
     // interactive weight it did not earn (docs/SUBSTRATE.md pillar 3, BORE's fork
     // inheritance): a burst of short-lived children would otherwise each be treated
     // as maximally interactive.
+    // The child's entity, and it **inherits its parent's owner** (docs/SMP.md 10.0c). A cell
+    // created by a claimed cell must not be visible to any other core: without this, a peer's
+    // exit-time reschedule could find a child that was forked a moment ago on another core, and
+    // two cores would share one trap frame. Before E2 this was the `vcpu: p.vcpu` copy; the fact
+    // moved, the rule did not.
+    // SAFETY: the core running the parent is the one creating the child.
+    {
+        let t = unsafe { crate::sched::entity::table() };
+        t.create_at(entity_of(idx, 0), idx as u16, 0);
+        t.claim(entity_of(idx, 0), parent_owner);
+    }
     crate::sched::dispatch::track(idx, 0, Some(parent));
     // Clean FP state for the spawned child's first entry (see `install`).
     // SAFETY: `cell_fp(idx, 0)` is a valid, aligned `FP_AREA_LEN` area.
@@ -2601,6 +2655,9 @@ pub unsafe fn install_forked(
     // its tables are funded. Needed on this path too because a slot is reused - a
     // stale entry would place this cell's tables on the previous occupant's node.
     crate::mm::kmeta::set_owner_node(crate::mm::kmeta::Owner::cell(idx), p.node);
+    // Read before the child's slot is written: it is the *parent's* owner that is inherited.
+    // SAFETY: a read.
+    let parent_owner = unsafe { crate::sched::entity::table() }.owner_of(entity_of(parent, 0));
     cells()[idx] = RunCell {
         aspace,
         caps: owned_caps(idx),
@@ -2622,7 +2679,7 @@ pub unsafe fn install_forked(
         chan: [EMPTY_CHAN; MAX_CELL_CHANNELS],
         // The parent's core - see `install_spawned` for why an unclaimed child is a
         // two-cores-one-cell hazard the moment a fork happens off the boot CPU.
-        vcpu: p.vcpu,
+        _ownership_moved_to_entity_table: (),
         // The parent's node, and here it is not a preference but a fact: `fork` is
         // copy-on-write, so the child starts out mapping the parent's frames, which
         // are already placed. Anything else would be a claim the pages do not
@@ -2631,6 +2688,17 @@ pub unsafe fn install_forked(
     };
     // As `install_spawned`: a forked child inherits its parent's burst score
     // (docs/SUBSTRATE.md pillar 3).
+    // The child's entity, and it **inherits its parent's owner** (docs/SMP.md 10.0c). A cell
+    // created by a claimed cell must not be visible to any other core: without this, a peer's
+    // exit-time reschedule could find a child that was forked a moment ago on another core, and
+    // two cores would share one trap frame. Before E2 this was the `vcpu: p.vcpu` copy; the fact
+    // moved, the rule did not.
+    // SAFETY: the core running the parent is the one creating the child.
+    {
+        let t = unsafe { crate::sched::entity::table() };
+        t.create_at(entity_of(idx, 0), idx as u16, 0);
+        t.claim(entity_of(idx, 0), parent_owner);
+    }
     crate::sched::dispatch::track(idx, 0, Some(parent));
 }
 

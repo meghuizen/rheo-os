@@ -309,6 +309,7 @@ fn test_secondary_bringup() {
             test_user_cells_on_both();
             test_placement();
             test_hetero_placement();
+            test_entity_authority();
             test_two_vcores_one_cell();
             test_vcore_yield();
             test_per_vcore_queues();
@@ -3209,5 +3210,94 @@ fn test_nvme_per_core_queues() {
          read its own sector correctly {NVME_ROUNDS} times, each woken by its own \
          completion vector",
         nvme::MAX_IOQ
+    );
+}
+
+// ------------------- E2: the entity table is the authority on ownership and entry
+//
+// Ownership used to live in a `vcpu[]` array on `RunCell` and the entered-guard in a separate
+// per-CPU array scanned on every dispatch - two places holding one fact, which is what made the
+// claim/enter *ordering* something a caller could get wrong (docs/SMP.md 10.0 records the defect:
+// a batch stamped as owned before any of it had been won). Both now live on the entity, one word
+// each, and every predicate and claim site delegates (docs/EXECUTION-MODEL.md 9, E2).
+//
+// The property this phase asserts is the one that could not be asserted before: **the table and
+// the running machine agree**. It runs after the placement rounds above, so entities have been
+// created, claimed, entered, left and retired by four cores, and then:
+//
+//  1. `EntityTable::check` finds **no violation** - which covers I1 (no CPU inside two entities),
+//     I2 (no owner beyond the CPU count), I3 (an entered entity is owned by the core inside it),
+//     I7 and I9 (a free or exited slot is clean).
+//  2. **No CPU is left inside anything**, which is the invariant the old per-CPU array could only
+//     express by being cleared on every path - a path that forgot left a core permanently
+//     "inside" a cell nobody was running.
+//  3. Every live entity's owner is a **real CPU or nobody**, and the ids line up with the cells:
+//     an entity is `cell * MAX_VCORES + vcore` rather than an allocated handle, so there is no
+//     mapping to drift.
+fn test_entity_authority() {
+    use kernel::sched::entity;
+
+    // SAFETY: between rounds, with no core inside a cell.
+    let t = unsafe { entity::table() };
+
+    assert!(
+        t.check().is_none(),
+        "the entity table violates one of its own invariants after four cores ran cells \
+         through it: {:?}",
+        t.check()
+    );
+
+    let mut inside = 0usize;
+    let mut live = 0usize;
+    let mut owned = 0usize;
+    for id in 0..t.capacity() {
+        let Some(e) = t.get(id) else { continue };
+        if e.state == entity::State::Free {
+            continue;
+        }
+        if e.inside != u16::MAX {
+            inside += 1;
+        }
+        if e.live() {
+            live += 1;
+            if e.owner != entity::NO_CPU {
+                owned += 1;
+                assert!(
+                    (e.owner as usize) < smp::MAX_CPUS,
+                    "entity {id} is owned by CPU {}, which does not exist",
+                    e.owner
+                );
+            }
+        }
+        // The id is the identity, not a handle: it must decompose back to the cell and vcore it
+        // was created for. A mapping that drifted would show up here and nowhere else.
+        assert_eq!(
+            id,
+            kernel::user::entity_of(e.cell as usize, e.context as usize),
+            "entity {id} says it is cell {} vcore {}, which is entity {}",
+            e.cell,
+            e.context,
+            kernel::user::entity_of(e.cell as usize, e.context as usize)
+        );
+    }
+    assert_eq!(
+        inside, 0,
+        "{inside} entities still record a CPU inside them between rounds. The old per-CPU guard \
+         could only express this by being cleared on every exit path; on the entity it is a \
+         field, so a path that forgot leaves a core permanently inside a cell nobody runs"
+    );
+    assert_eq!(
+        entity::double_entries(),
+        0,
+        "the entered-guard refused an entry, so two cores tried to run one entity"
+    );
+    println!(
+        "smp: THE ENTITY TABLE IS THE AUTHORITY - after four cores created, claimed, entered, \
+         left and retired entities through it, every invariant it can check holds (no CPU inside \
+         two entities, no entered entity unowned, no free slot dirty), {inside} CPUs are left \
+         inside anything, {live} entities are live of which {owned} are claimed, and every id \
+         still decomposes to the cell and vcore it names. Ownership and the entered-guard were \
+         two places holding one fact; they are one word each on the entity now \
+         (docs/EXECUTION-MODEL.md 9, E2) OK"
     );
 }

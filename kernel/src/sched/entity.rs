@@ -342,6 +342,65 @@ impl EntityTable {
         Some(id)
     }
 
+    /// Create the entity **at a chosen id**, growing the table if needed.
+    ///
+    /// The kernel's entity id is not allocated - it *is* `cell * MAX_VCORES + vcore`, the
+    /// identity every existing path already carries. One identity rather than a table mapping
+    /// one to the other, because two identities for one thing is the shape that produced the
+    /// ownership defects this stage exists to remove (docs/EXECUTION-MODEL.md 9, E2).
+    ///
+    /// Idempotent for a slot that already holds this `(cell, context)`: `install` runs again for
+    /// a cell slot that is being reused, and refusing there would make reuse a special case.
+    pub fn create_at(&mut self, id: usize, cell: u16, context: u16) -> bool {
+        if id >= self.capacity() && !self.slots.set_growing(id, Entity::EMPTY) {
+            return false;
+        }
+        let mut e = Entity::EMPTY;
+        e.cell = cell;
+        e.context = context;
+        e.state = State::Runnable;
+        self.slots.set(id, e)
+    }
+
+    /// The CPU that owns `id`, or [`NO_CPU`] - including for a slot that does not exist, which
+    /// is the same answer as "nobody has claimed it".
+    pub fn owner_of(&self, id: usize) -> u16 {
+        self.slots.get(id).map(|e| e.owner).unwrap_or(NO_CPU)
+    }
+
+    /// Give `id` to `cpu` without entering it - the claim a placement makes ahead of the run.
+    ///
+    /// Separate from [`EntityTable::enter`] because they answer different questions: a claim
+    /// says *who may*, an entry says *who is*. Collapsing them was defect 1 in the other
+    /// direction - a batch stamped as owned before any of it had been won.
+    pub fn claim(&mut self, id: usize, cpu: u16) -> bool {
+        let Some(mut e) = self.slots.get(id) else {
+            return false;
+        };
+        e.owner = cpu;
+        self.slots.set(id, e)
+    }
+
+    /// Whether `id` is live - created and not yet exited.
+    pub fn live_id(&self, id: usize) -> bool {
+        self.slots.get(id).map(|e| e.live()).unwrap_or(false)
+    }
+
+    /// Leave whichever entity `cpu` is inside, if any, returning its id.
+    ///
+    /// **Keyed on the CPU rather than on an id the caller remembers**, and that is required
+    /// rather than convenient: a cross-cell hand-off chain means the entity a core returns from
+    /// is not the one it entered, so a caller that cleared the id it entered would leave a stale
+    /// `inside` on the entity it actually left and clear one nobody is in. The old per-CPU guard
+    /// had this property for free by construction; keeping it is what lets the guard move into
+    /// the table without changing what it means.
+    pub fn leave_cpu(&mut self, cpu: u16, ns: u64, involuntary: bool) -> Option<usize> {
+        let id =
+            (0..self.capacity()).find(|&i| self.slots.get(i).map(|e| e.inside) == Some(cpu))?;
+        self.leave(id, cpu, ns, involuntary);
+        Some(id)
+    }
+
     /// **The one predicate.** May `cpu` pick entity `id`?
     ///
     /// This replaces `user::cell_on_this_cpu`, `user::vcore_on_this_cpu` and the
@@ -494,6 +553,15 @@ impl EntityTable {
         true
     }
 
+    /// Clear a slot unconditionally - the reset path, where nothing is running.
+    ///
+    /// Distinct from [`EntityTable::release`], which refuses a live or entered entity. That
+    /// refusal is correct on a running machine (freeing under a live core is a use-after-free)
+    /// and wrong between runs, where the whole point is that the previous run is over.
+    pub fn force_free(&mut self, id: usize) -> bool {
+        self.slots.set(id, Entity::EMPTY)
+    }
+
     /// Check every invariant that is a property of this table alone, returning the
     /// first violation.
     ///
@@ -564,4 +632,66 @@ impl Default for EntityTable {
     fn default() -> EntityTable {
         EntityTable::new()
     }
+}
+
+// ------------------------------------------------------- the kernel's entity table
+
+/// The kernel's entities, indexed by `cell * MAX_VCORES + vcore`.
+///
+/// A `static mut` behind one accessor, the same shape as `user::cells()` and for the same
+/// reason: the paths that mutate it are **partitioned** - a given entity belongs to one core,
+/// and the two cross-core writes (a claim by a placement, a steal by a core that ran dry) go
+/// through `Funded::set` on distinct slots. That is the argument `PerCpu`, the frame
+/// allocator's node ranges and the per-vcore resources already make, and it is what this stage
+/// replaces: the state was in two places (an owner array in `user`, an entered-guard in a
+/// per-CPU array) and is now in one.
+static mut TABLE: EntityTable = EntityTable::new();
+
+/// # Safety
+/// The caller must be operating on entities its own core owns, or be between runs. Every
+/// caller in this tree is (`user` claims and enters only what its core will run; `reset` runs
+/// with no core inside a cell).
+#[allow(clippy::mut_from_ref)]
+pub unsafe fn table() -> &'static mut EntityTable {
+    // SAFETY: the caller's contract, above.
+    unsafe { &mut *core::ptr::addr_of_mut!(TABLE) }
+}
+
+/// Entries refused because another CPU was already inside the entity.
+///
+/// The double-entry guard's counter, moved with the guard. It was a per-CPU scan asking "does
+/// another core report this vcore"; it is now one word on the entity itself, which is both
+/// cheaper and stronger - a scan can only see the cores that happened to have published, where
+/// the field is the fact.
+static DOUBLE_ENTRY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+pub fn note_double_entry() {
+    DOUBLE_ENTRY.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+}
+
+pub fn double_entries() -> u32 {
+    DOUBLE_ENTRY.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Times a scheduler was offered an entity belonging to another core and declined it.
+static AFFINITY_SKIPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn note_affinity_skip() {
+    AFFINITY_SKIPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn affinity_skips() -> u64 {
+    AFFINITY_SKIPS.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Clear the table between runs, and give it the CPU bound invariant I2 checks against.
+pub fn reset_table(cpus: u16) {
+    // SAFETY: between runs, with no core inside a cell.
+    let t = unsafe { table() };
+    for id in 0..t.capacity() {
+        // Force the slot clean: `release` refuses a live or entered entity, which is right for
+        // a running machine and wrong for a reset, where the point is that nothing is running.
+        t.force_free(id);
+    }
+    t.init(Owner::KERNEL, cpus);
 }

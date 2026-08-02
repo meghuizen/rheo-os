@@ -1105,8 +1105,13 @@ fn verify() -> bool {
     drivers.iter().all(|&(name, src)| {
         let bin = out.join(name);
         println!("[xtask] verify: building {src}");
+        // **The kernel's edition**, because these drivers `#[path]`-include kernel source
+        // verbatim. Built as 2021 they diverge silently until a file uses a 2024 construct and
+        // then fail to *compile* - which is how a let-chain in `hw/graph.rs` broke this driver
+        // and went unnoticed for a commit, because the check that was run counted passing
+        // properties instead of reading the verdict.
         let built = Command::new("rustc")
-            .args(["-O", "--edition", "2021", "-A", "dead_code", "-o"])
+            .args(["-O", "--edition", "2024", "-A", "dead_code", "-o"])
             .arg(&bin)
             .arg(src)
             .status()
