@@ -59,6 +59,7 @@ extern "C" fn kernel_main() -> ! {
     sections();
     tick();
     events();
+    window_mask();
 
     println!("observe: PASS");
     arch::exit(arch::ExitCode::Success)
@@ -226,6 +227,102 @@ fn events() {
          also a release path is the S1' leak"
     );
     println!("observe: reset returned all {funded} frame(s) OK");
+}
+
+/// The window mask: a window that is off records **nothing**, and one that is on is
+/// unaffected by its neighbours.
+///
+/// This is the property that makes the framework usable rather than merely present.
+/// "Narrate everything" is almost never the useful request - a boot chasing a frame
+/// leak wants two windows and would have the six lines that matter buried under
+/// thousands of syscall records - so selection has to happen at the *source*, where the
+/// events cost nothing to not produce.
+///
+/// Asserted as an exact count rather than as "fewer records": a mask that leaked one
+/// window into another would still produce fewer records than everything.
+fn window_mask() {
+    use kernel::obs::{self, Kind, Window};
+
+    assert!(!obs::enabled(), "the previous phase left recording on");
+    if !obs::enable_windows(Window::Net.bit()) {
+        println!("observe: SKIP the window mask - the pool refused the ring");
+        return;
+    }
+    assert_eq!(
+        obs::windows(),
+        Window::Net.bit(),
+        "asked for one window and got {:#x}",
+        obs::windows()
+    );
+    assert!(obs::on(Window::Net), "the window asked for is off");
+    assert!(
+        !obs::on(Window::Lock),
+        "a window that was not asked for is on"
+    );
+    // `enabled()` must mean "any window", not "all of them": a caller using it as a
+    // cheap pre-test has to see true here or it would skip a window that is recording.
+    assert!(obs::enabled(), "one window on reads as nothing recording");
+
+    // Offer both; exactly one must land.
+    const EACH: u64 = 20;
+    for i in 0..EACH {
+        obs::emit(Window::Net, Kind::Note, 0, i, 0);
+        obs::emit(Window::Lock, Kind::Note, 0, i, 1);
+        obs::emit(Window::Gpu, Kind::Note, 0, i, 2);
+    }
+    let (written, _) = obs::counters();
+    assert_eq!(
+        written,
+        EACH,
+        "asked for one of three windows and recorded {written} of {} offered events",
+        EACH * 3
+    );
+    // And the records that landed are the right ones - a count could be reached by
+    // recording the wrong window exclusively.
+    let cpu = kernel::smp::cpu_index();
+    // SAFETY: this CPU's own ring.
+    let r = unsafe { obs::ring_of(cpu) };
+    for i in 0..EACH {
+        let e = r.get(i).expect("a recorded event is missing");
+        assert_eq!(
+            e.window,
+            Window::Net as u8,
+            "a record from window {} landed while only Net was enabled",
+            e.window
+        );
+        assert_eq!(e.b, 0, "the record is not the one Net emitted");
+    }
+
+    // Turning a second window on takes effect without re-funding, and the first keeps
+    // recording - so the mask is a filter rather than a mode.
+    obs::set_windows(Window::Net.bit() | Window::Gpu.bit());
+    obs::emit(Window::Gpu, Kind::Note, 0, 999, 2);
+    obs::emit(Window::Lock, Kind::Note, 0, 999, 1);
+    assert_eq!(
+        obs::counters().0,
+        EACH + 1,
+        "enabling a second window recorded {} events instead of one more",
+        obs::counters().0 - EACH
+    );
+
+    // Off means off: not "buffered for later".
+    obs::set_windows(0);
+    assert!(!obs::enabled(), "clearing the mask left recording on");
+    for i in 0..EACH {
+        obs::emit(Window::Net, Kind::Note, 0, i, 0);
+    }
+    assert_eq!(
+        obs::counters().0,
+        EACH + 1,
+        "{} event(s) were recorded with every window off",
+        obs::counters().0 - EACH - 1
+    );
+    println!(
+        "observe: window mask - 1 of 3 windows recorded {EACH} of {} offered, a second \
+         window took effect without re-funding, and every window off records nothing OK",
+        EACH * 3
+    );
+    obs::reset();
 }
 
 /// Frames taken out of the pool. `stats()` reports `(free, total)` and `total` is a

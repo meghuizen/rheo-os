@@ -1580,8 +1580,24 @@ fn verify() -> bool {
         // then fail to *compile* - which is how a let-chain in `hw/graph.rs` broke this driver
         // and went unnoticed for a commit, because the check that was run counted passing
         // properties instead of reading the verdict.
+        // `-C debug-assertions=on`, which `-O` would otherwise turn off. A model checker
+        // is exactly where a `debug_assert!` should fire: it costs nothing in a host
+        // process running for milliseconds, and the alternative is that a hot path's
+        // cheap invariant check is compiled out in the one place built to break it. The
+        // observability ring's append path bypasses `Funded`'s bounds check for measured
+        // reasons, so its own bounds are debug assertions - and without this flag a
+        // defect there was a segfault rather than a named failure.
         let built = Command::new("rustc")
-            .args(["-O", "--edition", "2024", "-A", "dead_code", "-o"])
+            .args([
+                "-O",
+                "-C",
+                "debug-assertions=on",
+                "--edition",
+                "2024",
+                "-A",
+                "dead_code",
+                "-o",
+            ])
             .arg(&bin)
             .arg(src)
             .status()

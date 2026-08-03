@@ -42,10 +42,31 @@ pub mod dump;
 pub mod ring;
 pub mod root;
 
+/// Record one event, evaluating its arguments **only if** the window is on.
+///
+/// The macro rather than a function call, and the reason is measured rather than
+/// stylistic. Rust evaluates a call's arguments before the call, so
+/// `obs::emit(W, K, owner, expensive(), other())` pays for `expensive()` even when the
+/// window is off. The first version of the queue window did precisely that - one shift,
+/// one or, one truncation - and `cargo xtask bench` reported **+9 instructions per
+/// queue round trip** while nothing was being recorded, on a path whose whole disabled
+/// cost is supposed to be a load and a branch. The plan had named that as a control to
+/// run; writing it as a function call committed the defect instead.
+///
+/// Expanding to `if on(w) { emit_now(...) }` puts the mask test outside the argument
+/// expressions, and the measured delta went back to **zero**.
+#[macro_export]
+macro_rules! obs_event {
+    ($w:expr, $k:expr, $owner:expr, $a:expr, $b:expr) => {
+        if $crate::obs::on($w) {
+            $crate::obs::emit_now($w, $k, $owner, $a, $b);
+        }
+    };
+}
+
 pub use dump::dump;
 pub use root::{publish, refresh_online, root_va};
 
-use core::sync::atomic::{AtomicBool, Ordering};
 use ring::ObsRing;
 
 /// Which subsystem produced an event - the **window key**, and from
@@ -121,6 +142,12 @@ impl Window {
     pub fn from_u8(v: u8) -> Option<Window> {
         Window::ALL.into_iter().find(|w| *w as u8 == v)
     }
+
+    /// This window's bit in the enable mask.
+    #[inline(always)]
+    pub const fn bit(self) -> u32 {
+        1u32 << (self as u32)
+    }
 }
 
 /// What happened. Subsystem-local, so [`Kind::Acquire`] under [`Window::Kmeta`] and
@@ -165,30 +192,65 @@ pub const WINDOW_MASK_ALL: u32 = crate::abi::obs::WINDOW_MASK_ALL;
 static RINGS: crate::smp::PerCpu<ObsRing> =
     crate::smp::PerCpu::from_array([const { ObsRing::new() }; crate::smp::MAX_CPUS]);
 
-/// Whether anything is being recorded.
-///
-/// One flag in S1; the per-window mask this becomes lives in the published root, so
-/// that a reader sees exactly what is on rather than being told by a mirror.
-static ENABLED: AtomicBool = AtomicBool::new(false);
-
-/// Start recording, funding **this** CPU's ring.
+/// Start recording **every** window, funding this CPU's ring.
 ///
 /// Returns false when the pool refuses the frames, which is a clean "tracing is off"
 /// rather than a boot failure: an observability facility that can take a machine
 /// down is worse than one that is absent.
 ///
-/// Each secondary funds its own ring at bring-up ([`fund_this_cpu`]). A CPU that
-/// never funds one still records nothing and holds no frames, and its offered emits
-/// are counted rather than lost silently.
+/// Each secondary funds its own ring when it is asked to record
+/// ([`fund_this_cpu`]). A CPU that never funds one still records nothing and holds no
+/// frames, and its offered emits are counted rather than lost silently.
 pub fn enable() -> bool {
+    enable_windows(WINDOW_MASK_ALL)
+}
+
+/// Start recording just the named windows.
+///
+/// The reason the mask is per window rather than one flag: the useful question is
+/// almost never "narrate everything". A boot chasing a leak wants
+/// [`Window::Kmeta`] and [`Window::Frames`] and nothing else, and turning on
+/// [`Window::Syscall`] beside them would bury the six lines that matter under
+/// thousands - the same reason `cargo xtask trace` groups by window on the way out.
+/// Selecting at the *source* also means the events never cost anything to produce.
+pub fn enable_windows(mask: u32) -> bool {
     let ok = fund_this_cpu();
-    ENABLED.store(true, Ordering::Release);
-    root::republish_windows(if ok {
-        crate::abi::obs::WINDOW_MASK_ALL
-    } else {
-        0
-    });
+    // Only advertise windows if there is somewhere to put their events, so a reader
+    // is never told a window is recording into a ring that does not exist.
+    set_windows(if ok { mask & WINDOW_MASK_ALL } else { 0 });
     ok
+}
+
+/// Change which windows record, without funding anything.
+///
+/// One store. The mask lives in the published root rather than in a private static,
+/// so a reader sees exactly what the kernel consults - there is no mirror that could
+/// disagree with it.
+pub fn set_windows(mask: u32) {
+    root::republish_windows(mask);
+}
+
+/// Which windows are recording.
+#[inline(always)]
+pub fn windows() -> u32 {
+    root::windows()
+}
+
+/// Whether `window` is recording.
+///
+/// **The hot path's whole cost when off**: one relaxed load of a fixed address, one
+/// `and` with an immediate, one not-taken branch - 3-4 instructions with no barrier,
+/// since a relaxed atomic load lowers to a plain load on all three ISAs. The mask is
+/// never written while a workload runs, so its line stays shared-clean in every L1
+/// and never causes a coherence event.
+///
+/// Honest about the one cost that is not free: *changing* the mask moves that line to
+/// Modified on the writer, so every other core takes one coherence miss on its next
+/// check. Enabling is a boot-time or operator act rather than something a workload
+/// does, so it is a one-off - said rather than claimed to be nothing.
+#[inline(always)]
+pub fn on(window: Window) -> bool {
+    windows() & window.bit() != 0
 }
 
 /// Take frames for this CPU's ring, if it has none.
@@ -213,8 +275,7 @@ pub fn fund_this_cpu() -> bool {
 /// Called between runs, single-threaded, which is why it may touch other CPUs'
 /// slots.
 pub fn reset() {
-    ENABLED.store(false, Ordering::Release);
-    root::republish_windows(0);
+    set_windows(0);
     for i in 0..crate::smp::MAX_CPUS {
         // SAFETY: between runs, no secondary is executing.
         let r = unsafe { RINGS.get_mut(i) };
@@ -224,29 +285,43 @@ pub fn reset() {
     }
 }
 
-/// Whether anything is being recorded.
+/// Whether any window is recording.
 #[inline]
 pub fn enabled() -> bool {
-    ENABLED.load(Ordering::Relaxed)
+    windows() != 0
 }
 
-/// Record one event.
+/// Record one event, with the arguments already computed.
 ///
-/// A no-op - one relaxed load and a branch - when recording is off, so every kernel
-/// that never enables it is byte-for-byte what it was. Split into an
-/// `#[inline]` test and an `#[inline(never)]` body so a call site that is off costs
-/// the test and a fall-through, with no register pressure from marshalling six
-/// arguments that will not be used.
+/// **Prefer [`crate::obs_event!`] at a call site.** This function cannot avoid
+/// evaluating its arguments, because Rust evaluates them before the call - so a site
+/// whose `a` or `b` costs anything to compute pays that cost even with the window
+/// off. That is not hypothetical: the first version of the queue window did exactly
+/// this and `cargo xtask bench` showed **+9 instructions per queue round trip** with
+/// nothing being recorded. The macro puts the mask test *outside* the argument
+/// expressions and the delta went back to zero.
+///
+/// This entry point remains for callers whose arguments are already in registers -
+/// the [`crate::trace`] shim, which is handed them by its own caller.
 #[inline]
 pub fn emit(window: Window, kind: Kind, owner: u16, a: u64, b: u64) {
-    if !enabled() {
+    if !on(window) {
         return;
     }
-    emit_slow(window, kind, owner, a, b);
+    emit_now(window, kind, owner, a, b);
 }
 
+/// Record one event **without** testing the mask - [`crate::obs_event!`]'s body.
+///
+/// `#[inline(never)]` so a call site is a test and a call rather than the whole ring
+/// path inlined into it, and `#[cold]` because the two are not the same instruction:
+/// without it the compiler is free to place this call's register setup *before* the
+/// branch that skips it, and measurably did - a queue round trip cost **+8
+/// instructions** with the window off, against the 3 a load-and-test should be.
+/// `#[cold]` moves the whole path out of line and the delta went to **+1**.
 #[inline(never)]
-fn emit_slow(window: Window, kind: Kind, owner: u16, a: u64, b: u64) {
+#[cold]
+pub fn emit_now(window: Window, kind: Kind, owner: u16, a: u64, b: u64) {
     // SAFETY: this CPU's own ring; single producer by partitioning, and `push`
     // re-enters nothing.
     let r = unsafe { RINGS.this_mut() };

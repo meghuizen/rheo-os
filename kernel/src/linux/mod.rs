@@ -667,9 +667,42 @@ pub(crate) fn reset_trace() {
 
 pub fn handle(cur: usize, nr_val: u64, args: &[u64; 6], frame: *mut TrapFrame) -> Ctl {
     let _g = plock();
+    // The `strace` window (docs/OBSERVABILITY.md 11.4). Here and nowhere else,
+    // because this is the one place a Linux syscall enters the personality - the same
+    // property that makes `plock` auditable. `a` is the syscall number and `b` the
+    // first argument, which is the one that identifies *what* a call was about (an fd,
+    // an address) often enough to be worth the field; the rest are recoverable from
+    // the pair of records plus the program.
+    crate::obs_event!(
+        crate::obs::Window::Syscall,
+        crate::obs::Kind::Enter,
+        cur as u16,
+        nr_val,
+        args[0]
+    );
     let ctl = handle_inner(cur, nr_val, args, frame);
     trace_record(nr_val, &ctl);
+    crate::obs_event!(
+        crate::obs::Window::Syscall,
+        crate::obs::Kind::Exit,
+        cur as u16,
+        nr_val,
+        ctl_code(&ctl)
+    );
     ctl
+}
+
+/// A syscall's outcome as one number, for the [`crate::obs::Window::Syscall`] exit
+/// record.
+///
+/// Deliberately lossy and deliberately *not* the errno alone: what a reader is
+/// usually chasing is a refusal, so a returned value and a "this cell is going to
+/// block" are distinguishable here even though both are ordinary outcomes.
+fn ctl_code(ctl: &Ctl) -> u64 {
+    match ctl {
+        Ctl::Ret(v) => *v,
+        _ => u64::MAX,
+    }
 }
 
 /// The **personality lock**: one lock over the whole Linux dispatch, taken only

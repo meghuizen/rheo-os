@@ -428,6 +428,17 @@ pub fn fault(st: &mut LinuxState, addr: usize) -> bool {
     // stack and the `brk` heap too, and neither has a VMA record, so a COW test that
     // went through `st.vmas` would refuse the first stack write after every fork.
     if user::with_current_aspace(|aspace| aspace.cow_fault(page)) {
+        // A copy-on-write private, which is a `Transfer` rather than an `Acquire`: the
+        // page changed hands between two cells that were sharing it. Recording it apart
+        // from a fill is what lets "this process is paying for its parent's pages" and
+        // "this process is touching new ones" be different answers.
+        crate::obs_event!(
+            crate::obs::Window::Mem,
+            crate::obs::Kind::Transfer,
+            user::current_index() as u16,
+            page as u64,
+            0
+        );
         return true;
     }
     let Some(m) = st.vmas.find(page) else {
@@ -477,6 +488,17 @@ static mut FAULTS: u64 = 0;
 static mut FAULTS_MMAP: u64 = 0;
 
 fn bump_faults(page: usize) {
+    // The memory window (docs/OBSERVABILITY.md 11.4): a page was filled on demand.
+    // Here rather than at `fault`'s several exits, because this function *is* "the fill
+    // happened" - a frame was taken and a mapping now exists, which is what makes this
+    // an `Acquire` with a resource attached rather than a note.
+    crate::obs_event!(
+        crate::obs::Window::Mem,
+        crate::obs::Kind::Acquire,
+        crate::user::current_index() as u16,
+        page as u64,
+        1
+    );
     // SAFETY: single CPU, synchronous trap.
     unsafe {
         let p = core::ptr::addr_of_mut!(FAULTS);

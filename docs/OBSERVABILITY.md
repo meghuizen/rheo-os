@@ -333,9 +333,120 @@ microsecond. `u64` wrap is deliberately not tested: at one event per nanosecond 
 584 years, so the ring does not claim to survive it and asserting that it does would
 be inventing a requirement.
 
-### 11.4 Not built yet
+### 11.4 S2 - the window mask, and what "off costs nothing" actually costs
 
-The window mask and the eight new windows' call sites, the snapshot plane and per-CPU
-busy/idle accounting, the counter unification, lock instrumentation, syscall tracing,
-the capability gate on telemetry, egress beyond the serial console, the host tool, and
-the OTLP exporter cell. Dynamic probes remain the documented deferral of section 5.
+A single on/off flag is the wrong control. The useful request is almost never
+"narrate everything": a boot chasing a frame leak wants `Kmeta` and `Frames`, and
+turning `Syscall` on beside them buries the six lines that matter under thousands.
+So the mask is per window, selection happens at the **source** where an event costs
+nothing to not produce, and the mask lives **in the published root** rather than in a
+private static - one copy, so a reader sees exactly what the kernel consults and no
+mirror can disagree with it.
+
+Five new windows get their first call sites, each at a seam that is already the single
+place its subsystem funnels through:
+
+| Window | Where | What the fields carry |
+|---|---|---|
+| `Syscall` | `linux::handle` | enter/exit pair; number and first argument, then the outcome |
+| `Irq` | `net_rx::on_irq` | arrival count and which line |
+| `Timer` | `ktimer::register` / `cancel` | acquire/release per **client**, so a lost deadline is visible |
+| `Queue` | `queue::kernel_process` | opcode packed with status; the flow id |
+| `Mem` | `linux::mem` fill and COW | acquire for a fill, **transfer** for a copy-on-write private |
+
+Each is one place for the same reason `linux::plock` is auditable from one line.
+`Timer`'s acquire/release-per-client shape is chosen because this module exists at all
+due to two subsystems arming one hardware one-shot and destroying each other's
+deadlines (docs/NETSTACK.md 16 N2h) - and a lost deadline is invisible in a total.
+`Net`, `Gpu` and `Lock` are deliberately left for the slices that bring their counters
+and their instrumentation; a window with no call site would be a name pretending to be
+a feature.
+
+Two honest narrowings are recorded where they happen rather than done quietly. The
+queue window carries the **low 64 bits** of the flow id: a flow id is 16 bytes because
+it is W3C-traceparent shaped (section 2), and carrying it whole would consume both
+payload fields of a 32-byte record and so cost the opcode and status - within one boot
+the low half identifies a flow, and an exporter that needs all of it has the submission
+entry, where it is not truncated. And the syscall exit record collapses the outcome to
+one number, distinguishing a returned value from "this cell is about to block".
+
+**The cost claim is now a measurement, and getting there took two defects of my own.**
+
+The plan listed "move the mask test after argument marshalling" as a *control to run*.
+Writing the first version as an ordinary function call committed it instead: Rust
+evaluates arguments before the call, so `obs::emit(W, K, owner, expensive(), ...)` pays
+for `expensive()` with the window off, and `cargo xtask bench` showed **+9 instructions
+per queue round trip** while nothing was recorded. `obs_event!` is a macro so the mask
+test sits outside the argument expressions.
+
+That recovered one instruction, not nine - so the cost was not the marshalling. The
+remainder was the compiler placing the cold call's register setup *before* the branch
+meant to skip it. `#[cold]` on `emit_now` moves the path out of line, and the delta
+fell to **+3**: exactly the load, the `and` and the not-taken branch the design claims.
+Neither of these would have been found by reading the source.
+
+**And then the enabled path, where three attempts made it worse before deleting code
+made it better.** The first measurement was 60 instructions per event. The reasoning
+said the cost was `Funded`'s page directory - a bounds check, two more branches and a
+**dependent load** before the store - and that consecutive events hit the same frame
+128 times running, so caching the frame would remove almost all of it. Caching it
+changed **nothing** (60 -> 60): the directory entry is in a hot line, and a load from
+a hot line is not what a 60-instruction path is made of.
+
+Reading the **disassembly** answered in one look what two rounds of reasoning had not:
+**15 of the ~46 instructions were prologue and epilogue** - six callee-saved register
+pushes and pops - and they existed because the `#[cold]` refresh function behind the
+cache was a *call*, which forces LLVM to keep live values in registers it must save.
+An optimisation for a path taken one time in 128 was costing 15 instructions on the
+other 127. Inlining it recovered 6; deleting the cache entirely and indexing the
+directory directly recovered 14 more, and left `push` with a single `push %rbx`.
+
+| | x86-64 | riscv64 | aarch64 (scaled) |
+|---|---|---|---|
+| `obs_emit_off` | 5 | 5 | ~4 |
+| `obs_emit_on` | **46** (was 60) | **47** (was 53) | **~40** (was ~52) |
+
+(`obs_emit_off` includes the benchmark's own two `black_box` loads, so the mask test is
+the 3 instructions above. aarch64's counter advances at 62 ticks per 1000 instructions,
+so its raw numbers are scaled by that calibration.) For scale, in the same run an
+interrupt entropy mix is **15** instructions and one `rng_next_u64` draw is **367** - so
+an enabled event is about an eighth of a single random number, and a disabled one is
+noise. Seven of the 46 are the record's own stores, which is the floor for a 32-byte
+record.
+
+The append path is now the one place in the tree that writes through a `Funded`
+directory without `Funded`'s bounds check, and the cost of that is stated rather than
+elided: an off-by-one there is a wild store instead of a refusal. It is paid for with
+two `debug_assert!`s, which are free in a kernel build and **live** in
+`verify/obs/fuzz.rs` - `cargo xtask verify` now builds with `-C debug-assertions=on`,
+because a model checker is exactly where a cheap invariant check should fire. With the
+slot mask broken the fuzzer prints `slot 2048 past capacity`; before the flag it
+segfaulted.
+
+**On removing the flow id, which was the other candidate**: it is not where the cost
+is. `entry.flow_id as u64` is one narrowed load on the queue path only, and the 46
+instructions above are measured with plain constants - no flow id involved. Dropping
+the field would buy about one instruction and give up following a request across the
+queue, the graph and the wire, which is section 2's primitive and the reason the design
+carries flow context at all. Kept.
+
+Per-benchmark, against the pre-S2 baseline: every path with a new call site on it costs
+**+3** (`p2_roundtrip_single` 243011 -> 246011 milliticks/op, `p2_roundtrip_batched64`
+167417 -> 170417, `p2_user_roundtrip` 333007 -> 336007), and every path without one is
+**unchanged to the tick** (`p1_grant_check`, `p2_ring_push_pop`, `p2_doorbell_trap`,
+`p3_context_switch`, `p5_crosscell_roundtrip`, `entropy_mix_event`). The two new
+benchmarks are permanent, so the claim stays measured rather than becoming folklore.
+
+Proven by `observe`'s mask phase on all three ISAs: one of three windows enabled records
+**exactly** 20 of 60 offered events (an exact count, because a mask leaking one window
+into another would still record fewer than everything), the records that landed are
+asserted to be the enabled window's rather than merely the right number, a second window
+takes effect with no re-funding, and clearing the mask records nothing at all - off
+meaning off, not buffered for later.
+
+### 11.5 Not built yet
+
+The snapshot plane and per-CPU busy/idle accounting, the counter unification, the
+`Net`/`Gpu`/`Lock` windows with their device and lock instrumentation, the capability
+gate on telemetry, egress beyond the serial console, the host tool, and the OTLP
+exporter cell. Dynamic probes remain the documented deferral of section 5.

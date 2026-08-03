@@ -377,6 +377,24 @@ pub fn kernel_process(qp: &QueuePair, caps: &mut CapTable, objects: &ObjectTable
                 Ok(object) if objects.kind(object) != ObjectKind::QueuePair => (STATUS_DENIED, 0),
                 Ok(_) => run_opcode(&entry),
             };
+        // The queue window (docs/OBSERVABILITY.md 11.4): one record per completed
+        // submission, here because this is the single point every one passes through.
+        // `a` packs the opcode with its status, so "which operations are being refused"
+        // is a group-by rather than a correlation.
+        //
+        // `b` is the **low 64 bits** of the flow id - a truncation, and said so rather
+        // than narrowed quietly. A flow id is 16 bytes because it is W3C-traceparent
+        // shaped (docs/OBSERVABILITY.md 2), and carrying it whole would take both of a
+        // 32-byte record's payload fields and so cost the opcode and status. Within one
+        // boot the low half identifies a flow perfectly well, and an exporter that needs
+        // the full id has the submission entry itself, where it is not truncated.
+        crate::obs_event!(
+            crate::obs::Window::Queue,
+            crate::obs::Kind::Exit,
+            crate::obs::OWNER_KERNEL,
+            (entry.opcode as u64) << 32 | status as u64,
+            entry.flow_id as u64
+        );
         qp.cq.push(CqEntry {
             flow_id: entry.flow_id,
             user_data: entry.user_data,

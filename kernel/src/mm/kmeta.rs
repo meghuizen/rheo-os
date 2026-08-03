@@ -525,6 +525,25 @@ impl<T: Copy> Funded<T> {
         true
     }
 
+    /// Kernel VA of data frame `page`, or 0 if that page is not held.
+    ///
+    /// For a **sequential** writer that wants to cache it. Every ordinary access goes
+    /// through [`Funded::get`]/[`Funded::set`], which bound the index and consult the
+    /// directory each time - correct, and the right default. But a caller appending in
+    /// order touches `elems_per_page` consecutive elements of one frame before moving
+    /// to the next, so it can hold the frame and skip the directory's **dependent
+    /// load** on all but one access in `elems_per_page`.
+    ///
+    /// The one caller is `obs::ring`, where that load was measured as a real part of an
+    /// event emit's cost. Anything not appending sequentially should not use this: the
+    /// bounds check it lets a caller skip is the bounds check `set` exists to perform.
+    pub fn page_va(&self, page: usize) -> usize {
+        if page >= self.pages {
+            return 0;
+        }
+        self.dir_get(page)
+    }
+
     /// Raw pointer to element `index`, or `None` when it is beyond the current
     /// capacity. The single place index arithmetic happens.
     fn slot_ptr(&self, index: usize) -> Option<*mut T> {

@@ -433,8 +433,30 @@ pub fn on_irq() {
     // operations - a handler must never wait for the pool lock.
     // SAFETY: reading the counter we just wrote, on this CPU.
     crate::rng::feed_interrupt(unsafe { *addr_of!(IRQS) }, 0);
+    // The interrupt window (docs/OBSERVABILITY.md 11.4). `a` is the arrival count, so
+    // a reader gets the rate from two records and their ticks without the kernel
+    // dividing anything, and `b` names which line it was - here the NIC's receive.
+    //
+    // Cheap enough for a handler by construction: when the window is off it is a
+    // relaxed load and a not-taken branch, and when it is on it is a store into this
+    // core's own ring with no lock. A handler that could wait on a lock held by a
+    // thread is the hazard `rng::feed_interrupt` beside it was also written to avoid.
+    crate::obs_event!(
+        crate::obs::Window::Irq,
+        crate::obs::Kind::Note,
+        crate::obs::OWNER_KERNEL,
+        // SAFETY: reading the counter this handler just wrote, on this CPU.
+        unsafe { *addr_of!(IRQS) },
+        IRQ_LINE_NET_RX
+    );
     note_activity();
 }
+
+/// Which interrupt line an [`crate::obs::Window::Irq`] record is about.
+///
+/// A small closed set of numbers rather than a per-driver convention, so a reader can
+/// tell one line's arrivals from another's without a table that drifts.
+pub const IRQ_LINE_NET_RX: u64 = 1;
 
 /// `SYS_WAIT_NET`: block until a received frame is available, copy it into the
 /// cell buffer at `buf_va` (up to `len` bytes), and return the frame length. The

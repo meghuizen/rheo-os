@@ -302,6 +302,18 @@ pub fn register(client: TimerClient, in_ns: u64) {
         };
         a.regs[client as usize] = a.regs[client as usize].wrapping_add(1);
     }
+    // The timer window (docs/OBSERVABILITY.md 11.4): who asked, and for how long.
+    // This module's whole reason for existing is that two subsystems arming the one
+    // hardware one-shot used to destroy each other's deadlines (docs/NETSTACK.md 16
+    // N2h), and a lost deadline is invisible in a total - so the acquire/release pair
+    // per *client* is exactly the shape that makes it visible.
+    crate::obs_event!(
+        crate::obs::Window::Timer,
+        crate::obs::Kind::Acquire,
+        crate::obs::OWNER_KERNEL,
+        client as u64,
+        in_ns
+    );
     rearm(now, false);
 }
 
@@ -316,6 +328,17 @@ pub fn cancel(client: TimerClient) {
         a.slots[client as usize] = EMPTY;
         was
     };
+    // The other half of the pair. `b` says whether there was anything to cancel, so
+    // "cancelled a deadline" and "cancelled nothing" are different records rather than
+    // one indistinguishable count - which matters here, because a cancel that finds
+    // nothing armed is the shape a lost deadline leaves behind.
+    crate::obs_event!(
+        crate::obs::Window::Timer,
+        crate::obs::Kind::Release,
+        crate::obs::OWNER_KERNEL,
+        client as u64,
+        u64::from(was_armed)
+    );
     rearm(now_ns(), was_armed);
 }
 

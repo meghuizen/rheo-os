@@ -70,56 +70,90 @@ fn set_pool_allows(v: bool) {
     ALLOW.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The shim models the **paged** layout, not a flat `Vec`.
+///
+/// It has to. `ObsRing::push` writes through the frame directory directly - reading
+/// `dir_va` as an array of frame addresses and indexing it - so a shim that returned a
+/// plausible-looking fake address for `dir_va` would have the code under test
+/// dereference a pointer to nothing. The first version did exactly that, and the
+/// fuzzer duly died the moment `push` stopped going through `set`. A shim is only
+/// worth anything if it presents the same shape as the thing it stands in for.
 pub struct Funded<T: Copy> {
-    slots: Vec<T>,
+    /// One boxed slice per "frame", each holding `elems_per_page::<T>()` elements.
+    /// Boxed so the addresses stay put - `dir` holds pointers into them.
+    pages: Vec<Box<[T]>>,
+    /// The directory: one address per page, exactly what the kernel's directory frame
+    /// holds. Built once after every page exists, and never grown, so the pointers in
+    /// it cannot be invalidated by a reallocation.
+    dir: Vec<usize>,
+    cap: usize,
 }
 
 impl<T: Copy> Funded<T> {
     pub const fn new() -> Funded<T> {
-        Funded { slots: Vec::new() }
+        Funded {
+            pages: Vec::new(),
+            dir: Vec::new(),
+            cap: 0,
+        }
     }
     pub fn set_owner(&mut self, _owner: Owner) {}
     pub fn reserve(&mut self, want: usize) -> bool {
         if !ALLOW.load(std::sync::atomic::Ordering::Relaxed) {
             return false;
         }
-        while self.slots.len() < want {
+        if want <= self.cap {
+            return true;
+        }
+        let per = elems_per_page::<T>();
+        let need = want.div_ceil(per);
+        while self.pages.len() < need {
             // The kernel grows into freshly allocated frames, which arrive zeroed -
             // `mm::kmeta`'s stated contract on `T`. Reproducing it keeps the shim
             // faithful to what the code under test sees, and it is what makes the
             // "a zero sequence number means never written" rule testable.
-            self.slots.push(unsafe { std::mem::zeroed() });
+            let page: Vec<T> = (0..per).map(|_| unsafe { std::mem::zeroed() }).collect();
+            self.pages.push(page.into_boxed_slice());
         }
+        self.dir = self.pages.iter().map(|p| p.as_ptr() as usize).collect();
+        self.cap = self.pages.len() * per;
         true
     }
     pub fn release(&mut self) {
-        self.slots.clear();
+        self.pages.clear();
+        self.dir.clear();
+        self.cap = 0;
     }
     pub fn capacity(&self) -> usize {
-        self.slots.len()
+        self.cap
     }
     pub fn pages(&self) -> usize {
-        self.slots.len().div_ceil(elems_per_page::<T>().max(1))
+        self.pages.len()
     }
     pub fn dir_va(&self) -> usize {
-        // A plausible non-zero kernel VA; the ring only publishes it.
-        if self.slots.is_empty() {
+        if self.dir.is_empty() {
             0
         } else {
-            0xffff_0000_0000_1000
+            self.dir.as_ptr() as usize
         }
+    }
+    pub fn page_va(&self, page: usize) -> usize {
+        self.dir.get(page).copied().unwrap_or(0)
     }
     pub fn get(&self, index: usize) -> Option<T> {
-        self.slots.get(index).copied()
+        if index >= self.cap {
+            return None;
+        }
+        let per = elems_per_page::<T>();
+        Some(self.pages[index / per][index % per])
     }
     pub fn set(&mut self, index: usize, value: T) -> bool {
-        match self.slots.get_mut(index) {
-            Some(s) => {
-                *s = value;
-                true
-            }
-            None => false,
+        if index >= self.cap {
+            return false;
         }
+        let per = elems_per_page::<T>();
+        self.pages[index / per][index % per] = value;
+        true
     }
 }
 

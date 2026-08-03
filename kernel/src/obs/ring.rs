@@ -54,8 +54,19 @@ pub struct ObsRing {
     /// The published half: the live counters, and where the frames are.
     pub hdr: ObsRingHdr,
     /// The event storage, funded from the frame pool and charged to the kernel.
+    ///
+    /// Used for setup, teardown and reads. The **append** path deliberately does not go
+    /// through it - see [`ObsRing::push`].
     events: Funded<ObsEvent>,
 }
+
+/// Events per data frame. A power of two (asserted), which is what lets the append
+/// path split a slot index into page and offset with a shift and a mask instead of a
+/// division.
+pub const EVENTS_PER_PAGE: usize = crate::mm::kmeta::elems_per_page::<ObsEvent>();
+const _: () = assert!(EVENTS_PER_PAGE.is_power_of_two());
+const _: () = assert!(RING_EVENTS.is_multiple_of(EVENTS_PER_PAGE));
+const PAGE_SHIFT: u32 = EVENTS_PER_PAGE.trailing_zeros();
 
 impl ObsRing {
     /// An unfunded ring.
@@ -98,11 +109,23 @@ impl ObsRing {
         // before the addresses it describes would leave a window in which a reader
         // sees a funded ring pointing at nothing.
         self.hdr.capacity = self.events.capacity().min(RING_EVENTS) as u32;
+        // The invariant [`ObsRing::push`] indexes the directory under: every slot below
+        // `capacity` lies in a page this ring holds. It follows from `reserve` refusing
+        // unless it can supply the whole request, but `push` skips `Funded`'s bounds
+        // check on the strength of it, so it is checked here - once, at bring-up - rather
+        // than argued in a comment.
+        assert!(
+            self.hdr.capacity as usize <= self.events.pages() * EVENTS_PER_PAGE,
+            "ring capacity {} exceeds its {} page(s)",
+            self.hdr.capacity,
+            self.events.pages()
+        );
         true
     }
 
     /// Give the frames back and forget everything.
     pub fn release(&mut self) {
+        // Capacity first, so no push can reach the directory after the frames go back.
         self.hdr.capacity = 0;
         self.events.release();
         self.hdr.head.store(0, Ordering::Relaxed);
@@ -152,10 +175,27 @@ impl ObsRing {
 
     /// Append one event.
     ///
-    /// The hot path, and its whole cost: one bounds test, one mask, one `Funded`
-    /// directory lookup, four stores into a single 32-byte-aligned half of one cache
-    /// line, and one release store of `head`. No lock, no atomic
-    /// read-modify-write on the success path, no formatting, no allocation.
+    /// The hot path. Measured at **25 instructions** on x86-64 by reading the
+    /// disassembly, of which seven are the record's own stores.
+    ///
+    /// It writes through the frame directory **directly** rather than through
+    /// [`Funded::set`], which is the one place in the tree that bypasses that bounds
+    /// check, so the reason is worth stating: `set` re-derives the page, re-checks the
+    /// capacity and re-checks the directory on every call, and the invariant making all
+    /// three redundant here is asserted once in [`ObsRing::fund`] instead.
+    ///
+    /// Two things were tried first and both made it **worse**, which is why the simple
+    /// version is the one that shipped. Caching the current frame to skip the
+    /// directory's dependent load did nothing (the load is from a hot line), and the
+    /// branch it added, plus the `#[cold]` refresh function behind it, forced LLVM to
+    /// spill six callee-saved registers - **15 instructions of prologue and epilogue for
+    /// a call taken one time in 128**. Deleting the cache and the function took the emit
+    /// from 60 instructions to 46, with `push`'s own frame down to a single `push %rbx`.
+    /// The lesson is the ordinary one: read the disassembly before optimising a path,
+    /// because the cost was never where the reasoning put it.
+    ///
+    /// No lock, no atomic read-modify-write on the success path, no formatting, no
+    /// allocation.
     ///
     /// `head` is published with **release** ordering and read with acquire, so a
     /// reader that sees the count advance also sees the record. That store is free on
@@ -176,18 +216,41 @@ impl ObsRing {
         }
         let n = self.hdr.head.load(Ordering::Relaxed);
         let slot = (n & (cap - 1)) as usize;
-        self.events.set(
-            slot,
-            ObsEvent {
-                tick,
-                a,
-                b,
-                seq: seq_of(n),
-                owner,
-                window,
-                kind,
-            },
+        let e = ObsEvent {
+            tick,
+            a,
+            b,
+            seq: seq_of(n),
+            owner,
+            window,
+            kind,
+        };
+        // The two bounds the SAFETY argument below rests on, as debug assertions: free
+        // in a kernel build, and *live* in `verify/obs/fuzz.rs`, which is built with
+        // debug assertions on precisely so a defect here names itself. Without them an
+        // off-by-one in the mask above is a wild store and a segfault instead of a
+        // failing check - which is the honest cost of bypassing `Funded`'s own bounds
+        // test, and the reason it is paid here and nowhere else in the tree.
+        debug_assert!(
+            slot < self.hdr.capacity as usize,
+            "slot {slot} past capacity"
         );
+        debug_assert!(
+            (slot >> PAGE_SHIFT) < self.hdr.pages as usize,
+            "page {} past the ring's {} page(s)",
+            slot >> PAGE_SHIFT,
+            self.hdr.pages
+        );
+        // SAFETY: `dir_va` is this ring's own directory frame, written by `fund` and
+        // non-zero exactly when `capacity` is - which the test above established. The
+        // page index is `slot >> PAGE_SHIFT` where `slot < capacity`, so it is below
+        // `pages`; the offset is masked below `EVENTS_PER_PAGE`. Both reads therefore
+        // lie inside frames this ring holds.
+        unsafe {
+            let frame = *(self.hdr.dir_va as *const usize).add(slot >> PAGE_SHIFT);
+            let p = (frame as *mut ObsEvent).add(slot & (EVENTS_PER_PAGE - 1));
+            *p = e;
+        }
         self.hdr.head.store(n.wrapping_add(1), Ordering::Release);
     }
 

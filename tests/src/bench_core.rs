@@ -312,6 +312,49 @@ extern "C" fn kernel_main() -> ! {
         kernel::rng::entropy::absorb(kernel::rng::entropy::Source::User, echunk, 0);
     });
 
+    // -------------------------------------------- the observability event plane
+    // The claim the whole framework rests on is "it cannot make the kernel much
+    // slower" (docs/OBSERVABILITY.md 11.4), and that has two halves, both of which
+    // have to be numbers rather than assertions.
+    //
+    // `obs_emit_off` is the half that matters most, because it is what every kernel
+    // in the tree pays whether or not it ever looks at telemetry: a window that is
+    // off should cost one relaxed load of a fixed address, one `and` and one
+    // not-taken branch. It is measured because the first version of this cost
+    // **eight** instructions instead of three - the compiler had hoisted a cold
+    // call's register setup in front of the branch meant to skip it, which no amount
+    // of reading the source would have shown.
+    //
+    // `obs_emit_on` is what a boot that *does* enable a window pays per event, so a
+    // deployment can decide what it can afford instead of guessing.
+    {
+        use kernel::obs::{Kind, Window};
+        // A window that is deliberately *not* the one being emitted, so the mask test
+        // fails the way it does on a real disabled path.
+        kernel::obs::set_windows(Window::Lock.bit());
+        bench("obs_emit_off", || {
+            kernel::obs_event!(
+                Window::Queue,
+                Kind::Note,
+                0,
+                core::hint::black_box(1u64),
+                core::hint::black_box(2u64)
+            );
+        });
+        if kernel::obs::enable_windows(Window::Queue.bit()) {
+            bench("obs_emit_on", || {
+                kernel::obs_event!(
+                    Window::Queue,
+                    Kind::Note,
+                    0,
+                    core::hint::black_box(1u64),
+                    core::hint::black_box(2u64)
+                );
+            });
+        }
+        kernel::obs::reset();
+    }
+
     // ------------------------------------------------------------- P4
     // Strand spawn/teardown and context switch (docs/CONCURRENCY.md,
     // BUILD-ORDER step 7). These are the "light thread" path lengths: a
