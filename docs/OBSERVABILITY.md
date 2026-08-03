@@ -754,9 +754,60 @@ skip branch now asserts exactly that distinction. The once-absorbed misroute
 now fails by name ("the spin counter is broken, not the guest stalled") -
 observed.
 
-### 11.9 Not built yet
+### 11.9 S6 (first slice) - the distribution plane records for real
+
+**Five of the six unrecorded histograms gained their recorder at their honest
+owner**: `QueueNs` per entry at the one bridge point every submission passes,
+`SyscallNs` at the **Linux personality dispatch** (the surface Node/Bun/Claude
+Code exercise - the native verbs are measured by their own planes, and
+bracketing them too would double-charge the same work), `FaultNs` on successful
+demand-page fills only (a fault that becomes a signal is not a fill service
+time - `bracket_cancel` exists for exactly that path), `BlockNs` at the block
+cache's device-read seam whichever driver is underneath, and `SwitchNs` at the
+**scheduler's** switch sites in `nproc` - deliberately *not* inside
+`switch_native_cell_vcore` itself, below. **`NetRttNs` is deferred with its
+reason written on the metric**: an RTT is the transport's own measurement and
+the transport is userspace by doctrine; a kernel-side wait duration wearing that
+name would be false.
+
+**The disabled cost was unacceptable on the first attempt, and the fix is the
+S2b lesson applied to the distribution plane.** Written as
+`let t0 = if enabled() { now_ns() } else { 0 }`, the stamp stays **live across
+the measured region** - the whole opcode dispatch, the whole switch - and the
+register pressure lands with recording off: measured +12..+42 instructions per
+queue/switch round trip. The `metrics::bracket_start`/`bracket_end` form stores
+the stamp in a per-CPU slot (one per metric, so different metrics nest - a fill
+inside a syscall - while a metric's own bracket never does at its sites) behind
+an `#[inline(always)]` gate with a `#[cold]` body: the disabled path is a load,
+a test and a not-taken branch with nothing live after it. Re-measured: **+2..6
+per queue round trip (~3 per gate, the S2 bound), everything else unchanged**.
+
+**And the switch bracket moved rather than being paid for**: even the bracket
+form's two gates cost a measured **+34 instructions per `SYS_SWITCH` round trip
+on riscv64** inside the small, hottest-primitive switch function (isolated by
+removing exactly those two gates: p5 761008 -> 759008). The raw verb's constant
+cost is already a headline `bench` number; the *variance* the metric exists to
+expose lives at the scheduler's call sites, so the bracket lives there
+(`nproc::reschedule` and the yield path), and `p5_crosscell_roundtrip` is at or
+below its pre-S6 value on all three ISAs.
+
+**A third aliasing hazard closed by ordering**: the allocating `record` no
+longer holds `&mut` into the histogram set across the first-sample bucket
+allocation - taking the frame drops the pool lock's guard, and with
+`W_LOCK_HOLD` on that drop re-enters metrics through `record_noalloc`.
+
+Proven on all three ISAs where the paths already are: `librhearun` (exactly 8
+`QueueNs` samples for its 8 echoes), `schedidle` (4 scheduler switches),
+`linuxpoll` (116-129 syscalls + 205-247 fault fills, means plausible per ISA),
+`blockfs` (exactly 16 device reads). Control observed firing by name: the
+`FaultNs` record removed fails `linuxpoll` with "the recorder is dead".
+
+Still ahead in S6: entity `ready_ts` for a correct `RunDelayNs` (with the plan's
+revert control), and the fairness / balance / starvation / reservation exports.
+
+### 11.10 Not built yet
 
 The per-node memory breakdown, the rest of the counter unification (11.6), the
-capability gate on telemetry, egress beyond the serial console, the host tool,
-and the OTLP exporter cell. Dynamic probes remain the documented deferral of
-section 5.
+rest of S6 (11.9), the capability gate on telemetry, egress beyond the serial
+console, the host tool, and the OTLP exporter cell. Dynamic probes remain the
+documented deferral of section 5.

@@ -160,7 +160,15 @@ impl<D: BlockDevice> BlockCache<D> {
             *b = 0;
         }
         if avail > 0 {
-            self.dev.read(base, &mut data[..avail * SECTOR])?;
+            // `Metric::BlockNs` (docs/OBSERVABILITY.md 11, S6): the device read's
+            // service time - the transport's cost, measured at the one seam every
+            // cache miss passes through, whichever driver is underneath.
+            crate::metrics::bracket_start(crate::metrics::Metric::BlockNs);
+            if let Err(e) = self.dev.read(base, &mut data[..avail * SECTOR]) {
+                crate::metrics::bracket_cancel(crate::metrics::Metric::BlockNs);
+                return Err(e);
+            }
+            crate::metrics::bracket_end(crate::metrics::Metric::BlockNs);
         }
         FILLS.fetch_add(1, Ordering::Relaxed);
         Ok(())
