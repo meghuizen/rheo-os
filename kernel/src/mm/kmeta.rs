@@ -398,6 +398,20 @@ impl<T: Copy> Funded<T> {
         self.pages
     }
 
+    /// Kernel VA of the directory frame, or 0 before first growth.
+    ///
+    /// Exposed for **publication**, not for access: `obs::root` puts it in the
+    /// observability plane so a reader outside the guest can walk this table's
+    /// frames, which it cannot do through [`Funded::get`] because it is not in the
+    /// guest (docs/OBSERVABILITY.md 11). The directory holds one kernel VA per data
+    /// frame, so such a reader masks each with the published `va_base`.
+    ///
+    /// Nothing inside the kernel should reach into a table this way - `get`/`set`
+    /// exist for that and keep the bounds check.
+    pub fn dir_va(&self) -> usize {
+        self.dir
+    }
+
     /// Frames this table holds in total, directory included - what its owner is
     /// charged.
     pub fn frames_held(&self) -> usize {

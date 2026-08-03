@@ -312,6 +312,7 @@ fn test_secondary_bringup() {
             test_hetero_placement();
             test_entity_authority();
             test_funded_contexts();
+            test_percpu_event_rings();
             test_two_vcores_one_cell();
             test_vcore_yield();
             test_per_vcore_queues();
@@ -3643,4 +3644,206 @@ fn test_funded_contexts() {
             println!("smp: SKIP the trace phase - the pool refused the event ring");
         }
     }
+}
+
+// ---------------------------------------------------------------- per-CPU event rings
+//
+// The claim `kernel::trace` could not make. Its ring was one shared buffer behind one
+// shared counter, and its own header said so: "single-CPU today ... deliberately not
+// copied here until a multi-core boot wants to trace". This is that boot.
+//
+// What two cores make provable that one cannot:
+//
+//  1. **Each core writes its own ring.** With a shared buffer, two producers interleave
+//     into one slot array and the result is not "slower" - it is records containing one
+//     core's timestamp and the other's payload, with no fault and no log.
+//  2. **Each core has its own sequence counter.** A shared counter makes the numbers
+//     globally unique and therefore *not* consecutive per stream, so the host tool's
+//     loss detection - which is a per-stream gap check - reports gaps that are not
+//     there. A diagnostic that cries wolf is worse than no diagnostic.
+//
+// Both are properties of the *partitioning*, so the phase asserts them as counts and
+// contents per ring rather than as a total.
+
+/// Events each core records in this phase. Small: the claim is which ring took them
+/// and in what order, not how many fit.
+const RING_EVENTS_EACH: u64 = 64;
+
+/// The secondary's baseline `written()`, taken after it funds and before it emits, so
+/// funding's own kmeta events cannot be mistaken for the payload.
+static SEC_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Whether the secondary's ring funded at all.
+static SEC_FUNDED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Which CPU index the secondary emitted from, read from its own per-CPU identity.
+static SEC_CPU: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// What the secondary does: fund its own ring, then record `RING_EVENTS_EACH` events
+/// tagged so they cannot be confused with the primary's.
+///
+/// `fn()` with no arguments because that is what crosses cores through a static - a
+/// captured environment would be a borrow this side cannot prove outlives the other
+/// core (`smp::run_fn_with_secondary`).
+fn secondary_records() {
+    use core::sync::atomic::Ordering;
+    use kernel::obs::{self, Kind, Window};
+
+    // Funding allocates, and allocation is traced, so the kmeta events it produces
+    // land in `unfunded` (capacity is published last, on purpose) or in this ring
+    // depending on ordering. A baseline read here rather than an assumption of zero is
+    // what makes the payload count exact either way.
+    let ok = obs::fund_this_cpu();
+    SEC_FUNDED.store(usize::from(ok), Ordering::Release);
+    if !ok {
+        return;
+    }
+    let cpu = kernel::smp::cpu_index();
+    SEC_CPU.store(cpu, Ordering::Release);
+    // SAFETY: this core's own ring.
+    let base = unsafe { obs::ring_of(cpu) }.written();
+    SEC_BASE.store(base, Ordering::Release);
+    for i in 0..RING_EVENTS_EACH {
+        // Owner `1` and `b = 1` mark these as the secondary's, so a record found in
+        // the wrong ring is identifiable from its contents rather than only from a
+        // count - the `regstress.c` discipline of keying every value on its writer.
+        obs::emit(Window::Entity, Kind::Note, 1, i, 1);
+    }
+}
+
+/// What the primary does at the same instant: record its own events into its own ring.
+fn primary_records() {
+    use kernel::obs::{self, Kind, Window};
+    for i in 0..RING_EVENTS_EACH {
+        obs::emit(Window::Entity, Kind::Note, 0, i, 0);
+    }
+}
+
+fn test_percpu_event_rings() {
+    use core::sync::atomic::Ordering;
+    use kernel::obs;
+
+    // Enable on the primary, which funds the primary's ring. The secondary funds its
+    // own inside its job - deliberately not at bring-up, because a facility that is
+    // off must not take 17 frames per core from every boot that never asks for it.
+    if !obs::enable() {
+        println!("smp: SKIP the per-CPU ring phase - the pool refused the primary's ring");
+        return;
+    }
+    let p_cpu = kernel::smp::cpu_index();
+    // SAFETY: this core's own ring, before any secondary is running its job.
+    let p_base = unsafe { obs::ring_of(p_cpu) }.written();
+
+    let (met, done) = kernel::smp::run_fn_with_secondary(secondary_records, primary_records);
+    assert!(
+        done,
+        "the secondary did not finish recording - nothing can be concluded about two rings"
+    );
+    if SEC_FUNDED.load(Ordering::Acquire) == 0 {
+        obs::reset();
+        println!("smp: SKIP the per-CPU ring phase - the pool refused the secondary's ring");
+        return;
+    }
+    let s_cpu = SEC_CPU.load(Ordering::Acquire);
+    let s_base = SEC_BASE.load(Ordering::Acquire);
+    assert_ne!(
+        s_cpu, p_cpu,
+        "the 'secondary' recorded from the primary's CPU index, so this phase is one \
+         core twice and proves nothing about two rings"
+    );
+
+    // 1. Two rings, each holding exactly its own core's events.
+    //
+    // Exact, and that is the point: a shared buffer would give one ring 128 records
+    // and the other none, which is the defect stated as an arithmetic fact.
+    // SAFETY: cross-core reads of rings whose writers have finished.
+    let (pr, sr) = unsafe { (obs::ring_of(p_cpu), obs::ring_of(s_cpu)) };
+    assert_eq!(
+        pr.written() - p_base,
+        RING_EVENTS_EACH,
+        "the primary's ring took {} of its {RING_EVENTS_EACH} events",
+        pr.written() - p_base
+    );
+    assert_eq!(
+        sr.written() - s_base,
+        RING_EVENTS_EACH,
+        "the secondary's ring took {} of its {RING_EVENTS_EACH} events",
+        sr.written() - s_base
+    );
+
+    // 2. Each core's records are in its **own** ring, identified by content.
+    //
+    // A count alone would pass on two rings that each took 64 records of the wrong
+    // core's - which is exactly what one shared buffer split by a shared counter
+    // produces.
+    for (name, r, base, want_owner) in [
+        ("primary", pr, p_base, 0u16),
+        ("secondary", sr, s_base, 1u16),
+    ] {
+        for i in 0..RING_EVENTS_EACH {
+            let e = r
+                .get(base + i)
+                .unwrap_or_else(|| panic!("{name} ring is missing event {i}"));
+            assert_eq!(
+                e.owner, want_owner,
+                "the {name} ring holds a record owned by {} at index {i} - the two \
+                 cores wrote into one buffer",
+                e.owner
+            );
+            assert_eq!(
+                e.b, want_owner as u64,
+                "{name} ring event {i} has the wrong tag"
+            );
+            assert_eq!(e.a, i, "{name} ring event {i} carries a={}", e.a);
+        }
+    }
+
+    // 3. Each ring's sequence numbers are **consecutive within that ring**.
+    //
+    // This is the property the host tool's loss detection rests on, and the one a
+    // shared counter destroys: with one counter the numbers are globally unique, so
+    // every stream has holes and every boot reports loss that did not happen.
+    for (name, r, base) in [("primary", pr, p_base), ("secondary", sr, s_base)] {
+        let mut prev = r
+            .get(base)
+            .unwrap_or_else(|| panic!("{name} ring event 0 missing"))
+            .seq;
+        for i in 1..RING_EVENTS_EACH {
+            let seq = r.get(base + i).unwrap().seq;
+            assert_eq!(
+                seq,
+                prev.wrapping_add(1),
+                "{name} ring: seq {prev} is followed by {seq}, so this stream has a gap \
+                 the host tool would report as loss"
+            );
+            prev = seq;
+        }
+    }
+
+    // And the two rings genuinely used the same numbers, which is what "per-CPU
+    // counter" means and what a shared counter cannot produce.
+    assert_eq!(
+        pr.get(p_base).unwrap().seq - p_base as u32,
+        sr.get(s_base).unwrap().seq - s_base as u32,
+        "the two rings' first sequence numbers do not agree, so the counter is shared"
+    );
+
+    let (total, unfunded) = obs::counters();
+    println!(
+        "smp: PER-CPU EVENT RINGS - cpu{p_cpu} and cpu{s_cpu} each recorded \
+         {RING_EVENTS_EACH} event(s) into its OWN ring, each stream's sequence numbers \
+         consecutive and each record found in the ring of the core that wrote it \
+         (rendezvous {}, {total} total, {unfunded} offered to an unfunded ring) OK",
+        if met { "held" } else { "timed out" }
+    );
+
+    let before_reset = kernel::mm::frames::stats().0;
+    obs::reset();
+    let after_reset = kernel::mm::frames::stats().0;
+    assert!(
+        after_reset > before_reset,
+        "reset gave no frames back, yet two rings were funded"
+    );
+    println!(
+        "smp: both rings released, {} frame(s) returned OK",
+        after_reset - before_reset
+    );
 }

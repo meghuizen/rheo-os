@@ -26,9 +26,10 @@
 //! it is knowable earlier.
 
 use crate::abi::obs::{
-    OBS_MAX_SECTIONS, OBS_SEC_EVENT_LAYOUT, OBS_SEC_HISTOGRAMS, OBS_SEC_TEXT_RINGS, ObsEvent,
-    ObsRoot, ObsSection,
+    OBS_MAX_SECTIONS, OBS_SEC_EVENT_LAYOUT, OBS_SEC_HISTOGRAMS, OBS_SEC_RINGS, OBS_SEC_TEXT_RINGS,
+    ObsEvent, ObsRoot, ObsSection,
 };
+use core::sync::atomic::Ordering;
 
 /// The one exported symbol.
 ///
@@ -116,6 +117,22 @@ pub fn publish() {
         },
     );
 
+    // The event plane. One section for the whole per-CPU array: each element begins
+    // with an `ObsRingHdr`, and the event frames are reached from that header rather
+    // than published separately - a ring is funded by its own CPU, so per-directory
+    // sections would mean several cores appending to one section table.
+    add(
+        r,
+        region(
+            OBS_SEC_RINGS,
+            0,
+            crate::obs::rings_va(),
+            size_of::<crate::smp::PerCpu<crate::obs::ring::ObsRing>>(),
+            size_of::<crate::obs::ring::ObsRing>() as u32,
+            crate::smp::MAX_CPUS as u32,
+        ),
+    );
+
     add(
         r,
         region(
@@ -151,6 +168,22 @@ pub fn refresh_online() {
     // SAFETY: called after bring-up completes, from the CPU that performed it.
     let r = unsafe { root_mut() };
     r.online_cpus = online_cpus();
+}
+
+/// Publish which windows are being recorded.
+///
+/// The mask lives **in the root** rather than in a private kernel static so that
+/// there is one copy: a reader sees exactly what is on, and cannot be told one thing
+/// by a mirror while the kernel consults another. An atomic store, so this is the one
+/// field that legitimately changes after boot.
+pub fn republish_windows(mask: u32) {
+    root().windows.store(mask, Ordering::Release);
+}
+
+/// Which windows are being recorded.
+#[inline(always)]
+pub fn windows() -> u32 {
+    root().windows.load(Ordering::Relaxed)
 }
 
 /// How many CPUs are running.

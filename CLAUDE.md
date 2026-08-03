@@ -212,7 +212,11 @@ last forever.** Two hardening passes over the above. (1) `rng::feed_hid` takes a
 mistake - a property a reviewer checks in one line rather than a promise about
 what callers do - and the console byte path, which used to pass the byte, follows
 the same rule; the HID DMA buffer is wiped as it is drained, asserted by
-`virtio_input::buffers_clear`. It costs nothing, because the unpredictability is
+`virtio_input::wiped() == events()` - the wipe **read back** before the buffer goes
+to the device again, which is the only race-free place to ask, since a returned
+buffer can be refilled by the next keystroke before any later scan runs (the first
+version scanned the buffers afterwards and failed intermittently on riscv64 saying a
+drained event was still there, when a *new* one had arrived). It costs nothing, because the unpredictability is
 in *when* a key was pressed, not which one, and mixing a key code would put what a
 person typed into kernel state for a source credited zero. (2) Against an attacker
 who captures the pool or a root: past output is already safe (fast key erasure,
@@ -3113,6 +3117,68 @@ notably `metrics.rs` declares **eight** latency histograms of which only two hav
 recorder anywhere and **no boot enables it**, so most of the scheduler-quality work ahead
 is wiring and a switch rather than new machinery.
 
+**And the event stream is per-CPU** (docs/OBSERVABILITY.md 11.3, the `observe` and `smp`
+kernels, all three ISAs) - the second observability slice, and the one `kernel/src/trace.rs`
+had already written down as its own defect: the ring was "one shared buffer with a plain
+counter, so it is single-CPU today", with the fix "deliberately not copied here until a
+multi-core boot wants to trace". `kernel/src/obs/ring.rs` is one ring per CPU with its own
+sequence counter, safe by **partitioning** rather than by hoping - the argument `telemetry`
+already made - and `trace.rs` is now a shim keeping every signature and the `@E` format
+byte-compatible, because `cargo xtask trace` parses it and `smp` asserts on it (renaming a
+module is not a proof, so nothing was renamed). The module is **dependency-free** (the tick
+and the CPU index are passed in) so `verify/obs/fuzz.rs` can drive it on the host, which is
+the only place the wrap is reachable: a boot emits a few thousand events, and the arithmetic
+that matters is at **2^32**, where the recorded sequence number - `head`'s low 32 bits -
+recycles, about 71 minutes at one event per microsecond. **Two design decisions were forced
+by writing the code**, not by the plan. Funding **cannot** happen on the emit path as
+planned: funding allocates, allocation takes `mm::frames`' pool lock, and one of the
+recorded windows *traces the allocator* - so a lazily-funding emit could re-enter the
+allocator from inside it on a non-recursive lock, which is a deadlock rather than a slow
+path, appearing only on the first event a boot ever recorded from that window; `fund` is a
+bring-up act now and `emit` never allocates, with a CPU that has no ring counting its
+offered emits rather than losing them (and publishing `capacity` **last** - written so a
+reader could never see a funded ring pointing at nothing - makes funding self-excluding for
+free, since the allocator's own events see `capacity == 0`). And the host tool's gap
+detection **had** to change: a sequence number is per-CPU monotone now, so comparing
+consecutive lines of the merged stream would report a gap wherever the emitting core
+changed - pure noise on any multi-core boot, against that tool's own rule that a diagnostic
+which cries wolf is worse than none. `trace::counters()`' second value is **derived** rather
+than counted (a ring holds `RING_EVENTS`, so anything past that was overwritten), which
+removes an atomic read-modify-write from the hot path and stops conflating "the ring is a
+ring" with "a reader lost data". Proven by `observe` on all three ISAs (17 frames - 16 data
+plus a directory, as designed - 300 records read back **field-for-field** with real ticks
+advancing, the ring wrapped with the surviving window exactly `[total-cap, total)` and the
+record before it gone, all 17 frames returned) and by `smp`, where **two cores record 64
+events each at the same instant** and three things are asserted per ring rather than as a
+total: each ring took exactly its own core's 64, every record is found in the ring of the
+core that wrote it *identified by a tag in its own contents*, and each stream's sequence
+numbers are consecutive - the property the host tool's loss detection rests on and the one a
+shared counter destroys (observed cpu0 and cpu2, 128 total, 17 offered to an unfunded ring
+being the secondary's own funding allocations exactly, 34 frames returned). Three controls
+observed firing - every CPU forced onto ring 0 gives `the primary's ring took 145 of its 64
+events` (= 64 + 64 + 17 in one ring with the other empty; note what it is *not*, since under
+TCG nothing was lost and a count of totals would have looked fine - what breaks is
+attribution); the slot mask written `n & cap` fails four wrap cases by name; `seq_of` made
+zero-based makes a zeroed frame read as a written event - and **one recorded as a
+non-result**: `ObsRing::get`'s sequence-number check does not fire, measured rather than
+assumed, because sequentially the bounds test subsumes it and it earns its keep only against
+a reader racing a live writer on another core, which no built reader is yet and which a
+single-threaded host driver cannot produce without aliasing the ring mutably to model a data
+race the language forbids.
+
+**One intermittent test was found and fixed** while gating the above: `rng`'s HID phase
+asserted `virtio_input::buffers_clear()` - every DMA buffer zero *after* a drain - and failed
+on riscv64 about one run in ten saying a drained event was still in the buffer, when what had
+happened was that a **new** keystroke had arrived. A wiped buffer goes straight back to the
+device and the injector is still typing, so the question was being asked in the one place it
+cannot be answered. The property is now asked of the **drain**: the wipe is **read back**
+before the buffer is handed over and only a verified wipe is counted, so
+`wiped() == events()` is a statement about memory rather than about timing. Read back
+deliberately rather than just counted - an increment beside the wipe would prove nothing,
+since deleting the wipe would delete the increment with it; the control (wipe removed) gives
+`1 of 2 drained HID event(s) were wiped`. A test that fails on correct behaviour is worse
+than no test.
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
 proofs, and the hardware-lab performance numbers.
@@ -3309,7 +3375,11 @@ kernel/       the no_std kernel library + boot demo bin
               docs/LINUX-COMPAT.md - incl. the blocking, readiness-computing
               poll/epoll_wait, a real nanosleep, blocking stdin, and eventfd2 as
               a shared counter registry - eventfd.rs), obs (**the observability
-              spine**: one exported page-aligned root, `RHEO_OBS_ROOT`, whose
+              spine**: ring.rs is the **per-CPU event ring** - one ring and one
+              sequence counter per core, safe by partitioning, dependency-free so
+              `verify/obs/` can drive its wrap on the host; trace.rs is now a shim
+              over it keeping the `@E` format. Plus one exported page-aligned root,
+              `RHEO_OBS_ROOT`, whose
               section table carries a kernel VA *and a physical address* per
               telemetry region, so a host tool, a hypervisor or a crash dump can
               walk the whole plane from the ELF symbol alone with **zero** guest
@@ -3338,7 +3408,10 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               mistake that makes a host reader silently decode nothing), and the
               tick asserted to be a real advancing counter with a real frequency,
               since a timestamp domain published as zero makes every recorded time
-              a lie),
+              a lie; then the event plane end to end - the ring funded from the real
+              pool, 300 records read back field-for-field with real ticks advancing,
+              the ring wrapped with the surviving window located exactly, and every
+              frame returned),
               resources, numa (docs/SUBSTRATE.md pillar 6: node-affine frame
               allocation - QEMU launched with two 512 MiB memory nodes, the pool
               asserted partitioned between them at exactly the boundary the launch
@@ -3653,7 +3726,18 @@ verify/       host-side model checking of the kernel state machines that are
               attempted and reverted twice on real hardware and named here in 213
               operations on the first seed. It does not replace `cargo xtask test`:
               it checks state machines, not the trap path, the page tables or the FP
-              register file (verify/README.md)
+              register file (verify/README.md).
+              obs/ drives `obs/ring.rs` - the per-CPU event ring against an
+              independent VecDeque oracle at four counter start points, including one
+              **crossing 2^32**, where the recorded sequence number recycles (~71
+              minutes at one event per microsecond, so a boot never reaches it and
+              would ship the arithmetic untested). u64 wrap is deliberately NOT
+              tested: 584 years at one event per nanosecond, so the ring makes no such
+              claim and asserting it would invent a requirement. Two controls firing
+              (slot mask off by one; zero-based sequence numbers), one honest
+              non-result recorded (`get`'s seq check cannot fire single-threaded -
+              the bounds test subsumes it, and it only earns its keep against a
+              reader racing a live writer)
 idl/          system IDL + codegen        (future, step 6)
 runtime/      strand runtime: heap (alloc), async executor + channel,
               type-level capability rights (BUILD-ORDER step 7)

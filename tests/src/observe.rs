@@ -22,14 +22,25 @@
 //!   - that the tick is a real, advancing counter with a real frequency, since a
 //!     timestamp domain published as zero would make every recorded time a lie.
 //!
+//! It then drives the **event plane** end to end: the ring funds from the real frame
+//! pool, records come back field-for-field with advancing real ticks, the ring wraps
+//! and reports which events were lost rather than how many, and reset returns every
+//! frame.
+//!
 //! ## What it deliberately does not claim
 //!
-//! Nothing is instrumented yet and no window exists, so this says nothing about
-//! event recording, cost, or what a real reader does with the plane. The symbol's
-//! resolvability from outside is checked by the host tool that resolves it, which
-//! is where that claim belongs - here it would only be this kernel reading its own
-//! address, which proves the linker kept the page but not that anyone else can name
-//! it.
+//! The symbol's resolvability *from outside* is checked by the host tool that
+//! resolves it, which is where that claim belongs - here it would only be this kernel
+//! reading its own address, which proves the linker kept the page but not that anyone
+//! else can name it.
+//!
+//! The wrap **arithmetic** is checked to destruction on the host
+//! (`verify/obs/fuzz.rs`), where the counter can be started next to a boundary a boot
+//! would take four billion events to reach. And the **multi-core** property - that
+//! each core writes its own ring behind its own sequence counter, which is the whole
+//! reason this plane replaced `kernel::trace`'s single shared buffer - needs two
+//! cores and lives in the `smp` kernel. This kernel is single-CPU, so asserting it
+//! here would be one core agreeing with itself.
 
 #![no_std]
 #![no_main]
@@ -47,9 +58,181 @@ extern "C" fn kernel_main() -> ! {
     self_address();
     sections();
     tick();
+    events();
 
     println!("observe: PASS");
     arch::exit(arch::ExitCode::Success)
+}
+
+/// The event plane: recording, reading back, wrapping, and the counters that say
+/// which of those happened.
+///
+/// The wrap *arithmetic* is checked to destruction on the host
+/// (`verify/obs/fuzz.rs`), where the counter can be started next to a boundary. What
+/// only a real boot can show is the parts that fuzzer explicitly excludes: that the
+/// ring funds from the real frame pool and gives the frames back, that a real
+/// `arch::obs_tick` lands in the records in order, and that the whole path from
+/// `obs::emit` to a readable record works with the real `PerCpu` indexing rather than
+/// a shim.
+fn events() {
+    use kernel::obs::{self, Kind, Window};
+
+    let before = pool_used();
+    assert!(
+        !obs::enabled(),
+        "something enabled recording before this phase"
+    );
+    assert_eq!(
+        obs::counters(),
+        (0, 0),
+        "the rings are not empty at the start"
+    );
+
+    if !obs::enable() {
+        // A pool that refuses the ring is a true statement about this machine, not a
+        // gap in the plane - so it is reported and the phase ends, rather than being
+        // dressed up as a pass of something that did not run.
+        println!("observe: SKIP the event plane - the pool refused the ring");
+        return;
+    }
+    assert!(
+        obs::enabled(),
+        "enable() reported success but recording is off"
+    );
+    let funded = pool_used() - before;
+    println!("observe: ring funded, {funded} frame(s) charged to the kernel");
+    assert!(
+        funded > 0,
+        "the ring claims to be funded but took no frames"
+    );
+
+    // The published mask must say what is actually being recorded. A reader consults
+    // it to know whether an empty stream means "nothing happened" or "nothing was
+    // asked for", so a zero here while recording would make that unanswerable.
+    assert_eq!(
+        kernel::obs::root::windows(),
+        obs::WINDOW_MASK_ALL,
+        "recording is on but the root advertises no windows"
+    );
+
+    // --- records go in and come back out, in order, with their own contents -----
+    const N: u64 = 300;
+    for i in 0..N {
+        obs::emit(Window::Kmeta, Kind::Acquire, (i % 7) as u16, i, i ^ 0xa5a5);
+    }
+    let (written, unfunded) = obs::counters();
+    assert_eq!(written, N, "recorded {written} of {N} events");
+    assert_eq!(
+        unfunded, 0,
+        "{unfunded} emit(s) found no ring on a CPU that funded one"
+    );
+    assert_eq!(
+        obs::overwritten(),
+        0,
+        "{N} events overwrote something in a ring of {}",
+        obs::ring::RING_EVENTS
+    );
+
+    let cpu = kernel::smp::cpu_index();
+    // SAFETY: this CPU's own ring, read after writing it, single-threaded here.
+    let r = unsafe { obs::ring_of(cpu) };
+    assert_eq!(r.written(), N, "this CPU's ring did not take every event");
+    assert_eq!(r.oldest(), 0, "nothing was written yet the oldest is not 0");
+    let mut last_tick = 0u64;
+    for i in 0..N {
+        let e = r.get(i).unwrap_or_else(|| {
+            panic!("event {i} of {N} is missing from a ring that never wrapped")
+        });
+        // Every field, not just a count: a ring that kept the right *number* of the
+        // wrong records is exactly what an off-by-one in the slot mask produces, and
+        // a count alone cannot see it.
+        assert_eq!(e.a, i, "event {i} carries a={}", e.a);
+        assert_eq!(e.b, i ^ 0xa5a5, "event {i} carries the wrong b");
+        assert_eq!(e.owner, (i % 7) as u16, "event {i} carries the wrong owner");
+        assert_eq!(e.window, Window::Kmeta as u8, "event {i} moved window");
+        assert_eq!(e.kind, Kind::Acquire as u8, "event {i} changed kind");
+        assert!(
+            e.tick >= last_tick,
+            "event {i} has tick {} after {last_tick} - the counter went backwards",
+            e.tick
+        );
+        last_tick = e.tick;
+    }
+    // The tick must actually *advance* across 300 records, not merely not-decrease: a
+    // constant timestamp would satisfy the ordering above and carry no information.
+    let first = r.get(0).expect("event 0").tick;
+    assert!(
+        last_tick > first,
+        "300 events all carry tick {first} - the timestamp is a constant"
+    );
+    println!(
+        "observe: {N} events recorded and read back field-for-field, ticks advancing \
+         ({} over the run) OK",
+        last_tick - first
+    );
+
+    // --- the ring wraps, and loss is located rather than counted ---------------
+    let cap = obs::ring::RING_EVENTS as u64;
+    for i in N..(cap + N + 17) {
+        obs::emit(Window::Frames, Kind::Note, 0, i, 0);
+    }
+    let total = cap + N + 17;
+    assert_eq!(obs::counters().0, total, "the ring stopped counting");
+    assert_eq!(
+        obs::overwritten(),
+        total - cap,
+        "overwritten should be everything past the ring's capacity"
+    );
+    // The oldest surviving event is exactly `total - cap`, and the one before it is
+    // gone. That is what "located" means: a reader is told which events it missed
+    // rather than how many.
+    assert_eq!(
+        r.oldest(),
+        total - cap,
+        "the surviving window moved wrongly"
+    );
+    assert!(
+        r.get(total - cap).is_some(),
+        "the oldest surviving event is not readable"
+    );
+    assert!(
+        r.get(total - cap - 1).is_none(),
+        "an overwritten event still reads back"
+    );
+    assert!(
+        r.get(total).is_none(),
+        "an event that has not been written reads back"
+    );
+    println!(
+        "observe: ring wrapped - {} of {total} events overwritten, survivors are \
+         [{}..{total}) and the record before them is gone OK",
+        total - cap,
+        total - cap
+    );
+
+    // --- and the frames come back ---------------------------------------------
+    obs::reset();
+    assert!(!obs::enabled(), "reset left recording on");
+    assert_eq!(obs::counters(), (0, 0), "reset left counters behind");
+    assert_eq!(
+        kernel::obs::root::windows(),
+        0,
+        "reset left the root advertising windows that are off"
+    );
+    assert_eq!(
+        pool_used(),
+        before,
+        "the ring did not give every frame back - a slot-handback path that is not \
+         also a release path is the S1' leak"
+    );
+    println!("observe: reset returned all {funded} frame(s) OK");
+}
+
+/// Frames taken out of the pool. `stats()` reports `(free, total)` and `total` is a
+/// constant, so the difference is the only thing that measures anything.
+fn pool_used() -> usize {
+    let (free, total) = frames::stats();
+    total - free
 }
 
 /// The four fields a reader checks before it trusts a single byte of the rest.
@@ -227,6 +410,28 @@ fn sections() {
         t.count as usize,
         kernel::telemetry::MAX_RING_CPUS,
         "the text-ring section advertises a different CPU count than the ring array has"
+    );
+    let rings = r
+        .section(obs::OBS_SEC_RINGS, 0)
+        .expect("the event rings are not published");
+    assert_eq!(
+        rings.count as usize,
+        kernel::smp::MAX_CPUS,
+        "the ring section advertises a different CPU count than the array has"
+    );
+    assert_eq!(
+        rings.stride as usize,
+        size_of::<kernel::obs::ring::ObsRing>(),
+        "the ring section's stride is not the per-CPU ring size, so a reader striding \
+         it lands between headers"
+    );
+    // A reader finds each CPU's header by striding from the section base, so the
+    // header must be at offset 0 of each element - the thing that makes the frame
+    // directory reachable without publishing a section per CPU.
+    assert_eq!(
+        core::mem::offset_of!(kernel::obs::ring::ObsRing, hdr),
+        0,
+        "the ring header is not at the start of the ring"
     );
     let h = r
         .section(obs::OBS_SEC_HISTOGRAMS, 0)

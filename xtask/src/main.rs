@@ -1320,21 +1320,36 @@ fn trace(arch: Arch, bin: &str, window: &str, ledger: bool) -> bool {
     );
 
     // Loss, located: a gap in the sequence is where the record is incomplete.
+    //
+    // **Per CPU**, because a sequence number is per-CPU monotone - each core has its
+    // own ring and its own counter (docs/OBSERVABILITY.md 11). Comparing consecutive
+    // lines of the merged stream, which is what this did while there was one shared
+    // counter, would report a gap at every point where the emitting core changed:
+    // pure noise on any multi-core boot, and this tool's own rule is that a
+    // diagnostic which cries wolf is worse than no diagnostic.
+    let mut cpus: Vec<u64> = evs.iter().map(|e| e.cpu).collect();
+    cpus.sort_unstable();
+    cpus.dedup();
     let mut gaps = 0usize;
-    for w in evs.windows(2) {
-        if w[1].seq != w[0].seq + 1 {
-            println!(
-                "  LOST  seq {}..{} ({} event(s) overwritten)",
-                w[0].seq,
-                w[1].seq,
-                w[1].seq - w[0].seq - 1
-            );
-            gaps += 1;
+    for c in &cpus {
+        let mut seqs: Vec<u64> = evs.iter().filter(|e| e.cpu == *c).map(|e| e.seq).collect();
+        seqs.sort_unstable();
+        for w in seqs.windows(2) {
+            if w[1] != w[0] + 1 {
+                println!(
+                    "  LOST  cpu{c} seq {}..{} ({} event(s) overwritten)",
+                    w[0],
+                    w[1],
+                    w[1] - w[0] - 1
+                );
+                gaps += 1;
+            }
         }
     }
     if gaps > 0 {
         println!(
-            "  ({gaps} gap(s) - the ring wrapped; raise `trace::CAPACITY` or narrow what is traced)"
+            "  ({gaps} gap(s) - a ring wrapped; raise `obs::ring::RING_EVENTS` or narrow \
+             what is traced)"
         );
     }
 
@@ -1548,6 +1563,7 @@ fn verify() -> bool {
     let drivers = [
         ("entity", "verify/entity/fuzz.rs"),
         ("telemetry", "verify/telemetry/fuzz.rs"),
+        ("obs", "verify/obs/fuzz.rs"),
         ("graph", "verify/graph/fuzz.rs"),
         ("hetero", "verify/hetero/fuzz.rs"),
     ];

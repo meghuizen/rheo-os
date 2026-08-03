@@ -475,12 +475,18 @@ impl ObsSection {
     };
 }
 
-/// The `[ObsRingHdr; n]` array, one entry per CPU. One section, `count` = CPUs.
-pub const OBS_SEC_RING_HDR: u32 = 1;
-/// One CPU's event-frame directory. `id` = CPU index, `va`/`pa` = the directory
-/// frame, `count` = populated entries. The entries are kernel VAs, so a host
-/// reader masks each with [`ObsRoot::va_base`].
-pub const OBS_SEC_RING_DIR: u32 = 2;
+/// The per-CPU event rings, one section for the whole array, `count` = CPUs and
+/// `stride` = the kernel's per-CPU ring struct.
+///
+/// Each element **begins** with an [`ObsRingHdr`], so a reader strides by `stride`
+/// and reads a header at each step without knowing what the kernel keeps after it.
+/// The event frames are reached from that header's `dir_pa`, rather than being
+/// published as sections of their own - which is not just fewer entries: a ring is
+/// funded lazily by the CPU that first emits on it, so per-directory sections would
+/// have to be appended to the root by whichever core got there first, and several
+/// cores racing to append to one section table is a hazard with nothing to gain.
+/// The header is written by its owning CPU, which is the only writer it can have.
+pub const OBS_SEC_RINGS: u32 = 1;
 /// The `[ObsCpu; n]` array. One section, `count` = CPUs.
 pub const OBS_SEC_CPU: u32 = 3;
 /// The `[ObsName; n]` table in `.rodata`.

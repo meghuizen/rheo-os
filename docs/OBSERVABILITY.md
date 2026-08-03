@@ -150,7 +150,7 @@ the cheapest shape that answers its own:
 | Plane | Question | Where | State |
 |---|---|---|---|
 | Text | what did it say | `kernel/src/telemetry.rs` | built (per-CPU, folding, host-fuzzed) |
-| Event | what happened, in order | `kernel/src/trace.rs` | built but **single-CPU**, 6 windows |
+| Event | what happened, in order | `kernel/src/obs/ring.rs` | built, **per-CPU** (S1); `trace.rs` is now a shim |
 | Distribution | how long did it take | `kernel/src/metrics.rs` | built; **6 of 8 metrics have no recorder** and no boot enables it |
 | Counter | how many | ~30 hand-written accessors | scattered, unindexed |
 | Snapshot | what is it doing **now** | - | not built; this is the htop data source |
@@ -244,10 +244,98 @@ Also landed here, as prerequisites rather than as their own claims: `repr(C)` on
 `smp::PerCpu<T>`, so that a reader outside the guest can stride those arrays with a
 guaranteed layout rather than one that happens to hold.
 
-### 11.3 Not built yet
+### 11.3 S1 - the per-CPU event ring (done, all three ISAs)
 
-Per-CPU event rings (closing `trace.rs`'s own single-CPU admission), the window
-mask and the eight new windows, the snapshot plane and per-CPU busy/idle
-accounting, the counter unification, lock instrumentation, syscall tracing, the
-capability gate on telemetry, egress beyond the serial console, the host tool, and
+`kernel/src/trace.rs` said what was wrong with it: the ring was "one shared buffer
+with a plain counter, so it is single-CPU today", and the fix was "deliberately not
+copied here until a multi-core boot wants to trace". This is that fix.
+`kernel/src/obs/ring.rs` is one ring per CPU, each with its own sequence counter,
+safe by **partitioning** rather than by hoping - the argument `telemetry` already
+made. `trace.rs` becomes a ~180-line shim: `Subsys`, `Kind`, `emit`, `enable`,
+`counters`, `dump` all keep their signatures and the `@E` format is unchanged,
+because `cargo xtask trace` parses it and `tests/src/smp.rs` asserts on it. Renaming
+a module is not a proof, so nothing was renamed.
+
+**Two design decisions were forced by writing the code**, and both are corrections to
+the plan rather than details of it.
+
+*Funding cannot happen on the emit path.* The plan said a CPU would fund its ring
+lazily on first emit. Funding allocates, allocation takes `mm::frames`' pool lock,
+and one of the recorded windows traces the allocator - so an emit that funded on
+demand could re-enter the frame allocator from inside it, on a lock that is not
+recursive. That is a deadlock, not a slow path, and it would appear only on the first
+event a boot ever recorded from that window. `fund_this_cpu()` is therefore a
+bring-up act and `emit` never allocates; a CPU with no ring counts its offered emits
+instead of losing them. One thing fell out for free: `fund` publishes `capacity`
+**last**, which was written so a reader could never see a funded ring pointing at
+nothing, and it also makes funding self-excluding - the allocator's own events see
+`capacity == 0` and land in the unfunded counter rather than in the ring being built.
+
+*The `@E` header changed and the host tool's gap detection had to.* A sequence number
+is now per-CPU monotone, and `cargo xtask trace` compared consecutive lines of the
+merged stream - which would report a gap at every point where the emitting core
+changed. Pure noise on any multi-core boot, and the tool's own rule is that a
+diagnostic which cries wolf is worse than none, so gaps are detected per CPU. Events
+are dumped in per-CPU blocks rather than merged on the tick: a k-way merge costs a
+scan of every cursor per line for an ordering the host can produce by sorting, and it
+would put a ~2.5 KiB working set on a kernel stack at the moment the machine is being
+inspected. Timestamps are converted to nanoseconds **here**, at the edge, relative to
+the plane's origin tick - which is the point of recording raw ticks at all.
+
+`trace::counters()` keeps returning `(written, lost)`, but the second number is
+**derived** now: a ring holds `RING_EVENTS`, so anything past that has been
+overwritten and no increment on the emit path is needed to know it. Same meaning as
+before - "a total computed from this dump would be incomplete", which is exactly what
+`smp`'s trace phase asserts - reached without an atomic read-modify-write per event.
+
+**Proof.** The `observe` kernel drives the plane end to end on all three ISAs: the
+ring funds from the real pool (**17 frames** - 16 data plus a directory, as designed),
+300 records come back **field-for-field** with real ticks advancing, the ring wraps
+and the surviving window is exactly `[total-cap, total)` with the record before it
+gone and the one after it not yet written, and reset returns all 17 frames.
+
+The multi-core claim - the whole reason this replaced a shared buffer - needs two
+cores, so it lives in `smp`. Two cores record 64 events each **at the same instant**
+(through `smp::run_fn_with_secondary`, which rendezvouses first so the overlap is
+real), and three things are asserted per ring rather than as a total: each ring took
+exactly its own core's 64; every record is found in the ring of the core that wrote
+it, identified by a tag in its own contents rather than by a count; and each stream's
+sequence numbers are consecutive, which is the property the host tool's loss detection
+rests on and the one a shared counter destroys. Observed: `cpu0` and `cpu2`, 128
+total, 17 offered to an unfunded ring (the secondary's own funding allocations,
+exactly), 34 frames returned.
+
+Controls, three firing and **one recorded as a non-result**:
+
+- Every CPU forced onto ring 0 - `trace.rs`'s own shape -> `the primary's ring took
+  145 of its 64 events`, which is 64 + 64 + 17 in one ring with the other empty. The
+  defect stated as arithmetic. Note what it is *not*: under TCG nothing was lost, so a
+  count of total events would have looked fine. What breaks is attribution.
+- The slot mask written `n & cap` instead of `n & (cap - 1)` -> the host fuzzer fails
+  four wrap cases and the release case by name.
+- `seq_of` made zero-based -> "a zeroed frame reads as a written event". Sequence
+  numbers are one-based because a funded frame arrives zeroed, so a `seq` of 0 must
+  mean "never written" rather than "written first".
+- **`ObsRing::get`'s sequence-number check does not fire**, measured rather than
+  assumed: removing it leaves every fuzzer case passing. Sequentially the bounds test
+  subsumes it, because nothing can recycle a slot between a bounds check and a read
+  when nothing else runs. It earns its keep only against a reader racing a live writer
+  on another core - which no built reader is yet - and reproducing that would mean
+  aliasing the ring mutably to model a data race the language forbids. Kept as what
+  makes the later collector and host tool sound, documented in `ring.rs` as reasoned
+  rather than proven.
+
+`verify/obs/fuzz.rs` is the host driver, included in `cargo xtask verify`. It checks
+the wrap against an independent `VecDeque` oracle at four starting points, including
+one that crosses **2^32** - which matters because the recorded sequence number is
+`head`'s low 32 bits, and four billion events is about 71 minutes at one event per
+microsecond. `u64` wrap is deliberately not tested: at one event per nanosecond it is
+584 years, so the ring does not claim to survive it and asserting that it does would
+be inventing a requirement.
+
+### 11.4 Not built yet
+
+The window mask and the eight new windows' call sites, the snapshot plane and per-CPU
+busy/idle accounting, the counter unification, lock instrumentation, syscall tracing,
+the capability gate on telemetry, egress beyond the serial console, the host tool, and
 the OTLP exporter cell. Dynamic probes remain the documented deferral of section 5.
