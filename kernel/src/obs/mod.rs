@@ -53,13 +53,21 @@ pub mod root;
 /// cost is supposed to be a load and a branch. The plan had named that as a control to
 /// run; writing it as a function call committed the defect instead.
 ///
-/// Expanding to `if on(w) { emit_now(...) }` puts the mask test outside the argument
+/// Expanding to `if on(w) { emit_packed(...) }` puts the mask test outside the argument
 /// expressions, and the measured delta went back to **zero**.
+/// Expanding to `if on(w) { emit_packed(pack_meta(...), a, b) }` also lets the
+/// window/kind constants **fold**: `pack_meta` is `const fn`, so a site with a
+/// constant owner passes the whole metadata word as one immediate - the ftrace
+/// `TRACE_EVENT` trick of assembling the header word at compile time.
 #[macro_export]
 macro_rules! obs_event {
     ($w:expr, $k:expr, $owner:expr, $a:expr, $b:expr) => {
         if $crate::obs::on($w) {
-            $crate::obs::emit_now($w, $k, $owner, $a, $b);
+            $crate::obs::emit_packed(
+                $crate::obs::ring::pack_meta($w as u8, $k as u8, $owner),
+                $a,
+                $b,
+            );
         }
     };
 }
@@ -267,7 +275,24 @@ pub fn fund_this_cpu() -> bool {
     // SAFETY: this CPU's own slot, and nothing else holds a reference to it across
     // this call - funding is a bring-up act, not something an emit re-enters.
     let r = unsafe { RINGS.this_mut() };
-    r.fund(cpu as u32, crate::arch::virt_to_phys)
+    if r.funded() {
+        return true;
+    }
+    // One contiguous block, so the emit path is `base + slot * 32` and a reader's
+    // job is a linear read - the allocation the ring's whole layout is built on
+    // (docs/OBSERVABILITY.md 11.4). The pool zeroes it, which the ring requires: an
+    // untouched slot is recognised by its zero sequence number. Allocated here
+    // rather than inside the ring so `obs/ring.rs` names nothing and stays
+    // host-drivable; freed in [`reset`], the matching release path.
+    let Some(pa) = crate::mm::frames::alloc_contig(ring::RING_PAGES) else {
+        return false;
+    };
+    r.fund(
+        cpu as u32,
+        crate::arch::phys_to_virt(pa),
+        crate::arch::virt_to_phys,
+    );
+    true
 }
 
 /// Stop recording and give every ring's frames back.
@@ -279,8 +304,16 @@ pub fn reset() {
     for i in 0..crate::smp::MAX_CPUS {
         // SAFETY: between runs, no secondary is executing.
         let r = unsafe { RINGS.get_mut(i) };
-        if r.funded() {
-            r.release();
+        let va = r.release();
+        if va == 0 {
+            continue;
+        }
+        // The block [`fund_this_cpu`] allocated, frame by frame: a contiguous run is
+        // not an object, just frames that happen to be adjacent, so the ordinary
+        // per-frame free is the whole teardown.
+        let pa = crate::arch::virt_to_phys(va);
+        for p in 0..ring::RING_PAGES {
+            crate::mm::frames::free(pa + p * crate::mm::frames::FRAME_SIZE);
         }
     }
 }
@@ -308,10 +341,15 @@ pub fn emit(window: Window, kind: Kind, owner: u16, a: u64, b: u64) {
     if !on(window) {
         return;
     }
-    emit_now(window, kind, owner, a, b);
+    emit_packed(ring::pack_meta(window as u8, kind as u8, owner), a, b);
 }
 
 /// Record one event **without** testing the mask - [`crate::obs_event!`]'s body.
+///
+/// Takes the metadata half pre-packed ([`ring::pack_meta`]) rather than as three
+/// fields, because at every call site the window and kind are compile-time
+/// constants: packed there, the constant half folds into one immediate and this
+/// function neither marshals three small arguments nor stores four sub-word fields.
 ///
 /// `#[inline(never)]` so a call site is a test and a call rather than the whole ring
 /// path inlined into it, and `#[cold]` because the two are not the same instruction:
@@ -321,18 +359,11 @@ pub fn emit(window: Window, kind: Kind, owner: u16, a: u64, b: u64) {
 /// `#[cold]` moves the whole path out of line and the delta went to **+1**.
 #[inline(never)]
 #[cold]
-pub fn emit_now(window: Window, kind: Kind, owner: u16, a: u64, b: u64) {
-    // SAFETY: this CPU's own ring; single producer by partitioning, and `push`
-    // re-enters nothing.
+pub fn emit_packed(meta: u64, a: u64, b: u64) {
+    // SAFETY: this CPU's own ring; single producer by partitioning, and
+    // `push_packed` re-enters nothing.
     let r = unsafe { RINGS.this_mut() };
-    r.push(
-        crate::arch::obs_tick(),
-        window as u8,
-        kind as u8,
-        owner,
-        a,
-        b,
-    );
+    r.push_packed(crate::arch::obs_tick(), meta, a, b);
 }
 
 /// `(events written, emits offered to an unfunded ring)`, summed over every CPU.

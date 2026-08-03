@@ -1327,9 +1327,13 @@ kernel.
   caught up to `GITS_CWRITER` after MAPD / MAPC / MAPTI / INV / SYNC), LPIs were
   enabled on the redistributor over a shared 8 KiB configuration table and a
   64 KiB-aligned per-core pending table - both statics, because the frame
-  allocator offers neither contiguity nor that alignment and adding a contiguous
+  allocator offered neither contiguity nor that alignment and adding a contiguous
   allocator for one device path would mean changing the tree's most
-  safety-critical allocator. It also turned up a real defect worth keeping in the
+  safety-critical allocator. (That calculus has since changed: the observability
+  event ring became the second caller to need contiguity, and
+  `frames::alloc_contig` now exists - docs/OBSERVABILITY.md 11.4 - so a returned
+  ITS can take its config table from the pool; the 64 KiB *alignment* is still
+  not offered and would be the one remaining addition.) It also turned up a real defect worth keeping in the
   record: `GITS_TYPER.PTA` is **0** on this machine, so `MAPC`'s `RDbase` is a
   *processor number* and not a redistributor address - and the symptom of getting
   that wrong is indistinguishable from getting everything else wrong, since the

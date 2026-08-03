@@ -36,131 +36,25 @@
 
 use std::collections::VecDeque;
 
-// --------------------------------------------------------------- host shims
+// ------------------------------------------------------------- host storage
 //
-// `Funded<T>` is a page-directory-backed table charged to a cell's frame budget
-// (kernel/src/mm/kmeta.rs). The methods below are every one `ring.rs` calls; a new
-// one appearing upstream is a compile error here rather than a silent divergence.
-// This is the same shim `verify/entity/fuzz.rs` uses, for the same reason: a host
-// process has no frame pool.
+// `ring.rs` is fully dependency-free now: it adopts a caller-allocated contiguous
+// block and computes physical addresses through a caller-supplied closure. So the
+// "shim" is one leaked, zeroed allocation - no `Funded` model at all, which is the
+// payoff of the contiguous-ring architecture (docs/OBSERVABILITY.md 11.4) landing
+// on the fuzzer too: less pretending, more of the shipped code under test.
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct Owner(u16);
-impl Owner {
-    pub const KERNEL: Owner = Owner(u16::MAX);
-}
-
-/// How many elements of `T` a 4 KiB frame holds - the real function's answer, since
-/// the ring publishes it and a wrong value would be a wrong published layout.
-pub const fn elems_per_page<T>() -> usize {
-    let size = std::mem::size_of::<T>();
-    if size == 0 || size > 4096 { 0 } else { 4096 / size }
-}
-
-/// Whether the shimmed pool will allow growth.
+/// A zeroed block the size the ring wants, leaked so its address is stable for the
+/// process's life (a fuzzer run allocates a handful).
 ///
-/// A property of the *pool*, kept here rather than as a test-only method on the ring:
-/// the kernel's `reserve` can refuse because the frame pool is exhausted, and a shim
-/// that always succeeds would never exercise the ring's "not funded, count the emit"
-/// path. Modelling that as a knob on the code under test would be the fuzzer
-/// changing the thing it is checking.
-static ALLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-fn set_pool_allows(v: bool) {
-    ALLOW.store(v, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// The shim models the **paged** layout, not a flat `Vec`.
-///
-/// It has to. `ObsRing::push` writes through the frame directory directly - reading
-/// `dir_va` as an array of frame addresses and indexing it - so a shim that returned a
-/// plausible-looking fake address for `dir_va` would have the code under test
-/// dereference a pointer to nothing. The first version did exactly that, and the
-/// fuzzer duly died the moment `push` stopped going through `set`. A shim is only
-/// worth anything if it presents the same shape as the thing it stands in for.
-pub struct Funded<T: Copy> {
-    /// One boxed slice per "frame", each holding `elems_per_page::<T>()` elements.
-    /// Boxed so the addresses stay put - `dir` holds pointers into them.
-    pages: Vec<Box<[T]>>,
-    /// The directory: one address per page, exactly what the kernel's directory frame
-    /// holds. Built once after every page exists, and never grown, so the pointers in
-    /// it cannot be invalidated by a reallocation.
-    dir: Vec<usize>,
-    cap: usize,
-}
-
-impl<T: Copy> Funded<T> {
-    pub const fn new() -> Funded<T> {
-        Funded {
-            pages: Vec::new(),
-            dir: Vec::new(),
-            cap: 0,
-        }
-    }
-    pub fn set_owner(&mut self, _owner: Owner) {}
-    pub fn reserve(&mut self, want: usize) -> bool {
-        if !ALLOW.load(std::sync::atomic::Ordering::Relaxed) {
-            return false;
-        }
-        if want <= self.cap {
-            return true;
-        }
-        let per = elems_per_page::<T>();
-        let need = want.div_ceil(per);
-        while self.pages.len() < need {
-            // The kernel grows into freshly allocated frames, which arrive zeroed -
-            // `mm::kmeta`'s stated contract on `T`. Reproducing it keeps the shim
-            // faithful to what the code under test sees, and it is what makes the
-            // "a zero sequence number means never written" rule testable.
-            let page: Vec<T> = (0..per).map(|_| unsafe { std::mem::zeroed() }).collect();
-            self.pages.push(page.into_boxed_slice());
-        }
-        self.dir = self.pages.iter().map(|p| p.as_ptr() as usize).collect();
-        self.cap = self.pages.len() * per;
-        true
-    }
-    pub fn release(&mut self) {
-        self.pages.clear();
-        self.dir.clear();
-        self.cap = 0;
-    }
-    pub fn capacity(&self) -> usize {
-        self.cap
-    }
-    pub fn pages(&self) -> usize {
-        self.pages.len()
-    }
-    pub fn dir_va(&self) -> usize {
-        if self.dir.is_empty() {
-            0
-        } else {
-            self.dir.as_ptr() as usize
-        }
-    }
-    pub fn page_va(&self, page: usize) -> usize {
-        self.dir.get(page).copied().unwrap_or(0)
-    }
-    pub fn get(&self, index: usize) -> Option<T> {
-        if index >= self.cap {
-            return None;
-        }
-        let per = elems_per_page::<T>();
-        Some(self.pages[index / per][index % per])
-    }
-    pub fn set(&mut self, index: usize, value: T) -> bool {
-        if index >= self.cap {
-            return false;
-        }
-        let per = elems_per_page::<T>();
-        self.pages[index / per][index % per] = value;
-        true
-    }
-}
-
-mod mm {
-    pub mod kmeta {
-        pub use crate::{Funded, Owner, elems_per_page};
-    }
+/// A `Vec<ObsEvent>` and not a `Vec<u64>`, because the ring requires its block
+/// aligned to the record (align 32 - the never-straddles-a-cache-line property) and
+/// the first version handed it a merely 8-aligned block: the debug-assertions build
+/// refused at the `read_volatile`, which is exactly the class of contract this
+/// driver exists to hold the shipped code - and its callers - to.
+fn ring_block() -> usize {
+    let v: Vec<ObsEvent> = vec![ObsEvent::default(); RING_EVENTS];
+    Box::leak(v.into_boxed_slice()).as_ptr() as usize
 }
 
 // The ABI module is dependency-free and `no_std`, so it includes as-is.
@@ -213,8 +107,9 @@ fn push_expected(r: &mut ObsRing, n: u64) {
 /// the wrap boundary is reachable.
 fn ring_model(seed: u64, start: u64, steps: usize) -> Result<(), String> {
     let mut r = ObsRing::new();
-    if !r.fund(3, |va| va & 0x0000_ffff_ffff_ffff) {
-        return Err("fund refused with an allowing shim".into());
+    r.fund(3, ring_block(), |va| va & 0x0000_ffff_ffff_ffff);
+    if !r.funded() {
+        return Err("fund did not adopt the block".into());
     }
     let cap = r.capacity() as u64;
     if cap != RING_EVENTS as u64 {
@@ -318,15 +213,12 @@ fn ring_model(seed: u64, start: u64, steps: usize) -> Result<(), String> {
 /// A ring the pool refused must record nothing, count every offered emit, and stay
 /// usable as a reader (answering `None`) rather than misbehaving.
 fn unfunded_model() -> Result<(), String> {
+    // The pool refusing IS the caller never calling `fund` - allocation lives with
+    // the caller now, so an unfunded ring is simply one that was never given a
+    // block, and the ring's own job is to count what it was offered meanwhile.
     let mut r = ObsRing::new();
-    set_pool_allows(false);
-    let funded = r.fund(1, |va| va);
-    set_pool_allows(true);
-    if funded {
-        return Err("fund succeeded against a refusing pool".into());
-    }
     if r.funded() {
-        return Err("a ring the pool refused reports itself funded".into());
+        return Err("a ring never given a block reports itself funded".into());
     }
     for i in 0..50 {
         push_expected(&mut r, i);
@@ -350,7 +242,7 @@ fn unfunded_model() -> Result<(), String> {
 /// A funded ring released must give everything back and behave like a fresh one.
 fn release_model() -> Result<(), String> {
     let mut r = ObsRing::new();
-    r.fund(0, |va| va);
+    r.fund(0, ring_block(), |va| va);
     for i in 0..(RING_EVENTS as u64 + 7) {
         push_expected(&mut r, i);
     }
@@ -365,7 +257,8 @@ fn release_model() -> Result<(), String> {
         return Err("a released ring returned an event".into());
     }
     // And it can be funded again - the between-runs path.
-    if !r.fund(0, |va| va) {
+    r.fund(0, ring_block(), |va| va);
+    if !r.funded() {
         return Err("re-funding a released ring refused".into());
     }
     push_expected(&mut r, 0);
@@ -386,7 +279,7 @@ fn zero_slot_model() -> Result<(), String> {
         return Err("seq_of(0) is 0, so a zeroed frame reads as a written event".into());
     }
     let mut r = ObsRing::new();
-    r.fund(0, |va| va);
+    r.fund(0, ring_block(), |va| va);
     push_expected(&mut r, 0);
     // Slot 1 has never been written and is still zero. `written` is 1, so `get(1)`
     // must be refused on the bounds - and `get` of a *stale* generation must be

@@ -401,18 +401,86 @@ An optimisation for a path taken one time in 128 was costing 15 instructions on 
 other 127. Inlining it recovered 6; deleting the cache entirely and indexing the
 directory directly recovered 14 more, and left `push` with a single `push %rbx`.
 
+**A second pass took the enabled path from 46 to 40, by doing what ftrace does.** The
+question that prompted it was the right one - Linux under PREEMPT_RT cannot afford a
+half-baked trace path, so what does it do that this did not? Point by point:
+
+| | Linux (tracepoints + ftrace ring buffer) | this plane |
+|---|---|---|
+| disabled site | a **patched NOP** (static keys rewrite kernel text) | load + test + branch, **3** |
+| record write | **in place, as words** - reserve/commit, no struct copy | was: build `ObsEvent`, 7 stores |
+| metadata | packed header word, constants folded at compile time | was: 4 sub-word fields, 3 register moves per site |
+| nesting | NMI-safe via a local cmpxchg, paid on every event | single producer per CPU, **no nesting cost** |
+| timestamp | delta-encoded TSC read | one raw counter read |
+
+Two of those rows were real gaps and both closed. `pack_meta` is a `const fn` packing
+owner/window/kind into the one u64 they occupy in the record's last eight bytes, so
+the constant half **folds into a single immediate at the call site** (a site with a
+constant owner passes the whole word as one `movabs`, replacing three register moves)
+- the `TRACE_EVENT` trick of assembling the header word at compile time. And
+`push_packed` writes the record **in place as four u64 stores** - tick, `a`, `b`,
+packed-word-or-sequence - where the first version built an `ObsEvent` and let the
+compiler copy it field by field, seven stores, four of them sub-word. On ARM64 the
+four pair into **two `stp` store-pair instructions**. The layout equivalence between
+the four words and the `ObsEvent` fields is a compile-time assertion on every field
+offset, plus a little-endian assertion so a big-endian port fails at the assumption
+rather than by decoding swapped fields.
+
+**The last of it took an architecture change, taken because this is greenfield.** The
+ring stored its events in `Funded` pages and paid a page split - a shift, a mask and a
+dependent directory load - per recorded event, purely because `mm::frames` had no
+contiguous allocation path. That absence was a choice made for good reasons (`Funded`
+exists so nothing needs contiguity), and it had already cost once before: the GICv3
+ITS work fell back to statics, recording "the frame allocator offers neither
+contiguity nor that alignment". With two real callers the admission test is met, so
+the pool grew **`frames::alloc_contig(n)`** - first-fit under the existing lock,
+zeroing exactly as `alloc` zeroes, freeing per-frame through the ordinary `free`, and
+refusing honestly under fragmentation rather than panicking. The ring is now **one
+contiguous 64 KiB block**: the emit path is `base + slot * 32` with nothing between
+the slot arithmetic and the stores, the published header carries one `base_pa` instead
+of a directory to walk (four ABI fields deleted), a host reader's job is a **linear
+read**, and `obs/ring.rs` now depends on *nothing* - the block, the tick and the
+physical address all arrive from the caller, so the host fuzzer's `Funded` shim was
+deleted outright and more of the shipped code runs under test. A funded ring is 16
+frames now where 11.3 reported 17: the directory frame is gone.
+
+Read from the disassembly afterwards, not assumed: the function is **22 instructions
+with no prologue at all** on x86-64, and every one is irreducible - the four stores,
+the head load and store, the counter read and its 3-instruction combine, the
+capacity guard, the slot arithmetic, one register save, `ret`.
+
 | | x86-64 | riscv64 | aarch64 (scaled) |
 |---|---|---|---|
 | `obs_emit_off` | 5 | 5 | ~4 |
-| `obs_emit_on` | **46** (was 60) | **47** (was 53) | **~40** (was ~52) |
+| `obs_emit_on` | **37** (was 60) | **40** (was 53) | **~33** (was ~52) |
 
 (`obs_emit_off` includes the benchmark's own two `black_box` loads, so the mask test is
-the 3 instructions above. aarch64's counter advances at 62 ticks per 1000 instructions,
-so its raw numbers are scaled by that calibration.) For scale, in the same run an
-interrupt entropy mix is **15** instructions and one `rng_next_u64` draw is **367** - so
-an enabled event is about an eighth of a single random number, and a disabled one is
-noise. Seven of the 46 are the record's own stores, which is the floor for a 32-byte
-record.
+the 3 instructions above; `obs_emit_on` likewise carries ~9 of bench harness - the
+function itself is 22. aarch64's counter advances at 62 ticks per 1000 instructions, so
+its raw numbers are scaled by that calibration.) For scale, in the same run an
+interrupt entropy mix is **15** instructions and one `rng_next_u64` draw is **367**.
+
+The alignment contract earned its keep immediately: `verify` builds with debug
+assertions on, and the first host run of the contiguous ring **fired the new
+`read_volatile` alignment check** - the fuzzer had handed it a `Vec<u64>` block, merely
+8-aligned, where `ObsEvent`'s align(32) (the never-straddles-a-cache-line property)
+demands 32. In the kernel the contract holds for free because frames are page-aligned,
+so no boot test could ever have caught a caller that broke it; `fund` now asserts it,
+and the fuzzer allocates the type it claims to hold.
+
+Where Linux still wins, named rather than matched: **the disabled site**. Static keys
+patch the branch to a NOP in the kernel text, so an off tracepoint costs ~0 against our
+3. Matching it means self-modifying kernel text - a write window over RX pages, and
+per-ISA I-cache/pipeline synchronisation (x86 needs the breakpoint-dance protocol,
+ARM64 cache maintenance plus ISB) - which is a large, security-sensitive mechanism to
+buy back three instructions that are already measured as noise. Refused for now, with
+this paragraph as the record of what it would take. Where Linux pays *more*, also
+named: its ring-buffer reserve/commit is nesting-safe against NMIs via a local
+cmpxchg on every event, because anything can trace inside anything there. This plane's
+producer is partitioned per CPU and the kernel takes interrupts only in its idle
+paths, so no emit can interrupt an emit today - the cost is not paid, and the
+constraint is stated in `obs/ring.rs` so the first design that lets a handler
+interrupt kernel-context code knows to revisit it.
 
 The append path is now the one place in the tree that writes through a `Funded`
 directory without `Funded`'s bounds check, and the cost of that is stated rather than

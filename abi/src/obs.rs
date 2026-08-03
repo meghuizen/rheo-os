@@ -199,13 +199,12 @@ const _: () = assert!(core::mem::align_of::<ObsEvent>() == 32);
 
 /// The published state of one CPU's event ring.
 ///
-/// One per CPU, in a plain array so a reader takes the whole set in one read.
-/// The events themselves live in frames reached through a [`Funded`-style]
-/// directory, because the frame allocator hands out one frame at a time and has
-/// no contiguous multi-frame path; `dir_pa` and `pages` are what let a reader
-/// walk them.
-///
-/// [`Funded`-style]: https://docs.rs/  <!-- kernel::mm::kmeta::Funded -->
+/// One per CPU, in a plain array so a reader takes the whole set in one read. The
+/// events are **one physically contiguous block** of `capacity` records at
+/// `base_pa`, so a reader's whole job is a linear read - no directory to walk, no
+/// page arithmetic to reproduce. Contiguity is also what the *writer's* hot path is
+/// built on: `base + slot * 32` with nothing between the slot arithmetic and the
+/// store (docs/OBSERVABILITY.md 11.4).
 #[repr(C, align(64))]
 pub struct ObsRingHdr {
     /// Free-running count of events *written*. The slot for event `n` is
@@ -230,16 +229,11 @@ pub struct ObsRingHdr {
     /// against the slot index, which is the ring-granularity replacement for a
     /// per-record CPU field.
     pub cpu: u32,
-    /// Kernel VA of the frame directory (an array of frame VAs).
-    pub dir_va: u64,
-    /// Physical address of that directory, so a host reader needs no translation
-    /// to take the first step.
-    pub dir_pa: u64,
-    /// Data frames held.
-    pub pages: u32,
-    /// Events per frame.
-    pub per_page: u32,
-    pub _rsv: [u64; 2],
+    /// Kernel VA of the event block.
+    pub base_va: u64,
+    /// Physical address of the same block, so a host reader needs no translation.
+    pub base_pa: u64,
+    pub _rsv: [u64; 3],
 }
 
 const _: () = assert!(core::mem::size_of::<ObsRingHdr>() == 64);
@@ -258,11 +252,9 @@ impl ObsRingHdr {
             unfunded: AtomicU64::new(0),
             capacity: 0,
             cpu: 0,
-            dir_va: 0,
-            dir_pa: 0,
-            pages: 0,
-            per_page: 0,
-            _rsv: [0; 2],
+            base_va: 0,
+            base_pa: 0,
+            _rsv: [0; 3],
         }
     }
 }
@@ -480,12 +472,12 @@ impl ObsSection {
 ///
 /// Each element **begins** with an [`ObsRingHdr`], so a reader strides by `stride`
 /// and reads a header at each step without knowing what the kernel keeps after it.
-/// The event frames are reached from that header's `dir_pa`, rather than being
-/// published as sections of their own - which is not just fewer entries: a ring is
-/// funded lazily by the CPU that first emits on it, so per-directory sections would
-/// have to be appended to the root by whichever core got there first, and several
-/// cores racing to append to one section table is a hazard with nothing to gain.
-/// The header is written by its owning CPU, which is the only writer it can have.
+/// The events are reached from that header's `base_pa` - one contiguous block per
+/// ring - rather than being published as sections of their own, which is not just
+/// fewer entries: a ring is funded by its own CPU when that CPU is asked to record,
+/// so per-ring sections would have cores racing to append to one section table, a
+/// hazard with nothing to gain. The header is written by its owning CPU, which is
+/// the only writer it can have.
 pub const OBS_SEC_RINGS: u32 = 1;
 /// The `[ObsCpu; n]` array. One section, `count` = CPUs.
 pub const OBS_SEC_CPU: u32 = 3;

@@ -387,6 +387,69 @@ pub fn alloc() -> Option<usize> {
     }
 }
 
+/// Allocate `n` **physically contiguous** zeroed frames, returning the first frame's
+/// PA, or `None`.
+///
+/// The pool deliberately had no contiguous path - `Funded` exists to stitch single
+/// frames precisely so nothing needs one - and two real callers have now asked
+/// anyway, which is the admission test for adding it. The GICv3 ITS work needed a
+/// contiguous 8 KiB config table and fell back to statics, recording "the frame
+/// allocator offers neither contiguity nor that alignment" (docs/SMP.md); and the
+/// observability event ring paid a page-split - a shift, a mask, and a dependent
+/// directory load - **per recorded event** to work around frames that were not
+/// adjacent (docs/OBSERVABILITY.md 11.4). A boot-time contiguous allocation deletes
+/// a hot-path cost, which is the right trade in that direction.
+///
+/// First-fit, and the failure mode is honest: external fragmentation can refuse an
+/// `n` that free-frame *count* suggests should fit, so a caller treats `None` as
+/// "degrade and count it", never as a panic. In practice the callers ask for tens of
+/// frames at bring-up from a pool of 131,072, where a refusal means something is
+/// deeply wrong anyway. Does not move [`alloc`]'s rotating hint, for `alloc_in`'s
+/// stated reason.
+///
+/// Freeing is per frame through the ordinary [`free`], `n` times - the run is not an
+/// object, just frames that happen to be adjacent, so no bookkeeping beyond each
+/// frame's own exists to get out of step.
+pub fn alloc_contig(n: usize) -> Option<usize> {
+    if n == 0 || n > POOL_FRAMES {
+        return None;
+    }
+    let _g = POOL_LOCK.lock();
+    // SAFETY: the pool lock is held, so no other core is mid-update.
+    unsafe {
+        assert!(
+            *core::ptr::addr_of!(INITIALIZED),
+            "frame allocator used before init"
+        );
+        let bitmap = &mut *core::ptr::addr_of_mut!(BITMAP);
+        let mut run = 0usize;
+        for frame in 0..POOL_FRAMES {
+            let (word, bit) = (frame / 64, frame % 64);
+            if bitmap[word] & (1 << bit) != 0 {
+                run = 0;
+                continue;
+            }
+            run += 1;
+            if run < n {
+                continue;
+            }
+            let first = frame + 1 - n;
+            for f in first..=frame {
+                let (w, b) = (f / 64, f % 64);
+                bitmap[w] |= 1 << b;
+                (*core::ptr::addr_of_mut!(REFS))[f] = 1;
+            }
+            *core::ptr::addr_of_mut!(USED) += n;
+            let pa = arch::FRAME_POOL_BASE + first * FRAME_SIZE;
+            // Zeroed exactly as `alloc` zeroes: callers' "a fresh frame is zero"
+            // contract must not depend on which allocation path produced it.
+            core::ptr::write_bytes(arch::phys_to_virt(pa) as *mut u8, 0, n * FRAME_SIZE);
+            return Some(pa);
+        }
+        None
+    }
+}
+
 /// (free frames, total frames) - the shell's `meminfo` builtin, the reservation
 /// memory floor, and the cell-allocation guard above.
 pub fn stats() -> (usize, usize) {

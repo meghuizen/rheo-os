@@ -1679,8 +1679,10 @@ pub fn exit(code: super::ExitCode) -> ! {
 //     queue drained, nothing delivered;
 //   - LPIs were enabled on the redistributor (`GICR_CTLR` bit 0 set) over a shared
 //     8 KiB configuration table and a 64 KiB-aligned per-core pending table, both
-//     statics because the frame allocator offers neither contiguity nor that
-//     alignment;
+//     statics because the frame allocator offered neither contiguity nor that
+//     alignment (contiguity it now has - `frames::alloc_contig`, added when the
+//     observability ring became the second caller to need it - so only the 64 KiB
+//     alignment remains missing for a return here);
 //   - and no LPI was ever taken.
 //
 // So the remaining question is which of the three mappings QEMU disagrees with, or
