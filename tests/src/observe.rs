@@ -94,16 +94,21 @@ fn snapshot() {
 
     let me = kernel::smp::cpu_index();
 
-    // ---- while the writers are off, nothing may have been stamped ----
-    // The suite so far has parked (the events phase waits on nothing, but boot
-    // paths may idle), entered no cell, and the writers were never enabled - so a
-    // nonzero here means a writer runs without its gate, which is exactly the
-    // cost regression the mask exists to prevent.
+    // ---- while the writers are off, nothing gated may have been stamped ----
+    // The suite so far has entered no cell and the writers were never enabled -
+    // so a nonzero here means a gated writer runs without its gate, which is
+    // exactly the cost regression the mask exists to prevent.
+    //
+    // `CTR_HALTS` is **deliberately no longer in this list** (S4): the halt and
+    // spin counts are the one unconditional counter `idle::halts()`/`spins()`
+    // read - mask or no mask - so "zero while off" stopped being their contract
+    // the moment the two copies became one. Their contract is asserted below
+    // instead: the *count* moves with snapshots off while the *time attribution*
+    // does not.
     for (slot, name) in [
         (CTR_BUSY_TICKS, "busy"),
         (CTR_IDLE_TICKS, "idle"),
         (CTR_DISPATCHES, "dispatches"),
-        (CTR_HALTS, "halts"),
     ] {
         assert_eq!(
             kobs::cpu_counter(me, slot),
@@ -118,6 +123,24 @@ fn snapshot() {
         "the group was written while snapshots were off"
     );
 
+    // ---- with snapshots OFF: a park moves the count, never the time ----
+    arch::enable_timer_irq();
+    let off_parks = kobs::cpu_counter(me, CTR_HALTS) + kobs::cpu_counter(me, CTR_SPINS);
+    ktimer::register(TimerClient::CellSleep, 1_000_000);
+    while !ktimer::expired(TimerClient::CellSleep) {
+        idle::wait(idle::TIMER);
+    }
+    assert!(
+        kobs::cpu_counter(me, CTR_HALTS) + kobs::cpu_counter(me, CTR_SPINS) > off_parks,
+        "a park with snapshots off moved neither the halt nor the spin count - \
+         the unconditional counter is behind a gate it must not be behind"
+    );
+    assert_eq!(
+        kobs::cpu_counter(me, CTR_IDLE_TICKS),
+        0,
+        "a park with snapshots off charged idle time - the gated writer leaked"
+    );
+
     kobs::enable_snapshots();
     assert!(kobs::snapshots_on(), "the snapshot bit did not latch");
     assert!(
@@ -126,7 +149,6 @@ fn snapshot() {
     );
 
     // ---- a real park charges idle, not busy ----
-    arch::enable_timer_irq();
     // First transition establishes the stamp; its interval is dropped by design.
     ktimer::register(TimerClient::CellSleep, 1_000_000);
     while !ktimer::expired(TimerClient::CellSleep) {

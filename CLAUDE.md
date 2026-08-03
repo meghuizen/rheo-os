@@ -3200,6 +3200,30 @@ cell per decision, each itself a context-table walk). Whole-matrix bench diff pu
 two questions about one element set are one walk; a struct's size is an interface, bench
 everything) recorded in docs/ENGINEERING.md 11.
 
+**And the machine's live state is a readable block, not a replay** (docs/OBSERVABILITY.md
+11.5-11.6, S3/S4): one `ObsCpu` per CPU - a seqlock'd coupled group (state, current
+cell/entity/vcore, since-when, the armed deadline in the arbiter's own ns domain, the
+receive tier) written only by the owning CPU at transitions it already passes through,
+plus 56 monotone counters outside the lock - published as `OBS_SEC_CPU` with a name table
+saying which slot means what. **Busy/idle is real measured time**: every transition
+charges `now - since` to busy, or to idle only when the park genuinely halted - a spin
+charges busy, never laundered - proven by `observe` on all three ISAs (a 20 ms park
+charges ~20 ms of idle ticks, judged through the root's published `tick_hz`) and the
+seqlock by `verify/obs` on real host threads (4.8M coherent reads racing 3M writes, zero
+torn; the bracket-deleted control caught within ~25k reads). A machine-wide `ObsMem`
+block is **filled on request** and stamped with when (`refreshed_tick`), never maintained
+by the allocators - a mirror-keeping store on the allocation hot path is the cost the
+design refuses. **S4 has begun**: the module counter statics migrate onto the plane's
+per-CPU slots - `net_rx`'s five (racy `static mut`s the moment a second core ran a
+receive wait), `input`'s three, and `idle`'s two, which were a double-report (`idle`'s
+own statics plus a gated bump in the snapshot writer - the same halt counted once or
+twice depending on the mask; one unconditional counter now, with `observe`'s
+zero-while-off assertion *moved deliberately*: the count moves with snapshots off, the
+time attribution does not). Every accessor keeps its signature and sums over CPUs, so the
+existing suite is the migration's exactness oracle; two controls fire by name, and one
+non-result is recorded - `netwait`'s stall-tolerance branch absorbs a misrouted spin-poll
+counter, so the control that stands is on an assertion with no tolerance.
+
 **One intermittent test was found and fixed** while gating the above: `rng`'s HID phase
 asserted `virtio_input::buffers_clear()` - every DMA buffer zero *after* a drain - and failed
 on riscv64 about one run in ten saying a drained event was still in the buffer, when what had

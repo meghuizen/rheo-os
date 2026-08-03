@@ -60,10 +60,34 @@ pub const CTR_BUSY_TICKS: usize = 0;
 pub const CTR_IDLE_TICKS: usize = 1;
 /// Entries into an execution entity (context switches into user work).
 pub const CTR_DISPATCHES: usize = 2;
-/// Parks that really halted the CPU.
+/// Parks that really halted the CPU. **Unconditional** (S4): bumped by the
+/// scheduler idle state itself, mask or no mask - `idle::halts()` reads this
+/// slot, and existing kernels assert it with recording off. What stays gated is
+/// the *time attribution* ([`CTR_IDLE_TICKS`]), which needs the seqlock'd group.
 pub const CTR_HALTS: usize = 3;
-/// Idle iterations that could not halt and spun instead.
+/// Idle iterations that could not halt and spun instead. Unconditional, as
+/// [`CTR_HALTS`] - `idle::spins()` reads it.
 pub const CTR_SPINS: usize = 4;
+/// NIC receive interrupts taken (`net_rx::on_irq`). Non-zero is proof a real
+/// device interrupt was delivered and serviced.
+pub const CTR_NET_IRQS: usize = 5;
+/// Receive-queue checks performed in the **hot** (bounded busy-poll) receive tier.
+pub const CTR_NET_SPIN_POLLS: usize = 6;
+/// Timer slices a receive wait halted for (warm + cold tiers).
+pub const CTR_NET_SLICES: usize = 7;
+/// Halts performed inside a receive wait (either idle mode).
+pub const CTR_NET_HALTS: usize = 8;
+/// Receive-tier escalations (hot -> warm, warm -> cold), summed over all waits.
+pub const CTR_NET_ESCALATIONS: usize = 9;
+/// Console bytes received (`input::rx_push`). The running count doubles as the
+/// sequence number handed to the entropy pool - never the byte itself.
+pub const CTR_CONSOLE_BYTES: usize = 10;
+/// Injected console bytes recovered from the UART FIFO because the interrupt
+/// did not deliver them. Zero on a healthy path.
+pub const CTR_PUMP_FIFO_TAKES: usize = 11;
+/// Injected console bytes pushed directly because neither the interrupt nor the
+/// FIFO produced them. Zero on a healthy path.
+pub const CTR_PUMP_DIRECT_PUSHES: usize = 12;
 
 /// One coherent reading of the coupled group.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -149,21 +173,40 @@ pub unsafe fn set_aux(c: *mut ObsCpu, timer_deadline_ns: Option<u64>, net_tier: 
     }
 }
 
-/// Add `delta` to counter `slot`. Not an atomic RMW: the owning CPU is the only
-/// writer, so a volatile read-add-write cannot lose an update, and a cross-core
-/// reader of an aligned u64 sees either the old or the new value.
+/// Add `delta` to counter `slot`, returning the new value. Not an atomic RMW:
+/// the owning CPU is the only writer, so a volatile read-add-write cannot lose
+/// an update, and a cross-core reader of an aligned u64 sees either the old or
+/// the new value. The return is free (the sum was just computed) and lets a
+/// caller that needs the running count - an interrupt handler feeding a
+/// sequence number to the entropy pool - avoid a second volatile read.
 ///
 /// # Safety
 /// `c` must be this CPU's own block.
-pub unsafe fn bump(c: *mut ObsCpu, slot: usize, delta: u64) {
+pub unsafe fn bump(c: *mut ObsCpu, slot: usize, delta: u64) -> u64 {
     if slot >= crate::abi::obs::OBS_COUNTERS {
-        return;
+        return 0;
     }
     // SAFETY: owning CPU; in-bounds by the check above.
     unsafe {
         let p = (&raw mut (*c).counters[0]).add(slot);
-        write_volatile(p, read_volatile(p).wrapping_add(delta));
+        let v = read_volatile(p).wrapping_add(delta);
+        write_volatile(p, v);
+        v
     }
+}
+
+/// Overwrite counter `slot` with `v`. **Between-runs only**: the single-writer
+/// rule means the owning CPU, and a reset path writing another CPU's slot is
+/// sound only where every other reset in the tree is - no secondary executing.
+///
+/// # Safety
+/// Either `c` is this CPU's own block, or no other CPU is executing.
+pub unsafe fn set(c: *mut ObsCpu, slot: usize, v: u64) {
+    if slot >= crate::abi::obs::OBS_COUNTERS {
+        return;
+    }
+    // SAFETY: caller's contract; in-bounds by the check above.
+    unsafe { write_volatile((&raw mut (*c).counters[0]).add(slot), v) }
 }
 
 /// Read counter `slot` - any core, torn-free because an aligned u64 load is

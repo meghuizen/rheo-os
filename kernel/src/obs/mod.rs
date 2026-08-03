@@ -513,38 +513,19 @@ pub fn snap_parked() {
 }
 
 /// This CPU came out of a park. `halted` is `idle::wait`'s own answer: a genuine
-/// halt charges the interval idle and counts a halt; a park that could not stop
-/// the CPU charges it **busy** and counts a spin - a spin is not idle, and
-/// recording it as idle would launder the one number this plane exists to make
-/// honest (docs/ENGINEERING.md 7).
+/// halt charges the interval idle; a park that could not stop the CPU charges it
+/// **busy** - a spin is not idle, and recording it as idle would launder the one
+/// number this plane exists to make honest (docs/ENGINEERING.md 7).
+///
+/// The halt/spin **counts** are not bumped here: since S4 they are the
+/// unconditional [`cpu::CTR_HALTS`]/[`cpu::CTR_SPINS`] slots, written by
+/// `idle::wait` itself whatever the mask says, because `idle::halts()`/`spins()`
+/// read them and existing kernels assert those with recording off. Bumping them
+/// here too would double-count every halt taken while snapshots are on.
 #[inline(always)]
 pub fn snap_unparked(halted: bool) {
     if snapshots_on() {
-        snap_unparked_cold(halted);
-    }
-}
-
-#[inline(never)]
-#[cold]
-fn snap_unparked_cold(halted: bool) {
-    // SAFETY: this CPU's own block.
-    unsafe {
-        let c = CPUS.this_mut() as *mut _;
-        cpu::transition(
-            c,
-            crate::abi::obs::OBS_CPU_KERNEL,
-            0,
-            0,
-            0,
-            crate::arch::obs_tick(),
-            halted,
-        );
-        let (slot, n) = if halted {
-            (cpu::CTR_HALTS, 1)
-        } else {
-            (cpu::CTR_SPINS, 1)
-        };
-        cpu::bump(c, slot, n);
+        snap_state_cold(crate::abi::obs::OBS_CPU_KERNEL, halted);
     }
 }
 
@@ -598,6 +579,41 @@ pub fn cpu_snap(i: usize) -> Option<cpu::CpuSnap> {
 pub fn cpu_counter(i: usize, slot: usize) -> u64 {
     // SAFETY: a live block; a torn u64 cannot occur on these ISAs.
     unsafe { cpu::counter(cpu_block(i), slot) }
+}
+
+/// Add `delta` to counter `slot` on **this CPU's** block, returning the new value.
+///
+/// **Unconditional** - not behind any mask bit - because the counters migrated
+/// here (S4) replace module statics whose accessors existing test kernels assert
+/// with recording off; a counter that only counts while observability is enabled
+/// is a different quantity wearing the same name. The cost is what the statics
+/// cost: one volatile read-add-write on this core's own line, no lock, so an
+/// interrupt handler can never wait on it.
+#[inline]
+pub fn cpu_bump(slot: usize, delta: u64) -> u64 {
+    // SAFETY: this CPU's own block; single writer by partitioning.
+    unsafe { cpu::bump(CPUS.this_mut() as *mut _, slot, delta) }
+}
+
+/// Counter `slot` summed over every CPU - what a module-level accessor reports
+/// on a machine where any core may have done the work. On a single-CPU boot this
+/// is byte-for-byte the old static (every other block reads zero).
+pub fn cpu_counter_sum(slot: usize) -> u64 {
+    let mut total = 0u64;
+    for i in 0..crate::smp::MAX_CPUS {
+        total = total.wrapping_add(cpu_counter(i, slot));
+    }
+    total
+}
+
+/// Zero counter `slot` on every CPU - the module `reset()` paths' half of the
+/// migration, under the same contract those resets already state: between runs,
+/// no secondary executing.
+pub fn cpu_counter_clear(slot: usize) {
+    for i in 0..crate::smp::MAX_CPUS {
+        // SAFETY: between runs, no secondary is executing (the callers' contract).
+        unsafe { cpu::set(CPUS.get_mut(i) as *mut _, slot, 0) };
+    }
 }
 
 /// Kernel VA of the per-CPU snapshot array, for the root to publish.
@@ -666,7 +682,7 @@ pub fn mem_va() -> usize {
 /// The published name table: which counter slot means what, as runtime data
 /// rather than an ABI contract, so a reader never guesses at an unnamed slot
 /// (`abi::obs::OBS_SEC_NAMES`).
-static NAMES: [crate::abi::obs::ObsName; 5] = {
+static NAMES: [crate::abi::obs::ObsName; 13] = {
     use crate::abi::obs::{OBS_NAME_COUNTER, ObsName};
     [
         ObsName::new(OBS_NAME_COUNTER, cpu::CTR_BUSY_TICKS as u32, "busy_ticks"),
@@ -674,6 +690,38 @@ static NAMES: [crate::abi::obs::ObsName; 5] = {
         ObsName::new(OBS_NAME_COUNTER, cpu::CTR_DISPATCHES as u32, "dispatches"),
         ObsName::new(OBS_NAME_COUNTER, cpu::CTR_HALTS as u32, "halts"),
         ObsName::new(OBS_NAME_COUNTER, cpu::CTR_SPINS as u32, "spins"),
+        ObsName::new(OBS_NAME_COUNTER, cpu::CTR_NET_IRQS as u32, "net_rx_irqs"),
+        ObsName::new(
+            OBS_NAME_COUNTER,
+            cpu::CTR_NET_SPIN_POLLS as u32,
+            "net_spin_polls",
+        ),
+        ObsName::new(
+            OBS_NAME_COUNTER,
+            cpu::CTR_NET_SLICES as u32,
+            "net_timer_slices",
+        ),
+        ObsName::new(OBS_NAME_COUNTER, cpu::CTR_NET_HALTS as u32, "net_halts"),
+        ObsName::new(
+            OBS_NAME_COUNTER,
+            cpu::CTR_NET_ESCALATIONS as u32,
+            "net_escalations",
+        ),
+        ObsName::new(
+            OBS_NAME_COUNTER,
+            cpu::CTR_CONSOLE_BYTES as u32,
+            "console_bytes",
+        ),
+        ObsName::new(
+            OBS_NAME_COUNTER,
+            cpu::CTR_PUMP_FIFO_TAKES as u32,
+            "pump_fifo_takes",
+        ),
+        ObsName::new(
+            OBS_NAME_COUNTER,
+            cpu::CTR_PUMP_DIRECT_PUSHES as u32,
+            "pump_direct_pushes",
+        ),
     ]
 };
 

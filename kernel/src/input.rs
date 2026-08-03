@@ -102,9 +102,13 @@ pub fn reset() {
         *addr_of_mut!(RING) = RxRing::new();
         *addr_of_mut!(SOURCE) = Source::Serial;
         *addr_of_mut!(IDLED) = false;
-        *addr_of_mut!(FIFO_TAKES) = 0;
-        *addr_of_mut!(DIRECT_PUSHES) = 0;
     }
+    // The pump-tier counts live in the observability plane (S4). The byte
+    // sequence (`CTR_CONSOLE_BYTES`) is deliberately *not* cleared, matching the
+    // old `RX_SEQ`: it is an entropy sequence number, and monotonicity across
+    // runs costs nothing.
+    crate::obs::cpu_counter_clear(crate::obs::cpu::CTR_PUMP_FIFO_TAKES);
+    crate::obs::cpu_counter_clear(crate::obs::cpu::CTR_PUMP_DIRECT_PUSHES);
 }
 
 /// Install a scripted input source (deterministic headless tests). The script
@@ -144,10 +148,6 @@ pub fn scripted() -> bool {
     matches!(unsafe { &*core::ptr::addr_of!(SOURCE) }, Source::Script(..))
 }
 
-/// Console bytes seen, used only as the sequence number handed to the entropy
-/// pool - never the byte itself.
-static mut RX_SEQ: u64 = 0;
-
 /// Push a received byte into the RX ring - the UART RX interrupt handler's sink
 /// (and the poll path's). Portable so per-ISA trap code never names the ring.
 pub fn rx_push(b: u8) {
@@ -156,13 +156,9 @@ pub fn rx_push(b: u8) {
     // itself is deliberately *not* passed: `feed_hid` reads the cycle counter and
     // takes only a sequence number, so console input cannot leak into the entropy
     // path as content. The timing is the entropy; the character is what a person
-    // typed.
-    // SAFETY: a counter this module owns; the same single-CPU-at-a-time
-    // discipline as the ring beside it.
-    let seq = unsafe {
-        RX_SEQ = (*addr_of!(RX_SEQ)).wrapping_add(1);
-        *addr_of!(RX_SEQ)
-    };
+    // typed. The count is this core's `CTR_CONSOLE_BYTES` slot (S4), and the
+    // returned running count is the sequence number.
+    let seq = crate::obs::cpu_bump(crate::obs::cpu::CTR_CONSOLE_BYTES, 1);
     crate::rng::feed_hid(seq);
     ring().push(b);
 }
@@ -213,31 +209,23 @@ pub fn at_eof() -> bool {
     }
 }
 
-/// How [`pump`]'s injected byte actually reached the ring, counted per tier.
-/// **Measured, not claimed**: a non-zero `FIFO_TAKES` means the interrupt did not
-/// deliver it and a non-zero `DIRECT_PUSHES` means the wire had nothing either -
-/// precisely the facts the old code inferred away.
-static mut FIFO_TAKES: u64 = 0;
-static mut DIRECT_PUSHES: u64 = 0;
-
-fn bump(p: *mut u64) {
-    // SAFETY: single CPU, synchronous; a plain counter.
-    unsafe { *p = (*p).wrapping_add(1) };
-}
+// How [`pump`]'s injected byte actually reached the ring is counted per tier in
+// the observability plane (`obs::cpu`, S4). **Measured, not claimed**: a non-zero
+// fifo-take count means the interrupt did not deliver it and a non-zero
+// direct-push count means the wire had nothing either - precisely the facts the
+// old code inferred away.
 
 /// Times [`pump`] had to recover an injected byte from the UART RX FIFO because
 /// the interrupt did not deliver it. Zero on a healthy path.
 pub fn pump_fifo_takes() -> u64 {
-    // SAFETY: single CPU.
-    unsafe { *addr_of!(FIFO_TAKES) }
+    crate::obs::cpu_counter_sum(crate::obs::cpu::CTR_PUMP_FIFO_TAKES)
 }
 
 /// Times [`pump`] had to push an injected byte into the ring itself, because
 /// neither the interrupt nor the FIFO produced it. Zero on a healthy path, and one
 /// console line per occurrence says so.
 pub fn pump_direct_pushes() -> u64 {
-    // SAFETY: single CPU.
-    unsafe { *addr_of!(DIRECT_PUSHES) }
+    crate::obs::cpu_counter_sum(crate::obs::cpu::CTR_PUMP_DIRECT_PUSHES)
 }
 
 /// What [`pump`] achieved.
@@ -308,7 +296,7 @@ pub fn pump() -> Pump {
             }
             // The interrupt did not deliver it. On a 16550 the loopback byte is
             // still sitting in the RX FIFO, so recover it from the wire.
-            bump(addr_of_mut!(FIFO_TAKES));
+            crate::obs::cpu_bump(crate::obs::cpu::CTR_PUMP_FIFO_TAKES, 1);
             if let Some(got) = crate::arch::serial_read_byte() {
                 rx_push(got);
                 return Pump::Data;
@@ -319,7 +307,7 @@ pub fn pump() -> Pump {
             // this one can recover it. Dropping the keystroke would be a silent
             // wrong answer; the printed line plus `pump_direct_pushes` is how a
             // degraded interrupt path stays visible instead of being papered over.
-            bump(addr_of_mut!(DIRECT_PUSHES));
+            crate::obs::cpu_bump(crate::obs::cpu::CTR_PUMP_DIRECT_PUSHES, 1);
             crate::println!(
                 "input: the UART RX interrupt did not deliver an injected byte and the FIFO was \
                  empty - delivered directly (interrupt path degraded)"

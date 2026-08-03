@@ -251,8 +251,15 @@ impl RxPolicy {
     }
 }
 
-/// Interrupts taken from the NIC (incremented by [`on_irq`]).
-static mut IRQS: u64 = 0;
+// The **counts** - interrupts, spin polls, slices, halts, escalations - live in
+// the observability plane's per-CPU counter block (`obs::cpu`, S4 of
+// docs/OBSERVABILITY.md 11) rather than in module statics: the old `static mut`s
+// were racy the moment a second core ran a receive wait, and the plane's blocks
+// are single-writer per CPU by construction. The accessors below keep their
+// signatures and sum over CPUs, so every existing assertion is the migration's
+// exactness oracle. What stays here is **state**, not counts: the flag, the mode,
+// the profile, the hot deadline, the tier.
+
 /// Whether a wait halted the CPU (either idle mode).
 static mut IDLED: bool = false;
 /// The mode the most recent [`wait_frame`] used.
@@ -261,14 +268,6 @@ static mut MODE: IdleMode = IdleMode::None;
 static mut PROFILE: RxProfile = RxProfile::Edge;
 /// Monotonic ns (timer domain) until which the link counts as **hot**.
 static mut HOT_UNTIL_NS: u64 = 0;
-/// Receive-queue checks done in the hot (busy-poll) tier.
-static mut SPIN_POLLS: u64 = 0;
-/// Timer slices halted for (warm + cold).
-static mut SLICES: u64 = 0;
-/// Halts performed inside a receive wait (either idle mode).
-static mut HALTS: u64 = 0;
-/// Tier transitions observed (hot->warm, warm->cold), summed over all waits.
-static mut ESCALATIONS: u64 = 0;
 /// The tier the most recent wait ended in.
 static mut TIER: RxTier = RxTier::None;
 
@@ -276,15 +275,19 @@ static mut TIER: RxTier = RxTier::None;
 pub fn reset() {
     // SAFETY: single CPU, between runs.
     unsafe {
-        *addr_of_mut!(IRQS) = 0;
         *addr_of_mut!(IDLED) = false;
         *addr_of_mut!(MODE) = IdleMode::None;
         *addr_of_mut!(HOT_UNTIL_NS) = 0;
-        *addr_of_mut!(SPIN_POLLS) = 0;
-        *addr_of_mut!(SLICES) = 0;
-        *addr_of_mut!(HALTS) = 0;
-        *addr_of_mut!(ESCALATIONS) = 0;
         *addr_of_mut!(TIER) = RxTier::None;
+    }
+    for slot in [
+        crate::obs::cpu::CTR_NET_IRQS,
+        crate::obs::cpu::CTR_NET_SPIN_POLLS,
+        crate::obs::cpu::CTR_NET_SLICES,
+        crate::obs::cpu::CTR_NET_HALTS,
+        crate::obs::cpu::CTR_NET_ESCALATIONS,
+    ] {
+        crate::obs::cpu_counter_clear(slot);
     }
     ktimer::cancel(TimerClient::RxPoll);
     ktimer::cancel(TimerClient::RxDeadline);
@@ -344,8 +347,7 @@ pub fn idle_mode() -> IdleMode {
 /// interrupt was genuinely delivered and serviced (it cannot be faked: the
 /// handler runs from the ISA's interrupt vector).
 pub fn irq_count() -> u64 {
-    // SAFETY: single CPU.
-    unsafe { *addr_of!(IRQS) }
+    crate::obs::cpu_counter_sum(crate::obs::cpu::CTR_NET_IRQS)
 }
 
 /// Whether a [`wait_frame`] call halted the CPU (at WFI / `hlt`) while waiting for a
@@ -360,28 +362,24 @@ pub fn did_idle() -> bool {
 
 /// Receive-queue checks performed in the **hot** (bounded busy-poll) tier.
 pub fn spin_polls() -> u64 {
-    // SAFETY: single CPU.
-    unsafe { *addr_of!(SPIN_POLLS) }
+    crate::obs::cpu_counter_sum(crate::obs::cpu::CTR_NET_SPIN_POLLS)
 }
 
 /// Timer slices a receive wait halted for (warm + cold tiers). With [`halts`] this
 /// is the measurable duty cycle: slices * slice length vs the wait's wall time.
 pub fn timer_slices() -> u64 {
-    // SAFETY: single CPU.
-    unsafe { *addr_of!(SLICES) }
+    crate::obs::cpu_counter_sum(crate::obs::cpu::CTR_NET_SLICES)
 }
 
 /// Halts performed inside a receive wait (a `wfi`/`hlt`, either idle mode).
 pub fn halts() -> u64 {
-    // SAFETY: single CPU.
-    unsafe { *addr_of!(HALTS) }
+    crate::obs::cpu_counter_sum(crate::obs::cpu::CTR_NET_HALTS)
 }
 
 /// Tier transitions (hot -> warm, warm -> cold) summed over all waits: the
 /// observable proof that the escalation actually happened.
 pub fn escalations() -> u64 {
-    // SAFETY: single CPU.
-    unsafe { *addr_of!(ESCALATIONS) }
+    crate::obs::cpu_counter_sum(crate::obs::cpu::CTR_NET_ESCALATIONS)
 }
 
 /// The tier the most recent wait ended in.
@@ -424,15 +422,13 @@ pub fn note_activity() {
 /// re-entered mid-operation.
 pub fn on_irq() {
     crate::hw::virtio_net::ack_irq();
-    // SAFETY: single CPU; the handler cannot overlap itself.
-    unsafe {
-        *addr_of_mut!(IRQS) = (*addr_of!(IRQS)).wrapping_add(1);
-    }
-    // When a frame arrived is a real, unpredictable quantity. Mixed into the
-    // entropy pool, never counted (docs/TIME-IDENTITY.md 4a). Two atomic
-    // operations - a handler must never wait for the pool lock.
-    // SAFETY: reading the counter we just wrote, on this CPU.
-    crate::rng::feed_interrupt(unsafe { *addr_of!(IRQS) }, 0);
+    // The count goes to this core's own counter block - one volatile
+    // read-add-write, no lock, so a handler can never wait on it. The returned
+    // running count doubles as the entropy sequence number: when a frame arrived
+    // is a real, unpredictable quantity, mixed into the pool and never counted
+    // (docs/TIME-IDENTITY.md 4a).
+    let n = crate::obs::cpu_bump(crate::obs::cpu::CTR_NET_IRQS, 1);
+    crate::rng::feed_interrupt(n, 0);
     // The interrupt window (docs/OBSERVABILITY.md 11.4). `a` is the arrival count, so
     // a reader gets the rate from two records and their ticks without the kernel
     // dividing anything, and `b` names which line it was - here the NIC's receive.
@@ -445,8 +441,7 @@ pub fn on_irq() {
         crate::obs::Window::Irq,
         crate::obs::Kind::Note,
         crate::obs::OWNER_KERNEL,
-        // SAFETY: reading the counter this handler just wrote, on this CPU.
-        unsafe { *addr_of!(IRQS) },
+        n,
         IRQ_LINE_NET_RX
     );
     note_activity();
@@ -535,10 +530,7 @@ pub fn wait_frame(buf_va: u64, len: usize, timeout_ns: u64) -> usize {
         let next = policy.tier(spin_budget, spins, slices);
         if next != cur_tier {
             if cur_tier != RxTier::None {
-                // SAFETY: single CPU.
-                unsafe {
-                    *addr_of_mut!(ESCALATIONS) = (*addr_of!(ESCALATIONS)).wrapping_add(1);
-                }
+                crate::obs::cpu_bump(crate::obs::cpu::CTR_NET_ESCALATIONS, 1);
             }
             cur_tier = next;
             // SAFETY: single CPU.
@@ -550,10 +542,7 @@ pub fn wait_frame(buf_va: u64, len: usize, timeout_ns: u64) -> usize {
 
         if next == RxTier::Hot {
             spins += 1;
-            // SAFETY: single CPU.
-            unsafe {
-                *addr_of_mut!(SPIN_POLLS) = (*addr_of!(SPIN_POLLS)).wrapping_add(1);
-            }
+            crate::obs::cpu_bump(crate::obs::cpu::CTR_NET_SPIN_POLLS, 1);
             core::hint::spin_loop();
             continue;
         }
@@ -579,10 +568,7 @@ pub fn wait_frame(buf_va: u64, len: usize, timeout_ns: u64) -> usize {
                 // Count the slice - and claim the idle - only when the park really
                 // halted the CPU, so `did_idle`/`timer_slices` never overstate.
                 if ktimer::park(false) {
-                    // SAFETY: single CPU.
-                    unsafe {
-                        *addr_of_mut!(SLICES) = (*addr_of!(SLICES)).wrapping_add(1);
-                    }
+                    crate::obs::cpu_bump(crate::obs::cpu::CTR_NET_SLICES, 1);
                     mark_halt();
                 }
                 // Release our slice; the arbiter re-arms whatever else is pending
@@ -664,8 +650,8 @@ fn mark_halt() {
     // SAFETY: single CPU.
     unsafe {
         *addr_of_mut!(IDLED) = true;
-        *addr_of_mut!(HALTS) = (*addr_of!(HALTS)).wrapping_add(1);
     }
+    crate::obs::cpu_bump(crate::obs::cpu::CTR_NET_HALTS, 1);
 }
 
 /// Kernel-side twin of [`wait_frame`] over a **kernel-owned** slice: the

@@ -565,8 +565,9 @@ arithmetic check's first version said "half each" for 4999 odd and 5000 even
 intervals, and the counters refuted it - the failing assertion was the hand
 computation, not the code.
 
-Proven in-QEMU by `observe`'s snapshot phase on all three ISAs: everything zero
-while the writers are off (a nonzero would mean a writer escaped its gate), a
+Proven in-QEMU by `observe`'s snapshot phase on all three ISAs: every gated
+counter zero while the writers are off (a nonzero would mean a writer escaped its
+gate; the halt/spin counts left this list when S4 made them unconditional - 11.6), a
 **20 ms park charges ~20 ms of idle ticks** (19.93M of 20M expected on x86-64,
 judged through the root's own published `tick_hz` - the bound proves attribution,
 not timer precision), a real U-mode cell entry writes the group and counts a
@@ -587,9 +588,66 @@ without a refresh would mean an allocator is keeping the mirror warm, the cost
 the design refuses). Per-node used/total breakdowns wait on per-node counters in
 `frames` itself, which is S4-adjacent work, named rather than approximated.
 
-### 11.6 Not built yet
+### 11.6 S4 - counter unification (begun: `net_rx`, `input`, `idle`)
 
-The per-node memory breakdown, the counter unification, the `Net`/`Gpu`/`Lock`
-windows with their device and lock instrumentation, the capability gate on
-telemetry, egress beyond the serial console, the host tool, and the OTLP
-exporter cell. Dynamic probes remain the documented deferral of section 5.
+**One counter, wherever a count had two homes or none safe.** The counter plane is
+`ObsCpu`'s 56 slots plus three helpers - `obs::cpu_bump` on this CPU's own block
+(returning the running count, so an interrupt handler that needs a sequence number
+pays no second read), `cpu_counter_sum` over every CPU, and `cpu_counter_clear` for
+the reset paths - and the migration rule is the plan row's own: **every accessor
+keeps its signature**, so the existing suite's assertions on those accessors are the
+migration's exactness oracle. Bumps are **unconditional**, not behind any mask bit,
+because the kernels asserting these counts never enable recording - a counter that
+only counts while observability is on is a different quantity wearing the same name.
+The cost is what the statics cost (one volatile read-add-write on the owning core's
+own line, no lock), and where the old counter was one global `static mut` bumped
+from whichever core ran the path - racy the moment a second core did - the per-CPU
+slots make the SMP case correct and cheaper at once.
+
+Migrated: `net_rx`'s five (NIC irqs - whose running count doubles as the entropy
+sequence number - spin polls, timer slices, halts, escalations), `input`'s three
+(console bytes / entropy sequence, pump FIFO takes, pump direct pushes), and
+`idle`'s two, which were the **double-report** the plan named: `idle` kept its own
+unconditional statics while `obs::snap_unparked` bumped `CTR_HALTS`/`CTR_SPINS`
+behind the mask, so the same halt counted once or twice depending on a bit. One
+counter now - `idle::wait` bumps the plane slots unconditionally and the snapshot
+writer keeps only the gated *time attribution* - and `observe`'s zero-while-off
+assertion **moved deliberately rather than being weakened**: halts left the zero
+list, and a new bracket parks with snapshots off and asserts the count moves while
+`CTR_IDLE_TICKS` stays zero, the split contract (count unconditional, time gated)
+asserted as itself.
+
+Three controls, two firing and one honest non-result. Misrouting the NIC-irq bump
+into the halts slot fails `netwait` by name on aarch64 ("interrupt-driven ISA but
+the kernel never took a NIC interrupt"); gating the idle bumps behind the mask - the
+wrong unification - fails `observe`'s new bracket by name. The first control
+attempted, misrouting the hot-tier spin-poll bump, **did not fire**: `netwait` has a
+stall-tolerance branch that reads 0 spins as "the guest was stalled past the
+busy-poll budget" and skips exactly the assertions that would have caught it.
+Recorded rather than shrugged off - a control a tolerance branch can absorb proves
+nothing, which is why the control that stands is on a counter whose assertion has no
+tolerance.
+
+Reset topology was checked before the move, not after: `obs::reset` (which zeroes
+whole blocks) and the module `reset()`s are called by **disjoint kernels**, so the
+plane clearing between runs changes no kernel's observations, and each module reset
+clears exactly its own slots through `cpu_counter_clear` under the same between-runs
+contract every reset in the tree already states. `input`'s byte sequence is
+deliberately not cleared, matching the old `RX_SEQ`: it is an entropy sequence
+number, and monotonicity across runs costs nothing.
+
+Still to migrate (the rest of the plan row): the arbiter's arms/firings/parks/
+preserved, sched/user/smp's dispatch/preemption/claim counters, and the
+frames/nvme/block/load/mm/rng::entropy families - each a mechanical repetition of
+the proven pattern, gated per module. Deliberately **not** migrating: gauges
+(`kmeta::META_FRAMES`, the pool's `USED` - the plane's slots are monotone counters,
+and a gauge in a counter slot invites rate arithmetic over a non-rate), config
+statics (profiles, VAs, search hints), and per-cell Linux-personality state, which
+is per *cell* rather than per CPU and lives behind `plock`.
+
+### 11.7 Not built yet
+
+The per-node memory breakdown, the rest of the counter unification (11.6), the
+`Net`/`Gpu`/`Lock` windows with their device and lock instrumentation, the
+capability gate on telemetry, egress beyond the serial console, the host tool, and
+the OTLP exporter cell. Dynamic probes remain the documented deferral of section 5.
