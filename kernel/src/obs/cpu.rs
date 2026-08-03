@@ -88,6 +88,34 @@ pub const CTR_PUMP_FIFO_TAKES: usize = 11;
 /// Injected console bytes pushed directly because neither the interrupt nor the
 /// FIFO produced them. Zero on a healthy path.
 pub const CTR_PUMP_DIRECT_PUSHES: usize = 12;
+/// Queue-driven picks (`sched::dispatch`).
+pub const CTR_SCHED_PICKS: usize = 13;
+/// Round-robin picks (queue-driven dispatch off or not applicable).
+pub const CTR_SCHED_RR_PICKS: usize = 14;
+/// Picks where the queue chose a different cell than round-robin would have -
+/// the only direct evidence the queue changed the order.
+pub const CTR_SCHED_DIVERGED: usize = 15;
+/// Nanoseconds of CPU time charged to vcores at their transitions.
+pub const CTR_SCHED_CHARGED_NS: usize = 16;
+/// Return-to-user re-arm sites reached (`sched::dispatch`, stage E5).
+pub const CTR_SCHED_REARM_CALLS: usize = 17;
+/// Of those, how many found no running record - "not reached" and "reached and
+/// declined" are different defects.
+pub const CTR_SCHED_REARM_NO_RECORD: usize = 18;
+/// Preemption slices armed (`sched::preempt`).
+pub const CTR_PREEMPT_ARMED: usize = 19;
+/// Preemptions actually taken.
+pub const CTR_PREEMPT_TAKEN: usize = 20;
+/// Slices that could not be armed (no wired timer interrupt).
+pub const CTR_PREEMPT_UNARMABLE: usize = 21;
+/// Preemptions that moved to a sibling context of the same cell.
+pub const CTR_PREEMPT_TO_SIBLING: usize = 22;
+/// Preemptions that moved to another cell.
+pub const CTR_PREEMPT_TO_CELL: usize = 23;
+/// Preemption-timer interrupts that actually arrived - distinct from taken,
+/// because "not delivered" and "delivered with nobody to switch to" are
+/// different faults with the same symptom.
+pub const CTR_PREEMPT_NOTES: usize = 24;
 
 /// One coherent reading of the coupled group.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]

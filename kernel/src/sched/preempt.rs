@@ -62,7 +62,6 @@
 
 use crate::ktimer::{self, TimerClient};
 use crate::smp::PerCpu;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Per-CPU "a preemption is due" flag, set by the timer interrupt and consumed at
 /// trap exit.
@@ -73,41 +72,27 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// preemption timer interrupts that CPU.
 static PENDING: PerCpu<bool> = PerCpu::from_array([false; crate::smp::MAX_CPUS]);
 
-/// Slices armed, preemptions actually taken, and slices that could not be armed
-/// because the ISA has no wired timer interrupt.
-///
-/// Atomics rather than `static mut`, because these are *aggregate* counters: unlike
-/// [`PENDING`] above they are written by every CPU, and once cells run on more than
-/// one core a `+= 1` on a plain static is a lost update, not a race that "cannot
-/// interleave". A relaxed `fetch_add` is the right cost for a counter - it orders
-/// nothing and is what makes the totals mean what they say (docs/SMP.md 10.2: every
-/// shared static gets a lock, a partition, or - here - an atomic).
-static ARMED: AtomicU64 = AtomicU64::new(0);
-static TAKEN: AtomicU64 = AtomicU64::new(0);
-static UNARMABLE: AtomicU64 = AtomicU64::new(0);
-/// Preemptions that moved to a **sibling context** of the same cell, versus to
-/// another cell. Kept apart because they are different capabilities: the first is
-/// what an intra-process event loop with a worker needs (the `linuxbun` case), the
-/// second is what a multi-tenant machine needs.
-static TO_SIBLING: AtomicU64 = AtomicU64::new(0);
-static TO_CELL: AtomicU64 = AtomicU64::new(0);
-/// Times the preemption timer interrupt actually **arrived**.
-///
-/// Distinct from `TAKEN` on purpose, and the distinction earns its keep: "the
-/// interrupt is not being delivered" and "the interrupt arrives but there is nobody
-/// to switch to" are different faults with the same symptom, and a single counter
-/// cannot tell them apart. (It earned it immediately - the first bring-up run showed
-/// `armed=1, taken=0`, which could have been either.)
-static NOTES: AtomicU64 = AtomicU64::new(0);
+// Slices armed, preemptions actually taken, slices that could not be armed
+// (no wired timer interrupt), the sibling-vs-cell split (different capabilities:
+// the first is what an intra-process event loop with a worker needs - the
+// `linuxbun` case - the second what a multi-tenant machine needs), and how many
+// preemption-timer interrupts actually **arrived** - distinct from taken because
+// "not delivered" and "delivered with nobody to switch to" are different faults
+// with the same symptom (the first bring-up run showed `armed=1, taken=0`, which
+// could have been either). All live in the observability plane's per-CPU blocks
+// (`obs::cpu`, S4): each CPU counts its own arms/takes on its own line - cheaper
+// than the relaxed `fetch_add`s these replaced and correct for the same reason,
+// one writer per slot - and the accessors sum, so every existing assertion reads
+// the same totals.
 
 /// (armed, taken, unarmable, to-sibling, to-cell).
 pub fn counters() -> (u64, u64, u64, u64, u64) {
     (
-        ARMED.load(Ordering::Relaxed),
-        TAKEN.load(Ordering::Relaxed),
-        UNARMABLE.load(Ordering::Relaxed),
-        TO_SIBLING.load(Ordering::Relaxed),
-        TO_CELL.load(Ordering::Relaxed),
+        crate::obs::cpu_counter_sum(crate::obs::cpu::CTR_PREEMPT_ARMED),
+        crate::obs::cpu_counter_sum(crate::obs::cpu::CTR_PREEMPT_TAKEN),
+        crate::obs::cpu_counter_sum(crate::obs::cpu::CTR_PREEMPT_UNARMABLE),
+        crate::obs::cpu_counter_sum(crate::obs::cpu::CTR_PREEMPT_TO_SIBLING),
+        crate::obs::cpu_counter_sum(crate::obs::cpu::CTR_PREEMPT_TO_CELL),
     )
 }
 
@@ -117,8 +102,15 @@ pub fn reset() {
         // SAFETY: between runs.
         unsafe { *PENDING.get_mut(cpu) = false };
     }
-    for c in [&ARMED, &TAKEN, &UNARMABLE, &NOTES, &TO_SIBLING, &TO_CELL] {
-        c.store(0, Ordering::Relaxed);
+    for slot in [
+        crate::obs::cpu::CTR_PREEMPT_ARMED,
+        crate::obs::cpu::CTR_PREEMPT_TAKEN,
+        crate::obs::cpu::CTR_PREEMPT_UNARMABLE,
+        crate::obs::cpu::CTR_PREEMPT_NOTES,
+        crate::obs::cpu::CTR_PREEMPT_TO_SIBLING,
+        crate::obs::cpu::CTR_PREEMPT_TO_CELL,
+    ] {
+        crate::obs::cpu_counter_clear(slot);
     }
 }
 
@@ -136,11 +128,11 @@ pub fn arm(slice_ns: u64) {
         // Nothing here can enforce a slice, and saying so is the point: a slice
         // reported as armed but never delivered would make a cooperative run look
         // preemptive (docs/ENGINEERING.md 1).
-        UNARMABLE.fetch_add(1, Ordering::Relaxed);
+        crate::obs::cpu_bump(crate::obs::cpu::CTR_PREEMPT_UNARMABLE, 1);
         return;
     }
     ktimer::register(TimerClient::Preempt, slice_ns);
-    ARMED.fetch_add(1, Ordering::Relaxed);
+    crate::obs::cpu_bump(crate::obs::cpu::CTR_PREEMPT_ARMED, 1);
 }
 
 /// Cancel any outstanding preemption slice - the cell stopped for its own reasons
@@ -166,12 +158,12 @@ pub fn note() {
     unsafe {
         *PENDING.this_mut() = true;
     }
-    NOTES.fetch_add(1, Ordering::Relaxed);
+    crate::obs::cpu_bump(crate::obs::cpu::CTR_PREEMPT_NOTES, 1);
 }
 
 /// How many preemption-timer interrupts arrived.
 pub fn notes() -> u64 {
-    NOTES.load(Ordering::Relaxed)
+    crate::obs::cpu_counter_sum(crate::obs::cpu::CTR_PREEMPT_NOTES)
 }
 
 /// Whether a preemption is due on this CPU.
@@ -194,10 +186,11 @@ pub fn take() -> bool {
 
 /// Count a preemption that actually moved the CPU, and to what.
 pub(crate) fn took(to_sibling: bool) {
-    TAKEN.fetch_add(1, Ordering::Relaxed);
-    if to_sibling {
-        TO_SIBLING.fetch_add(1, Ordering::Relaxed);
+    crate::obs::cpu_bump(crate::obs::cpu::CTR_PREEMPT_TAKEN, 1);
+    let slot = if to_sibling {
+        crate::obs::cpu::CTR_PREEMPT_TO_SIBLING
     } else {
-        TO_CELL.fetch_add(1, Ordering::Relaxed);
-    }
+        crate::obs::cpu::CTR_PREEMPT_TO_CELL
+    };
+    crate::obs::cpu_bump(slot, 1);
 }

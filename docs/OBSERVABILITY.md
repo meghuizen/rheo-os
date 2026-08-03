@@ -636,8 +636,19 @@ contract every reset in the tree already states. `input`'s byte sequence is
 deliberately not cleared, matching the old `RX_SEQ`: it is an entropy sequence
 number, and monotonicity across runs costs nothing.
 
+The scheduler's counters followed in the second slice: `sched::dispatch`'s six
+(picks, round-robin picks, diverged, charged ns, and the E5 re-arm pair) and
+`sched::preempt`'s six (armed, taken, unarmable, to-sibling, to-cell, notes) - the
+hottest counter sites in the tree, one bump per pick and per slice, where the
+relaxed `fetch_add`s these replaced were a locked RMW on a line shared by every
+dispatching core and the per-CPU slot is a plain read-add-write on the owner's
+own. Gated by `preempt`/`substrate`/`smp`/`linuxproc` on all three ISAs, with the
+control observed firing by name: misrouting the taken-count into the armed slot
+fails `preempt` with "61 slices armed but none was ever taken".
+
 Still to migrate (the rest of the plan row): the arbiter's arms/firings/parks/
-preserved, sched/user/smp's dispatch/preemption/claim counters, and the
+preserved (already per-CPU inside the `Arbiter` - publication candidates more than
+relocation candidates), user/smp's claim counters, and the
 frames/nvme/block/load/mm/rng::entropy families - each a mechanical repetition of
 the proven pattern, gated per module. Deliberately **not** migrating: gauges
 (`kmeta::META_FRAMES`, the pool's `USED` - the plane's slots are monotone counters,

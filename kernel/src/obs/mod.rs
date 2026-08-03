@@ -682,7 +682,7 @@ pub fn mem_va() -> usize {
 /// The published name table: which counter slot means what, as runtime data
 /// rather than an ABI contract, so a reader never guesses at an unnamed slot
 /// (`abi::obs::OBS_SEC_NAMES`).
-static NAMES: [crate::abi::obs::ObsName; 13] = {
+static NAMES: [crate::abi::obs::ObsName; 25] = {
     use crate::abi::obs::{OBS_NAME_COUNTER, ObsName};
     [
         ObsName::new(OBS_NAME_COUNTER, cpu::CTR_BUSY_TICKS as u32, "busy_ticks"),
@@ -721,6 +721,62 @@ static NAMES: [crate::abi::obs::ObsName; 13] = {
             OBS_NAME_COUNTER,
             cpu::CTR_PUMP_DIRECT_PUSHES as u32,
             "pump_direct_pushes",
+        ),
+        ObsName::new(OBS_NAME_COUNTER, cpu::CTR_SCHED_PICKS as u32, "sched_picks"),
+        ObsName::new(
+            OBS_NAME_COUNTER,
+            cpu::CTR_SCHED_RR_PICKS as u32,
+            "sched_rr_picks",
+        ),
+        ObsName::new(
+            OBS_NAME_COUNTER,
+            cpu::CTR_SCHED_DIVERGED as u32,
+            "sched_diverged",
+        ),
+        ObsName::new(
+            OBS_NAME_COUNTER,
+            cpu::CTR_SCHED_CHARGED_NS as u32,
+            "sched_charged_ns",
+        ),
+        ObsName::new(
+            OBS_NAME_COUNTER,
+            cpu::CTR_SCHED_REARM_CALLS as u32,
+            "sched_rearm_calls",
+        ),
+        ObsName::new(
+            OBS_NAME_COUNTER,
+            cpu::CTR_SCHED_REARM_NO_RECORD as u32,
+            "sched_rearm_no_record",
+        ),
+        ObsName::new(
+            OBS_NAME_COUNTER,
+            cpu::CTR_PREEMPT_ARMED as u32,
+            "preempt_armed",
+        ),
+        ObsName::new(
+            OBS_NAME_COUNTER,
+            cpu::CTR_PREEMPT_TAKEN as u32,
+            "preempt_taken",
+        ),
+        ObsName::new(
+            OBS_NAME_COUNTER,
+            cpu::CTR_PREEMPT_UNARMABLE as u32,
+            "preempt_unarmable",
+        ),
+        ObsName::new(
+            OBS_NAME_COUNTER,
+            cpu::CTR_PREEMPT_TO_SIBLING as u32,
+            "preempt_to_sibling",
+        ),
+        ObsName::new(
+            OBS_NAME_COUNTER,
+            cpu::CTR_PREEMPT_TO_CELL as u32,
+            "preempt_to_cell",
+        ),
+        ObsName::new(
+            OBS_NAME_COUNTER,
+            cpu::CTR_PREEMPT_NOTES as u32,
+            "preempt_notes",
         ),
     ]
 };
