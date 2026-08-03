@@ -521,9 +521,62 @@ forced - optimise the access shape not the access, two questions about one eleme
 are one walk, bench the whole matrix because a struct's size is an interface - are
 recorded in docs/ENGINEERING.md 11.
 
-### 11.5 Not built yet
+### 11.5 The snapshot plane and busy/idle time (S3)
 
-The snapshot plane and per-CPU busy/idle accounting, the counter unification, the
-`Net`/`Gpu`/`Lock` windows with their device and lock instrumentation, the capability
-gate on telemetry, egress beyond the serial console, the host tool, and the OTLP
-exporter cell. Dynamic probes remain the documented deferral of section 5.
+**Built: the plane that answers "what is this CPU doing now."** One
+`abi::obs::ObsCpu` per CPU (512 bytes = 8 cache lines, so a reader sampling CPU 3
+never touches CPU 4's lines): line 0 is a **seqlock'd coupled group** - state,
+current cell/entity/vcore, when that began, the armed timer deadline, the receive
+tier - and lines 1..7 are monotone counters outside the lock, because each counter
+is independently meaningful while the *group* torn in half is a cell that never ran
+an entity that never existed. Written only by the owning CPU at transitions it
+already passes through (`user::enter_vcore`, the end of `run_inner`, `idle::wait`'s
+park bracket, `ktimer`'s re-arm, `net_rx`'s tier escalation) - **no sampler, no
+timer, no IPI**. Published as `OBS_SEC_CPU`, with a name table (`OBS_SEC_NAMES`)
+saying which counter slot means what, so a reader takes the meaning from the kernel
+it is actually reading.
+
+**Busy/idle is real time, measured at the one place each transition happens.**
+`since_tick` is the stamp; every transition charges `now - since` to busy or - only
+when the park genuinely halted - to idle. A park that could not halt charges
+**busy** and counts a spin, because a spin is not idle and recording it as one
+would launder exactly the number this plane exists to make honest. The armed
+deadline is published in the arbiter's own **ns domain** and the field says so
+(`timer_deadline_ns`) - converting per re-arm would put a multiply on the pacer's
+continuous re-arm path to make the field prettier.
+
+**The writers are behind their own mask bit** (`W_SNAPSHOT`, a modifier like
+`W_LOCK_HOLD`): the disabled cost on the context-switch and idle paths is one load
+and a not-taken branch, and the bench matrix against the pre-S3 build shows **every
+path unchanged to the tick** (the only deltas are the `rng_*` static-layout ripples
+from S2c moving back to their pre-S2c values - which is itself the confirmation
+they were layout, not code).
+
+**The seqlock's orderings are proven where they are reachable.** Begin is
+`fetch_add(1, Acquire)` (a store cannot carry Acquire; the RMW keeps field writes
+below the odd count), end is `store(+2, Release)`; the reader re-checks behind an
+Acquire fence. QEMU TCG cannot interleave a 6-store window and the in-kernel reader
+runs on the writer's own CPU, so `verify/obs` drives the shipped `cpu.rs` verbatim
+on real host threads: **4.8M coherent reads racing 3M writes, zero torn groups**,
+with busy+idle exact to the write count afterwards - and the negative control (the
+same stores, bracket deleted) **is caught torn within ~25k reads**, so the
+invariant detects what it claims to. One oracle correction recorded: the
+arithmetic check's first version said "half each" for 4999 odd and 5000 even
+intervals, and the counters refuted it - the failing assertion was the hand
+computation, not the code.
+
+Proven in-QEMU by `observe`'s snapshot phase on all three ISAs: everything zero
+while the writers are off (a nonzero would mean a writer escaped its gate), a
+**20 ms park charges ~20 ms of idle ticks** (19.93M of 20M expected on x86-64,
+judged through the root's own published `tick_hz` - the bound proves attribution,
+not timer precision), a real U-mode cell entry writes the group and counts a
+dispatch, and after the run the group says kernel context - a group still claiming
+the cell would be a live-state lie.
+
+### 11.6 Not built yet
+
+Memory-status blocks (frame pool by node, pmem, the kmeta ledger - the remaining
+S3 half), the counter unification, the `Net`/`Gpu`/`Lock` windows with their
+device and lock instrumentation, the capability gate on telemetry, egress beyond
+the serial console, the host tool, and the OTLP exporter cell. Dynamic probes
+remain the documented deferral of section 5.

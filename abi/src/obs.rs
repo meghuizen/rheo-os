@@ -118,8 +118,22 @@ pub const OBS_WINDOWS: usize = 14;
 /// worth having when it is turned on.
 pub const W_LOCK_HOLD: u32 = 14;
 
+/// The **snapshot plane's writers** ([`ObsCpu`]), as a modifier bit like
+/// [`W_LOCK_HOLD`] rather than a window: it keys no events and appears in no
+/// record - it says whether the kernel is stamping its per-CPU live state
+/// (the seqlock'd group, busy/idle time) at the transitions it passes through.
+/// A bit of its own because the snapshot writers sit on the context-switch and
+/// idle paths, where the disabled cost must stay one load and a not-taken
+/// branch whatever event windows are on.
+pub const W_SNAPSHOT: u32 = 15;
+
 /// Every bit that is a window (not a modifier like [`W_LOCK_HOLD`]).
 pub const WINDOW_MASK_ALL: u32 = (1u32 << OBS_WINDOWS) - 1;
+
+/// Every bit the mask accepts: the windows plus the two modifiers. A set bit
+/// outside this is meaningless and is dropped at the enable boundary rather
+/// than stored, so a reader never sees a mask it cannot decode.
+pub const MASK_VALID: u32 = WINDOW_MASK_ALL | (1u32 << W_LOCK_HOLD) | (1u32 << W_SNAPSHOT);
 
 /// The bit for window `w`.
 #[inline(always)]
@@ -307,8 +321,12 @@ pub struct ObsCpu {
     pub runq_depth: u32,
     /// When the current state began.
     pub since_tick: u64,
-    /// The nearest deadline the timer arbiter has armed here, or 0 for none.
-    pub timer_deadline_tick: u64,
+    /// The nearest outstanding deadline in this CPU's timer arbiter, or 0 for
+    /// none. **Monotonic nanoseconds in the arbiter's own domain**
+    /// (`ktimer::now_ns`), not a tick: that is the domain the arbiter already
+    /// holds the value in, and converting per re-arm would put a multiply on the
+    /// pacer's continuous re-arm path to make the field prettier.
+    pub timer_deadline_ns: u64,
     /// Deadlines outstanding in this CPU's timing wheel.
     pub wheel_occupancy: u32,
     /// The `LockId` currently held, or 0.
@@ -361,7 +379,7 @@ impl ObsCpu {
             cur_vcore: 0,
             runq_depth: 0,
             since_tick: 0,
-            timer_deadline_tick: 0,
+            timer_deadline_ns: 0,
             wheel_occupancy: 0,
             lock_held: 0,
             net_tier: 0,

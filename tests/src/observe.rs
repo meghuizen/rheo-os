@@ -49,6 +49,17 @@ use kernel::abi::obs;
 use kernel::mm::frames;
 use kernel::{arch, println};
 
+#[path = "fixture.rs"]
+mod fixture;
+#[path = "harness.rs"]
+mod harness;
+
+/// The M1 userland hello - the smallest real cell in the tree, reused here so the
+/// snapshot plane's context-switch writer is driven by a genuine U-mode entry
+/// rather than by calling the writer directly (which would prove the writer can
+/// write, not that the kernel writes it).
+static HELLO: &[u8] = fixture::cell!("hello");
+
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
     kernel::boot::init(); // ends in obs::publish()
@@ -60,9 +71,156 @@ extern "C" fn kernel_main() -> ! {
     tick();
     events();
     window_mask();
+    snapshot();
 
     println!("observe: PASS");
     arch::exit(arch::ExitCode::Success)
+}
+
+/// The snapshot plane (docs/OBSERVABILITY.md 11, S3): busy/idle accounting moved
+/// by a real halt, the coupled group written by a real cell entry, and everything
+/// zero while the writers were off.
+///
+/// The oracle for idle time is the deadline itself: a 20 ms park must record
+/// roughly 20 ms of idle ticks, bounded loosely (half to five times) because the
+/// park wakes on the one-shot plus interrupt latency - the bound proves the
+/// *attribution* (idle, not busy), not the timer's precision, which is
+/// `nettcpcc`'s job. Everything is converted through the root's own published
+/// `tick_hz`, so this phase also exercises the conversion contract a reader uses.
+fn snapshot() {
+    use kernel::ktimer::{self, TimerClient};
+    use kernel::obs::cpu::{CTR_BUSY_TICKS, CTR_DISPATCHES, CTR_HALTS, CTR_IDLE_TICKS, CTR_SPINS};
+    use kernel::{idle, obs as kobs};
+
+    let me = kernel::smp::cpu_index();
+
+    // ---- while the writers are off, nothing may have been stamped ----
+    // The suite so far has parked (the events phase waits on nothing, but boot
+    // paths may idle), entered no cell, and the writers were never enabled - so a
+    // nonzero here means a writer runs without its gate, which is exactly the
+    // cost regression the mask exists to prevent.
+    for (slot, name) in [
+        (CTR_BUSY_TICKS, "busy"),
+        (CTR_IDLE_TICKS, "idle"),
+        (CTR_DISPATCHES, "dispatches"),
+        (CTR_HALTS, "halts"),
+    ] {
+        assert_eq!(
+            kobs::cpu_counter(me, slot),
+            0,
+            "{name} accumulated while snapshots were off - a writer is not behind the gate"
+        );
+    }
+    let s0 = kobs::cpu_snap(me).expect("the group must be readable when idle");
+    assert_eq!(
+        s0.state,
+        obs::OBS_CPU_OFFLINE,
+        "the group was written while snapshots were off"
+    );
+
+    kobs::enable_snapshots();
+    assert!(kobs::snapshots_on(), "the snapshot bit did not latch");
+    assert!(
+        !kobs::enabled(),
+        "the snapshot modifier must not turn event recording on"
+    );
+
+    // ---- a real park charges idle, not busy ----
+    arch::enable_timer_irq();
+    // First transition establishes the stamp; its interval is dropped by design.
+    ktimer::register(TimerClient::CellSleep, 1_000_000);
+    while !ktimer::expired(TimerClient::CellSleep) {
+        idle::wait(idle::TIMER);
+    }
+    let idle_before = kobs::cpu_counter(me, CTR_IDLE_TICKS);
+    let busy_before = kobs::cpu_counter(me, CTR_BUSY_TICKS);
+
+    const PARK_NS: u64 = 20_000_000;
+    ktimer::register(TimerClient::CellSleep, PARK_NS);
+    while !ktimer::expired(TimerClient::CellSleep) {
+        idle::wait(idle::TIMER);
+    }
+    let idle_ticks = kobs::cpu_counter(me, CTR_IDLE_TICKS) - idle_before;
+    let halts = kobs::cpu_counter(me, CTR_HALTS);
+    let spins = kobs::cpu_counter(me, CTR_SPINS);
+    let hz = kernel::obs::root::root().tick_hz;
+    assert!(hz > 0, "tick_hz unpublished - idle ticks cannot be judged");
+    let expect_ticks = PARK_NS as u128 * hz as u128 / 1_000_000_000;
+    println!(
+        "observe: 20 ms park -> {idle_ticks} idle tick(s) (expect ~{expect_ticks}), \
+         {halts} halt(s), {spins} spin(s)"
+    );
+    if halts > 0 {
+        // A genuine halt: the park's time must be attributed to idle, roughly the
+        // deadline's worth. The loose bound is the attribution test, not a timer
+        // precision test.
+        assert!(
+            (idle_ticks as u128) >= expect_ticks / 2,
+            "a 20 ms park recorded only {idle_ticks} idle ticks (expect ~{expect_ticks}) - \
+             the park's time went to the wrong counter"
+        );
+        assert!(
+            (idle_ticks as u128) <= expect_ticks * 5,
+            "a 20 ms park recorded {idle_ticks} idle ticks (expect ~{expect_ticks}) - \
+             busy time is being laundered as idle"
+        );
+    } else {
+        // No ISA in this suite lacks a verified timer interrupt since SMP phase 1;
+        // a future configuration that does must land here, with the spins counted.
+        assert!(
+            spins > 0,
+            "no halt and no spin - the park did nothing at all"
+        );
+        assert_eq!(
+            idle_ticks, 0,
+            "a park that never halted must charge nothing to idle"
+        );
+        println!("observe: no timer interrupt here - park spun and charged busy (honest)");
+    }
+    let s1 = kobs::cpu_snap(me).expect("group readable after the park");
+    assert_eq!(
+        s1.state,
+        obs::OBS_CPU_KERNEL,
+        "after the park the CPU is in kernel context, and the group must say so"
+    );
+
+    // ---- a real cell entry writes the coupled group and counts a dispatch ----
+    let dispatches_before = kobs::cpu_counter(me, CTR_DISPATCHES);
+    let busy_mark = kobs::cpu_counter(me, CTR_BUSY_TICKS);
+    // SAFETY: single-threaded init; the harness installs into slot 0 after reset.
+    let outcome = unsafe { harness::run_elf_cell(HELLO, "hello") };
+    assert_eq!(
+        outcome,
+        kernel::user::Outcome::Exited(42),
+        "the hello cell must run to its normal exit under the snapshot writers"
+    );
+    assert!(
+        kobs::cpu_counter(me, CTR_DISPATCHES) > dispatches_before,
+        "a cell ran but no dispatch was counted - the enter writer did not fire"
+    );
+    let s2 = kobs::cpu_snap(me).expect("group readable after the run");
+    assert_eq!(
+        s2.state,
+        obs::OBS_CPU_KERNEL,
+        "the run is over; a group still claiming a cell would be a live-state lie"
+    );
+    assert!(
+        kobs::cpu_counter(me, CTR_BUSY_TICKS) > busy_mark,
+        "running a cell moved no busy time"
+    );
+    println!(
+        "observe: SNAPSHOT PLANE - zero while off; a 20 ms park charged idle not busy; \
+         a real cell entry wrote the group and counted a dispatch; the group reads \
+         coherent and honest afterwards OK"
+    );
+
+    kernel::obs::reset();
+    assert!(!kobs::snapshots_on(), "reset must clear the snapshot bit");
+    assert_eq!(
+        kobs::cpu_counter(me, CTR_BUSY_TICKS),
+        0,
+        "reset must clear the snapshot counters"
+    );
 }
 
 /// The event plane: recording, reading back, wrapping, and the counters that say

@@ -26,8 +26,8 @@
 //! it is knowable earlier.
 
 use crate::abi::obs::{
-    OBS_MAX_SECTIONS, OBS_SEC_EVENT_LAYOUT, OBS_SEC_HISTOGRAMS, OBS_SEC_RINGS, OBS_SEC_TEXT_RINGS,
-    ObsEvent, ObsRoot, ObsSection,
+    OBS_MAX_SECTIONS, OBS_SEC_CPU, OBS_SEC_EVENT_LAYOUT, OBS_SEC_HISTOGRAMS, OBS_SEC_NAMES,
+    OBS_SEC_RINGS, OBS_SEC_TEXT_RINGS, ObsCpu, ObsEvent, ObsName, ObsRoot, ObsSection,
 };
 use core::sync::atomic::Ordering;
 
@@ -154,6 +154,35 @@ pub fn publish() {
             size_of::<crate::smp::PerCpu<[crate::metrics::Histogram; crate::metrics::METRICS]>>(),
             size_of::<[crate::metrics::Histogram; crate::metrics::METRICS]>() as u32,
             crate::smp::MAX_CPUS as u32,
+        ),
+    );
+
+    // The snapshot plane: one `ObsCpu` per CPU (docs/OBSERVABILITY.md 11, S3).
+    add(
+        r,
+        region(
+            OBS_SEC_CPU,
+            0,
+            crate::obs::cpus_va(),
+            size_of::<crate::smp::PerCpu<ObsCpu>>(),
+            size_of::<ObsCpu>() as u32,
+            crate::smp::MAX_CPUS as u32,
+        ),
+    );
+
+    // The name table: which counter slot means what, as data a reader takes from
+    // the kernel it is actually reading rather than from a header it was built
+    // against (`.rodata`, so `pa` is in the image).
+    let (names_va, names_n) = crate::obs::names_va();
+    add(
+        r,
+        region(
+            OBS_SEC_NAMES,
+            0,
+            names_va,
+            names_n * size_of::<ObsName>(),
+            size_of::<ObsName>() as u32,
+            names_n as u32,
         ),
     );
 }

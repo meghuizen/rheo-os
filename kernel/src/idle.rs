@@ -173,7 +173,14 @@ pub fn wait(src: Sources) -> bool {
         ktimer::register(TimerClient::RxPoll, crate::net_rx::poll_slice_ns());
     }
 
+    // The snapshot plane's idle bracket (docs/OBSERVABILITY.md 11, S3): the time up
+    // to here was execution, the park's own time is charged idle only if the CPU
+    // genuinely halted - `snap_unparked(false)` charges a spin as busy, because a
+    // spin is not idle and recording it as one would launder exactly the number
+    // this plane exists to make honest.
+    crate::obs::snap_parked();
     let halted = ktimer::park(net_irq || uart_irq);
+    crate::obs::snap_unparked(halted);
 
     if sliced {
         // Release our slice; the arbiter re-arms whatever else is outstanding (a

@@ -543,6 +543,9 @@ pub fn wait_frame(buf_va: u64, len: usize, timeout_ns: u64) -> usize {
             cur_tier = next;
             // SAFETY: single CPU.
             unsafe { *addr_of_mut!(TIER) = next };
+            // The snapshot plane's receive-tier field (docs/OBSERVABILITY.md 11,
+            // S3): published at the escalation itself, the only place it changes.
+            crate::obs::snap_aux(None, Some(next as u32));
         }
 
         if next == RxTier::Hot {

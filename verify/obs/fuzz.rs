@@ -69,7 +69,15 @@ mod abi {
 #[path = "../../kernel/src/obs/ring.rs"]
 mod ring;
 
-use abi::obs::ObsEvent;
+// The snapshot plane's seqlock (docs/OBSERVABILITY.md 11, S3), also dependency-free.
+// This is the one piece of the plane whose interesting case a boot test cannot
+// reach at all: the writer's bracket is ~6 stores, QEMU TCG interleaves far more
+// coarsely than that, and the in-kernel reader runs on the same CPU as the writer.
+// Real host threads are where a reader can actually catch a writer mid-update.
+#[path = "../../kernel/src/obs/cpu.rs"]
+mod cpu;
+
+use abi::obs::{ObsCpu, ObsEvent};
 use ring::{ObsRing, RING_EVENTS, seq_of};
 
 /// A cheap deterministic PRNG so a failing run is reproducible without a dependency
@@ -344,10 +352,221 @@ fn main() {
         }
     }
 
+    println!("== snapshot plane: the seqlock ==");
+    for (name, res) in [
+        ("busy/idle arithmetic is exact", seqlock_arithmetic()),
+        ("a racing reader never sees a torn group", seqlock_race()),
+        ("CONTROL: an unbracketed writer IS caught torn", seqlock_torn_control()),
+    ] {
+        match res {
+            Ok(msg) => println!("  ok   {name}{msg}"),
+            Err(e) => {
+                println!("  FAIL {name}: {e}");
+                failures += 1;
+            }
+        }
+    }
+
     if failures == 0 {
         println!("obs fuzz: PASS");
     } else {
         println!("obs fuzz: FAIL ({failures} failure(s))");
         std::process::exit(1);
+    }
+}
+
+// ------------------------------------------------------------ the seqlock model
+//
+// The writer publishes only **self-consistent** tuples: at step k the group is
+// `(state, cell, entity, vcore, since) = (k%5, k, k+1, k+2, k)`. A reader that ever
+// sees `entity != cell+1` (or any other relation broken) has caught a group that
+// existed at no instant - the torn triple docs/OBSERVABILITY.md 11's plan names as
+// exactly what the seqlock exists to make impossible. The invariant is on the
+// *contents*, so it needs no shared state with the writer (the regstress.c idea).
+
+/// Whether one reading satisfies the writer's invariant (or is the initial zero
+/// group, which the reader can legitimately catch before the first write).
+fn coherent(s: &cpu::CpuSnap) -> bool {
+    if s.since_tick == 0 {
+        return s.cell == 0 && s.entity == 0 && s.vcore == 0 && s.state == 0;
+    }
+    let k32 = s.since_tick as u32;
+    s.cell == k32
+        && s.entity == k32.wrapping_add(1)
+        && s.vcore == k32.wrapping_add(2)
+        && s.state == (s.since_tick % 5) as u32
+}
+
+/// Deterministic single-thread checks: the first interval is dropped, every later
+/// one lands in exactly one of busy/idle, and their sum is exact.
+fn seqlock_arithmetic() -> Result<String, String> {
+    let c = Box::leak(Box::new(ObsCpu::new())) as *mut ObsCpu;
+    const STEPS: u64 = 10_000;
+    for k in 1..=STEPS {
+        // now = 3k, so every interval is 3 ticks; odd steps charge idle.
+        // SAFETY: single thread owns the block.
+        unsafe { cpu::transition(c, (k % 5) as u32, k as u32, 0, 0, 3 * k, k % 2 == 1) };
+    }
+    // SAFETY: live leaked block, single thread here.
+    let (busy, idle) = unsafe { (cpu::counter(c, cpu::CTR_BUSY_TICKS), cpu::counter(c, cpu::CTR_IDLE_TICKS)) };
+    // Steps 2..=STEPS each charge 3 ticks; step 1's interval is dropped (no stamp
+    // existed before it). Odd k charges idle: of 2..=10000 the odd steps are
+    // 3,5,..,9999 = 4999 of them, the even 2,4,..,10000 = 5000 - not "half each",
+    // which is what this oracle's first version said and the counters refuted.
+    let want_idle = 3 * (STEPS / 2 - 1);
+    let want_busy = 3 * (STEPS / 2);
+    if busy != want_busy || idle != want_idle {
+        return Err(format!(
+            "busy {busy} idle {idle}, want {want_busy}/{want_idle} - an interval was \
+             lost, double-charged, or the first one was not dropped"
+        ));
+    }
+    // `set_aux` touches only what it was given: the deadline lands, and the group
+    // still reads exactly as the last `transition` left it (this writer's tuples
+    // are not the race writer's, so the check is against the known final values,
+    // not `coherent`).
+    // SAFETY: as above.
+    unsafe { cpu::set_aux(c, Some(777), None) };
+    // SAFETY: live leaked block, single thread here.
+    let s = unsafe { cpu::read(c as *const ObsCpu) }.ok_or("group unreadable single-threaded")?;
+    if s.timer_deadline_ns != 777
+        || s.cell != STEPS as u32
+        || s.since_tick != 3 * STEPS
+        || s.state != (STEPS % 5) as u32
+        || s.net_tier != 0
+    {
+        return Err(format!(
+            "set_aux broke the group: deadline {} cell {} since {} state {} tier {}",
+            s.timer_deadline_ns, s.cell, s.since_tick, s.state, s.net_tier
+        ));
+    }
+    Ok(format!(" (busy {want_busy} / idle {want_idle} over {STEPS} steps, exact)"))
+}
+
+/// A writer thread hammers `transition` while this thread reads: every successful
+/// read must be coherent. This is the only place in the tree the retry loop is
+/// reachable - the boot tests' reader always runs on the writer's own CPU.
+fn seqlock_race() -> Result<String, String> {
+    if std::thread::available_parallelism().map_or(1, |n| n.get()) < 2 {
+        return Ok(" (skipped: single-CPU host, no real race to produce)".into());
+    }
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let c_addr = Box::leak(Box::new(ObsCpu::new())) as *mut ObsCpu as usize;
+    let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+
+    const WRITES: u64 = 3_000_000;
+    let writer = std::thread::spawn(move || {
+        let c = c_addr as *mut ObsCpu;
+        for k in 1..=WRITES {
+            // SAFETY: the one writer, as the kernel's owning CPU is.
+            unsafe {
+                cpu::transition(
+                    c,
+                    (k % 5) as u32,
+                    k as u32,
+                    (k as u32).wrapping_add(1),
+                    (k as u32).wrapping_add(2),
+                    k,
+                    k % 2 == 0,
+                )
+            };
+        }
+        stop.store(true, Ordering::Release);
+    });
+
+    let c = c_addr as *const ObsCpu;
+    let (mut reads, mut gaveup, mut torn) = (0u64, 0u64, 0u64);
+    while !stop.load(Ordering::Acquire) {
+        // SAFETY: live leaked block; racing the writer is the point.
+        match unsafe { cpu::read(c) } {
+            Some(s) => {
+                reads += 1;
+                if !coherent(&s) {
+                    torn += 1;
+                    if torn == 1 {
+                        eprintln!(
+                            "  torn: state {} cell {} entity {} vcore {} since {}",
+                            s.state, s.cell, s.entity, s.vcore, s.since_tick
+                        );
+                    }
+                }
+            }
+            // A writer held the bracket across every retry - legal under this
+            // hammering, counted so a protocol that never lets a read through
+            // would still be visible.
+            None => gaveup += 1,
+        }
+    }
+    writer.join().map_err(|_| "writer panicked")?;
+    if torn != 0 {
+        return Err(format!("{torn} torn group(s) in {reads} reads"));
+    }
+    if reads == 0 {
+        return Err(format!("no read ever succeeded ({gaveup} gave up)"));
+    }
+    // The post-race accounting is still exact: single writer, so busy + idle is
+    // every interval after the first, whatever the reader was doing.
+    // SAFETY: live leaked block; the writer has joined.
+    let total =
+        unsafe { cpu::counter(c, cpu::CTR_BUSY_TICKS) + cpu::counter(c, cpu::CTR_IDLE_TICKS) };
+    if total != WRITES - 1 {
+        return Err(format!(
+            "busy+idle {total}, want {} - the race corrupted the counters",
+            WRITES - 1
+        ));
+    }
+    Ok(format!(" ({reads} coherent reads beside {WRITES} writes, {gaveup} retries exhausted)"))
+}
+
+/// The negative control: the same field writes with the bracket deleted must be
+/// *caught* by the same reader - otherwise the race test above proves only that
+/// nobody looked. Firing requires a real interleaving, so a bounded budget and an
+/// honest skip on a single-CPU host.
+fn seqlock_torn_control() -> Result<String, String> {
+    if std::thread::available_parallelism().map_or(1, |n| n.get()) < 2 {
+        return Ok(" (skipped: single-CPU host, no real race to produce)".into());
+    }
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let c_addr = Box::leak(Box::new(ObsCpu::new())) as *mut ObsCpu as usize;
+    let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+
+    let writer = std::thread::spawn(move || {
+        let c = c_addr as *mut ObsCpu;
+        let mut k = 0u64;
+        while !stop.load(Ordering::Acquire) {
+            k += 1;
+            // The bracket deleted: the same stores `transition` makes, raw.
+            // SAFETY: same single-writer contract; the *reader* is what races.
+            unsafe {
+                core::ptr::write_volatile(&raw mut (*c).state, (k % 5) as u32);
+                core::ptr::write_volatile(&raw mut (*c).cur_cell, k as u32);
+                core::ptr::write_volatile(&raw mut (*c).cur_entity, (k as u32).wrapping_add(1));
+                core::ptr::write_volatile(&raw mut (*c).cur_vcore, (k as u32).wrapping_add(2));
+                core::ptr::write_volatile(&raw mut (*c).since_tick, k);
+            }
+        }
+    });
+
+    let c = c_addr as *const ObsCpu;
+    const BUDGET: u64 = 50_000_000;
+    let mut torn_at = None;
+    for i in 0..BUDGET {
+        // SAFETY: live leaked block; racing the broken writer is the point.
+        if let Some(s) = unsafe { cpu::read(c) }
+            && s.since_tick != 0
+            && !coherent(&s)
+        {
+            torn_at = Some(i);
+            break;
+        }
+    }
+    stop.store(true, Ordering::Release);
+    writer.join().map_err(|_| "writer panicked")?;
+    match torn_at {
+        Some(i) => Ok(format!(" (torn group observed after {i} reads)")),
+        None => Err(format!(
+            "an unbracketed writer was never caught in {BUDGET} reads - the reader's \
+             invariant detects nothing, so the race test's green is worth nothing"
+        )),
     }
 }

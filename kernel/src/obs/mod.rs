@@ -38,6 +38,7 @@
 //! byte-for-byte what they were, which is the only way a framework this size lands
 //! without invalidating every proof already in the tree.
 
+pub mod cpu;
 pub mod dump;
 pub mod ring;
 pub mod root;
@@ -224,9 +225,21 @@ pub fn enable() -> bool {
 pub fn enable_windows(mask: u32) -> bool {
     let ok = fund_this_cpu();
     // Only advertise windows if there is somewhere to put their events, so a reader
-    // is never told a window is recording into a ring that does not exist.
-    set_windows(if ok { mask & WINDOW_MASK_ALL } else { 0 });
+    // is never told a window is recording into a ring that does not exist. The
+    // modifier bits (`W_LOCK_HOLD`, `W_SNAPSHOT`) pass through: the snapshot plane
+    // writes fixed `.bss`, so it needs no funding to be true.
+    set_windows(if ok {
+        mask & crate::abi::obs::MASK_VALID
+    } else {
+        0
+    });
     ok
+}
+
+/// Turn the snapshot writers on without recording any events - fixed `.bss`, so
+/// nothing to fund and nothing that can refuse.
+pub fn enable_snapshots() {
+    set_windows(windows() | SNAPSHOT_BIT);
 }
 
 /// Change which windows record, without funding anything.
@@ -316,12 +329,20 @@ pub fn reset() {
             crate::mm::frames::free(pa + p * crate::mm::frames::FRAME_SIZE);
         }
     }
+    for i in 0..crate::smp::MAX_CPUS {
+        // SAFETY: between runs, no secondary is executing and no reader is live, so
+        // replacing the block wholesale (its seqlock included) races nothing.
+        unsafe { *CPUS.get_mut(i) = crate::abi::obs::ObsCpu::new() };
+    }
 }
 
 /// Whether any window is recording.
 #[inline]
 pub fn enabled() -> bool {
-    windows() != 0
+    // The *event* windows only: the modifier bits (`W_SNAPSHOT`, `W_LOCK_HOLD`)
+    // do not put records in the rings, and the one caller of this predicate
+    // (the `trace` shim) is asking exactly "are events being recorded".
+    windows() & WINDOW_MASK_ALL != 0
 }
 
 /// Record one event, with the arguments already computed.
@@ -420,4 +441,185 @@ pub unsafe fn ring_of(i: usize) -> &'static ObsRing {
 /// Kernel VA of the per-CPU ring array, for the root to publish.
 pub fn rings_va() -> usize {
     core::ptr::addr_of!(RINGS) as usize
+}
+
+// =========================================================================
+// The snapshot plane (docs/OBSERVABILITY.md 11, phase S3)
+// =========================================================================
+
+/// One live-state block per CPU, written only by its owner at transitions it
+/// already passes through - no sampler, no timer, no IPI anywhere in the design.
+/// `from_array` for the reason [`RINGS`] gives; safe across cores by partitioning
+/// on the write side, and by [`cpu::read`]'s seqlock on the read side.
+static CPUS: crate::smp::PerCpu<crate::abi::obs::ObsCpu> = crate::smp::PerCpu::from_array(
+    [const { crate::abi::obs::ObsCpu::new() }; crate::smp::MAX_CPUS],
+);
+
+/// The snapshot writers' bit in the mask (a modifier, like `W_LOCK_HOLD`).
+pub const SNAPSHOT_BIT: u32 = 1u32 << crate::abi::obs::W_SNAPSHOT;
+
+/// Whether the snapshot writers are stamping. Same cost shape as [`on`]: one
+/// relaxed load, one test - the whole price every transition pays when off.
+#[inline(always)]
+pub fn snapshots_on() -> bool {
+    windows() & SNAPSHOT_BIT != 0
+}
+
+/// This CPU entered an execution entity: publish the coupled group and count a
+/// dispatch. The interval since the last transition is charged busy.
+#[inline(always)]
+pub fn snap_user(cell: usize, entity: usize, vcore: usize) {
+    if snapshots_on() {
+        snap_user_cold(cell, entity, vcore);
+    }
+}
+
+#[inline(never)]
+#[cold]
+fn snap_user_cold(cell: usize, entity: usize, vcore: usize) {
+    // SAFETY: this CPU's own block; `transition` is single-writer by partitioning.
+    unsafe {
+        let c = CPUS.this_mut() as *mut _;
+        cpu::transition(
+            c,
+            crate::abi::obs::OBS_CPU_USER,
+            cell as u32,
+            entity as u32,
+            vcore as u32,
+            crate::arch::obs_tick(),
+            false,
+        );
+        cpu::bump(c, cpu::CTR_DISPATCHES, 1);
+    }
+}
+
+/// This CPU is back in kernel context (a run ended, a trap will not resume the
+/// same entity). The interval since the last transition is charged busy.
+#[inline(always)]
+pub fn snap_kernel() {
+    if snapshots_on() {
+        snap_state_cold(crate::abi::obs::OBS_CPU_KERNEL, false);
+    }
+}
+
+/// This CPU is about to park in the scheduler idle state. The interval **up to
+/// here** was execution, so it is charged busy; the park itself is charged by
+/// [`snap_unparked`], which knows whether the halt was genuine.
+#[inline(always)]
+pub fn snap_parked() {
+    if snapshots_on() {
+        snap_state_cold(crate::abi::obs::OBS_CPU_PARKED, false);
+    }
+}
+
+/// This CPU came out of a park. `halted` is `idle::wait`'s own answer: a genuine
+/// halt charges the interval idle and counts a halt; a park that could not stop
+/// the CPU charges it **busy** and counts a spin - a spin is not idle, and
+/// recording it as idle would launder the one number this plane exists to make
+/// honest (docs/ENGINEERING.md 7).
+#[inline(always)]
+pub fn snap_unparked(halted: bool) {
+    if snapshots_on() {
+        snap_unparked_cold(halted);
+    }
+}
+
+#[inline(never)]
+#[cold]
+fn snap_unparked_cold(halted: bool) {
+    // SAFETY: this CPU's own block.
+    unsafe {
+        let c = CPUS.this_mut() as *mut _;
+        cpu::transition(
+            c,
+            crate::abi::obs::OBS_CPU_KERNEL,
+            0,
+            0,
+            0,
+            crate::arch::obs_tick(),
+            halted,
+        );
+        let (slot, n) = if halted {
+            (cpu::CTR_HALTS, 1)
+        } else {
+            (cpu::CTR_SPINS, 1)
+        };
+        cpu::bump(c, slot, n);
+    }
+}
+
+#[inline(never)]
+#[cold]
+fn snap_state_cold(state: u32, charge_idle: bool) {
+    // SAFETY: this CPU's own block.
+    unsafe {
+        cpu::transition(
+            CPUS.this_mut() as *mut _,
+            state,
+            0,
+            0,
+            0,
+            crate::arch::obs_tick(),
+            charge_idle,
+        );
+    }
+}
+
+/// Publish an auxiliary field of this CPU's coupled group: the nearest armed
+/// timer deadline and/or the receive-wait tier.
+#[inline(always)]
+pub fn snap_aux(timer_deadline_ns: Option<u64>, net_tier: Option<u32>) {
+    if snapshots_on() {
+        snap_aux_cold(timer_deadline_ns, net_tier);
+    }
+}
+
+#[inline(never)]
+#[cold]
+fn snap_aux_cold(timer_deadline_ns: Option<u64>, net_tier: Option<u32>) {
+    // SAFETY: this CPU's own block.
+    unsafe { cpu::set_aux(CPUS.this_mut() as *mut _, timer_deadline_ns, net_tier) }
+}
+
+/// CPU `i`'s snapshot block, read-only - the test oracle and the dumper's source.
+pub fn cpu_block(i: usize) -> *const crate::abi::obs::ObsCpu {
+    // SAFETY: a shared pointer to a block whose cross-core reads go through the
+    // seqlock (`cpu::read`) or single-copy-atomic counter loads (`cpu::counter`).
+    unsafe { CPUS.get(i) as *const _ }
+}
+
+/// One coherent reading of CPU `i`'s coupled group.
+pub fn cpu_snap(i: usize) -> Option<cpu::CpuSnap> {
+    // SAFETY: a live block; racing the owner is what the seqlock is for.
+    unsafe { cpu::read(cpu_block(i)) }
+}
+
+/// Counter `slot` of CPU `i`.
+pub fn cpu_counter(i: usize, slot: usize) -> u64 {
+    // SAFETY: a live block; a torn u64 cannot occur on these ISAs.
+    unsafe { cpu::counter(cpu_block(i), slot) }
+}
+
+/// Kernel VA of the per-CPU snapshot array, for the root to publish.
+pub fn cpus_va() -> usize {
+    core::ptr::addr_of!(CPUS) as usize
+}
+
+/// The published name table: which counter slot means what, as runtime data
+/// rather than an ABI contract, so a reader never guesses at an unnamed slot
+/// (`abi::obs::OBS_SEC_NAMES`).
+static NAMES: [crate::abi::obs::ObsName; 5] = {
+    use crate::abi::obs::{OBS_NAME_COUNTER, ObsName};
+    [
+        ObsName::new(OBS_NAME_COUNTER, cpu::CTR_BUSY_TICKS as u32, "busy_ticks"),
+        ObsName::new(OBS_NAME_COUNTER, cpu::CTR_IDLE_TICKS as u32, "idle_ticks"),
+        ObsName::new(OBS_NAME_COUNTER, cpu::CTR_DISPATCHES as u32, "dispatches"),
+        ObsName::new(OBS_NAME_COUNTER, cpu::CTR_HALTS as u32, "halts"),
+        ObsName::new(OBS_NAME_COUNTER, cpu::CTR_SPINS as u32, "spins"),
+    ]
+};
+
+/// The name table's address and entry count, for the root.
+pub fn names_va() -> (usize, usize) {
+    (core::ptr::addr_of!(NAMES) as usize, NAMES.len())
 }

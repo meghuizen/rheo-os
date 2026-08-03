@@ -2518,6 +2518,11 @@ fn enter_vcore(idx: usize, v: usize) {
         }
         Err(e) => panic!("cell {idx} vcore {v} refused to CPU {me}: {e:?}"),
     }
+    // The snapshot plane's context-switch write (docs/OBSERVABILITY.md 11, S3):
+    // this CPU is now inside `(idx, v)`. Here rather than in `entity.rs` because
+    // that file is host-included verbatim by `verify/entity`, and because this is
+    // already the one place both enter paths meet.
+    crate::obs::snap_user(idx, id, v);
 }
 
 /// Cores observed inside one entity at once.
@@ -2565,6 +2570,7 @@ fn run_inner(idx: usize, v: usize) {
     // from is not the one it entered.
     // SAFETY: this core's own entry.
     unsafe { crate::sched::entity::table() }.leave_cpu(crate::smp::cpu_index() as u16, 0, false);
+    crate::obs::snap_kernel();
 }
 
 /// Turn a Linux personality `Ctl` into the frame to resume (or a null-frame

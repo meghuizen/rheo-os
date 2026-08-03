@@ -456,6 +456,10 @@ pub fn park(other_source: bool) -> bool {
 /// completion - the ones the old direct-`timer_arm` pattern lost.
 fn rearm(now: u64, after_release: bool) {
     let nearest = nearest_ns();
+    // The snapshot plane's armed-deadline field (docs/OBSERVABILITY.md 11, S3):
+    // published at the one place every arm and re-arm already passes through, in
+    // the arbiter's own ns domain (the ABI field says so), 0 for "nothing armed".
+    crate::obs::snap_aux(Some(nearest.unwrap_or(0)), None);
     if after_release && nearest.is_some() {
         // SAFETY: a plain counter update of this CPU's own state.
         unsafe {
