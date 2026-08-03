@@ -810,4 +810,109 @@ revert control), and the fairness / balance / starvation / reservation exports.
 The per-node memory breakdown, the rest of the counter unification (11.6), the
 rest of S6 (11.9), the capability gate on telemetry, egress beyond the serial
 console, the host tool, and the OTLP exporter cell. Dynamic probes remain the
-documented deferral of section 5.
+documented deferral of section 5. Section 12 is the plan of record for all of
+them.
+
+## 12. The remaining phases - the plan of record
+
+The working plan lived in a session-local file; sessions are ephemeral and this
+document is not, so the remainder is recorded here with enough detail to resume
+from a cold start. Phases S0-S5 and the first S6 slice are **done** (11.2-11.9,
+each with its controls and measured costs). What follows keeps the plan's
+numbering.
+
+### 12.1 S6 remainder - scheduler effectiveness
+
+Not "did it schedule" but "did it schedule well": a distribution plus ratios.
+
+- **`RunDelayNs` made correct**: it is recorded today from the queue's own
+  bookkeeping; correctness needs a `ready_ts` stamped when an entity becomes
+  runnable, on the entity's **cold** line (EXECUTION-MODEL.md 4.1 caps the hot
+  line at 64 bytes). Constraint discovered in S3/S4: `sched/entity.rs` is
+  host-included verbatim by `verify/entity`, so the stamp must be **passed in**
+  by the caller (`user.rs`/`nproc`), never read from `crate::arch` inside that
+  file. Control, from the plan row: revert `ready_ts` and run-queue latency
+  reads zero while dispatches keep climbing - it must be observed firing.
+- **Fairness**: EEVDF `vruntime` spread, `vdeadline` lag across runnables, and
+  `eligibility_defers` - already computed in `sched/vcore.rs`'s stats tuple,
+  needing export rather than mechanism.
+- **Balance and transfers**: per-CPU runnable depth, `smp::node_claims`,
+  `avoidable_crossings`, `steals`, `tier_claims` - all existing counters;
+  publication (a pane or plane slots), not relocation.
+- **Preemption armed-vs-taken by query alone**: already plane slots since S4;
+  the acceptance is reproducing the `preempt` kernel's hand-computed counts
+  through the published plane with no accessor.
+- **Starvation**: longest a runnable entity waited without being picked - the
+  number that turns "the scheduler is busy" into "the scheduler is unfair".
+  Falls out of `ready_ts`.
+- **Reservations, admitted vs delivered**: will honestly expose the known gap
+  that admission is enforced at admit and not at run time (LIBRHEO.md Phase C).
+  Showing it is the job; hiding it is not.
+
+### 12.2 S7 - the capability gate, and a real hole to close
+
+`SYS_EVENT_EMIT` today lets **any cell pick any event kind** - including
+`EV_CELL_SPAWN`/`EV_GRANT`/`EV_REVOKE` - with no capability check: a cell can
+forge kernel-attributed events into the stream every other cell reads.
+`ObjectKind::Stream` exists and nothing constructs it. The fix: `obs::init`
+creates one Stream object at boot; a cell reaches telemetry only through a
+capability its launcher minted (no ambient authority - the cell-spawn shape).
+`RIGHT_READ` = collector; `|RIGHT_WRITE` = may change the mask. Three syscalls
+(each needing the ARCHITECTURE.md 6 admission audit written at its definition):
+**`SYS_OBS_INFO` (55)** grant-checks READ and maps the root page +
+`PerCpu<ObsCpu>` **read-only** into the cell (the `SYS_GRANT_SHARE` shape);
+**`SYS_OBS_READ` (56)** copies whole records out of the rings merged by tick,
+cursor per cell, loss reported as a located `[lo,hi)` range; **`SYS_OBS_CTL`
+(57)** requires WRITE. `SYS_EVENT_EMIT` is **fixed, not removed**: without
+WRITE its `kind` is forced to `EV_USER`, so `lsh`'s `event` builtin behaves
+byte-for-byte as today. **Refused**: mapping the event rings writable into any
+cell - `SYS_OBS_READ` costs a memcpy of 32-byte records; a writable ring would
+let the most privileged cell forge the kernel's own trace. Named limitation:
+the read cursor is per *cell*, not per capability (`CapSlot` has no room).
+Controls: no cap -> refused; revoke -> a live handle fails `Revoked`; no WRITE
+-> `SYS_EVENT_EMIT(EV_CELL_SPAWN)` records `EV_USER`.
+
+### 12.3 S8 - egress
+
+A virtio-console driver (the fifth virtio device, same two transports as
+blk/net/gpu/rng) beside the existing serial `@E`/`@S` path, so the same boot's
+records arrive identically over both; plus the QEMU `pmemsave` route for a host
+reader. Control: detach the console device -> the driver reports absent and
+the serial path still carries everything. Tests assert on the **portable
+serial path**, so nothing depends on QEMU.
+
+### 12.4 S9 - the host tool (`tools/rheoscope`, Tier A)
+
+Decodes the plane from outside (ELF symbol -> `pa = p_paddr + (vma - p_vaddr)`
+-> sections, the 11.2 walk) and inside (serial dump), rendering the panes:
+CPUs (busy/idle, current entity, dispatches), entities, scheduler quality,
+memory by node, devices, queues/timers, locks, log. Every view has
+`--once --format tsv|arrow|table|json` over the same decode path. Its oracle:
+the decoded stream **byte-identical** to the `@E` dump the same boot printed -
+two independent readers of one buffer agreeing is the proof the root is
+walkable. Refusal behaviour is part of the spec: version bumped in the tool
+only -> refuses; `size_of::<ObsEvent>()` changed in the kernel only -> the
+layout section mismatches and it refuses; `obs` never enabled -> "root present,
+windows=0, 0 events", not a crash. Tier A (pinned `arrow`/`ratatui`/
+`crossterm`); xtask stays zero-dep - a SUBSTRATE.md 11 shelf amendment must
+land with it.
+
+### 12.5 S10 - the OTLP exporter cell
+
+Tier S, `no_std`, hand-rolled protobuf over `net::http1`: spans and metrics
+into a real collector, wire bytes checked against a hand-built OTLP fixture
+(control: one varint tag changed -> the fixture comparison fails). OTel at the
+edge, never in the kernel - the section 5 doctrine.
+
+### 12.6 Standing constraints (learned, not assumed)
+
+Every phase above inherits the rules the built phases paid for: the disabled
+path is a load and a not-taken branch with **nothing live across the region**
+(11.9's bracket lesson); funding happens at bring-up, never on an emit path
+(three aliasing/deadlock incidents: 11.3, 11.7, 11.9); accessors keep their
+signatures so the existing suite is the exactness oracle (11.6); a quantity
+that cannot be measured is **reported absent, never estimated** (11.8's GPU
+utilisation); host-included files (`sched/entity.rs`, `obs/ring.rs`,
+`obs/cpu.rs`) take their inputs as arguments and name nothing outside
+`crate::abi`; and every slice lands with a hand-computed oracle, an observed
+firing control, and the full matrix green on all three ISAs before push.
