@@ -397,6 +397,73 @@ impl Default for ObsCpu {
 }
 
 // =========================================================================
+// Machine-wide memory status
+// =========================================================================
+
+/// The machine's memory numbers, filled **on request** rather than maintained:
+/// every field is already live in its own subsystem (the frame pool's counters,
+/// the pmem pool's, the kmeta ledger, the demand-paging witnesses), and stamping
+/// a copy here from `frames::alloc` would put a store on the hottest allocation
+/// path to keep a mirror warm. So [`ObsMem::refreshed_tick`] says when the copy
+/// was taken, and a reader judges staleness instead of being lied to about it.
+/// The same seqlock protocol as [`ObsCpu`] guards the group.
+#[repr(C, align(64))]
+pub struct ObsMem {
+    /// Even means stable, odd means a refresh is inside.
+    pub seq: AtomicU32,
+    pub _pad: u32,
+    /// The `obs_tick()` at which these numbers were copied from the live
+    /// subsystems. 0 = never refreshed, and every other field is meaningless.
+    pub refreshed_tick: u64,
+    /// DDR frame pool: frames free / frames total.
+    pub ddr_free: u64,
+    pub ddr_total: u64,
+    /// The separate persistent-memory pool, 0/0 where no nvdimm exists.
+    pub pmem_free: u64,
+    pub pmem_total: u64,
+    /// Frame allocations that fell back off their preferred NUMA node.
+    pub numa_fallbacks: u64,
+    /// Demand paging: ELF pages recorded for lazy fill vs copied eagerly.
+    pub recorded_pages: u64,
+    pub eager_pages: u64,
+    /// Block-cache fills - bytes genuinely read off a disk on demand.
+    pub block_cache_fills: u64,
+    /// Frames the kernel's own funded tables hold, charged to `Owner::KERNEL`.
+    pub kmeta_kernel_frames: u64,
+    pub _rsv: [u64; 5],
+}
+
+const _: () = assert!(core::mem::size_of::<ObsMem>() == 128);
+
+impl ObsMem {
+    /// Never refreshed; every field zero. A `const fn` for the reason
+    /// [`ObsRingHdr::new`] gives (the atomic must not be copied from a `const`).
+    pub const fn new() -> ObsMem {
+        ObsMem {
+            seq: AtomicU32::new(0),
+            _pad: 0,
+            refreshed_tick: 0,
+            ddr_free: 0,
+            ddr_total: 0,
+            pmem_free: 0,
+            pmem_total: 0,
+            numa_fallbacks: 0,
+            recorded_pages: 0,
+            eager_pages: 0,
+            block_cache_fills: 0,
+            kmeta_kernel_frames: 0,
+            _rsv: [0; 5],
+        }
+    }
+}
+
+impl Default for ObsMem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// =========================================================================
 // Names
 // =========================================================================
 
@@ -505,6 +572,8 @@ pub const OBS_SEC_NAMES: u32 = 4;
 pub const OBS_SEC_HISTOGRAMS: u32 = 5;
 /// The per-CPU text log rings (`kernel::telemetry`).
 pub const OBS_SEC_TEXT_RINGS: u32 = 6;
+/// The machine-wide [`ObsMem`] block. One element.
+pub const OBS_SEC_MEM: u32 = 8;
 /// A layout witness carrying no data: `stride` = `size_of::<ObsEvent>()`.
 ///
 /// A reader built against a different `rheo-abi` than the kernel would otherwise
@@ -603,7 +672,7 @@ const _: () = assert!(core::mem::offset_of!(ObsRoot, sections) == OBS_HEADER_LEN
 /// anyone having to remember to bump a constant.
 pub const OBS_ABI_HASH: u64 = {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let vals: [u64; 9] = [
+    let vals: [u64; 10] = [
         OBS_VERSION as u64,
         core::mem::size_of::<ObsEvent>() as u64,
         core::mem::size_of::<ObsRingHdr>() as u64,
@@ -611,6 +680,7 @@ pub const OBS_ABI_HASH: u64 = {
         core::mem::size_of::<ObsSection>() as u64,
         core::mem::size_of::<ObsName>() as u64,
         core::mem::size_of::<ObsRoot>() as u64,
+        core::mem::size_of::<ObsMem>() as u64,
         OBS_COUNTERS as u64,
         OBS_WINDOWS as u64,
     ];

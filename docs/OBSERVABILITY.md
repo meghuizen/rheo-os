@@ -573,10 +573,23 @@ not timer precision), a real U-mode cell entry writes the group and counts a
 dispatch, and after the run the group says kernel context - a group still claiming
 the cell would be a live-state lie.
 
+**The machine-wide memory block** (`abi::obs::ObsMem`, `OBS_SEC_MEM`) closes S3:
+DDR and pmem pool numbers, NUMA fallbacks, the demand-paging witness pair
+(`recorded_pages`/`eager_pages`), block-cache fills and the kernel's own kmeta
+charge, **filled on request** (`obs::mem_refresh`) rather than maintained -
+every field is already live in its own subsystem, and stamping a mirror from
+`frames::alloc` would put a store on the hottest allocation path. So the block
+carries `refreshed_tick`: a reader judges staleness instead of being lied to
+about it, and `observe` asserts exactly that - the unrefreshed block says tick 0,
+a refresh matches `frames::stats()` exactly, three allocated frames appear as
+exactly three after the next refresh **and not before** (a block that moved
+without a refresh would mean an allocator is keeping the mirror warm, the cost
+the design refuses). Per-node used/total breakdowns wait on per-node counters in
+`frames` itself, which is S4-adjacent work, named rather than approximated.
+
 ### 11.6 Not built yet
 
-Memory-status blocks (frame pool by node, pmem, the kmeta ledger - the remaining
-S3 half), the counter unification, the `Net`/`Gpu`/`Lock` windows with their
-device and lock instrumentation, the capability gate on telemetry, egress beyond
-the serial console, the host tool, and the OTLP exporter cell. Dynamic probes
-remain the documented deferral of section 5.
+The per-node memory breakdown, the counter unification, the `Net`/`Gpu`/`Lock`
+windows with their device and lock instrumentation, the capability gate on
+telemetry, egress beyond the serial console, the host tool, and the OTLP
+exporter cell. Dynamic probes remain the documented deferral of section 5.

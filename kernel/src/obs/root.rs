@@ -26,8 +26,9 @@
 //! it is knowable earlier.
 
 use crate::abi::obs::{
-    OBS_MAX_SECTIONS, OBS_SEC_CPU, OBS_SEC_EVENT_LAYOUT, OBS_SEC_HISTOGRAMS, OBS_SEC_NAMES,
-    OBS_SEC_RINGS, OBS_SEC_TEXT_RINGS, ObsCpu, ObsEvent, ObsName, ObsRoot, ObsSection,
+    OBS_MAX_SECTIONS, OBS_SEC_CPU, OBS_SEC_EVENT_LAYOUT, OBS_SEC_HISTOGRAMS, OBS_SEC_MEM,
+    OBS_SEC_NAMES, OBS_SEC_RINGS, OBS_SEC_TEXT_RINGS, ObsCpu, ObsEvent, ObsMem, ObsName, ObsRoot,
+    ObsSection,
 };
 use core::sync::atomic::Ordering;
 
@@ -167,6 +168,19 @@ pub fn publish() {
             size_of::<crate::smp::PerCpu<ObsCpu>>(),
             size_of::<ObsCpu>() as u32,
             crate::smp::MAX_CPUS as u32,
+        ),
+    );
+
+    // The machine-wide memory block, refreshed on request and stamped with when.
+    add(
+        r,
+        region(
+            OBS_SEC_MEM,
+            0,
+            crate::obs::mem_va(),
+            size_of::<ObsMem>(),
+            size_of::<ObsMem>() as u32,
+            1,
         ),
     );
 

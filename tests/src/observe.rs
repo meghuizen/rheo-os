@@ -221,6 +221,71 @@ fn snapshot() {
         0,
         "reset must clear the snapshot counters"
     );
+
+    memory_block();
+}
+
+/// The machine-wide memory block: never a lie while unrefreshed, exact against the
+/// pool's own numbers when refreshed, and moved by **exactly** the frames a known
+/// allocation takes - the plan's "frame numbers match existing hand-computed pool
+/// deltas" oracle, asked of the published plane instead of of the accessors.
+fn memory_block() {
+    use core::sync::atomic::Ordering;
+    use kernel::obs as kobs;
+
+    let m = kobs::mem_block();
+    assert_eq!(
+        m.refreshed_tick, 0,
+        "the memory block claims a refresh that never happened"
+    );
+
+    kobs::mem_refresh();
+    let (free, total) = frames::stats();
+    assert!(
+        m.seq.load(Ordering::Acquire) & 1 == 0,
+        "refresh left the bracket open"
+    );
+    assert!(m.refreshed_tick > 0, "refresh did not stamp its tick");
+    assert_eq!(
+        (m.ddr_free, m.ddr_total),
+        (free as u64, total as u64),
+        "the published pool numbers disagree with the pool's own"
+    );
+
+    // Take three frames; the published copy must be stale by exactly three until
+    // the next refresh - staleness is the design, visible through the stamp.
+    let stale_free = m.ddr_free;
+    let taken: [usize; 3] =
+        core::array::from_fn(|_| frames::alloc().expect("test allocation refused"));
+    assert_eq!(
+        m.ddr_free, stale_free,
+        "the block moved without a refresh - an allocator is keeping the mirror warm, \
+         which is exactly the hot-path cost the design refuses"
+    );
+    let t1 = m.refreshed_tick;
+    kobs::mem_refresh();
+    assert!(
+        m.refreshed_tick > t1,
+        "the second refresh did not advance the stamp"
+    );
+    assert_eq!(
+        m.ddr_free,
+        stale_free - 3,
+        "three frames allocated, but the refreshed block does not say so"
+    );
+    for pa in taken {
+        frames::free(pa);
+    }
+    kobs::mem_refresh();
+    assert_eq!(
+        m.ddr_free, stale_free,
+        "the frames went back but the block does not say so"
+    );
+    println!(
+        "observe: MEMORY BLOCK - unrefreshed says so (tick 0), a refresh matches the \
+         pool exactly, 3 allocated frames appear as exactly 3, staleness is visible \
+         through the stamp rather than papered over OK"
+    );
 }
 
 /// The event plane: recording, reading back, wrapping, and the counters that say

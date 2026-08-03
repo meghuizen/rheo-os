@@ -605,6 +605,64 @@ pub fn cpus_va() -> usize {
     core::ptr::addr_of!(CPUS) as usize
 }
 
+/// The machine-wide memory status block (`abi::obs::ObsMem`), filled by
+/// [`mem_refresh`] and stamped with when - never maintained by the allocators
+/// themselves, because that would put a mirror-keeping store on the hottest
+/// allocation path. `refreshed_tick == 0` means never filled.
+static MEM: crate::abi::obs::ObsMem = crate::abi::obs::ObsMem::new();
+
+/// Copy the live memory numbers into the published [`MEM`] block, under the same
+/// seqlock protocol the per-CPU group uses, and stamp when.
+///
+/// Callers: the dump path, a test oracle, and eventually `SYS_OBS_INFO` - anything
+/// that is about to *read* the numbers. Cheap enough to call freely (a dozen loads
+/// of counters every subsystem already maintains), expensive enough in principle
+/// (the pool's lock for `stats`) that it must never sit on an allocation path.
+pub fn mem_refresh() {
+    use core::ptr::write_volatile;
+    use core::sync::atomic::Ordering;
+
+    let (ddr_free, ddr_total) = crate::mm::frames::stats();
+    let (pmem_free, pmem_total) = crate::mm::frames_pmem::stats();
+    let c = &MEM as *const crate::abi::obs::ObsMem as *mut crate::abi::obs::ObsMem;
+    // SAFETY: the block is a static written only here; concurrent readers are
+    // defended by the seqlock exactly as for `ObsCpu`. Single writer in practice
+    // (the boot CPU's read paths); a future concurrent refresher must serialise.
+    unsafe {
+        let s = (*c).seq.fetch_add(1, Ordering::Acquire);
+        write_volatile(&raw mut (*c).refreshed_tick, crate::arch::obs_tick());
+        write_volatile(&raw mut (*c).ddr_free, ddr_free as u64);
+        write_volatile(&raw mut (*c).ddr_total, ddr_total as u64);
+        write_volatile(&raw mut (*c).pmem_free, pmem_free as u64);
+        write_volatile(&raw mut (*c).pmem_total, pmem_total as u64);
+        write_volatile(
+            &raw mut (*c).numa_fallbacks,
+            crate::mm::frames::numa_fallbacks() as u64,
+        );
+        write_volatile(&raw mut (*c).recorded_pages, crate::load::recorded_pages());
+        write_volatile(&raw mut (*c).eager_pages, crate::load::eager_pages());
+        write_volatile(
+            &raw mut (*c).block_cache_fills,
+            crate::hw::block::cache_fills(),
+        );
+        write_volatile(
+            &raw mut (*c).kmeta_kernel_frames,
+            crate::mm::kmeta::charged(crate::mm::kmeta::Owner::KERNEL) as u64,
+        );
+        (*c).seq.store(s.wrapping_add(2), Ordering::Release);
+    }
+}
+
+/// The published memory block, read-only.
+pub fn mem_block() -> &'static crate::abi::obs::ObsMem {
+    &MEM
+}
+
+/// Kernel VA of the memory block, for the root.
+pub fn mem_va() -> usize {
+    core::ptr::addr_of!(MEM) as usize
+}
+
 /// The published name table: which counter slot means what, as runtime data
 /// rather than an ABI contract, so a reader never guesses at an unnamed slot
 /// (`abi::obs::OBS_SEC_NAMES`).
