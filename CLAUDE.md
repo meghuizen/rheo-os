@@ -3563,7 +3563,12 @@ comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md; plus
               trace and sched_latency.rs asking the host Linux the same question
               in ns - different units, never divided. Every other axis is
               lab-gated and named; no number in the tree says rheo-os is faster
-              than Linux (docs/SUBSTRATE.md)
+              than Linux (docs/SUBSTRATE.md); plus ethos/ - the Ethos OS design
+              comparison (paper-driven; the source needs an authorized key and
+              is stated unreachable): Etypes' type-hash-at-the-boundary and
+              image-measured identity taken as G-gated debt rows, MinimaLT's
+              transport lessons folded into NETSTACK.md N7, paired-OS/Xen
+              delegation and per-message kernel type checks refused with reasons
 xtask/        build/run/test/bench/verify orchestration (cargo xtask ...)
 verify/       host-side model checking of the kernel state machines that are
               integer-only and dependency-free (docs/EXECUTION-MODEL.md 8): each

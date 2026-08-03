@@ -82,6 +82,14 @@ a published reference, never a fabricated local number:
   (tiled == naive) and an AVX2 kernel proven bit-identical to the scalar
   one. `sh comparison/tiles/run.sh`.
 
+One directory is a **design comparison with no harness**, and says why:
+
+- `ethos/` - the Ethos OS (UIC, Solworth), the other clean-slate
+  security-first bet. Its source requires an authorized key and is stated
+  unreachable, so the comparison is paper-driven and design-level: what is
+  taken (gated in docs/ARCHITECTURE-DEBT.md 7.5), what is refused, and no
+  performance claim in either direction.
+
 ## The honest framing of the seL4 comparison
 
 Per docs/IO.md 6.1: the queue pair is a composition of seL4's data channel
