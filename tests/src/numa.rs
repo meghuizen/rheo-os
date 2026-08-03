@@ -273,14 +273,22 @@ fn metadata_follows_its_owner(boundary: u64) {
 
         let mut table: Funded<u64> = Funded::new();
         table.set_owner(owner);
-        // Enough elements to need two data frames plus the directory, so the check
-        // covers a directory frame and more than one data frame.
-        let want = kmeta::elems_per_page::<u64>() + 1;
+        // Enough elements to cross the inline directory (kmeta's first
+        // INLINE_PAGES page addresses live in the struct and cost no frame), so
+        // the walk below covers data frames resolved through **both** tiers -
+        // inline and the overflow directory frame - and the overflow frame
+        // itself is charged through the same owner-placed allocation the data
+        // frames take.
+        let want = kmeta::INLINE_PAGES * kmeta::elems_per_page::<u64>() + 1;
         assert!(
             table.reserve(want),
             "funded reserve failed for owner {slot}"
         );
-        assert!(table.frames_held() >= 3);
+        assert_eq!(
+            table.frames_held(),
+            kmeta::INLINE_PAGES + 2,
+            "want INLINE_PAGES+1 data frames plus the one overflow directory frame"
+        );
 
         // Every element's frame must be on the owner's node. Walked per element
         // rather than per page because the mapping from element to frame is

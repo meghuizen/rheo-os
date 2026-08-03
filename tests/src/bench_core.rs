@@ -355,6 +355,78 @@ extern "C" fn kernel_main() -> ! {
         kernel::obs::reset();
     }
 
+    // ------------------------------------------------- the funded-table hot path
+    // `mm::kmeta::Funded` sits on scheduler-hot paths - the entity table is read on
+    // every pick, park and wake, the vcore queue on every dispatch, the Linux VMA
+    // list on every fault - so its per-access cost cascades into everything above
+    // it (docs/SUBSTRATE.md pillar 1). Four shapes, so an optimisation cannot look
+    // good on one and quietly move the cost to another:
+    //
+    //  - `funded_get_64B`: a 64-byte element (the entity table's shape; a
+    //    power-of-two count per page, so the index split is shift-and-mask).
+    //  - `funded_get_48B`: a 48-byte element (the vcore's shape; 85 per page, so
+    //    the index split is a divide-by-constant).
+    //  - `funded_get_deep`: the same table read on its 4th page, so a design that
+    //    only speeds up page 0 shows its regression here.
+    //  - `funded_scan_64`: the `(0..cap).filter_map(get)` loop the scheduler's
+    //    scan predicates actually run - per-access cost times the table.
+    {
+        use kernel::mm::kmeta::{Funded, Owner};
+        #[derive(Copy, Clone)]
+        struct E64([u64; 8]);
+        #[derive(Copy, Clone)]
+        struct E48([u64; 6]);
+        static mut T64: Funded<E64> = Funded::new();
+        static mut T48: Funded<E48> = Funded::new();
+        // SAFETY: single-threaded bench; unique statics.
+        let (t64, t48) = unsafe {
+            (
+                &mut *core::ptr::addr_of_mut!(T64),
+                &mut *core::ptr::addr_of_mut!(T48),
+            )
+        };
+        t64.set_owner(Owner::KERNEL);
+        t48.set_owner(Owner::KERNEL);
+        assert!(t64.reserve(64 * 4), "bench table refused"); // 4 pages of 64
+        assert!(t48.reserve(85 * 2), "bench table refused");
+        for i in 0..t64.capacity() {
+            t64.set(i, E64([i as u64; 8]));
+        }
+        for i in 0..t48.capacity() {
+            t48.set(i, E48([i as u64; 6]));
+        }
+        let mut acc = 0u64;
+        bench("funded_get_64B", || {
+            acc = acc.wrapping_add(t64.get(core::hint::black_box(7usize)).unwrap().0[0]);
+        });
+        bench("funded_get_48B", || {
+            acc = acc.wrapping_add(t48.get(core::hint::black_box(7usize)).unwrap().0[0]);
+        });
+        bench("funded_get_deep", || {
+            acc = acc.wrapping_add(t64.get(core::hint::black_box(64 * 3 + 5)).unwrap().0[0]);
+        });
+        bench("funded_set_64B", || {
+            t64.set(core::hint::black_box(9usize), E64([acc; 8]));
+        });
+        let mut hits = 0u64;
+        bench("funded_scan_64", || {
+            hits += (0..t64.capacity())
+                .filter_map(|i| t64.get(i))
+                .filter(|e| e.0[0] & 1 == 0)
+                .count() as u64;
+        });
+        // The same predicate over the iteration API: one page resolve per
+        // `elems_per_page` elements and reference-based reads, instead of a
+        // resolve and a 64-byte copy per element. The pair is the architecture
+        // measurement - scans are what the scheduler and the fault path actually
+        // run (docs/SUBSTRATE.md pillar 1), so this delta, not `funded_get_*`'s,
+        // is the one that cascades.
+        bench("funded_scan_iter", || {
+            hits += t64.iter().filter(|(_, e)| e.0[0] & 1 == 0).count() as u64;
+        });
+        core::hint::black_box((acc, hits));
+    }
+
     // ------------------------------------------------------------- P4
     // Strand spawn/teardown and context switch (docs/CONCURRENCY.md,
     // BUILD-ORDER step 7). These are the "light thread" path lengths: a

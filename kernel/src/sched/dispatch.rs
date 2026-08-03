@@ -461,10 +461,39 @@ pub fn preempted() -> u64 {
 /// returned. That is not belt-and-braces: `sync_runnable` reconciles by (cell,
 /// context) and a cell with several contexts is runnable if *any* of them is, so a
 /// queue entry can legitimately be ready while the caller's predicate - which is
-/// per *cell* - has since changed its mind. Preferring the predicate keeps the
-/// old safety property exactly: a cell is only ever resumed when the personality
-/// says it may be.
+/// per *cell* - answered differently. Preferring the predicate keeps the old
+/// safety property exactly: a cell is only ever resumed when the personality says
+/// it may be.
+///
+/// **The predicate is asked once per cell per decision**, memoized for the rest of
+/// it. One pick used to evaluate it up to three times per cell - per queue entry
+/// in `sync_runnable` (a multi-context cell has several), once in the final
+/// filter, and up to once more in the divergence probe below - and the predicate
+/// can itself walk the cell's whole context table (`linux::proc`'s `any_ready`),
+/// so the repeats multiplied two table walks together. Nothing inside one pick
+/// mutates personality state (`sync_runnable` writes only the queue), so the memo
+/// is not a staleness trade: it makes the decision read **one** snapshot of
+/// runnability instead of several, which is what reconcile-at-the-pick means.
 pub fn pick<F: Fn(usize) -> bool>(leaving: usize, cells: usize, runnable: F) -> Option<usize> {
+    // 0 = not asked, 1 = no, 2 = yes. `Cell` because the closure is shared with
+    // `sync_runnable` as `Fn`; 16 bytes copied per query is nothing against the
+    // context-table walk it replaces.
+    let memo = core::cell::Cell::new([0u8; crate::user::MAX_CELLS]);
+    let runnable = |i: usize| {
+        let mut m = memo.get();
+        match m.get(i).copied() {
+            Some(1) => false,
+            Some(2) => true,
+            _ => {
+                let r = runnable(i);
+                if let Some(slot) = m.get_mut(i) {
+                    *slot = 1 + r as u8;
+                    memo.set(m);
+                }
+                r
+            }
+        }
+    };
     let round_robin = || {
         (1..=cells)
             .map(|k| (leaving + k) % cells)

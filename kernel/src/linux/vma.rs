@@ -166,6 +166,23 @@ impl Vma {
         self.file_len.saturating_sub(at - self.base)
     }
 
+    /// The file bytes behind the page containing `addr`: **which** file, **where**
+    /// in it, and **how many** bytes of the page come from it (the rest are zero).
+    /// `None` for an anonymous mapping, and also once the page lies wholly past the
+    /// file content, because then a zeroed frame is already the right answer.
+    ///
+    /// A method on the record rather than a `VmaList` lookup, deliberately: the one
+    /// caller is the page-fault fill, which has **already found** this record to
+    /// check its protection - asking the list again was a second full scan per
+    /// fault for an answer the record in hand could give (the combine-the-passes
+    /// rule: two questions about one element are one walk, not two).
+    pub fn file_page(&self, addr: usize) -> Option<(filemap::Handle, u64, usize)> {
+        let h = self.file?;
+        let page = addr & !(FRAME_SIZE - 1);
+        let avail = self.avail_at(page).min(FRAME_SIZE);
+        (avail > 0).then_some((h, self.file_off + (page - self.base) as u64, avail))
+    }
+
     fn end(&self) -> usize {
         self.base + self.len
     }
@@ -212,9 +229,8 @@ impl VmaList {
     }
 
     fn close_all(&mut self) {
-        for i in 0..self.v.capacity() {
-            if let Some(m) = self.v.get(i)
-                && m.len != 0
+        for (_, m) in self.v.iter() {
+            if m.len != 0
                 && let Some(h) = m.file
             {
                 filemap::close(h);
@@ -255,10 +271,8 @@ impl VmaList {
         if n > 0 && !self.v.reserve(n) {
             return false;
         }
-        for i in 0..n {
-            if let Some(m) = src.v.get(i) {
-                self.v.set(i, m);
-            }
+        for (i, m) in src.v.iter() {
+            self.v.set(i, *m);
         }
         true
     }
@@ -267,21 +281,21 @@ impl VmaList {
     ///
     /// Yields `Vma` rather than `&Vma`: a funded element's address is stable, but
     /// handing out references would borrow the table for the iterator's whole life
-    /// and block the mutating walks below. The record is 7 words, so a copy is
-    /// cheaper than the borrow discipline would be.
+    /// and block the mutating walks below. The record is 7 words, so a copy of a
+    /// **live** record is cheaper than the borrow discipline would be - and only
+    /// live records are copied: the walk itself is `Funded::iter`, by reference,
+    /// because this runs under every page fault and the copy-per-slot form paid
+    /// the 7-word copy for dead slots too (docs/SUBSTRATE.md pillar 1).
     fn live(&self) -> impl Iterator<Item = Vma> + '_ {
-        (0..self.v.capacity()).filter_map(move |i| match self.v.get(i) {
-            Some(m) if m.len != 0 => Some(m),
-            _ => None,
-        })
+        self.v.iter().filter(|(_, m)| m.len != 0).map(|(_, m)| *m)
     }
 
     /// The index of the first live record satisfying `pred`.
     fn position(&self, pred: impl Fn(&Vma) -> bool) -> Option<usize> {
-        (0..self.v.capacity()).find(|&i| match self.v.get_ref(i) {
-            Some(m) => m.len != 0 && pred(m),
-            None => false,
-        })
+        self.v
+            .iter()
+            .find(|(_, m)| m.len != 0 && pred(m))
+            .map(|(i, _)| i)
     }
 
     /// The mapping containing `addr`, if any. **This is the page-fault lookup**;
@@ -290,18 +304,11 @@ impl VmaList {
         self.live().find(|m| addr >= m.base && addr < m.end())
     }
 
-    /// The file backing `addr`, if any - the second half of the page-fault lookup:
-    /// **which** file, **where** in it, and **how many** bytes of this page come from
-    /// it (the rest are zero). Returns `None` for an anonymous mapping, and also once
-    /// the page lies wholly past the file content, because then there is nothing to
-    /// read and a zeroed frame is already the right answer.
-    pub fn file_at(&self, addr: usize) -> Option<(filemap::Handle, u64, usize)> {
-        let m = self.find(addr)?;
-        let h = m.file?;
-        let page = addr & !(FRAME_SIZE - 1);
-        let avail = m.avail_at(page).min(FRAME_SIZE);
-        (avail > 0).then_some((h, m.file_off + (page - m.base) as u64, avail))
-    }
+    // The second half of the page-fault lookup - which file backs a page - is
+    // [`Vma::file_page`], a method on the record `find` returns rather than a
+    // second list lookup: the fault path holds the record already, and a
+    // list-level `file_at(addr)` here made every file-backed fault scan the
+    // whole table twice.
 
     /// Add a backing-store reference for every live file-backed record - the **`fork`**
     /// step, and the exact twin of `fd::inherit_pipe_ends`.
@@ -383,10 +390,8 @@ impl VmaList {
     /// loop pays a logarithmic number of growths rather than one per mapping.
     fn free_slot(&mut self) -> Option<usize> {
         let cap = self.v.capacity();
-        for i in 0..cap {
-            if self.v.get(i).is_some_and(|m| m.len == 0) {
-                return Some(i);
-            }
+        if let Some(i) = self.v.iter().find(|(_, m)| m.len == 0).map(|(i, _)| i) {
+            return Some(i);
         }
         let want = if cap == 0 {
             INITIAL_VMAS

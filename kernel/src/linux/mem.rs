@@ -461,7 +461,9 @@ pub fn fault(st: &mut LinuxState, addr: usize) -> bool {
     // A file-backed page is read through the kernel's linear map *before* the frame
     // is user-mapped, so the read cannot alias the cell's memory. A short read (past
     // end of file) leaves the tail zero, which is what the frame already is.
-    if let Some((h, off, avail)) = st.vmas.file_at(page) {
+    // Asked of the record `find` already returned, not of the list again - the
+    // list-level lookup made every file-backed fault walk the whole table twice.
+    if let Some((h, off, avail)) = m.file_page(page) {
         let kva = arch::phys_to_virt(pa) as u64;
         // `avail` bytes at most: an ELF segment's file content can end mid-page, and
         // reading the whole page would serve the *next* segment's bytes in the tail

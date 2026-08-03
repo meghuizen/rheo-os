@@ -3522,17 +3522,20 @@ fn test_funded_contexts() {
         // them is per context (docs/EXECUTION-MODEL.md 9.3):
         //
         //  - its FP save area, one frame each, always; and
-        //  - a share of the cell's funded context table, which is a directory frame plus one
-        //    data page, allocated on the **first** context past vcore 0 and then reused - a
-        //    `Vcore` is 48 bytes, so one page holds 85 of them.
+        //  - a share of the cell's funded context table: one data page, allocated on the
+        //    **first** context past vcore 0 and then reused - a `Vcore` is 48 bytes, so one
+        //    page holds 85 of them. The table's directory is inline in the struct
+        //    (`kmeta::INLINE_PAGES`), so no directory frame is charged at this size - this
+        //    constant was 2 when the directory was its own frame, and the drop to 1 is
+        //    itself evidence the inline tier is in use.
         //
         // Measuring one batch would conflate the two and could not tell "the table is
         // amortised" from "every context allocates a table". So the first context is measured
-        // alone (1 area + 2 table = 3) and the next five together (5 areas + 0 table = 5), and
+        // alone (1 area + 1 table = 2) and the next five together (5 areas + 0 table = 5), and
         // the second number is the one that says the marginal cost of a context is one frame -
         // which is what makes "the ceiling is the cell's budget" a statement about frames
         // rather than a slogan.
-        const TABLE_FRAMES: usize = 2;
+        const TABLE_FRAMES: usize = 1;
         user::install_vcore(0, core::ptr::addr_of_mut!(frame), (*store).qp.qp.as_ptr());
         let after_first = used_frames();
         for _ in 1..EXTRA {

@@ -63,7 +63,10 @@ fn test_funded_metadata() {
     assert_eq!(table.capacity(), 0, "an empty table must hold no frames");
     assert_eq!(table.frames_held(), 0);
 
-    // Reserve enough to need two data frames plus the directory.
+    // Reserve enough to need two data frames. The directory for a table this
+    // size is inline in the struct, so it costs no frame at all - which is
+    // itself an assertion: a third frame appearing here means the overflow
+    // directory was allocated for a table that does not need one.
     let per_page = kmeta::elems_per_page::<u64>();
     assert!(per_page > 0, "u64 must have a valid page layout");
     let want = per_page + 1;
@@ -76,12 +79,12 @@ fn test_funded_metadata() {
     );
     assert_eq!(
         table.frames_held(),
-        3,
-        "2 data frames + 1 directory frame should be held"
+        2,
+        "2 data frames, directory inline (no frame) should be held"
     );
     assert_eq!(
         kmeta::charged(cell) - before_charged,
-        3,
+        2,
         "the owner must be charged for every frame the table holds"
     );
     assert!(
@@ -124,7 +127,7 @@ fn test_funded_metadata() {
         frames::used_matches_bitmap(),
         "frame accounting diverged from the bitmap"
     );
-    println!("substrate: funded metadata charges and releases exactly (3 frames)");
+    println!("substrate: funded metadata charges and releases exactly (2 frames)");
 }
 
 /// The point of pillar 1: a table grows **past every ceiling it replaced**.
@@ -153,8 +156,39 @@ fn test_funded_growth_beyond_old_caps() {
     assert_eq!(table.get(per_page), Some(per_page as u32));
     assert_eq!(table.get(per_page - 1), Some((per_page - 1) as u32));
 
-    // The ceiling that does exist is one directory frame's worth, and it must be
-    // refused cleanly rather than silently truncating.
+    // 4096 u32s is 4 pages - inside the inline directory. Cross the inline
+    // boundary too, or the overflow directory ships untested: grow the same
+    // table past INLINE_PAGES, assert the overflow frame appears exactly once
+    // (frames_held = pages + 1), and round-trip elements on both sides of the
+    // boundary so inline and overflow resolution are both exercised on the
+    // same table.
+    let boundary = kmeta::INLINE_PAGES * per_page;
+    let past = boundary + per_page + 1; // two pages into the overflow tier
+    assert!(
+        table.reserve(past),
+        "growth past the inline directory failed"
+    );
+    assert_eq!(
+        table.frames_held(),
+        table.pages() + 1,
+        "crossing INLINE_PAGES must cost exactly one overflow directory frame"
+    );
+    for i in (boundary - 2)..(boundary + 2) {
+        assert!(table.set(i, i as u32));
+    }
+    for i in (boundary - 2)..(boundary + 2) {
+        assert_eq!(
+            table.get(i),
+            Some(i as u32),
+            "element {i} did not round-trip across the inline/overflow boundary"
+        );
+    }
+    assert!(table.set(past - 1, 0xDEAD_BEEF));
+    assert_eq!(table.get(past - 1), Some(0xDEAD_BEEF));
+
+    // The ceiling that does exist is the inline tier plus one overflow
+    // directory's worth, and it must be refused cleanly rather than silently
+    // truncating.
     let too_big = Funded::<u32>::max_capacity() + 1;
     let mut huge: Funded<u32> = Funded::new();
     huge.set_owner(cell);

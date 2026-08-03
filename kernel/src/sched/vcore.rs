@@ -225,6 +225,30 @@ impl VcoreId {
     }
 }
 
+/// What one walk over the queue found: the best candidate per class, and
+/// whether the eligibility gate is holding back the earliest fair deadline.
+/// Produced by `RunQueue::scan`, consumed by `pick`, `eligibility_would_defer`
+/// and - both answers from the same walk - `dispatch`.
+struct Scan {
+    reserved: Option<(u64, VcoreId)>,
+    eligible: Option<(u64, VcoreId)>,
+    ineligible: Option<(u64, VcoreId)>,
+    residual: Option<(u64, VcoreId)>,
+    earliest_fair_ineligible: bool,
+}
+
+impl Scan {
+    /// The pick order [`RunQueue::pick`] documents: reserved, then eligible
+    /// fair, then ineligible fair, then residual.
+    fn pick_id(&self) -> Option<VcoreId> {
+        self.reserved
+            .or(self.eligible)
+            .or(self.ineligible)
+            .or(self.residual)
+            .map(|(_, id)| id)
+    }
+}
+
 /// One CPU's ready queue.
 pub struct RunQueue {
     vcores: Funded<Vcore>,
@@ -328,9 +352,15 @@ impl RunQueue {
     }
 
     /// Live vcores.
+    ///
+    /// Bounded by `high_water`, not capacity, and reading each slot **by
+    /// reference** before deciding to copy it: capacity is a whole page's worth
+    /// of slots (85 for a 48-byte `Vcore`), so a queue holding a handful of
+    /// vcores must not pay a full-page walk - the bound is what keeps the small
+    /// queue cheap, and `get_ref` is what stops the 48-byte copy per dead slot.
     pub fn iter(&self) -> impl Iterator<Item = (VcoreId, Vcore)> + '_ {
-        (0..self.high_water).filter_map(move |i| match self.vcores.get(i) {
-            Some(v) if v.live => Some((VcoreId(i as u32), v)),
+        (0..self.high_water).filter_map(move |i| match self.vcores.get_ref(i) {
+            Some(v) if v.live => Some((VcoreId(i as u32), *v)),
             _ => None,
         })
     }
@@ -442,17 +472,22 @@ impl RunQueue {
     /// preemption path, which says so explicitly.
     pub fn sync_runnable<F: Fn(u16, u16) -> bool>(&mut self, now_ns: u64, ready: F) {
         for i in 0..self.high_water {
-            let Some(v) = self.vcores.get(i) else {
-                continue;
+            // By reference, copying out only the four fields the decision needs -
+            // this runs per dispatch, and the whole-struct copy per slot was the
+            // dominant cost of the reconcile (docs/SUBSTRATE.md pillar 1). The
+            // borrow must end before `wake`/`block` take `&mut self`.
+            let (live, runnable, cell, context) = match self.vcores.get_ref(i) {
+                Some(v) => (v.live, v.runnable, v.cell, v.context),
+                None => continue,
             };
-            if !v.live {
+            if !live {
                 continue;
             }
-            let want = ready(v.cell, v.context);
+            let want = ready(cell, context);
             let id = VcoreId(i as u32);
-            if want && !v.runnable {
+            if want && !runnable {
                 let _ = self.wake(id, now_ns);
-            } else if !want && v.runnable {
+            } else if !want && runnable {
                 let _ = self.block(id, true);
             }
         }
@@ -460,7 +495,7 @@ impl RunQueue {
 
     fn free_index(&mut self) -> Option<usize> {
         for i in 0..self.high_water {
-            if !self.vcores.get(i).map(|v| v.live).unwrap_or(false) {
+            if !self.vcores.get_ref(i).map(|v| v.live).unwrap_or(false) {
                 return Some(i);
             }
         }
@@ -645,11 +680,27 @@ impl RunQueue {
     ///    a fairness rule bought with throughput).
     /// 4. **Residual** work, by virtual deadline.
     pub fn pick(&self) -> Option<VcoreId> {
-        let mut best_reserved: Option<(u64, VcoreId)> = None;
-        let mut best_eligible: Option<(u64, VcoreId)> = None;
-        let mut best_ineligible: Option<(u64, VcoreId)> = None;
-        let mut best_residual: Option<(u64, VcoreId)> = None;
+        self.scan().pick_id()
+    }
 
+    /// One walk over the queue answering **both** of dispatch's questions - who
+    /// runs next, and whether the eligibility gate changed that answer.
+    ///
+    /// They used to be two walks ([`Self::pick`] and
+    /// [`Self::eligibility_would_defer`]) with identical filters, run
+    /// back-to-back on every dispatch - two questions about the same elements
+    /// are one walk, not two. The per-element work here is exactly the union of
+    /// the two loops', including the strict-`<` first-seen tie rule both used,
+    /// so the fused answers are bit-identical to the sequential ones.
+    fn scan(&self) -> Scan {
+        let mut s = Scan {
+            reserved: None,
+            eligible: None,
+            ineligible: None,
+            residual: None,
+            earliest_fair_ineligible: false,
+        };
+        let mut earliest_fair: Option<u64> = None;
         for (id, v) in self.iter() {
             if !v.ready() {
                 continue;
@@ -660,23 +711,23 @@ impl RunQueue {
                 }
             };
             match v.class {
-                Class::Reserved => key(&mut best_reserved, v.hard_deadline_ns),
-                Class::Residual => key(&mut best_residual, v.vdeadline),
+                Class::Reserved => key(&mut s.reserved, v.hard_deadline_ns),
+                Class::Residual => key(&mut s.residual, v.vdeadline),
                 Class::Fair => {
-                    if self.eligible(&v) {
-                        key(&mut best_eligible, v.vdeadline)
+                    let e = self.eligible(&v);
+                    if e {
+                        key(&mut s.eligible, v.vdeadline)
                     } else {
-                        key(&mut best_ineligible, v.vdeadline)
+                        key(&mut s.ineligible, v.vdeadline)
+                    }
+                    if earliest_fair.map(|k| v.vdeadline < k).unwrap_or(true) {
+                        earliest_fair = Some(v.vdeadline);
+                        s.earliest_fair_ineligible = !e;
                     }
                 }
             }
         }
-
-        best_reserved
-            .or(best_eligible)
-            .or(best_ineligible)
-            .or(best_residual)
-            .map(|(_, id)| id)
+        s
     }
 
     /// Whether the eligibility gate changed the answer: the earliest-deadline
@@ -686,17 +737,7 @@ impl RunQueue {
     /// degenerating to earliest-deadline-first: the two agree most of the time, so
     /// "it works" is not observable from the pick alone (docs/ENGINEERING.md 1).
     pub fn eligibility_would_defer(&self) -> bool {
-        let mut earliest: Option<(u64, bool)> = None;
-        for (_, v) in self.iter() {
-            if !v.ready() || v.class != Class::Fair {
-                continue;
-            }
-            let e = self.eligible(&v);
-            if earliest.map(|(k, _)| v.vdeadline < k).unwrap_or(true) {
-                earliest = Some((v.vdeadline, e));
-            }
-        }
-        matches!(earliest, Some((_, false)))
+        self.scan().earliest_fair_ineligible
     }
 
     /// Dispatch the picked vcore: mark it current, count it, and report how long
@@ -704,10 +745,11 @@ impl RunQueue {
     ///
     /// Returns `(id, queue_delay_ns)`, or `None` when nothing is runnable.
     pub fn dispatch(&mut self, now_ns: u64) -> Option<(VcoreId, u64)> {
-        if self.eligibility_would_defer() {
+        let scan = self.scan();
+        if scan.earliest_fair_ineligible {
             self.eligibility_defers = self.eligibility_defers.wrapping_add(1);
         }
-        let id = self.pick()?;
+        let id = scan.pick_id()?;
         let mut v = self.get(id)?;
         let delay = now_ns.saturating_sub(v.runnable_since_ns);
         v.dispatches = v.dispatches.saturating_add(1);
