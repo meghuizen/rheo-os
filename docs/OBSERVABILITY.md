@@ -648,13 +648,20 @@ fails `preempt` with "61 slices armed but none was ever taken".
 
 Still to migrate (the rest of the plan row): the arbiter's arms/firings/parks/
 preserved (already per-CPU inside the `Arbiter` - publication candidates more than
-relocation candidates), user/smp's claim counters, and the
-frames/nvme/block/load/mm/rng::entropy families - each a mechanical repetition of
-the proven pattern, gated per module. Deliberately **not** migrating: gauges
-(`kmeta::META_FRAMES`, the pool's `USED` - the plane's slots are monotone counters,
-and a gauge in a counter slot invites rate arithmetic over a non-rate), config
-statics (profiles, VAs, search hints), and per-cell Linux-personality state, which
-is per *cell* rather than per CPU and lives behind `plock`.
+relocation candidates), smp's claim counters (already-correct feature-gated
+atomics with exact multi-core assertions - plane-readability is the only gain),
+and the frames/nvme/block/load/mm/rng::entropy families - each a mechanical
+repetition of the proven pattern, gated per module. Deliberately **not**
+migrating: gauges (`kmeta::META_FRAMES`, the pool's `USED` - the plane's slots are
+monotone counters, and a gauge in a counter slot invites rate arithmetic over a
+non-rate), config statics (profiles, VAs, search hints), per-cell
+Linux-personality state (per *cell* rather than per CPU, behind `plock`), and
+`sched/entity.rs`'s `double_entries`/`affinity_skips` - that file is
+**host-included verbatim** by `verify/entity`, so a `crate::obs` call inside it
+would break the fuzzer's shim, the same structural rule that put S3's `snap_user`
+in `user.rs` rather than beside the entity table. Those two stay SMP-sound atomics
+where they are; the plane's query surface (S7/S9) reads accessors, not slots, so
+nothing is lost but relocation.
 
 ### 11.7 Not built yet
 
