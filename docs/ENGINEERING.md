@@ -667,6 +667,57 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   cause it *measured*, so "loaded to the concurrency frontier" is evidence, not a guess -
   and the acceptance is bounded to that exact signature (exit 134 **and** empty output)
   so a different failure still fails loudly.
+- **Optimise the access *shape*, not the access - and map the consumers before touching
+  the primitive.** The funded-table hot-path work (docs/SUBSTRATE.md pillar 1, S2c)
+  started as "make `slot_ptr` faster" and would have bought ~1 instruction. Drawing the
+  dependency graph of who consults the table and how often showed the cost was never
+  point access: it was whole-table **scans** written as point access in a loop - the
+  index split, the page resolve and a full copy of `T` per element, times the table,
+  times per-decision frequency (the scheduler's predicates per pick, the VMA walk per
+  fault). A scan API reading by reference took the same predicate from 10.5 to 4.9
+  instructions per element; the point-access fix was noise. And the graph is also what
+  keeps a fix from becoming a **moved bottleneck**: the identical migration applied to
+  the EEVDF queue would have *regressed* it, because its capacity is a whole page of
+  48-byte slots and its walks are bounded by a much smaller `high_water` - the right
+  lever there was killing the per-slot copy (`get_ref`), keeping the bound. One
+  primitive, two consumers, two opposite answers; only the consumer map tells them
+  apart.
+- **Two questions about the same elements are one walk.** Found three times in one pass,
+  all on decision paths: the page-fault fill asked the VMA list `find(addr)` and then a
+  list-level `file_at(addr)` **which re-ran `find`** - the record was already in the
+  caller's hand, so the second question became a method on it (`Vma::file_page`); EEVDF
+  `dispatch` walked its queue twice with identical filters (`eligibility_would_defer`
+  then `pick`) and now takes both answers from one walk - fused *exactly*, including the
+  strict-`<` first-seen tie rule, because a fusion that changes an edge case is a
+  behaviour change wearing an optimisation's name; and `sched::dispatch::pick` evaluated
+  the personality's runnable predicate - itself a context-table walk - up to **three
+  times per cell per decision** (per queue entry in the reconcile, the final filter, the
+  divergence probe), fixed with a per-decision memo, which is also semantically better:
+  one decision now reads one snapshot of runnability instead of several. The smell in
+  every case is a helper that re-derives what its caller already holds.
+- **A struct's size is an interface: bench the whole matrix, not the paths you touched.**
+  Growing `Funded<T>` by 64 bytes (the inline directory) changed benchmarks that never
+  touch a funded table: the `rng_*` draws moved +3..6 instructions **amortized** -
+  non-integer per-op deltas, so a rare path (the 1-in-1024 drain), not the per-draw path
+  - and two queue round trips moved +-1, all from static-layout and alignment ripples
+  (a word-wide wipe loop degrades to per-byte when a buffer's alignment shifts). None of
+  this is visible from the touched paths' benches, and icount is deterministic, so these
+  are real instructions, not noise. The discipline: diff **every** benchmark against the
+  pre-change build, publish the regressions next to the wins (+1 on `p2_roundtrip_single`
+  beside -16 on `p5_crosscell_roundtrip`), and treat an unexplained delta as a finding to
+  localise, not a rounding error to wave at.
+- **When a design change deletes a cost, the oracles that hand-computed it must move to
+  the new number - and a boundary that becomes untested must gain a test.** The inline
+  directory made small tables stop paying a directory frame, which broke three frame
+  oracles (`smp` E4's `TABLE_FRAMES`, `substrate`'s charge count, `numa`'s `>= 3`) -
+  correctly, and each was moved to assert the **new** truth rather than loosened
+  (`TABLE_FRAMES: 2 -> 1` is itself evidence the inline tier is in use, and a third
+  frame appearing in `substrate` now means the overflow directory was allocated for a
+  table that does not need one). The same change also moved the overflow directory out
+  of every existing test's reach - every boot-suite table now fits inline - so the
+  growth test crosses the boundary explicitly and round-trips elements on both sides.
+  A designed-away cost quietly un-tests the mechanism that remains; check what the old
+  tests were reaching *through*, not just what they asserted.
 
 ## 12. Never dereference an address the caller chose
 

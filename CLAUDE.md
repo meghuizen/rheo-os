@@ -3166,6 +3166,40 @@ a reader racing a live writer on another core, which no built reader is yet and 
 single-threaded host driver cannot produce without aliasing the ring mutably to model a data
 race the language forbids.
 
+**And recording is cheap enough to leave compiled in everywhere** (docs/OBSERVABILITY.md
+11.4, S2/S2b): a per-window **enable mask** gates 13 windows - one relaxed load, a test
+and a branch, **3 instructions** on every disabled site, with the event's arguments never
+evaluated (`obs_event!` is a macro so the mask test sits *outside* argument marshalling;
+written as a function first, it cost +9 and the plan's own named control caught it) - and
+the **enabled** emit went 60 -> **22** instructions by doing what Linux's ring buffer does
+(4 packed u64 stores, header word const-folded at the call site) minus what this kernel
+does not need (no nesting-safe reserve/commit: the producer is partitioned per CPU and no
+emit can interrupt an emit today, stated in `obs/ring.rs` for the design that changes it).
+The ring became a **contiguous block** (`frames::alloc_contig`, the allocator whose
+absence two ISA scars had recorded) so a slot address is one multiply rather than a page
+split, and a host reader's walk is linear. Static-key text patching for the disabled site
+is **refused with the cost recorded** (self-modifying kernel text + per-ISA I-cache
+protocol to buy back 3 instructions). Measured against the pre-S2 build across the whole
+matrix: +3 per new call site on the queue round trips, every untouched path unchanged to
+the tick. **And the table under the scheduler state those windows record about was priced
+next** (docs/SUBSTRATE.md pillar 1, S2c): `Funded<T>` grew an **inline directory** (first
+8 page addresses in the struct - no dependent directory load and no directory frame for
+every hot table; three frame oracles moved to the new numbers, the inline/overflow
+boundary gained the test it had silently lost) and a **scan API**
+(`page_slices`/`iter`, one resolve per page, elements by reference - 10.5 -> 4.9
+instructions/element; migrated into the entity table's, VMA list's and thread table's
+decision-path scans, while the EEVDF queue deliberately kept its `high_water`-bounded
+point loop over `get_ref`, where the same migration would have *regressed* a small
+queue), and the **repeated walks were fused**: the page-fault fill asks the record it
+already holds (`Vma::file_page`) instead of re-scanning the list, EEVDF `dispatch` takes
+pick + eligibility from one walk instead of two identical ones, and `dispatch::pick`
+memoizes the personality's runnable predicate (it was evaluated up to three times per
+cell per decision, each itself a context-table walk). Whole-matrix bench diff published:
+`p5_crosscell_roundtrip` 499 -> 483, against +1/-1 ripples and +3..6 amortized on the
+`rng_*` draws from the 64-byte-larger struct - the lessons (optimise the access shape;
+two questions about one element set are one walk; a struct's size is an interface, bench
+everything) recorded in docs/ENGINEERING.md 11.
+
 **One intermittent test was found and fixed** while gating the above: `rng`'s HID phase
 asserted `virtio_input::buffers_clear()` - every DMA buffer zero *after* a drain - and failed
 on riscv64 about one run in ten saying a drained event was still in the buffer, when what had

@@ -512,6 +512,15 @@ asserted to be the enabled window's rather than merely the right number, a secon
 takes effect with no re-funding, and clearing the mask records nothing at all - off
 meaning off, not buffered for later.
 
+The performance pass did not stop at the emit: the same "where is the cost actually
+paid" question, asked of `mm::kmeta::Funded` - the table under the entity, VMA and
+vcore state the event windows record about - produced the inline directory, the
+by-reference scan API and the fused decision-path walks. That work and its measured
+numbers live with the mechanism in docs/SUBSTRATE.md pillar 1 (S2c), and the lessons it
+forced - optimise the access shape not the access, two questions about one element set
+are one walk, bench the whole matrix because a struct's size is an interface - are
+recorded in docs/ENGINEERING.md 11.
+
 ### 11.5 Not built yet
 
 The snapshot plane and per-CPU busy/idle accounting, the counter unification, the
