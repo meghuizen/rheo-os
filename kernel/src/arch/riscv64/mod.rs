@@ -477,6 +477,41 @@ pub fn timer_now_ns() -> u64 {
     ((rdtime() as u128 * 1_000_000_000) / TIMEBASE_HZ as u128) as u64
 }
 
+/// Which counter [`obs_tick`] reads, published in the observability root so a
+/// reader knows what it is looking at rather than assuming one clock per machine.
+pub const OBS_TICK_DOMAIN: u32 = crate::abi::obs::OBS_TICK_RDTIME;
+
+/// Which ISA the observability root reports. A per-ISA constant rather than a
+/// `cfg` in portable code, per docs/TARGET-ARCHITECTURES.md 4.
+pub const OBS_ARCH: u32 = crate::abi::obs::OBS_ARCH_RISCV64;
+
+/// The observability timestamp: **one counter read, no barrier, no division**
+/// (docs/OBSERVABILITY.md).
+///
+/// [`timer_now_ns`] cannot be used here. It is a 128-bit multiply and a 128-bit
+/// divide, and RV64 has no 128-bit divide instruction, so that divide is a call
+/// into `__udivti3` - a software loop, on what is supposed to be the cheap half of
+/// an event emit. Recording the raw tick and converting at the edge is what keeps
+/// a tracer from costing more than the code it observes.
+///
+/// The missing barrier is deliberate and does not lose ordering: within a CPU,
+/// order comes from the event's own sequence number, and across CPUs it is
+/// recovered by merging on the tick - the argument `crate::telemetry` already
+/// relies on. A reordered counter read costs nothing the sequence number does not
+/// already fix.
+///
+/// `rdtime` and **not** the `cycle` CSR, so an observability timestamp and a timer
+/// arbiter deadline are in the same domain and can be compared directly.
+#[inline(always)]
+pub fn obs_tick() -> u64 {
+    rdtime()
+}
+
+/// Ticks per second for [`obs_tick`].
+pub fn obs_tick_hz() -> u64 {
+    TIMEBASE_HZ
+}
+
 /// Halt the CPU until an enabled interrupt fires - the timer one-shot the arbiter
 /// armed, or any other wired source. Called only by `kernel/src/ktimer.rs`, which
 /// owns the hardware one-shot (docs/NETSTACK.md 16).

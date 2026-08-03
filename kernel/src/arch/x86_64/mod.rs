@@ -2517,6 +2517,47 @@ pub fn cycles() -> u64 {
     ((hi as u64) << 32) | lo as u64
 }
 
+/// Which counter [`obs_tick`] reads, published in the observability root so a
+/// reader knows what it is looking at rather than assuming one clock per machine.
+pub const OBS_TICK_DOMAIN: u32 = crate::abi::obs::OBS_TICK_TSC;
+
+/// Which ISA the observability root reports. A per-ISA constant rather than a
+/// `cfg` in portable code, per docs/TARGET-ARCHITECTURES.md 4.
+pub const OBS_ARCH: u32 = crate::abi::obs::OBS_ARCH_X86_64;
+
+/// The observability timestamp: **one counter read, no barrier, no division**
+/// (docs/OBSERVABILITY.md).
+///
+/// Neither [`cycles`] nor `timer_now_ns` will do here. [`cycles`] serialises with
+/// `lfence`, and the nanosecond conversion is a 128-bit multiply and divide - both
+/// far more expensive than the handful of stores an event emit is supposed to be.
+/// Recording the raw tick and converting at the edge is what keeps a tracer from
+/// measuring itself.
+///
+/// The missing `lfence` is deliberate and does not lose ordering: within a CPU,
+/// order comes from the event's own sequence number, and across CPUs it is
+/// recovered by merging on the tick - the argument `crate::telemetry` already
+/// relies on. A reordered counter read costs nothing the sequence number does not
+/// already fix.
+#[inline(always)]
+pub fn obs_tick() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    // SAFETY: `rdtsc` is unprivileged and reads no memory.
+    unsafe { asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)) };
+    ((hi as u64) << 32) | lo as u64
+}
+
+/// Ticks per second for [`obs_tick`].
+///
+/// The same cached CPUID leaf 0x16 reading `ticks_to_ns` uses, including its
+/// documented 1 GHz fallback where the CPU reports no base frequency - so a reader
+/// converting ticks to time gets the same answer the kernel would, fallback and
+/// all, rather than a second guess at the frequency.
+pub fn obs_tick_hz() -> u64 {
+    tsc_hz()
+}
+
 /// Convert `cycles()` (TSC ticks) to nanoseconds for the Linux personality's
 /// `clock_gettime` (docs/LINUX-COMPAT.md L2). Uses CPUID leaf 0x16 (processor
 /// base frequency in MHz) when the CPU reports it; otherwise a documented

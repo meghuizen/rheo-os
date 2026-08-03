@@ -60,10 +60,10 @@
 //! QEMU models the chip but not its behaviour: `tpm-tis` / `tpm-crb` on x86-64
 //! and `tpm-tis-device` on arm/riscv all need a **backend**. `xtask` starts one
 //! (`swtpm`, a software TPM speaking the same protocol over a socket) per ISA for
-//! the `rng` kernel, so the command path really executes: `TPM2_Startup` - the
-//! chip arrives unstarted, so the `TPM_RC_INITIALIZE` retry below runs every time
-//! - then `TPM2_GetRandom` giving 32 bytes and then 32 different ones, on **all
-//! three ISAs**, vendor/device `0x00011014`.
+//! the `rng` kernel, so the command path really executes: `TPM2_Startup` (the
+//! chip arrives unstarted, so the `TPM_RC_INITIALIZE` retry below runs every
+//! time), then `TPM2_GetRandom` giving 32 bytes and then 32 different ones, on
+//! **all three ISAs**, vendor/device `0x00011014`.
 //!
 //! Where `swtpm` is not installed no TPM is attached, firmware describes none,
 //! the probe finds none, and the boot says so. That is a true statement about

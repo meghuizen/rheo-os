@@ -135,3 +135,119 @@ and a service mesh's access logs.
 - The exporter cell is security-critical - it aggregates cross-tenant
   visibility by design, so its grants and output path need state-store-grade
   scrutiny.
+
+## 11. What is built
+
+Everything above is the design. This section is the ledger: what exists in code,
+proven on all three ISAs, and what is still only written down. Phase names are the
+ones in the implementation plan.
+
+### 11.1 The five planes
+
+Observability is not one structure, because it is not one question. Each plane gets
+the cheapest shape that answers its own:
+
+| Plane | Question | Where | State |
+|---|---|---|---|
+| Text | what did it say | `kernel/src/telemetry.rs` | built (per-CPU, folding, host-fuzzed) |
+| Event | what happened, in order | `kernel/src/trace.rs` | built but **single-CPU**, 6 windows |
+| Distribution | how long did it take | `kernel/src/metrics.rs` | built; **6 of 8 metrics have no recorder** and no boot enables it |
+| Counter | how many | ~30 hand-written accessors | scattered, unindexed |
+| Snapshot | what is it doing **now** | - | not built; this is the htop data source |
+
+The spine that indexes them is `kernel/src/obs/`, and `abi/src/obs.rs` is the
+layout all three readers agree on.
+
+### 11.2 S0 - the ABI and the root (done, all three ISAs)
+
+`abi/src/obs.rs` defines the plane's layout once, for three separately-compiled
+readers: the kernel that writes it, an in-guest collector cell, and a **host tool**
+that reads guest physical memory with no cooperation from the guest. That third
+reader is why the layout is in `rheo-abi` (zero-dep, `no_std`, no lang items) and
+not in the kernel.
+
+`kernel/src/obs/root.rs` exports one page-aligned symbol, `RHEO_OBS_ROOT`, whose
+section table carries both a kernel VA and a **physical address** per region, plus
+the tick domain, tick rate, CPU counts and the live window mask.
+
+**The load-bearing claim is that an outside reader can walk it from the ELF alone**,
+and it is verified rather than argued. The reader's algorithm is: resolve the
+symbol's VMA, find the `PT_LOAD` containing it, and compute
+`pa = p_paddr + (vma - p_vaddr)`. Hand-computing that from `readelf` output and
+comparing against what the guest published gives the same address on every ISA:
+
+| ISA | symbol VMA | segment vaddr/paddr | hand-computed PA | guest published |
+|---|---|---|---|---|
+| x86-64 | `0xffffffff8047f000` | `0xffffffff80400000` / `0x400000` | `0x47f000` | `0x47f000` |
+| ARM64 | `0xffff0000404a7000` | `0xffff000040400000` / `0x40400000` | `0x404a7000` | `0x404a7000` |
+| RISC-V | `0xffffffc08068d000` | `0xffffffc080600000` / `0x80600000` | `0x8068d000` | `0x8068d000` |
+
+Two independent computations of the same fact agreeing is the proof; the
+`observe` test kernel asserts the guest half, and nothing in the path is
+ISA-specific or QEMU-specific.
+
+**Timestamps are raw ticks, and this is the design's first real constraint.**
+`arch::timer_now_ns()` cannot be on an emit path: it is a 128-bit multiply and
+divide on all three ISAs, where riscv64 has no 128-bit divide instruction (so the
+divide is a call into `__udivti3`, a software loop) and aarch64 additionally
+re-reads `cntfrq_el0` and executes an `isb` every call. A tracer built on it would
+cost more than the code it observes, which is the one thing a tracer must not do.
+So `arch::obs_tick()` is one counter read with no barrier - `rdtsc` / `mrs
+cntvct_el0` / `rdtime` - and `tick_hz` is published for conversion at the edge.
+Dropping the barrier loses no ordering: within a CPU order comes from the event's
+sequence number, and across CPUs from merging on the tick.
+
+Measured resolution, which is why `tick_hz` is published at all rather than assumed:
+**1 ns/tick on x86-64, 16 ns on ARM64, 100 ns on riscv64** (QEMU `virt`'s 10 MHz
+timebase). Intervals below a machine's own tick are not resolvable there, and a
+reader is expected to decline to print such a number rather than invent one.
+
+Layout decisions and their reasons: the event record is **32 bytes**, so with a
+page-aligned frame it never straddles a 64-byte cache line (at 40 bytes it straddles
+~40% of the time and an emit dirties two lines instead of one); there is **no drop
+counter**, because loss is a property of a reader's cursor - `head - capacity - c`
+events are missing and the range `[c, head-capacity)` says exactly which, located
+rather than counted, and one fewer atomic read-modify-write on the emit path; and
+`abi_hash` is a compile-time hash of every structure size rather than a build id,
+because the kernel has no build-id mechanism and a constant sitting in such a field
+would be a field that lies.
+
+Three negative controls, two firing and **one recorded as a non-result**:
+
+- The const initialiser stops writing the magic -> the identity assertion fires
+  (`left: 0, right: 5929065116637020755`). This is the check that makes a wrong
+  address report "no root" instead of decoding garbage.
+- `region()` publishes the virtual address where a physical one belongs - the
+  forgotten linear-map mask, and the single most likely mistake, because it makes a
+  host reader silently decode nothing -> `section kind 6 publishes pa
+  0xffffffff80476c70, which is not anywhere physical memory is`. The oracle is
+  deliberately not a recomputation of `virt_to_phys` (which would only show the
+  publisher agrees with itself) but a question about the machine: does this land
+  where memory is?
+- **`#[used]` removed -> the symbol survives on all three ISAs.** It is not
+  load-bearing today, because `publish()` takes the static's address and
+  `boot::init` calls it on every kernel, so there is a real reference and nothing
+  for a garbage collector to take. It is kept because that reference is incidental
+  to the plane's purpose, not because a control fired - stated so the attribute is
+  not mistaken for a proven guard.
+
+One real finding came out of publishing a field rather than reasoning about it:
+`smp::online_count()` answers "CPUs that SMP bring-up **registered**", and the only
+thing that registers the boot CPU is `smp::init`, which exists only under the `smp`
+feature - so it returns **0 on every single-CPU boot**, while a CPU is demonstrably
+executing the call. Correct for the question `smp` asks it, and a plain falsehood in
+the field a reader uses to size every per-CPU view, so `obs::root` floors it at the
+CPU doing the publishing.
+
+Also landed here, as prerequisites rather than as their own claims: `repr(C)` on
+`telemetry::Ring`/`Rings` and `metrics::Histogram`, and `repr(transparent)` on
+`smp::PerCpu<T>`, so that a reader outside the guest can stride those arrays with a
+guaranteed layout rather than one that happens to hold.
+
+### 11.3 Not built yet
+
+Per-CPU event rings (closing `trace.rs`'s own single-CPU admission), the window
+mask and the eight new windows, the snapshot plane and per-CPU busy/idle
+accounting, the counter unification, lock instrumentation, syscall tracing, the
+capability gate on telemetry, egress beyond the serial console, the host tool, and
+the OTLP exporter cell. Dynamic probes remain the documented deferral of section 5.

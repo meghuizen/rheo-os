@@ -187,7 +187,13 @@ pub fn bucket_value(index: usize) -> u64 {
 ///
 /// `Copy` and `const`-constructible so a per-CPU array of them is a plain
 /// static; the bucket storage it points at is funded and lazy.
+///
+/// `repr(C)` because the observability root publishes the per-CPU set's address
+/// and a host tool decodes it from outside the guest (docs/OBSERVABILITY.md).
+/// `buckets` is a kernel VA, so such a reader masks it with the root's `va_base`
+/// to reach the frame.
 #[derive(Copy, Clone)]
+#[repr(C)]
 pub struct Histogram {
     /// Kernel VA of the `[u32; SLOTS]` bucket array, or 0 if not yet allocated.
     buckets: usize,
@@ -452,6 +458,13 @@ static SETS: PerCpu<[Histogram; METRICS]> = PerCpu::new([const { Histogram::new(
 /// not select a policy, it decides whether the kernel spends frames observing
 /// itself, which is exactly the kind of thing a boot should decide.
 static ENABLED: PerCpu<bool> = PerCpu::new(false);
+
+/// Kernel VA of the per-CPU histogram sets, for the observability root to publish
+/// (docs/OBSERVABILITY.md). A function rather than exporting the static, so a
+/// publisher gets the address and not a reference it could record through.
+pub fn sets_va() -> usize {
+    core::ptr::addr_of!(SETS) as usize
+}
 
 /// Turn recording on for this CPU.
 pub fn enable() {

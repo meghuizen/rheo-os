@@ -161,6 +161,11 @@ impl Record {
 /// `head` and `tail` are free-running counters, not indices: the slot is
 /// `counter & (SLOTS - 1)`. That is what makes "is it full" one subtraction and makes
 /// wrap-around correct without a spare slot.
+///
+/// `repr(C)` because the observability root publishes this array's address and a
+/// host tool decodes it from outside the guest (docs/OBSERVABILITY.md): the field
+/// order has to be the declared one, not whatever the compiler prefers.
+#[repr(C)]
 pub struct Ring {
     head: u32,
     tail: u32,
@@ -323,6 +328,11 @@ impl Ring {
 ///
 /// A struct rather than loose statics so the whole thing is one value a host driver can
 /// construct - the `sched::entity` shape, for the same reason.
+///
+/// `repr(C)` for the reason [`Ring`] is, and additionally so that `rings` is at
+/// offset 0: the published section's address is this struct's, and a reader
+/// strides it by `size_of::<Ring>()` from there.
+#[repr(C)]
 pub struct Rings {
     rings: [Ring; MAX_RING_CPUS],
     /// The lowest level that is recorded at all. A comparison against this is the entire
@@ -500,6 +510,16 @@ pub fn counters() -> (u32, u32, u32, u32) {
 pub fn pending() -> usize {
     // SAFETY: as `counters`.
     unsafe { rings().pending() }
+}
+
+/// Kernel VA of the per-CPU ring array, for the observability root to publish
+/// (docs/OBSERVABILITY.md).
+///
+/// A function rather than exporting the static, so the address is the only thing
+/// that leaves this module - a publisher does not get a reference it could write
+/// through.
+pub fn rings_va() -> usize {
+    core::ptr::addr_of!(RINGS) as usize
 }
 
 /// Clear the rings and the flags (between runs).

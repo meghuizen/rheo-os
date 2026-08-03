@@ -116,6 +116,11 @@ pub fn cpu_index() -> usize {
 /// The slot array is stored inside a single [`UnsafeCell`] because a core
 /// mutates its own slot through a shared reference. The safety obligation is the
 /// partitioning itself and is stated at each accessor.
+/// `repr(transparent)` because the observability root publishes the addresses of
+/// several `PerCpu` statics for a reader outside the guest to stride
+/// (docs/OBSERVABILITY.md), and that reader needs the container's layout to be the
+/// array's - guaranteed, rather than true today because there is one field.
+#[repr(transparent)]
 pub struct PerCpu<T> {
     slots: UnsafeCell<[T; MAX_CPUS]>,
 }

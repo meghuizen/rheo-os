@@ -3065,6 +3065,54 @@ no other phase - `linuxthreads` therefore asserts it *directly* (context 0's ent
 the cell's vcore 0) rather than leaving a cleanup nothing checks, and that assertion fires
 under the revert.
 
+**The machine can be watched from outside it** (docs/OBSERVABILITY.md 11, the `observe`
+kernel, all three ISAs) - the first slice of the observability framework, which is the
+**root** and the layout every reader agrees on. The tree could already *prove* things
+about itself and could not *watch* itself: every hard defect this session cost a bespoke
+diagnostic (Bun's abort took **three wrong diagnoses** and two fully-built mechanisms
+before a one-line "print the refused path" answered it), and `kernel/src/trace.rs`'s own
+header names the shape - "the lifecycle is not observable, only its endpoints are".
+`abi/src/obs.rs` defines the plane once for three separately-compiled readers - the kernel
+that writes it, an in-guest collector cell, and a **host tool reading guest physical memory
+with no cooperation from the guest** - which is why it is in `rheo-abi` (zero-dep, `no_std`,
+no lang items) rather than in the kernel. `kernel/src/obs/root.rs` exports one page-aligned
+symbol, `RHEO_OBS_ROOT`, carrying a kernel VA **and a physical address** per published
+region plus the tick domain, tick rate, CPU counts and the live window mask. The
+load-bearing claim - that an outside reader can walk it from the ELF alone, on bare metal
+or under any hypervisor, with no device and no `fw_cfg` - is **verified rather than
+argued**: hand-computing the reader's own algorithm (`pa = p_paddr + (vma - p_vaddr)`) from
+`readelf` output gives exactly what the guest published on every ISA (`0x47f000` /
+`0x404a7000` / `0x8068d000`), two independent computations of one fact agreeing.
+**Timestamps are raw ticks, and that is the design's first real constraint**:
+`arch::timer_now_ns()` cannot be on an emit path, being a 128-bit multiply *and divide* on
+all three ISAs - riscv64 has no 128-bit divide instruction, so it is a call into
+`__udivti3`, a software loop, and aarch64 re-reads `cntfrq_el0` and executes an `isb` every
+call - so a tracer built on it would cost more than the code it observes, which is the one
+thing a tracer must not do; `arch::obs_tick()` is one counter read with **no barrier**
+(`rdtsc` / `mrs cntvct_el0` / `rdtime`), losing no ordering because within a CPU order
+comes from the sequence number and across CPUs from merging on the tick. Resolution is
+**measured, not assumed** - 1 ns/tick on x86-64, 16 ns on ARM64, **100 ns on riscv64** -
+and `tick_hz` is published so a reader declines to print a sub-resolution number rather
+than inventing one. The event record is **32 bytes** so that with a page-aligned frame it
+never straddles a cache line (at 40 it straddles ~40% of the time), and there is
+deliberately **no drop counter**: loss is a property of a reader's cursor, so
+`[c, head-capacity)` names exactly which events are missing - located rather than counted,
+and one fewer atomic RMW on the emit path. Two controls observed firing (the magic not
+written -> "no root" rather than decoded garbage; the linear-map mask forgotten in one
+place -> the published address is refused as "not anywhere physical memory is", the mistake
+that would make a host reader silently decode nothing), and one recorded as a **non-result**
+- removing `#[used]` leaves the symbol present on all three ISAs, because `publish` takes
+its address and every kernel calls it, so the attribute is kept as insurance and not
+claimed as a proven guard. Publishing a field rather than reasoning about it found a real
+defect: `smp::online_count()` answers "CPUs SMP bring-up **registered**", and the only
+thing that registers the boot CPU is `smp::init`, which exists only under the `smp` feature
+- so it returns **0 on every single-CPU boot** while a CPU is executing the call. Honest
+scope: this is the root and the layout. Nothing is instrumented yet, no window exists, and
+the four planes it will index are in the state docs/OBSERVABILITY.md 11.1 tabulates -
+notably `metrics.rs` declares **eight** latency histograms of which only two have a
+recorder anywhere and **no boot enables it**, so most of the scheduler-quality work ahead
+is wiring and a switch rather than new machinery.
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
 proofs, and the hardware-lab performance numbers.
@@ -3189,7 +3237,11 @@ abi/          rheo-abi: the on-wire user/kernel ABI, defined **once** - syscall
               links into a kernel binary and a cell alike; kernel::abi,
               kernel::queue, librheo::sys and libc::sys all re-export it, which
               is what makes divergence a compile error instead of a wrong number
-              at runtime (docs/ARCHITECTURE-DEBT.md 3.1)
+              at runtime (docs/ARCHITECTURE-DEBT.md 3.1). `obs` is a submodule
+              rather than more of lib.rs because it has a **third** reader the
+              rest of the ABI does not: a host tool walking the telemetry plane
+              out of guest physical memory, with no cell and no syscall involved
+              (docs/OBSERVABILITY.md 11)
 kernel/       the no_std kernel library + boot demo bin
   src/        ISA-independent: boot (the portable boot sequencer - arch::init
               does only console/vectors/page tables, so arch names nothing above
@@ -3256,7 +3308,16 @@ kernel/       the no_std kernel library + boot demo bin
               linux (the Linux personality:
               docs/LINUX-COMPAT.md - incl. the blocking, readiness-computing
               poll/epoll_wait, a real nanosleep, blocking stdin, and eventfd2 as
-              a shared counter registry - eventfd.rs), U-mode programs
+              a shared counter registry - eventfd.rs), obs (**the observability
+              spine**: one exported page-aligned root, `RHEO_OBS_ROOT`, whose
+              section table carries a kernel VA *and a physical address* per
+              telemetry region, so a host tool, a hypervisor or a crash dump can
+              walk the whole plane from the ELF symbol alone with **zero** guest
+              instructions - no device, no MMIO, no fw_cfg, and nothing
+              QEMU-specific. It *indexes* the five planes rather than absorbing
+              them: text is telemetry.rs, distribution is metrics.rs, and the
+              event/counter/snapshot planes live here -
+              docs/OBSERVABILITY.md 11), U-mode programs
               (user_progs.rs incl. the lsh shell), abi
   src/arch/   per-ISA Rust modules incl. paging.rs (one dir per ISA)
   arch/       per-ISA assembly (boot, vectors/traps, context switch, user)
@@ -3269,6 +3330,15 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               queue region / a kernel VA / the .user window / the channel + grant
               regions - each refused, ring still serving; plus a control per
               finding so the bound is not a break),
+              observe (docs/OBSERVABILITY.md 11: the observability root - the
+              compile-time identity a reader checks *before* trusting a byte, the
+              published physical address against the kernel's own virt_to_phys,
+              every section asserted to carry an address where physical memory
+              actually is (which is what catches a forgotten linear-map mask - the
+              mistake that makes a host reader silently decode nothing), and the
+              tick asserted to be a real advancing counter with a real frequency,
+              since a timestamp domain published as zero makes every recorded time
+              a lie),
               resources, numa (docs/SUBSTRATE.md pillar 6: node-affine frame
               allocation - QEMU launched with two 512 MiB memory nodes, the pool
               asserted partitioned between them at exactly the boundary the launch
