@@ -861,6 +861,10 @@ pub fn present(buf_va: u64, w: u32, h: u32) -> (u32, u32) {
     // SAFETY: `buf_va` was range-checked for `len` readable bytes in the calling
     // cell by `queue::run_opcode`, whose address space is active; `n <= len`.
     if unsafe { dev.present_frame(buf_va, n) } {
+        // The GPU status pane's counts (docs/OBSERVABILITY.md 11, S5): a
+        // completed present and the bytes it copied into the device resource.
+        crate::obs::cpu_bump(crate::obs::cpu::CTR_GPU_PRESENTS, 1);
+        crate::obs::cpu_bump(crate::obs::cpu::CTR_GPU_PRESENT_BYTES, n as u64);
         (STATUS_OK, n as u32)
     } else {
         (STATUS_IO, 0)

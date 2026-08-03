@@ -116,6 +116,18 @@ pub const CTR_PREEMPT_TO_CELL: usize = 23;
 /// because "not delivered" and "delivered with nobody to switch to" are
 /// different faults with the same symptom.
 pub const CTR_PREEMPT_NOTES: usize = 24;
+/// Ethernet frames the NIC driver transmitted (`hw::virtio_net`).
+pub const CTR_NET_TX_FRAMES: usize = 25;
+/// Bytes those transmitted frames carried (payload past the virtio header).
+pub const CTR_NET_TX_BYTES: usize = 26;
+/// Ethernet frames the NIC driver received (taken off the receive queue).
+pub const CTR_NET_RX_FRAMES: usize = 27;
+/// Bytes those received frames carried.
+pub const CTR_NET_RX_BYTES: usize = 28;
+/// virtio-gpu 2D presents completed (`hw::virtio_gpu`).
+pub const CTR_GPU_PRESENTS: usize = 29;
+/// Bytes those presents copied into the device resource.
+pub const CTR_GPU_PRESENT_BYTES: usize = 30;
 
 /// One coherent reading of the coupled group.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]

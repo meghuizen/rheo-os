@@ -26,9 +26,9 @@
 //! it is knowable earlier.
 
 use crate::abi::obs::{
-    OBS_MAX_SECTIONS, OBS_SEC_CPU, OBS_SEC_EVENT_LAYOUT, OBS_SEC_HISTOGRAMS, OBS_SEC_MEM,
-    OBS_SEC_NAMES, OBS_SEC_RINGS, OBS_SEC_TEXT_RINGS, ObsCpu, ObsEvent, ObsMem, ObsName, ObsRoot,
-    ObsSection,
+    OBS_MAX_SECTIONS, OBS_SEC_CPU, OBS_SEC_EVENT_LAYOUT, OBS_SEC_GPU, OBS_SEC_HISTOGRAMS,
+    OBS_SEC_MEM, OBS_SEC_NAMES, OBS_SEC_NET, OBS_SEC_RINGS, OBS_SEC_STORAGE, OBS_SEC_TEXT_RINGS,
+    ObsCpu, ObsEvent, ObsGpu, ObsMem, ObsName, ObsNet, ObsRoot, ObsSection, ObsStorage,
 };
 use core::sync::atomic::Ordering;
 
@@ -180,6 +180,42 @@ pub fn publish() {
             crate::obs::mem_va(),
             size_of::<ObsMem>(),
             size_of::<ObsMem>() as u32,
+            1,
+        ),
+    );
+
+    // The device panes (S5): same refresh-on-request discipline as the memory
+    // block, one each for the NIC, storage and GPU.
+    add(
+        r,
+        region(
+            OBS_SEC_NET,
+            0,
+            crate::obs::net_va(),
+            size_of::<ObsNet>(),
+            size_of::<ObsNet>() as u32,
+            1,
+        ),
+    );
+    add(
+        r,
+        region(
+            OBS_SEC_STORAGE,
+            0,
+            crate::obs::storage_va(),
+            size_of::<ObsStorage>(),
+            size_of::<ObsStorage>() as u32,
+            1,
+        ),
+    );
+    add(
+        r,
+        region(
+            OBS_SEC_GPU,
+            0,
+            crate::obs::gpu_va(),
+            size_of::<ObsGpu>(),
+            size_of::<ObsGpu>() as u32,
             1,
         ),
     );

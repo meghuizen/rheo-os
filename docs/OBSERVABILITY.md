@@ -716,10 +716,47 @@ hold field and the drop's compare, ~0.8% of that op. Every other benchmark,
 including every path through the *unnamed* nineteen locks, is unchanged to the
 tick. The plan estimated ~4 instructions; 11 is the honest number.
 
-### 11.8 Not built yet
+### 11.8 S5 (device half) - the NIC, storage and GPU panes
+
+**Built: three status panes under `ObsMem`'s discipline** - `ObsNet`,
+`ObsStorage`, `ObsGpu` (`abi/src/obs.rs`, 128 bytes each, published as
+`OBS_SEC_NET`/`STORAGE`/`GPU`), filled **on request** (`obs::net_refresh` etc.)
+and stamped with when, never maintained on a driver's hot path. A pane is a
+*view*: the counts it copies are live in the drivers and the counter plane
+already. What had to be added at the source: the NIC driver's frame/byte counts
+each way (plane slots, bumped at the one point a frame is genuinely sent or
+taken - beside the entropy hook, for the same reason) and the virtio-gpu
+present/byte counts; the storage pane reads the NVMe driver's existing honesty
+counters (per-core submits, cross-core = 0, poll fallbacks, reordering) and the
+block cache's fills. The NIC pane also carries the receive wait's escalation
+counters, its idle mode, and `interrupt_driven` - so the pane says whether the
+machine parks or polls instead of leaving it inferred. **GPU utilisation is
+reported absent, not estimated** (`util_plus_one = 0`): no device QEMU models
+exposes a busy signal and there is no vendor driver to ask, and `librheogpu`
+asserts the absence so an estimate cannot creep in.
+
+Proven where the round trips already are: `librheonet` asserts the unrefreshed
+pane says tick 0 (a pane that moved un-refreshed means a driver keeps a mirror
+warm - the cost this design refuses), then after refresh exactly 1 TX frame /
+42 B (its ARP request) and >= 1 RX frame (SLIRP's padded reply); `librheogpu`
+asserts presents >= 1 with `present_bytes` **exact** (presents x 128x128x4).
+Two controls observed firing by name: the TX-frame bump removed fails
+`librheonet` with "counted 0 frame(s) / 42 byte(s)" (the bytes still counting is
+the surgical signature), and the fix below re-armed the once-absorbed control.
+
+**A recorded non-result became a fix**: 11.6's absorbed control - `netwait`'s
+stall-tolerance branch reading a misrouted spin counter as a stalled guest - is
+closed by publishing the kernel's own answer: `net_rx::last_spin_budget()`, the
+effective hot-tier budget of the most recent wait. A genuine stall means the
+wait *computed* a zero budget (the hot window had expired before it ran); a
+nonzero budget with zero counted spins means the counter is broken, and the
+skip branch now asserts exactly that distinction. The once-absorbed misroute
+now fails by name ("the spin counter is broken, not the guest stalled") -
+observed.
+
+### 11.9 Not built yet
 
 The per-node memory breakdown, the rest of the counter unification (11.6), the
-device status blocks (GPU/NIC/storage - the other half of S5) with the
-`Net`/`Gpu` windows' device instrumentation, the capability gate on telemetry,
-egress beyond the serial console, the host tool, and the OTLP exporter cell.
-Dynamic probes remain the documented deferral of section 5.
+capability gate on telemetry, egress beyond the serial console, the host tool,
+and the OTLP exporter cell. Dynamic probes remain the documented deferral of
+section 5.

@@ -270,6 +270,14 @@ static mut PROFILE: RxProfile = RxProfile::Edge;
 static mut HOT_UNTIL_NS: u64 = 0;
 /// The tier the most recent wait ended in.
 static mut TIER: RxTier = RxTier::None;
+/// The effective hot-tier budget of the most recent [`wait_frame`] - the
+/// kernel's own answer to "was there a busy-poll tier to observe". What lets a
+/// test tell "the guest was stalled past the hot window before the wait ran"
+/// (budget computed 0, so zero spins is the honest count) from "the spin
+/// counter is broken" (budget nonzero, zero spins). Added because a misrouted
+/// counter was absorbed by exactly that tolerance branch
+/// (docs/OBSERVABILITY.md 11.6, the recorded non-result).
+static mut LAST_SPIN_BUDGET: u32 = 0;
 
 /// Reset the receive-wait state (call before installing a fresh set of cells).
 pub fn reset() {
@@ -279,6 +287,7 @@ pub fn reset() {
         *addr_of_mut!(MODE) = IdleMode::None;
         *addr_of_mut!(HOT_UNTIL_NS) = 0;
         *addr_of_mut!(TIER) = RxTier::None;
+        *addr_of_mut!(LAST_SPIN_BUDGET) = 0;
     }
     for slot in [
         crate::obs::cpu::CTR_NET_IRQS,
@@ -388,6 +397,15 @@ pub fn tier() -> RxTier {
     unsafe { *addr_of!(TIER) }
 }
 
+/// The effective hot-tier budget of the most recent [`wait_frame`] (see
+/// [`LAST_SPIN_BUDGET`]): 0 means the wait legitimately had no busy-poll tier -
+/// the link had gone cold, or the profile refuses to spin - so zero recorded
+/// spins is the honest count and not a broken counter.
+pub fn last_spin_budget() -> u32 {
+    // SAFETY: single CPU.
+    unsafe { *addr_of!(LAST_SPIN_BUDGET) }
+}
+
 /// Whether the link is currently **hot** - activity within the profile's hot window.
 pub fn is_hot() -> bool {
     let window = policy().hot_window_ns;
@@ -494,6 +512,12 @@ pub fn wait_frame(buf_va: u64, len: usize, timeout_ns: u64) -> usize {
     } else {
         policy.spin_polls
     };
+    // SAFETY: single CPU. Recorded so a zero spin count is attributable: budget
+    // 0 = legitimately no busy-poll tier; budget nonzero + zero spins = a broken
+    // counter (see `last_spin_budget`).
+    unsafe {
+        *addr_of_mut!(LAST_SPIN_BUDGET) = spin_budget;
+    }
     // The caller's deadline goes to the arbiter, which arms the hardware only if it
     // is the nearest outstanding deadline and re-arms whatever survives our exit.
     if timeout_ns > 0 {

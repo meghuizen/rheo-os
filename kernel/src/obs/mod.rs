@@ -680,10 +680,180 @@ pub fn mem_va() -> usize {
     core::ptr::addr_of!(MEM) as usize
 }
 
+// -------------------------------------------------------------- device panes
+//
+// Network, storage and GPU status (docs/OBSERVABILITY.md 11, S5): each is one
+// block under [`MEM`]'s discipline - filled on request, stamped with when,
+// never maintained on a driver's hot path. The counts they copy are live in
+// the drivers and the counter plane already; a pane is a *view*, not a second
+// bookkeeping.
+
+/// The NIC pane, filled by [`net_refresh`].
+static NET_PANE: crate::abi::obs::ObsNet = crate::abi::obs::ObsNet::new();
+/// The storage pane, filled by [`storage_refresh`].
+static STORAGE_PANE: crate::abi::obs::ObsStorage = crate::abi::obs::ObsStorage::new();
+/// The GPU pane, filled by [`gpu_refresh`].
+static GPU_PANE: crate::abi::obs::ObsGpu = crate::abi::obs::ObsGpu::new();
+
+/// Copy the live NIC numbers into the published pane and stamp when.
+pub fn net_refresh() {
+    use core::ptr::write_volatile;
+    use core::sync::atomic::Ordering;
+
+    let c = &NET_PANE as *const crate::abi::obs::ObsNet as *mut crate::abi::obs::ObsNet;
+    // SAFETY: a static written only here, readers defended by the seqlock -
+    // the `mem_refresh` argument verbatim.
+    unsafe {
+        let s = (*c).seq.fetch_add(1, Ordering::Acquire);
+        write_volatile(&raw mut (*c).refreshed_tick, crate::arch::obs_tick());
+        write_volatile(
+            &raw mut (*c).present,
+            crate::hw::virtio_net::mac_addr().is_some() as u64,
+        );
+        write_volatile(
+            &raw mut (*c).rx_frames,
+            cpu_counter_sum(cpu::CTR_NET_RX_FRAMES),
+        );
+        write_volatile(
+            &raw mut (*c).rx_bytes,
+            cpu_counter_sum(cpu::CTR_NET_RX_BYTES),
+        );
+        write_volatile(
+            &raw mut (*c).tx_frames,
+            cpu_counter_sum(cpu::CTR_NET_TX_FRAMES),
+        );
+        write_volatile(
+            &raw mut (*c).tx_bytes,
+            cpu_counter_sum(cpu::CTR_NET_TX_BYTES),
+        );
+        write_volatile(&raw mut (*c).rx_irqs, cpu_counter_sum(cpu::CTR_NET_IRQS));
+        write_volatile(
+            &raw mut (*c).spin_polls,
+            cpu_counter_sum(cpu::CTR_NET_SPIN_POLLS),
+        );
+        write_volatile(
+            &raw mut (*c).timer_slices,
+            cpu_counter_sum(cpu::CTR_NET_SLICES),
+        );
+        write_volatile(&raw mut (*c).halts, cpu_counter_sum(cpu::CTR_NET_HALTS));
+        write_volatile(
+            &raw mut (*c).escalations,
+            cpu_counter_sum(cpu::CTR_NET_ESCALATIONS),
+        );
+        write_volatile(&raw mut (*c).idle_mode, crate::net_rx::idle_mode() as u32);
+        write_volatile(
+            &raw mut (*c).interrupt_driven,
+            crate::net_rx::interrupt_driven() as u32,
+        );
+        (*c).seq.store(s.wrapping_add(2), Ordering::Release);
+    }
+}
+
+/// Copy the live storage numbers into the published pane and stamp when.
+pub fn storage_refresh() {
+    use core::ptr::write_volatile;
+    use core::sync::atomic::Ordering;
+
+    let mut submits = 0u64;
+    for c in 0..crate::smp::MAX_CPUS {
+        submits = submits.wrapping_add(crate::hw::nvme::submits(c));
+    }
+    let c = &STORAGE_PANE as *const crate::abi::obs::ObsStorage as *mut crate::abi::obs::ObsStorage;
+    // SAFETY: as `net_refresh`.
+    unsafe {
+        let s = (*c).seq.fetch_add(1, Ordering::Acquire);
+        write_volatile(&raw mut (*c).refreshed_tick, crate::arch::obs_tick());
+        write_volatile(&raw mut (*c).cache_fills, crate::hw::block::cache_fills());
+        write_volatile(&raw mut (*c).nvme_irqs, crate::hw::nvme::irq_count());
+        write_volatile(&raw mut (*c).nvme_irq_parks, crate::hw::nvme::irq_parks());
+        write_volatile(
+            &raw mut (*c).nvme_poll_fallbacks,
+            crate::hw::nvme::poll_fallbacks(),
+        );
+        write_volatile(&raw mut (*c).nvme_submits, submits);
+        write_volatile(
+            &raw mut (*c).nvme_cross_core_submits,
+            crate::hw::nvme::cross_core_submits(),
+        );
+        write_volatile(
+            &raw mut (*c).nvme_max_inflight,
+            crate::hw::nvme::max_inflight(),
+        );
+        write_volatile(
+            &raw mut (*c).nvme_out_of_order,
+            crate::hw::nvme::out_of_order(),
+        );
+        (*c).seq.store(s.wrapping_add(2), Ordering::Release);
+    }
+}
+
+/// Copy the live GPU numbers into the published pane and stamp when.
+///
+/// `util_plus_one` stays 0 - engine-busy utilisation is **reported absent, not
+/// estimated** (no modelled device exposes a busy signal and there is no vendor
+/// driver to ask; docs/ENGINEERING.md 1).
+pub fn gpu_refresh() {
+    use core::ptr::write_volatile;
+    use core::sync::atomic::Ordering;
+
+    let inv = crate::hw::inventory();
+    let mut devices = 0u64;
+    let mut ticks_per_kib = 0u64;
+    for g in inv.gpus.iter() {
+        if g.vendor_id != 0 {
+            devices += 1;
+            ticks_per_kib = ticks_per_kib.max(g.measured_cost_ticks);
+        }
+    }
+    let c = &GPU_PANE as *const crate::abi::obs::ObsGpu as *mut crate::abi::obs::ObsGpu;
+    // SAFETY: as `net_refresh`.
+    unsafe {
+        let s = (*c).seq.fetch_add(1, Ordering::Acquire);
+        write_volatile(&raw mut (*c).refreshed_tick, crate::arch::obs_tick());
+        write_volatile(&raw mut (*c).devices, devices);
+        write_volatile(
+            &raw mut (*c).presents,
+            cpu_counter_sum(cpu::CTR_GPU_PRESENTS),
+        );
+        write_volatile(
+            &raw mut (*c).present_bytes,
+            cpu_counter_sum(cpu::CTR_GPU_PRESENT_BYTES),
+        );
+        write_volatile(&raw mut (*c).attach_ticks_per_kib, ticks_per_kib);
+        (*c).seq.store(s.wrapping_add(2), Ordering::Release);
+    }
+}
+
+/// The published NIC pane, read-only.
+pub fn net_pane() -> &'static crate::abi::obs::ObsNet {
+    &NET_PANE
+}
+
+/// The published storage pane, read-only.
+pub fn storage_pane() -> &'static crate::abi::obs::ObsStorage {
+    &STORAGE_PANE
+}
+
+/// The published GPU pane, read-only.
+pub fn gpu_pane() -> &'static crate::abi::obs::ObsGpu {
+    &GPU_PANE
+}
+
+/// Kernel VAs of the three device panes, for the root.
+pub fn net_va() -> usize {
+    core::ptr::addr_of!(NET_PANE) as usize
+}
+pub fn storage_va() -> usize {
+    core::ptr::addr_of!(STORAGE_PANE) as usize
+}
+pub fn gpu_va() -> usize {
+    core::ptr::addr_of!(GPU_PANE) as usize
+}
+
 /// The published name table: which counter slot means what, as runtime data
 /// rather than an ABI contract, so a reader never guesses at an unnamed slot
 /// (`abi::obs::OBS_SEC_NAMES`).
-static NAMES: [crate::abi::obs::ObsName; 25] = {
+static NAMES: [crate::abi::obs::ObsName; 31] = {
     use crate::abi::obs::{OBS_NAME_COUNTER, ObsName};
     [
         ObsName::new(OBS_NAME_COUNTER, cpu::CTR_BUSY_TICKS as u32, "busy_ticks"),
@@ -778,6 +948,36 @@ static NAMES: [crate::abi::obs::ObsName; 25] = {
             OBS_NAME_COUNTER,
             cpu::CTR_PREEMPT_NOTES as u32,
             "preempt_notes",
+        ),
+        ObsName::new(
+            OBS_NAME_COUNTER,
+            cpu::CTR_NET_TX_FRAMES as u32,
+            "net_tx_frames",
+        ),
+        ObsName::new(
+            OBS_NAME_COUNTER,
+            cpu::CTR_NET_TX_BYTES as u32,
+            "net_tx_bytes",
+        ),
+        ObsName::new(
+            OBS_NAME_COUNTER,
+            cpu::CTR_NET_RX_FRAMES as u32,
+            "net_rx_frames",
+        ),
+        ObsName::new(
+            OBS_NAME_COUNTER,
+            cpu::CTR_NET_RX_BYTES as u32,
+            "net_rx_bytes",
+        ),
+        ObsName::new(
+            OBS_NAME_COUNTER,
+            cpu::CTR_GPU_PRESENTS as u32,
+            "gpu_presents",
+        ),
+        ObsName::new(
+            OBS_NAME_COUNTER,
+            cpu::CTR_GPU_PRESENT_BYTES as u32,
+            "gpu_present_bytes",
         ),
     ]
 };

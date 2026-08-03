@@ -84,6 +84,46 @@ extern "C" fn kernel_main() -> ! {
         Outcome::Faulted(addr) => panic!("librheo-net faulted at {addr:#x}"),
     }
 
+    // The NIC status pane (docs/OBSERVABILITY.md 11, S5): the round trip the cell
+    // just performed must be visible as counter movement through the published
+    // block - an ARP request went out and a reply was taken off the queue, so an
+    // unrefreshed pane says tick 0 and a refreshed one carries both directions.
+    // A minimum ARP frame is 28 bytes of payload; asserting >= 28 rather than an
+    // exact length keeps SLIRP's padding out of the oracle.
+    let pane = kernel::obs::net_pane();
+    assert_eq!(
+        pane.refreshed_tick, 0,
+        "the NIC pane moved before anyone refreshed it - a driver is keeping a mirror warm"
+    );
+    kernel::obs::net_refresh();
+    assert_eq!(
+        pane.present, 1,
+        "a NIC is installed and the pane says otherwise"
+    );
+    assert!(
+        pane.tx_frames >= 1 && pane.tx_bytes >= 28,
+        "the cell transmitted an ARP request and the pane counted {} frame(s) / {} byte(s)",
+        pane.tx_frames,
+        pane.tx_bytes
+    );
+    assert!(
+        pane.rx_frames >= 1 && pane.rx_bytes >= 28,
+        "the cell received an ARP reply and the pane counted {} frame(s) / {} byte(s)",
+        pane.rx_frames,
+        pane.rx_bytes
+    );
+    assert!(pane.refreshed_tick > 0, "the refresh did not stamp when");
+    println!(
+        "librheonet: NIC pane after refresh - tx {}f/{}B rx {}f/{}B, irqs {}, \
+         interrupt_driven={} OK",
+        pane.tx_frames,
+        pane.tx_bytes,
+        pane.rx_frames,
+        pane.rx_bytes,
+        pane.rx_irqs,
+        pane.interrupt_driven
+    );
+
     println!("librheonet: PASS");
     arch::exit(arch::ExitCode::Success)
 }

@@ -464,6 +464,182 @@ impl Default for ObsMem {
 }
 
 // =========================================================================
+// Device status: network / storage / gpu (docs/OBSERVABILITY.md 11, S5)
+// =========================================================================
+//
+// All three follow [`ObsMem`]'s discipline: filled **on request**, stamped with
+// when, never maintained by the drivers themselves - a mirror kept warm on the
+// send/receive/submit hot paths would tax exactly what it watches. The counts
+// they copy are live in the drivers or the counter plane already.
+
+/// The NIC pane: frames and bytes each way, the receive wait's escalation
+/// counters, and whether the machine parks or polls - stated, not inferred.
+#[repr(C, align(64))]
+pub struct ObsNet {
+    /// Even means stable, odd means a refresh is inside (the [`ObsCpu`] seqlock).
+    pub seq: AtomicU32,
+    pub _pad: u32,
+    /// `obs_tick()` at the copy; 0 = never refreshed, other fields meaningless.
+    pub refreshed_tick: u64,
+    /// 1 = a NIC is installed (its MAC is readable); 0 = no NIC.
+    pub present: u64,
+    /// Frames and bytes the driver received / transmitted.
+    pub rx_frames: u64,
+    pub rx_bytes: u64,
+    pub tx_frames: u64,
+    pub tx_bytes: u64,
+    /// NIC receive interrupts genuinely taken.
+    pub rx_irqs: u64,
+    /// The adaptive receive wait's counters (hot spins, timer slices, halts,
+    /// tier escalations - docs/NETSTACK.md 16).
+    pub spin_polls: u64,
+    pub timer_slices: u64,
+    pub halts: u64,
+    pub escalations: u64,
+    /// The most recent wait's `IdleMode` discriminant (0 none, 1 NIC interrupt,
+    /// 2 timer-backed idle, 3 poll).
+    pub idle_mode: u32,
+    /// Whether the NIC RX interrupt is wired on this ISA - deliberately narrow,
+    /// never widened by the timer-backed mode.
+    pub interrupt_driven: u32,
+    pub _rsv: [u64; 3],
+}
+
+const _: () = assert!(core::mem::size_of::<ObsNet>() == 128);
+
+impl ObsNet {
+    pub const fn new() -> ObsNet {
+        ObsNet {
+            seq: AtomicU32::new(0),
+            _pad: 0,
+            refreshed_tick: 0,
+            present: 0,
+            rx_frames: 0,
+            rx_bytes: 0,
+            tx_frames: 0,
+            tx_bytes: 0,
+            rx_irqs: 0,
+            spin_polls: 0,
+            timer_slices: 0,
+            halts: 0,
+            escalations: 0,
+            idle_mode: 0,
+            interrupt_driven: 0,
+            _rsv: [0; 3],
+        }
+    }
+}
+
+impl Default for ObsNet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The storage pane: the block cache's demand reads and the NVMe driver's own
+/// honesty counters (per-core queue discipline, interrupt-vs-poll, reordering).
+#[repr(C, align(64))]
+pub struct ObsStorage {
+    /// Seqlock, as [`ObsNet`].
+    pub seq: AtomicU32,
+    pub _pad: u32,
+    /// `obs_tick()` at the copy; 0 = never refreshed.
+    pub refreshed_tick: u64,
+    /// Block-cache line fills - device reads performed on demand, any cache.
+    pub cache_fills: u64,
+    /// NVMe: completion interrupts taken, waits that genuinely halted, waits
+    /// that fell back to polling, submissions across every queue, submissions
+    /// that crossed cores (0 is the per-core-queue assertion), the deepest
+    /// in-flight batch, completions that arrived out of submission order.
+    pub nvme_irqs: u64,
+    pub nvme_irq_parks: u64,
+    pub nvme_poll_fallbacks: u64,
+    pub nvme_submits: u64,
+    pub nvme_cross_core_submits: u64,
+    pub nvme_max_inflight: u64,
+    pub nvme_out_of_order: u64,
+    pub _rsv: [u64; 6],
+}
+
+const _: () = assert!(core::mem::size_of::<ObsStorage>() == 128);
+
+impl ObsStorage {
+    pub const fn new() -> ObsStorage {
+        ObsStorage {
+            seq: AtomicU32::new(0),
+            _pad: 0,
+            refreshed_tick: 0,
+            cache_fills: 0,
+            nvme_irqs: 0,
+            nvme_irq_parks: 0,
+            nvme_poll_fallbacks: 0,
+            nvme_submits: 0,
+            nvme_cross_core_submits: 0,
+            nvme_max_inflight: 0,
+            nvme_out_of_order: 0,
+            _rsv: [0; 6],
+        }
+    }
+}
+
+impl Default for ObsStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The GPU pane. **Engine-busy utilisation is reported absent, not estimated**:
+/// no device QEMU models exposes a busy signal and there is no vendor driver
+/// here to ask, so [`ObsGpu::util_plus_one`] is 0 (unavailable) rather than a
+/// number a reader would trust (observe-never-infer, docs/ENGINEERING.md 1).
+#[repr(C, align(64))]
+pub struct ObsGpu {
+    /// Seqlock, as [`ObsNet`].
+    pub seq: AtomicU32,
+    pub _pad: u32,
+    /// `obs_tick()` at the copy; 0 = never refreshed.
+    pub refreshed_tick: u64,
+    /// GPU-class devices the machine inventory enumerated.
+    pub devices: u64,
+    /// virtio-gpu 2D presents completed, and the bytes those presents copied
+    /// into the device resource.
+    pub presents: u64,
+    pub present_bytes: u64,
+    /// Attach-measured transport throughput (ticks per KiB streamed through the
+    /// aperture, `hw::gpu_attach_measure`) - 0 = never measured, since the
+    /// measurement is opt-in.
+    pub attach_ticks_per_kib: u64,
+    /// 0 = utilisation unavailable (the honest value everywhere today);
+    /// a future vendor driver reports 1 + percent.
+    pub util_plus_one: u64,
+    pub _rsv: [u64; 9],
+}
+
+const _: () = assert!(core::mem::size_of::<ObsGpu>() == 128);
+
+impl ObsGpu {
+    pub const fn new() -> ObsGpu {
+        ObsGpu {
+            seq: AtomicU32::new(0),
+            _pad: 0,
+            refreshed_tick: 0,
+            devices: 0,
+            presents: 0,
+            present_bytes: 0,
+            attach_ticks_per_kib: 0,
+            util_plus_one: 0,
+            _rsv: [0; 9],
+        }
+    }
+}
+
+impl Default for ObsGpu {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// =========================================================================
 // Names
 // =========================================================================
 
@@ -574,6 +750,12 @@ pub const OBS_SEC_HISTOGRAMS: u32 = 5;
 pub const OBS_SEC_TEXT_RINGS: u32 = 6;
 /// The machine-wide [`ObsMem`] block. One element.
 pub const OBS_SEC_MEM: u32 = 8;
+/// The NIC status pane: one [`ObsNet`].
+pub const OBS_SEC_NET: u32 = 9;
+/// The storage status pane: one [`ObsStorage`].
+pub const OBS_SEC_STORAGE: u32 = 10;
+/// The GPU status pane: one [`ObsGpu`].
+pub const OBS_SEC_GPU: u32 = 11;
 /// A layout witness carrying no data: `stride` = `size_of::<ObsEvent>()`.
 ///
 /// A reader built against a different `rheo-abi` than the kernel would otherwise
@@ -672,7 +854,7 @@ const _: () = assert!(core::mem::offset_of!(ObsRoot, sections) == OBS_HEADER_LEN
 /// anyone having to remember to bump a constant.
 pub const OBS_ABI_HASH: u64 = {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let vals: [u64; 10] = [
+    let vals: [u64; 13] = [
         OBS_VERSION as u64,
         core::mem::size_of::<ObsEvent>() as u64,
         core::mem::size_of::<ObsRingHdr>() as u64,
@@ -681,6 +863,9 @@ pub const OBS_ABI_HASH: u64 = {
         core::mem::size_of::<ObsName>() as u64,
         core::mem::size_of::<ObsRoot>() as u64,
         core::mem::size_of::<ObsMem>() as u64,
+        core::mem::size_of::<ObsNet>() as u64,
+        core::mem::size_of::<ObsStorage>() as u64,
+        core::mem::size_of::<ObsGpu>() as u64,
         OBS_COUNTERS as u64,
         OBS_WINDOWS as u64,
     ];
