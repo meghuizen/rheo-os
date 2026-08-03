@@ -430,10 +430,19 @@ fn test_hid_events() {
     // Nothing a person typed is left behind. The stronger half of the
     // not-a-keylogger property is structural - `rng::feed_hid` takes a sequence
     // number and no event, so a caller *cannot* pass a key code - and this is the
-    // part a test can see: the DMA buffers are wiped as they are drained.
-    assert!(
-        kernel::hw::virtio_input::buffers_clear(),
-        "a drained HID event is still sitting in the kernel's buffer"
+    // part a test can see: every buffer was read back as zero before being handed to
+    // the device again.
+    //
+    // Asked of the *drain* rather than of the buffers, because a wiped buffer goes
+    // straight back to the device and the injector is still typing: scanning the
+    // buffers afterwards fails when a **new** keystroke lands between the drain and
+    // the scan, which is exactly how it failed intermittently on riscv64.
+    let ev = kernel::hw::virtio_input::events();
+    assert_eq!(
+        kernel::hw::virtio_input::wiped(),
+        ev,
+        "{} of {ev} drained HID event(s) were wiped - a keystroke is still in kernel memory",
+        kernel::hw::virtio_input::wiped()
     );
     println!(
         "rng: HID device \"{}\" delivered {drained} key event(s) into the entropy pool \

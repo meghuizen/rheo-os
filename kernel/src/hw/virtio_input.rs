@@ -198,6 +198,15 @@ static mut RING: Ring = Ring {
 static mut LAST_USED: u16 = 0;
 /// Events drained since boot, for the report and the proof.
 static mut EVENTS: u64 = 0;
+/// Drained buffers whose wipe was **read back as zero** before the buffer was handed
+/// to the device again.
+///
+/// Verified rather than merely counted, and that distinction is the whole reason this
+/// exists: an increment sitting beside the wipe would prove nothing, because anyone
+/// deleting the wipe would delete the increment with it. Reading the buffer back
+/// makes `WIPED == EVENTS` a statement about memory, and removing the wipe makes the
+/// two diverge.
+static mut WIPED: u64 = 0;
 
 unsafe fn r32(base: usize, off: usize) -> u32 {
     unsafe { ((base + off) as *const u32).read_volatile() }
@@ -610,6 +619,19 @@ impl VirtioInput {
                     core::ptr::addr_of_mut!((*r).events[id]),
                     Event::default(),
                 );
+                // Read it back and count only a wipe that actually happened.
+                //
+                // Sound here and nowhere later: the buffer has not been returned to
+                // the device yet - the hand-back is below - so nothing else can be
+                // writing it. Checking the buffers *after* a drain instead is a race,
+                // because a handed-back buffer can be refilled by the next keystroke
+                // before the check runs, which is how this presented: an intermittent
+                // riscv64 failure saying a drained event was still in the buffer,
+                // when what had happened was that a *new* one had arrived.
+                let back = core::ptr::read_volatile(core::ptr::addr_of!((*r).events[id]));
+                if back.etype == 0 && back.code == 0 && back.value == 0 {
+                    WIPED = (*core::ptr::addr_of!(WIPED)).wrapping_add(1);
+                }
                 n += 1;
 
                 // Hand the buffer straight back, so a burst of typing does not
@@ -673,18 +695,22 @@ pub fn pump() -> usize {
     }
 }
 
-/// Whether every event buffer is zero - nothing a person typed is left in
-/// kernel memory. A property a test can check, unlike "the code does not read
-/// the key code", which is a property of the signature.
-pub fn buffers_clear() -> bool {
-    // SAFETY: reading this driver's own static from thread context.
-    unsafe {
-        let r = core::ptr::addr_of!(RING);
-        (0..QSIZE).all(|i| {
-            let e = (*r).events[i];
-            e.etype == 0 && e.code == 0 && e.value == 0
-        })
-    }
+/// Drained events whose buffer was **verified zero** before being handed back -
+/// nothing a person typed is left in kernel memory.
+///
+/// Compare against [`events`]: equal means every event drained was wiped, and the
+/// wipe was observed rather than assumed. This replaced a `buffers_clear()` that
+/// scanned the buffers *after* a drain, which looked like the same property and was
+/// not: a wiped buffer goes straight back to the device, so the next keystroke can
+/// refill it before the scan runs. That produced an intermittent riscv64 failure
+/// claiming a drained event was still in the buffer when a *new* one had simply
+/// arrived - a test that fails on correct behaviour, which is worse than no test.
+///
+/// The check that a caller cannot pass a key code at all is structural and needs no
+/// counter: `rng::feed_hid` takes a sequence number and no event.
+pub fn wiped() -> u64 {
+    // SAFETY: a counter written by this module from thread context.
+    unsafe { *core::ptr::addr_of!(WIPED) }
 }
 
 /// HID events drained since boot.
