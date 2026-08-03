@@ -949,7 +949,7 @@ pub fn probe() -> Option<Nvme> {
         nlba: 0,
         lba_bytes: 0,
         armed: false,
-        admin: SpinLock::new(admin),
+        admin: SpinLock::named(admin, crate::obs::lock::LockId::Nvme),
         io: [const { None }; MAX_IOQ],
         nio: 0,
     };
@@ -1106,7 +1106,7 @@ pub fn probe() -> Option<Nvme> {
             return None;
         }
         c.io[i] = Some(Chan {
-            q: SpinLock::new(q),
+            q: SpinLock::named(q, crate::obs::lock::LockId::Nvme),
             irq: core::sync::atomic::AtomicBool::new(false),
             irq_probed: core::sync::atomic::AtomicBool::new(false),
             bounce_va,

@@ -40,6 +40,7 @@
 
 pub mod cpu;
 pub mod dump;
+pub mod lock;
 pub mod ring;
 pub mod root;
 

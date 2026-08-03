@@ -81,7 +81,8 @@ static FALLBACKS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUs
 /// that produced the `SYS_YIELD` FP defect: state whose safety depends on which
 /// features are enabled gets written twice and diverges). An uncontended acquire is
 /// one atomic exchange, which is not measurable next to zeroing a 4 KiB frame.
-static POOL_LOCK: crate::smp::SpinLock<()> = crate::smp::SpinLock::new(());
+static POOL_LOCK: crate::smp::SpinLock<()> =
+    crate::smp::SpinLock::named((), crate::obs::lock::LockId::FramePool);
 
 /// How many mappings hold each allocated frame, for **copy-on-write `fork`**
 /// (docs/ARCHITECTURE-DEBT.md 4.0, blocker 2). One byte per frame = 128 KiB of

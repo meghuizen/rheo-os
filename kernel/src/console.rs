@@ -29,7 +29,8 @@ use core::fmt;
 /// output appears, which is a behaviour change for 210 existing boots; a lock changes only
 /// who waits, and a console write is already the slowest thing the kernel does, so the
 /// contention is irrelevant next to the UART it is protecting.
-static LOCK: crate::smp::SpinLock<()> = crate::smp::SpinLock::new(());
+static LOCK: crate::smp::SpinLock<()> =
+    crate::smp::SpinLock::named((), crate::obs::lock::LockId::Console);
 
 struct Console;
 

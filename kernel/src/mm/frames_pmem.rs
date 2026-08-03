@@ -49,7 +49,8 @@ static mut NEXT_HINT: usize = 0;
 /// `BASE_PA`/`NFRAMES`/`WINDOW_VA`/`READY` are written once by `init` before any
 /// secondary starts, so reading them needs no lock. Every acquire below is in a
 /// leaf function, so this non-reentrant lock is never taken twice on one core.
-static PMEM_LOCK: crate::smp::SpinLock<()> = crate::smp::SpinLock::new(());
+static PMEM_LOCK: crate::smp::SpinLock<()> =
+    crate::smp::SpinLock::named((), crate::obs::lock::LockId::PmemPool);
 
 /// Bring up the allocator over a discovered persistent-memory region
 /// `[base_pa, base_pa + len)`. Called once from `hw::detect` when firmware

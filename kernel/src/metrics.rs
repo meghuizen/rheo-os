@@ -118,10 +118,21 @@ pub enum Metric {
     /// Scheduler queue delay: runnable-to-running, nanoseconds. The
     /// responsiveness number the EEVDF/BORE work is judged on.
     RunDelayNs = 7,
+    /// How long a contended acquire of a **named** [`crate::smp::SpinLock`]
+    /// waited, nanoseconds (docs/OBSERVABILITY.md 11, S5). Recorded only from the
+    /// `#[cold]` contended path and only with the Lock window on, so an
+    /// uncontended acquire never reads a clock.
+    LockWaitNs = 8,
+    /// How long a named lock was **held**, nanoseconds. Behind its own modifier
+    /// bit (`W_LOCK_HOLD`), separate from the wait, because measuring hold time
+    /// reads the clock inside the critical section and lengthens the very region
+    /// it measures - a wait-only run gives contention with no perturbation of the
+    /// held region, and the two runs can be diffed.
+    LockHoldNs = 9,
 }
 
 /// Number of metrics.
-pub const METRICS: usize = 8;
+pub const METRICS: usize = 10;
 
 impl Metric {
     /// Every metric, for a reader that reports all of them.
@@ -134,6 +145,8 @@ impl Metric {
         Metric::FaultNs,
         Metric::BurstNs,
         Metric::RunDelayNs,
+        Metric::LockWaitNs,
+        Metric::LockHoldNs,
     ];
 
     /// Short stable name, for a diagnostic line or a bench report.
@@ -147,6 +160,8 @@ impl Metric {
             Metric::FaultNs => "fault_ns",
             Metric::BurstNs => "burst_ns",
             Metric::RunDelayNs => "run_delay_ns",
+            Metric::LockWaitNs => "lock_wait_ns",
+            Metric::LockHoldNs => "lock_hold_ns",
         }
     }
 }
@@ -287,6 +302,24 @@ impl Histogram {
     /// this may take (pillar 1); pass [`Owner::KERNEL`] for kernel-wide metrics,
     /// which is what [`record`] does.
     pub fn record_owned(&mut self, value: u64, owner: Owner) {
+        self.record_inner(value, Some(owner));
+    }
+
+    /// [`Histogram::record_owned`] with the allocation arm removed: a sample on
+    /// an unfunded histogram counts into count/sum/min/max and `unplaced`, and
+    /// never takes a frame. The variant the **lock instrumentation** must use
+    /// (docs/OBSERVABILITY.md 11, S5): the frames pool lock is itself a named
+    /// lock, so a record that could allocate while its guard is held would
+    /// re-enter the pool lock (a self-deadlock) - and even after release, an
+    /// alloc mid-record re-enters `record` through the inner guard's drop while
+    /// the outer `&mut` histogram is live, which is aliasing, not a slow path.
+    /// Bucket storage comes from [`prefund`], a bring-up act - the same rule
+    /// that keeps `obs::fund_this_cpu` off the emit path.
+    fn record_noalloc(&mut self, value: u64) {
+        self.record_inner(value, None);
+    }
+
+    fn record_inner(&mut self, value: u64, alloc: Option<Owner>) {
         self.count = self.count.saturating_add(1);
         self.sum = self.sum.saturating_add(value);
         if value < self.min {
@@ -296,6 +329,10 @@ impl Histogram {
             self.max = value;
         }
         if self.buckets == 0 {
+            let Some(owner) = alloc else {
+                self.unplaced = self.unplaced.saturating_add(1);
+                return;
+            };
             match kmeta::alloc_metric_frame(owner) {
                 Some(va) => self.buckets = va,
                 None => {
@@ -501,6 +538,37 @@ pub fn record(metric: Metric, value: u64) {
     unsafe {
         SETS.this_mut()[metric as usize].record_owned(value, Owner::KERNEL);
     }
+}
+
+/// Record `value` for `metric` on this CPU **without ever allocating** - the
+/// lock-instrumentation entry point (see [`Histogram::record_noalloc`] for why an
+/// allocation here is a deadlock and an aliasing hazard, not a slow path). A
+/// sample on an unfunded histogram still counts (count/sum/min/max, `unplaced`);
+/// percentiles need [`prefund`].
+#[inline]
+pub fn record_noalloc(metric: Metric, value: u64) {
+    if !enabled() {
+        return;
+    }
+    // SAFETY: this CPU's own slot; the noalloc path calls nothing that could
+    // re-enter metrics, which is the whole point of the variant.
+    unsafe {
+        SETS.this_mut()[metric as usize].record_noalloc(value);
+    }
+}
+
+/// Take bucket storage for `metric` on **this CPU** now, from a context where
+/// allocating is safe - a bring-up act, exactly like `obs::fund_this_cpu`.
+/// Returns whether buckets exist afterwards. Without it, `record_noalloc`
+/// samples report a mean and no percentiles ([`Histogram::has_buckets`] says
+/// which a reader has).
+pub fn prefund(metric: Metric) -> bool {
+    // SAFETY: this CPU's own slot; called from bring-up, not from a record path.
+    let h = unsafe { &mut SETS.this_mut()[metric as usize] };
+    if h.buckets == 0 {
+        h.buckets = kmeta::alloc_metric_frame(Owner::KERNEL).unwrap_or(0);
+    }
+    h.buckets != 0
 }
 
 /// Record the elapsed time between two [`crate::ktimer::now_ns`] readings.

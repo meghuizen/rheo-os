@@ -663,9 +663,63 @@ in `user.rs` rather than beside the entity table. Those two stay SMP-sound atomi
 where they are; the plane's query surface (S7/S9) reads accessors, not slots, so
 nothing is lost but relocation.
 
-### 11.7 Not built yet
+### 11.7 S5 (lock half) - named locks, contention, wait and hold time
+
+**Built: a `SpinLock` that can say who it is, and instrumentation that measures
+contention and only contention.** `SpinLock::named(value, LockId)` opts a lock in
+(`LockId` a closed kernel-defined set, like `TimerClient`: the frames pool, the
+pmem pool, the console, the admission ledger, the entropy pool, the NVMe queues,
+and a `Probe` id so a proof can contend on a lock that is not load-bearing);
+`SpinLock::new` is untouched and id 0 is never measured. The fast path is now one
+**strong** `compare_exchange` - strong deliberately, because a weak CAS may fail
+spuriously on LL/SC ISAs and every failure enters the contended path, whose count
+must mean "the lock was genuinely held" for the uncontended-equals-zero oracle to
+hold. The `#[cold]` contended path counts the contention and the spin iterations
+per lock (`obs/lock.rs` - per-**lock** atomics rather than per-CPU plane slots,
+because "which lock is hot" is the question and per-CPU slots would answer "which
+CPU waited"), records `Metric::LockWaitNs`, and emits a Lock-window event naming
+the lock. Hold time is behind its **own** modifier bit (`W_LOCK_HOLD`): measuring
+it reads the clock inside the critical section and lengthens the very region it
+measures, so a wait-only run gives contention with no perturbation of the held
+region - and the guard records the hold **after** the release store, so the
+measured region never includes the recording.
+
+**The recording rule the frames lock forced**: lock metrics go through
+`metrics::record_noalloc`, never the allocating `record` - the pool lock is itself
+named, so a first-sample bucket allocation from inside its guard is a
+self-deadlock, and even after release the allocation re-enters `metrics` through
+the *inner* guard's drop while the outer `&mut` histogram is live, which is
+aliasing. Bucket storage comes from `metrics::prefund`, a bring-up act - the S1
+fund-never-on-emit rule, third application. `Metric` gained `LockWaitNs` and
+`LockHoldNs` (METRICS 8 -> 10); metrics enabling is per-CPU, which shaped the
+proof - the secondary enables and prefunds for itself, and assertions sum over
+CPUs.
+
+**Contention is proven deterministically, not statistically**: TCG's interleaving
+is far coarser than a critical section, so two cores hammering symmetrically can
+serialise entirely and a `contention > 0` assertion on that shape is flaky by
+construction. The `smp` phase instead has the primary take the probe lock, hold it
+until the secondary *declares* its acquire, and keep holding through a generous
+delay - so the secondary's CAS lands on a genuinely held lock every time. Observed
+on all three ISAs: **16 of 16 handshakes contended** (2.7-3.3M spins, 16 wait
+samples, p50 from a real prefunded histogram), **1024 uncontended acquisitions of
+the same named lock = exactly 0 contentions** (the plan's own control, asserted
+in-line: nonzero would mean the counter counts acquisitions), and the hold split -
+0 hold samples with the modifier off across all of the above, >= 1 after one
+acquire with it on.
+
+**The disabled cost is measured and published**: the whole 102-benchmark matrix
+against the pre-S5 build moved on exactly one line - `entropy_absorb_32B`, the one
+op that takes a named lock per iteration, at **+11 milli-instructions/op** on
+x86-64/riscv64 (+0.5 aarch64) = the id test, the mask load, the guard's zeroed
+hold field and the drop's compare, ~0.8% of that op. Every other benchmark,
+including every path through the *unnamed* nineteen locks, is unchanged to the
+tick. The plan estimated ~4 instructions; 11 is the honest number.
+
+### 11.8 Not built yet
 
 The per-node memory breakdown, the rest of the counter unification (11.6), the
-`Net`/`Gpu`/`Lock` windows with their device and lock instrumentation, the
-capability gate on telemetry, egress beyond the serial console, the host tool, and
-the OTLP exporter cell. Dynamic probes remain the documented deferral of section 5.
+device status blocks (GPU/NIC/storage - the other half of S5) with the
+`Net`/`Gpu` windows' device instrumentation, the capability gate on telemetry,
+egress beyond the serial console, the host tool, and the OTLP exporter cell.
+Dynamic probes remain the documented deferral of section 5.

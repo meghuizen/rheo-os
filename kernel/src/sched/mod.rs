@@ -145,7 +145,8 @@ impl Default for Admission {
 /// `#[cfg(feature = "smp")]`, for the reason `frames::POOL_LOCK` is: whether a
 /// structure needs a lock is a property of the structure, not of which features
 /// are enabled.
-static SYSTEM: crate::smp::SpinLock<Admission> = crate::smp::SpinLock::new(Admission::new());
+static SYSTEM: crate::smp::SpinLock<Admission> =
+    crate::smp::SpinLock::named(Admission::new(), crate::obs::lock::LockId::SchedSystem);
 
 /// Admit a reservation against the machine-wide ledger (charged in addition to
 /// the caller's own per-cell controller). Atomic: the check and the commit happen

@@ -304,6 +304,7 @@ fn test_secondary_bringup() {
             test_parallel_gemm(idx);
             test_shared_heap();
             test_shared_ledger();
+            test_lock_contention();
             test_vcore_identity();
             test_strands_across_vcores();
             test_loaded_multi_vcore_cell();
@@ -2168,6 +2169,226 @@ fn test_shared_ledger() {
          hold, ledger back to 0 ppm OK",
         LEDGER_ROUNDS
     );
+}
+
+// ----------------------------------- LOCK CONTENTION IS MEASURED, AND ONLY CONTENTION
+//
+// docs/OBSERVABILITY.md 11, S5: a **named** SpinLock counts its contended
+// acquisitions, the spins and wait they cost, and - behind a separate modifier bit -
+// its hold times, while an uncontended acquire of the same lock records nothing.
+// "Only contention" is the load-bearing half: a counter that moves on every
+// acquisition is an acquisition counter wearing a contention counter's name, and the
+// uncontended round below is the oracle that tells them apart.
+//
+// Contention is made **deterministic rather than statistical**: TCG's interleaving is
+// far coarser than a lock's critical section, so two cores hammering symmetrically can
+// serialise entirely and contend zero times - a phase asserting `> 0` on that shape is
+// flaky by construction. Instead the primary takes the probe lock and holds it until
+// the secondary *declares* it is about to acquire, then keeps holding through a
+// generous delay before releasing - so the secondary's fast-path CAS lands while the
+// lock is genuinely held and its acquire must take the contended path. The one
+// remaining race (the secondary declaring, then being descheduled past the whole
+// delay) is closed by bounded retries: a genuine instrumentation regression fails
+// every attempt deterministically, while a scheduling miss fails one.
+//
+// The metrics half is per-CPU, and that shaped the phase: `metrics::enable()` and
+// `prefund` act on the **calling** CPU, so the secondary enables and prefunds for
+// itself at the start of its run, and the assertions sum counts over every CPU.
+
+/// The probe lock: named so its numbers are attributable to this phase alone, not
+/// load-bearing so contending on it perturbs nothing.
+static LOCK_PROBE: kernel::smp::SpinLock<u64> =
+    kernel::smp::SpinLock::named(0, kernel::obs::lock::LockId::Probe);
+/// The deterministic-contention handshake: 0 idle, 1 primary holds, 2 secondary
+/// about to acquire, 3 secondary done (releases the primary to the next attempt).
+static LOCK_STAGE: AtomicUsize = AtomicUsize::new(0);
+/// How long the primary keeps holding after the secondary declares (spin loops).
+const LOCK_HOLD_SPINS: usize = 200_000;
+/// Deterministic-contention attempts before giving up.
+const LOCK_ATTEMPTS: usize = 16;
+
+fn lock_probe_secondary() {
+    // Per-CPU: recording and bucket storage for THIS core, from a safe context
+    // (the start of the run, no lock held).
+    kernel::metrics::enable();
+    kernel::metrics::prefund(kernel::metrics::Metric::LockWaitNs);
+    for _ in 0..LOCK_ATTEMPTS {
+        // Wait for the primary to hold the lock.
+        while LOCK_STAGE.load(Ordering::Acquire) != 1 {
+            core::hint::spin_loop();
+        }
+        // Declare, then acquire: the primary keeps holding well past this store,
+        // so this acquire finds the lock held and takes the contended path.
+        LOCK_STAGE.store(2, Ordering::Release);
+        let mut g = LOCK_PROBE.lock();
+        *g += 1;
+        drop(g);
+        LOCK_STAGE.store(3, Ordering::Release);
+    }
+}
+
+fn lock_probe_primary() {
+    for _ in 0..LOCK_ATTEMPTS {
+        let g = LOCK_PROBE.lock();
+        LOCK_STAGE.store(1, Ordering::Release);
+        // Hold until the secondary declares its acquire...
+        while LOCK_STAGE.load(Ordering::Acquire) != 2 {
+            core::hint::spin_loop();
+        }
+        // ...and then long enough for its CAS to land on the held lock.
+        for _ in 0..LOCK_HOLD_SPINS {
+            core::hint::spin_loop();
+        }
+        drop(g);
+        // Wait for the secondary to finish its acquire before re-taking, so the
+        // next attempt starts from a clean stage.
+        while LOCK_STAGE.load(Ordering::Acquire) != 3 {
+            core::hint::spin_loop();
+        }
+        LOCK_STAGE.store(0, Ordering::Release);
+    }
+}
+
+/// LockWaitNs / LockHoldNs sample count summed over every CPU (recording lands on
+/// whichever core waited).
+fn lock_metric_count(metric: kernel::metrics::Metric) -> u64 {
+    let mut total = 0;
+    for cpu in 0..kernel::smp::MAX_CPUS {
+        // SAFETY: cross-core histogram read; counts can only grow, and both cores
+        // are quiescent when this is called.
+        total += unsafe { kernel::metrics::per_cpu(cpu, metric) }.count();
+    }
+    total
+}
+
+fn test_lock_contention() {
+    use kernel::metrics::{self, Metric};
+    use kernel::obs::lock::{self as klock, LockId};
+
+    // The Lock window on (contention counting), the hold modifier deliberately
+    // OFF: the split between the two bits is asserted below.
+    assert!(
+        kernel::obs::enable_windows(kernel::obs::Window::Lock.bit()),
+        "the event ring could not be funded"
+    );
+    metrics::enable();
+    assert!(
+        metrics::prefund(Metric::LockWaitNs) && metrics::prefund(Metric::LockHoldNs),
+        "bucket storage refused - the pool is exhausted this early?"
+    );
+    klock::reset();
+    LOCK_STAGE.store(0, Ordering::Release);
+    let wait_before = lock_metric_count(Metric::LockWaitNs);
+
+    let (met, finished) = smp::run_fn_with_secondary(lock_probe_secondary, lock_probe_primary);
+    if !finished {
+        println!(
+            "smp: SKIP the lock-contention phase - the secondary did not finish inside \
+             the bound, so nothing about two cores on one lock is claimed"
+        );
+        kernel::obs::reset();
+        metrics::disable();
+        klock::reset();
+        return;
+    }
+    assert!(
+        met && !smp::rendezvous_timed_out(),
+        "the two cores never met, so they never contended"
+    );
+
+    // Exactness first: the lock still excludes (every increment landed).
+    assert_eq!(
+        *LOCK_PROBE.lock(),
+        LOCK_ATTEMPTS as u64,
+        "increments were lost - the named lock stopped excluding"
+    );
+    let contentions = klock::contentions(LockId::Probe);
+    let spins = klock::lock_spins(LockId::Probe);
+    let waits = lock_metric_count(Metric::LockWaitNs) - wait_before;
+    assert!(
+        contentions >= 1,
+        "{LOCK_ATTEMPTS} held-while-attempted handshakes produced no contention - \
+         the contended path is not counting"
+    );
+    assert!(
+        spins >= 1,
+        "contended acquires spun 0 times against a hold of {LOCK_HOLD_SPINS} loops"
+    );
+    assert!(
+        waits >= 1,
+        "contention was counted but no LockWaitNs sample landed on any CPU"
+    );
+    // The wait distribution is real: some CPU's histogram has the samples, with
+    // buckets (prefunded), so its p50 is a measured wait, not a fabricated one.
+    let mut p50 = 0;
+    for cpu in 0..kernel::smp::MAX_CPUS {
+        // SAFETY: quiescent cross-core read, as above.
+        let h = unsafe { kernel::metrics::per_cpu(cpu, Metric::LockWaitNs) };
+        if h.count() > 0 && h.has_buckets() {
+            p50 = p50.max(h.percentile(50));
+        }
+    }
+    assert!(
+        p50 > 0,
+        "a contended wait across a {LOCK_HOLD_SPINS}-loop hold has p50 = 0 ns"
+    );
+
+    // The hold modifier was off, so all of the above must have recorded NO hold
+    // times - the two bits are separate precisely so a wait-only run never reads
+    // the clock inside a critical section.
+    assert_eq!(
+        lock_metric_count(Metric::LockHoldNs),
+        0,
+        "hold times were recorded with W_LOCK_HOLD off - the modifier does not gate"
+    );
+
+    // The uncontended oracle: one core, same named lock, same window on. A
+    // thousand acquisitions must count exactly ZERO contentions - nonzero here
+    // means the counter counts acquisitions, not contention (the control the
+    // plan names, asserted in-line rather than by a revert).
+    klock::reset();
+    for _ in 0..1024 {
+        let mut g = LOCK_PROBE.lock();
+        *g = g.wrapping_add(1);
+    }
+    assert_eq!(
+        klock::contentions(LockId::Probe),
+        0,
+        "1024 uncontended acquisitions counted as contention"
+    );
+
+    // Now the hold bit too: one acquire with a known-length hold records a hold
+    // sample, on this CPU, with the wait counters untouched (nothing contends).
+    kernel::obs::set_windows(
+        kernel::obs::Window::Lock.bit() | (1u32 << kernel::abi::obs::W_LOCK_HOLD),
+    );
+    {
+        let mut g = LOCK_PROBE.lock();
+        *g = g.wrapping_add(1);
+        for _ in 0..10_000 {
+            core::hint::spin_loop();
+        }
+    }
+    assert!(
+        lock_metric_count(Metric::LockHoldNs) >= 1,
+        "W_LOCK_HOLD is on and a 10k-loop hold recorded nothing"
+    );
+    assert_eq!(
+        klock::contentions(LockId::Probe),
+        0,
+        "an uncontended hold-measured acquire counted as contention"
+    );
+
+    println!(
+        "smp: LOCK CONTENTION MEASURED AND ONLY CONTENTION - {contentions} deterministic \
+         contention(s) over {LOCK_ATTEMPTS} handshakes ({spins} spins, {waits} wait \
+         sample(s), p50 {p50} ns), 1024 uncontended acquisitions = 0 contentions, \
+         holds gated by their own bit (0 recorded off, >=1 on) OK"
+    );
+
+    kernel::obs::reset();
+    metrics::disable();
+    klock::reset();
 }
 
 // ------------------------------- TWO CORES ALLOCATING FROM ONE HEAP AT THE SAME TIME

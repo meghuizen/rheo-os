@@ -279,7 +279,7 @@ impl Pool {
     }
 }
 
-static POOL: SpinLock<Pool> = SpinLock::new(Pool::new());
+static POOL: SpinLock<Pool> = SpinLock::named(Pool::new(), crate::obs::lock::LockId::EntropyPool);
 
 // ------------------------------------------------- per-core interrupt scratch
 
