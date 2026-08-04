@@ -1425,8 +1425,10 @@ are different problems and the second only exists because the first was answered
 `mm::frames` is correct on N cores and it is also the one structure every path
 touches, so it is where N cores queue.
 
-Four changes, in the order they matter. The first is worth far more than the
-others and would have been worth doing with no lock in sight.
+Five changes, in the order they matter. The first is worth far more than the
+others and would have been worth doing with no lock in sight; the last is about the
+bitmap search itself rather than about getting to it, and is the largest single win
+of the group.
 
 **1. The 4 KiB zeroing left the critical section.** Every `alloc` set a bitmap
 bit, three fields, and then zeroed 4096 bytes - *inside* the lock. That is a
@@ -1509,6 +1511,45 @@ The boot-time and diagnostic paths (`init_numa`, `alloc_contig`, `stats`,
 `used_matches_bitmap`, `node_free`, `node_of`) deliberately stay on the plain
 lock: they allocate nothing or run once, so a batch would add machinery to a path
 with nothing to batch against.
+
+**5. The search is a word at a time, not a bit at a time.** The three changes above
+are about *reaching* the bitmap; this one is about the work once you are there, and it
+is the largest of the five by a wide margin. The search was a per-frame loop - index a
+word, shift, mask, test - so its cost grew with how many frames were **allocated**. On
+the unrestricted path the rotating hint usually points straight at a free frame and it
+never showed; on the NUMA path it did, because `alloc_on` restarts at the node's `lo`
+on *every call*, so a node at 90% paid ~59,000 iterations per allocation and running
+one dry - which the `numa` kernel does deliberately - is quadratic in the node's size.
+
+`mm::bitmap` turns each 64 allocated frames into one load, one compare and one branch,
+finding the free bit with a single `trailing_zeros`. Same answer; **63x fewer steps**
+through a full region. The pmem pool got the same treatment, for 10.0f's reason: it is
+the same scan, and its frame count is the one that is *not* a multiple of 64, since it
+comes from whatever size the NFIT reports. `alloc_contig`'s run search is deliberately
+left bit-at-a-time and says so where it lives: a run cannot skip an all-free word
+without carrying a partial run across the skip, and it runs a handful of times per
+boot, so the win would be unmeasurable and the risk would not.
+
+It is **its own dependency-free module**, and that is the whole safety argument. This
+is bit arithmetic with four boundary conditions the old form did not have - the first
+word's low bits, the last word's high bits, both at once in a single-word range, and a
+range whose end is not a multiple of 64 - and each is a case where being wrong is
+*silent*: a missed free bit is a spurious out-of-memory on a machine with free memory,
+and a bit returned from outside `[lo, hi)` is a frame on the wrong NUMA node that
+`alloc_on` reports as correctly placed. So the functions take a plain `&[u64]` and no
+kernel state, which lets `verify/bitmap/` include them verbatim and drive **683,792
+cases** against a bit-at-a-time reference on the host: 16 hand-computed boundaries,
+320,000 random `find_in`/`find_from` across densities from empty to full, 32,000
+random `find_run`, and every 8-bit map *exhaustively*. Two controls fire, the second
+by exactly the name that matters - "returned N outside [lo, hi) - on the NUMA path
+this is a frame on another node reported as placed".
+
+The cost is reported there rather than in `cargo xtask bench`, because **the bench
+suite cannot see this change**: the benches allocate from a nearly-empty pool where
+both algorithms stop on the first candidate, so "the benches are unchanged" would be
+true and beside the point. Wall clock was tried too and is not claimed - the `numa`
+boot went 11.6 s to 10.7 s, one sample of a boot doing far more than the run-dry
+phase, under an emulator. The step count is what this container can defend.
 
 **The proof** is a new `smp` phase, mirroring the shared-heap phase because the
 failure mode is the same shape. Each core, in a loop: allocate a frame, stamp

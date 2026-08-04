@@ -315,6 +315,9 @@ fn zero_frames(pa: usize, n: usize) {
 
 /// Claim one frame from anywhere in the pool, rotating [`NEXT_HINT`]. **Not zeroed.**
 ///
+/// The search is [`super::bitmap::find_from`] - a word at a time, so a full region
+/// costs one load and one `trailing_zeros` per 64 frames rather than per frame.
+///
 /// # Safety
 /// The pool lock must be held.
 unsafe fn claim_hinted() -> Option<usize> {
@@ -326,22 +329,21 @@ unsafe fn claim_hinted() -> Option<usize> {
         );
         let bitmap = &mut *core::ptr::addr_of_mut!(BITMAP);
         let hint = *core::ptr::addr_of!(NEXT_HINT);
-        for offset in 0..POOL_FRAMES {
-            let frame = (hint + offset) % POOL_FRAMES;
-            let (word, bit) = (frame / 64, frame % 64);
-            if bitmap[word] & (1 << bit) == 0 {
-                bitmap[word] |= 1 << bit;
-                (*core::ptr::addr_of_mut!(REFS))[frame] = 1;
-                *core::ptr::addr_of_mut!(USED) += 1;
-                *core::ptr::addr_of_mut!(NEXT_HINT) = frame + 1;
-                return Some(arch::FRAME_POOL_BASE + frame * FRAME_SIZE);
-            }
-        }
-        None
+        let frame = super::bitmap::find_from(bitmap, POOL_FRAMES, hint)?;
+        bitmap[frame / 64] |= 1 << (frame % 64);
+        (*core::ptr::addr_of_mut!(REFS))[frame] = 1;
+        *core::ptr::addr_of_mut!(USED) += 1;
+        *core::ptr::addr_of_mut!(NEXT_HINT) = frame + 1;
+        Some(arch::FRAME_POOL_BASE + frame * FRAME_SIZE)
     }
 }
 
 /// Claim one frame from pool frame indices `[lo, hi)`. **Not zeroed.**
+///
+/// The search is [`super::bitmap::find_in`], and this is the caller that made the
+/// word-at-a-time form worth having: it restarts at `lo` on **every** call, so with a
+/// bit-at-a-time scan the cost of an allocation grew with how full the node already
+/// was.
 ///
 /// Deliberately does **not** move [`NEXT_HINT`]: a bounded search must not steer the
 /// unrestricted one, or a single node-affine allocation would send every subsequent
@@ -357,16 +359,11 @@ unsafe fn claim_in(lo: usize, hi: usize) -> Option<usize> {
             "frame allocator used before init"
         );
         let bitmap = &mut *core::ptr::addr_of_mut!(BITMAP);
-        for frame in lo..hi.min(POOL_FRAMES) {
-            let (word, bit) = (frame / 64, frame % 64);
-            if bitmap[word] & (1 << bit) == 0 {
-                bitmap[word] |= 1 << bit;
-                (*core::ptr::addr_of_mut!(REFS))[frame] = 1;
-                *core::ptr::addr_of_mut!(USED) += 1;
-                return Some(arch::FRAME_POOL_BASE + frame * FRAME_SIZE);
-            }
-        }
-        None
+        let frame = super::bitmap::find_in(bitmap, POOL_FRAMES, lo, hi)?;
+        bitmap[frame / 64] |= 1 << (frame % 64);
+        (*core::ptr::addr_of_mut!(REFS))[frame] = 1;
+        *core::ptr::addr_of_mut!(USED) += 1;
+        Some(arch::FRAME_POOL_BASE + frame * FRAME_SIZE)
     }
 }
 
@@ -928,29 +925,14 @@ pub fn alloc_contig(n: usize) -> Option<usize> {
                 "frame allocator used before init"
             );
             let bitmap = &mut *core::ptr::addr_of_mut!(BITMAP);
-            let mut run = 0usize;
-            let mut found = None;
-            for frame in 0..POOL_FRAMES {
-                let (word, bit) = (frame / 64, frame % 64);
-                if bitmap[word] & (1 << bit) != 0 {
-                    run = 0;
-                    continue;
-                }
-                run += 1;
-                if run < n {
-                    continue;
-                }
-                let first = frame + 1 - n;
-                for f in first..=frame {
-                    let (w, b) = (f / 64, f % 64);
-                    bitmap[w] |= 1 << b;
+            super::bitmap::find_run(bitmap, POOL_FRAMES, n).map(|first| {
+                for f in first..first + n {
+                    bitmap[f / 64] |= 1 << (f % 64);
                     (*core::ptr::addr_of_mut!(REFS))[f] = 1;
                 }
                 *core::ptr::addr_of_mut!(USED) += n;
-                found = Some(arch::FRAME_POOL_BASE + first * FRAME_SIZE);
-                break;
-            }
-            found
+                arch::FRAME_POOL_BASE + first * FRAME_SIZE
+            })
         }
     };
     let pa = claimed?;

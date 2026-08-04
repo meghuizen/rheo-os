@@ -1566,6 +1566,7 @@ fn verify() -> bool {
         ("obs", "verify/obs/fuzz.rs"),
         ("graph", "verify/graph/fuzz.rs"),
         ("hetero", "verify/hetero/fuzz.rs"),
+        ("bitmap", "verify/bitmap/fuzz.rs"),
     ];
     let out = std::path::Path::new("target/verify");
     if let Err(e) = std::fs::create_dir_all(out) {

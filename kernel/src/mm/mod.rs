@@ -6,6 +6,7 @@
 //! ASID/PCID-tagged switches. Huge pages back the kernel identity map;
 //! elastic grants, reclaim, and pressure events are later steps.
 
+pub mod bitmap;
 pub mod frames;
 pub mod frames_pmem;
 pub mod grant;

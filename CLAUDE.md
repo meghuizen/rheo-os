@@ -2641,6 +2641,32 @@ cold code sharing its stack frame - and once the frame was cheap, two atomics an
 round trip were the whole remaining cost, which is only visible once you are counting. Two controls observed firing (the zeroing
 deleted -> `4096 nonzero byte(s)`; the combiner running each request twice -> `double
 free of <pa>`).
+**And (5) the bitmap search is a word at a time**, which is the largest of the five and
+is about the work once you reach the bitmap rather than about reaching it: the scan was a
+per-frame loop, so its cost grew with how many frames were **allocated** - invisible on
+the rotating-hint path, but `alloc_on` restarts at the node's `lo` on *every* call, so a
+node at 90% paid ~59,000 iterations per allocation and running one dry (which `numa` does
+deliberately) is quadratic in the node's size. `mm::bitmap` turns each 64 allocated frames
+into one load, one compare and one branch with a single `trailing_zeros` - same answer,
+**63x fewer steps** through a full region - and the pmem pool got it too, for 10.0f's
+reason (same scan, and its frame count is the one that is *not* a multiple of 64, coming
+from whatever the NFIT reports); `alloc_contig`'s run search is deliberately left
+bit-at-a-time and says why where it lives. It is its own **dependency-free module**, and
+that is the whole safety argument: four boundary conditions the old form did not have (the
+first word's low bits, the last word's high bits, both at once in a single-word range, and
+a range whose end is not a multiple of 64), each **silent** when wrong - a missed free bit
+is a spurious out-of-memory on a machine with free memory, and a bit from outside
+`[lo, hi)` is a frame on the wrong NUMA node that `alloc_on` reports as correctly placed.
+So it takes a plain `&[u64]` and no kernel state, and **`verify/bitmap/`** includes it
+verbatim and drives **683,792 cases** against a bit-at-a-time reference: 16 hand-computed
+boundaries, 320,000 random `find_in`/`find_from` from empty to full, 32,000 random
+`find_run`, and every 8-bit map **exhaustively**. Two controls fire, the second by exactly
+the name that matters (`returned N outside [lo, hi) - on the NUMA path this is a frame on
+another node reported as placed`). The cost is reported there rather than by `cargo xtask
+bench`, because **the bench suite cannot see this change** - the benches allocate from a
+nearly-empty pool where both algorithms stop on the first candidate - and wall clock was
+tried and is **not** claimed (the `numa` boot went 11.6 s to 10.7 s: one sample of a boot
+doing far more than the run-dry phase, under an emulator).
 **And the first version of the zeroing oracle passed with the fix deleted** - the
 concurrent loop asserted every fresh frame arrives zero, reasoning that a frame one core
 stamped and freed comes back to the other dirty, but `alloc` rotates its hint so a freed
@@ -3471,7 +3497,9 @@ kernel/       the no_std kernel library + boot demo bin
               `share`/`refs` the COW primitives - **and** the per-NUMA-node frame
               ranges `alloc_on` places against, docs/SUBSTRATE.md pillar 6; the hot
               operations go through **flat combining** rather than each core taking the
-              pool lock in turn, and the 4 KiB zeroing is outside the lock entirely -
+              pool lock in turn, the 4 KiB zeroing is outside the lock entirely, and
+              the free-frame search is **bitmap.rs** - a word at a time, dependency-free
+              so `verify/bitmap/` can drive its four boundary conditions on the host -
               docs/SMP.md 10.0g), uaccess (**the one seam kernel code
               touches a cell's memory through**: bounds + presence + copy-on-write
               resolution, so every lazy-mapping feature is one change here rather than a
@@ -3894,6 +3922,16 @@ verify/       host-side model checking of the kernel state machines that are
               operations on the first seed. It does not replace `cargo xtask test`:
               it checks state machines, not the trap path, the page tables or the FP
               register file (verify/README.md).
+              bitmap/ drives `mm/bitmap.rs` - the free-frame search, 683,792 cases
+              against the pre-change bit-at-a-time algorithm as the oracle (16 hand-
+              computed boundaries, 320,000 random find_in/find_from, 32,000 find_run,
+              and every 8-bit map exhaustively). It is here and not in a boot test
+              because the word-at-a-time form has four boundary conditions the old one
+              did not, each **silent** when wrong: a missed free bit is a spurious OOM,
+              and a bit from outside [lo, hi) is a frame on the wrong NUMA node that
+              `alloc_on` reports as placed. Also where the win is *measured* (63x fewer
+              steps through a full region), since the bench suite allocates from a
+              nearly-empty pool and cannot see it at all.
               obs/ drives `obs/ring.rs` - the per-CPU event ring against an
               independent VecDeque oracle at four counter start points, including one
               **crossing 2^32**, where the recorded sequence number recycles (~71
