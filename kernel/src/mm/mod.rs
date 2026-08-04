@@ -325,26 +325,33 @@ impl AddressSpace {
             return false;
         };
         // One holder means the other side already privated its copy (or this page was
-        // never shared, just marked): keep the frame and make it writable.
-        let new_pa = if frames::refs(pa) > 1 {
-            let Some(dst) = frames::alloc() else {
+        // never shared, just marked): keep the frame and make it writable. The test and
+        // the replacement frame come from one call, so the refcount cannot change
+        // between them.
+        let new_pa = match frames::cow_resolve(pa) {
+            frames::Cow::Sole => None,
+            frames::Cow::NoFrame => {
                 crate::println!("cow: no frame to private the shared page at {page:#x}");
                 return false;
-            };
-            // SAFETY: both are 4 KiB pool frames reached through the kernel linear map;
-            // `dst` is freshly allocated and disjoint from `pa`.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    arch::phys_to_virt(pa) as *const u8,
-                    arch::phys_to_virt(dst) as *mut u8,
-                    frames::FRAME_SIZE,
-                );
             }
-            // This mapping no longer holds the shared frame.
-            frames::free(pa);
-            Some(dst)
-        } else {
-            None
+            frames::Cow::Private(dst) => {
+                // SAFETY: both are 4 KiB pool frames reached through the kernel linear
+                // map; `dst` is freshly claimed and disjoint from `pa`. The copy fills
+                // every byte, which is what `Cow::Private` requires of its caller in
+                // place of a zeroing pass.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        arch::phys_to_virt(pa) as *const u8,
+                        arch::phys_to_virt(dst) as *mut u8,
+                        frames::FRAME_SIZE,
+                    );
+                }
+                // This mapping no longer holds the shared frame. **After** the copy:
+                // dropping the reference first would let a peer core faulting on the
+                // same page see a count of one and write through it mid-copy.
+                frames::free(pa);
+                Some(dst)
+            }
         };
         arch::paging_cow_clear(&mut self.root, page, new_pa);
         self.touched();

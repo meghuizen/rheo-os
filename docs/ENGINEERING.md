@@ -510,6 +510,20 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   read, so that phase never reached the code it claimed to test. The discriminating
   case was a *write* to a filled read-only page. Before trusting a phase, delete the
   thing it guards and watch it fail.
+- **An allocator that never recycles cannot prove it sanitises.** Moving the frame
+  allocator's 4 KiB zeroing out of the pool lock (docs/SMP.md 10.0g) came with what
+  looked like the obvious oracle: two cores loop over allocate / stamp every byte /
+  free, asserting every *fresh* frame arrives zero, on the reasoning that a frame one
+  core stamped and freed comes back to the other still dirty. It **passed with the
+  zeroing deleted**. `alloc` rotates a search hint, so a freed frame is not handed out
+  again until the cursor has walked all 131,072 of them: nothing in a 2,000-round pass
+  is ever recycled, and the oracle only ever inspected memory that was already zero.
+  The fix is to dirty the frame **before** it is allocated - the hint makes the next
+  frame predictable, and a free frame belongs to nobody, so a test may write to it -
+  with the prediction *asserted* rather than assumed, and a miss skipping with a
+  reason. The general trap: a "reuse the resource and check it was cleaned" oracle is
+  only an oracle if the allocator under test actually reuses on the timescale of the
+  test, and rotating allocators specifically do not.
 - **Do not split a sequence you have not understood.** The first attempt at that
   fix split the arch injector into "inject" and "halt" so the portable code could
   re-halt until the byte arrived. It wedged the machine: the per-ISA sequence is

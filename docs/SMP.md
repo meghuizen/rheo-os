@@ -1417,6 +1417,114 @@ phase of its own: an nvdimm is x86-64-only here, and adding one to the `smp`
 launch would perturb the tree's most assertion-dense kernel to buy a control that
 would not fire either.
 
+### 10.0g The frame allocator, made a batch - flat combining
+
+10.0f closes the *safety* question for the global allocators: every one of them is
+behind a lock. This closes the *scalability* one for the hottest of them. The two
+are different problems and the second only exists because the first was answered:
+`mm::frames` is correct on N cores and it is also the one structure every path
+touches, so it is where N cores queue.
+
+Four changes, in the order they matter. The first is worth far more than the
+others and would have been worth doing with no lock in sight.
+
+**1. The 4 KiB zeroing left the critical section.** Every `alloc` set a bitmap
+bit, three fields, and then zeroed 4096 bytes - *inside* the lock. That is a
+handful of instructions of bookkeeping against 4096 bytes of stores, so the
+critical section was ~99% `memset` and every core allocating waited on another
+core's `memset` rather than on anything shared. It is safe to move out for one
+reason: **the bitmap bit is what makes a frame unhandable.** Once it is set, no
+scan can return that frame, so the window between the claim and the zeroing is
+private to the claiming core by construction, not by timing. `alloc`, `alloc_on`
+and `alloc_contig` now claim under the lock and zero after it.
+
+**2. `alloc_on` takes one acquisition instead of three.** It read the node's
+frame range (acquire), searched inside it (acquire), and fell back to the whole
+pool (acquire). A range read that is not in the same critical section as the
+search it bounds is a range that can change under it, so this was a correctness
+tidy as much as a cost one.
+
+**3. A copy-on-write break takes two instead of three.** `cow_fault` asked
+`refs(pa)` (acquire), then `alloc()` (acquire), then `free(pa)` (acquire).
+"Is this shared" and "give me somewhere to copy it to" are **one** decision, and
+asking them separately means the first answer can be stale by the time the second
+is served - so they are now `frames::cow_resolve`, returning
+`Sole` / `Private(dst)` / `NoFrame`. The `Private` frame is deliberately **not**
+zeroed: the caller overwrites all 4096 bytes, so a `memset` first is 4 KiB of
+stores nothing reads, and the "never leak previous contents" rule is met by the
+copy. The old frame's release is **not** folded in, and that is a correctness
+requirement rather than laziness: dropping the reference before the copy would let
+a peer core faulting on the same page see a count of one, conclude it was the sole
+owner, and write through the very frame this copy is reading. Two acquisitions is
+the floor for this operation.
+
+**4. Flat combining** (Hendler, Incze, Shavit, Tzafrir, *Flat Combining and the
+Synchronization-Parallelism Tradeoff*, SPAA 2010). With the `memset` gone the lock
+is held for a few words, which is exactly the regime the technique is for: N cores
+each taking a short lock pay N cache-line handoffs of the lock word plus N handoffs
+of every line the section touches, and the work itself is trivial by comparison.
+So a core publishes its request to its **own** 64-byte-aligned slot, one core wins
+the *combiner* role, takes the lock once, executes the whole batch while the bitmap
+stays in its cache, and writes each result back; the others spin on a line nobody
+else writes.
+
+Two things about the shape here rather than in the paper:
+
+- **The uncontended path does not publish at all.** A core tries the election
+  *first*. Winning it - always, on a single-CPU boot or an idle machine - means
+  taking the lock and doing its own work directly, then draining a pending mask
+  that is normally zero. So the cost added to an uncontended allocation is two
+  atomics and one relaxed load, and there is no separate "SMP path" to diverge
+  from. The `FC_PENDING` bitmask exists for exactly this: a combiner with nothing
+  to do reads one word rather than scanning `MAX_CPUS` cache lines.
+- **The batch does not zero.** Each requesting core zeroes its own frame after its
+  request completes. A combiner zeroing on behalf of the batch would re-serialise
+  precisely what change 1 unserialised.
+
+Executed **exactly once** is the invariant, and it is enforced by a claim rather
+than argued: a publisher may withdraw its request only by moving its slot from its
+own opcode straight to idle, which fails once a combiner has moved it to *busy*.
+The withdrawal exists because a publication can land just after the combiner
+sampled the mask, which no protocol without a second handshake avoids; it is a
+liveness backstop, and it is counted so a machine that needs it says so.
+
+The boot-time and diagnostic paths (`init_numa`, `alloc_contig`, `stats`,
+`used_matches_bitmap`, `node_free`, `node_of`) deliberately stay on the plain
+lock: they allocate nothing or run once, so a batch would add machinery to a path
+with nothing to batch against.
+
+**The proof** is a new `smp` phase, mirroring the shared-heap phase because the
+failure mode is the same shape. Each core, in a loop: allocate a frame, stamp
+every byte with its own marker, read every byte back, free it - so a frame handed
+to both cores means one core's stamp lands in the other's frame between the write
+and the read, which is the corruption itself rather than a proxy for it. The two
+meet at a rendezvous first, and the counter is asserted to still match the bitmap
+and no frame to have leaked. Then the same two cores run a **churn** pass -
+allocate and free, touching nothing - because the verify pass spends far longer
+outside the allocator than inside it and so measures the correctness, not the
+combining. Across both passes **313-1228 requests were executed by the other
+core's combiner** on riscv64, 0 withdrawn.
+
+That number is **reported, never asserted**. Zero is a legal schedule (one core
+running its whole share before the other starts), and TCG interleaves coarsely, so
+an assertion on it could fail on a correct machine. It also stays modest *by
+design*, which is the point rather than a disappointment: after change 1 there is
+very little window left for a second core to arrive in. Shortening the window
+removed most of the contention; combining handles what is left.
+
+**Controls, both observed firing.** Deleting the zeroing makes the frame-zeroing
+check report `4096 nonzero byte(s)`; making the combiner execute each request
+twice trips `double free of <pa>` inside `release`.
+
+**And the first version of the zeroing oracle passed with the fix deleted** -
+recorded in docs/ENGINEERING.md 11, because the reason is not obvious and the
+same mistake is available to anyone testing an allocator. Changes 2 and 3 have
+**no control of their own** and that is stated rather than papered over: their
+observable behaviour is identical to what they replaced - only the number of
+acquisitions changed - so the existing `numa` (node placement and fallback
+counting, exactly) and `cowfork` (2406 pages shared, 0 copied) phases are their
+gate. There is no test that can distinguish one acquisition from three.
+
 ### 10.1 The measured motivation (not a wish)
 
 The cooperative single-CPU scheduler switches to another context **only when the

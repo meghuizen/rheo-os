@@ -3,8 +3,22 @@
 //! init() checks they clear the image). Frames are 4 KiB and are zeroed
 //! on allocation - page tables and user memory must never leak previous
 //! contents.
+//!
+//! # Two layers, and why
+//!
+//! The **bookkeeping** (bitmap, reference counts, used counter, search hint, NUMA
+//! ranges) is one data structure under one lock. The **zeroing** is not part of it:
+//! once a frame's bit is set no other core can be handed it, so the 4 KiB `memset`
+//! belongs outside the critical section. It used to be inside, where it dominated -
+//! a bitmap word test-and-set is a handful of instructions against 4096 bytes of
+//! stores - so every core allocating serialised on another core's `memset`.
+//!
+//! On top of that, the hot operations go through **flat combining**
+//! ([`fc_op`], Hendler/Incze/Shavit/Tzafrir, SPAA 2010) rather than each core
+//! taking the lock in turn.
 
 use crate::arch;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub const FRAME_SIZE: usize = 4096;
 
@@ -72,15 +86,20 @@ static FALLBACKS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUs
 /// A `SpinLock<()>` rather than wrapping the state, because the state is four
 /// separate `static mut`s reached through `addr_of_mut!` and moving them inside the
 /// lock would be a large mechanical change to a file the isolation proofs depend on.
-/// The guard is the discipline: **every** function that touches those four statics
-/// takes it, which is checkable by grep, and the guard's lifetime is the critical
-/// section.
+/// The guard is the discipline: every function that touches those statics either takes
+/// it or is one of the `unsafe` primitives below whose contract requires it to be
+/// held, which is checkable by reading this file.
 ///
 /// Unconditional, not `#[cfg(feature = "smp")]`. Locking is a property of the data
 /// structure, not of a build configuration (docs/SUBSTRATE.md pillar 3, the lesson
 /// that produced the `SYS_YIELD` FP defect: state whose safety depends on which
-/// features are enabled gets written twice and diverges). An uncontended acquire is
-/// one atomic exchange, which is not measurable next to zeroing a 4 KiB frame.
+/// features are enabled gets written twice and diverges).
+///
+/// It is taken **once per batch** rather than once per operation: the hot paths reach
+/// it through [`fc_op`]'s combiner, and the diagnostics and boot-time paths take it
+/// directly. What it no longer covers is the 4 KiB zeroing, which used to be the
+/// dominant part of every critical section here and is now done by each requesting
+/// core after its claim.
 static POOL_LOCK: crate::smp::SpinLock<()> =
     crate::smp::SpinLock::named((), crate::obs::lock::LockId::FramePool);
 
@@ -275,6 +294,441 @@ pub fn numa_fallbacks() -> usize {
 /// does not ask gets.
 pub const NODE_ANY: u8 = u8::MAX;
 
+// ------------------------------------------------------- bookkeeping primitives
+//
+// The lock-held halves of the public API. Each one does *only* the bitmap /
+// refcount / counter work: no zeroing, no copying, no lock of its own. They are the
+// unit a flat-combining batch executes, and they are private so that the "every
+// public function takes the pool lock exactly once" rule stays checkable by reading
+// the file rather than by reading call graphs.
+
+/// Zero `n` frames starting at `pa`, **outside** the pool lock.
+///
+/// Safe to do without the lock because the frames are already marked allocated: the
+/// bitmap bit is what makes a frame unhandable to anyone else, so nothing can observe
+/// the window between the claim and the zeroing.
+fn zero_frames(pa: usize, n: usize) {
+    // SAFETY: `pa` is a claimed pool frame run, reached through the kernel's linear
+    // map (identity on x86/riscv, the high map on aarch64 - never the raw PA).
+    unsafe { core::ptr::write_bytes(arch::phys_to_virt(pa) as *mut u8, 0, n * FRAME_SIZE) }
+}
+
+/// Claim one frame from anywhere in the pool, rotating [`NEXT_HINT`]. **Not zeroed.**
+///
+/// # Safety
+/// The pool lock must be held.
+unsafe fn claim_hinted() -> Option<usize> {
+    // SAFETY: the pool lock is held, so no other core is mid-update.
+    unsafe {
+        assert!(
+            *core::ptr::addr_of!(INITIALIZED),
+            "frame allocator used before init"
+        );
+        let bitmap = &mut *core::ptr::addr_of_mut!(BITMAP);
+        let hint = *core::ptr::addr_of!(NEXT_HINT);
+        for offset in 0..POOL_FRAMES {
+            let frame = (hint + offset) % POOL_FRAMES;
+            let (word, bit) = (frame / 64, frame % 64);
+            if bitmap[word] & (1 << bit) == 0 {
+                bitmap[word] |= 1 << bit;
+                (*core::ptr::addr_of_mut!(REFS))[frame] = 1;
+                *core::ptr::addr_of_mut!(USED) += 1;
+                *core::ptr::addr_of_mut!(NEXT_HINT) = frame + 1;
+                return Some(arch::FRAME_POOL_BASE + frame * FRAME_SIZE);
+            }
+        }
+        None
+    }
+}
+
+/// Claim one frame from pool frame indices `[lo, hi)`. **Not zeroed.**
+///
+/// Deliberately does **not** move [`NEXT_HINT`]: a bounded search must not steer the
+/// unrestricted one, or a single node-affine allocation would send every subsequent
+/// node-agnostic one hunting through that node's range first.
+///
+/// # Safety
+/// The pool lock must be held.
+unsafe fn claim_in(lo: usize, hi: usize) -> Option<usize> {
+    // SAFETY: the pool lock is held, so no other core is mid-update.
+    unsafe {
+        assert!(
+            *core::ptr::addr_of!(INITIALIZED),
+            "frame allocator used before init"
+        );
+        let bitmap = &mut *core::ptr::addr_of_mut!(BITMAP);
+        for frame in lo..hi.min(POOL_FRAMES) {
+            let (word, bit) = (frame / 64, frame % 64);
+            if bitmap[word] & (1 << bit) == 0 {
+                bitmap[word] |= 1 << bit;
+                (*core::ptr::addr_of_mut!(REFS))[frame] = 1;
+                *core::ptr::addr_of_mut!(USED) += 1;
+                return Some(arch::FRAME_POOL_BASE + frame * FRAME_SIZE);
+            }
+        }
+        None
+    }
+}
+
+/// Claim one frame preferring `node`, counting the fallback. **Not zeroed.**
+///
+/// The whole node decision (read the node's range, search it, fall back to the pool)
+/// under the **one** acquisition the caller already holds. It used to be three
+/// separate ones, and a range read that is not in the same critical section as the
+/// search it bounds is a range that can change under it.
+///
+/// # Safety
+/// The pool lock must be held.
+unsafe fn claim_on(node: u8) -> Option<usize> {
+    // SAFETY: the pool lock is held.
+    unsafe {
+        let (lo, hi) = (*core::ptr::addr_of!(NODE_RANGE))
+            .get(node as usize)
+            .copied()
+            .unwrap_or((0, 0));
+        if lo < hi {
+            if let Some(pa) = claim_in(lo, hi) {
+                return Some(pa);
+            }
+            // The node is known but full. Fall through to the whole pool and say so.
+            FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        }
+        claim_hinted()
+    }
+}
+
+/// Drop one reference to `pa`, releasing the frame at zero.
+///
+/// # Safety
+/// The pool lock must be held, and `pa` must satisfy [`in_pool`].
+unsafe fn release(pa: usize) {
+    let frame = (pa - arch::FRAME_POOL_BASE) / FRAME_SIZE;
+    // SAFETY: the pool lock is held.
+    unsafe {
+        let bitmap = &mut *core::ptr::addr_of_mut!(BITMAP);
+        assert!(
+            bitmap[frame / 64] & (1 << (frame % 64)) != 0,
+            "double free of {pa:#x}"
+        );
+        let refs = &mut *core::ptr::addr_of_mut!(REFS);
+        // A live frame always has at least one reference; a zero here would mean the
+        // bitmap and the counts disagreed, so treat it as the last reference rather
+        // than wrapping.
+        refs[frame] = refs[frame].saturating_sub(1);
+        if refs[frame] != 0 {
+            return; // still held by another mapping
+        }
+        bitmap[frame / 64] &= !(1 << (frame % 64));
+        *core::ptr::addr_of_mut!(USED) -= 1;
+    }
+}
+
+/// Take an extra reference to `pa`, or report that it cannot be shared.
+///
+/// # Safety
+/// The pool lock must be held, and `pa` must satisfy [`in_pool`].
+unsafe fn add_ref(pa: usize) -> bool {
+    let frame = (pa - arch::FRAME_POOL_BASE) / FRAME_SIZE;
+    // SAFETY: the pool lock is held.
+    unsafe {
+        let refs = &mut *core::ptr::addr_of_mut!(REFS);
+        if refs[frame] == 0 || refs[frame] == SHARE_MAX {
+            return false;
+        }
+        refs[frame] += 1;
+    }
+    true
+}
+
+/// How many mappings hold `pa`.
+///
+/// # Safety
+/// The pool lock must be held, and `pa` must satisfy [`in_pool`].
+unsafe fn ref_count(pa: usize) -> u8 {
+    let frame = (pa - arch::FRAME_POOL_BASE) / FRAME_SIZE;
+    // SAFETY: the pool lock is held.
+    unsafe { (*core::ptr::addr_of!(REFS))[frame] }
+}
+
+/// The refcount test and the replacement claim as **one** decision - see
+/// [`cow_resolve`].
+///
+/// # Safety
+/// The pool lock must be held, and `pa` must satisfy [`in_pool`].
+unsafe fn cow_claim(pa: usize) -> u64 {
+    // SAFETY: the pool lock is held.
+    unsafe {
+        if ref_count(pa) <= 1 {
+            return COW_SOLE;
+        }
+        match claim_hinted() {
+            // The old frame keeps its reference: nothing has changed, so the caller
+            // can refuse the fault and the mapping stays exactly as it was.
+            None => COW_NO_FRAME,
+            Some(dst) => dst as u64,
+        }
+    }
+}
+
+// ---------------------------------------------------------------- flat combining
+//
+// Flat combining (Hendler, Incze, Shavit, Tzafrir - "Flat Combining and the
+// Synchronization-Parallelism Tradeoff", SPAA 2010).
+//
+// The lock above is correct and short, and that is exactly the case flat combining
+// improves: N cores each taking a short lock pay N cache-line handoffs of the lock
+// word plus N handoffs of every line the critical section touches. Instead, a core
+// publishes its request to its **own** cache line, one core wins the *combiner* role,
+// takes the lock once, executes the whole batch while the bitmap stays in its cache,
+// and writes each result back. The others spin on a line nobody else writes.
+//
+// Two properties make it fit here rather than being a general-purpose wrapper:
+//
+// 1. **Every hot operation is a few words of work on one shared structure.** Alloc is
+//    a bitmap scan plus three field updates; free is the inverse. Batching them costs
+//    the combiner almost nothing per extra request, which is the regime the paper's
+//    win comes from. The 4 KiB zeroing is *not* in the batch - it is done by each
+//    requesting core, after its request completes, outside the lock. A combiner that
+//    zeroed on behalf of the batch would re-serialise precisely what moving the
+//    `memset` out of the lock unserialised.
+//
+// 2. **The uncontended path does not publish at all.** A core tries the combiner
+//    election *first*; winning it (always, on a single-CPU boot or an idle machine)
+//    means taking the lock and doing its own work directly, then draining a pending
+//    mask that is normally zero. So the cost added to an uncontended allocation is two
+//    atomics and one relaxed load - there is no separate "SMP path" to diverge from,
+//    which is the mistake docs/SUBSTRATE.md pillar 3 records as the cause of the
+//    `SYS_YIELD` FP defect.
+//
+// # Preconditions
+//
+// A frame operation must not be reached from a context that already holds the pool
+// lock, and must not be reached from an interrupt that could land on a core inside a
+// batch. Both already held before this existed (the lock is not recursive, so the
+// first would self-deadlock), and every allocation path in the tree is synchronous
+// kernel context - a syscall or a page fault. The lock-held diagnostics
+// ([`stats`], [`used_matches_bitmap`], [`node_free`]) and the boot-time paths
+// ([`init_numa`], [`alloc_contig`]) deliberately stay on the plain lock: they either
+// allocate nothing or run once, so a batch would only add machinery.
+
+/// Slot state: nothing published.
+const FC_IDLE: u64 = 0;
+/// Slot state: the combiner has executed this request; the result is readable.
+const FC_DONE: u64 = 1;
+/// Slot state: the combiner has claimed this request and is executing it. The
+/// publisher must **not** withdraw - that is what stops one request running twice.
+const FC_BUSY: u64 = 2;
+
+/// The lowest opcode. Anything below is a state, not a request.
+const FC_OP_MIN: u64 = 3;
+const OP_ALLOC: u64 = 3;
+/// `arg` = NUMA node id.
+const OP_ALLOC_ON: u64 = 4;
+/// `arg` = physical address.
+const OP_FREE: u64 = 5;
+/// `arg` = physical address.
+const OP_SHARE: u64 = 6;
+/// `arg` = physical address.
+const OP_REFS: u64 = 7;
+/// `arg` = physical address.
+const OP_COW: u64 = 8;
+
+/// [`OP_COW`] result: one holder, so there is nothing to copy.
+const COW_SOLE: u64 = 0;
+/// [`OP_COW`] result: shared, but the pool is exhausted.
+const COW_NO_FRAME: u64 = 1;
+
+/// One publication slot per CPU.
+///
+/// `align(64)` so two cores never share a line: the whole point is that a waiter
+/// spins on a line nobody else writes, and two slots in one line would put the
+/// handoff back.
+#[repr(align(64))]
+struct FcSlot {
+    /// The state machine above, or an opcode while a request is outstanding.
+    req: AtomicU64,
+    arg: AtomicU64,
+    res: AtomicU64,
+}
+
+impl FcSlot {
+    const fn new() -> FcSlot {
+        FcSlot {
+            req: AtomicU64::new(FC_IDLE),
+            arg: AtomicU64::new(0),
+            res: AtomicU64::new(0),
+        }
+    }
+}
+
+static FC_SLOTS: [FcSlot; crate::smp::MAX_CPUS] = [const { FcSlot::new() }; crate::smp::MAX_CPUS];
+
+/// Which CPUs have a request outstanding, one bit each - so a combiner with nothing
+/// to do reads **one** word instead of scanning every slot's cache line. `MAX_CPUS`
+/// is 64, asserted below, which is what makes a `u64` the whole registry.
+static FC_PENDING: AtomicU64 = AtomicU64::new(0);
+
+const _: () = assert!(
+    crate::smp::MAX_CPUS <= 64,
+    "FC_PENDING is a u64 bitmask over CPU indices"
+);
+
+/// Whether some core currently holds the combiner role.
+static FC_COMBINER: AtomicBool = AtomicBool::new(false);
+
+/// Requests a combiner executed **on behalf of another core** - the combining itself.
+///
+/// The witness, because a batch of size one is indistinguishable from the plain lock:
+/// without this, "flat combining landed" would be a claim about the source rather than
+/// about the machine (docs/ENGINEERING.md 1). It costs the uncontended path **nothing**
+/// - it is bumped inside [`fc_drain`]'s loop body, which does not execute when the
+/// pending mask is empty, and that is the whole of the single-core case.
+static FC_COMBINED: AtomicU64 = AtomicU64::new(0);
+/// Requests taken back after the spin bound because no combiner picked them up. Also
+/// contended-path only.
+static FC_WITHDRAWN: AtomicU64 = AtomicU64::new(0);
+
+/// (requests served for another core, requests withdrawn) - see [`FC_COMBINED`].
+pub fn fc_stats() -> (u64, u64) {
+    (
+        FC_COMBINED.load(Ordering::Relaxed),
+        FC_WITHDRAWN.load(Ordering::Relaxed),
+    )
+}
+
+/// Spin iterations a publisher waits for the combiner before taking its request back
+/// and trying to combine itself.
+///
+/// A liveness backstop, not a tuning knob: the window it covers is a publication that
+/// lands just after the combiner sampled the pending mask, which no protocol without
+/// a second handshake can avoid. Large enough that a normal batch completes well
+/// inside it, so the retry is rare rather than a second phase of the common path.
+const FC_SPINS: u32 = 1024;
+
+/// Submit one bookkeeping operation and return its result.
+///
+/// The single entry point for every operation the hot paths use. See the module note
+/// above for the protocol; the invariant that matters for correctness is that a
+/// request is executed **exactly once**, enforced by the [`FC_BUSY`] claim: a
+/// publisher may only withdraw by moving its slot from its own opcode straight to
+/// [`FC_IDLE`], which fails once a combiner has claimed it.
+fn fc_op(op: u64, arg: u64) -> u64 {
+    loop {
+        // The election is also the fast path: whoever takes the role serves itself
+        // with no publication and no spin.
+        if !FC_COMBINER.swap(true, Ordering::Acquire) {
+            let res = {
+                let _g = POOL_LOCK.lock();
+                // SAFETY: the pool lock is held for the whole batch, and this core is
+                // the only combiner.
+                unsafe {
+                    let mine = fc_execute(op, arg);
+                    fc_drain();
+                    mine
+                }
+            };
+            FC_COMBINER.store(false, Ordering::Release);
+            return res;
+        }
+
+        // Someone else is combining. Publish and let them do the work; `arg` before
+        // `req` so the release store on `req` publishes both.
+        let cpu = crate::smp::cpu_index();
+        let slot = &FC_SLOTS[cpu];
+        slot.arg.store(arg, Ordering::Relaxed);
+        slot.req.store(op, Ordering::Release);
+        FC_PENDING.fetch_or(1u64 << cpu, Ordering::Release);
+
+        let mut spins = 0u32;
+        loop {
+            match slot.req.load(Ordering::Acquire) {
+                FC_DONE => {
+                    let res = slot.res.load(Ordering::Relaxed);
+                    slot.req.store(FC_IDLE, Ordering::Relaxed);
+                    return res;
+                }
+                // Claimed: withdrawing now would run the request twice.
+                FC_BUSY => core::hint::spin_loop(),
+                // Still ours.
+                _ => {
+                    spins += 1;
+                    if spins > FC_SPINS
+                        && slot
+                            .req
+                            .compare_exchange(op, FC_IDLE, Ordering::Acquire, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        // Took it back - go and combine ourselves.
+                        FC_PENDING.fetch_and(!(1u64 << cpu), Ordering::Relaxed);
+                        FC_WITHDRAWN.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                    if spins > FC_SPINS {
+                        // The CAS lost: a combiner claimed it between the load above
+                        // and here, so wait for it after all.
+                        spins = 0;
+                    }
+                    core::hint::spin_loop();
+                }
+            }
+        }
+    }
+}
+
+/// Execute one request. The whole of what a batch does per slot.
+///
+/// # Safety
+/// The pool lock must be held. Every `arg` carrying an address reaches here only from
+/// a public wrapper that has already checked [`in_pool`].
+unsafe fn fc_execute(op: u64, arg: u64) -> u64 {
+    // SAFETY: the pool lock is held; delegated to each primitive's contract.
+    unsafe {
+        match op {
+            OP_ALLOC => claim_hinted().unwrap_or(0) as u64,
+            OP_ALLOC_ON => claim_on(arg as u8).unwrap_or(0) as u64,
+            OP_FREE => {
+                release(arg as usize);
+                0
+            }
+            OP_SHARE => u64::from(add_ref(arg as usize)),
+            OP_REFS => u64::from(ref_count(arg as usize)),
+            // The opcodes are private constants and `fc_op` is the only producer, so
+            // there is no other value to reach here.
+            _ => cow_claim(arg as usize),
+        }
+    }
+}
+
+/// Serve every published request. Called by the combiner with the lock held.
+///
+/// # Safety
+/// The pool lock must be held, and the caller must hold the combiner role.
+unsafe fn fc_drain() {
+    let mut mask = FC_PENDING.swap(0, Ordering::Acquire);
+    while mask != 0 {
+        let cpu = mask.trailing_zeros() as usize;
+        mask &= mask - 1;
+        let slot = &FC_SLOTS[cpu];
+        let op = slot.req.load(Ordering::Acquire);
+        if op < FC_OP_MIN {
+            continue; // withdrawn before we got here
+        }
+        if slot
+            .req
+            .compare_exchange(op, FC_BUSY, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            continue; // withdrawn between the load and the claim
+        }
+        let arg = slot.arg.load(Ordering::Relaxed);
+        // SAFETY: the pool lock is held for the whole batch.
+        let res = unsafe { fc_execute(op, arg) };
+        slot.res.store(res, Ordering::Relaxed);
+        slot.req.store(FC_DONE, Ordering::Release);
+        FC_COMBINED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Allocate one zeroed frame **on `node`** if that node has a free one, else anywhere.
 ///
 /// A preference, not a guarantee, and the difference is counted
@@ -289,46 +743,12 @@ pub fn alloc_on(node: u8) -> Option<usize> {
     if node == NODE_ANY {
         return alloc();
     }
-    let (lo, hi) = node_range(node);
-    if lo < hi {
-        if let Some(pa) = alloc_in(lo, hi) {
-            return Some(pa);
-        }
-        // The node is known but full. Fall through to the whole pool and say so.
-        FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let pa = fc_op(OP_ALLOC_ON, u64::from(node)) as usize;
+    if pa == 0 {
+        return None;
     }
-    alloc()
-}
-
-/// Allocate one zeroed frame from pool frame indices `[lo, hi)`, or `None`.
-///
-/// The body of [`alloc`] with the search bounded. Kept separate from `alloc` (rather
-/// than `alloc` calling it with the full range) so the unrestricted path keeps its
-/// rotating [`NEXT_HINT`]: a bounded search must not move the global hint, or one
-/// node-affine allocation would send every subsequent node-agnostic one hunting
-/// through that node's range first.
-fn alloc_in(lo: usize, hi: usize) -> Option<usize> {
-    let _g = POOL_LOCK.lock();
-    // SAFETY: the pool lock is held, so no other core is mid-update.
-    unsafe {
-        assert!(
-            *core::ptr::addr_of!(INITIALIZED),
-            "frame allocator used before init"
-        );
-        let bitmap = &mut *core::ptr::addr_of_mut!(BITMAP);
-        for frame in lo..hi.min(POOL_FRAMES) {
-            let (word, bit) = (frame / 64, frame % 64);
-            if bitmap[word] & (1 << bit) == 0 {
-                bitmap[word] |= 1 << bit;
-                (*core::ptr::addr_of_mut!(REFS))[frame] = 1;
-                *core::ptr::addr_of_mut!(USED) += 1;
-                let pa = arch::FRAME_POOL_BASE + frame * FRAME_SIZE;
-                core::ptr::write_bytes(arch::phys_to_virt(pa) as *mut u8, 0, FRAME_SIZE);
-                return Some(pa);
-            }
-        }
-        None
-    }
+    zero_frames(pa, 1);
+    Some(pa)
 }
 
 /// Frames held back from **cell-driven** allocation (docs/ENGINEERING.md 12):
@@ -360,32 +780,16 @@ pub fn user_available() -> usize {
 /// strictly worse). Kernel-internal callers that allocate a bounded, known
 /// amount while the user reserve above is held may `expect` it, and each says
 /// why at its call site.
+///
+/// The bookkeeping goes through the flat-combining batch; the 4 KiB zeroing is done
+/// here, by the requesting core, **after** the claim and outside the lock.
 pub fn alloc() -> Option<usize> {
-    let _g = POOL_LOCK.lock();
-    unsafe {
-        assert!(
-            *core::ptr::addr_of!(INITIALIZED),
-            "frame allocator used before init"
-        );
-        let bitmap = &mut *core::ptr::addr_of_mut!(BITMAP);
-        let hint = *core::ptr::addr_of!(NEXT_HINT);
-        for offset in 0..POOL_FRAMES {
-            let frame = (hint + offset) % POOL_FRAMES;
-            let (word, bit) = (frame / 64, frame % 64);
-            if bitmap[word] & (1 << bit) == 0 {
-                bitmap[word] |= 1 << bit;
-                (*core::ptr::addr_of_mut!(REFS))[frame] = 1;
-                *core::ptr::addr_of_mut!(USED) += 1;
-                *core::ptr::addr_of_mut!(NEXT_HINT) = frame + 1;
-                let pa = arch::FRAME_POOL_BASE + frame * FRAME_SIZE;
-                // Zero through the kernel's linear map (identity on x86/riscv;
-                // the high map on aarch64), never the raw physical address.
-                core::ptr::write_bytes(arch::phys_to_virt(pa) as *mut u8, 0, FRAME_SIZE);
-                return Some(pa);
-            }
-        }
-        None
+    let pa = fc_op(OP_ALLOC, 0) as usize;
+    if pa == 0 {
+        return None;
     }
+    zero_frames(pa, 1);
+    Some(pa)
 }
 
 /// Allocate `n` **physically contiguous** zeroed frames, returning the first frame's
@@ -411,44 +815,51 @@ pub fn alloc() -> Option<usize> {
 /// Freeing is per frame through the ordinary [`free`], `n` times - the run is not an
 /// object, just frames that happen to be adjacent, so no bookkeeping beyond each
 /// frame's own exists to get out of step.
+/// Stays on the plain lock rather than the flat-combining batch: it runs at bring-up,
+/// so batching would add machinery to a path with nothing to batch against.
 pub fn alloc_contig(n: usize) -> Option<usize> {
     if n == 0 || n > POOL_FRAMES {
         return None;
     }
-    let _g = POOL_LOCK.lock();
-    // SAFETY: the pool lock is held, so no other core is mid-update.
-    unsafe {
-        assert!(
-            *core::ptr::addr_of!(INITIALIZED),
-            "frame allocator used before init"
-        );
-        let bitmap = &mut *core::ptr::addr_of_mut!(BITMAP);
-        let mut run = 0usize;
-        for frame in 0..POOL_FRAMES {
-            let (word, bit) = (frame / 64, frame % 64);
-            if bitmap[word] & (1 << bit) != 0 {
-                run = 0;
-                continue;
+    let claimed = {
+        let _g = POOL_LOCK.lock();
+        // SAFETY: the pool lock is held, so no other core is mid-update.
+        unsafe {
+            assert!(
+                *core::ptr::addr_of!(INITIALIZED),
+                "frame allocator used before init"
+            );
+            let bitmap = &mut *core::ptr::addr_of_mut!(BITMAP);
+            let mut run = 0usize;
+            let mut found = None;
+            for frame in 0..POOL_FRAMES {
+                let (word, bit) = (frame / 64, frame % 64);
+                if bitmap[word] & (1 << bit) != 0 {
+                    run = 0;
+                    continue;
+                }
+                run += 1;
+                if run < n {
+                    continue;
+                }
+                let first = frame + 1 - n;
+                for f in first..=frame {
+                    let (w, b) = (f / 64, f % 64);
+                    bitmap[w] |= 1 << b;
+                    (*core::ptr::addr_of_mut!(REFS))[f] = 1;
+                }
+                *core::ptr::addr_of_mut!(USED) += n;
+                found = Some(arch::FRAME_POOL_BASE + first * FRAME_SIZE);
+                break;
             }
-            run += 1;
-            if run < n {
-                continue;
-            }
-            let first = frame + 1 - n;
-            for f in first..=frame {
-                let (w, b) = (f / 64, f % 64);
-                bitmap[w] |= 1 << b;
-                (*core::ptr::addr_of_mut!(REFS))[f] = 1;
-            }
-            *core::ptr::addr_of_mut!(USED) += n;
-            let pa = arch::FRAME_POOL_BASE + first * FRAME_SIZE;
-            // Zeroed exactly as `alloc` zeroes: callers' "a fresh frame is zero"
-            // contract must not depend on which allocation path produced it.
-            core::ptr::write_bytes(arch::phys_to_virt(pa) as *mut u8, 0, n * FRAME_SIZE);
-            return Some(pa);
+            found
         }
-        None
-    }
+    };
+    let pa = claimed?;
+    // Zeroed exactly as `alloc` zeroes: callers' "a fresh frame is zero" contract must
+    // not depend on which allocation path produced it.
+    zero_frames(pa, n);
+    Some(pa)
 }
 
 /// (free frames, total frames) - the shell's `meminfo` builtin, the reservation
@@ -511,17 +922,47 @@ pub fn share(pa: usize) -> bool {
     if !in_pool(pa) {
         return false;
     }
-    let frame = (pa - arch::FRAME_POOL_BASE) / FRAME_SIZE;
-    let _g = POOL_LOCK.lock();
-    // SAFETY: the pool lock is held.
-    unsafe {
-        let refs = &mut *core::ptr::addr_of_mut!(REFS);
-        if refs[frame] == 0 || refs[frame] == SHARE_MAX {
-            return false;
-        }
-        refs[frame] += 1;
+    fc_op(OP_SHARE, pa as u64) != 0
+}
+
+/// What a **copy-on-write** write fault should do about the frame at `pa`.
+pub enum Cow {
+    /// One holder: nothing to copy, just make the existing frame writable. Also the
+    /// answer for an address this allocator does not own.
+    Sole,
+    /// Shared. `.0` is a fresh frame for this mapping's private copy.
+    ///
+    /// **It is not zeroed.** The caller must overwrite all [`FRAME_SIZE`] bytes,
+    /// which is what a COW break does by definition - zeroing a page that is about
+    /// to be fully copied over is 4 KiB of stores nothing reads. The
+    /// "never leak previous contents" rule is met by the copy, not by a `memset`.
+    ///
+    /// The old frame's reference is **not** dropped: the caller frees it after the
+    /// copy. Folding the free in here would make it three lock acquisitions into one
+    /// instead of two, and it would be wrong - a peer core faulting on the same page
+    /// would then see a refcount of one, decide it was the sole owner, and start
+    /// writing through the very frame this copy is reading.
+    Private(usize),
+    /// Shared, and the pool is exhausted. Nothing has changed, so the caller can
+    /// refuse the fault and leave the mapping as it was.
+    NoFrame,
+}
+
+/// Decide a copy-on-write break for the frame at `pa` in **one** acquisition.
+///
+/// "Is this frame shared" and "give me a frame to copy it into" are one decision, and
+/// asking them separately means the answer to the first can be stale by the time the
+/// second is served. The 4 KiB copy - and the release of the old reference after it -
+/// happen at the caller, outside the lock.
+pub fn cow_resolve(pa: usize) -> Cow {
+    if !in_pool(pa) {
+        return Cow::Sole;
     }
-    true
+    match fc_op(OP_COW, pa as u64) {
+        COW_SOLE => Cow::Sole,
+        COW_NO_FRAME => Cow::NoFrame,
+        dst => Cow::Private(dst as usize),
+    }
 }
 
 /// How many mappings hold `pa`, or 0 if it is free or not ours. The witness a test
@@ -531,10 +972,7 @@ pub fn refs(pa: usize) -> u8 {
     if !in_pool(pa) {
         return 0;
     }
-    let frame = (pa - arch::FRAME_POOL_BASE) / FRAME_SIZE;
-    let _g = POOL_LOCK.lock();
-    // SAFETY: the pool lock is held.
-    unsafe { (*core::ptr::addr_of!(REFS))[frame] }
+    fc_op(OP_REFS, pa as u64) as u8
 }
 
 /// Drop one reference to a frame, releasing it to the pool at zero. `pa` must be a
@@ -545,22 +983,5 @@ pub fn refs(pa: usize) -> u8 {
 /// releases, exactly as before.
 pub fn free(pa: usize) {
     assert!(in_pool(pa), "frames::free of a non-pool address {pa:#x}");
-    let offset = pa - arch::FRAME_POOL_BASE;
-    let frame = offset / FRAME_SIZE;
-    let _g = POOL_LOCK.lock();
-    // SAFETY: the pool lock is held.
-    unsafe {
-        let bitmap = &mut *core::ptr::addr_of_mut!(BITMAP);
-        assert!(bitmap[frame / 64] & (1 << (frame % 64)) != 0, "double free");
-        let refs = &mut *core::ptr::addr_of_mut!(REFS);
-        // A live frame always has at least one reference; a zero here would mean the
-        // bitmap and the counts disagreed, so treat it as the last reference rather
-        // than wrapping.
-        refs[frame] = refs[frame].saturating_sub(1);
-        if refs[frame] != 0 {
-            return; // still held by another mapping
-        }
-        bitmap[frame / 64] &= !(1 << (frame % 64));
-        *core::ptr::addr_of_mut!(USED) -= 1;
-    }
+    fc_op(OP_FREE, pa as u64);
 }

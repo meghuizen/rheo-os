@@ -303,6 +303,7 @@ fn test_secondary_bringup() {
             println!("smp: real second core on {} confirmed", arch::NAME);
             test_parallel_gemm(idx);
             test_shared_heap();
+            test_shared_frames();
             test_shared_ledger();
             test_lock_contention();
             test_vcore_identity();
@@ -2527,6 +2528,315 @@ fn test_shared_heap() {
          core's block ever holding the other's marker (so no block was handed to both), \
          0 pointers outside the region, and the free list still serving afterwards OK",
         HEAP_ROUNDS
+    );
+}
+
+// ------------------------------ TWO CORES ALLOCATING FRAMES AT THE SAME TIME
+//
+// `mm::frames` is the hottest shared structure in the tree, and this session changed two
+// things about it that the pre-existing suite exercises constantly but cannot *attribute*:
+// the 4 KiB zeroing moved **out** of the pool lock, and the bookkeeping moved behind flat
+// combining, where one core executes another core's request. Both are claims about what
+// happens when two cores are inside the allocator together, so both need a phase where
+// they are (docs/ENGINEERING.md 1).
+//
+// Each core, in a loop: allocate a frame, check every byte of it is zero, stamp every byte
+// with its own marker, read every byte back, free it. Three oracles, each aimed at one
+// thing:
+//
+//  * **Marker on read-back.** A frame handed to both cores means one core's stamp lands in
+//    the other's frame between the write and the read - the corruption itself, not a proxy
+//    for it. This is what a flat-combining request executed twice would produce.
+//  * **The counter still matches the bitmap**, which a lost `USED` update breaks.
+//  * **Zero on arrival**, though see below - in the concurrent pass this is a cheap extra
+//    rather than the proof, and the proof is [`assert_fresh_frame_is_zero`].
+//
+// The two cores meet at a rendezvous first, so the overlap is real, and
+// `frames::fc_stats()` reports how many requests were genuinely served by the *other*
+// core - a batch of one everywhere would mean this phase measured nothing about combining.
+
+/// The zeroing is still inside the claim window - the direct check that moving the 4 KiB
+/// `memset` out of the pool lock did not open a hole.
+///
+/// **Deliberately single-core and deliberately not part of the concurrent pass**, because
+/// the obvious version of this check cannot fail. The first draft asserted "every freshly
+/// allocated frame is zero" inside the two-core loop, reasoning that a frame stamped and
+/// freed by one core would come back to the other still dirty - and it **passed with the
+/// zeroing deleted**. `alloc` rotates `NEXT_HINT`, so a freed frame is not handed out
+/// again until the cursor has walked all 131,072 frames: nothing in a 2,000-round pass is
+/// ever recycled, and the oracle only ever saw memory that was already zero.
+///
+/// So the frame is dirtied *before* it is allocated instead. `alloc` leaves the hint one
+/// past what it returned, which makes the **next** frame it will hand out predictable; a
+/// free frame belongs to nobody, so a test may write to it through the linear map. The
+/// prediction is then asserted rather than assumed, and a miss (the next frame was not
+/// free, so the scan went elsewhere) skips with a reason rather than claiming anything.
+fn assert_fresh_frame_is_zero() {
+    use kernel::mm::frames;
+    let Some(a) = frames::alloc() else {
+        println!("smp: SKIP the frame-zeroing check - the pool had nothing to give");
+        return;
+    };
+    // `a`'s frame is taken and the hint sits one past it, so this is what the next
+    // allocation returns provided that frame is free.
+    let predicted = a + frames::FRAME_SIZE;
+    if !frames::in_pool(predicted) {
+        frames::free(a);
+        println!("smp: SKIP the frame-zeroing check - no frame follows {a:#x} in the pool");
+        return;
+    }
+    // SAFETY: `predicted` is a pool frame that is currently free, so no cell and no
+    // kernel structure holds it; reached through the kernel's linear map.
+    let dirty = unsafe {
+        core::slice::from_raw_parts_mut(
+            arch::phys_to_virt(predicted) as *mut u8,
+            frames::FRAME_SIZE,
+        )
+    };
+    dirty.fill(0xEE);
+
+    let Some(b) = frames::alloc() else {
+        frames::free(a);
+        println!("smp: SKIP the frame-zeroing check - the pool had nothing to give");
+        return;
+    };
+    if b != predicted {
+        frames::free(b);
+        frames::free(a);
+        println!(
+            "smp: SKIP the frame-zeroing check - the allocator returned {b:#x}, not the \
+             predicted {predicted:#x}, so the frame that was dirtied is not the one handed \
+             out and nothing is claimed"
+        );
+        return;
+    }
+    // SAFETY: `b` is this core's frame now.
+    let page = unsafe {
+        core::slice::from_raw_parts(arch::phys_to_virt(b) as *const u8, frames::FRAME_SIZE)
+    };
+    let nonzero = page.iter().filter(|&&x| x != 0).count();
+    assert_eq!(
+        nonzero, 0,
+        "a freshly allocated frame held {nonzero} nonzero byte(s) of what was in that \
+         physical memory before it was claimed - the zeroing no longer covers the window \
+         between the claim and the hand-over"
+    );
+    frames::free(b);
+    frames::free(a);
+    println!(
+        "smp: a frame dirtied while free came back ZEROED from alloc - the 4 KiB memset \
+         still covers the claim window it moved out of the pool lock OK"
+    );
+}
+
+/// Rounds per core. Each round touches the frame four times (zero-check, stamp,
+/// read-back, and the allocator's own zeroing), so this is ~2 MiB of byte traffic per
+/// core - enough rounds to be inside the allocator together many times over, few enough
+/// to stay well inside the boot budget under TCG.
+const FRM_ROUNDS: usize = 128;
+
+/// Rounds of the **churn** pass: alloc then free, touching nothing.
+///
+/// The correctness oracles above need to read and write every byte of the frame, which
+/// means the round spends far longer outside the allocator than inside it - so it is a
+/// poor measurement of the *combining*, which only happens when two cores want the
+/// structure at the same instant. This pass strips the round down to the bookkeeping so
+/// the two cores are contending rather than mostly doing byte traffic.
+const FRM_CHURN: usize = 1024;
+
+/// Bytes of a **freshly allocated** frame that were not zero.
+///
+/// A cheap extra, not the zeroing proof - see [`assert_fresh_frame_is_zero`] for why a
+/// concurrent loop cannot make this fire. It stays because it is one pass over a page the
+/// round already touches, and it would catch a zeroing that raced rather than one that was
+/// simply absent.
+static FRM_DIRTY: AtomicUsize = AtomicUsize::new(0);
+/// Bytes that failed to read back as the marker this core wrote - one frame, two owners.
+static FRM_MISMATCH: AtomicUsize = AtomicUsize::new(0);
+/// Allocations that failed, or came back outside the pool.
+static FRM_BAD: AtomicUsize = AtomicUsize::new(0);
+/// Rounds completed, per core.
+static FRM_ROUNDS_DONE: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+/// Churn-pass rounds completed, per core.
+static FRM_CHURN_DONE: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+
+/// One core's share: `FRM_ROUNDS` alloc / zero-check / stamp / verify / free cycles.
+fn frames_hammer(marker: u8, slot: usize) {
+    for _ in 0..FRM_ROUNDS {
+        let Some(pa) = kernel::mm::frames::alloc() else {
+            FRM_BAD.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        if !kernel::mm::frames::in_pool(pa) {
+            FRM_BAD.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        // SAFETY: `pa` is a frame this core has just been given, so no one else holds
+        // it; reached through the kernel's linear map, never the raw physical address.
+        let page = unsafe {
+            core::slice::from_raw_parts_mut(
+                arch::phys_to_virt(pa) as *mut u8,
+                kernel::mm::frames::FRAME_SIZE,
+            )
+        };
+        let dirty = page.iter().filter(|&&b| b != 0).count();
+        if dirty != 0 {
+            FRM_DIRTY.fetch_add(dirty, Ordering::Relaxed);
+        }
+        page.fill(marker);
+        let bad = page.iter().filter(|&&b| b != marker).count();
+        if bad != 0 {
+            FRM_MISMATCH.fetch_add(bad, Ordering::Relaxed);
+        }
+        kernel::mm::frames::free(pa);
+        FRM_ROUNDS_DONE[slot].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn frames_hammer_primary() {
+    frames_hammer(0xA5, 0);
+}
+
+fn frames_hammer_secondary() {
+    frames_hammer(0x5A, 1);
+}
+
+/// One core's share of the churn pass. No page is touched, so almost all of the round is
+/// the operation being batched.
+fn frames_churn(slot: usize) {
+    for _ in 0..FRM_CHURN {
+        match kernel::mm::frames::alloc() {
+            Some(pa) => {
+                kernel::mm::frames::free(pa);
+                FRM_CHURN_DONE[slot].fetch_add(1, Ordering::Relaxed);
+            }
+            None => {
+                FRM_BAD.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+fn frames_churn_primary() {
+    frames_churn(0);
+}
+
+fn frames_churn_secondary() {
+    frames_churn(1);
+}
+
+fn test_shared_frames() {
+    assert_fresh_frame_is_zero();
+    FRM_DIRTY.store(0, Ordering::Release);
+    FRM_MISMATCH.store(0, Ordering::Release);
+    FRM_BAD.store(0, Ordering::Release);
+    for c in FRM_ROUNDS_DONE.iter() {
+        c.store(0, Ordering::Release);
+    }
+    let (free_before, _) = kernel::mm::frames::stats();
+    let (combined_before, _) = kernel::mm::frames::fc_stats();
+
+    let (met, finished) =
+        smp::run_fn_with_secondary(frames_hammer_secondary, frames_hammer_primary);
+    if !finished {
+        println!(
+            "smp: SKIP the shared-frames phase - the secondary did not finish inside the \
+             bound, so nothing about two cores in one frame allocator is claimed"
+        );
+        return;
+    }
+    assert!(
+        met && !smp::rendezvous_timed_out(),
+        "the two cores never met, so they did not allocate at the same time"
+    );
+
+    let (p, s) = (
+        FRM_ROUNDS_DONE[0].load(Ordering::Acquire),
+        FRM_ROUNDS_DONE[1].load(Ordering::Acquire),
+    );
+    assert_eq!(p, FRM_ROUNDS, "the primary lost rounds");
+    assert_eq!(s, FRM_ROUNDS, "the secondary lost rounds");
+    assert_eq!(
+        FRM_BAD.load(Ordering::Acquire),
+        0,
+        "the allocator refused a frame, or handed one out from outside the pool"
+    );
+    assert_eq!(
+        FRM_DIRTY.load(Ordering::Acquire),
+        0,
+        "a freshly allocated frame held nonzero bytes while two cores were allocating"
+    );
+    // The headline: no byte of either core's frame ever held the other's marker.
+    assert_eq!(
+        FRM_MISMATCH.load(Ordering::Acquire),
+        0,
+        "bytes of one core's frame held the other core's marker - the allocator gave both \
+         cores the same frame"
+    );
+    assert!(
+        kernel::mm::frames::used_matches_bitmap(),
+        "the used counter and the bitmap disagree after two cores allocated at once"
+    );
+    let (free_after, _) = kernel::mm::frames::stats();
+    assert_eq!(
+        free_after, free_before,
+        "the phase leaked frames: {free_before} free before, {free_after} after"
+    );
+
+    println!(
+        "smp: TWO CORES ALLOCATED FRAMES at the same time - {} rounds each of \
+         alloc/zero-check/stamp/verify/free, 0 bytes of either core's frame ever holding \
+         the other's marker (so no frame was served twice), the used counter still \
+         matching the bitmap, and every frame returned OK",
+        FRM_ROUNDS
+    );
+
+    // ---- and now the same two cores, contending on the bookkeeping alone ----
+    for c in FRM_CHURN_DONE.iter() {
+        c.store(0, Ordering::Release);
+    }
+    let (met, finished) = smp::run_fn_with_secondary(frames_churn_secondary, frames_churn_primary);
+    if !finished {
+        println!("smp: SKIP the frame-churn pass - the secondary did not finish in time");
+        return;
+    }
+    assert!(
+        met && !smp::rendezvous_timed_out(),
+        "the two cores never met"
+    );
+    let (cp, cs) = (
+        FRM_CHURN_DONE[0].load(Ordering::Acquire),
+        FRM_CHURN_DONE[1].load(Ordering::Acquire),
+    );
+    assert_eq!(cp, FRM_CHURN, "the primary lost churn rounds");
+    assert_eq!(cs, FRM_CHURN, "the secondary lost churn rounds");
+    assert!(
+        kernel::mm::frames::used_matches_bitmap(),
+        "the used counter and the bitmap disagree after the churn pass"
+    );
+    let (free_end, _) = kernel::mm::frames::stats();
+    assert_eq!(
+        free_end, free_before,
+        "the churn pass leaked frames: {free_before} free before, {free_end} after"
+    );
+
+    let (combined, withdrawn) = kernel::mm::frames::fc_stats();
+    let combined = combined - combined_before;
+    // Reported, never asserted. A count of zero is a legal schedule - it means the two
+    // cores never wanted the structure at the same instant, which one core running its
+    // whole share before the other starts produces, and TCG interleaves coarsely. An
+    // assertion that can fail on a legal schedule is not a proof.
+    //
+    // The number also stays modest **by design**, and that is the point rather than a
+    // disappointment: the critical section is now a bitmap word and three fields, with
+    // the 4 KiB zeroing outside it, so there is very little window left for a second
+    // core to arrive in. Combining is what handles the window that remains; shortening
+    // the window is what removed most of it.
+    println!(
+        "smp: ...then {} churn rounds each (alloc/free, no page touched) with the counter \
+         still matching the bitmap and no frame leaked - {} request(s) across both passes \
+         were executed by the OTHER core's combiner, {} withdrawn OK",
+        FRM_CHURN, combined, withdrawn
     );
 }
 

@@ -2556,6 +2556,66 @@ pairs produced zero lost updates, because the critical section is a handful of
 instructions and TCG's interleaving is far coarser, so the phase asserts the invariant
 while the lock's necessity stays argued from the structure and gated at the lab.
 
+**And the frame allocator is a batch, not a queue** (docs/SMP.md 10.0g): 10.0f closed the
+*safety* question for the global allocators; this closes the *scalability* one for the
+hottest of them. Four changes, of which the first is worth more than the other three and
+would have been worth doing with no lock in sight. **(1) The 4 KiB zeroing left the
+critical section.** Every `alloc` set a bitmap bit and three fields and then zeroed 4096
+bytes *inside* the lock, so the critical section was ~99% `memset` and a core allocating
+waited on another core's `memset` rather than on anything shared. It is safe to move out
+for one structural reason - **the bitmap bit is what makes a frame unhandable**, so once
+it is set the window before the zeroing is private to the claiming core by construction
+rather than by timing. **(2) `alloc_on` takes one acquisition instead of three** (it read
+the node's frame range, searched inside it, then fell back to the whole pool, each
+separately - and a range read that is not in the same critical section as the search it
+bounds is a range that can change under it). **(3) A copy-on-write break takes two
+instead of three**: "is this shared" and "give me somewhere to copy it to" are one
+decision, now `frames::cow_resolve` -> `Sole`/`Private(dst)`/`NoFrame`, whose `Private`
+frame is deliberately **not** zeroed (the caller overwrites all 4096 bytes, so the
+no-leak rule is met by the copy) and whose old-frame release is deliberately **not**
+folded in - dropping the reference before the copy would let a peer core faulting on the
+same page see a count of one, decide it was the sole owner, and write through the frame
+this copy is reading, so two is the floor. **(4) Flat combining** (Hendler/Incze/Shavit/
+Tzafrir, SPAA 2010): with the `memset` gone the lock is held for a few words, which is
+exactly the regime where N cores each taking a short lock pay N cache-line handoffs for
+trivial work - so a core publishes to its own 64-byte-aligned slot, one core wins the
+*combiner* role, takes the lock once, executes the whole batch with the bitmap in its
+cache, and writes each result back. Two shape decisions matter: **the uncontended path
+does not publish at all** (a core tries the election first, and winning it - always, on a
+single-CPU boot - means doing its own work directly and then draining a pending mask that
+is normally zero, so the added cost is two atomics and one relaxed load and there is no
+separate "SMP path" to diverge from), and **the batch does not zero** (each core zeroes
+its own frame afterwards; a combiner zeroing for the batch would re-serialise exactly what
+change 1 unserialised). Executed **exactly once** is enforced by a claim rather than
+argued - a publisher may withdraw only by moving its slot from its own opcode straight to
+idle, which fails once a combiner has moved it to *busy* - and the withdrawal, which
+exists because a publication can land just after the combiner sampled the mask, is
+counted so a machine that needs it says so. The boot-time and diagnostic paths
+(`init_numa`, `alloc_contig`, `stats`, `used_matches_bitmap`, `node_free`, `node_of`) stay
+on the plain lock. Proven by a new `smp` phase on all three ISAs, mirroring the
+shared-heap phase because the failure mode has the same shape: each core loops
+allocate/stamp-every-byte/read-back/free after a rendezvous, so a frame handed to both
+means one core's stamp lands in the other's frame between the write and the read - the
+corruption itself, not a proxy - with the counter still matching the bitmap and no frame
+leaked; then a **churn** pass (allocate and free, touching nothing) because the verify
+pass spends far longer outside the allocator than inside it, across which **313-1228
+requests were executed by the other core's combiner**, 0 withdrawn. That number is
+**reported, never asserted** (zero is a legal schedule, and TCG interleaves coarsely) and
+it stays modest *by design*, which is the point: change 1 left very little window for a
+second core to arrive in, so shortening the window removed most of the contention and
+combining handles what is left. Two controls observed firing (the zeroing deleted ->
+`4096 nonzero byte(s)`; the combiner running each request twice -> `double free of <pa>`).
+**And the first version of the zeroing oracle passed with the fix deleted** - the
+concurrent loop asserted every fresh frame arrives zero, reasoning that a frame one core
+stamped and freed comes back to the other dirty, but `alloc` rotates its hint so a freed
+frame is not handed out again until the cursor has walked all 131,072 of them and nothing
+in a 2,000-round pass is ever recycled; the frame is dirtied **before** it is allocated
+now (the hint makes the next one predictable, and a free frame belongs to nobody), with
+the prediction asserted rather than assumed. Recorded in docs/ENGINEERING.md 11. Honest:
+changes 2 and 3 have **no control of their own** - their observable behaviour is identical
+to what they replaced, only the acquisition count changed, so `numa` and `cowfork` are
+their gate and no test can distinguish one acquisition from three.
+
 **Honest scope:** preemption is *within* a core's own claim and rebalancing moves only
 **unstarted** cells. Migrating a *running* one was **attempted twice and reverted twice**, with four findings
 recorded in docs/SMP.md 10.0. The second attempt followed the first's own advice -
@@ -3373,7 +3433,10 @@ kernel/       the no_std kernel library + boot demo bin
               (frames + frames_pmem real-nvdimm allocator + grants; frames carries a
               per-frame refcount so `fork` is copy-on-write - `free` is a decrement,
               `share`/`refs` the COW primitives - **and** the per-NUMA-node frame
-              ranges `alloc_on` places against, docs/SUBSTRATE.md pillar 6), uaccess (**the one seam kernel code
+              ranges `alloc_on` places against, docs/SUBSTRATE.md pillar 6; the hot
+              operations go through **flat combining** rather than each core taking the
+              pool lock in turn, and the 4 KiB zeroing is outside the lock entirely -
+              docs/SMP.md 10.0g), uaccess (**the one seam kernel code
               touches a cell's memory through**: bounds + presence + copy-on-write
               resolution, so every lazy-mapping feature is one change here rather than a
               ~98-site audit - docs/LINUX-COMPAT.md), time (clock), rng (ChaCha20 DRBG +
@@ -3514,7 +3577,17 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               its own core; then **TWO CORES IN ONE HEAP** - 512 allocate/stamp/
               verify/free cycles each through `runtime::Heap`'s global allocator,
               0 bytes of either core's block ever holding the other's marker;
-              then **STRANDS ACROSS VCORES** - 64 `spawn_shared` strands each
+              then **TWO CORES IN ONE FRAME ALLOCATOR** - the same shape against
+              `mm::frames` (128 alloc/stamp/verify/free rounds each, 0 bytes of
+              either core's frame ever holding the other's marker, the used
+              counter still matching the bitmap, no frame leaked), then 1024
+              churn rounds each with no page touched so the two are contending
+              on the bookkeeping alone - 313-1228 requests executed by the OTHER
+              core's flat-combining combiner, reported and never asserted - plus
+              a single-core check that a frame **dirtied while free** comes back
+              zeroed, which is the only shape that can catch a missing memset in
+              a rotating allocator (docs/SMP.md 10.0g,
+              docs/ENGINEERING.md 11); then **STRANDS ACROSS VCORES** - 64 `spawn_shared` strands each
               asserted to run exactly once, drained by two cores at once and then
               spawned on one vcore and executed entirely by another
               (docs/CONCURRENCY.md); then **A CELL ASKING WHICH VCORE IT IS** -
