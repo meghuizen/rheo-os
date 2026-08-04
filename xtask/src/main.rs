@@ -21,9 +21,10 @@ use std::time::{Duration, Instant};
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every kernel binary booted by `cargo xtask test`, in order.
-const TEST_KERNELS: [&str; 70] = [
+const TEST_KERNELS: [&str; 71] = [
     "kernel",
     "substrate",
+    "observe",
     "cap-invariants",
     "queue-pipeline",
     "isolation-hw",
@@ -1319,21 +1320,36 @@ fn trace(arch: Arch, bin: &str, window: &str, ledger: bool) -> bool {
     );
 
     // Loss, located: a gap in the sequence is where the record is incomplete.
+    //
+    // **Per CPU**, because a sequence number is per-CPU monotone - each core has its
+    // own ring and its own counter (docs/OBSERVABILITY.md 11). Comparing consecutive
+    // lines of the merged stream, which is what this did while there was one shared
+    // counter, would report a gap at every point where the emitting core changed:
+    // pure noise on any multi-core boot, and this tool's own rule is that a
+    // diagnostic which cries wolf is worse than no diagnostic.
+    let mut cpus: Vec<u64> = evs.iter().map(|e| e.cpu).collect();
+    cpus.sort_unstable();
+    cpus.dedup();
     let mut gaps = 0usize;
-    for w in evs.windows(2) {
-        if w[1].seq != w[0].seq + 1 {
-            println!(
-                "  LOST  seq {}..{} ({} event(s) overwritten)",
-                w[0].seq,
-                w[1].seq,
-                w[1].seq - w[0].seq - 1
-            );
-            gaps += 1;
+    for c in &cpus {
+        let mut seqs: Vec<u64> = evs.iter().filter(|e| e.cpu == *c).map(|e| e.seq).collect();
+        seqs.sort_unstable();
+        for w in seqs.windows(2) {
+            if w[1] != w[0] + 1 {
+                println!(
+                    "  LOST  cpu{c} seq {}..{} ({} event(s) overwritten)",
+                    w[0],
+                    w[1],
+                    w[1] - w[0] - 1
+                );
+                gaps += 1;
+            }
         }
     }
     if gaps > 0 {
         println!(
-            "  ({gaps} gap(s) - the ring wrapped; raise `trace::CAPACITY` or narrow what is traced)"
+            "  ({gaps} gap(s) - a ring wrapped; raise `obs::ring::RING_EVENTS` or narrow \
+             what is traced)"
         );
     }
 
@@ -1547,8 +1563,10 @@ fn verify() -> bool {
     let drivers = [
         ("entity", "verify/entity/fuzz.rs"),
         ("telemetry", "verify/telemetry/fuzz.rs"),
+        ("obs", "verify/obs/fuzz.rs"),
         ("graph", "verify/graph/fuzz.rs"),
         ("hetero", "verify/hetero/fuzz.rs"),
+        ("bitmap", "verify/bitmap/fuzz.rs"),
     ];
     let out = std::path::Path::new("target/verify");
     if let Err(e) = std::fs::create_dir_all(out) {
@@ -1563,8 +1581,24 @@ fn verify() -> bool {
         // then fail to *compile* - which is how a let-chain in `hw/graph.rs` broke this driver
         // and went unnoticed for a commit, because the check that was run counted passing
         // properties instead of reading the verdict.
+        // `-C debug-assertions=on`, which `-O` would otherwise turn off. A model checker
+        // is exactly where a `debug_assert!` should fire: it costs nothing in a host
+        // process running for milliseconds, and the alternative is that a hot path's
+        // cheap invariant check is compiled out in the one place built to break it. The
+        // observability ring's append path bypasses `Funded`'s bounds check for measured
+        // reasons, so its own bounds are debug assertions - and without this flag a
+        // defect there was a segfault rather than a named failure.
         let built = Command::new("rustc")
-            .args(["-O", "--edition", "2024", "-A", "dead_code", "-o"])
+            .args([
+                "-O",
+                "-C",
+                "debug-assertions=on",
+                "--edition",
+                "2024",
+                "-A",
+                "dead_code",
+                "-o",
+            ])
             .arg(&bin)
             .arg(src)
             .status()
@@ -2504,7 +2538,57 @@ fn build_bun_disk_fixture(arch: Arch, out_dir: &str) {
 /// JavaScriptCore runtime `linuxbun` proves, at four times the size and with its
 /// whole application bundled in. It needs `librt` on top of bun's set. Thin caller of
 /// [`build_runtime_disk_fixture`].
+/// Where the expected `claude --version` transcript is written for the test kernels to
+/// `include_bytes!`. **Not** per-arch: the string is a property of the binary, and the
+/// binary is x86-64-only, but the test compiles for all three ISAs so the file has to
+/// exist for all three builds.
+const CLAUDE_VERSION_FILE: &str = "tests/linux-fixtures/build/claude-version.txt";
+
+/// Record what the installed Claude Code binary reports as its version, for
+/// `linuxclaude`/`linuxclaudesmp` to assert against.
+///
+/// **Derived, not hardcoded.** The expected transcript used to be the literal
+/// `2.1.220 (Claude Code)\n` in two test kernels, which fails the moment the installed
+/// binary is upgraded - and it was, to `2.1.221`, turning a green gate red with nothing
+/// wrong. Asking the binary is the same discipline the `smp` kernel uses for its tile
+/// hashes: the expected value comes from the thing under test, so it cannot go stale.
+///
+/// What this does **not** weaken: the assertion is still an exact byte-for-byte match on
+/// the cell's whole stdout, and the version is read on the *host* from the very file
+/// that is copied onto the disk image. The cell has no way to influence it, so a cell
+/// that printed nothing, or a different string, or the right string with extra output,
+/// still fails.
+///
+/// An empty file when the binary is absent, which is the honest value - the test skips
+/// on the same condition (no binary, no disk image), so the two can never disagree.
+fn write_claude_version(binary: &str) {
+    let expected = std::process::Command::new(binary)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| o.stdout)
+        .unwrap_or_default();
+    if let Some(parent) = std::path::Path::new(CLAUDE_VERSION_FILE).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if expected.is_empty() {
+        println!("[xtask] no Claude Code binary to version-probe; linuxclaude will skip");
+    } else {
+        println!(
+            "[xtask] claude reports {:?} - linuxclaude asserts that",
+            core::str::from_utf8(&expected)
+                .unwrap_or("<non-utf8>")
+                .trim_end()
+        );
+    }
+    let _ = std::fs::write(CLAUDE_VERSION_FILE, &expected);
+}
+
 fn build_claude_disk_fixture(arch: Arch, out_dir: &str) {
+    // Before the arch gate: the file is `include_bytes!`d by a kernel that compiles for
+    // every ISA, so it must exist even where no disk is built.
+    write_claude_version("/opt/claude-code/bin/claude");
     build_runtime_disk_fixture(
         arch,
         out_dir,

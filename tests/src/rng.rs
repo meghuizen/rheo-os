@@ -111,10 +111,9 @@ fn test_next_u64_matches_fill() {
 
 /// **Fast key erasure, rule 2**: a byte is erased from the buffer as it is
 /// handed out, so capturing the DRBG state later reveals nothing about output
-/// already delivered (cr.yp.to 2017.07.23, the recording-attacker case). Rule 1
-/// - re-key on every refill - was already implemented; this half was not, and
-/// up to 256 bytes of delivered output stayed in the buffer until the next
-/// refill.
+/// already delivered (cr.yp.to 2017.07.23, the recording-attacker case). Rule 1,
+/// re-keying on every refill, was already implemented; this half was not, and up
+/// to 256 bytes of delivered output stayed in the buffer until the next refill.
 ///
 /// Drawn in odd sizes so the spent region ends mid-word and spans a refill.
 fn test_erase_on_read() {
@@ -430,10 +429,19 @@ fn test_hid_events() {
     // Nothing a person typed is left behind. The stronger half of the
     // not-a-keylogger property is structural - `rng::feed_hid` takes a sequence
     // number and no event, so a caller *cannot* pass a key code - and this is the
-    // part a test can see: the DMA buffers are wiped as they are drained.
-    assert!(
-        kernel::hw::virtio_input::buffers_clear(),
-        "a drained HID event is still sitting in the kernel's buffer"
+    // part a test can see: every buffer was read back as zero before being handed to
+    // the device again.
+    //
+    // Asked of the *drain* rather than of the buffers, because a wiped buffer goes
+    // straight back to the device and the injector is still typing: scanning the
+    // buffers afterwards fails when a **new** keystroke lands between the drain and
+    // the scan, which is exactly how it failed intermittently on riscv64.
+    let ev = kernel::hw::virtio_input::events();
+    assert_eq!(
+        kernel::hw::virtio_input::wiped(),
+        ev,
+        "{} of {ev} drained HID event(s) were wiped - a keystroke is still in kernel memory",
+        kernel::hw::virtio_input::wiped()
     );
     println!(
         "rng: HID device \"{}\" delivered {drained} key event(s) into the entropy pool \
@@ -487,16 +495,20 @@ fn test_rekey_bounds_a_compromise() {
 /// which is why the pool's target is the **full key width** and not less. A
 /// 128-bit seed would be the actual weakness, so that is what is asserted.
 fn test_quantum_margin() {
-    assert!(
+    // Both of these are relations between **constants**, so they are `const`
+    // assertions: the build fails rather than the boot, which is strictly stronger
+    // than checking at run time and is what clippy's `assertions_on_constants` asks
+    // for. A const assertion takes a plain message, hence no interpolated value - the
+    // constant is named in the expression, which is where a reader would look anyway.
+    const _: () = assert!(
         entropy::CREDIT_TARGET == 256,
-        "the seed target is {} bits; Grover halves it, so anything under 256 \
-         leaves less than a 128-bit post-quantum margin",
-        entropy::CREDIT_TARGET
+        "the seed target must be the full 256-bit key width: Grover halves it, so \
+         anything less leaves under a 128-bit post-quantum margin"
     );
     // And the key the DRBG is built from is that wide.
-    assert!(
-        core::mem::size_of_val(&[0u8; 32]) * 8 == entropy::CREDIT_TARGET as usize,
-        "the DRBG key and the seed target disagree"
+    const _: () = assert!(
+        32 * 8 == entropy::CREDIT_TARGET as usize,
+        "the DRBG key width and the seed target disagree"
     );
     println!(
         "rng: post-quantum margin - 256-bit key, ~128 bits under Grover; no \
@@ -587,7 +599,7 @@ fn test_hwrng_and_seed_source() {
             "two TPM2_GetRandom calls returned the same bytes"
         );
         assert!(
-            names.iter().any(|n| *n == Some("tpm")),
+            names.contains(&Some("tpm")),
             "the TPM answered but did not register with the pool"
         );
         println!(

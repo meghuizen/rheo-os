@@ -226,19 +226,21 @@ fn test_parallel_gemm(idx: usize) {
             "blocks completed ({sum}) do not account for the whole queue \
              ({total_blocks}) - a claim was lost or double-counted"
         );
-        // Sharing, asserted; **which** cores got a block, reported. The barrier above is
-        // what proves all `cores` were inside one interval; it does not promise each of
-        // them *won* a block, because winning one is a race against peers that may drain
-        // the queue first. An earlier version asserted `workers == cores` and was
-        // therefore asserting a race outcome - it failed on a run where three cores took
-        // all sixteen blocks before the fourth reached its first `fetch_add`, which is
-        // correct behaviour for a work queue (docs/ENGINEERING.md 1: a proof must not be
-        // able to fail on a legal schedule).
-        assert!(
-            workers > 1,
-            "one core did all {total_blocks} blocks - the queue was drained serially, \
-             not shared"
-        );
+        // **How many cores won a block is reported, never asserted**, and getting here
+        // took two goes. The first version asserted `workers == cores`; that was a race
+        // outcome, and it failed on a run where three cores took all sixteen blocks
+        // before the fourth reached its first `fetch_add`. It was weakened to
+        // `workers > 1` - which is the *same* mistake one step smaller, because a single
+        // core draining the whole queue before any peer arrives is equally legal. On a
+        // loaded host, where the vCPU threads are scheduled against everything else,
+        // that is not even rare: with 12 spinners beside it this failed four runs out of
+        // four, saying "the queue was drained serially" about a kernel doing exactly
+        // what a work queue should.
+        //
+        // What proves the parallelism is the **barrier** above - all `cores` inside one
+        // interval, which one core cannot produce - and what proves the sharing is
+        // correct is that the counts sum to the queue and the result is bit-identical.
+        // Neither can fail on a legal schedule (docs/ENGINEERING.md 1, 4).
         // And the frame allocator survived two cores using it (the pool lock,
         // docs/SMP.md 10.2): the incremental used counter still agrees with the bitmap
         // it summarises, which is exactly the invariant a lost update breaks.
@@ -303,7 +305,9 @@ fn test_secondary_bringup() {
             println!("smp: real second core on {} confirmed", arch::NAME);
             test_parallel_gemm(idx);
             test_shared_heap();
+            test_shared_frames();
             test_shared_ledger();
+            test_lock_contention();
             test_vcore_identity();
             test_strands_across_vcores();
             test_loaded_multi_vcore_cell();
@@ -312,6 +316,7 @@ fn test_secondary_bringup() {
             test_hetero_placement();
             test_entity_authority();
             test_funded_contexts();
+            test_percpu_event_rings();
             test_two_vcores_one_cell();
             test_vcore_yield();
             test_per_vcore_queues();
@@ -868,8 +873,8 @@ fn test_flash_attention_parallel() {
         // **Bit-identical**, not within a tolerance: the query-row split changes no
         // row's arithmetic, so anything else is a defect rather than rounding.
         let got = core::ptr::addr_of!(FA_OUT) as *const f32;
-        for i in 0..FA_TQ * FA_D {
-            let (g, w) = (got.add(i).read(), refbuf[i]);
+        for (i, &w) in refbuf.iter().enumerate().take(FA_TQ * FA_D) {
+            let g = got.add(i).read();
             assert!(
                 g.to_bits() == w.to_bits(),
                 "parallel FA2 differs from the single-cell reference at element {i}: \
@@ -879,10 +884,10 @@ fn test_flash_attention_parallel() {
 
         // The GEMM half too, and integer so equality is unconditional.
         let ggot = core::ptr::addr_of!(FA_GEMM_OUT) as *const i32;
-        for i in 0..FA_GM * FA_GN {
+        for (i, &gw) in grefbuf.iter().enumerate().take(FA_GM * FA_GN) {
             assert_eq!(
                 ggot.add(i).read(),
-                grefbuf[i],
+                gw,
                 "parallel int8 GEMM differs from the single-cell reference at element {i}"
             );
         }
@@ -1549,6 +1554,11 @@ static mut KSTACK_V1: KernelStack = KernelStack::new();
 /// Rounds each vcore runs. As `CO_ROUNDS`: enough to overlap for many rounds under TCG,
 /// few enough to finish inside the boot budget.
 const VCORE_ROUNDS: u64 = 64;
+/// `user_copair`'s workload flag that makes it trap once per round (bit 1). Named rather
+/// than written `0 | 2` at the call site: the `0` was the witness slot, and an OR with
+/// zero is a no-op the compiler and clippy both see through, so the intent has to live
+/// in a name instead.
+const COPAIR_TRAP_EACH_ROUND: u64 = 2;
 
 fn test_two_vcores_one_cell() {
     // SAFETY: single-threaded setup on the primary; the secondaries are parked in their
@@ -1572,12 +1582,14 @@ fn test_two_vcores_one_cell() {
             (*core::ptr::addr_of!(KSTACK_V0)).top(),
             7,
             user_copair,
-            // Slot 0, **and** bit 1: trap once per round. Without that this program
-            // traps only at its exit, and two contexts that each trap once, far apart,
-            // never collide - so a kernel stack shared between them would go unnoticed
-            // (verified: with one stack for both vcores and no per-round trap the phase
-            // passes on all three ISAs).
-            0 | 2,
+            // `user_copair` packs its witness slot and its flags into one word. This is
+            // **slot 0 plus bit 1**: slot 0 contributes nothing, and bit 1 makes the
+            // program trap once per round. Without the trap it traps only at its exit,
+            // and two contexts that each trap once, far apart, never collide - so a
+            // kernel stack shared between them would go unnoticed (verified: with one
+            // stack for both vcores and no per-round trap the phase passes on all three
+            // ISAs).
+            COPAIR_TRAP_EACH_ROUND,
             VCORE_ROUNDS,
         );
 
@@ -1609,7 +1621,7 @@ fn test_two_vcores_one_cell() {
         (*v1).params.ticks = shared as u64;
 
         let frame1 = arch::trapframe_new(
-            user_copair as usize,
+            user_copair as *const () as usize,
             stack1 + core::mem::size_of_val(&(*v1).stack),
             params1,
             (*core::ptr::addr_of!(KSTACK_V1)).top(),
@@ -1777,7 +1789,7 @@ fn test_vcore_yield() {
             core::mem::MaybeUninit::uninit();
         let yf = core::ptr::addr_of_mut!(YFRAME);
         (*yf).write(arch::trapframe_new(
-            kernel::user_progs::user_vyield as usize,
+            kernel::user_progs::user_vyield as *const () as usize,
             stack1 + stack1_len,
             params1,
             (*core::ptr::addr_of!(KSTACK_Y1)).top(),
@@ -1952,7 +1964,7 @@ fn test_per_vcore_queues() {
             core::mem::MaybeUninit::uninit();
         let qf = core::ptr::addr_of_mut!(QFRAME);
         (*qf).write(arch::trapframe_new(
-            kernel::user_progs::user_vqueue as usize,
+            kernel::user_progs::user_vqueue as *const () as usize,
             stack1 + stack1_len,
             params1,
             (*core::ptr::addr_of!(KSTACK_Q1)).top(),
@@ -2169,6 +2181,226 @@ fn test_shared_ledger() {
     );
 }
 
+// ----------------------------------- LOCK CONTENTION IS MEASURED, AND ONLY CONTENTION
+//
+// docs/OBSERVABILITY.md 11, S5: a **named** SpinLock counts its contended
+// acquisitions, the spins and wait they cost, and - behind a separate modifier bit -
+// its hold times, while an uncontended acquire of the same lock records nothing.
+// "Only contention" is the load-bearing half: a counter that moves on every
+// acquisition is an acquisition counter wearing a contention counter's name, and the
+// uncontended round below is the oracle that tells them apart.
+//
+// Contention is made **deterministic rather than statistical**: TCG's interleaving is
+// far coarser than a lock's critical section, so two cores hammering symmetrically can
+// serialise entirely and contend zero times - a phase asserting `> 0` on that shape is
+// flaky by construction. Instead the primary takes the probe lock and holds it until
+// the secondary *declares* it is about to acquire, then keeps holding through a
+// generous delay before releasing - so the secondary's fast-path CAS lands while the
+// lock is genuinely held and its acquire must take the contended path. The one
+// remaining race (the secondary declaring, then being descheduled past the whole
+// delay) is closed by bounded retries: a genuine instrumentation regression fails
+// every attempt deterministically, while a scheduling miss fails one.
+//
+// The metrics half is per-CPU, and that shaped the phase: `metrics::enable()` and
+// `prefund` act on the **calling** CPU, so the secondary enables and prefunds for
+// itself at the start of its run, and the assertions sum counts over every CPU.
+
+/// The probe lock: named so its numbers are attributable to this phase alone, not
+/// load-bearing so contending on it perturbs nothing.
+static LOCK_PROBE: kernel::smp::SpinLock<u64> =
+    kernel::smp::SpinLock::named(0, kernel::obs::lock::LockId::Probe);
+/// The deterministic-contention handshake: 0 idle, 1 primary holds, 2 secondary
+/// about to acquire, 3 secondary done (releases the primary to the next attempt).
+static LOCK_STAGE: AtomicUsize = AtomicUsize::new(0);
+/// How long the primary keeps holding after the secondary declares (spin loops).
+const LOCK_HOLD_SPINS: usize = 200_000;
+/// Deterministic-contention attempts before giving up.
+const LOCK_ATTEMPTS: usize = 16;
+
+fn lock_probe_secondary() {
+    // Per-CPU: recording and bucket storage for THIS core, from a safe context
+    // (the start of the run, no lock held).
+    kernel::metrics::enable();
+    kernel::metrics::prefund(kernel::metrics::Metric::LockWaitNs);
+    for _ in 0..LOCK_ATTEMPTS {
+        // Wait for the primary to hold the lock.
+        while LOCK_STAGE.load(Ordering::Acquire) != 1 {
+            core::hint::spin_loop();
+        }
+        // Declare, then acquire: the primary keeps holding well past this store,
+        // so this acquire finds the lock held and takes the contended path.
+        LOCK_STAGE.store(2, Ordering::Release);
+        let mut g = LOCK_PROBE.lock();
+        *g += 1;
+        drop(g);
+        LOCK_STAGE.store(3, Ordering::Release);
+    }
+}
+
+fn lock_probe_primary() {
+    for _ in 0..LOCK_ATTEMPTS {
+        let g = LOCK_PROBE.lock();
+        LOCK_STAGE.store(1, Ordering::Release);
+        // Hold until the secondary declares its acquire...
+        while LOCK_STAGE.load(Ordering::Acquire) != 2 {
+            core::hint::spin_loop();
+        }
+        // ...and then long enough for its CAS to land on the held lock.
+        for _ in 0..LOCK_HOLD_SPINS {
+            core::hint::spin_loop();
+        }
+        drop(g);
+        // Wait for the secondary to finish its acquire before re-taking, so the
+        // next attempt starts from a clean stage.
+        while LOCK_STAGE.load(Ordering::Acquire) != 3 {
+            core::hint::spin_loop();
+        }
+        LOCK_STAGE.store(0, Ordering::Release);
+    }
+}
+
+/// LockWaitNs / LockHoldNs sample count summed over every CPU (recording lands on
+/// whichever core waited).
+fn lock_metric_count(metric: kernel::metrics::Metric) -> u64 {
+    let mut total = 0;
+    for cpu in 0..kernel::smp::MAX_CPUS {
+        // SAFETY: cross-core histogram read; counts can only grow, and both cores
+        // are quiescent when this is called.
+        total += unsafe { kernel::metrics::per_cpu(cpu, metric) }.count();
+    }
+    total
+}
+
+fn test_lock_contention() {
+    use kernel::metrics::{self, Metric};
+    use kernel::obs::lock::{self as klock, LockId};
+
+    // The Lock window on (contention counting), the hold modifier deliberately
+    // OFF: the split between the two bits is asserted below.
+    assert!(
+        kernel::obs::enable_windows(kernel::obs::Window::Lock.bit()),
+        "the event ring could not be funded"
+    );
+    metrics::enable();
+    assert!(
+        metrics::prefund(Metric::LockWaitNs) && metrics::prefund(Metric::LockHoldNs),
+        "bucket storage refused - the pool is exhausted this early?"
+    );
+    klock::reset();
+    LOCK_STAGE.store(0, Ordering::Release);
+    let wait_before = lock_metric_count(Metric::LockWaitNs);
+
+    let (met, finished) = smp::run_fn_with_secondary(lock_probe_secondary, lock_probe_primary);
+    if !finished {
+        println!(
+            "smp: SKIP the lock-contention phase - the secondary did not finish inside \
+             the bound, so nothing about two cores on one lock is claimed"
+        );
+        kernel::obs::reset();
+        metrics::disable();
+        klock::reset();
+        return;
+    }
+    assert!(
+        met && !smp::rendezvous_timed_out(),
+        "the two cores never met, so they never contended"
+    );
+
+    // Exactness first: the lock still excludes (every increment landed).
+    assert_eq!(
+        *LOCK_PROBE.lock(),
+        LOCK_ATTEMPTS as u64,
+        "increments were lost - the named lock stopped excluding"
+    );
+    let contentions = klock::contentions(LockId::Probe);
+    let spins = klock::lock_spins(LockId::Probe);
+    let waits = lock_metric_count(Metric::LockWaitNs) - wait_before;
+    assert!(
+        contentions >= 1,
+        "{LOCK_ATTEMPTS} held-while-attempted handshakes produced no contention - \
+         the contended path is not counting"
+    );
+    assert!(
+        spins >= 1,
+        "contended acquires spun 0 times against a hold of {LOCK_HOLD_SPINS} loops"
+    );
+    assert!(
+        waits >= 1,
+        "contention was counted but no LockWaitNs sample landed on any CPU"
+    );
+    // The wait distribution is real: some CPU's histogram has the samples, with
+    // buckets (prefunded), so its p50 is a measured wait, not a fabricated one.
+    let mut p50 = 0;
+    for cpu in 0..kernel::smp::MAX_CPUS {
+        // SAFETY: quiescent cross-core read, as above.
+        let h = unsafe { kernel::metrics::per_cpu(cpu, Metric::LockWaitNs) };
+        if h.count() > 0 && h.has_buckets() {
+            p50 = p50.max(h.percentile(50));
+        }
+    }
+    assert!(
+        p50 > 0,
+        "a contended wait across a {LOCK_HOLD_SPINS}-loop hold has p50 = 0 ns"
+    );
+
+    // The hold modifier was off, so all of the above must have recorded NO hold
+    // times - the two bits are separate precisely so a wait-only run never reads
+    // the clock inside a critical section.
+    assert_eq!(
+        lock_metric_count(Metric::LockHoldNs),
+        0,
+        "hold times were recorded with W_LOCK_HOLD off - the modifier does not gate"
+    );
+
+    // The uncontended oracle: one core, same named lock, same window on. A
+    // thousand acquisitions must count exactly ZERO contentions - nonzero here
+    // means the counter counts acquisitions, not contention (the control the
+    // plan names, asserted in-line rather than by a revert).
+    klock::reset();
+    for _ in 0..1024 {
+        let mut g = LOCK_PROBE.lock();
+        *g = g.wrapping_add(1);
+    }
+    assert_eq!(
+        klock::contentions(LockId::Probe),
+        0,
+        "1024 uncontended acquisitions counted as contention"
+    );
+
+    // Now the hold bit too: one acquire with a known-length hold records a hold
+    // sample, on this CPU, with the wait counters untouched (nothing contends).
+    kernel::obs::set_windows(
+        kernel::obs::Window::Lock.bit() | (1u32 << kernel::abi::obs::W_LOCK_HOLD),
+    );
+    {
+        let mut g = LOCK_PROBE.lock();
+        *g = g.wrapping_add(1);
+        for _ in 0..10_000 {
+            core::hint::spin_loop();
+        }
+    }
+    assert!(
+        lock_metric_count(Metric::LockHoldNs) >= 1,
+        "W_LOCK_HOLD is on and a 10k-loop hold recorded nothing"
+    );
+    assert_eq!(
+        klock::contentions(LockId::Probe),
+        0,
+        "an uncontended hold-measured acquire counted as contention"
+    );
+
+    println!(
+        "smp: LOCK CONTENTION MEASURED AND ONLY CONTENTION - {contentions} deterministic \
+         contention(s) over {LOCK_ATTEMPTS} handshakes ({spins} spins, {waits} wait \
+         sample(s), p50 {p50} ns), 1024 uncontended acquisitions = 0 contentions, \
+         holds gated by their own bit (0 recorded off, >=1 on) OK"
+    );
+
+    kernel::obs::reset();
+    metrics::disable();
+    klock::reset();
+}
+
 // ------------------------------- TWO CORES ALLOCATING FROM ONE HEAP AT THE SAME TIME
 //
 // `runtime::Heap` is the allocator every `alloc`-using cell and test kernel binds as its
@@ -2241,11 +2473,9 @@ fn heap_hammer(marker: u8, slot: usize) {
 }
 
 fn heap_range() -> (usize, usize) {
-    // SAFETY: a plain address computation over a unique static.
-    unsafe {
-        let base = core::ptr::addr_of!(HEAP_MEM) as usize;
-        (base, base + 512 * 1024)
-    }
+    // `addr_of!` only forms an address, so no `unsafe` is needed to ask where a static is.
+    let base = core::ptr::addr_of!(HEAP_MEM) as usize;
+    (base, base + 512 * 1024)
 }
 
 fn heap_hammer_primary() {
@@ -2308,6 +2538,315 @@ fn test_shared_heap() {
     );
 }
 
+// ------------------------------ TWO CORES ALLOCATING FRAMES AT THE SAME TIME
+//
+// `mm::frames` is the hottest shared structure in the tree, and this session changed two
+// things about it that the pre-existing suite exercises constantly but cannot *attribute*:
+// the 4 KiB zeroing moved **out** of the pool lock, and the bookkeeping moved behind flat
+// combining, where one core executes another core's request. Both are claims about what
+// happens when two cores are inside the allocator together, so both need a phase where
+// they are (docs/ENGINEERING.md 1).
+//
+// Each core, in a loop: allocate a frame, check every byte of it is zero, stamp every byte
+// with its own marker, read every byte back, free it. Three oracles, each aimed at one
+// thing:
+//
+//  * **Marker on read-back.** A frame handed to both cores means one core's stamp lands in
+//    the other's frame between the write and the read - the corruption itself, not a proxy
+//    for it. This is what a flat-combining request executed twice would produce.
+//  * **The counter still matches the bitmap**, which a lost `USED` update breaks.
+//  * **Zero on arrival**, though see below - in the concurrent pass this is a cheap extra
+//    rather than the proof, and the proof is [`assert_fresh_frame_is_zero`].
+//
+// The two cores meet at a rendezvous first, so the overlap is real, and
+// `frames::fc_stats()` reports how many requests were genuinely served by the *other*
+// core - a batch of one everywhere would mean this phase measured nothing about combining.
+
+/// The zeroing is still inside the claim window - the direct check that moving the 4 KiB
+/// `memset` out of the pool lock did not open a hole.
+///
+/// **Deliberately single-core and deliberately not part of the concurrent pass**, because
+/// the obvious version of this check cannot fail. The first draft asserted "every freshly
+/// allocated frame is zero" inside the two-core loop, reasoning that a frame stamped and
+/// freed by one core would come back to the other still dirty - and it **passed with the
+/// zeroing deleted**. `alloc` rotates `NEXT_HINT`, so a freed frame is not handed out
+/// again until the cursor has walked all 131,072 frames: nothing in a 2,000-round pass is
+/// ever recycled, and the oracle only ever saw memory that was already zero.
+///
+/// So the frame is dirtied *before* it is allocated instead. `alloc` leaves the hint one
+/// past what it returned, which makes the **next** frame it will hand out predictable; a
+/// free frame belongs to nobody, so a test may write to it through the linear map. The
+/// prediction is then asserted rather than assumed, and a miss (the next frame was not
+/// free, so the scan went elsewhere) skips with a reason rather than claiming anything.
+fn assert_fresh_frame_is_zero() {
+    use kernel::mm::frames;
+    let Some(a) = frames::alloc() else {
+        println!("smp: SKIP the frame-zeroing check - the pool had nothing to give");
+        return;
+    };
+    // `a`'s frame is taken and the hint sits one past it, so this is what the next
+    // allocation returns provided that frame is free.
+    let predicted = a + frames::FRAME_SIZE;
+    if !frames::in_pool(predicted) {
+        frames::free(a);
+        println!("smp: SKIP the frame-zeroing check - no frame follows {a:#x} in the pool");
+        return;
+    }
+    // SAFETY: `predicted` is a pool frame that is currently free, so no cell and no
+    // kernel structure holds it; reached through the kernel's linear map.
+    let dirty = unsafe {
+        core::slice::from_raw_parts_mut(
+            arch::phys_to_virt(predicted) as *mut u8,
+            frames::FRAME_SIZE,
+        )
+    };
+    dirty.fill(0xEE);
+
+    let Some(b) = frames::alloc() else {
+        frames::free(a);
+        println!("smp: SKIP the frame-zeroing check - the pool had nothing to give");
+        return;
+    };
+    if b != predicted {
+        frames::free(b);
+        frames::free(a);
+        println!(
+            "smp: SKIP the frame-zeroing check - the allocator returned {b:#x}, not the \
+             predicted {predicted:#x}, so the frame that was dirtied is not the one handed \
+             out and nothing is claimed"
+        );
+        return;
+    }
+    // SAFETY: `b` is this core's frame now.
+    let page = unsafe {
+        core::slice::from_raw_parts(arch::phys_to_virt(b) as *const u8, frames::FRAME_SIZE)
+    };
+    let nonzero = page.iter().filter(|&&x| x != 0).count();
+    assert_eq!(
+        nonzero, 0,
+        "a freshly allocated frame held {nonzero} nonzero byte(s) of what was in that \
+         physical memory before it was claimed - the zeroing no longer covers the window \
+         between the claim and the hand-over"
+    );
+    frames::free(b);
+    frames::free(a);
+    println!(
+        "smp: a frame dirtied while free came back ZEROED from alloc - the 4 KiB memset \
+         still covers the claim window it moved out of the pool lock OK"
+    );
+}
+
+/// Rounds per core. Each round touches the frame four times (zero-check, stamp,
+/// read-back, and the allocator's own zeroing), so this is ~2 MiB of byte traffic per
+/// core - enough rounds to be inside the allocator together many times over, few enough
+/// to stay well inside the boot budget under TCG.
+const FRM_ROUNDS: usize = 128;
+
+/// Rounds of the **churn** pass: alloc then free, touching nothing.
+///
+/// The correctness oracles above need to read and write every byte of the frame, which
+/// means the round spends far longer outside the allocator than inside it - so it is a
+/// poor measurement of the *combining*, which only happens when two cores want the
+/// structure at the same instant. This pass strips the round down to the bookkeeping so
+/// the two cores are contending rather than mostly doing byte traffic.
+const FRM_CHURN: usize = 1024;
+
+/// Bytes of a **freshly allocated** frame that were not zero.
+///
+/// A cheap extra, not the zeroing proof - see [`assert_fresh_frame_is_zero`] for why a
+/// concurrent loop cannot make this fire. It stays because it is one pass over a page the
+/// round already touches, and it would catch a zeroing that raced rather than one that was
+/// simply absent.
+static FRM_DIRTY: AtomicUsize = AtomicUsize::new(0);
+/// Bytes that failed to read back as the marker this core wrote - one frame, two owners.
+static FRM_MISMATCH: AtomicUsize = AtomicUsize::new(0);
+/// Allocations that failed, or came back outside the pool.
+static FRM_BAD: AtomicUsize = AtomicUsize::new(0);
+/// Rounds completed, per core.
+static FRM_ROUNDS_DONE: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+/// Churn-pass rounds completed, per core.
+static FRM_CHURN_DONE: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+
+/// One core's share: `FRM_ROUNDS` alloc / zero-check / stamp / verify / free cycles.
+fn frames_hammer(marker: u8, slot: usize) {
+    for _ in 0..FRM_ROUNDS {
+        let Some(pa) = kernel::mm::frames::alloc() else {
+            FRM_BAD.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        if !kernel::mm::frames::in_pool(pa) {
+            FRM_BAD.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        // SAFETY: `pa` is a frame this core has just been given, so no one else holds
+        // it; reached through the kernel's linear map, never the raw physical address.
+        let page = unsafe {
+            core::slice::from_raw_parts_mut(
+                arch::phys_to_virt(pa) as *mut u8,
+                kernel::mm::frames::FRAME_SIZE,
+            )
+        };
+        let dirty = page.iter().filter(|&&b| b != 0).count();
+        if dirty != 0 {
+            FRM_DIRTY.fetch_add(dirty, Ordering::Relaxed);
+        }
+        page.fill(marker);
+        let bad = page.iter().filter(|&&b| b != marker).count();
+        if bad != 0 {
+            FRM_MISMATCH.fetch_add(bad, Ordering::Relaxed);
+        }
+        kernel::mm::frames::free(pa);
+        FRM_ROUNDS_DONE[slot].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn frames_hammer_primary() {
+    frames_hammer(0xA5, 0);
+}
+
+fn frames_hammer_secondary() {
+    frames_hammer(0x5A, 1);
+}
+
+/// One core's share of the churn pass. No page is touched, so almost all of the round is
+/// the operation being batched.
+fn frames_churn(slot: usize) {
+    for _ in 0..FRM_CHURN {
+        match kernel::mm::frames::alloc() {
+            Some(pa) => {
+                kernel::mm::frames::free(pa);
+                FRM_CHURN_DONE[slot].fetch_add(1, Ordering::Relaxed);
+            }
+            None => {
+                FRM_BAD.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+fn frames_churn_primary() {
+    frames_churn(0);
+}
+
+fn frames_churn_secondary() {
+    frames_churn(1);
+}
+
+fn test_shared_frames() {
+    assert_fresh_frame_is_zero();
+    FRM_DIRTY.store(0, Ordering::Release);
+    FRM_MISMATCH.store(0, Ordering::Release);
+    FRM_BAD.store(0, Ordering::Release);
+    for c in FRM_ROUNDS_DONE.iter() {
+        c.store(0, Ordering::Release);
+    }
+    let (free_before, _) = kernel::mm::frames::stats();
+    let (combined_before, _) = kernel::mm::frames::fc_stats();
+
+    let (met, finished) =
+        smp::run_fn_with_secondary(frames_hammer_secondary, frames_hammer_primary);
+    if !finished {
+        println!(
+            "smp: SKIP the shared-frames phase - the secondary did not finish inside the \
+             bound, so nothing about two cores in one frame allocator is claimed"
+        );
+        return;
+    }
+    assert!(
+        met && !smp::rendezvous_timed_out(),
+        "the two cores never met, so they did not allocate at the same time"
+    );
+
+    let (p, s) = (
+        FRM_ROUNDS_DONE[0].load(Ordering::Acquire),
+        FRM_ROUNDS_DONE[1].load(Ordering::Acquire),
+    );
+    assert_eq!(p, FRM_ROUNDS, "the primary lost rounds");
+    assert_eq!(s, FRM_ROUNDS, "the secondary lost rounds");
+    assert_eq!(
+        FRM_BAD.load(Ordering::Acquire),
+        0,
+        "the allocator refused a frame, or handed one out from outside the pool"
+    );
+    assert_eq!(
+        FRM_DIRTY.load(Ordering::Acquire),
+        0,
+        "a freshly allocated frame held nonzero bytes while two cores were allocating"
+    );
+    // The headline: no byte of either core's frame ever held the other's marker.
+    assert_eq!(
+        FRM_MISMATCH.load(Ordering::Acquire),
+        0,
+        "bytes of one core's frame held the other core's marker - the allocator gave both \
+         cores the same frame"
+    );
+    assert!(
+        kernel::mm::frames::used_matches_bitmap(),
+        "the used counter and the bitmap disagree after two cores allocated at once"
+    );
+    let (free_after, _) = kernel::mm::frames::stats();
+    assert_eq!(
+        free_after, free_before,
+        "the phase leaked frames: {free_before} free before, {free_after} after"
+    );
+
+    println!(
+        "smp: TWO CORES ALLOCATED FRAMES at the same time - {} rounds each of \
+         alloc/zero-check/stamp/verify/free, 0 bytes of either core's frame ever holding \
+         the other's marker (so no frame was served twice), the used counter still \
+         matching the bitmap, and every frame returned OK",
+        FRM_ROUNDS
+    );
+
+    // ---- and now the same two cores, contending on the bookkeeping alone ----
+    for c in FRM_CHURN_DONE.iter() {
+        c.store(0, Ordering::Release);
+    }
+    let (met, finished) = smp::run_fn_with_secondary(frames_churn_secondary, frames_churn_primary);
+    if !finished {
+        println!("smp: SKIP the frame-churn pass - the secondary did not finish in time");
+        return;
+    }
+    assert!(
+        met && !smp::rendezvous_timed_out(),
+        "the two cores never met"
+    );
+    let (cp, cs) = (
+        FRM_CHURN_DONE[0].load(Ordering::Acquire),
+        FRM_CHURN_DONE[1].load(Ordering::Acquire),
+    );
+    assert_eq!(cp, FRM_CHURN, "the primary lost churn rounds");
+    assert_eq!(cs, FRM_CHURN, "the secondary lost churn rounds");
+    assert!(
+        kernel::mm::frames::used_matches_bitmap(),
+        "the used counter and the bitmap disagree after the churn pass"
+    );
+    let (free_end, _) = kernel::mm::frames::stats();
+    assert_eq!(
+        free_end, free_before,
+        "the churn pass leaked frames: {free_before} free before, {free_end} after"
+    );
+
+    let (combined, withdrawn) = kernel::mm::frames::fc_stats();
+    let combined = combined - combined_before;
+    // Reported, never asserted. A count of zero is a legal schedule - it means the two
+    // cores never wanted the structure at the same instant, which one core running its
+    // whole share before the other starts produces, and TCG interleaves coarsely. An
+    // assertion that can fail on a legal schedule is not a proof.
+    //
+    // The number also stays modest **by design**, and that is the point rather than a
+    // disappointment: the critical section is now a bitmap word and three fields, with
+    // the 4 KiB zeroing outside it, so there is very little window left for a second
+    // core to arrive in. Combining is what handles the window that remains; shortening
+    // the window is what removed most of it.
+    println!(
+        "smp: ...then {} churn rounds each (alloc/free, no page touched) with the counter \
+         still matching the bitmap and no frame leaked - {} request(s) across both passes \
+         were executed by the OTHER core's combiner, {} withdrawn OK",
+        FRM_CHURN, combined, withdrawn
+    );
+}
+
 // ----------------------------------------- a CELL asks which vcore it is (SYS_VCORE_INFO)
 //
 // The runtime half below indexes every per-vcore structure by the vcore's own number, and a
@@ -2361,7 +2900,7 @@ fn test_vcore_identity() {
             core::mem::MaybeUninit::uninit();
         let f = core::ptr::addr_of_mut!(IFRAME);
         (*f).write(arch::trapframe_new(
-            kernel::user_progs::user_vcore_id as usize,
+            kernel::user_progs::user_vcore_id as *const () as usize,
             stack1 + stack1_len,
             params1,
             (*core::ptr::addr_of!(KSTACK_I1)).top(),
@@ -2490,7 +3029,7 @@ fn test_loaded_multi_vcore_cell() {
         let sp1 = load::map_vcore_stack(&mut aspace, 1);
 
         // A capability per ring: vcore 1 does not get a second handle on vcore 0's.
-        let mut cap_of = |objects: &mut ObjectTable, caps: &mut CapTable| {
+        let cap_of = |objects: &mut ObjectTable, caps: &mut CapTable| {
             let o = objects
                 .create(kernel::capability::ObjectKind::QueuePair)
                 .expect("a queue object");
@@ -2625,10 +3164,10 @@ fn strand_reset() {
 /// the executor genuinely interleaves them rather than running each to completion inside
 /// its first poll.
 fn strand_fill() {
-    for i in 0..STRAND_WORK {
+    for slot in STRAND_RAN.iter() {
         runtime::strand::spawn_shared(async move {
             runtime::strand::yield_now().await;
-            STRAND_RAN[i].fetch_add(1, Ordering::AcqRel);
+            slot.fetch_add(1, Ordering::AcqRel);
         });
     }
 }
@@ -2808,12 +3347,8 @@ fn test_cross_core_preemption() {
             );
             return;
         }
-        for i in 0..PLACED {
-            assert_eq!(
-                out[i].0,
-                (i + 1) as u64,
-                "cell {i} exited with the wrong code"
-            );
+        for (i, o) in out.iter().enumerate() {
+            assert_eq!(o.0, (i + 1) as u64, "cell {i} exited with the wrong code");
         }
 
         let (armed, taken, unarmable, to_sibling, to_cell) = preempt::counters();
@@ -3521,17 +4056,20 @@ fn test_funded_contexts() {
         // them is per context (docs/EXECUTION-MODEL.md 9.3):
         //
         //  - its FP save area, one frame each, always; and
-        //  - a share of the cell's funded context table, which is a directory frame plus one
-        //    data page, allocated on the **first** context past vcore 0 and then reused - a
-        //    `Vcore` is 48 bytes, so one page holds 85 of them.
+        //  - a share of the cell's funded context table: one data page, allocated on the
+        //    **first** context past vcore 0 and then reused - a `Vcore` is 48 bytes, so one
+        //    page holds 85 of them. The table's directory is inline in the struct
+        //    (`kmeta::INLINE_PAGES`), so no directory frame is charged at this size - this
+        //    constant was 2 when the directory was its own frame, and the drop to 1 is
+        //    itself evidence the inline tier is in use.
         //
         // Measuring one batch would conflate the two and could not tell "the table is
         // amortised" from "every context allocates a table". So the first context is measured
-        // alone (1 area + 2 table = 3) and the next five together (5 areas + 0 table = 5), and
+        // alone (1 area + 1 table = 2) and the next five together (5 areas + 0 table = 5), and
         // the second number is the one that says the marginal cost of a context is one frame -
         // which is what makes "the ceiling is the cell's budget" a statement about frames
         // rather than a slogan.
-        const TABLE_FRAMES: usize = 2;
+        const TABLE_FRAMES: usize = 1;
         user::install_vcore(0, core::ptr::addr_of_mut!(frame), (*store).qp.qp.as_ptr());
         let after_first = used_frames();
         for _ in 1..EXTRA {
@@ -3643,4 +4181,206 @@ fn test_funded_contexts() {
             println!("smp: SKIP the trace phase - the pool refused the event ring");
         }
     }
+}
+
+// ---------------------------------------------------------------- per-CPU event rings
+//
+// The claim `kernel::trace` could not make. Its ring was one shared buffer behind one
+// shared counter, and its own header said so: "single-CPU today ... deliberately not
+// copied here until a multi-core boot wants to trace". This is that boot.
+//
+// What two cores make provable that one cannot:
+//
+//  1. **Each core writes its own ring.** With a shared buffer, two producers interleave
+//     into one slot array and the result is not "slower" - it is records containing one
+//     core's timestamp and the other's payload, with no fault and no log.
+//  2. **Each core has its own sequence counter.** A shared counter makes the numbers
+//     globally unique and therefore *not* consecutive per stream, so the host tool's
+//     loss detection - which is a per-stream gap check - reports gaps that are not
+//     there. A diagnostic that cries wolf is worse than no diagnostic.
+//
+// Both are properties of the *partitioning*, so the phase asserts them as counts and
+// contents per ring rather than as a total.
+
+/// Events each core records in this phase. Small: the claim is which ring took them
+/// and in what order, not how many fit.
+const RING_EVENTS_EACH: u64 = 64;
+
+/// The secondary's baseline `written()`, taken after it funds and before it emits, so
+/// funding's own kmeta events cannot be mistaken for the payload.
+static SEC_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Whether the secondary's ring funded at all.
+static SEC_FUNDED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Which CPU index the secondary emitted from, read from its own per-CPU identity.
+static SEC_CPU: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// What the secondary does: fund its own ring, then record `RING_EVENTS_EACH` events
+/// tagged so they cannot be confused with the primary's.
+///
+/// `fn()` with no arguments because that is what crosses cores through a static - a
+/// captured environment would be a borrow this side cannot prove outlives the other
+/// core (`smp::run_fn_with_secondary`).
+fn secondary_records() {
+    use core::sync::atomic::Ordering;
+    use kernel::obs::{self, Kind, Window};
+
+    // Funding allocates, and allocation is traced, so the kmeta events it produces
+    // land in `unfunded` (capacity is published last, on purpose) or in this ring
+    // depending on ordering. A baseline read here rather than an assumption of zero is
+    // what makes the payload count exact either way.
+    let ok = obs::fund_this_cpu();
+    SEC_FUNDED.store(usize::from(ok), Ordering::Release);
+    if !ok {
+        return;
+    }
+    let cpu = kernel::smp::cpu_index();
+    SEC_CPU.store(cpu, Ordering::Release);
+    // SAFETY: this core's own ring.
+    let base = unsafe { obs::ring_of(cpu) }.written();
+    SEC_BASE.store(base, Ordering::Release);
+    for i in 0..RING_EVENTS_EACH {
+        // Owner `1` and `b = 1` mark these as the secondary's, so a record found in
+        // the wrong ring is identifiable from its contents rather than only from a
+        // count - the `regstress.c` discipline of keying every value on its writer.
+        obs::emit(Window::Entity, Kind::Note, 1, i, 1);
+    }
+}
+
+/// What the primary does at the same instant: record its own events into its own ring.
+fn primary_records() {
+    use kernel::obs::{self, Kind, Window};
+    for i in 0..RING_EVENTS_EACH {
+        obs::emit(Window::Entity, Kind::Note, 0, i, 0);
+    }
+}
+
+fn test_percpu_event_rings() {
+    use core::sync::atomic::Ordering;
+    use kernel::obs;
+
+    // Enable on the primary, which funds the primary's ring. The secondary funds its
+    // own inside its job - deliberately not at bring-up, because a facility that is
+    // off must not take 17 frames per core from every boot that never asks for it.
+    if !obs::enable() {
+        println!("smp: SKIP the per-CPU ring phase - the pool refused the primary's ring");
+        return;
+    }
+    let p_cpu = kernel::smp::cpu_index();
+    // SAFETY: this core's own ring, before any secondary is running its job.
+    let p_base = unsafe { obs::ring_of(p_cpu) }.written();
+
+    let (met, done) = kernel::smp::run_fn_with_secondary(secondary_records, primary_records);
+    assert!(
+        done,
+        "the secondary did not finish recording - nothing can be concluded about two rings"
+    );
+    if SEC_FUNDED.load(Ordering::Acquire) == 0 {
+        obs::reset();
+        println!("smp: SKIP the per-CPU ring phase - the pool refused the secondary's ring");
+        return;
+    }
+    let s_cpu = SEC_CPU.load(Ordering::Acquire);
+    let s_base = SEC_BASE.load(Ordering::Acquire);
+    assert_ne!(
+        s_cpu, p_cpu,
+        "the 'secondary' recorded from the primary's CPU index, so this phase is one \
+         core twice and proves nothing about two rings"
+    );
+
+    // 1. Two rings, each holding exactly its own core's events.
+    //
+    // Exact, and that is the point: a shared buffer would give one ring 128 records
+    // and the other none, which is the defect stated as an arithmetic fact.
+    // SAFETY: cross-core reads of rings whose writers have finished.
+    let (pr, sr) = unsafe { (obs::ring_of(p_cpu), obs::ring_of(s_cpu)) };
+    assert_eq!(
+        pr.written() - p_base,
+        RING_EVENTS_EACH,
+        "the primary's ring took {} of its {RING_EVENTS_EACH} events",
+        pr.written() - p_base
+    );
+    assert_eq!(
+        sr.written() - s_base,
+        RING_EVENTS_EACH,
+        "the secondary's ring took {} of its {RING_EVENTS_EACH} events",
+        sr.written() - s_base
+    );
+
+    // 2. Each core's records are in its **own** ring, identified by content.
+    //
+    // A count alone would pass on two rings that each took 64 records of the wrong
+    // core's - which is exactly what one shared buffer split by a shared counter
+    // produces.
+    for (name, r, base, want_owner) in [
+        ("primary", pr, p_base, 0u16),
+        ("secondary", sr, s_base, 1u16),
+    ] {
+        for i in 0..RING_EVENTS_EACH {
+            let e = r
+                .get(base + i)
+                .unwrap_or_else(|| panic!("{name} ring is missing event {i}"));
+            assert_eq!(
+                e.owner, want_owner,
+                "the {name} ring holds a record owned by {} at index {i} - the two \
+                 cores wrote into one buffer",
+                e.owner
+            );
+            assert_eq!(
+                e.b, want_owner as u64,
+                "{name} ring event {i} has the wrong tag"
+            );
+            assert_eq!(e.a, i, "{name} ring event {i} carries a={}", e.a);
+        }
+    }
+
+    // 3. Each ring's sequence numbers are **consecutive within that ring**.
+    //
+    // This is the property the host tool's loss detection rests on, and the one a
+    // shared counter destroys: with one counter the numbers are globally unique, so
+    // every stream has holes and every boot reports loss that did not happen.
+    for (name, r, base) in [("primary", pr, p_base), ("secondary", sr, s_base)] {
+        let mut prev = r
+            .get(base)
+            .unwrap_or_else(|| panic!("{name} ring event 0 missing"))
+            .seq;
+        for i in 1..RING_EVENTS_EACH {
+            let seq = r.get(base + i).unwrap().seq;
+            assert_eq!(
+                seq,
+                prev.wrapping_add(1),
+                "{name} ring: seq {prev} is followed by {seq}, so this stream has a gap \
+                 the host tool would report as loss"
+            );
+            prev = seq;
+        }
+    }
+
+    // And the two rings genuinely used the same numbers, which is what "per-CPU
+    // counter" means and what a shared counter cannot produce.
+    assert_eq!(
+        pr.get(p_base).unwrap().seq - p_base as u32,
+        sr.get(s_base).unwrap().seq - s_base as u32,
+        "the two rings' first sequence numbers do not agree, so the counter is shared"
+    );
+
+    let (total, unfunded) = obs::counters();
+    println!(
+        "smp: PER-CPU EVENT RINGS - cpu{p_cpu} and cpu{s_cpu} each recorded \
+         {RING_EVENTS_EACH} event(s) into its OWN ring, each stream's sequence numbers \
+         consecutive and each record found in the ring of the core that wrote it \
+         (rendezvous {}, {total} total, {unfunded} offered to an unfunded ring) OK",
+        if met { "held" } else { "timed out" }
+    );
+
+    let before_reset = kernel::mm::frames::stats().0;
+    obs::reset();
+    let after_reset = kernel::mm::frames::stats().0;
+    assert!(
+        after_reset > before_reset,
+        "reset gave no frames back, yet two rings were funded"
+    );
+    println!(
+        "smp: both rings released, {} frame(s) returned OK",
+        after_reset - before_reset
+    );
 }

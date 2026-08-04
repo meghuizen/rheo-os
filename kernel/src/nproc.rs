@@ -778,7 +778,9 @@ pub fn yield_cell(cur: usize) -> Sched {
     // hard-float cell's hand-off point (docs/LIBRHEO.md, docs/ENGINEERING.md 3),
     // and a service cell reaches it on every client round.
     let v = runnable_vcore(next).expect("`schedulable` required an enterable vcore");
+    crate::metrics::bracket_start(crate::metrics::Metric::SwitchNs);
     user::switch_native_cell_vcore(cur, next, v);
+    crate::metrics::bracket_end(crate::metrics::Metric::SwitchNs);
     crate::sched::dispatch::running(next, 0);
     complete_block(next, v);
     Sched::Switch(user::vcore_frame(next, v))
@@ -1000,7 +1002,9 @@ fn reschedule(leaving: usize) -> *mut TrapFrame {
                 // Save the outgoing cell's live FP/SIMD state (harmless if it is
                 // exiting) and load the incoming context's - the native analogue of the
                 // Linux personality's `thread::save_current_fp`/`restore_current`.
+                crate::metrics::bracket_start(crate::metrics::Metric::SwitchNs);
                 user::switch_native_cell_vcore(leaving, n, v);
+                crate::metrics::bracket_end(crate::metrics::Metric::SwitchNs);
             } else if v != user::current_vcore() {
                 // Same cell, different context: the cheap switch - no `activate()`,
                 // only the FP file and the frame.

@@ -18,6 +18,10 @@
 //! register, arguments in the argument registers, return value back in the first
 //! one. See each arch's `decode_syscall` / `set_syscall_ret`.
 
+/// The observability plane's layout (docs/OBSERVABILITY.md). A module rather
+/// than a flat re-export because a host tool names it the same way.
+pub use rheo_abi::obs;
+
 pub use rheo_abi::{
     BufReduceDesc, CAP_KIND_CELL, CAP_KIND_FILE, CAP_KIND_MEMORY_GRANT, CAP_KIND_QUEUE_PAIR,
     CAP_KIND_RESERVATION, CAP_KIND_STREAM, CapInfo, ChannelInfo, CpuFeatures, DEADLOCK_EXIT,

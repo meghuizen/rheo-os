@@ -31,6 +31,9 @@ static mut HEAP_MEM: [u8; 2 * 1024 * 1024] = [0; 2 * 1024 * 1024];
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
     kernel::boot::init();
+    // The distribution plane (docs/OBSERVABILITY.md 11, S6): every cache miss
+    // below is a device read through the one BlockNs seam - asserted before PASS.
+    kernel::metrics::enable();
     println!("blockfs: start on {}", arch::NAME);
 
     // SAFETY: once, before any allocation; HEAP_MEM is a unique static.
@@ -112,6 +115,16 @@ extern "C" fn kernel_main() -> ! {
          {fills} line fills through a {}-KiB cache over a {}-KiB disk",
         BlockCache::<VirtioBlk>::CAPACITY / 1024,
         disk_bytes / 1024
+    );
+    let bl = kernel::metrics::local(kernel::metrics::Metric::BlockNs);
+    assert!(
+        bl.count() > 0,
+        "the cache filled from the device and Metric::BlockNs holds no samples - the recorder is dead"
+    );
+    println!(
+        "blockfs: BlockNs distribution - {} device read(s), mean {} ns OK",
+        bl.count(),
+        bl.mean()
     );
     println!("blockfs: PASS");
     arch::exit(arch::ExitCode::Success)

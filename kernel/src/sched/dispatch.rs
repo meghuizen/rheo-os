@@ -57,7 +57,6 @@
 use super::vcore::{Class, RunQueue, VcoreId};
 use crate::smp::PerCpu;
 use core::ptr::{addr_of, addr_of_mut};
-use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Whether the run queue drives the cell pick.
 ///
@@ -88,22 +87,13 @@ impl Running {
 
 static CURRENT: PerCpu<Running> = PerCpu::from_array([Running::NONE; crate::smp::MAX_CPUS]);
 
-/// Counters, so the seam's behaviour is observed rather than assumed
-/// (docs/ENGINEERING.md 1).
-///
-/// Atomics: every CPU dispatching a cell adds to these, so a `+= 1` on a plain
-/// static would silently lose counts once more than one core runs cells
-/// (docs/SMP.md 10.2). Relaxed - they order nothing, they only have to be right.
-static PICKS: AtomicU64 = AtomicU64::new(0);
-static RR_PICKS: AtomicU64 = AtomicU64::new(0);
-static DIVERGED: AtomicU64 = AtomicU64::new(0);
-static CHARGED_NS: AtomicU64 = AtomicU64::new(0);
-/// How many times the single return-to-user site was reached, and how many of those
-/// found no running record. Counted rather than reasoned about, because "the site is
-/// never reached" and "the site is reached and declines" are different defects and an
-/// unchanged `armed` count cannot tell them apart (docs/ENGINEERING.md 1).
-static REARM_CALLS: AtomicU64 = AtomicU64::new(0);
-static REARM_NO_RECORD: AtomicU64 = AtomicU64::new(0);
+// Counters, so the seam's behaviour is observed rather than assumed
+// (docs/ENGINEERING.md 1). They live in the observability plane's per-CPU blocks
+// (`obs::cpu`, S4): every CPU dispatching a cell counts on its **own** line -
+// cheaper than the relaxed `fetch_add`s these replaced (no locked RMW, no shared
+// line bouncing between dispatching cores) and correct for the same reason, one
+// writer per slot. The accessors below sum over CPUs, so every existing assertion
+// reads the same totals.
 
 /// Turn queue-driven dispatch on or off. Off is the pre-migration behaviour,
 /// exactly.
@@ -127,10 +117,10 @@ pub fn enabled() -> bool {
 /// finds it zero has learned that the queue is decorative.
 pub fn counters() -> (u64, u64, u64, u64) {
     (
-        PICKS.load(Ordering::Relaxed),
-        RR_PICKS.load(Ordering::Relaxed),
-        DIVERGED.load(Ordering::Relaxed),
-        CHARGED_NS.load(Ordering::Relaxed),
+        crate::obs::cpu_counter_sum(crate::obs::cpu::CTR_SCHED_PICKS),
+        crate::obs::cpu_counter_sum(crate::obs::cpu::CTR_SCHED_RR_PICKS),
+        crate::obs::cpu_counter_sum(crate::obs::cpu::CTR_SCHED_DIVERGED),
+        crate::obs::cpu_counter_sum(crate::obs::cpu::CTR_SCHED_CHARGED_NS),
     )
 }
 
@@ -149,15 +139,15 @@ pub fn reset() {
         // SAFETY: between runs, nothing else is running on any CPU.
         unsafe { *CURRENT.get_mut(cpu) = Running::NONE };
     }
-    for c in [
-        &PICKS,
-        &RR_PICKS,
-        &DIVERGED,
-        &CHARGED_NS,
-        &REARM_CALLS,
-        &REARM_NO_RECORD,
+    for slot in [
+        crate::obs::cpu::CTR_SCHED_PICKS,
+        crate::obs::cpu::CTR_SCHED_RR_PICKS,
+        crate::obs::cpu::CTR_SCHED_DIVERGED,
+        crate::obs::cpu::CTR_SCHED_CHARGED_NS,
+        crate::obs::cpu::CTR_SCHED_REARM_CALLS,
+        crate::obs::cpu::CTR_SCHED_REARM_NO_RECORD,
     ] {
-        c.store(0, Ordering::Relaxed);
+        crate::obs::cpu_counter_clear(slot);
     }
 }
 
@@ -165,8 +155,8 @@ pub fn reset() {
 /// distinguishes stage E5 not being reached from E5 being reached and declining.
 pub fn rearm_counters() -> (u64, u64) {
     (
-        REARM_CALLS.load(Ordering::Relaxed),
-        REARM_NO_RECORD.load(Ordering::Relaxed),
+        crate::obs::cpu_counter_sum(crate::obs::cpu::CTR_SCHED_REARM_CALLS),
+        crate::obs::cpu_counter_sum(crate::obs::cpu::CTR_SCHED_REARM_NO_RECORD),
     )
 }
 
@@ -369,10 +359,10 @@ pub fn rearm_remaining() {
 /// costs a load and a branch at the call site rather than a call.
 #[inline(never)]
 fn rearm_remaining_slow() {
-    REARM_CALLS.fetch_add(1, Ordering::Relaxed);
+    crate::obs::cpu_bump(crate::obs::cpu::CTR_SCHED_REARM_CALLS, 1);
     let rec = *CURRENT.this();
     if rec.id.is_none() {
-        REARM_NO_RECORD.fetch_add(1, Ordering::Relaxed);
+        crate::obs::cpu_bump(crate::obs::cpu::CTR_SCHED_REARM_NO_RECORD, 1);
         return;
     }
     // SAFETY: a short call on this CPU's own queue.
@@ -400,7 +390,7 @@ fn stop(voluntary: bool, still_runnable: bool) -> u64 {
     let q = unsafe { queue() };
     if delta > 0 {
         let _ = q.charge(id, delta);
-        CHARGED_NS.fetch_add(delta, Ordering::Relaxed);
+        crate::obs::cpu_bump(crate::obs::cpu::CTR_SCHED_CHARGED_NS, delta);
         if voluntary {
             // `BurstNs` is defined as "how long a vcore ran before *voluntarily*
             // relinquishing" - the distribution the burst score claims to
@@ -461,17 +451,46 @@ pub fn preempted() -> u64 {
 /// returned. That is not belt-and-braces: `sync_runnable` reconciles by (cell,
 /// context) and a cell with several contexts is runnable if *any* of them is, so a
 /// queue entry can legitimately be ready while the caller's predicate - which is
-/// per *cell* - has since changed its mind. Preferring the predicate keeps the
-/// old safety property exactly: a cell is only ever resumed when the personality
-/// says it may be.
+/// per *cell* - answered differently. Preferring the predicate keeps the old
+/// safety property exactly: a cell is only ever resumed when the personality says
+/// it may be.
+///
+/// **The predicate is asked once per cell per decision**, memoized for the rest of
+/// it. One pick used to evaluate it up to three times per cell - per queue entry
+/// in `sync_runnable` (a multi-context cell has several), once in the final
+/// filter, and up to once more in the divergence probe below - and the predicate
+/// can itself walk the cell's whole context table (`linux::proc`'s `any_ready`),
+/// so the repeats multiplied two table walks together. Nothing inside one pick
+/// mutates personality state (`sync_runnable` writes only the queue), so the memo
+/// is not a staleness trade: it makes the decision read **one** snapshot of
+/// runnability instead of several, which is what reconcile-at-the-pick means.
 pub fn pick<F: Fn(usize) -> bool>(leaving: usize, cells: usize, runnable: F) -> Option<usize> {
+    // 0 = not asked, 1 = no, 2 = yes. `Cell` because the closure is shared with
+    // `sync_runnable` as `Fn`; 16 bytes copied per query is nothing against the
+    // context-table walk it replaces.
+    let memo = core::cell::Cell::new([0u8; crate::user::MAX_CELLS]);
+    let runnable = |i: usize| {
+        let mut m = memo.get();
+        match m.get(i).copied() {
+            Some(1) => false,
+            Some(2) => true,
+            _ => {
+                let r = runnable(i);
+                if let Some(slot) = m.get_mut(i) {
+                    *slot = 1 + r as u8;
+                    memo.set(m);
+                }
+                r
+            }
+        }
+    };
     let round_robin = || {
         (1..=cells)
             .map(|k| (leaving + k) % cells)
             .find(|&i| runnable(i))
     };
     if !enabled() {
-        RR_PICKS.fetch_add(1, Ordering::Relaxed);
+        crate::obs::cpu_bump(crate::obs::cpu::CTR_SCHED_RR_PICKS, 1);
         return round_robin();
     }
     let now = now_ns();
@@ -483,9 +502,9 @@ pub fn pick<F: Fn(usize) -> bool>(leaving: usize, cells: usize, runnable: F) -> 
         let cell = v.cell as usize;
         runnable(cell).then_some(cell)
     });
-    PICKS.fetch_add(1, Ordering::Relaxed);
+    crate::obs::cpu_bump(crate::obs::cpu::CTR_SCHED_PICKS, 1);
     if chosen.is_some() && chosen != round_robin() {
-        DIVERGED.fetch_add(1, Ordering::Relaxed);
+        crate::obs::cpu_bump(crate::obs::cpu::CTR_SCHED_DIVERGED, 1);
     }
     // Falling back to round-robin when the queue has no answer is deliberate and
     // is not a silent divergence: the queue only holds cells something called

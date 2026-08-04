@@ -165,3 +165,51 @@ threshold / CPU-range checks, so breaking one left the other intact and the test
 intact one. Two places deciding one thing, with a test unable to tell - the defect class
 docs/EXECUTION-MODEL.md 1 exists for, reproduced inside the module written to demonstrate
 the fix. `push` delegates now, and the control fires.
+
+## bitmap/ - the free-frame search
+
+`verify/bitmap/fuzz.rs` drives `kernel/src/mm/bitmap.rs`, the allocator's free-frame
+search (docs/SMP.md 10.0g). It is here rather than in a boot test for a reason worth
+stating plainly: the search went from a bit-at-a-time loop to a word-at-a-time one,
+which is the *same answer* computed with four boundary conditions the old form did not
+have - the first word's low bits, the last word's high bits, both at once in a
+single-word range, and a range whose end is not a multiple of 64 - and every one of
+those is a case where being wrong is **silent**. A missed free bit is a spurious
+out-of-memory on a machine with free memory; a bit returned from outside `[lo, hi)` is
+a frame on the wrong NUMA node, which `alloc_on` then reports as correctly placed.
+Neither faults. A boot exercises a handful of bitmap shapes; this exercises 683,792.
+
+`bitmap.rs` was written dependency-free *for* this - no statics, no `crate::` paths,
+plain functions over a `&[u64]` - so it includes with no shim at all, which is the most
+of-the-shipped-code any driver here gets under test.
+
+The oracle is the **pre-change algorithm**, written out again here rather than
+refactored out of the shipped one: a disagreement therefore means the optimisation
+changed an answer, which is the entire question. Beside it, two properties that hold
+even if the reference were also wrong - whatever comes back is inside the requested
+range, and it is actually free.
+
+Five sections: 16 hand-computed boundaries (each also checked *against* the reference,
+so a wrong expected value in the table is caught rather than enshrined), 320,000 random
+`find_in`/`find_from` cases across densities from empty to full, 32,000 random
+`find_run`, and then **every 8-bit map exhaustively** over every `(nbits, lo, hi)` -
+the one part that proves rather than tests.
+
+| Change to `bitmap.rs` | Result |
+|---|---|
+| `low_mask` loses its `b >= 64` arm (`1 << (b % 64)`) | 2 named boundaries + thousands of random cases, all `got None want Some(_)` |
+| the `hi` mask dropped | `single-bit range, taken` + "returned N outside [lo, hi) - on the NUMA path this is a frame on another node reported as placed" |
+
+A sixth section reports the **cost**, and it is here rather than in `cargo xtask bench`
+because the bench suite cannot see this change at all: the benches allocate from a
+nearly-empty pool, where the rotating hint points straight at a free frame and both
+algorithms stop on the first candidate. The win is on a *full* region - what `alloc_on`
+faces once a NUMA node fills - and it is a step count, not an instruction count. Both
+numbers are exact rather than sampled, since a bit-at-a-time scan examines every bit up
+to and including the first free one and a word-at-a-time scan examines every word up to
+that bit's: at 50/75/90/99% full over a 65,536-frame node that is 32,769/49,153/58,983/
+64,881 bits against 513/769/922/1,014 words, **63x fewer steps**.
+
+Wall clock was tried and is **not** reported: the `numa` kernel's boot went 11.6 s to
+10.7 s, which is one sample of a boot that does far more than the run-dry phase, under
+an emulator. The step count is what this container can defend.

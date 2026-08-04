@@ -395,11 +395,28 @@ pass unedited), and carries a three-ISA proof observed to fail when reverted.
   and offline verification are `SECURITY-IDENTITY.md`'s subject and stay
   future work; ID5 builds the single-host half against that shape so it
   extends rather than gets replaced.
-- **Hardware root of trust.** `BOOT.md` §1 requires TPM or DICE. QEMU here
-  offers neither, so the measurement chain is rooted in the kernel's own image
-  hash and that limit is stated wherever a principal is reported - a measured
-  principal without a hardware root proves *what* is running, not that the
-  measurement itself was not tampered with before the kernel started.
+- **Hardware root of trust.** `BOOT.md` §1 requires TPM or DICE. A TPM 2.0
+  is now present and driven here - `kernel/src/hw/tpm.rs` speaks FIFO/TIS and
+  `TPM2_GetRandom` against a real `swtpm` backend on all three ISAs
+  (docs/TIME-IDENTITY.md 4a) - so the deferral narrows: the *hardware* exists,
+  and what is not built is the trust chain over it (PCR extend/quote, sealed
+  keystores). Until that lands the measurement chain stays rooted in the
+  kernel's own image hash and that limit is stated wherever a principal is
+  reported - a measured principal without a hardware-rooted chain proves
+  *what* is running, not that the measurement itself was not tampered with
+  before the kernel started.
+- **Kernel-mediated signing (the Ethos precedent - comparison/ethos/).**
+  Ethos implements signing as a syscall where applications never hold private
+  keys and kernel policy names *which application may sign which kind of
+  statement*. Three notes bind that precedent to this design for whichever
+  phase builds a signing surface: (a) the apps-never-hold-keys shape is
+  already proven here in miniature - the per-cell DRBG is a library over
+  cell-owned state derived from a root the cell never sees; (b) "which kind
+  of statement" should be an IDL **type hash** (the Etypes idea), so signing
+  policy composes with the typed-channel work rather than inventing a second
+  naming scheme; (c) the keystore's sealing target is the TPM above. None of
+  this is buildable before the §9 prerequisites - a signing verb above an
+  uncapability-checked `svc` surface would be decoration.
 - **Login over the network.** sshd is a much later cell; ID5's login path is
   the console.
 - **Quotas and per-user resource accounting.** Reservations (object 7) are

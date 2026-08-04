@@ -312,6 +312,170 @@ extern "C" fn kernel_main() -> ! {
         kernel::rng::entropy::absorb(kernel::rng::entropy::Source::User, echunk, 0);
     });
 
+    // -------------------------------------------- the observability event plane
+    // The claim the whole framework rests on is "it cannot make the kernel much
+    // slower" (docs/OBSERVABILITY.md 11.4), and that has two halves, both of which
+    // have to be numbers rather than assertions.
+    //
+    // `obs_emit_off` is the half that matters most, because it is what every kernel
+    // in the tree pays whether or not it ever looks at telemetry: a window that is
+    // off should cost one relaxed load of a fixed address, one `and` and one
+    // not-taken branch. It is measured because the first version of this cost
+    // **eight** instructions instead of three - the compiler had hoisted a cold
+    // call's register setup in front of the branch meant to skip it, which no amount
+    // of reading the source would have shown.
+    //
+    // `obs_emit_on` is what a boot that *does* enable a window pays per event, so a
+    // deployment can decide what it can afford instead of guessing.
+    {
+        use kernel::obs::{Kind, Window};
+        // A window that is deliberately *not* the one being emitted, so the mask test
+        // fails the way it does on a real disabled path.
+        kernel::obs::set_windows(Window::Lock.bit());
+        bench("obs_emit_off", || {
+            kernel::obs_event!(
+                Window::Queue,
+                Kind::Note,
+                0,
+                core::hint::black_box(1u64),
+                core::hint::black_box(2u64)
+            );
+        });
+        if kernel::obs::enable_windows(Window::Queue.bit()) {
+            bench("obs_emit_on", || {
+                kernel::obs_event!(
+                    Window::Queue,
+                    Kind::Note,
+                    0,
+                    core::hint::black_box(1u64),
+                    core::hint::black_box(2u64)
+                );
+            });
+        }
+        kernel::obs::reset();
+    }
+
+    // ------------------------------------------------- the funded-table hot path
+    // `mm::kmeta::Funded` sits on scheduler-hot paths - the entity table is read on
+    // every pick, park and wake, the vcore queue on every dispatch, the Linux VMA
+    // list on every fault - so its per-access cost cascades into everything above
+    // it (docs/SUBSTRATE.md pillar 1). Four shapes, so an optimisation cannot look
+    // good on one and quietly move the cost to another:
+    //
+    //  - `funded_get_64B`: a 64-byte element (the entity table's shape; a
+    //    power-of-two count per page, so the index split is shift-and-mask).
+    //  - `funded_get_48B`: a 48-byte element (the vcore's shape; 85 per page, so
+    //    the index split is a divide-by-constant).
+    //  - `funded_get_deep`: the same table read on its 4th page, so a design that
+    //    only speeds up page 0 shows its regression here.
+    //  - `funded_scan_64`: the `(0..cap).filter_map(get)` loop the scheduler's
+    //    scan predicates actually run - per-access cost times the table.
+    {
+        use kernel::mm::kmeta::{Funded, Owner};
+        #[derive(Copy, Clone)]
+        struct E64([u64; 8]);
+        #[derive(Copy, Clone)]
+        struct E48([u64; 6]);
+        static mut T64: Funded<E64> = Funded::new();
+        static mut T48: Funded<E48> = Funded::new();
+        // SAFETY: single-threaded bench; unique statics.
+        let (t64, t48) = unsafe {
+            (
+                &mut *core::ptr::addr_of_mut!(T64),
+                &mut *core::ptr::addr_of_mut!(T48),
+            )
+        };
+        t64.set_owner(Owner::KERNEL);
+        t48.set_owner(Owner::KERNEL);
+        assert!(t64.reserve(64 * 4), "bench table refused"); // 4 pages of 64
+        assert!(t48.reserve(85 * 2), "bench table refused");
+        for i in 0..t64.capacity() {
+            t64.set(i, E64([i as u64; 8]));
+        }
+        for i in 0..t48.capacity() {
+            t48.set(i, E48([i as u64; 6]));
+        }
+        let mut acc = 0u64;
+        bench("funded_get_64B", || {
+            acc = acc.wrapping_add(t64.get(core::hint::black_box(7usize)).unwrap().0[0]);
+        });
+        bench("funded_get_48B", || {
+            acc = acc.wrapping_add(t48.get(core::hint::black_box(7usize)).unwrap().0[0]);
+        });
+        bench("funded_get_deep", || {
+            acc = acc.wrapping_add(t64.get(core::hint::black_box(64 * 3 + 5)).unwrap().0[0]);
+        });
+        bench("funded_set_64B", || {
+            t64.set(core::hint::black_box(9usize), E64([acc; 8]));
+        });
+        let mut hits = 0u64;
+        bench("funded_scan_64", || {
+            hits += (0..t64.capacity())
+                .filter_map(|i| t64.get(i))
+                .filter(|e| e.0[0] & 1 == 0)
+                .count() as u64;
+        });
+        // The same predicate over the iteration API: one page resolve per
+        // `elems_per_page` elements and reference-based reads, instead of a
+        // resolve and a 64-byte copy per element. The pair is the architecture
+        // measurement - scans are what the scheduler and the fault path actually
+        // run (docs/SUBSTRATE.md pillar 1), so this delta, not `funded_get_*`'s,
+        // is the one that cascades.
+        bench("funded_scan_iter", || {
+            hits += t64.iter().filter(|(_, e)| e.0[0] & 1 == 0).count() as u64;
+        });
+        core::hint::black_box((acc, hits));
+    }
+
+    // ------------------------------------------- the frame allocator's own paths
+    // The hottest shared structure in the kernel, and until this existed nothing in
+    // the bench suite touched it - so "flat combining cost the uncontended path two
+    // atomics" (docs/SMP.md 10.0g) was a claim about the source rather than a number.
+    //
+    // Read the two together, because the interesting thing is the ratio. `alloc_free`
+    // is the whole public operation and is dominated by the 4 KiB zeroing, which is
+    // the *point*: that zeroing used to be inside the pool lock, so its share of this
+    // number is the share of the critical section that was pure `memset`.
+    // `frame_claim_free` strips it out (`alloc_contig(1)` claims and zeroes the same
+    // one frame through the plain-lock path, so the difference between them is the
+    // batching machinery and the acquisition count, not the memset) - and the
+    // combining layer's whole cost has to be read against `alloc_free`, since that is
+    // what a caller pays.
+    //
+    // `alloc_on_free` is the NUMA path, three acquisitions collapsed into one. With
+    // no NUMA reported the node has no range and it degenerates to `alloc`, so on a
+    // single-node boot this measures the extra hop and nothing else.
+    {
+        bench("frame_alloc_free", || {
+            let pa = kernel::mm::frames::alloc().expect("bench: pool exhausted");
+            kernel::mm::frames::free(core::hint::black_box(pa));
+        });
+        bench("frame_alloc_on_free", || {
+            let pa = kernel::mm::frames::alloc_on(0).expect("bench: pool exhausted");
+            kernel::mm::frames::free(core::hint::black_box(pa));
+        });
+        bench("frame_contig1_free", || {
+            let pa = kernel::mm::frames::alloc_contig(1).expect("bench: pool exhausted");
+            kernel::mm::frames::free(core::hint::black_box(pa));
+        });
+        // The refcount pair a COW `fork` drives, and the resolve that replaced
+        // "refs then alloc" - two acquisitions where there were three.
+        let pa = kernel::mm::frames::alloc().expect("bench: pool exhausted");
+        bench("frame_share_free", || {
+            kernel::mm::frames::share(core::hint::black_box(pa));
+            kernel::mm::frames::free(pa);
+        });
+        bench("frame_cow_resolve_sole", || {
+            // One holder, so this is the Sole arm: a refcount read and no claim,
+            // which is the common case once a page has been privated.
+            core::hint::black_box(matches!(
+                kernel::mm::frames::cow_resolve(core::hint::black_box(pa)),
+                kernel::mm::frames::Cow::Sole
+            ));
+        });
+        kernel::mm::frames::free(pa);
+    }
+
     // ------------------------------------------------------------- P4
     // Strand spawn/teardown and context switch (docs/CONCURRENCY.md,
     // BUILD-ORDER step 7). These are the "light thread" path lengths: a

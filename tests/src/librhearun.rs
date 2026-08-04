@@ -88,6 +88,10 @@ static mut KSTACK: KStack = KStack([0; 64 * 1024]);
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
     kernel::boot::init();
+    // The distribution plane (docs/OBSERVABILITY.md 11, S6): the cell's 8 async
+    // echo round trips pass through the queue bridge, so Metric::QueueNs must
+    // hold at least 8 samples - asserted before PASS.
+    kernel::metrics::enable();
     println!("librhearun: start on {}", arch::NAME);
 
     // Seed the kernel DRBG (SYS_RANDOM, used once by librheo to seed its own).
@@ -148,6 +152,17 @@ extern "C" fn kernel_main() -> ! {
         Outcome::Faulted(addr) => panic!("librheo-demo faulted at {addr:#x}"),
     }
 
+    let q = kernel::metrics::local(kernel::metrics::Metric::QueueNs);
+    assert!(
+        q.count() >= 8,
+        "the cell completed 8 echo round trips and Metric::QueueNs holds {} sample(s)",
+        q.count()
+    );
+    println!(
+        "librhearun: QueueNs distribution - {} submission(s), mean {} ns OK",
+        q.count(),
+        q.mean()
+    );
     println!("librhearun: PASS");
     arch::exit(arch::ExitCode::Success)
 }

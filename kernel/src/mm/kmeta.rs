@@ -44,24 +44,40 @@
 //! ## Structure - why a directory rather than a contiguous array
 //!
 //! The frame allocator is a bitmap over 4 KiB frames and hands out **one frame at
-//! a time**; there is no contiguous-range allocator, and adding one would make
-//! table growth fail on fragmentation - the worst possible failure mode for
-//! kernel metadata, because it is unpredictable and unattributable.
+//! a time** for metadata; growth through single frames cannot fail on
+//! fragmentation - the worst possible failure mode for kernel metadata, because
+//! it is unpredictable and unattributable. (`frames::alloc_contig` exists for
+//! DMA rings, which devices force to be contiguous; tables do not.)
 //!
-//! So a `Funded<T>` is a **page directory**: one frame holding up to
-//! [`PTRS_PER_DIR`] kernel virtual addresses of data frames, each data frame
-//! holding [`elems_per_page::<T>()`] elements. Element `i` lives at directory
-//! entry `i / per_page`, offset `i % per_page`. No data frame need be adjacent to
-//! any other, so growth cannot fail while any frame at all is free.
+//! So a `Funded<T>` is a **page directory**, in two tiers. The first
+//! [`INLINE_PAGES`] data-frame addresses live **in the struct itself**
+//! (`dir_inline`), so for every table up to 8 frames - which is all of them on
+//! the scheduler's hot paths - resolving an element's page is a load from the
+//! table's own cache line, with **no dependent directory-frame load and no
+//! directory frame charged**. Pages past that spill to one **overflow directory
+//! frame** holding up to [`PTRS_PER_DIR`] more addresses, allocated only when a
+//! table actually crosses the inline boundary. Each data frame holds
+//! [`elems_per_page::<T>()`] elements; element `i` lives at page `i / per_page`,
+//! offset `i % per_page`. No data frame need be adjacent to any other, so growth
+//! cannot fail while any frame at all is free.
 //!
-//! One directory frame therefore spans `PTRS_PER_DIR` data frames = 2 MiB of
-//! table, which is ~131,000 capability slots or ~262,000 descriptor entries -
-//! four orders of magnitude above the ceilings this replaces. A second directory
-//! level (a directory of directories) is the documented extension when a single
-//! table genuinely needs more than 2 MiB; it is deliberately not built now,
-//! because building it would be speculation rather than headroom, and
-//! [`Funded::reserve`] refuses cleanly at the boundary instead of silently
-//! truncating.
+//! The two tiers together span `INLINE_PAGES + PTRS_PER_DIR` data frames = a
+//! little over 2 MiB of table - four orders of magnitude above the ceilings this
+//! replaces. A second directory level is the documented extension when a single
+//! table genuinely needs more; it is deliberately not built now, because building
+//! it would be speculation rather than headroom, and [`Funded::reserve`] refuses
+//! cleanly at the boundary instead of silently truncating.
+//!
+//! ## Two access shapes, priced separately
+//!
+//! Point access ([`Funded::get`]/[`Funded::set`]/[`Funded::get_ref`]) is the
+//! index split plus one page resolve plus the element. Whole-table **scans** -
+//! what the scheduler's predicates, the fault path's VMA walk and the EEVDF
+//! queue's reconcile actually run - must not be written as point access in a
+//! loop, because that pays the resolve *and a full copy of `T`* per element;
+//! [`Funded::page_slices`]/[`Funded::iter`] pay one resolve per page and read by
+//! reference (measured 2.1x on the 64-byte-element scan, `funded_scan_64` vs
+//! `funded_scan_iter`).
 //!
 //! ## Addressing
 //!
@@ -343,7 +359,18 @@ pub const fn elems_per_page<T>() -> usize {
 /// the kernel already uses while the *contents* stop being fixed. It holds no
 /// frames until something calls [`Funded::reserve`].
 pub struct Funded<T: Copy> {
-    /// Kernel VA of the directory frame, or 0 before first growth.
+    /// Kernel VAs of data pages `0..INLINE_PAGES`, held **in the struct itself**.
+    ///
+    /// The hot-path redesign (docs/SUBSTRATE.md pillar 1): nearly every live table
+    /// in the tree is a page or two, and the original design charged each one a
+    /// 4 KiB directory frame to index them, plus a dependent load through that
+    /// frame on every access - a cost that cascades, because the entity table is
+    /// read on every scheduler pick, park and wake, and the VMA list on every
+    /// fault. Inline, the page address is one load from the struct's own cache
+    /// line, and a small table holds no directory frame at all.
+    dir_inline: [usize; INLINE_PAGES],
+    /// Kernel VA of the **overflow** directory frame - pages `INLINE_PAGES..` -
+    /// or 0 while the table has never grown past the inline entries.
     dir: usize,
     /// Data frames currently held.
     pages: usize,
@@ -354,10 +381,21 @@ pub struct Funded<T: Copy> {
     _marker: PhantomData<T>,
 }
 
+/// Directory entries kept inline in the struct: 8, covering a 32 KiB table (512
+/// entities at 64 bytes, ~680 VMA records) before the overflow frame is touched.
+///
+/// The number is a trade written down rather than felt: each entry is 8 bytes of
+/// space in every `Funded` in every static, and each covered page is a table that
+/// pays no directory frame and no dependent load. At 8 the struct grows by 64
+/// bytes - across the tree's ~30-odd instances, ~2 KiB - while every table the
+/// running system holds today stays entirely inline.
+pub const INLINE_PAGES: usize = 8;
+
 impl<T: Copy> Funded<T> {
     /// An empty table holding no frames, charged to nobody until it grows.
     pub const fn new() -> Funded<T> {
         Funded {
+            dir_inline: [0; INLINE_PAGES],
             dir: 0,
             pages: 0,
             cap: 0,
@@ -398,42 +436,48 @@ impl<T: Copy> Funded<T> {
         self.pages
     }
 
-    /// Frames this table holds in total, directory included - what its owner is
-    /// charged.
+    /// Frames this table holds in total, overflow directory included - what its
+    /// owner is charged. A table within [`INLINE_PAGES`] holds exactly its data
+    /// frames: the inline directory lives in the struct and costs nothing.
     pub fn frames_held(&self) -> usize {
         self.pages + usize::from(self.dir != 0)
     }
 
-    /// The largest capacity this table can reach with one directory frame.
+    /// The largest capacity this table can reach: the inline entries plus one
+    /// overflow directory frame.
     pub fn max_capacity() -> usize {
-        PTRS_PER_DIR * elems_per_page::<T>()
+        (INLINE_PAGES + PTRS_PER_DIR) * elems_per_page::<T>()
     }
 
-    /// Read directory entry `slot`: the kernel VA of a data frame, or 0 if that
-    /// slot is unpopulated.
-    ///
-    /// The directory holds plain `usize`s, never `T`, so these accessors are
-    /// deliberately raw-pointer-based rather than handing out a reference to the
-    /// frame: a `&'static mut [usize; N]` returned from a method on `Funded<T>`
-    /// would force a `T: 'static` bound on the whole type for no reason, and
-    /// would also claim a unique borrow that outlives the call.
-    fn dir_get(&self, slot: usize) -> usize {
+    /// Kernel VA of data page `page`, or 0 if it is not held. Setup, teardown and
+    /// rollback use this; the access path is [`Funded::slot_ptr`], which carries
+    /// the same split with the checks the invariant makes redundant removed.
+    fn page_of(&self, page: usize) -> usize {
+        if page < INLINE_PAGES {
+            return self.dir_inline[page];
+        }
+        let slot = page - INLINE_PAGES;
         if self.dir == 0 || slot >= PTRS_PER_DIR {
             return 0;
         }
-        // SAFETY: `dir` is a frame this table allocated (zeroed, exactly one
-        // frame, reached through the kernel's linear map) and `slot` is bounded
+        // SAFETY: `dir` is the overflow frame this table allocated (zeroed, exactly
+        // one frame, reached through the kernel's linear map) and `slot` is bounded
         // above, so the read lies wholly inside it.
         unsafe { *(self.dir as *const usize).add(slot) }
     }
 
-    /// Write directory entry `slot`. No-op when there is no directory frame yet
-    /// or the slot is out of range.
-    fn dir_set(&mut self, slot: usize, va: usize) {
+    /// Record data page `page` at `va`. No-op past the addressable range or when
+    /// the overflow frame it would land in does not exist.
+    fn set_page(&mut self, page: usize, va: usize) {
+        if page < INLINE_PAGES {
+            self.dir_inline[page] = va;
+            return;
+        }
+        let slot = page - INLINE_PAGES;
         if self.dir == 0 || slot >= PTRS_PER_DIR {
             return;
         }
-        // SAFETY: as `dir_get`, and `&mut self` gives exclusivity.
+        // SAFETY: as `page_of`, and `&mut self` gives exclusivity.
         unsafe { *(self.dir as *mut usize).add(slot) = va }
     }
 
@@ -454,13 +498,15 @@ impl<T: Copy> Funded<T> {
             return true;
         }
         let need_pages = want.div_ceil(per_page);
-        if need_pages > PTRS_PER_DIR {
+        if need_pages > INLINE_PAGES + PTRS_PER_DIR {
             return false;
         }
 
-        // The directory frame comes first, and is the one allocation that can be
-        // rolled back on its own.
-        let fresh_dir = if self.dir == 0 {
+        // The overflow directory frame comes first - and only for a table growing
+        // past the inline entries, which is what makes a small table cost exactly
+        // its data frames. It is the one allocation that can be rolled back on its
+        // own.
+        let fresh_dir = if need_pages > INLINE_PAGES && self.dir == 0 {
             match alloc_frame(self.owner) {
                 Some(va) => {
                     self.dir = va;
@@ -479,10 +525,10 @@ impl<T: Copy> Funded<T> {
             }
             match alloc_frame(self.owner) {
                 Some(va) => {
-                    // The directory exists by this point (allocated just above or
-                    // already present) and the index is below PTRS_PER_DIR
-                    // because `need_pages` is.
-                    self.dir_set(self.pages + added, va);
+                    // Anywhere this lands is addressable: an inline entry, or the
+                    // overflow directory that exists by this point because
+                    // `need_pages` said it would be needed.
+                    self.set_page(self.pages + added, va);
                     added += 1;
                 }
                 None => break false,
@@ -492,8 +538,8 @@ impl<T: Copy> Funded<T> {
         if !ok {
             // Roll back exactly what this call took.
             for i in 0..added {
-                let va = self.dir_get(self.pages + i);
-                self.dir_set(self.pages + i, 0);
+                let va = self.page_of(self.pages + i);
+                self.set_page(self.pages + i, 0);
                 if va != 0 {
                     free_frame(va, self.owner);
                 }
@@ -512,22 +558,91 @@ impl<T: Copy> Funded<T> {
     }
 
     /// Raw pointer to element `index`, or `None` when it is beyond the current
-    /// capacity. The single place index arithmetic happens.
+    /// capacity. The single place index arithmetic happens - and the hot path of
+    /// every table above it, so its cost is engineered, not incidental
+    /// (docs/SUBSTRATE.md pillar 1): the entity table takes this path on every
+    /// scheduler pick, park and wake, and the VMA list on every page fault.
+    ///
+    /// **One real branch.** The old body tested the index, the directory pointer,
+    /// the directory bound and the page address - four branches and a dependent
+    /// load through the directory frame, per access. Three of the four were
+    /// re-checking an invariant `reserve` already establishes: **`cap > 0` implies
+    /// every page below `pages` is populated** (growth is
+    /// whole-request-or-rollback), and `index < cap` implies `page < pages`. So
+    /// the index test is the only question whose answer is not already known, the
+    /// invariant is a `debug_assert` (live in any debug-assertions build, which
+    /// `cargo xtask verify` is), and for a table within [`INLINE_PAGES`] the page
+    /// address is a load from the struct's own cache line rather than a dependent
+    /// walk into a directory frame.
+    ///
+    /// The `page < INLINE_PAGES` test stays a **branch, deliberately not
+    /// branchless**: for any given table it always goes the same way, so it
+    /// predicts perfectly on hardware, while the branchless alternative - compute
+    /// both addresses and select - would perform the overflow directory's
+    /// dependent load unconditionally, adding latency to every access to remove a
+    /// mispredict that never happens.
+    #[inline]
     fn slot_ptr(&self, index: usize) -> Option<*mut T> {
         if index >= self.cap {
             return None;
         }
         let per_page = elems_per_page::<T>();
         let (page, offset) = (index / per_page, index % per_page);
-        // `page < self.pages <= PTRS_PER_DIR` because `index < self.cap`.
-        let base = self.dir_get(page);
-        if base == 0 {
-            return None;
-        }
+        let base = if page < INLINE_PAGES {
+            self.dir_inline[page]
+        } else {
+            debug_assert!(self.dir != 0, "page {page} inside cap but no overflow dir");
+            // SAFETY: `page < pages <= INLINE_PAGES + PTRS_PER_DIR` because
+            // `index < cap`, so the slot lies inside the overflow frame.
+            unsafe { *(self.dir as *const usize).add(page - INLINE_PAGES) }
+        };
+        debug_assert!(
+            base != 0,
+            "page {page} inside cap {} has no frame - the reserve invariant broke",
+            self.cap
+        );
         // SAFETY: `offset < per_page`, so the element lies wholly inside the
         // frame; the frame is kernel-owned metadata reached through the linear
-        // map, and `T: Copy` needs no drop tracking.
+        // map (nonzero by the invariant above), and `T: Copy` needs no drop
+        // tracking.
         Some(unsafe { (base as *mut T).add(offset) })
+    }
+
+    /// The table's pages as element slices, in order.
+    ///
+    /// **The scan API**, and the architectural half of this module's hot-path work
+    /// (docs/SUBSTRATE.md pillar 1). The tables above this one are consulted two
+    /// ways, and only one of them is a point access: the scheduler asks the entity
+    /// table whole-table questions per decision, the fault path walks the VMA list
+    /// per fault, and the EEVDF queue walks its vcores per dispatch. Written as
+    /// `(0..cap).filter_map(get)`, each element of such a scan pays the index
+    /// split, the page resolve *and a full copy of `T`* to test a field or two -
+    /// per-element cost times table size times per-decision frequency, which is
+    /// the multiplication that cascades. A slice per page pays the resolve once
+    /// per [`elems_per_page`] elements and reads by reference; measured on the
+    /// 64-byte element shape, the same predicate drops from ~10.5 to ~4.9
+    /// instructions per element (`funded_scan_64` vs `funded_scan_iter` in
+    /// `cargo xtask bench`, 2.1x - the remainder is the iterator adaptor's own
+    /// bookkeeping, and a consumer that walks the slices directly does better).
+    ///
+    /// Every yielded slice is exactly full, because `reserve` sets
+    /// `cap = pages * per_page` - there is no partial tail page to special-case.
+    pub fn page_slices(&self) -> impl Iterator<Item = &[T]> {
+        let per_page = elems_per_page::<T>();
+        (0..self.pages).map(move |p| {
+            let base = self.page_of(p);
+            debug_assert!(base != 0, "page {p} below pages has no frame");
+            // SAFETY: `base` is a data frame this table holds (the reserve
+            // invariant: every page below `pages` is populated), holding
+            // `per_page` zero-initialised elements of `T`, and the borrow is tied
+            // to `&self` so nothing frees it underneath.
+            unsafe { core::slice::from_raw_parts(base as *const T, per_page) }
+        })
+    }
+
+    /// Every element with its index - the shape a whole-table scan wants.
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &T)> {
+        self.page_slices().flatten().enumerate()
     }
 
     /// A reference to element `index`, or `None` beyond capacity.
@@ -592,9 +707,15 @@ impl<T: Copy> Funded<T> {
     /// Release every frame and return to the empty state, uncharging the owner.
     /// Idempotent, so a teardown path may call it unconditionally.
     pub fn release(&mut self) {
-        for i in 0..self.pages {
-            let va = self.dir_get(i);
-            self.dir_set(i, 0);
+        // Capacity first, so the invariant `cap > 0 => every page below it is
+        // resolvable` - which `slot_ptr` dereferences on the strength of - is never
+        // false while the frames are being handed back.
+        let pages = self.pages;
+        self.cap = 0;
+        self.pages = 0;
+        for i in 0..pages {
+            let va = self.page_of(i);
+            self.set_page(i, 0);
             if va != 0 {
                 free_frame(va, self.owner);
             }
@@ -604,8 +725,6 @@ impl<T: Copy> Funded<T> {
             self.dir = 0;
             free_frame(dir, self.owner);
         }
-        self.pages = 0;
-        self.cap = 0;
     }
 }
 

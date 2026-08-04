@@ -116,6 +116,11 @@ pub fn cpu_index() -> usize {
 /// The slot array is stored inside a single [`UnsafeCell`] because a core
 /// mutates its own slot through a shared reference. The safety obligation is the
 /// partitioning itself and is stated at each accessor.
+/// `repr(transparent)` because the observability root publishes the addresses of
+/// several `PerCpu` statics for a reader outside the guest to stride
+/// (docs/OBSERVABILITY.md), and that reader needs the container's layout to be the
+/// array's - guaranteed, rather than true today because there is one field.
+#[repr(transparent)]
 pub struct PerCpu<T> {
     slots: UnsafeCell<[T; MAX_CPUS]>,
 }
@@ -230,6 +235,9 @@ impl<T> PerCpu<T> {
 /// docs/CONCURRENCY.md 6).
 pub struct SpinLock<T> {
     locked: AtomicBool,
+    /// [`crate::obs::lock::LockId`] as a byte; 0 = unnamed, never measured. The
+    /// byte packs into `locked`'s padding, so naming costs no size.
+    id: u8,
     data: UnsafeCell<T>,
 }
 
@@ -242,31 +250,132 @@ impl<T> SpinLock<T> {
     pub const fn new(value: T) -> SpinLock<T> {
         SpinLock {
             locked: AtomicBool::new(false),
+            id: 0,
+            data: UnsafeCell::new(value),
+        }
+    }
+
+    /// A lock that identifies itself to the contention instrumentation
+    /// (docs/OBSERVABILITY.md 11, S5). Same lock, same fast path - the only
+    /// costs a name adds with recording off are one `id` test on the contended
+    /// path and one compare in the guard's drop.
+    pub const fn named(value: T, id: crate::obs::lock::LockId) -> SpinLock<T> {
+        SpinLock {
+            locked: AtomicBool::new(false),
+            id: id as u8,
             data: UnsafeCell::new(value),
         }
     }
 
     /// Acquire the lock, spinning until it is free. Returns a guard that
     /// releases the lock when dropped.
+    ///
+    /// The fast path is one **strong** `compare_exchange` - strong deliberately,
+    /// because a weak CAS may fail spuriously on LL/SC ISAs and every failure
+    /// here enters the contended path, whose count must mean "the lock was
+    /// genuinely held" for the uncontended-equals-zero oracle to hold.
+    #[inline]
     pub fn lock(&self) -> SpinGuard<'_, T> {
-        while self
+        if self
             .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
         {
+            return SpinGuard {
+                lock: self,
+                hold_start_ns: self.hold_stamp(),
+            };
+        }
+        self.lock_contended()
+    }
+
+    /// Acquire the lock **or give up immediately**, never spinning.
+    ///
+    /// For a caller whose answer to "someone else is inside" is to do something
+    /// else rather than to wait - `mm::frames`' flat combining publishes its
+    /// request to a per-CPU slot instead (docs/SMP.md 10.0g), which is only cheaper
+    /// than waiting if discovering the contention is cheap.
+    ///
+    /// Exactly [`SpinLock::lock`]'s fast path with the `#[cold]` fallback replaced
+    /// by `None`, so a successful `try_lock` costs precisely what a successful
+    /// `lock` costs: one strong `compare_exchange`. A failure is deliberately **not**
+    /// counted as contention - the contention counters mean "an acquire had to wait",
+    /// and a caller that never waits did not.
+    #[inline]
+    pub fn try_lock(&self) -> Option<SpinGuard<'_, T>> {
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Some(SpinGuard {
+                lock: self,
+                hold_start_ns: self.hold_stamp(),
+            });
+        }
+        None
+    }
+
+    /// The contended acquire: spin until free, and - for a named lock with the
+    /// Lock window on - count the contention, the spin iterations and the wait.
+    /// `#[cold]` so the fast path stays a test and a return; the clock is read
+    /// only when observing, so an unobserved contended acquire costs exactly
+    /// what it used to.
+    #[cold]
+    #[inline(never)]
+    fn lock_contended(&self) -> SpinGuard<'_, T> {
+        let observe = self.id != 0 && crate::obs::on(crate::obs::Window::Lock);
+        let t0 = if observe {
+            crate::arch::timer_now_ns()
+        } else {
+            0
+        };
+        let mut spins: u64 = 0;
+        loop {
             // Spin on a relaxed read so contenders share the cache line
             // read-only until the holder releases (test-and-test-and-set).
             while self.locked.load(Ordering::Relaxed) {
+                spins = spins.wrapping_add(1);
                 core::hint::spin_loop();
             }
+            if self
+                .locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
         }
-        SpinGuard { lock: self }
+        if observe {
+            let wait = crate::arch::timer_now_ns().saturating_sub(t0);
+            crate::obs::lock::contended(self.id, spins, wait);
+        }
+        SpinGuard {
+            lock: self,
+            hold_start_ns: self.hold_stamp(),
+        }
+    }
+
+    /// When the hold began - stamped only for a named lock with the hold
+    /// modifier on, because reading the clock here lengthens the critical
+    /// section it measures (the reason `W_LOCK_HOLD` is its own bit).
+    #[inline]
+    fn hold_stamp(&self) -> u64 {
+        if self.id != 0 && crate::obs::windows() & (1u32 << crate::abi::obs::W_LOCK_HOLD) != 0 {
+            crate::arch::timer_now_ns()
+        } else {
+            0
+        }
     }
 }
 
 /// RAII guard for a held [`SpinLock`]; releases on drop.
 pub struct SpinGuard<'a, T> {
     lock: &'a SpinLock<T>,
+    /// When the hold began (`timer_now_ns` domain), or 0 = not measuring. The 8
+    /// bytes and the one compare in drop are the whole cost of hold measurement
+    /// existing (docs/OBSERVABILITY.md 11, S5).
+    hold_start_ns: u64,
 }
 
 impl<T> Deref for SpinGuard<'_, T> {
@@ -288,6 +397,16 @@ impl<T> DerefMut for SpinGuard<'_, T> {
 impl<T> Drop for SpinGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.locked.store(false, Ordering::Release);
+        // Record the hold AFTER the release store, so the measured region never
+        // includes the recording - and so the recording (which may touch the
+        // metrics of the very lock being dropped, e.g. the frames pool lock)
+        // runs with the lock already free.
+        if self.hold_start_ns != 0 {
+            crate::obs::lock::held(
+                self.lock.id,
+                crate::arch::timer_now_ns().saturating_sub(self.hold_start_ns),
+            );
+        }
     }
 }
 
@@ -713,11 +832,20 @@ static RV_TIMEOUT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "smp")]
 /// How long a rendezvous half waits before giving up, in timer-domain nanoseconds.
 ///
-/// Generous (2 s) because under QEMU's TCG the two cores are time-sliced by the host
-/// and a secondary can be descheduled for a long time. The bound exists so a
-/// single-core machine - where the rendezvous genuinely cannot complete - reports that
-/// instead of wedging the boot test into its 120 s timeout with no diagnostic.
-const RV_TIMEOUT_NS: u64 = 2_000_000_000;
+/// Generous because under QEMU's TCG the two cores are time-sliced by the host and a
+/// secondary can be descheduled for a long time. The bound exists so a single-core
+/// machine - where the rendezvous genuinely cannot complete - reports that instead of
+/// wedging the boot test into its 120 s timeout with no diagnostic.
+///
+/// **10 s, raised from 2 s against a measurement.** With the host deliberately
+/// oversubscribed 3:1 (12 spinners against 4 cores), 2 s was not enough: the `smp`
+/// kernel failed with "cores did not meet" about a kernel that was working, since
+/// whether a vCPU thread gets scheduled inside a fixed window is a property of the
+/// host and not of this code. CI runners are shared machines, so that is a real
+/// condition rather than a contrived one. 10 s keeps the diagnostic purpose intact -
+/// it is still an eighth of the boot budget, so a genuinely single-core machine
+/// reports the timeout long before the harness gives up.
+const RV_TIMEOUT_NS: u64 = 10_000_000_000;
 
 #[cfg(feature = "smp")]
 /// Announce this side of the rendezvous and wait for the other. Returns false on

@@ -56,4 +56,9 @@ pub fn init() {
     // needs are a boot cost rather than being charged to whichever operation happens to
     // establish a cell's first region (docs/SUBSTRATE.md pillar 2).
     crate::user::init_layouts();
+    // Publish the observability root last, so the sections it advertises describe a
+    // machine that is fully brought up (docs/OBSERVABILITY.md). Additive: it fills
+    // in one page of already-reserved `.data` and enables no window, so a boot that
+    // never asks for telemetry records nothing and costs nothing.
+    crate::obs::publish();
 }

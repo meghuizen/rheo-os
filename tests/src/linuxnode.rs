@@ -27,9 +27,9 @@ extern "C" fn kernel_main() -> ! {
     // `--no-expose-wasm` silences the otherwise stderr "conflicting flags" warning
     // so the captured transcript is exact; UV_THREADPOOL_SIZE=1 keeps libuv's lazy
     // pool minimal (the cell holds up to 8 contexts, node uses ~7).
-    disk_runtime::prove(
-        "linuxnode",
-        "/bin/node",
+    disk_runtime::prove(disk_runtime::Proof {
+        name: "linuxnode",
+        path: "/bin/node",
         // A real multi-file program off the disk rather than an inline `-e` string:
         // `/app/main.js` does `require('greeter')`, a **bare specifier**, which drives
         // Node's full npm-style module resolution - walk `node_modules`, read the
@@ -42,16 +42,16 @@ extern "C" fn kernel_main() -> ! {
         // the reduce of `[10,20,12]`), so this is strictly more demanding than the
         // string it replaces rather than a different claim. The `/app` tree is seeded
         // into the image by xtask's `build_node_disk_fixture`.
-        &[b"node", b"--no-expose-wasm", b"/app/main.js"],
-        &[
+        argv: &[b"node", b"--no-expose-wasm", b"/app/main.js"],
+        envp: &[
             b"LD_LIBRARY_PATH=/lib:/lib64",
             b"PATH=/bin",
             b"UV_THREADPOOL_SIZE=1",
         ],
-        b"rheo:42\n",
+        want: b"rheo:42\n",
         // Node completes fully (prints rheo:42, exits 0), so it is held to the strict
         // exit-0 gate - no thread-abort partial.
-        false,
+        thread_abort_partial: false,
         // **Preemptive dispatch** (docs/SUBSTRATE.md 15, S3'). This is the useful half
         // of that migration's proof: a preemption kernel that only ever preempts a
         // purpose-built spinner has not been tested by anything, and here a real
@@ -65,14 +65,14 @@ extern "C" fn kernel_main() -> ! {
         // in both directions by the `preempt` kernel's scratch-register phase, which
         // fails deterministically when reverted. Twelve consecutive clean runs here
         // after it; the property, not the run count, is what makes it shippable.
-        true,
+        preemptive: true,
         // The **W^X exception capability** (docs/ARCHITECTURE.md 5.1), so this
         // runtime's JIT can map its code pages writable-and-executable. Every other
         // kernel in the suite mints nothing of the sort and is refused exactly as
         // before, which is what makes this a capability rather than a setting.
-        true,
-        None,
+        wx_authority: true,
+        second: None,
         // Not on a secondary: this kernel is the boot-CPU proof (docs/SMP.md 10.0e).
-        false,
-    )
+        on_secondary: false,
+    })
 }

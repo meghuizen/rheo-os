@@ -96,8 +96,12 @@ const _: () = assert!(SLOTS * core::mem::size_of::<u32>() <= crate::mm::frames::
 /// an allocator; this is for what only the kernel can see.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Metric {
-    /// Syscall entry to exit, nanoseconds. The number the "syscall batch
-    /// throughput" axis of docs/SUBSTRATE.md 2 is argued from.
+    /// Syscall dispatch to return, nanoseconds. The number the "syscall batch
+    /// throughput" axis of docs/SUBSTRATE.md 2 is argued from. Recorded at the
+    /// **Linux personality dispatch** - the surface production binaries actually
+    /// exercise; the native verbs are measured by their own planes (the queue's
+    /// per-entry time, the switch's), and bracketing them here too would
+    /// double-charge the same work.
     SyscallNs = 0,
     /// Queue submission to completion, nanoseconds - the async round trip a
     /// strand actually waits on.
@@ -107,7 +111,12 @@ pub enum Metric {
     /// Block-device request service time, nanoseconds.
     BlockNs = 3,
     /// Network round-trip / RTT samples, nanoseconds. The input to the pacing
-    /// safe-zone and jitter questions (docs/NETSTACK.md).
+    /// safe-zone and jitter questions (docs/NETSTACK.md). **No kernel recorder,
+    /// deliberately** (S6): the RTT is the transport's own measurement and the
+    /// transport is userspace by doctrine (`net::tcp` tracks it per connection);
+    /// a kernel-side wait duration is not an RTT and recording it here would
+    /// wear the name falsely. Recorded when a transport gains an export path
+    /// (the S7 stream).
     NetRttNs = 4,
     /// User page-fault service time, nanoseconds - demand paging's real cost.
     FaultNs = 5,
@@ -118,10 +127,21 @@ pub enum Metric {
     /// Scheduler queue delay: runnable-to-running, nanoseconds. The
     /// responsiveness number the EEVDF/BORE work is judged on.
     RunDelayNs = 7,
+    /// How long a contended acquire of a **named** [`crate::smp::SpinLock`]
+    /// waited, nanoseconds (docs/OBSERVABILITY.md 11, S5). Recorded only from the
+    /// `#[cold]` contended path and only with the Lock window on, so an
+    /// uncontended acquire never reads a clock.
+    LockWaitNs = 8,
+    /// How long a named lock was **held**, nanoseconds. Behind its own modifier
+    /// bit (`W_LOCK_HOLD`), separate from the wait, because measuring hold time
+    /// reads the clock inside the critical section and lengthens the very region
+    /// it measures - a wait-only run gives contention with no perturbation of the
+    /// held region, and the two runs can be diffed.
+    LockHoldNs = 9,
 }
 
 /// Number of metrics.
-pub const METRICS: usize = 8;
+pub const METRICS: usize = 10;
 
 impl Metric {
     /// Every metric, for a reader that reports all of them.
@@ -134,6 +154,8 @@ impl Metric {
         Metric::FaultNs,
         Metric::BurstNs,
         Metric::RunDelayNs,
+        Metric::LockWaitNs,
+        Metric::LockHoldNs,
     ];
 
     /// Short stable name, for a diagnostic line or a bench report.
@@ -147,6 +169,8 @@ impl Metric {
             Metric::FaultNs => "fault_ns",
             Metric::BurstNs => "burst_ns",
             Metric::RunDelayNs => "run_delay_ns",
+            Metric::LockWaitNs => "lock_wait_ns",
+            Metric::LockHoldNs => "lock_hold_ns",
         }
     }
 }
@@ -187,7 +211,13 @@ pub fn bucket_value(index: usize) -> u64 {
 ///
 /// `Copy` and `const`-constructible so a per-CPU array of them is a plain
 /// static; the bucket storage it points at is funded and lazy.
+///
+/// `repr(C)` because the observability root publishes the per-CPU set's address
+/// and a host tool decodes it from outside the guest (docs/OBSERVABILITY.md).
+/// `buckets` is a kernel VA, so such a reader masks it with the root's `va_base`
+/// to reach the frame.
 #[derive(Copy, Clone)]
+#[repr(C)]
 pub struct Histogram {
     /// Kernel VA of the `[u32; SLOTS]` bucket array, or 0 if not yet allocated.
     buckets: usize,
@@ -281,6 +311,24 @@ impl Histogram {
     /// this may take (pillar 1); pass [`Owner::KERNEL`] for kernel-wide metrics,
     /// which is what [`record`] does.
     pub fn record_owned(&mut self, value: u64, owner: Owner) {
+        self.record_inner(value, Some(owner));
+    }
+
+    /// [`Histogram::record_owned`] with the allocation arm removed: a sample on
+    /// an unfunded histogram counts into count/sum/min/max and `unplaced`, and
+    /// never takes a frame. The variant the **lock instrumentation** must use
+    /// (docs/OBSERVABILITY.md 11, S5): the frames pool lock is itself a named
+    /// lock, so a record that could allocate while its guard is held would
+    /// re-enter the pool lock (a self-deadlock) - and even after release, an
+    /// alloc mid-record re-enters `record` through the inner guard's drop while
+    /// the outer `&mut` histogram is live, which is aliasing, not a slow path.
+    /// Bucket storage comes from [`prefund`], a bring-up act - the same rule
+    /// that keeps `obs::fund_this_cpu` off the emit path.
+    fn record_noalloc(&mut self, value: u64) {
+        self.record_inner(value, None);
+    }
+
+    fn record_inner(&mut self, value: u64, alloc: Option<Owner>) {
         self.count = self.count.saturating_add(1);
         self.sum = self.sum.saturating_add(value);
         if value < self.min {
@@ -290,6 +338,10 @@ impl Histogram {
             self.max = value;
         }
         if self.buckets == 0 {
+            let Some(owner) = alloc else {
+                self.unplaced = self.unplaced.saturating_add(1);
+                return;
+            };
             match kmeta::alloc_metric_frame(owner) {
                 Some(va) => self.buckets = va,
                 None => {
@@ -453,6 +505,13 @@ static SETS: PerCpu<[Histogram; METRICS]> = PerCpu::new([const { Histogram::new(
 /// itself, which is exactly the kind of thing a boot should decide.
 static ENABLED: PerCpu<bool> = PerCpu::new(false);
 
+/// Kernel VA of the per-CPU histogram sets, for the observability root to publish
+/// (docs/OBSERVABILITY.md). A function rather than exporting the static, so a
+/// publisher gets the address and not a reference it could record through.
+pub fn sets_va() -> usize {
+    core::ptr::addr_of!(SETS) as usize
+}
+
 /// Turn recording on for this CPU.
 pub fn enable() {
     // SAFETY: this CPU's own slot; no other reference is held across this call.
@@ -469,7 +528,10 @@ pub fn disable() {
     }
 }
 
-/// Whether this CPU is recording.
+/// Whether this CPU is recording. `#[inline(always)]`: this is the disabled
+/// path's whole cost at every bracket site, and left to the inliner's judgment
+/// it measurably stayed a call on riscv64 (+8 instructions per gate).
+#[inline(always)]
 pub fn enabled() -> bool {
     *ENABLED.this()
 }
@@ -478,15 +540,120 @@ pub fn enabled() -> bool {
 ///
 /// The hot path: one branch, one bucket index, one increment - no lock, no
 /// atomic, no allocation after the first sample per (CPU, metric).
+///
+/// The first-sample bucket allocation happens **outside any live `&mut` into the
+/// histogram set**: taking a frame drops the pool lock's guard on the way out,
+/// and with hold measurement on (`W_LOCK_HOLD`) that drop re-enters metrics
+/// through `record_noalloc` - which must not land while a `&mut` histogram is
+/// held across the allocation. The S5 aliasing hazard, closed by ordering rather
+/// than by forbidding the combination.
 #[inline]
 pub fn record(metric: Metric, value: u64) {
     if !enabled() {
         return;
     }
-    // SAFETY: this CPU's own slot, and no other reference to it is live across
-    // this call (the record path calls nothing that re-enters metrics).
+    if SETS.this()[metric as usize].buckets == 0 {
+        // No reference into SETS is live across this call (see above).
+        let va = kmeta::alloc_metric_frame(Owner::KERNEL).unwrap_or(0);
+        if va != 0 {
+            // SAFETY: this CPU's own slot; the reference is scoped to the store.
+            unsafe { SETS.this_mut()[metric as usize].buckets = va };
+        }
+    }
+    // SAFETY: this CPU's own slot; `record_noalloc` calls nothing that re-enters
+    // metrics, which is the whole point of the variant.
     unsafe {
-        SETS.this_mut()[metric as usize].record_owned(value, Owner::KERNEL);
+        SETS.this_mut()[metric as usize].record_noalloc(value);
+    }
+}
+
+/// Record `value` for `metric` on this CPU **without ever allocating** - the
+/// lock-instrumentation entry point (see [`Histogram::record_noalloc`] for why an
+/// allocation here is a deadlock and an aliasing hazard, not a slow path). A
+/// sample on an unfunded histogram still counts (count/sum/min/max, `unplaced`);
+/// percentiles need [`prefund`].
+#[inline]
+pub fn record_noalloc(metric: Metric, value: u64) {
+    if !enabled() {
+        return;
+    }
+    // SAFETY: this CPU's own slot; the noalloc path calls nothing that could
+    // re-enter metrics, which is the whole point of the variant.
+    unsafe {
+        SETS.this_mut()[metric as usize].record_noalloc(value);
+    }
+}
+
+/// Take bucket storage for `metric` on **this CPU** now, from a context where
+/// allocating is safe - a bring-up act, exactly like `obs::fund_this_cpu`.
+/// Returns whether buckets exist afterwards. Without it, `record_noalloc`
+/// samples report a mean and no percentiles ([`Histogram::has_buckets`] says
+/// which a reader has).
+pub fn prefund(metric: Metric) -> bool {
+    // SAFETY: this CPU's own slot; called from bring-up, not from a record path.
+    let h = unsafe { &mut SETS.this_mut()[metric as usize] };
+    if h.buckets == 0 {
+        h.buckets = kmeta::alloc_metric_frame(Owner::KERNEL).unwrap_or(0);
+    }
+    h.buckets != 0
+}
+
+/// Per-CPU bracket stamps for [`bracket_start`]/[`bracket_end`] - one slot per
+/// metric, so brackets of *different* metrics may nest (a demand-page fill
+/// inside a syscall) while a metric's own bracket never does at its sites.
+static BRACKETS: PerCpu<[u64; METRICS]> = PerCpu::new([0; METRICS]);
+
+/// Open a timing bracket for `metric` - the hot-path form of "read the clock if
+/// recording". The stamp lives in a per-CPU slot rather than in a caller local,
+/// and that is the whole point (docs/OBSERVABILITY.md 11, S6): a `let t0` held
+/// across the measured region stays **live** across it, and the register
+/// pressure cost lands even with recording off - measured at +12..+42
+/// instructions per queue/switch round trip written that way, against +3..6 for
+/// this shape. The disabled path here is one load, one test, one not-taken
+/// branch, with nothing live afterwards (the S2b `obs_event!` lesson applied to
+/// the distribution plane).
+#[inline(always)]
+pub fn bracket_start(metric: Metric) {
+    if enabled() {
+        bracket_start_cold(metric);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn bracket_start_cold(metric: Metric) {
+    let now = crate::ktimer::now_ns();
+    // SAFETY: this CPU's own slot; the reference is scoped to the store.
+    unsafe { BRACKETS.this_mut()[metric as usize] = now };
+}
+
+/// Close the bracket and record the elapsed time. A close with no matching open
+/// (stamp 0 - recording was enabled between the two) records nothing.
+#[inline(always)]
+pub fn bracket_end(metric: Metric) {
+    if enabled() {
+        bracket_end_cold(metric);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn bracket_end_cold(metric: Metric) {
+    // SAFETY: this CPU's own slot; the reference is scoped to the take.
+    let t0 = unsafe { core::mem::take(&mut BRACKETS.this_mut()[metric as usize]) };
+    if t0 != 0 {
+        record(metric, crate::ktimer::now_ns().wrapping_sub(t0));
+    }
+}
+
+/// Abandon an open bracket without recording - the path that turned out not to
+/// be the thing being measured (a demand-page fault that becomes a signal is
+/// not a fill service time).
+#[inline(always)]
+pub fn bracket_cancel(metric: Metric) {
+    if enabled() {
+        // SAFETY: this CPU's own slot; the reference is scoped to the store.
+        unsafe { BRACKETS.this_mut()[metric as usize] = 0 };
     }
 }
 

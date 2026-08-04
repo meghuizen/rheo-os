@@ -39,6 +39,9 @@ pub mod metrics;
 pub mod mm;
 pub mod net_rx;
 pub mod nproc;
+/// The observability spine: one exported root indexing every telemetry plane, so
+/// the machine can be watched from inside or outside it (docs/OBSERVABILITY.md).
+pub mod obs;
 mod panic;
 pub mod pty;
 pub mod queue;

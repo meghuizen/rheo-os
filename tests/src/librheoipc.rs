@@ -151,7 +151,10 @@ extern "C" fn kernel_main() -> ! {
     );
 
     // SAFETY: single-threaded init; the statics outlive the run.
-    let mut flushes_before = 0u64;
+    // Not initialised here: it is set inside the `unsafe` block below, just before the
+    // run, and reading a placeholder would silently measure the wrong interval. Declared
+    // out here only because the count is compared after the block.
+    let flushes_before: u64;
     let outcome = unsafe {
         let objects = &mut *addr_of_mut!(OBJECTS);
         let caps0 = &mut *addr_of_mut!(CAPS0);

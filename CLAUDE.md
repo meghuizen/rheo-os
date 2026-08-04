@@ -212,7 +212,11 @@ last forever.** Two hardening passes over the above. (1) `rng::feed_hid` takes a
 mistake - a property a reviewer checks in one line rather than a promise about
 what callers do - and the console byte path, which used to pass the byte, follows
 the same rule; the HID DMA buffer is wiped as it is drained, asserted by
-`virtio_input::buffers_clear`. It costs nothing, because the unpredictability is
+`virtio_input::wiped() == events()` - the wipe **read back** before the buffer goes
+to the device again, which is the only race-free place to ask, since a returned
+buffer can be refilled by the next keystroke before any later scan runs (the first
+version scanned the buffers afterwards and failed intermittently on riscv64 saying a
+drained event was still there, when a *new* one had arrived). It costs nothing, because the unpredictability is
 in *when* a key was pressed, not which one, and mixing a key code would put what a
 person typed into kernel state for a source credited zero. (2) Against an attacker
 who captures the pool or a root: past output is already safe (fast key erasure,
@@ -904,7 +908,9 @@ needed no new mechanism at all: it streams off a live ext4 disk over virtio-blk-
 (~116,000 block-cache fills, none resident whole), demand-pages, links its glibc set
 (`librt` on top of bun's), brings up JSC with its **JIT enabled** (the capability-gated
 W^X exception), runs **under preemption** (2,467 slices taken to sibling contexts), and
-prints exactly `2.1.220 (Claude Code)` with exit 0. Held to the strict gate; asserted on
+prints exactly its own version string with exit 0 (the expected transcript is read from
+the installed binary at fixture-build time, not hardcoded - a literal drifts every
+release). Held to the strict gate; asserted on
 an exact transcript.
 
 **Honest scope, because "runs Claude Code" invites a bigger reading than the evidence
@@ -2212,7 +2218,7 @@ per-core hardware no trampoline sets - it arms its own now (`83/6243`). **And so
 (`linuxnodesmp`, `linuxclaudesmp`) - same construction, `on_secondary` the only difference:
 Node (124 MB, V8 + libuv) at ~15,300 block-cache fills and 23 of 9,477 slices prints `rheo:42`
 and exits 0; **Claude Code** (275 MB, Bun-compiled) at ~116,300 fills and **1,612 of 61,701
-slices** prints exactly `2.1.220 (Claude Code)` and exits 0. Each is its own kernel rather than
+slices** prints exactly its own version string and exits 0. Each is its own kernel rather than
 a phase, deliberately: the primary-CPU proof is the baseline every claim about these runtimes
 rests on, and a boot that runs one somewhere else must not be able to weaken it. Still not
 shown: these are the same *cooperative-within-a-core* runtimes they are on the primary, so
@@ -2551,6 +2557,128 @@ sampled *inside* the hold is always one or two holders' worth, the ledger return
 pairs produced zero lost updates, because the critical section is a handful of
 instructions and TCG's interleaving is far coarser, so the phase asserts the invariant
 while the lock's necessity stays argued from the structure and gated at the lab.
+
+**And the frame allocator is a batch, not a queue** (docs/SMP.md 10.0g): 10.0f closed the
+*safety* question for the global allocators; this closes the *scalability* one for the
+hottest of them. Four changes, of which the first is worth more than the other three and
+would have been worth doing with no lock in sight. **(1) The 4 KiB zeroing left the
+critical section.** Every `alloc` set a bitmap bit and three fields and then zeroed 4096
+bytes *inside* the lock, so the critical section was ~99% `memset` and a core allocating
+waited on another core's `memset` rather than on anything shared. It is safe to move out
+for one structural reason - **the bitmap bit is what makes a frame unhandable**, so once
+it is set the window before the zeroing is private to the claiming core by construction
+rather than by timing. **(2) `alloc_on` takes one acquisition instead of three** (it read
+the node's frame range, searched inside it, then fell back to the whole pool, each
+separately - and a range read that is not in the same critical section as the search it
+bounds is a range that can change under it). **(3) A copy-on-write break takes two
+instead of three**: "is this shared" and "give me somewhere to copy it to" are one
+decision, now `frames::cow_resolve` -> `Sole`/`Private(dst)`/`NoFrame`, whose `Private`
+frame is deliberately **not** zeroed (the caller overwrites all 4096 bytes, so the
+no-leak rule is met by the copy) and whose old-frame release is deliberately **not**
+folded in - dropping the reference before the copy would let a peer core faulting on the
+same page see a count of one, decide it was the sole owner, and write through the frame
+this copy is reading, so two is the floor. **(4) Flat combining** (Hendler/Incze/Shavit/
+Tzafrir, SPAA 2010): with the `memset` gone the lock is held for a few words, which is
+exactly the regime where N cores each taking a short lock pay N cache-line handoffs for
+trivial work - so a core publishes to its own 64-byte-aligned slot, one core wins the
+*combiner* role, takes the lock once, executes the whole batch with the bitmap in its
+cache, and writes each result back. Three shape decisions matter, and the first two are
+what make it nearly free uncontended: **the combiner is whoever holds the lock** (the
+paper gives the role its own flag because a combiner there spans several acquisitions;
+here a batch is one critical section, so `SpinLock::try_lock` *is* the election - which
+deleted a static and two atomics per operation), **the wire form is slow-path only** (a
+request becomes `(op, arg)` words only if it is going to be published, so `fc_run` takes
+the operation twice - a closure returning its own type for this core, and the encoded form
+for a peer's slot - and `alloc`'s `Option<usize>` never round-trips through a `u64` on the
+path that never left this core), and **the batch does not zero** (each core zeroes its own
+frame afterwards; a combiner zeroing for the batch would re-serialise exactly what change
+1 unserialised). So the added cost uncontended is **one relaxed load** on top of the lock
+the pre-combining code already took, and there is no separate "SMP path" to diverge from.
+One honest liveness note: the lock's *other* holders (diagnostics, boot paths) do not
+drain, so a request published against one of those waits out its spin bound and is
+withdrawn rather than served - counted, and the retry then takes the lock itself. Executed **exactly once** is enforced by a claim rather than
+argued - a publisher may withdraw only by moving its slot from its own opcode straight to
+idle, which fails once a combiner has moved it to *busy* - and the withdrawal, which
+exists because a publication can land just after the combiner sampled the mask, is
+counted so a machine that needs it says so. The boot-time and diagnostic paths
+(`init_numa`, `alloc_contig`, `stats`, `used_matches_bitmap`, `node_free`, `node_of`) stay
+on the plain lock. Proven by a new `smp` phase on all three ISAs, mirroring the
+shared-heap phase because the failure mode has the same shape: each core loops
+allocate/stamp-every-byte/read-back/free after a rendezvous, so a frame handed to both
+means one core's stamp lands in the other's frame between the write and the read - the
+corruption itself, not a proxy - with the counter still matching the bitmap and no frame
+leaked; then a **churn** pass (allocate and free, touching nothing) because the verify
+pass spends far longer outside the allocator than inside it, across which **140-469
+requests were executed by the other core's combiner** (riscv64 315, aarch64 140, x86-64
+469) with **1-6 withdrawn** - and the withdrawal count matters more than its size, since
+it means the liveness backstop and the `FC_BUSY` claim it interacts with are exercised
+rather than dead code, a withdrawal racing a claim being the one interleaving in which a
+request could run twice. That number is
+**reported, never asserted** (zero is a legal schedule, and TCG interleaves coarsely) and
+it stays modest *by design*, which is the point: change 1 left very little window for a
+second core to arrive in, so shortening the window removed most of the contention and
+combining handles what is left. **The cost is measured, and it moved twice**: the bench
+suite touched none of these paths, so five benches were added, and the number went
+652 -> 731 -> **656** instructions for `alloc`+`free` on x86-64 (1728 -> 1756 -> **1743**
+on riscv64). Written as one function, flat combining cost **~40 instructions per
+operation** and `objdump` said why: that function held the election, the batch, the
+publication and the spin loop, so LLVM allocated seven callee-saved registers for the cold
+half and pushed and popped all seven on every fast-path call, with an un-inlined dispatch
+beside them keeping the opcode a runtime value. Split into an `#[inline(always)]` leaf plus
+a `#[cold]` remainder it was ~11; folding the election into `try_lock` and confining the
+wire encoding to the slow path took it to **+3 on x86-64 and +11 on riscv64** (isolated by
+`frame_contig1_free`, whose `alloc_contig` half never changed layer). **And
+`frame_alloc_on_free` is now faster than before any of this** - 10 instructions on x86-64,
+23 on riscv64 - because change 2 collapsed three acquisitions into one, and only once the
+combining layer got down to ~3 did that win stop being buried by it. Honest: uncontended
+the layer is still a small net loss, since it buys nothing where there is nobody to batch
+with; it is now dominated by change 2's win on the NUMA path and invisible against the
+`memset` elsewhere (+0.6% of a full `alloc`+`free`). Two things icount cannot price are
+named as lab claims rather than assumed - an atomic RMW counts as one instruction here and
+costs far more on real silicon (so removing two per operation is worth more than the table
+shows), and the cache-line handoffs the technique removes are invisible to an emulator with
+no cache model (so the contended saving is better than zero by an amount only hardware can
+report). Recorded in docs/ENGINEERING.md 11: a hot path's cost can be dominated by the
+cold code sharing its stack frame - and once the frame was cheap, two atomics and a `u64`
+round trip were the whole remaining cost, which is only visible once you are counting. Two controls observed firing (the zeroing
+deleted -> `4096 nonzero byte(s)`; the combiner running each request twice -> `double
+free of <pa>`).
+**And (5) the bitmap search is a word at a time**, which is the largest of the five and
+is about the work once you reach the bitmap rather than about reaching it: the scan was a
+per-frame loop, so its cost grew with how many frames were **allocated** - invisible on
+the rotating-hint path, but `alloc_on` restarts at the node's `lo` on *every* call, so a
+node at 90% paid ~59,000 iterations per allocation and running one dry (which `numa` does
+deliberately) is quadratic in the node's size. `mm::bitmap` turns each 64 allocated frames
+into one load, one compare and one branch with a single `trailing_zeros` - same answer,
+**63x fewer steps** through a full region - and the pmem pool got it too, for 10.0f's
+reason (same scan, and its frame count is the one that is *not* a multiple of 64, coming
+from whatever the NFIT reports); `alloc_contig`'s run search is deliberately left
+bit-at-a-time and says why where it lives. It is its own **dependency-free module**, and
+that is the whole safety argument: four boundary conditions the old form did not have (the
+first word's low bits, the last word's high bits, both at once in a single-word range, and
+a range whose end is not a multiple of 64), each **silent** when wrong - a missed free bit
+is a spurious out-of-memory on a machine with free memory, and a bit from outside
+`[lo, hi)` is a frame on the wrong NUMA node that `alloc_on` reports as correctly placed.
+So it takes a plain `&[u64]` and no kernel state, and **`verify/bitmap/`** includes it
+verbatim and drives **683,792 cases** against a bit-at-a-time reference: 16 hand-computed
+boundaries, 320,000 random `find_in`/`find_from` from empty to full, 32,000 random
+`find_run`, and every 8-bit map **exhaustively**. Two controls fire, the second by exactly
+the name that matters (`returned N outside [lo, hi) - on the NUMA path this is a frame on
+another node reported as placed`). The cost is reported there rather than by `cargo xtask
+bench`, because **the bench suite cannot see this change** - the benches allocate from a
+nearly-empty pool where both algorithms stop on the first candidate - and wall clock was
+tried and is **not** claimed (the `numa` boot went 11.6 s to 10.7 s: one sample of a boot
+doing far more than the run-dry phase, under an emulator).
+**And the first version of the zeroing oracle passed with the fix deleted** - the
+concurrent loop asserted every fresh frame arrives zero, reasoning that a frame one core
+stamped and freed comes back to the other dirty, but `alloc` rotates its hint so a freed
+frame is not handed out again until the cursor has walked all 131,072 of them and nothing
+in a 2,000-round pass is ever recycled; the frame is dirtied **before** it is allocated
+now (the hint makes the next one predictable, and a free frame belongs to nobody), with
+the prediction asserted rather than assumed. Recorded in docs/ENGINEERING.md 11. Honest:
+changes 2 and 3 have **no control of their own** - their observable behaviour is identical
+to what they replaced, only the acquisition count changed, so `numa` and `cowfork` are
+their gate and no test can distinguish one acquisition from three.
 
 **Honest scope:** preemption is *within* a core's own claim and rebalancing moves only
 **unstarted** cells. Migrating a *running* one was **attempted twice and reverted twice**, with four findings
@@ -3065,6 +3193,200 @@ no other phase - `linuxthreads` therefore asserts it *directly* (context 0's ent
 the cell's vcore 0) rather than leaving a cleanup nothing checks, and that assertion fires
 under the revert.
 
+**The machine can be watched from outside it** (docs/OBSERVABILITY.md 11, the `observe`
+kernel, all three ISAs) - the first slice of the observability framework, which is the
+**root** and the layout every reader agrees on. The tree could already *prove* things
+about itself and could not *watch* itself: every hard defect this session cost a bespoke
+diagnostic (Bun's abort took **three wrong diagnoses** and two fully-built mechanisms
+before a one-line "print the refused path" answered it), and `kernel/src/trace.rs`'s own
+header names the shape - "the lifecycle is not observable, only its endpoints are".
+`abi/src/obs.rs` defines the plane once for three separately-compiled readers - the kernel
+that writes it, an in-guest collector cell, and a **host tool reading guest physical memory
+with no cooperation from the guest** - which is why it is in `rheo-abi` (zero-dep, `no_std`,
+no lang items) rather than in the kernel. `kernel/src/obs/root.rs` exports one page-aligned
+symbol, `RHEO_OBS_ROOT`, carrying a kernel VA **and a physical address** per published
+region plus the tick domain, tick rate, CPU counts and the live window mask. The
+load-bearing claim - that an outside reader can walk it from the ELF alone, on bare metal
+or under any hypervisor, with no device and no `fw_cfg` - is **verified rather than
+argued**: hand-computing the reader's own algorithm (`pa = p_paddr + (vma - p_vaddr)`) from
+`readelf` output gives exactly what the guest published on every ISA (`0x47f000` /
+`0x404a7000` / `0x8068d000`), two independent computations of one fact agreeing.
+**Timestamps are raw ticks, and that is the design's first real constraint**:
+`arch::timer_now_ns()` cannot be on an emit path, being a 128-bit multiply *and divide* on
+all three ISAs - riscv64 has no 128-bit divide instruction, so it is a call into
+`__udivti3`, a software loop, and aarch64 re-reads `cntfrq_el0` and executes an `isb` every
+call - so a tracer built on it would cost more than the code it observes, which is the one
+thing a tracer must not do; `arch::obs_tick()` is one counter read with **no barrier**
+(`rdtsc` / `mrs cntvct_el0` / `rdtime`), losing no ordering because within a CPU order
+comes from the sequence number and across CPUs from merging on the tick. Resolution is
+**measured, not assumed** - 1 ns/tick on x86-64, 16 ns on ARM64, **100 ns on riscv64** -
+and `tick_hz` is published so a reader declines to print a sub-resolution number rather
+than inventing one. The event record is **32 bytes** so that with a page-aligned frame it
+never straddles a cache line (at 40 it straddles ~40% of the time), and there is
+deliberately **no drop counter**: loss is a property of a reader's cursor, so
+`[c, head-capacity)` names exactly which events are missing - located rather than counted,
+and one fewer atomic RMW on the emit path. Two controls observed firing (the magic not
+written -> "no root" rather than decoded garbage; the linear-map mask forgotten in one
+place -> the published address is refused as "not anywhere physical memory is", the mistake
+that would make a host reader silently decode nothing), and one recorded as a **non-result**
+- removing `#[used]` leaves the symbol present on all three ISAs, because `publish` takes
+its address and every kernel calls it, so the attribute is kept as insurance and not
+claimed as a proven guard. Publishing a field rather than reasoning about it found a real
+defect: `smp::online_count()` answers "CPUs SMP bring-up **registered**", and the only
+thing that registers the boot CPU is `smp::init`, which exists only under the `smp` feature
+- so it returns **0 on every single-CPU boot** while a CPU is executing the call. Honest
+scope: this is the root and the layout. Nothing is instrumented yet, no window exists, and
+the four planes it will index are in the state docs/OBSERVABILITY.md 11.1 tabulates -
+notably `metrics.rs` declares **eight** latency histograms of which only two have a
+recorder anywhere and **no boot enables it**, so most of the scheduler-quality work ahead
+is wiring and a switch rather than new machinery.
+
+**And the event stream is per-CPU** (docs/OBSERVABILITY.md 11.3, the `observe` and `smp`
+kernels, all three ISAs) - the second observability slice, and the one `kernel/src/trace.rs`
+had already written down as its own defect: the ring was "one shared buffer with a plain
+counter, so it is single-CPU today", with the fix "deliberately not copied here until a
+multi-core boot wants to trace". `kernel/src/obs/ring.rs` is one ring per CPU with its own
+sequence counter, safe by **partitioning** rather than by hoping - the argument `telemetry`
+already made - and `trace.rs` is now a shim keeping every signature and the `@E` format
+byte-compatible, because `cargo xtask trace` parses it and `smp` asserts on it (renaming a
+module is not a proof, so nothing was renamed). The module is **dependency-free** (the tick
+and the CPU index are passed in) so `verify/obs/fuzz.rs` can drive it on the host, which is
+the only place the wrap is reachable: a boot emits a few thousand events, and the arithmetic
+that matters is at **2^32**, where the recorded sequence number - `head`'s low 32 bits -
+recycles, about 71 minutes at one event per microsecond. **Two design decisions were forced
+by writing the code**, not by the plan. Funding **cannot** happen on the emit path as
+planned: funding allocates, allocation takes `mm::frames`' pool lock, and one of the
+recorded windows *traces the allocator* - so a lazily-funding emit could re-enter the
+allocator from inside it on a non-recursive lock, which is a deadlock rather than a slow
+path, appearing only on the first event a boot ever recorded from that window; `fund` is a
+bring-up act now and `emit` never allocates, with a CPU that has no ring counting its
+offered emits rather than losing them (and publishing `capacity` **last** - written so a
+reader could never see a funded ring pointing at nothing - makes funding self-excluding for
+free, since the allocator's own events see `capacity == 0`). And the host tool's gap
+detection **had** to change: a sequence number is per-CPU monotone now, so comparing
+consecutive lines of the merged stream would report a gap wherever the emitting core
+changed - pure noise on any multi-core boot, against that tool's own rule that a diagnostic
+which cries wolf is worse than none. `trace::counters()`' second value is **derived** rather
+than counted (a ring holds `RING_EVENTS`, so anything past that was overwritten), which
+removes an atomic read-modify-write from the hot path and stops conflating "the ring is a
+ring" with "a reader lost data". Proven by `observe` on all three ISAs (17 frames - 16 data
+plus a directory, as designed - 300 records read back **field-for-field** with real ticks
+advancing, the ring wrapped with the surviving window exactly `[total-cap, total)` and the
+record before it gone, all 17 frames returned) and by `smp`, where **two cores record 64
+events each at the same instant** and three things are asserted per ring rather than as a
+total: each ring took exactly its own core's 64, every record is found in the ring of the
+core that wrote it *identified by a tag in its own contents*, and each stream's sequence
+numbers are consecutive - the property the host tool's loss detection rests on and the one a
+shared counter destroys (observed cpu0 and cpu2, 128 total, 17 offered to an unfunded ring
+being the secondary's own funding allocations exactly, 34 frames returned). Three controls
+observed firing - every CPU forced onto ring 0 gives `the primary's ring took 145 of its 64
+events` (= 64 + 64 + 17 in one ring with the other empty; note what it is *not*, since under
+TCG nothing was lost and a count of totals would have looked fine - what breaks is
+attribution); the slot mask written `n & cap` fails four wrap cases by name; `seq_of` made
+zero-based makes a zeroed frame read as a written event - and **one recorded as a
+non-result**: `ObsRing::get`'s sequence-number check does not fire, measured rather than
+assumed, because sequentially the bounds test subsumes it and it earns its keep only against
+a reader racing a live writer on another core, which no built reader is yet and which a
+single-threaded host driver cannot produce without aliasing the ring mutably to model a data
+race the language forbids.
+
+**And recording is cheap enough to leave compiled in everywhere** (docs/OBSERVABILITY.md
+11.4, S2/S2b): a per-window **enable mask** gates 13 windows - one relaxed load, a test
+and a branch, **3 instructions** on every disabled site, with the event's arguments never
+evaluated (`obs_event!` is a macro so the mask test sits *outside* argument marshalling;
+written as a function first, it cost +9 and the plan's own named control caught it) - and
+the **enabled** emit went 60 -> **22** instructions by doing what Linux's ring buffer does
+(4 packed u64 stores, header word const-folded at the call site) minus what this kernel
+does not need (no nesting-safe reserve/commit: the producer is partitioned per CPU and no
+emit can interrupt an emit today, stated in `obs/ring.rs` for the design that changes it).
+The ring became a **contiguous block** (`frames::alloc_contig`, the allocator whose
+absence two ISA scars had recorded) so a slot address is one multiply rather than a page
+split, and a host reader's walk is linear. Static-key text patching for the disabled site
+is **refused with the cost recorded** (self-modifying kernel text + per-ISA I-cache
+protocol to buy back 3 instructions). Measured against the pre-S2 build across the whole
+matrix: +3 per new call site on the queue round trips, every untouched path unchanged to
+the tick. **And the table under the scheduler state those windows record about was priced
+next** (docs/SUBSTRATE.md pillar 1, S2c): `Funded<T>` grew an **inline directory** (first
+8 page addresses in the struct - no dependent directory load and no directory frame for
+every hot table; three frame oracles moved to the new numbers, the inline/overflow
+boundary gained the test it had silently lost) and a **scan API**
+(`page_slices`/`iter`, one resolve per page, elements by reference - 10.5 -> 4.9
+instructions/element; migrated into the entity table's, VMA list's and thread table's
+decision-path scans, while the EEVDF queue deliberately kept its `high_water`-bounded
+point loop over `get_ref`, where the same migration would have *regressed* a small
+queue), and the **repeated walks were fused**: the page-fault fill asks the record it
+already holds (`Vma::file_page`) instead of re-scanning the list, EEVDF `dispatch` takes
+pick + eligibility from one walk instead of two identical ones, and `dispatch::pick`
+memoizes the personality's runnable predicate (it was evaluated up to three times per
+cell per decision, each itself a context-table walk). Whole-matrix bench diff published:
+`p5_crosscell_roundtrip` 499 -> 483, against +1/-1 ripples and +3..6 amortized on the
+`rng_*` draws from the 64-byte-larger struct - the lessons (optimise the access shape;
+two questions about one element set are one walk; a struct's size is an interface, bench
+everything) recorded in docs/ENGINEERING.md 11.
+
+**And the machine's live state is a readable block, not a replay** (docs/OBSERVABILITY.md
+11.5-11.6, S3/S4): one `ObsCpu` per CPU - a seqlock'd coupled group (state, current
+cell/entity/vcore, since-when, the armed deadline in the arbiter's own ns domain, the
+receive tier) written only by the owning CPU at transitions it already passes through,
+plus 56 monotone counters outside the lock - published as `OBS_SEC_CPU` with a name table
+saying which slot means what. **Busy/idle is real measured time**: every transition
+charges `now - since` to busy, or to idle only when the park genuinely halted - a spin
+charges busy, never laundered - proven by `observe` on all three ISAs (a 20 ms park
+charges ~20 ms of idle ticks, judged through the root's published `tick_hz`) and the
+seqlock by `verify/obs` on real host threads (4.8M coherent reads racing 3M writes, zero
+torn; the bracket-deleted control caught within ~25k reads). A machine-wide `ObsMem`
+block is **filled on request** and stamped with when (`refreshed_tick`), never maintained
+by the allocators - a mirror-keeping store on the allocation hot path is the cost the
+design refuses. **S4 has begun**: the module counter statics migrate onto the plane's
+per-CPU slots - `net_rx`'s five (racy `static mut`s the moment a second core ran a
+receive wait), `input`'s three, and `idle`'s two, which were a double-report (`idle`'s
+own statics plus a gated bump in the snapshot writer - the same halt counted once or
+twice depending on the mask; one unconditional counter now, with `observe`'s
+zero-while-off assertion *moved deliberately*: the count moves with snapshots off, the
+time attribution does not). Every accessor keeps its signature and sums over CPUs, so the
+existing suite is the migration's exactness oracle; two controls fire by name, and one
+non-result is recorded - `netwait`'s stall-tolerance branch absorbs a misrouted spin-poll
+counter, so the control that stands is on an assertion with no tolerance.
+
+**Four intermittent tests were found and fixed, and CI was unbroken** (docs/SMP.md
+10.0h, docs/ENGINEERING.md 11). The GitHub pipeline had been red for a while, and not
+for any reason in the kernel: `--no-install-recommends` drops `libc6-dev-*-cross`,
+which is a *Recommends* of the cross gcc, so every glibc fixture build died at
+`cannot find crt1.o` on aarch64 and riscv64. Naming the package (plus the optional C++
+set, so CI stops silently covering less than a developer's machine) unblocked the lint
+job - which then failed on **11 clippy errors CI had never reached**, in `rng`,
+`schedidle`, `numa`, `iommu`, `librheoipc`, `disk_runtime` and `smp`. All fixed rather
+than allowed: the constant `assert!` became a `const` assertion (stronger - it cannot
+build wrong), `prove`'s ten positional arguments became a named `Proof` struct (the
+lint was right; `prove(name, path, argv, envp, want, false, true, true, None, false)`
+is unreadable), and a stray doc comment was moved to the constants it describes. It
+also turned up a **gap**: the five `smp`-feature kernels have
+`required-features = ["smp"]`, so the default clippy run never built them and they were
+not linted at all - CI now lints both postures. Three test defects were load-dependent
+rather than wrong-in-principle, and were found by oversubscribing the host 3:1 on
+purpose: `observe` asserted a park moved a counter using `while !expired { wait() }` at
+a **1 ms** deadline, so one host preemption meant the loop body never ran (measured:
+`iters == 0` on exactly the failing runs, ~1 in 3); `smp`'s work queue asserted
+`workers > 1`, a race outcome a claim-based queue may legally not produce; and the
+2 s rendezvous bound is 10 s. Two remain open with their reproduction recorded, one of
+them a likely *false* deadlock in the vcore path rather than a test bound.
+Also **`linuxclaude` no longer hardcodes a version**: the expected transcript is read
+from the installed binary at fixture-build time, since `2.1.220` -> `2.1.221` turned a
+green gate red with nothing wrong.
+
+**One intermittent test was found and fixed** while gating the above: `rng`'s HID phase
+asserted `virtio_input::buffers_clear()` - every DMA buffer zero *after* a drain - and failed
+on riscv64 about one run in ten saying a drained event was still in the buffer, when what had
+happened was that a **new** keystroke had arrived. A wiped buffer goes straight back to the
+device and the injector is still typing, so the question was being asked in the one place it
+cannot be answered. The property is now asked of the **drain**: the wipe is **read back**
+before the buffer is handed over and only a verified wipe is counted, so
+`wiped() == events()` is a statement about memory rather than about timing. Read back
+deliberately rather than just counted - an increment beside the wipe would prove nothing,
+since deleting the wipe would delete the increment with it; the control (wipe removed) gives
+`1 of 2 drained HID event(s) were wiped`. A test that fails on correct behaviour is worse
+than no test.
+
 Deferred (documented): cross-host/cluster, PTP/NTS time sync, attested
 firmware + real GPU/NPU engines, elastic-grant pressure events, the Verus
 proofs, and the hardware-lab performance numbers.
@@ -3189,7 +3511,11 @@ abi/          rheo-abi: the on-wire user/kernel ABI, defined **once** - syscall
               links into a kernel binary and a cell alike; kernel::abi,
               kernel::queue, librheo::sys and libc::sys all re-export it, which
               is what makes divergence a compile error instead of a wrong number
-              at runtime (docs/ARCHITECTURE-DEBT.md 3.1)
+              at runtime (docs/ARCHITECTURE-DEBT.md 3.1). `obs` is a submodule
+              rather than more of lib.rs because it has a **third** reader the
+              rest of the ABI does not: a host tool walking the telemetry plane
+              out of guest physical memory, with no cell and no syscall involved
+              (docs/OBSERVABILITY.md 11)
 kernel/       the no_std kernel library + boot demo bin
   src/        ISA-independent: boot (the portable boot sequencer - arch::init
               does only console/vectors/page tables, so arch names nothing above
@@ -3197,7 +3523,12 @@ kernel/       the no_std kernel library + boot demo bin
               (frames + frames_pmem real-nvdimm allocator + grants; frames carries a
               per-frame refcount so `fork` is copy-on-write - `free` is a decrement,
               `share`/`refs` the COW primitives - **and** the per-NUMA-node frame
-              ranges `alloc_on` places against, docs/SUBSTRATE.md pillar 6), uaccess (**the one seam kernel code
+              ranges `alloc_on` places against, docs/SUBSTRATE.md pillar 6; the hot
+              operations go through **flat combining** rather than each core taking the
+              pool lock in turn, the 4 KiB zeroing is outside the lock entirely, and
+              the free-frame search is **bitmap.rs** - a word at a time, dependency-free
+              so `verify/bitmap/` can drive its four boundary conditions on the host -
+              docs/SMP.md 10.0g), uaccess (**the one seam kernel code
               touches a cell's memory through**: bounds + presence + copy-on-write
               resolution, so every lazy-mapping feature is one change here rather than a
               ~98-site audit - docs/LINUX-COMPAT.md), time (clock), rng (ChaCha20 DRBG +
@@ -3256,7 +3587,20 @@ kernel/       the no_std kernel library + boot demo bin
               linux (the Linux personality:
               docs/LINUX-COMPAT.md - incl. the blocking, readiness-computing
               poll/epoll_wait, a real nanosleep, blocking stdin, and eventfd2 as
-              a shared counter registry - eventfd.rs), U-mode programs
+              a shared counter registry - eventfd.rs), obs (**the observability
+              spine**: ring.rs is the **per-CPU event ring** - one ring and one
+              sequence counter per core, safe by partitioning, dependency-free so
+              `verify/obs/` can drive its wrap on the host; trace.rs is now a shim
+              over it keeping the `@E` format. Plus one exported page-aligned root,
+              `RHEO_OBS_ROOT`, whose
+              section table carries a kernel VA *and a physical address* per
+              telemetry region, so a host tool, a hypervisor or a crash dump can
+              walk the whole plane from the ELF symbol alone with **zero** guest
+              instructions - no device, no MMIO, no fw_cfg, and nothing
+              QEMU-specific. It *indexes* the five planes rather than absorbing
+              them: text is telemetry.rs, distribution is metrics.rs, and the
+              event/counter/snapshot planes live here -
+              docs/OBSERVABILITY.md 11), U-mode programs
               (user_progs.rs incl. the lsh shell), abi
   src/arch/   per-ISA Rust modules incl. paging.rs (one dir per ISA)
   arch/       per-ISA assembly (boot, vectors/traps, context switch, user)
@@ -3269,6 +3613,18 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               queue region / a kernel VA / the .user window / the channel + grant
               regions - each refused, ring still serving; plus a control per
               finding so the bound is not a break),
+              observe (docs/OBSERVABILITY.md 11: the observability root - the
+              compile-time identity a reader checks *before* trusting a byte, the
+              published physical address against the kernel's own virt_to_phys,
+              every section asserted to carry an address where physical memory
+              actually is (which is what catches a forgotten linear-map mask - the
+              mistake that makes a host reader silently decode nothing), and the
+              tick asserted to be a real advancing counter with a real frequency,
+              since a timestamp domain published as zero makes every recorded time
+              a lie; then the event plane end to end - the ring funded from the real
+              pool, 300 records read back field-for-field with real ticks advancing,
+              the ring wrapped with the surviving window located exactly, and every
+              frame returned),
               resources, numa (docs/SUBSTRATE.md pillar 6: node-affine frame
               allocation - QEMU launched with two 512 MiB memory nodes, the pool
               asserted partitioned between them at exactly the boundary the launch
@@ -3313,7 +3669,17 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               its own core; then **TWO CORES IN ONE HEAP** - 512 allocate/stamp/
               verify/free cycles each through `runtime::Heap`'s global allocator,
               0 bytes of either core's block ever holding the other's marker;
-              then **STRANDS ACROSS VCORES** - 64 `spawn_shared` strands each
+              then **TWO CORES IN ONE FRAME ALLOCATOR** - the same shape against
+              `mm::frames` (128 alloc/stamp/verify/free rounds each, 0 bytes of
+              either core's frame ever holding the other's marker, the used
+              counter still matching the bitmap, no frame leaked), then 1024
+              churn rounds each with no page touched so the two are contending
+              on the bookkeeping alone - 140-469 requests executed by the OTHER
+              core's flat-combining combiner, reported and never asserted - plus
+              a single-core check that a frame **dirtied while free** comes back
+              zeroed, which is the only shape that can catch a missing memset in
+              a rotating allocator (docs/SMP.md 10.0g,
+              docs/ENGINEERING.md 11); then **STRANDS ACROSS VCORES** - 64 `spawn_shared` strands each
               asserted to run exactly once, drained by two cores at once and then
               spawned on one vcore and executed entirely by another
               (docs/CONCURRENCY.md); then **A CELL ASKING WHICH VCORE IT IS** -
@@ -3347,7 +3713,7 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               linuxbun, 83 slices taken on that core, `rheo:42` and exit 0 -
               x86-64 only, docs/SMP.md 10.0e), linuxnodesmp + linuxclaudesmp (the
               same for the REAL node and the REAL 275 MB Claude Code binary on a
-              secondary - `rheo:42` and `2.1.220 (Claude Code)`, 23 and 1,612
+              secondary - `rheo:42` and its own version string, 23 and 1,612
               preemption slices taken on that core, docs/SMP.md 10.0e), shell-smoke, hwinfo, rng, runtime
               (the strand runtime, closing with the **measured** concurrency /
               async / sync phases: 256 strands in flight with every round a
@@ -3563,7 +3929,12 @@ comparison/   seL4 comparison: methodology, sel4bench script, RESULTS.md; plus
               trace and sched_latency.rs asking the host Linux the same question
               in ns - different units, never divided. Every other axis is
               lab-gated and named; no number in the tree says rheo-os is faster
-              than Linux (docs/SUBSTRATE.md)
+              than Linux (docs/SUBSTRATE.md); plus ethos/ - the Ethos OS design
+              comparison (paper-driven; the source needs an authorized key and
+              is stated unreachable): Etypes' type-hash-at-the-boundary and
+              image-measured identity taken as G-gated debt rows, MinimaLT's
+              transport lessons folded into NETSTACK.md N7, paired-OS/Xen
+              delegation and per-message kernel type checks refused with reasons
 xtask/        build/run/test/bench/verify orchestration (cargo xtask ...)
 verify/       host-side model checking of the kernel state machines that are
               integer-only and dependency-free (docs/EXECUTION-MODEL.md 8): each
@@ -3578,7 +3949,28 @@ verify/       host-side model checking of the kernel state machines that are
               attempted and reverted twice on real hardware and named here in 213
               operations on the first seed. It does not replace `cargo xtask test`:
               it checks state machines, not the trap path, the page tables or the FP
-              register file (verify/README.md)
+              register file (verify/README.md).
+              bitmap/ drives `mm/bitmap.rs` - the free-frame search, 683,792 cases
+              against the pre-change bit-at-a-time algorithm as the oracle (16 hand-
+              computed boundaries, 320,000 random find_in/find_from, 32,000 find_run,
+              and every 8-bit map exhaustively). It is here and not in a boot test
+              because the word-at-a-time form has four boundary conditions the old one
+              did not, each **silent** when wrong: a missed free bit is a spurious OOM,
+              and a bit from outside [lo, hi) is a frame on the wrong NUMA node that
+              `alloc_on` reports as placed. Also where the win is *measured* (63x fewer
+              steps through a full region), since the bench suite allocates from a
+              nearly-empty pool and cannot see it at all.
+              obs/ drives `obs/ring.rs` - the per-CPU event ring against an
+              independent VecDeque oracle at four counter start points, including one
+              **crossing 2^32**, where the recorded sequence number recycles (~71
+              minutes at one event per microsecond, so a boot never reaches it and
+              would ship the arithmetic untested). u64 wrap is deliberately NOT
+              tested: 584 years at one event per nanosecond, so the ring makes no such
+              claim and asserting it would invent a requirement. Two controls firing
+              (slot mask off by one; zero-based sequence numbers), one honest
+              non-result recorded (`get`'s seq check cannot fire single-threaded -
+              the bounds test subsumes it, and it only earns its keep against a
+              reader racing a live writer)
 idl/          system IDL + codegen        (future, step 6)
 runtime/      strand runtime: heap (alloc), async executor + channel,
               type-level capability rights (BUILD-ORDER step 7)

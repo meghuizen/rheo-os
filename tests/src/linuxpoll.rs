@@ -158,6 +158,10 @@ fn run_capture(image: &[u8], argv: &[&[u8]]) -> (Outcome, &'static [u8]) {
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
     kernel::boot::init();
+    // The distribution plane (docs/OBSERVABILITY.md 11, S6): the Linux fixtures
+    // below issue syscalls and demand-page their images, so Metric::SyscallNs and
+    // Metric::FaultNs must both fill - asserted before PASS.
+    kernel::metrics::enable();
     println!("linuxpoll: start on {}", arch::NAME);
 
     // SAFETY: once, before any allocation.
@@ -297,6 +301,23 @@ extern "C" fn kernel_main() -> ! {
         kernel::abi::DEADLOCK_EXIT
     );
 
+    let sy = kernel::metrics::local(kernel::metrics::Metric::SyscallNs);
+    let fa = kernel::metrics::local(kernel::metrics::Metric::FaultNs);
+    assert!(
+        sy.count() > 0,
+        "Linux fixtures ran and Metric::SyscallNs holds no samples - the recorder is dead"
+    );
+    assert!(
+        fa.count() > 0,
+        "Linux images demand-paged and Metric::FaultNs holds no samples - the recorder is dead"
+    );
+    println!(
+        "linuxpoll: distributions - {} syscall(s) mean {} ns, {} fault fill(s) mean {} ns OK",
+        sy.count(),
+        sy.mean(),
+        fa.count(),
+        fa.mean()
+    );
     println!("linuxpoll: PASS");
     arch::exit(arch::ExitCode::Success)
 }

@@ -510,6 +510,53 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   read, so that phase never reached the code it claimed to test. The discriminating
   case was a *write* to a filled read-only page. Before trusting a phase, delete the
   thing it guards and watch it fail.
+- **An allocator that never recycles cannot prove it sanitises.** Moving the frame
+  allocator's 4 KiB zeroing out of the pool lock (docs/SMP.md 10.0g) came with what
+  looked like the obvious oracle: two cores loop over allocate / stamp every byte /
+  free, asserting every *fresh* frame arrives zero, on the reasoning that a frame one
+  core stamped and freed comes back to the other still dirty. It **passed with the
+  zeroing deleted**. `alloc` rotates a search hint, so a freed frame is not handed out
+  again until the cursor has walked all 131,072 of them: nothing in a 2,000-round pass
+  is ever recycled, and the oracle only ever inspected memory that was already zero.
+  The fix is to dirty the frame **before** it is allocated - the hint makes the next
+  frame predictable, and a free frame belongs to nobody, so a test may write to it -
+  with the prediction *asserted* rather than assumed, and a miss skipping with a
+  reason. The general trap: a "reuse the resource and check it was cleaned" oracle is
+  only an oracle if the allocator under test actually reuses on the timescale of the
+  test, and rotating allocators specifically do not.
+- **A bounded wait is not a precondition.** `observe` asserted that a park moves the
+  halt/spin counter, using `register(1ms); while !expired { wait() }` - which only
+  parks *if the deadline has not already elapsed by the first test*. One host
+  scheduler preemption of the QEMU process breaks that, since the guest's counter
+  advances while the process is descheduled. It failed ~1 run in 3, and the loop was
+  measured running **zero** times on exactly the failing runs. Fixed by parking once
+  unconditionally: the property under test was what a park does, never whether a
+  deadline had already passed. The general form: if a test's experiment happens only
+  inside a timing window, the window is a silent precondition, and on a shared CI
+  runner it will not hold.
+- **A test must not assert a race outcome, and "weaken the bound" is not the fix.**
+  `smp`'s work-queue phase first asserted `workers == cores`; that failed on a legal
+  schedule, and was weakened to `workers > 1` - the same mistake one size smaller,
+  since a single core draining the whole queue before any peer arrives is equally
+  legal. Under a host oversubscribed 3:1 it failed four runs out of four. The fix is
+  not a smaller threshold but moving the claim: the *barrier* proves the cores were
+  simultaneous, the summed counts and the bit-identical result prove the sharing was
+  correct, and how many cores won a block is **reported**. Deliberately starving the
+  host is the cheap way to find these - `for i in $(seq 1 12); do (while :; do :; done) & done`
+  turned three separate latent flakes into deterministic failures.
+- **A hot path's cost can be dominated by the cold code sharing its stack frame.**
+  The frame allocator's flat-combining layer (docs/SMP.md 10.0g) was written as one
+  function holding the election, the batch, the publication and the spin loop, on the
+  reasoning that the fast path is "a swap, the work, a store" - three instructions.
+  It measured **~40**. `objdump` gave the answer in one look: because the cold half
+  lived in the same function, LLVM allocated seven callee-saved registers for it and
+  pushed and popped all seven on *every* fast-path call, and the out-of-line
+  `call fc_execute` beside them kept the opcode a runtime value so a six-way dispatch
+  ran as well. Splitting it - `#[inline(always)]` leaf fast path, everything cold
+  `#[cold] #[inline(never)]` - took it to 11 with no logic changed. Counting the
+  instructions you wrote is not counting the instructions that run; and adding the
+  bench *first* is what turned a wrong belief into a number, on a path the suite had
+  never measured at all.
 - **Do not split a sequence you have not understood.** The first attempt at that
   fix split the arch injector into "inject" and "halt" so the portable code could
   re-halt until the byte arrived. It wedged the machine: the per-ISA sequence is
@@ -667,6 +714,57 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   cause it *measured*, so "loaded to the concurrency frontier" is evidence, not a guess -
   and the acceptance is bounded to that exact signature (exit 134 **and** empty output)
   so a different failure still fails loudly.
+- **Optimise the access *shape*, not the access - and map the consumers before touching
+  the primitive.** The funded-table hot-path work (docs/SUBSTRATE.md pillar 1, S2c)
+  started as "make `slot_ptr` faster" and would have bought ~1 instruction. Drawing the
+  dependency graph of who consults the table and how often showed the cost was never
+  point access: it was whole-table **scans** written as point access in a loop - the
+  index split, the page resolve and a full copy of `T` per element, times the table,
+  times per-decision frequency (the scheduler's predicates per pick, the VMA walk per
+  fault). A scan API reading by reference took the same predicate from 10.5 to 4.9
+  instructions per element; the point-access fix was noise. And the graph is also what
+  keeps a fix from becoming a **moved bottleneck**: the identical migration applied to
+  the EEVDF queue would have *regressed* it, because its capacity is a whole page of
+  48-byte slots and its walks are bounded by a much smaller `high_water` - the right
+  lever there was killing the per-slot copy (`get_ref`), keeping the bound. One
+  primitive, two consumers, two opposite answers; only the consumer map tells them
+  apart.
+- **Two questions about the same elements are one walk.** Found three times in one pass,
+  all on decision paths: the page-fault fill asked the VMA list `find(addr)` and then a
+  list-level `file_at(addr)` **which re-ran `find`** - the record was already in the
+  caller's hand, so the second question became a method on it (`Vma::file_page`); EEVDF
+  `dispatch` walked its queue twice with identical filters (`eligibility_would_defer`
+  then `pick`) and now takes both answers from one walk - fused *exactly*, including the
+  strict-`<` first-seen tie rule, because a fusion that changes an edge case is a
+  behaviour change wearing an optimisation's name; and `sched::dispatch::pick` evaluated
+  the personality's runnable predicate - itself a context-table walk - up to **three
+  times per cell per decision** (per queue entry in the reconcile, the final filter, the
+  divergence probe), fixed with a per-decision memo, which is also semantically better:
+  one decision now reads one snapshot of runnability instead of several. The smell in
+  every case is a helper that re-derives what its caller already holds.
+- **A struct's size is an interface: bench the whole matrix, not the paths you touched.**
+  Growing `Funded<T>` by 64 bytes (the inline directory) changed benchmarks that never
+  touch a funded table: the `rng_*` draws moved +3..6 instructions **amortized** -
+  non-integer per-op deltas, so a rare path (the 1-in-1024 drain), not the per-draw path
+  - and two queue round trips moved +-1, all from static-layout and alignment ripples
+  (a word-wide wipe loop degrades to per-byte when a buffer's alignment shifts). None of
+  this is visible from the touched paths' benches, and icount is deterministic, so these
+  are real instructions, not noise. The discipline: diff **every** benchmark against the
+  pre-change build, publish the regressions next to the wins (+1 on `p2_roundtrip_single`
+  beside -16 on `p5_crosscell_roundtrip`), and treat an unexplained delta as a finding to
+  localise, not a rounding error to wave at.
+- **When a design change deletes a cost, the oracles that hand-computed it must move to
+  the new number - and a boundary that becomes untested must gain a test.** The inline
+  directory made small tables stop paying a directory frame, which broke three frame
+  oracles (`smp` E4's `TABLE_FRAMES`, `substrate`'s charge count, `numa`'s `>= 3`) -
+  correctly, and each was moved to assert the **new** truth rather than loosened
+  (`TABLE_FRAMES: 2 -> 1` is itself evidence the inline tier is in use, and a third
+  frame appearing in `substrate` now means the overflow directory was allocated for a
+  table that does not need one). The same change also moved the overflow directory out
+  of every existing test's reach - every boot-suite table now fits inline - so the
+  growth test crosses the boundary explicitly and round-trips elements on both sides.
+  A designed-away cost quietly un-tests the mechanism that remains; check what the old
+  tests were reaching *through*, not just what they asserted.
 
 ## 12. Never dereference an address the caller chose
 

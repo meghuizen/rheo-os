@@ -66,6 +66,31 @@ samenvatting en een paar oefeningen.
 - [Hoofdstuk 9 - Van bootloader naar kernel](09-van-bootloader-naar-kernel.md)
 - [Hoofdstuk 10 - Wat nu? De weg naar een echt besturingssysteem](10-volgende-stappen.md)
 
+### Deel 5 - Dieper: hoe een besturingssysteem echt werkt
+
+- [Hoofdstuk 11 - Interrupts diepgaand](11-interrupts-diepgaand.md)
+- [Hoofdstuk 12 - Virtueel geheugen](12-virtueel-geheugen.md)
+- [Hoofdstuk 13 - Systeemaanroepen](13-systeemaanroepen.md)
+- [Hoofdstuk 14 - Context wisselen](14-context-wisselen.md)
+- [Hoofdstuk 15 - Processen, threads en taken](15-processen-threads-taken.md)
+- [Hoofdstuk 16 - Scheduling](16-scheduling.md)
+- [Hoofdstuk 17 - CPU-caches](17-cpu-caches.md)
+- [Hoofdstuk 18 - Geheugenbeheer](18-geheugenbeheer.md)
+- [Hoofdstuk 19 - Drijvende komma en SIMD](19-drijvende-komma-en-simd.md)
+- [Hoofdstuk 20 - Atomen en geheugenordening](20-atomen-en-geheugenordening.md)
+- [Hoofdstuk 21 - Meerdere processoren (SMP)](21-meerdere-processoren.md)
+- [Hoofdstuk 22 - Vergrendelen in de kernel](22-vergrendelen.md)
+- [Hoofdstuk 23 - Lock-free strategieen](23-lock-free.md)
+- [Hoofdstuk 24 - Drivers en hardware](24-drivers-en-hardware.md)
+- [Hoofdstuk 25 - Wachtrijen overal](25-wachtrijen-overal.md)
+- [Hoofdstuk 26 - Ringbuffers](26-ringbuffers.md)
+- [Hoofdstuk 27 - Async en events](27-async-en-events.md)
+- [Hoofdstuk 28 - Zero-copy](28-zero-copy.md)
+- [Hoofdstuk 29 - Threads verhuizen tussen CPU's](29-threads-verhuizen.md)
+- [Hoofdstuk 30 - Talen en runtimes](30-talen-en-runtimes.md)
+- [Hoofdstuk 31 - Tegels en rekenkracht](31-tegels-en-rekenkracht.md)
+- [Hoofdstuk 32 - Het wachtrijmodel](32-het-wachtrijmodel.md)
+
 ### Extra
 
 - [Woordenlijst - alle moeilijke woorden op een rij](woordenlijst.md)

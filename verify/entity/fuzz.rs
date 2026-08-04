@@ -28,8 +28,10 @@ use std::collections::HashSet;
 // --------------------------------------------------------------- host shims
 //
 // `Funded<T>` is a page-directory-backed table charged to a cell's frame budget
-// (kernel/src/mm/kmeta.rs). The five methods below are every one `entity.rs` calls; a
-// sixth appearing upstream is a compile error here rather than a silent divergence.
+// (kernel/src/mm/kmeta.rs). The six methods below are every one `entity.rs` calls; a
+// seventh appearing upstream is a compile error here rather than a silent divergence
+// (which is exactly how `iter` arrived: the scan API landed upstream and this file
+// refused to build until the shim matched it).
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct Owner(u16);
@@ -64,6 +66,12 @@ impl<T: Copy> Funded<T> {
             }
             None => false,
         }
+    }
+    /// The scan API: every slot with its index, by reference - the same dense
+    /// iteration the kernel's page-slice walk yields (kernel/src/mm/kmeta.rs
+    /// `page_slices`/`iter`: all slots below capacity, Free ones included).
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &T)> {
+        self.slots.iter().enumerate()
     }
     pub fn set_growing(&mut self, index: usize, value: T) -> bool {
         // A real growth can fail when the cell's budget is exhausted; the fuzzer models

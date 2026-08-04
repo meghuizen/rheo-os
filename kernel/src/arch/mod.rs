@@ -141,26 +141,34 @@ mod imp;
 mod imp;
 
 pub use imp::linux_abi;
+
+// `KERNEL_VA_BASE` is exported for exactly one caller: `obs::root`, which
+// *publishes* it so a reader outside the guest can turn a kernel VA found inside a
+// telemetry structure into a physical address. Portable code that wants to convert
+// an address still uses `virt_to_phys` / `phys_to_virt` - the constant is here
+// because the plane has to tell an external reader the mask, not because address
+// arithmetic has moved out of `arch`.
 pub use imp::{
-    CLONE_BACKWARDS, FP_AREA_LEN, FRAME_POOL_BASE, LINUX_UNAME_MACHINE, NAME, PagingRoot,
-    SIGACTION_HAS_RESTORER, SIGTRAMP_VA, TPM_TIS_CANDIDATE, TrapFrame, USER_VA_TOP,
-    VIRTIO_MMIO_BASE, VIRTIO_MMIO_COUNT, VIRTIO_MMIO_STRIDE, clone_child_frame, context_init,
-    context_switch, cpu_class_this_cpu, cpu_feature_names, cpu_model_this_cpu, cpu_report,
-    cpu_topology_bits, cycles, decode_syscall, discover, doorbell_count, doorbell_trap,
-    enable_timer_irq, enable_timer_irq_this_cpu, enable_uart_rx_irq, enable_virtio_net_irq,
-    enter_user_first, exit, fp_area_init, fp_simd_tiers, has_hwrng, hwrng_name, hwrng_u64,
-    idle_wait, irq_ready_this_cpu, irq_window, mmio_map_window, mmio_probe_u32, msi_irq_count,
-    msi_route, msi_target, net_irq_enabled, net_irq_pending, paging_activate,
-    paging_activate_kernel, paging_cow_at, paging_cow_clear, paging_cow_protect_user,
-    paging_flush_asid, paging_for_each_user_leaf, paging_kernel_init, paging_map, paging_map_frame,
-    paging_mapped, paging_new_root, paging_protect, paging_tlb_tagged, paging_unmap_frame,
-    paging_unmapped_span, pci_cfg_read32, pci_cfg_write32, pci_mmio_window, phys_to_virt,
-    pmem_map_window, restore_rt_frame, restore_user_fp, return_to_kernel, save_user_fp,
-    serial_init, serial_read_byte, serial_write_byte, set_syscall_ret, set_user_fs_base,
-    setup_rt_frame, sig_tramp_code, spin_loop, thread_director_present, ticks_to_ns, timer_arm,
-    timer_disarm, timer_expired, timer_irq_enabled, timer_now_ns, timer_park, tlb_flushes,
-    trap_init, trapframe_kernel_sp, trapframe_new, trapframe_zeroed, uart_inject_and_wait,
-    uart_irq_enabled, user_fs_base, user_mode_init_this_cpu, user_sp, virt_to_phys,
+    CLONE_BACKWARDS, FP_AREA_LEN, FRAME_POOL_BASE, KERNEL_VA_BASE, LINUX_UNAME_MACHINE, NAME,
+    OBS_ARCH, OBS_TICK_DOMAIN, PagingRoot, SIGACTION_HAS_RESTORER, SIGTRAMP_VA, TPM_TIS_CANDIDATE,
+    TrapFrame, USER_VA_TOP, VIRTIO_MMIO_BASE, VIRTIO_MMIO_COUNT, VIRTIO_MMIO_STRIDE,
+    clone_child_frame, context_init, context_switch, cpu_class_this_cpu, cpu_feature_names,
+    cpu_model_this_cpu, cpu_report, cpu_topology_bits, cycles, decode_syscall, discover,
+    doorbell_count, doorbell_trap, enable_timer_irq, enable_timer_irq_this_cpu, enable_uart_rx_irq,
+    enable_virtio_net_irq, enter_user_first, exit, fp_area_init, fp_simd_tiers, has_hwrng,
+    hwrng_name, hwrng_u64, idle_wait, irq_ready_this_cpu, irq_window, mmio_map_window,
+    mmio_probe_u32, msi_irq_count, msi_route, msi_target, net_irq_enabled, net_irq_pending,
+    obs_tick, obs_tick_hz, paging_activate, paging_activate_kernel, paging_cow_at,
+    paging_cow_clear, paging_cow_protect_user, paging_flush_asid, paging_for_each_user_leaf,
+    paging_kernel_init, paging_map, paging_map_frame, paging_mapped, paging_new_root,
+    paging_protect, paging_tlb_tagged, paging_unmap_frame, paging_unmapped_span, pci_cfg_read32,
+    pci_cfg_write32, pci_mmio_window, phys_to_virt, pmem_map_window, restore_rt_frame,
+    restore_user_fp, return_to_kernel, save_user_fp, serial_init, serial_read_byte,
+    serial_write_byte, set_syscall_ret, set_user_fs_base, setup_rt_frame, sig_tramp_code,
+    spin_loop, thread_director_present, ticks_to_ns, timer_arm, timer_disarm, timer_expired,
+    timer_irq_enabled, timer_now_ns, timer_park, tlb_flushes, trap_init, trapframe_kernel_sp,
+    trapframe_new, trapframe_zeroed, uart_inject_and_wait, uart_irq_enabled, user_fs_base,
+    user_mode_init_this_cpu, user_sp, virt_to_phys,
 };
 
 /// SMP surface (docs/SMP.md, task #27), exported only under the `smp` feature so

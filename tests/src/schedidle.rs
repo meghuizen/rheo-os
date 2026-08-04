@@ -255,7 +255,7 @@ fn run_vcore_pair(mode: u64, arg: u64) -> (Outcome, u64, u64) {
             core::mem::MaybeUninit::uninit();
         let vf = core::ptr::addr_of_mut!(VFRAME);
         (*vf).write(arch::trapframe_new(
-            user_peer as usize,
+            user_peer as *const () as usize,
             stack_v + stack_v_len,
             params_v,
             (*core::ptr::addr_of!(KSTACK_V)).top(),
@@ -315,6 +315,10 @@ fn assert_interleave(what: &str) {
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
     kernel::boot::init();
+    // The distribution plane (docs/OBSERVABILITY.md 11, S6): recording on for the
+    // whole run, so the cross-cell switches the phases below perform land in
+    // Metric::SwitchNs - asserted before PASS.
+    kernel::metrics::enable();
     println!("schedidle: start on {}", arch::NAME);
     // Both interrupt paths this proof can idle on, opt-in exactly as the Phase D/F
     // kernels do (so the other 57 kernels are untouched).
@@ -617,6 +621,17 @@ extern "C" fn kernel_main() -> ! {
         core::str::from_utf8(order()).unwrap_or("?")
     );
 
+    let sw = kernel::metrics::local(kernel::metrics::Metric::SwitchNs);
+    assert!(
+        sw.count() > 0,
+        "cells switched all run and Metric::SwitchNs holds no samples - the recorder is dead"
+    );
+    assert!(sw.mean() > 0, "a cross-cell switch measured 0 ns");
+    println!(
+        "schedidle: SwitchNs distribution - {} switch(es), mean {} ns OK",
+        sw.count(),
+        sw.mean()
+    );
     println!("schedidle: PASS");
     arch::exit(arch::ExitCode::Success)
 }

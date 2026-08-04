@@ -26,6 +26,13 @@
 
 use core::sync::atomic::AtomicU32;
 
+/// The observability plane's layout (docs/OBSERVABILITY.md).
+///
+/// A module rather than more of this file because it has a third reader the rest
+/// of the ABI does not: a **host** tool that walks the plane out of guest physical
+/// memory, with no cell and no syscall involved.
+pub mod obs;
+
 // =========================================================================
 // Syscall numbers
 // =========================================================================

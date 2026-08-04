@@ -702,6 +702,10 @@ impl VirtioNet {
         // query, a TCP segment), so it counts as link activity for the receive
         // path's hot tier (docs/NETSTACK.md 16, the adaptive poll policy).
         crate::net_rx::note_activity();
+        // The counts for the NIC status pane (docs/OBSERVABILITY.md 11, S5):
+        // this core's own plane slots, one volatile read-add-write each.
+        crate::obs::cpu_bump(crate::obs::cpu::CTR_NET_TX_FRAMES, 1);
+        crate::obs::cpu_bump(crate::obs::cpu::CTR_NET_TX_BYTES, n as u64);
         true
     }
 
@@ -744,6 +748,12 @@ impl VirtioNet {
             // x86-64 has no NIC interrupt line, so the handler never runs there
             // and that ISA would get nothing from the network at all.
             crate::rng::feed_interrupt(frame_len as u64, id as u64);
+
+            // The NIC status pane's receive counts (docs/OBSERVABILITY.md 11,
+            // S5) - here at the one point a frame is actually taken, for the
+            // same reason as the entropy hook above.
+            crate::obs::cpu_bump(crate::obs::cpu::CTR_NET_RX_FRAMES, 1);
+            crate::obs::cpu_bump(crate::obs::cpu::CTR_NET_RX_BYTES, frame_len as u64);
 
             self.transport.notify(0);
             Some(frame_len)

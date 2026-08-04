@@ -94,6 +94,39 @@ extern "C" fn kernel_main() -> ! {
         Outcome::Faulted(addr) => panic!("librheo-gpu faulted at {addr:#x}"),
     }
 
+    // The GPU status pane (docs/OBSERVABILITY.md 11, S5): the present the cell
+    // just completed must be visible through the published block. The cell draws
+    // 128x128 RGBA = 65536 bytes, so the byte count is exact per present; and
+    // `util_plus_one` must be 0 - utilisation is reported ABSENT, not estimated,
+    // because no modelled device exposes a busy signal (docs/ENGINEERING.md 1).
+    let pane = kernel::obs::gpu_pane();
+    assert_eq!(
+        pane.refreshed_tick, 0,
+        "the GPU pane moved before anyone refreshed it"
+    );
+    kernel::obs::gpu_refresh();
+    assert!(
+        pane.presents >= 1,
+        "the cell presented a frame and the pane counted {} present(s)",
+        pane.presents
+    );
+    assert_eq!(
+        pane.present_bytes,
+        pane.presents * 128 * 128 * 4,
+        "present bytes do not match {} present(s) of a 128x128 RGBA frame",
+        pane.presents
+    );
+    assert_eq!(
+        pane.util_plus_one, 0,
+        "utilisation reported where no device exposes a busy signal - an estimate, not \
+         an observation"
+    );
+    println!(
+        "librheogpu: GPU pane after refresh - {} device(s), {} present(s) / {} B, \
+         utilisation honestly absent OK",
+        pane.devices, pane.presents, pane.present_bytes
+    );
+
     println!("librheogpu: PASS");
     arch::exit(arch::ExitCode::Success)
 }

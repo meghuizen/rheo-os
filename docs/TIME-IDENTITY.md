@@ -336,7 +336,18 @@ reviewer checks in one line, rather than a promise about what callers do. The
 same rule applies to the console byte path, which used to pass the byte. The
 event buffer is wiped as it is drained, so a keystroke does not sit in kernel
 memory waiting for the device to overwrite it (asserted:
-`virtio_input::buffers_clear`).
+`virtio_input::wiped() == events()`).
+
+The wipe is **read back** inside the drain, before the buffer is handed to the
+device again, and only a verified wipe is counted. Two reasons, both learned the
+hard way. A counter incremented beside the wipe would prove nothing, since anyone
+deleting the wipe would delete the increment with it; reading the buffer back makes
+the equality a statement about memory. And asking the question *after* a drain is a
+race rather than the same property: a wiped buffer goes straight back to the device,
+so the next keystroke refills it, and the first version - which scanned every buffer
+once the drain returned - duly failed on riscv64 about one run in ten, claiming a
+drained event was still in the buffer when what had happened was that a new one had
+arrived. A test that fails on correct behaviour is worse than no test.
 
 That costs nothing. The unpredictability is in *when* a key was pressed, not
 which one - a key code is a few bits of highly skewed, guessable text. Mixing it

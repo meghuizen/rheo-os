@@ -87,11 +87,13 @@ pub const PEER: Sources = 1 << 3;
 /// Sources this module can actually wait on (`PEER` deliberately excluded).
 pub const WAITABLE: Sources = TIMER | NET | CONSOLE;
 
-/// Halts performed by [`wait`] (the CPU genuinely stopped).
-static mut HALTS: u64 = 0;
-/// Bounded-poll / software-advance iterations performed by [`wait`] because no
-/// wake source on this machine could halt the CPU. Non-zero means the idle spun.
-static mut SPINS: u64 = 0;
+// The halt/spin **counts** are the observability plane's `CTR_HALTS`/`CTR_SPINS`
+// slots (S4): one counter, bumped **unconditionally** by [`wait`] itself, read by
+// the accessors below and by the snapshot plane's readers alike. Before S4 there
+// were two - these statics, and a gated bump inside `obs::snap_unparked` - which
+// is exactly the two-copies shape the unification removes: the same halt counted
+// once or twice depending on the mask.
+
 /// Whether any [`wait`] genuinely halted since the last [`reset`].
 static mut IDLED: bool = false;
 
@@ -99,24 +101,22 @@ static mut IDLED: bool = false;
 pub fn reset() {
     // SAFETY: single CPU, between runs.
     unsafe {
-        *addr_of_mut!(HALTS) = 0;
-        *addr_of_mut!(SPINS) = 0;
         *addr_of_mut!(IDLED) = false;
     }
+    crate::obs::cpu_counter_clear(crate::obs::cpu::CTR_HALTS);
+    crate::obs::cpu_counter_clear(crate::obs::cpu::CTR_SPINS);
 }
 
 /// Halts performed by the scheduler idle state.
 pub fn halts() -> u64 {
-    // SAFETY: single CPU.
-    unsafe { *addr_of!(HALTS) }
+    crate::obs::cpu_counter_sum(crate::obs::cpu::CTR_HALTS)
 }
 
 /// Bounded-poll iterations performed because nothing could halt the CPU. The
 /// honesty counter: a non-zero value with `halts() == 0` says the "idle" was a spin
 /// (docs/ENGINEERING.md 7).
 pub fn spins() -> u64 {
-    // SAFETY: single CPU.
-    unsafe { *addr_of!(SPINS) }
+    crate::obs::cpu_counter_sum(crate::obs::cpu::CTR_SPINS)
 }
 
 /// Whether the scheduler idle state genuinely halted the CPU at least once. Set
@@ -173,7 +173,14 @@ pub fn wait(src: Sources) -> bool {
         ktimer::register(TimerClient::RxPoll, crate::net_rx::poll_slice_ns());
     }
 
+    // The snapshot plane's idle bracket (docs/OBSERVABILITY.md 11, S3): the time up
+    // to here was execution, the park's own time is charged idle only if the CPU
+    // genuinely halted - `snap_unparked(false)` charges a spin as busy, because a
+    // spin is not idle and recording it as one would launder exactly the number
+    // this plane exists to make honest.
+    crate::obs::snap_parked();
     let halted = ktimer::park(net_irq || uart_irq);
+    crate::obs::snap_unparked(halted);
 
     if sliced {
         // Release our slice; the arbiter re-arms whatever else is outstanding (a
@@ -182,9 +189,9 @@ pub fn wait(src: Sources) -> bool {
     }
 
     if halted {
+        crate::obs::cpu_bump(crate::obs::cpu::CTR_HALTS, 1);
         // SAFETY: single CPU.
         unsafe {
-            *addr_of_mut!(HALTS) = (*addr_of!(HALTS)).wrapping_add(1);
             *addr_of_mut!(IDLED) = true;
         }
         // Credit the halt to the subsystem whose honesty counter the proofs read, so
@@ -204,10 +211,7 @@ pub fn wait(src: Sources) -> bool {
         // due (the caller re-checks), or a remaining delta below the one-shot's
         // resolution. Advance the software clock a little so a deadline compared
         // against `ktimer::now_ns()` still elapses, and say plainly that we spun.
-        // SAFETY: single CPU.
-        unsafe {
-            *addr_of_mut!(SPINS) = (*addr_of!(SPINS)).wrapping_add(1);
-        }
+        crate::obs::cpu_bump(crate::obs::cpu::CTR_SPINS, 1);
         arch::spin_loop(1);
     }
     halted

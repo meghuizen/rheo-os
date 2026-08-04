@@ -121,8 +121,7 @@ fn run_execve(
         user::set_personality(0, Personality::Linux);
         linux::install_cell(0, &img, path.as_bytes());
         if on_secondary {
-            // SAFETY: cell 0 is installed and present, and nothing else touches it.
-            match unsafe { run_on_secondary_core(preempt) } {
+            match run_on_secondary_core(preempt) {
                 Some(code) => Outcome::Exited(code as u64),
                 None => {
                     println!(
@@ -167,7 +166,7 @@ fn run_execve(
 /// # Safety
 /// Cell 0 must be installed and present, and nothing else may touch it.
 #[cfg(feature = "smp")]
-unsafe fn run_on_secondary_core(preempt: bool) -> Option<usize> {
+fn run_on_secondary_core(preempt: bool) -> Option<usize> {
     kernel::smp::init();
     kernel::smp::start_all();
     if kernel::smp::online_count() < 2 {
@@ -179,31 +178,65 @@ unsafe fn run_on_secondary_core(preempt: bool) -> Option<usize> {
 }
 
 #[cfg(not(feature = "smp"))]
-unsafe fn run_on_secondary_core(_preempt: bool) -> Option<usize> {
+fn run_on_secondary_core(_preempt: bool) -> Option<usize> {
     None
 }
 
-pub fn prove(
-    name: &str,
-    path: &str,
-    argv: &[&[u8]],
-    envp: &[&[u8]],
-    want: &[u8],
-    thread_abort_partial: bool,
-    preemptive: bool,
-    wx_authority: bool,
-    // An optional **second** invocation of the same binary: `(argv, expected stdout)`.
-    // Run only after the first succeeds, so a partial or a failure is never masked by
-    // it. `linuxbun` uses this to run a JS file that calls a tile kernel through
-    // `bun:ffi` (docs/TILES.md 13.4d); every other caller passes `None`.
-    second: Option<(&[&[u8]], &[u8])>,
-    // Run the cell **on a secondary core** rather than the boot CPU (docs/SMP.md 10.0e).
-    // The question a production runtime raises once the machine has more than one core:
-    // its whole load path - block device, ext4, `ld.so`, file-backed `mmap`, demand
-    // paging - plus JIT arenas and worker contexts, all driven from a core that is not
-    // the one that booted. `false` is the pre-existing path, byte for byte.
-    on_secondary: bool,
-) -> ! {
+/// What a runtime proof runs, and how.
+///
+/// A struct rather than ten positional arguments. Five of the fields are booleans or
+/// `Option`s, so the positional call read
+/// `prove(name, path, argv, envp, want, false, true, true, None, false)` - unreadable at
+/// the call site, and exactly what clippy's `too_many_arguments` was pointing at.
+/// `..Default::default()` also means a caller names only the fields it differs on.
+#[derive(Default)]
+pub struct Proof<'a> {
+    /// Test name, used in every line of the transcript.
+    pub name: &'a str,
+    /// The binary's path on the image's filesystem.
+    pub path: &'a str,
+    pub argv: &'a [&'a [u8]],
+    pub envp: &'a [&'a [u8]],
+    /// The exact stdout the cell must produce.
+    pub want: &'a [u8],
+    /// Accept "exit 134 and no output" as a bounded, reported partial instead of a
+    /// failure. Only a runtime that *provably* aborts before evaluating may set it, and
+    /// nothing in the suite does any more.
+    pub thread_abort_partial: bool,
+    /// Enable preemptive dispatch for this boot (docs/SUBSTRATE.md 15, S3').
+    pub preemptive: bool,
+    /// Mint the **W^X exception capability** (docs/ARCHITECTURE.md 5.1) so this
+    /// runtime's JIT can map its code pages writable-and-executable. Every other kernel
+    /// in the suite mints nothing of the sort and is refused exactly as before, which is
+    /// what makes this a capability rather than a setting.
+    pub wx_authority: bool,
+    /// An optional **second** invocation of the same binary: `(argv, expected stdout)`.
+    /// Run only after the first succeeds, so a partial or a failure is never masked by
+    /// it. `linuxbun` uses this to run a JS file that calls a tile kernel through
+    /// `bun:ffi` (docs/TILES.md 13.4d); every other caller leaves it `None`.
+    pub second: Option<(&'a [&'a [u8]], &'a [u8])>,
+    /// Run the cell **on a secondary core** rather than the boot CPU (docs/SMP.md
+    /// 10.0e). The question a production runtime raises once the machine has more than
+    /// one core: its whole load path - block device, ext4, `ld.so`, file-backed `mmap`,
+    /// demand paging - plus JIT arenas and worker contexts, all driven from a core that
+    /// is not the one that booted. The default `false` is the pre-existing path, byte
+    /// for byte.
+    pub on_secondary: bool,
+}
+
+pub fn prove(p: Proof<'_>) -> ! {
+    let Proof {
+        name,
+        path,
+        argv,
+        envp,
+        want,
+        thread_abort_partial,
+        preemptive,
+        wx_authority,
+        second,
+        on_secondary,
+    } = p;
     kernel::boot::init();
     println!("{name}: start on {}", arch::NAME);
 

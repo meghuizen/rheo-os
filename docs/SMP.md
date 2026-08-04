@@ -1353,7 +1353,7 @@ strict gate, `on_secondary` the only difference. Observed:
 |---|---|---|---|---|
 | Bun (JSC) | 99 MB | ~9,200 | 83 of 6,243 | `rheo:42`, exit 0 |
 | Node.js (V8 + libuv) | 124 MB | ~15,300 | 23 of 9,477 | `rheo:42`, exit 0 |
-| Claude Code (Bun-compiled) | 275 MB | ~116,300 | 1,612 of 61,701 | `2.1.220 (Claude Code)`, exit 0 |
+| Claude Code (Bun-compiled) | 275 MB | ~116,300 | 1,612 of 61,701 | its own version string, exit 0 |
 
 Each is its own kernel rather than a phase, deliberately: the primary-CPU proof is the
 baseline every claim about these runtimes rests on, and a boot that runs one somewhere else
@@ -1416,6 +1416,275 @@ reachable. `frames_pmem` gets the same treatment for the same reason, and with n
 phase of its own: an nvdimm is x86-64-only here, and adding one to the `smp`
 launch would perturb the tree's most assertion-dense kernel to buy a control that
 would not fire either.
+
+### 10.0g The frame allocator, made a batch - flat combining
+
+10.0f closes the *safety* question for the global allocators: every one of them is
+behind a lock. This closes the *scalability* one for the hottest of them. The two
+are different problems and the second only exists because the first was answered:
+`mm::frames` is correct on N cores and it is also the one structure every path
+touches, so it is where N cores queue.
+
+Five changes, in the order they matter. The first is worth far more than the
+others and would have been worth doing with no lock in sight; the last is about the
+bitmap search itself rather than about getting to it, and is the largest single win
+of the group.
+
+**1. The 4 KiB zeroing left the critical section.** Every `alloc` set a bitmap
+bit, three fields, and then zeroed 4096 bytes - *inside* the lock. That is a
+handful of instructions of bookkeeping against 4096 bytes of stores, so the
+critical section was ~99% `memset` and every core allocating waited on another
+core's `memset` rather than on anything shared. It is safe to move out for one
+reason: **the bitmap bit is what makes a frame unhandable.** Once it is set, no
+scan can return that frame, so the window between the claim and the zeroing is
+private to the claiming core by construction, not by timing. `alloc`, `alloc_on`
+and `alloc_contig` now claim under the lock and zero after it.
+
+**2. `alloc_on` takes one acquisition instead of three.** It read the node's
+frame range (acquire), searched inside it (acquire), and fell back to the whole
+pool (acquire). A range read that is not in the same critical section as the
+search it bounds is a range that can change under it, so this was a correctness
+tidy as much as a cost one.
+
+**3. A copy-on-write break takes two instead of three.** `cow_fault` asked
+`refs(pa)` (acquire), then `alloc()` (acquire), then `free(pa)` (acquire).
+"Is this shared" and "give me somewhere to copy it to" are **one** decision, and
+asking them separately means the first answer can be stale by the time the second
+is served - so they are now `frames::cow_resolve`, returning
+`Sole` / `Private(dst)` / `NoFrame`. The `Private` frame is deliberately **not**
+zeroed: the caller overwrites all 4096 bytes, so a `memset` first is 4 KiB of
+stores nothing reads, and the "never leak previous contents" rule is met by the
+copy. The old frame's release is **not** folded in, and that is a correctness
+requirement rather than laziness: dropping the reference before the copy would let
+a peer core faulting on the same page see a count of one, conclude it was the sole
+owner, and write through the very frame this copy is reading. Two acquisitions is
+the floor for this operation.
+
+**4. Flat combining** (Hendler, Incze, Shavit, Tzafrir, *Flat Combining and the
+Synchronization-Parallelism Tradeoff*, SPAA 2010). With the `memset` gone the lock
+is held for a few words, which is exactly the regime the technique is for: N cores
+each taking a short lock pay N cache-line handoffs of the lock word plus N handoffs
+of every line the section touches, and the work itself is trivial by comparison.
+So a core publishes its request to its **own** 64-byte-aligned slot, one core wins
+the *combiner* role, takes the lock once, executes the whole batch while the bitmap
+stays in its cache, and writes each result back; the others spin on a line nobody
+else writes.
+
+Three things about the shape here rather than in the paper, and the first two are
+what make it nearly free when nobody is contending:
+
+- **The combiner is whoever holds the lock.** The paper gives the role its own flag
+  because a combiner there may hold it across several lock acquisitions; here a
+  batch is one critical section, so a separate flag is a second atomic claim over
+  exclusivity the lock already provides. `SpinLock::try_lock` *is* the election.
+  That deleted a static and two atomics per operation.
+- **The wire form is slow-path only.** A request only has to become `(op, arg)`
+  words if it is going to be published, so `fc_run` takes the operation twice -
+  once as a closure returning its own type, for this core, and once encoded, for a
+  peer's slot. The fast path never encodes or decodes, which is what keeps `alloc`'s
+  `Option<usize>` from round-tripping through a `u64` on the path that never left
+  this core.
+- **The batch does not zero.** Each requesting core zeroes its own frame after its
+  request completes. A combiner zeroing on behalf of the batch would re-serialise
+  precisely what change 1 unserialised.
+
+So the cost added to an uncontended operation is **one relaxed load** - the
+`FC_PENDING` bitmask, which exists precisely so that a combiner with nothing to do
+reads one word rather than scanning `MAX_CPUS` cache lines - on top of the lock the
+pre-combining code already took. There is no separate "SMP path" to diverge from,
+which is the mistake docs/SUBSTRATE.md pillar 3 records as the cause of the
+`SYS_YIELD` FP defect.
+
+One consequence is stated because it is a real if rare liveness cost: the lock's
+*other* holders - the diagnostics, the boot paths - do not drain, so a request
+published against one of those waits out its spin bound and is withdrawn rather
+than served. It is counted, and the retry then takes the lock itself.
+
+Executed **exactly once** is the invariant, and it is enforced by a claim rather
+than argued: a publisher may withdraw its request only by moving its slot from its
+own opcode straight to idle, which fails once a combiner has moved it to *busy*.
+The withdrawal exists because a publication can land just after the combiner
+sampled the mask, which no protocol without a second handshake avoids; it is a
+liveness backstop, and it is counted so a machine that needs it says so.
+
+The boot-time and diagnostic paths (`init_numa`, `alloc_contig`, `stats`,
+`used_matches_bitmap`, `node_free`, `node_of`) deliberately stay on the plain
+lock: they allocate nothing or run once, so a batch would add machinery to a path
+with nothing to batch against.
+
+**5. The search is a word at a time, not a bit at a time.** The three changes above
+are about *reaching* the bitmap; this one is about the work once you are there, and it
+is the largest of the five by a wide margin. The search was a per-frame loop - index a
+word, shift, mask, test - so its cost grew with how many frames were **allocated**. On
+the unrestricted path the rotating hint usually points straight at a free frame and it
+never showed; on the NUMA path it did, because `alloc_on` restarts at the node's `lo`
+on *every call*, so a node at 90% paid ~59,000 iterations per allocation and running
+one dry - which the `numa` kernel does deliberately - is quadratic in the node's size.
+
+`mm::bitmap` turns each 64 allocated frames into one load, one compare and one branch,
+finding the free bit with a single `trailing_zeros`. Same answer; **63x fewer steps**
+through a full region. The pmem pool got the same treatment, for 10.0f's reason: it is
+the same scan, and its frame count is the one that is *not* a multiple of 64, since it
+comes from whatever size the NFIT reports. `alloc_contig`'s run search is deliberately
+left bit-at-a-time and says so where it lives: a run cannot skip an all-free word
+without carrying a partial run across the skip, and it runs a handful of times per
+boot, so the win would be unmeasurable and the risk would not.
+
+It is **its own dependency-free module**, and that is the whole safety argument. This
+is bit arithmetic with four boundary conditions the old form did not have - the first
+word's low bits, the last word's high bits, both at once in a single-word range, and a
+range whose end is not a multiple of 64 - and each is a case where being wrong is
+*silent*: a missed free bit is a spurious out-of-memory on a machine with free memory,
+and a bit returned from outside `[lo, hi)` is a frame on the wrong NUMA node that
+`alloc_on` reports as correctly placed. So the functions take a plain `&[u64]` and no
+kernel state, which lets `verify/bitmap/` include them verbatim and drive **683,792
+cases** against a bit-at-a-time reference on the host: 16 hand-computed boundaries,
+320,000 random `find_in`/`find_from` across densities from empty to full, 32,000
+random `find_run`, and every 8-bit map *exhaustively*. Two controls fire, the second
+by exactly the name that matters - "returned N outside [lo, hi) - on the NUMA path
+this is a frame on another node reported as placed".
+
+The cost is reported there rather than in `cargo xtask bench`, because **the bench
+suite cannot see this change**: the benches allocate from a nearly-empty pool where
+both algorithms stop on the first candidate, so "the benches are unchanged" would be
+true and beside the point. Wall clock was tried too and is not claimed - the `numa`
+boot went 11.6 s to 10.7 s, one sample of a boot doing far more than the run-dry
+phase, under an emulator. The step count is what this container can defend.
+
+**The proof** is a new `smp` phase, mirroring the shared-heap phase because the
+failure mode is the same shape. Each core, in a loop: allocate a frame, stamp
+every byte with its own marker, read every byte back, free it - so a frame handed
+to both cores means one core's stamp lands in the other's frame between the write
+and the read, which is the corruption itself rather than a proxy for it. The two
+meet at a rendezvous first, and the counter is asserted to still match the bitmap
+and no frame to have leaked. Then the same two cores run a **churn** pass -
+allocate and free, touching nothing - because the verify pass spends far longer
+outside the allocator than inside it and so measures the correctness, not the
+combining. Across both passes **140-469 requests were
+executed by the other core's combiner** (riscv64 315, aarch64 140, x86-64 469),
+with **1-6 withdrawn**.
+
+That withdrawal count matters more than its size: it means the liveness backstop
+is *exercised* rather than dead code, and so is the `FC_BUSY` claim it interacts
+with - a withdrawal racing a claim is the one interleaving in which a request could
+be executed twice, and it is reached on every ISA on every run.
+
+That number is **reported, never asserted**. Zero is a legal schedule (one core
+running its whole share before the other starts), and TCG interleaves coarsely, so
+an assertion on it could fail on a correct machine. It also stays modest *by
+design*, which is the point rather than a disappointment: after change 1 there is
+very little window left for a second core to arrive in. Shortening the window
+removed most of the contention; combining handles what is left.
+
+**What it costs, measured, because the whole case for change 4 is "cheap when
+uncontended" and that had to be a number.** The bench suite touched none of these
+paths, so five benches were added (`frame_alloc_free`, `frame_alloc_on_free`,
+`frame_contig1_free`, `frame_share_free`, `frame_cow_resolve_sole`), icount
+instructions per operation, against the pre-change tree:
+
+Three columns, because the number moved twice and the reason each time is the
+lesson. **A** is the pre-change tree. **B** is flat combining written as one
+function. **C** is the shipped form: an `#[inline(always)]` leaf fast path,
+`try_lock` as the election, and the wire encoding confined to the slow path.
+
+| bench | x86-64 A -> B -> C | riscv64 A -> B -> C |
+|---|---|---|
+| `frame_alloc_free` | 652 -> 731 -> **656** | 1728 -> 1756 -> **1743** |
+| `frame_alloc_on_free` | 689 -> 739 -> **679** | 1778 -> 1776 -> **1755** |
+| `frame_contig1_free` | 883 -> 920 -> **886** | 2009 -> 2026 -> **2020** |
+| `frame_share_free` (2 ops) | 94 -> 173 -> **100** | 123 -> 156 -> **138** |
+| `frame_cow_resolve_sole` | 40 -> 85 -> **46** | 57 -> 85 -> **66** |
+
+`frame_contig1_free` is the clean isolation: `alloc_contig` did not change layer,
+so its delta is `free` alone going through the batch - **+3 instructions on x86-64,
++11 on riscv64**. `frame_share_free` is two such operations and agrees.
+
+**And `frame_alloc_on_free` is now faster than before any of this** - 10
+instructions on x86-64, 23 on riscv64 - because change 2 collapsed three lock
+acquisitions into one, and only once the combining layer got down to ~3 did that
+win stop being buried by it.
+
+**Read against `frame_alloc_free`, the layer is +0.6% and +0.9%**, because the 4 KiB
+`memset` dominates the operation - which is the same fact as change 1: the thing
+the combining layer is measured against is precisely what used to be inside the
+lock.
+
+**The honest reading: on a single-core boot the combining layer is still a small
+net loss** - ~3 instructions on x86-64, ~11 on riscv64 - since it buys nothing
+where there is nobody to batch with. What changed is that it is now small enough to
+be dominated by change 2's win on the NUMA path and invisible against the `memset`
+on the others, rather than being a real tax.
+
+Two things icount cannot price, both stated as lab claims rather than assumed: an
+atomic RMW counts as one instruction here and costs far more on real silicon (the
+shipped form's advantage is larger than the table shows, since it removed two of
+them per operation); and the cache-line handoffs the technique removes are invisible
+to an emulator with no cache model, so the contended saving is better than zero by
+an amount only hardware can report. What is defensible from this container is the
+shape - a leaf fast path adding one relaxed load to a lock that was already taken -
+not a wall-clock speedup.
+
+**Column B cost ~40 instructions per operation, and `objdump` said why** rather
+than reasoning about it. One function held the election, the batch, the publication
+and the spin loop, so LLVM allocated seven callee-saved registers for the cold half
+and pushed and popped all seven on every fast-path call, and the `call fc_execute`
+beside them kept `op` a runtime value so the six-way dispatch ran too. Splitting it
+into an `#[inline(always)]` leaf with `fc_slow` and `fc_drain` both `#[cold]` took
+it to ~11; folding the election into `try_lock` and confining the wire encoding to
+the slow path took it to ~3. Recorded in docs/ENGINEERING.md 11: a hot path's cost
+can be dominated by the *cold* code sharing its stack frame - and the second half
+of that story is that once the frame was cheap, two atomics and a `u64` round trip
+were suddenly the whole remaining cost, which is only visible once you are counting.
+
+**Controls, both observed firing.** Deleting the zeroing makes the frame-zeroing
+check report `4096 nonzero byte(s)`; making the combiner execute each request
+twice trips `double free of <pa>` inside `release`.
+
+**And the first version of the zeroing oracle passed with the fix deleted** -
+recorded in docs/ENGINEERING.md 11, because the reason is not obvious and the
+same mistake is available to anyone testing an allocator. Changes 2 and 3 have
+**no control of their own** and that is stated rather than papered over: their
+observable behaviour is identical to what they replaced - only the number of
+acquisitions changed - so the existing `numa` (node placement and fallback
+counting, exactly) and `cowfork` (2406 pages shared, 0 copied) phases are their
+gate. There is no test that can distinguish one acquisition from three.
+
+### 10.0h Three phases that could fail on a legal schedule
+
+The multi-core phases assert on things four cores did. Three of those assertions
+were about *which* core did what, which is a race outcome, and a race outcome is a
+property of the host's scheduler rather than of this kernel. They passed on a quiet
+machine and failed on a busy one - the shape docs/ENGINEERING.md 11 records, since a
+test that fails on correct behaviour is worse than no test, and CI runners are busy
+machines.
+
+Found by making the host busy on purpose: 12 spinners against 4 cores turned all
+three from "occasionally red" into deterministic failures, which is what made them
+fixable.
+
+- **The GEMM work queue** asserted `workers > 1` - at least two cores won a block.
+  A single core draining all sixteen before any peer arrives is a legal schedule for
+  a claim-based queue, and under load that is what happens. It is **reported** now.
+  What proves the parallelism is unchanged and cannot fail on a legal schedule: the
+  barrier (all online cores inside one interval), the counts summing to the queue,
+  and the bit-identical result. The first fix of this assertion had already weakened
+  `workers == cores` to `workers > 1`, which is the same mistake one size smaller -
+  the threshold was never the problem, the *kind of claim* was.
+- **The rendezvous bound** was 2 s, chosen "generous" against TCG time-slicing. It
+  is not generous against a host that is oversubscribed: several phases reported
+  "the cores did not meet" about a kernel that was working. It is 10 s, still an
+  eighth of the boot budget, so a genuinely single-core machine still reports the
+  timeout rather than wedging.
+
+**Still open, and not fixed here**: under the same 3:1 oversubscription the
+vcore-identity phase reports `cell 0 vcore 1 refused to CPU 0: NotYours` and the run
+ends in `DEADLOCK_EXIT`, and the NVMe phase's rendezvous can still miss its 10 s
+bound. The first is the interesting one: a live vcore owned by a core the host has
+not scheduled looks, to the deadlock classifier, like no wake source - which is a
+*false* deadlock, and `retire_vcore` already carries the reasoning that "a core with
+nothing to do is not a deadlocked machine". That is a kernel-side question and wants
+its own diagnosis rather than a widened bound; the reproduction is recorded here so
+it starts from evidence.
 
 ### 10.1 The measured motivation (not a wish)
 

@@ -316,10 +316,14 @@ impl EntityTable {
 
     /// How many entities of `cell` are live. The cell exits when this reaches zero -
     /// the "last one out" rule, expressed once instead of per personality.
+    ///
+    /// Scans by reference (`Funded::iter`), not by point access: this is asked per
+    /// scheduling decision, and the copy-per-element form paid ~2x
+    /// (docs/SUBSTRATE.md pillar 1, `funded_scan_*` in `cargo xtask bench`).
     pub fn live_of(&self, cell: u16) -> usize {
-        (0..self.capacity())
-            .filter_map(|i| self.slots.get(i))
-            .filter(|e| e.cell == cell && e.live())
+        self.slots
+            .iter()
+            .filter(|(_, e)| e.cell == cell && e.live())
             .count()
     }
 
@@ -330,7 +334,7 @@ impl EntityTable {
     /// A cell with no live entities is not blocked either: it is finished.
     pub fn all_parked(&self, cell: u16) -> bool {
         let mut any = false;
-        for e in (0..self.capacity()).filter_map(|i| self.slots.get(i)) {
+        for (_, e) in self.slots.iter() {
             if e.cell != cell || !e.live() {
                 continue;
             }
@@ -347,9 +351,15 @@ impl EntityTable {
     /// clean `-EAGAIN` naming the cell, never a global "table full"
     /// (docs/MEMORY.md 7, no OOM killer).
     pub fn create(&mut self, cell: u16, context: u16) -> Option<usize> {
-        let id = match (FIRST_ID..self.capacity())
-            .find(|&i| self.slots.get(i).map(|e| e.state) == Some(State::Free))
-        {
+        // Found in its own statement so the scan's borrow of the table ends
+        // before the growth arm below mutates it.
+        let found = self
+            .slots
+            .iter()
+            .skip(FIRST_ID)
+            .find(|(_, e)| e.state == State::Free)
+            .map(|(i, _)| i);
+        let id = match found {
             Some(i) => i,
             None => {
                 // Never below the floor, so id 0 stays the "no context" value even on the
@@ -463,8 +473,11 @@ impl EntityTable {
     /// had this property for free by construction; keeping it is what lets the guard move into
     /// the table without changing what it means.
     pub fn leave_cpu(&mut self, cpu: u16, ns: u64, involuntary: bool) -> Option<usize> {
-        let id =
-            (0..self.capacity()).find(|&i| self.slots.get(i).map(|e| e.inside) == Some(cpu))?;
+        let id = self
+            .slots
+            .iter()
+            .find(|(_, e)| e.inside == cpu)
+            .map(|(i, _)| i)?;
         self.leave(id, cpu, ns, involuntary);
         Some(id)
     }
@@ -639,10 +652,7 @@ impl EntityTable {
     /// cannot. Saying which is which is the point - a checker that silently omitted
     /// them would read as covering ten invariants.
     pub fn check(&self) -> Option<Violation> {
-        for id in 0..self.capacity() {
-            let Some(e) = self.slots.get(id) else {
-                continue;
-            };
+        for (id, e) in self.slots.iter() {
             match e.state {
                 State::Free => {
                     if e.owner != NO_CPU || e.inside != NOT_INSIDE {
@@ -678,10 +688,7 @@ impl EntityTable {
                 // I1 as a cross-entity property: one CPU inside two entities at once
                 // is the same corruption seen from the other side, and it is what a
                 // per-CPU guard keyed on the wrong thing produces.
-                for other in (id + 1)..self.capacity() {
-                    let Some(o) = self.slots.get(other) else {
-                        continue;
-                    };
+                for (other, o) in self.slots.iter().skip(id + 1) {
                     if o.inside == e.inside {
                         return Some(Violation::I1EnteredTwice {
                             entity: other,

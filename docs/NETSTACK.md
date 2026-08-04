@@ -264,6 +264,22 @@ kernels stay green.
   Reed-Solomon k-loss) gated on `fec_recovered > 0` under group-aligned loss
   injection - never on a goodput delta. QUIC's per-connection RTO/PTO/pacing/
   idle/key-update deadlines are what size SUBSTRATE.md's per-core timer wheel.
+  N7's design must also read **MinimaLT** (Petullo/Zhang/Solworth/Bernstein/
+  Lange, CCS'13 - comparison/ethos/), which solved three problems in 2013 that
+  QUIC later standardised weaker forms of, and they are requirements here:
+  **directory-published server ephemeral keys** (encrypted 0-RTT without TLS
+  early-data's replay semantics - the key arrives with the name lookup, a
+  natural fit for the N1c resolver); **full header encryption** (only a
+  connection id visible on the wire); **mobility = rekey under a fresh
+  connection id**, unlinkable across IP changes; **server-stateless puzzles**
+  (the server spends a hash and *forgets* the request, the client spends a
+  brute-force - the DoS cost asymmetry QUIC approximates with Retry tokens);
+  and **hash-chain rekeying**, which is fast key erasure at the transport -
+  the exact construction the DRBG already implements and proves
+  (kernel/src/rng/mod.rs), so the primitive is in-tree. Doctrine that lands
+  with N7: **the native stack's remote transport defaults to encrypted**;
+  plaintext remains the Linux-personality compat path (N4b), because running
+  unmodified Linux binaries is the measured workload.
 - **N8 - Inline NIC TLS offload** (the keys-as-capabilities payoff): program
   session keys into a NIC TX/RX queue as a capability, encrypted zero-copy fetch
   removes Kafka's encryption cliff. Hardware-only, so the QEMU proof is the

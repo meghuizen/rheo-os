@@ -998,6 +998,13 @@ pub fn switch_native_cell(from: usize, to: usize) {
 /// vcore, because a cell that parked one context and left a sibling runnable must be
 /// re-entered at the sibling rather than at vcore 0.
 pub fn switch_native_cell_vcore(from: usize, to: usize, to_v: usize) {
+    // Deliberately NOT bracketed for `Metric::SwitchNs`: this is the system's
+    // hottest primitive and even the gated bracket's two disabled tests cost a
+    // measured +34 instructions per `SYS_SWITCH` round trip on riscv64 (register
+    // liveness in a small function). The raw verb's cost is already a headline
+    // `bench` number; the histogram lives at the *scheduler's* call sites in
+    // `nproc`, where the variance the metric exists to expose actually is
+    // (docs/OBSERVABILITY.md 11, S6).
     // Save the vcore this CPU is actually **inside**, and load the vcore the target is
     // entered at, which for a cross-cell switch is always its vcore 0. Naming both
     // rather than assuming 0 on each side is what lets a multi-vcore cell take this path
@@ -2518,6 +2525,11 @@ fn enter_vcore(idx: usize, v: usize) {
         }
         Err(e) => panic!("cell {idx} vcore {v} refused to CPU {me}: {e:?}"),
     }
+    // The snapshot plane's context-switch write (docs/OBSERVABILITY.md 11, S3):
+    // this CPU is now inside `(idx, v)`. Here rather than in `entity.rs` because
+    // that file is host-included verbatim by `verify/entity`, and because this is
+    // already the one place both enter paths meet.
+    crate::obs::snap_user(idx, id, v);
 }
 
 /// Cores observed inside one entity at once.
@@ -2565,6 +2577,7 @@ fn run_inner(idx: usize, v: usize) {
     // from is not the one it entered.
     // SAFETY: this core's own entry.
     unsafe { crate::sched::entity::table() }.leave_cpu(crate::smp::cpu_index() as u16, 0, false);
+    crate::obs::snap_kernel();
 }
 
 /// Turn a Linux personality `Ctl` into the frame to resume (or a null-frame
@@ -3202,8 +3215,17 @@ fn on_user_trap_inner(
             // be a missing page: an illegal instruction or an FP exception is never
             // one, and asking the VMA list about them would be answering a question
             // it was not asked.
-            if cause == FaultCause::Segv && crate::linux::fill_fault(cur, fault_addr) {
-                return frame;
+            if cause == FaultCause::Segv {
+                // `Metric::FaultNs` (docs/OBSERVABILITY.md 11, S6): demand paging's
+                // real per-fill cost - recorded only for a fill that succeeded,
+                // because a fault that becomes a signal is not a service time.
+                crate::metrics::bracket_start(crate::metrics::Metric::FaultNs);
+                if crate::linux::fill_fault(cur, fault_addr) {
+                    crate::metrics::bracket_end(crate::metrics::Metric::FaultNs);
+                    return frame;
+                }
+                // A fault that becomes a signal is not a fill service time.
+                crate::metrics::bracket_cancel(crate::metrics::Metric::FaultNs);
             }
             // A fault that demand paging could not satisfy is about to become a signal
             // or kill the process, so this is the last point at which the *cause* is
@@ -3256,7 +3278,16 @@ fn on_user_trap_inner(
     // Linux cells never reach native dispatch: the personality tag decides
     // the syscall table before the number means anything (the ABIs collide).
     if cells()[cur].personality == Personality::Linux {
-        return linux_ctl(crate::linux::handle(cur, nr, &args, frame), frame);
+        // `Metric::SyscallNs` (docs/OBSERVABILITY.md 11, S6): dispatch-to-return of
+        // the Linux personality - the syscall surface production binaries (Node,
+        // Bun, Claude Code) actually exercise. The native verbs are deliberately
+        // not bracketed here: each is measured by its own plane (the queue's
+        // per-entry time, the switch's, the waits' halt counters), and a second
+        // clock pair on every `SYS_DOORBELL` would double-charge the same work.
+        crate::metrics::bracket_start(crate::metrics::Metric::SyscallNs);
+        let ret = linux_ctl(crate::linux::handle(cur, nr, &args, frame), frame);
+        crate::metrics::bracket_end(crate::metrics::Metric::SyscallNs);
+        return ret;
     }
 
     match nr {

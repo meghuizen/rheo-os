@@ -29,22 +29,22 @@ mod disk_runtime;
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    disk_runtime::prove(
-        "linuxbunsmp",
-        "/bin/bun",
-        &[b"bun", b"-e", b"console.log(\"rheo:\"+(40+2))"],
-        &[b"LD_LIBRARY_PATH=/lib:/lib64", b"PATH=/bin", b"TMPDIR=/tmp"],
-        b"rheo:42\n",
+    disk_runtime::prove(disk_runtime::Proof {
+        name: "linuxbunsmp",
+        path: "/bin/bun",
+        argv: &[b"bun", b"-e", b"console.log(\"rheo:\"+(40+2))"],
+        envp: &[b"LD_LIBRARY_PATH=/lib:/lib64", b"PATH=/bin", b"TMPDIR=/tmp"],
+        want: b"rheo:42\n",
         // No partial accepted, exactly as `linuxbun`.
-        false,
+        thread_abort_partial: false,
         // Preemptive dispatch, so the worker is scheduled the same way it is on the primary.
-        true,
+        preemptive: true,
         // The W^X exception capability, so JSC's JIT can map its code pages.
-        true,
+        wx_authority: true,
         // One invocation. The `bun:ffi` tile call is `linuxbun`'s; repeating it here would
         // add time without adding a claim about which core ran it.
-        None,
+        second: None,
         // **On a secondary.** The whole point of this kernel.
-        true,
-    )
+        on_secondary: true,
+    })
 }

@@ -49,7 +49,8 @@ static mut NEXT_HINT: usize = 0;
 /// `BASE_PA`/`NFRAMES`/`WINDOW_VA`/`READY` are written once by `init` before any
 /// secondary starts, so reading them needs no lock. Every acquire below is in a
 /// leaf function, so this non-reentrant lock is never taken twice on one core.
-static PMEM_LOCK: crate::smp::SpinLock<()> = crate::smp::SpinLock::new(());
+static PMEM_LOCK: crate::smp::SpinLock<()> =
+    crate::smp::SpinLock::named((), crate::obs::lock::LockId::PmemPool);
 
 /// Bring up the allocator over a discovered persistent-memory region
 /// `[base_pa, base_pa + len)`. Called once from `hw::detect` when firmware
@@ -119,18 +120,15 @@ pub fn alloc() -> Option<usize> {
     let n = unsafe { *core::ptr::addr_of!(NFRAMES) };
     let hint = unsafe { *core::ptr::addr_of!(NEXT_HINT) };
     let bitmap = unsafe { &mut *core::ptr::addr_of_mut!(BITMAP) };
-    for offset in 0..n {
-        let frame = (hint + offset) % n;
-        let (word, bit) = (frame / 64, frame % 64);
-        if bitmap[word] & (1 << bit) == 0 {
-            bitmap[word] |= 1 << bit;
-            unsafe {
-                *core::ptr::addr_of_mut!(NEXT_HINT) = frame + 1;
-            }
-            return Some(base + frame * FRAME_SIZE);
-        }
+    // Word at a time, sharing the DDR pool's search (`mm::bitmap`) - and this region
+    // is the one whose frame count is **not** a multiple of 64, since it comes from
+    // whatever size the NFIT reports, so it is also what exercises that path.
+    let frame = super::bitmap::find_from(bitmap, n, hint)?;
+    bitmap[frame / 64] |= 1 << (frame % 64);
+    unsafe {
+        *core::ptr::addr_of_mut!(NEXT_HINT) = frame + 1;
     }
-    None
+    Some(base + frame * FRAME_SIZE)
 }
 
 /// Return a persistent frame to the region.

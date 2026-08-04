@@ -11,6 +11,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Runnable on demand against any branch: without it the only way to exercise this
+  # workflow is a push to `main` or an open pull request, so a fix to the workflow
+  # itself cannot be tried before it is merged.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,10 +35,26 @@ jobs:
       # static-glibc binaries for each ISA; clippy on qemu-tests `include_bytes!`s
       # them, so the cross gccs + `*-unknown-linux-gnu` targets are needed and
       # the fixtures must be built before clippy checks the test kernels.
+      #
+      # `libc6-dev-*-cross` must be named explicitly: it is a *Recommends* of the cross
+      # gcc, so `--no-install-recommends` drops it, and it is what supplies `crt1.o`,
+      # `crti.o`, `crtn.o` and `libc.a` for a static link (plus, via `libc6-*-cross`,
+      # the `ld-linux-*.so` / `libc.so.6` / `libm.so.6` the L7 dynamic fixtures copy
+      # out of the sysroot).
+      #
+      # The C++ set is for the four-library `dcpp` fixture. It is optional - xtask
+      # writes a placeholder and `linuxdyn` skips that phase - but a silent skip means
+      # CI covers less than a developer's machine, so it is installed rather than
+      # left to degrade.
       - name: Install Linux cross toolchains
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu \
+            libc6-dev-arm64-cross libc6-dev-riscv64-cross \
+            g++-aarch64-linux-gnu g++-riscv64-linux-gnu \
+            libstdc++6-arm64-cross libstdc++6-riscv64-cross \
+            libgcc-s1-arm64-cross libgcc-s1-riscv64-cross
           rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu riscv64gc-unknown-linux-gnu
 
       - name: Cache cargo
@@ -66,10 +86,16 @@ jobs:
       - name: Build userspace + fixtures (all ISAs)
         run: cargo xtask build --arch all
 
-      - name: clippy (kernel + test kernels, all ISAs)
+      # Both feature postures, because `smp` is a separate compilation: five test
+      # kernels (`smp`, `linuxsmp`, `linuxbunsmp`, `linuxnodesmp`, `linuxclaudesmp`)
+      # have `required-features = ["smp"]`, so the default run does not build them and
+      # was not linting them at all. That gap was hiding real lints in the tree's most
+      # assertion-dense kernel.
+      - name: clippy (kernel + test kernels, all ISAs, both feature postures)
         run: |
           for target in x86_64-unknown-none aarch64-unknown-none-softfloat riscv64gc-unknown-none-elf; do
             cargo clippy -p kernel -p qemu-tests --target "$target" $BUILD_STD_FLAGS -- -D warnings
+            cargo clippy -p kernel -p qemu-tests --features smp --target "$target" $BUILD_STD_FLAGS -- -D warnings
           done
 
   boot-test:
@@ -79,18 +105,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `cross-pkgs` is the whole toolchain this arch's glibc fixtures need, not
+          # just the compiler driver: see the lint job's note on why
+          # `libc6-dev-*-cross` has to be named. x86-64 needs nothing - the runner's
+          # own gcc, libc and libstdc++ are the fixture toolchain there.
           - arch: x86_64
             qemu-package: qemu-system-x86
             gnu-target: x86_64-unknown-linux-gnu
-            cross-gcc: ""
+            cross-pkgs: ""
           - arch: aarch64
             qemu-package: qemu-system-arm
             gnu-target: aarch64-unknown-linux-gnu
-            cross-gcc: gcc-aarch64-linux-gnu
+            cross-pkgs: >-
+              gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+              g++-aarch64-linux-gnu libstdc++6-arm64-cross libgcc-s1-arm64-cross
           - arch: riscv64
             qemu-package: qemu-system-misc
             gnu-target: riscv64gc-unknown-linux-gnu
-            cross-gcc: gcc-riscv64-linux-gnu
+            cross-pkgs: >-
+              gcc-riscv64-linux-gnu libc6-dev-riscv64-cross
+              g++-riscv64-linux-gnu libstdc++6-riscv64-cross libgcc-s1-riscv64-cross
     steps:
       - uses: actions/checkout@v4
 
@@ -100,7 +134,7 @@ jobs:
       - name: Install QEMU and cross toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ${{ matrix.qemu-package }} ${{ matrix.cross-gcc }}
+          sudo apt-get install -y --no-install-recommends ${{ matrix.qemu-package }} ${{ matrix.cross-pkgs }}
 
       - name: Install Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install

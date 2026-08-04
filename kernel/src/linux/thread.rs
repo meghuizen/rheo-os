@@ -292,9 +292,10 @@ impl ContextTable {
         }
     }
 
-    /// Every slot, by value.
-    fn iter_values(&self) -> impl Iterator<Item = Thread> + '_ {
-        (0..self.t.capacity()).filter_map(move |i| self.t.get(i))
+    /// Every slot, by reference (`Funded::iter` - one page resolve per page of
+    /// slots, no per-slot copy of the `Thread` record).
+    fn iter_refs(&self) -> impl Iterator<Item = &Thread> {
+        self.t.iter().map(|(_, th)| th)
     }
 }
 
@@ -1118,7 +1119,7 @@ fn wait_deadline(cmd: u64, op: u64, timeout_va: u64) -> Deadline {
 /// The nearest outstanding futex deadline among `cell`'s blocked contexts.
 fn nearest_deadline(cell: usize) -> Option<u64> {
     let t = threads(cell);
-    t.iter_values()
+    t.iter_refs()
         .filter(|th| tstate_of(th.entity) == TState::Blocked && th.fut_deadline != 0)
         .map(|th| th.fut_deadline)
         .min()
