@@ -908,7 +908,9 @@ needed no new mechanism at all: it streams off a live ext4 disk over virtio-blk-
 (~116,000 block-cache fills, none resident whole), demand-pages, links its glibc set
 (`librt` on top of bun's), brings up JSC with its **JIT enabled** (the capability-gated
 W^X exception), runs **under preemption** (2,467 slices taken to sibling contexts), and
-prints exactly `2.1.220 (Claude Code)` with exit 0. Held to the strict gate; asserted on
+prints exactly its own version string with exit 0 (the expected transcript is read from
+the installed binary at fixture-build time, not hardcoded - a literal drifts every
+release). Held to the strict gate; asserted on
 an exact transcript.
 
 **Honest scope, because "runs Claude Code" invites a bigger reading than the evidence
@@ -2216,7 +2218,7 @@ per-core hardware no trampoline sets - it arms its own now (`83/6243`). **And so
 (`linuxnodesmp`, `linuxclaudesmp`) - same construction, `on_secondary` the only difference:
 Node (124 MB, V8 + libuv) at ~15,300 block-cache fills and 23 of 9,477 slices prints `rheo:42`
 and exits 0; **Claude Code** (275 MB, Bun-compiled) at ~116,300 fills and **1,612 of 61,701
-slices** prints exactly `2.1.220 (Claude Code)` and exits 0. Each is its own kernel rather than
+slices** prints exactly its own version string and exits 0. Each is its own kernel rather than
 a phase, deliberately: the primary-CPU proof is the baseline every claim about these runtimes
 rests on, and a boot that runs one somewhere else must not be able to weaken it. Still not
 shown: these are the same *cooperative-within-a-core* runtimes they are on the primary, so
@@ -3346,6 +3348,32 @@ existing suite is the migration's exactness oracle; two controls fire by name, a
 non-result is recorded - `netwait`'s stall-tolerance branch absorbs a misrouted spin-poll
 counter, so the control that stands is on an assertion with no tolerance.
 
+**Four intermittent tests were found and fixed, and CI was unbroken** (docs/SMP.md
+10.0h, docs/ENGINEERING.md 11). The GitHub pipeline had been red for a while, and not
+for any reason in the kernel: `--no-install-recommends` drops `libc6-dev-*-cross`,
+which is a *Recommends* of the cross gcc, so every glibc fixture build died at
+`cannot find crt1.o` on aarch64 and riscv64. Naming the package (plus the optional C++
+set, so CI stops silently covering less than a developer's machine) unblocked the lint
+job - which then failed on **11 clippy errors CI had never reached**, in `rng`,
+`schedidle`, `numa`, `iommu`, `librheoipc`, `disk_runtime` and `smp`. All fixed rather
+than allowed: the constant `assert!` became a `const` assertion (stronger - it cannot
+build wrong), `prove`'s ten positional arguments became a named `Proof` struct (the
+lint was right; `prove(name, path, argv, envp, want, false, true, true, None, false)`
+is unreadable), and a stray doc comment was moved to the constants it describes. It
+also turned up a **gap**: the five `smp`-feature kernels have
+`required-features = ["smp"]`, so the default clippy run never built them and they were
+not linted at all - CI now lints both postures. Three test defects were load-dependent
+rather than wrong-in-principle, and were found by oversubscribing the host 3:1 on
+purpose: `observe` asserted a park moved a counter using `while !expired { wait() }` at
+a **1 ms** deadline, so one host preemption meant the loop body never ran (measured:
+`iters == 0` on exactly the failing runs, ~1 in 3); `smp`'s work queue asserted
+`workers > 1`, a race outcome a claim-based queue may legally not produce; and the
+2 s rendezvous bound is 10 s. Two remain open with their reproduction recorded, one of
+them a likely *false* deadlock in the vcore path rather than a test bound.
+Also **`linuxclaude` no longer hardcodes a version**: the expected transcript is read
+from the installed binary at fixture-build time, since `2.1.220` -> `2.1.221` turned a
+green gate red with nothing wrong.
+
 **One intermittent test was found and fixed** while gating the above: `rng`'s HID phase
 asserted `virtio_input::buffers_clear()` - every DMA buffer zero *after* a drain - and failed
 on riscv64 about one run in ten saying a drained event was still in the buffer, when what had
@@ -3685,7 +3713,7 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               linuxbun, 83 slices taken on that core, `rheo:42` and exit 0 -
               x86-64 only, docs/SMP.md 10.0e), linuxnodesmp + linuxclaudesmp (the
               same for the REAL node and the REAL 275 MB Claude Code binary on a
-              secondary - `rheo:42` and `2.1.220 (Claude Code)`, 23 and 1,612
+              secondary - `rheo:42` and its own version string, 23 and 1,612
               preemption slices taken on that core, docs/SMP.md 10.0e), shell-smoke, hwinfo, rng, runtime
               (the strand runtime, closing with the **measured** concurrency /
               async / sync phases: 256 strands in flight with every round a

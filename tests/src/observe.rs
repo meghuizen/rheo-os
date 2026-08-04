@@ -77,6 +77,30 @@ extern "C" fn kernel_main() -> ! {
     arch::exit(arch::ExitCode::Success)
 }
 
+/// Register a `CellSleep` deadline and park until it elapses, parking **at least
+/// once**.
+///
+/// The bare `register(ns); while !expired { wait() }` form has an unstated
+/// precondition: that the deadline has not *already* elapsed when the loop is first
+/// tested. At 1 ms one host scheduler preemption of the QEMU process breaks it - the
+/// guest's counter keeps advancing while the process is descheduled - so the body never
+/// runs, no park happens, and an assertion about what a park does fails on a working
+/// kernel (~1 run in 3 on x86-64).
+///
+/// Parking once up front makes the experiment happen whatever the clock did, and is
+/// sound for every caller: a park whose deadline is already due does not halt, it spins
+/// and says so through `CTR_SPINS`, which is a legitimate park outcome and what these
+/// assertions are written against.
+fn park_until(ns: u64) {
+    use kernel::idle;
+    use kernel::ktimer::{self, TimerClient};
+    ktimer::register(TimerClient::CellSleep, ns);
+    idle::wait(idle::TIMER);
+    while !ktimer::expired(TimerClient::CellSleep) {
+        idle::wait(idle::TIMER);
+    }
+}
+
 /// The snapshot plane (docs/OBSERVABILITY.md 11, S3): busy/idle accounting moved
 /// by a real halt, the coupled group written by a real cell entry, and everything
 /// zero while the writers were off.
@@ -88,9 +112,8 @@ extern "C" fn kernel_main() -> ! {
 /// `nettcpcc`'s job. Everything is converted through the root's own published
 /// `tick_hz`, so this phase also exercises the conversion contract a reader uses.
 fn snapshot() {
-    use kernel::ktimer::{self, TimerClient};
+    use kernel::obs as kobs;
     use kernel::obs::cpu::{CTR_BUSY_TICKS, CTR_DISPATCHES, CTR_HALTS, CTR_IDLE_TICKS, CTR_SPINS};
-    use kernel::{idle, obs as kobs};
 
     let me = kernel::smp::cpu_index();
 
@@ -126,10 +149,7 @@ fn snapshot() {
     // ---- with snapshots OFF: a park moves the count, never the time ----
     arch::enable_timer_irq();
     let off_parks = kobs::cpu_counter(me, CTR_HALTS) + kobs::cpu_counter(me, CTR_SPINS);
-    ktimer::register(TimerClient::CellSleep, 1_000_000);
-    while !ktimer::expired(TimerClient::CellSleep) {
-        idle::wait(idle::TIMER);
-    }
+    park_until(1_000_000);
     assert!(
         kobs::cpu_counter(me, CTR_HALTS) + kobs::cpu_counter(me, CTR_SPINS) > off_parks,
         "a park with snapshots off moved neither the halt nor the spin count - \
@@ -150,18 +170,12 @@ fn snapshot() {
 
     // ---- a real park charges idle, not busy ----
     // First transition establishes the stamp; its interval is dropped by design.
-    ktimer::register(TimerClient::CellSleep, 1_000_000);
-    while !ktimer::expired(TimerClient::CellSleep) {
-        idle::wait(idle::TIMER);
-    }
+    park_until(1_000_000);
     let idle_before = kobs::cpu_counter(me, CTR_IDLE_TICKS);
     let busy_before = kobs::cpu_counter(me, CTR_BUSY_TICKS);
 
     const PARK_NS: u64 = 20_000_000;
-    ktimer::register(TimerClient::CellSleep, PARK_NS);
-    while !ktimer::expired(TimerClient::CellSleep) {
-        idle::wait(idle::TIMER);
-    }
+    park_until(PARK_NS);
     let idle_ticks = kobs::cpu_counter(me, CTR_IDLE_TICKS) - idle_before;
     let halts = kobs::cpu_counter(me, CTR_HALTS);
     let spins = kobs::cpu_counter(me, CTR_SPINS);
@@ -185,6 +199,16 @@ fn snapshot() {
             (idle_ticks as u128) <= expect_ticks * 5,
             "a 20 ms park recorded {idle_ticks} idle ticks (expect ~{expect_ticks}) - \
              busy time is being laundered as idle"
+        );
+        // And the other half of the attribution, which was read and never checked:
+        // busy must grow by far less than idle across a park. It grows a little (the
+        // loop's own instructions between parks are genuinely busy), so the claim is
+        // the ratio, not zero - a park charged to busy would invert it.
+        let busy_ticks = kobs::cpu_counter(me, CTR_BUSY_TICKS) - busy_before;
+        assert!(
+            busy_ticks < idle_ticks,
+            "a 20 ms park charged {busy_ticks} busy ticks against {idle_ticks} idle - \
+             the park's own time is landing in the busy counter"
         );
     } else {
         // No ISA in this suite lacks a verified timer interrupt since SMP phase 1;

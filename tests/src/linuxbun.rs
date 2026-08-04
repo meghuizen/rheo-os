@@ -65,12 +65,12 @@ mod disk_runtime;
 extern "C" fn kernel_main() -> ! {
     // JSC's JIT is left **enabled**: the cell holds the W^X exception capability
     // (docs/ARCHITECTURE.md 5.1), so its 1 GiB RWX arena is grantable now.
-    disk_runtime::prove(
-        "linuxbun",
-        "/bin/bun",
-        &[b"bun", b"-e", b"console.log(\"rheo:\"+(40+2))"],
-        &[b"LD_LIBRARY_PATH=/lib:/lib64", b"PATH=/bin", b"TMPDIR=/tmp"],
-        b"rheo:42\n",
+    disk_runtime::prove(disk_runtime::Proof {
+        name: "linuxbun",
+        path: "/bin/bun",
+        argv: &[b"bun", b"-e", b"console.log(\"rheo:\"+(40+2))"],
+        envp: &[b"LD_LIBRARY_PATH=/lib:/lib64", b"PATH=/bin", b"TMPDIR=/tmp"],
+        want: b"rheo:42\n",
         // Bun aborts before evaluating, for a reason that is no longer attributed
         // (see the module docs: preemption landed, the worker now runs, and the
         // abort is unchanged). Accept that specific, bounded partial - exit 134
@@ -79,16 +79,16 @@ extern "C" fn kernel_main() -> ! {
         // **No partial accepted any more.** Bun evaluates its input and exits 0, so it
         // is held to the same strict gate as Node (see the module docs for what the
         // three withdrawn diagnoses cost, and what the fourth turned out to be).
-        false,
+        thread_abort_partial: false,
         // **Preemptive dispatch** (docs/SUBSTRATE.md 15, S3'), as for Node: JSC's
         // worker and its main thread are now scheduled preemptively rather than only
         // at blocking points.
-        true,
+        preemptive: true,
         // The **W^X exception capability** (docs/ARCHITECTURE.md 5.1), so this
         // runtime's JIT can map its code pages writable-and-executable. Every other
         // kernel in the suite mints nothing of the sort and is refused exactly as
         // before, which is what makes this a capability rather than a setting.
-        true,
+        wx_authority: true,
         // **JavaScript calling a tile kernel, from a real script file on the disk**
         // (docs/TILES.md 13.4d). `bun:ffi` is built into Bun, so the runtime opens
         // `/lib/libtileso.so`, generates a native trampoline for the declared signature,
@@ -109,8 +109,8 @@ extern "C" fn kernel_main() -> ! {
         // resolved - the same number the librheo cells, the static `tilelinux` binary and
         // the `dlopentile` C probe produce. 31 bits because a JS number is exact only to
         // 2^53.
-        Some((&[b"bun", b"/bin/tileffi.js"], b"tileffi: gemm 568708273\n")),
+        second: Some((&[b"bun", b"/bin/tileffi.js"], b"tileffi: gemm 568708273\n")),
         // Not on a secondary: this kernel is the boot-CPU proof (docs/SMP.md 10.0e).
-        false,
-    )
+        on_secondary: false,
+    })
 }

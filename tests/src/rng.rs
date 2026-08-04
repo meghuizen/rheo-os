@@ -111,10 +111,9 @@ fn test_next_u64_matches_fill() {
 
 /// **Fast key erasure, rule 2**: a byte is erased from the buffer as it is
 /// handed out, so capturing the DRBG state later reveals nothing about output
-/// already delivered (cr.yp.to 2017.07.23, the recording-attacker case). Rule 1
-/// - re-key on every refill - was already implemented; this half was not, and
-/// up to 256 bytes of delivered output stayed in the buffer until the next
-/// refill.
+/// already delivered (cr.yp.to 2017.07.23, the recording-attacker case). Rule 1,
+/// re-keying on every refill, was already implemented; this half was not, and up
+/// to 256 bytes of delivered output stayed in the buffer until the next refill.
 ///
 /// Drawn in odd sizes so the spent region ends mid-word and spans a refill.
 fn test_erase_on_read() {
@@ -496,16 +495,20 @@ fn test_rekey_bounds_a_compromise() {
 /// which is why the pool's target is the **full key width** and not less. A
 /// 128-bit seed would be the actual weakness, so that is what is asserted.
 fn test_quantum_margin() {
-    assert!(
+    // Both of these are relations between **constants**, so they are `const`
+    // assertions: the build fails rather than the boot, which is strictly stronger
+    // than checking at run time and is what clippy's `assertions_on_constants` asks
+    // for. A const assertion takes a plain message, hence no interpolated value - the
+    // constant is named in the expression, which is where a reader would look anyway.
+    const _: () = assert!(
         entropy::CREDIT_TARGET == 256,
-        "the seed target is {} bits; Grover halves it, so anything under 256 \
-         leaves less than a 128-bit post-quantum margin",
-        entropy::CREDIT_TARGET
+        "the seed target must be the full 256-bit key width: Grover halves it, so \
+         anything less leaves under a 128-bit post-quantum margin"
     );
     // And the key the DRBG is built from is that wide.
-    assert!(
-        core::mem::size_of_val(&[0u8; 32]) * 8 == entropy::CREDIT_TARGET as usize,
-        "the DRBG key and the seed target disagree"
+    const _: () = assert!(
+        32 * 8 == entropy::CREDIT_TARGET as usize,
+        "the DRBG key width and the seed target disagree"
     );
     println!(
         "rng: post-quantum margin - 256-bit key, ~128 bits under Grover; no \
@@ -596,7 +599,7 @@ fn test_hwrng_and_seed_source() {
             "two TPM2_GetRandom calls returned the same bytes"
         );
         assert!(
-            names.iter().any(|n| *n == Some("tpm")),
+            names.contains(&Some("tpm")),
             "the TPM answered but did not register with the pool"
         );
         println!(

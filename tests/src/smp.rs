@@ -226,19 +226,21 @@ fn test_parallel_gemm(idx: usize) {
             "blocks completed ({sum}) do not account for the whole queue \
              ({total_blocks}) - a claim was lost or double-counted"
         );
-        // Sharing, asserted; **which** cores got a block, reported. The barrier above is
-        // what proves all `cores` were inside one interval; it does not promise each of
-        // them *won* a block, because winning one is a race against peers that may drain
-        // the queue first. An earlier version asserted `workers == cores` and was
-        // therefore asserting a race outcome - it failed on a run where three cores took
-        // all sixteen blocks before the fourth reached its first `fetch_add`, which is
-        // correct behaviour for a work queue (docs/ENGINEERING.md 1: a proof must not be
-        // able to fail on a legal schedule).
-        assert!(
-            workers > 1,
-            "one core did all {total_blocks} blocks - the queue was drained serially, \
-             not shared"
-        );
+        // **How many cores won a block is reported, never asserted**, and getting here
+        // took two goes. The first version asserted `workers == cores`; that was a race
+        // outcome, and it failed on a run where three cores took all sixteen blocks
+        // before the fourth reached its first `fetch_add`. It was weakened to
+        // `workers > 1` - which is the *same* mistake one step smaller, because a single
+        // core draining the whole queue before any peer arrives is equally legal. On a
+        // loaded host, where the vCPU threads are scheduled against everything else,
+        // that is not even rare: with 12 spinners beside it this failed four runs out of
+        // four, saying "the queue was drained serially" about a kernel doing exactly
+        // what a work queue should.
+        //
+        // What proves the parallelism is the **barrier** above - all `cores` inside one
+        // interval, which one core cannot produce - and what proves the sharing is
+        // correct is that the counts sum to the queue and the result is bit-identical.
+        // Neither can fail on a legal schedule (docs/ENGINEERING.md 1, 4).
         // And the frame allocator survived two cores using it (the pool lock,
         // docs/SMP.md 10.2): the incremental used counter still agrees with the bitmap
         // it summarises, which is exactly the invariant a lost update breaks.
@@ -871,8 +873,8 @@ fn test_flash_attention_parallel() {
         // **Bit-identical**, not within a tolerance: the query-row split changes no
         // row's arithmetic, so anything else is a defect rather than rounding.
         let got = core::ptr::addr_of!(FA_OUT) as *const f32;
-        for i in 0..FA_TQ * FA_D {
-            let (g, w) = (got.add(i).read(), refbuf[i]);
+        for (i, &w) in refbuf.iter().enumerate().take(FA_TQ * FA_D) {
+            let g = got.add(i).read();
             assert!(
                 g.to_bits() == w.to_bits(),
                 "parallel FA2 differs from the single-cell reference at element {i}: \
@@ -882,10 +884,10 @@ fn test_flash_attention_parallel() {
 
         // The GEMM half too, and integer so equality is unconditional.
         let ggot = core::ptr::addr_of!(FA_GEMM_OUT) as *const i32;
-        for i in 0..FA_GM * FA_GN {
+        for (i, &gw) in grefbuf.iter().enumerate().take(FA_GM * FA_GN) {
             assert_eq!(
                 ggot.add(i).read(),
-                grefbuf[i],
+                gw,
                 "parallel int8 GEMM differs from the single-cell reference at element {i}"
             );
         }
@@ -1552,6 +1554,11 @@ static mut KSTACK_V1: KernelStack = KernelStack::new();
 /// Rounds each vcore runs. As `CO_ROUNDS`: enough to overlap for many rounds under TCG,
 /// few enough to finish inside the boot budget.
 const VCORE_ROUNDS: u64 = 64;
+/// `user_copair`'s workload flag that makes it trap once per round (bit 1). Named rather
+/// than written `0 | 2` at the call site: the `0` was the witness slot, and an OR with
+/// zero is a no-op the compiler and clippy both see through, so the intent has to live
+/// in a name instead.
+const COPAIR_TRAP_EACH_ROUND: u64 = 2;
 
 fn test_two_vcores_one_cell() {
     // SAFETY: single-threaded setup on the primary; the secondaries are parked in their
@@ -1575,12 +1582,14 @@ fn test_two_vcores_one_cell() {
             (*core::ptr::addr_of!(KSTACK_V0)).top(),
             7,
             user_copair,
-            // Slot 0, **and** bit 1: trap once per round. Without that this program
-            // traps only at its exit, and two contexts that each trap once, far apart,
-            // never collide - so a kernel stack shared between them would go unnoticed
-            // (verified: with one stack for both vcores and no per-round trap the phase
-            // passes on all three ISAs).
-            0 | 2,
+            // `user_copair` packs its witness slot and its flags into one word. This is
+            // **slot 0 plus bit 1**: slot 0 contributes nothing, and bit 1 makes the
+            // program trap once per round. Without the trap it traps only at its exit,
+            // and two contexts that each trap once, far apart, never collide - so a
+            // kernel stack shared between them would go unnoticed (verified: with one
+            // stack for both vcores and no per-round trap the phase passes on all three
+            // ISAs).
+            COPAIR_TRAP_EACH_ROUND,
             VCORE_ROUNDS,
         );
 
@@ -1612,7 +1621,7 @@ fn test_two_vcores_one_cell() {
         (*v1).params.ticks = shared as u64;
 
         let frame1 = arch::trapframe_new(
-            user_copair as usize,
+            user_copair as *const () as usize,
             stack1 + core::mem::size_of_val(&(*v1).stack),
             params1,
             (*core::ptr::addr_of!(KSTACK_V1)).top(),
@@ -1780,7 +1789,7 @@ fn test_vcore_yield() {
             core::mem::MaybeUninit::uninit();
         let yf = core::ptr::addr_of_mut!(YFRAME);
         (*yf).write(arch::trapframe_new(
-            kernel::user_progs::user_vyield as usize,
+            kernel::user_progs::user_vyield as *const () as usize,
             stack1 + stack1_len,
             params1,
             (*core::ptr::addr_of!(KSTACK_Y1)).top(),
@@ -1955,7 +1964,7 @@ fn test_per_vcore_queues() {
             core::mem::MaybeUninit::uninit();
         let qf = core::ptr::addr_of_mut!(QFRAME);
         (*qf).write(arch::trapframe_new(
-            kernel::user_progs::user_vqueue as usize,
+            kernel::user_progs::user_vqueue as *const () as usize,
             stack1 + stack1_len,
             params1,
             (*core::ptr::addr_of!(KSTACK_Q1)).top(),
@@ -2464,11 +2473,9 @@ fn heap_hammer(marker: u8, slot: usize) {
 }
 
 fn heap_range() -> (usize, usize) {
-    // SAFETY: a plain address computation over a unique static.
-    unsafe {
-        let base = core::ptr::addr_of!(HEAP_MEM) as usize;
-        (base, base + 512 * 1024)
-    }
+    // `addr_of!` only forms an address, so no `unsafe` is needed to ask where a static is.
+    let base = core::ptr::addr_of!(HEAP_MEM) as usize;
+    (base, base + 512 * 1024)
 }
 
 fn heap_hammer_primary() {
@@ -2893,7 +2900,7 @@ fn test_vcore_identity() {
             core::mem::MaybeUninit::uninit();
         let f = core::ptr::addr_of_mut!(IFRAME);
         (*f).write(arch::trapframe_new(
-            kernel::user_progs::user_vcore_id as usize,
+            kernel::user_progs::user_vcore_id as *const () as usize,
             stack1 + stack1_len,
             params1,
             (*core::ptr::addr_of!(KSTACK_I1)).top(),
@@ -3022,7 +3029,7 @@ fn test_loaded_multi_vcore_cell() {
         let sp1 = load::map_vcore_stack(&mut aspace, 1);
 
         // A capability per ring: vcore 1 does not get a second handle on vcore 0's.
-        let mut cap_of = |objects: &mut ObjectTable, caps: &mut CapTable| {
+        let cap_of = |objects: &mut ObjectTable, caps: &mut CapTable| {
             let o = objects
                 .create(kernel::capability::ObjectKind::QueuePair)
                 .expect("a queue object");
@@ -3157,10 +3164,10 @@ fn strand_reset() {
 /// the executor genuinely interleaves them rather than running each to completion inside
 /// its first poll.
 fn strand_fill() {
-    for i in 0..STRAND_WORK {
+    for slot in STRAND_RAN.iter() {
         runtime::strand::spawn_shared(async move {
             runtime::strand::yield_now().await;
-            STRAND_RAN[i].fetch_add(1, Ordering::AcqRel);
+            slot.fetch_add(1, Ordering::AcqRel);
         });
     }
 }
@@ -3340,12 +3347,8 @@ fn test_cross_core_preemption() {
             );
             return;
         }
-        for i in 0..PLACED {
-            assert_eq!(
-                out[i].0,
-                (i + 1) as u64,
-                "cell {i} exited with the wrong code"
-            );
+        for (i, o) in out.iter().enumerate() {
+            assert_eq!(o.0, (i + 1) as u64, "cell {i} exited with the wrong code");
         }
 
         let (armed, taken, unarmable, to_sibling, to_cell) = preempt::counters();

@@ -2538,7 +2538,57 @@ fn build_bun_disk_fixture(arch: Arch, out_dir: &str) {
 /// JavaScriptCore runtime `linuxbun` proves, at four times the size and with its
 /// whole application bundled in. It needs `librt` on top of bun's set. Thin caller of
 /// [`build_runtime_disk_fixture`].
+/// Where the expected `claude --version` transcript is written for the test kernels to
+/// `include_bytes!`. **Not** per-arch: the string is a property of the binary, and the
+/// binary is x86-64-only, but the test compiles for all three ISAs so the file has to
+/// exist for all three builds.
+const CLAUDE_VERSION_FILE: &str = "tests/linux-fixtures/build/claude-version.txt";
+
+/// Record what the installed Claude Code binary reports as its version, for
+/// `linuxclaude`/`linuxclaudesmp` to assert against.
+///
+/// **Derived, not hardcoded.** The expected transcript used to be the literal
+/// `2.1.220 (Claude Code)\n` in two test kernels, which fails the moment the installed
+/// binary is upgraded - and it was, to `2.1.221`, turning a green gate red with nothing
+/// wrong. Asking the binary is the same discipline the `smp` kernel uses for its tile
+/// hashes: the expected value comes from the thing under test, so it cannot go stale.
+///
+/// What this does **not** weaken: the assertion is still an exact byte-for-byte match on
+/// the cell's whole stdout, and the version is read on the *host* from the very file
+/// that is copied onto the disk image. The cell has no way to influence it, so a cell
+/// that printed nothing, or a different string, or the right string with extra output,
+/// still fails.
+///
+/// An empty file when the binary is absent, which is the honest value - the test skips
+/// on the same condition (no binary, no disk image), so the two can never disagree.
+fn write_claude_version(binary: &str) {
+    let expected = std::process::Command::new(binary)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| o.stdout)
+        .unwrap_or_default();
+    if let Some(parent) = std::path::Path::new(CLAUDE_VERSION_FILE).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if expected.is_empty() {
+        println!("[xtask] no Claude Code binary to version-probe; linuxclaude will skip");
+    } else {
+        println!(
+            "[xtask] claude reports {:?} - linuxclaude asserts that",
+            core::str::from_utf8(&expected)
+                .unwrap_or("<non-utf8>")
+                .trim_end()
+        );
+    }
+    let _ = std::fs::write(CLAUDE_VERSION_FILE, &expected);
+}
+
 fn build_claude_disk_fixture(arch: Arch, out_dir: &str) {
+    // Before the arch gate: the file is `include_bytes!`d by a kernel that compiles for
+    // every ISA, so it must exist even where no disk is built.
+    write_claude_version("/opt/claude-code/bin/claude");
     build_runtime_disk_fixture(
         arch,
         out_dir,

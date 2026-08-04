@@ -33,6 +33,8 @@ use kernel::hw::smmuv3::Smmu as Iommu;
 #[allow(dead_code)]
 static mut BUF: [u8; 512] = [0; 512];
 /// A second buffer, so the NVMe phase's DMA target is distinct from virtio-blk's.
+/// Unreferenced on riscv for `BUF`'s reason: that ISA skips the DMA phase.
+#[allow(dead_code)]
 static mut BUF2: [u8; 512] = [0; 512];
 
 #[unsafe(no_mangle)]

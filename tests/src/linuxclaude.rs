@@ -31,11 +31,11 @@ mod disk_runtime;
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main() -> ! {
-    disk_runtime::prove(
-        "linuxclaude",
-        "/bin/claude",
-        &[b"claude", b"--version"],
-        &[
+    disk_runtime::prove(disk_runtime::Proof {
+        name: "linuxclaude",
+        path: "/bin/claude",
+        argv: &[b"claude", b"--version"],
+        envp: &[
             b"LD_LIBRARY_PATH=/lib:/lib64",
             b"PATH=/bin",
             b"HOME=/",
@@ -45,16 +45,21 @@ extern "C" fn kernel_main() -> ! {
             // cell genuinely has no tty and no network.
             b"CI=1",
         ],
-        b"2.1.220 (Claude Code)\n",
+        // The version the **installed binary** reports, recorded on the host by xtask
+        // at fixture-build time (`write_claude_version`) rather than hardcoded here -
+        // a literal drifts every Claude Code release and turns a green gate red with
+        // nothing wrong. Still an exact byte-for-byte match on the cell's whole stdout,
+        // and still a value the cell cannot influence.
+        want: include_bytes!("../linux-fixtures/build/claude-version.txt"),
         // Held to the strict gate: it prints its version and exits 0.
-        false,
+        thread_abort_partial: false,
         // Preemptive, as for Node and Bun.
-        true,
+        preemptive: true,
         // The W^X exception capability, so JavaScriptCore's JIT can map its code pages
         // (docs/ARCHITECTURE.md 5.1).
-        true,
-        None,
+        wx_authority: true,
+        second: None,
         // Not on a secondary: this kernel is the boot-CPU proof (docs/SMP.md 10.0e).
-        false,
-    )
+        on_secondary: false,
+    })
 }

@@ -246,11 +246,11 @@ fn test_four_linux_cells() {
             return;
         }
 
-        for i in 0..4 {
+        for (i, o) in out.iter().enumerate() {
             assert_eq!(
-                out[i].0, CHELLO_EXIT,
+                o.0, CHELLO_EXIT,
                 "Linux cell {i} exited {:#x}, not {CHELLO_EXIT}",
-                out[i].0
+                o.0
             );
             let got = captured(i);
             assert!(
@@ -401,23 +401,22 @@ fn test_registry_stress_two_cores() {
 
         if !finished {
             println!(
-                "linuxsmp: SKIP the registry-stress phase - the queue did not drain inside the                  bound, so nothing about the registries under load is claimed"
+                "linuxsmp: SKIP the registry-stress phase - the queue did not drain \
+                 inside the bound, so nothing about the registries under load is claimed"
             );
             return;
         }
-        for i in 0..2 {
+        for (i, o) in out.iter().enumerate() {
             let got = captured(i);
             assert!(
                 got == REGSTRESS_OUT,
-                "registry-stress cell {i} printed {:?}, not {:?} - a `FAIL <n>` line means                  it read a byte written by the other cell, which is two processes holding                  one pipe or one eventfd",
+                "registry-stress cell {i} printed {:?}, not {:?} - a `FAIL <n>` line means \
+                 it read a byte written by the other cell, which is two processes holding \
+                 one pipe or one eventfd",
                 core::str::from_utf8(got),
                 core::str::from_utf8(REGSTRESS_OUT)
             );
-            assert_eq!(
-                out[i].0, 0,
-                "registry-stress cell {i} exited {:#x}",
-                out[i].0
-            );
+            assert_eq!(o.0, 0, "registry-stress cell {i} exited {:#x}", o.0);
         }
         assert!(
             out[0].1 != out[1].1,
@@ -592,7 +591,6 @@ fn test_linux_fork_across_cores() {
 // bring up JIT arenas behind the W^X exception, and they spawn worker contexts, none of
 // which this touches. What it removes is the doubt about the mechanism underneath them.
 
-/// `dhello`'s exact transcript and exit, as `linuxdyn` asserts them on the primary.
 // --------- TWO multi-threaded Linux cells, on TWO cores, each PREEMPTED while it runs
 //
 // The §10.2a audit found a hole that no phase could reach: `linux::plock` brackets the
@@ -798,6 +796,7 @@ fn test_preempted_threads_two_cores() {
     }
 }
 
+/// `dhello`'s exact transcript and exit, as `linuxdyn` asserts them on the primary.
 const DHELLO_OUT: &[u8] = b"hello from dynamic glibc\n";
 const DHELLO_EXIT: u64 = 12;
 

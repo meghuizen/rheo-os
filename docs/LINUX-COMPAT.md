@@ -1213,7 +1213,10 @@ fixup path.
   set (`librt` on top of bun's), JSC bring-up with its **JIT enabled** through the
   capability-gated W^X exception (docs/ARCHITECTURE.md 5.1), and **preemptive** dispatch
   (2,467 slices taken to sibling contexts) were all already there. It prints exactly
-  `2.1.220 (Claude Code)` and exits 0, asserted as an exact transcript. x86-64 only (the
+  its own version string and exits 0, asserted as an exact transcript - the expected
+  bytes are read from the installed binary by `xtask` at fixture-build time
+  (`write_claude_version`) rather than written out here, since a hardcoded version turns
+  a green gate red on every Claude Code release with nothing wrong. x86-64 only (the
   binary is an x86-64 ELF; arm64/riscv64 skip-with-reason).
 
   **What is and is not claimed.** It runs `claude --version`. That choice is the honest

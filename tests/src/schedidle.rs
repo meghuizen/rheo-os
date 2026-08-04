@@ -255,7 +255,7 @@ fn run_vcore_pair(mode: u64, arg: u64) -> (Outcome, u64, u64) {
             core::mem::MaybeUninit::uninit();
         let vf = core::ptr::addr_of_mut!(VFRAME);
         (*vf).write(arch::trapframe_new(
-            user_peer as usize,
+            user_peer as *const () as usize,
             stack_v + stack_v_len,
             params_v,
             (*core::ptr::addr_of!(KSTACK_V)).top(),

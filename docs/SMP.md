@@ -1353,7 +1353,7 @@ strict gate, `on_secondary` the only difference. Observed:
 |---|---|---|---|---|
 | Bun (JSC) | 99 MB | ~9,200 | 83 of 6,243 | `rheo:42`, exit 0 |
 | Node.js (V8 + libuv) | 124 MB | ~15,300 | 23 of 9,477 | `rheo:42`, exit 0 |
-| Claude Code (Bun-compiled) | 275 MB | ~116,300 | 1,612 of 61,701 | `2.1.220 (Claude Code)`, exit 0 |
+| Claude Code (Bun-compiled) | 275 MB | ~116,300 | 1,612 of 61,701 | its own version string, exit 0 |
 
 Each is its own kernel rather than a phase, deliberately: the primary-CPU proof is the
 baseline every claim about these runtimes rests on, and a boot that runs one somewhere else
@@ -1648,6 +1648,43 @@ observable behaviour is identical to what they replaced - only the number of
 acquisitions changed - so the existing `numa` (node placement and fallback
 counting, exactly) and `cowfork` (2406 pages shared, 0 copied) phases are their
 gate. There is no test that can distinguish one acquisition from three.
+
+### 10.0h Three phases that could fail on a legal schedule
+
+The multi-core phases assert on things four cores did. Three of those assertions
+were about *which* core did what, which is a race outcome, and a race outcome is a
+property of the host's scheduler rather than of this kernel. They passed on a quiet
+machine and failed on a busy one - the shape docs/ENGINEERING.md 11 records, since a
+test that fails on correct behaviour is worse than no test, and CI runners are busy
+machines.
+
+Found by making the host busy on purpose: 12 spinners against 4 cores turned all
+three from "occasionally red" into deterministic failures, which is what made them
+fixable.
+
+- **The GEMM work queue** asserted `workers > 1` - at least two cores won a block.
+  A single core draining all sixteen before any peer arrives is a legal schedule for
+  a claim-based queue, and under load that is what happens. It is **reported** now.
+  What proves the parallelism is unchanged and cannot fail on a legal schedule: the
+  barrier (all online cores inside one interval), the counts summing to the queue,
+  and the bit-identical result. The first fix of this assertion had already weakened
+  `workers == cores` to `workers > 1`, which is the same mistake one size smaller -
+  the threshold was never the problem, the *kind of claim* was.
+- **The rendezvous bound** was 2 s, chosen "generous" against TCG time-slicing. It
+  is not generous against a host that is oversubscribed: several phases reported
+  "the cores did not meet" about a kernel that was working. It is 10 s, still an
+  eighth of the boot budget, so a genuinely single-core machine still reports the
+  timeout rather than wedging.
+
+**Still open, and not fixed here**: under the same 3:1 oversubscription the
+vcore-identity phase reports `cell 0 vcore 1 refused to CPU 0: NotYours` and the run
+ends in `DEADLOCK_EXIT`, and the NVMe phase's rendezvous can still miss its 10 s
+bound. The first is the interesting one: a live vcore owned by a core the host has
+not scheduled looks, to the deadlock classifier, like no wake source - which is a
+*false* deadlock, and `retire_vcore` already carries the reasoning that "a core with
+nothing to do is not a deadlocked machine". That is a kernel-side question and wants
+its own diagnosis rather than a widened bound; the reproduction is recorded here so
+it starts from evidence.
 
 ### 10.1 The measured motivation (not a wish)
 

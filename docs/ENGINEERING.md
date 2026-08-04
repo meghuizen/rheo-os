@@ -524,6 +524,26 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   reason. The general trap: a "reuse the resource and check it was cleaned" oracle is
   only an oracle if the allocator under test actually reuses on the timescale of the
   test, and rotating allocators specifically do not.
+- **A bounded wait is not a precondition.** `observe` asserted that a park moves the
+  halt/spin counter, using `register(1ms); while !expired { wait() }` - which only
+  parks *if the deadline has not already elapsed by the first test*. One host
+  scheduler preemption of the QEMU process breaks that, since the guest's counter
+  advances while the process is descheduled. It failed ~1 run in 3, and the loop was
+  measured running **zero** times on exactly the failing runs. Fixed by parking once
+  unconditionally: the property under test was what a park does, never whether a
+  deadline had already passed. The general form: if a test's experiment happens only
+  inside a timing window, the window is a silent precondition, and on a shared CI
+  runner it will not hold.
+- **A test must not assert a race outcome, and "weaken the bound" is not the fix.**
+  `smp`'s work-queue phase first asserted `workers == cores`; that failed on a legal
+  schedule, and was weakened to `workers > 1` - the same mistake one size smaller,
+  since a single core draining the whole queue before any peer arrives is equally
+  legal. Under a host oversubscribed 3:1 it failed four runs out of four. The fix is
+  not a smaller threshold but moving the claim: the *barrier* proves the cores were
+  simultaneous, the summed counts and the bit-identical result prove the sharing was
+  correct, and how many cores won a block is **reported**. Deliberately starving the
+  host is the cheap way to find these - `for i in $(seq 1 12); do (while :; do :; done) & done`
+  turned three separate latent flakes into deterministic failures.
 - **A hot path's cost can be dominated by the cold code sharing its stack frame.**
   The frame allocator's flat-combining layer (docs/SMP.md 10.0g) was written as one
   function holding the election, the batch, the publication and the spin loop, on the

@@ -138,13 +138,13 @@ fn numa_two_nodes(inv: &hw::Inventory) {
     // Node 1 is the load-bearing case: it is the *upper* range, so a pre-NUMA
     // allocator - which searches from a rotating hint near the pool base - would
     // essentially never return one of these by chance.
-    for i in 0..PROBE {
+    for slot in held.iter_mut().take(PROBE) {
         let pa = frames::alloc_on(1).expect("node 1 allocation failed");
         assert!(
             pa as u64 >= boundary,
             "asked node 1, got {pa:#x} which is below the {boundary:#x} boundary"
         );
-        held[i] = pa;
+        *slot = pa;
     }
     // Node 0 too, so the proof is "the argument decides" and not "everything comes
     // from the top of the pool now".
@@ -227,8 +227,8 @@ fn numa_two_nodes(inv: &hw::Inventory) {
     // --- Give it all back ---------------------------------------------------
     // The invariant a lost update breaks (`mm::frames`' own): the used counter must
     // still agree with the bitmap after a bounded, node-directed workload.
-    for i in 0..n {
-        frames::free(held[i]);
+    for &pa in held.iter().take(n) {
+        frames::free(pa);
     }
     assert!(
         frames::used_matches_bitmap(),

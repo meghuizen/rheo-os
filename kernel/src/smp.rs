@@ -832,11 +832,20 @@ static RV_TIMEOUT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "smp")]
 /// How long a rendezvous half waits before giving up, in timer-domain nanoseconds.
 ///
-/// Generous (2 s) because under QEMU's TCG the two cores are time-sliced by the host
-/// and a secondary can be descheduled for a long time. The bound exists so a
-/// single-core machine - where the rendezvous genuinely cannot complete - reports that
-/// instead of wedging the boot test into its 120 s timeout with no diagnostic.
-const RV_TIMEOUT_NS: u64 = 2_000_000_000;
+/// Generous because under QEMU's TCG the two cores are time-sliced by the host and a
+/// secondary can be descheduled for a long time. The bound exists so a single-core
+/// machine - where the rendezvous genuinely cannot complete - reports that instead of
+/// wedging the boot test into its 120 s timeout with no diagnostic.
+///
+/// **10 s, raised from 2 s against a measurement.** With the host deliberately
+/// oversubscribed 3:1 (12 spinners against 4 cores), 2 s was not enough: the `smp`
+/// kernel failed with "cores did not meet" about a kernel that was working, since
+/// whether a vCPU thread gets scheduled inside a fixed window is a property of the
+/// host and not of this code. CI runners are shared machines, so that is a real
+/// condition rather than a contrived one. 10 s keeps the diagnostic purpose intact -
+/// it is still an eighth of the boot budget, so a genuinely single-core machine
+/// reports the timeout long before the harness gives up.
+const RV_TIMEOUT_NS: u64 = 10_000_000_000;
 
 #[cfg(feature = "smp")]
 /// Announce this side of the rendezvous and wait for the other. Returns false on
