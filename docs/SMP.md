@@ -1512,6 +1512,51 @@ design*, which is the point rather than a disappointment: after change 1 there i
 very little window left for a second core to arrive in. Shortening the window
 removed most of the contention; combining handles what is left.
 
+**What it costs, measured, because the whole case for change 4 is "cheap when
+uncontended" and that had to be a number.** The bench suite touched none of these
+paths, so five benches were added (`frame_alloc_free`, `frame_alloc_on_free`,
+`frame_contig1_free`, `frame_share_free`, `frame_cow_resolve_sole`), icount
+instructions per operation, against the pre-change tree:
+
+| bench | x86-64 before -> after | riscv64 before -> after |
+|---|---|---|
+| `frame_alloc_free` | 652 -> 670 | 1728 -> 1756 |
+| `frame_alloc_on_free` | 689 -> 693 | 1778 -> 1776 |
+| `frame_contig1_free` | 883 -> 894 | 2009 -> 2026 |
+| `frame_share_free` (2 ops) | 94 -> 118 | 123 -> 156 |
+| `frame_cow_resolve_sole` | 40 -> 58 | 57 -> 85 |
+
+`frame_contig1_free` is the clean one: `alloc_contig` did not change layer, so its
+delta is `free` alone going through the batch - **+11 instructions on x86-64, +17
+on riscv64** (RISC-V has no byte-wide atomic exchange, so an `AtomicBool` swap is
+more instructions there). `frame_share_free` is two such operations and agrees.
+
+**Read against `frame_alloc_free` that is +2.8% and +1.6%**, because the 4 KiB
+`memset` dominates the operation - which is the same fact as change 1: the thing
+the combining layer is measured against is precisely what used to be inside the
+lock.
+
+**And the honest reading of it: on a single-core boot flat combining is a net loss
+in instructions.** It buys nothing there and costs ~11-17. Two things icount
+cannot price cut the other way and both are lab claims, stated rather than
+assumed: an atomic RMW counts as one instruction here and costs far more than one
+on real silicon, so the true single-core cost is *worse* than the table shows; and
+the cache-line handoffs the technique removes are invisible to an emulator with no
+cache model, so the true contended saving is *better* than zero by an amount only
+hardware can report. What is defensible from this container is the shape - the fast
+path is a leaf with one extra `xchg`, one relaxed load and one store - not a
+speedup.
+
+**The first version cost ~40 instructions per operation, and `objdump` said why**
+rather than reasoning about it. One function held the election, the batch, the
+publication and the spin loop, so LLVM allocated seven callee-saved registers for
+the cold half and pushed and popped all seven on every fast-path call, and the
+`call fc_execute` beside them kept `op` a runtime value so the six-way dispatch ran
+too. Splitting it into an `#[inline(always)]` leaf fast path with `fc_slow` and
+`fc_drain` both `#[cold]` and out of line took it to 11. Recorded in
+docs/ENGINEERING.md 11: a hot path's cost can be dominated by the *cold* code
+sharing its stack frame.
+
 **Controls, both observed firing.** Deleting the zeroing makes the frame-zeroing
 check report `4096 nonzero byte(s)`; making the combiner execute each request
 twice trips `double free of <pa>` inside `release`.

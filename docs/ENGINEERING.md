@@ -524,6 +524,19 @@ Specific traps this codebase has hit, kept here so they are not re-learned.
   reason. The general trap: a "reuse the resource and check it was cleaned" oracle is
   only an oracle if the allocator under test actually reuses on the timescale of the
   test, and rotating allocators specifically do not.
+- **A hot path's cost can be dominated by the cold code sharing its stack frame.**
+  The frame allocator's flat-combining layer (docs/SMP.md 10.0g) was written as one
+  function holding the election, the batch, the publication and the spin loop, on the
+  reasoning that the fast path is "a swap, the work, a store" - three instructions.
+  It measured **~40**. `objdump` gave the answer in one look: because the cold half
+  lived in the same function, LLVM allocated seven callee-saved registers for it and
+  pushed and popped all seven on *every* fast-path call, and the out-of-line
+  `call fc_execute` beside them kept the opcode a runtime value so a six-way dispatch
+  ran as well. Splitting it - `#[inline(always)]` leaf fast path, everything cold
+  `#[cold] #[inline(never)]` - took it to 11 with no logic changed. Counting the
+  instructions you wrote is not counting the instructions that run; and adding the
+  bench *first* is what turned a wrong belief into a number, on a path the suite had
+  never measured at all.
 - **Do not split a sequence you have not understood.** The first attempt at that
   fix split the arch injector into "inject" and "halt" so the portable code could
   re-halt until the byte arrived. It wedged the machine: the per-ISA sequence is

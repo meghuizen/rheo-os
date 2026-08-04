@@ -2603,8 +2603,26 @@ requests were executed by the other core's combiner**, 0 withdrawn. That number 
 **reported, never asserted** (zero is a legal schedule, and TCG interleaves coarsely) and
 it stays modest *by design*, which is the point: change 1 left very little window for a
 second core to arrive in, so shortening the window removed most of the contention and
-combining handles what is left. Two controls observed firing (the zeroing deleted ->
-`4096 nonzero byte(s)`; the combiner running each request twice -> `double free of <pa>`).
+combining handles what is left. **The cost is measured, and the reading is honest**: the
+bench suite touched none of these paths, so five benches were added, and against the
+pre-change tree the layer costs **+11 instructions per operation on x86-64 and +17 on
+riscv64** (isolated by `frame_contig1_free`, whose `alloc_contig` half did not change
+layer) - +2.8% and +1.6% of a full `alloc`+`free`, because the 4 KiB `memset` dominates,
+which is the same fact as change 1. So **on a single-core boot flat combining is a net
+loss in instructions**: it buys nothing there and costs 11-17. Two things icount cannot
+price cut the other way and are named as lab claims rather than assumed - an atomic RMW
+counts as one instruction here and costs far more on real silicon, so the true
+single-core cost is *worse*; and the cache-line handoffs the technique removes are
+invisible to an emulator with no cache model, so the true contended saving is *better*
+than zero by an amount only hardware can report. **The first version cost ~40
+instructions and `objdump` said why**: one function held the election, the batch, the
+publication and the spin loop, so LLVM allocated seven callee-saved registers for the
+cold half and pushed and popped all seven on every fast-path call, with an un-inlined
+dispatch beside them - split into an `#[inline(always)]` leaf plus `#[cold]` remainder it
+is 11, with no logic changed (docs/ENGINEERING.md 11: a hot path's cost can be dominated
+by the cold code sharing its stack frame). Two controls observed firing (the zeroing
+deleted -> `4096 nonzero byte(s)`; the combiner running each request twice -> `double
+free of <pa>`).
 **And the first version of the zeroing oracle passed with the fix deleted** - the
 concurrent loop asserted every fresh frame arrives zero, reasoning that a frame one core
 stamped and freed comes back to the other dirty, but `alloc` rotates its hint so a freed

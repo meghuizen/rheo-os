@@ -580,8 +580,8 @@ static FC_COMBINER: AtomicBool = AtomicBool::new(false);
 ///
 /// The witness, because a batch of size one is indistinguishable from the plain lock:
 /// without this, "flat combining landed" would be a claim about the source rather than
-/// about the machine (docs/ENGINEERING.md 1). It costs the uncontended path **nothing**
-/// - it is bumped inside [`fc_drain`]'s loop body, which does not execute when the
+/// about the machine (docs/ENGINEERING.md 1). It costs the uncontended path **nothing**,
+/// being bumped inside [`fc_drain`]'s loop body - which is not even reached when the
 /// pending mask is empty, and that is the whole of the single-core case.
 static FC_COMBINED: AtomicU64 = AtomicU64::new(0);
 /// Requests taken back after the spin bound because no combiner picked them up. Also
@@ -612,27 +612,94 @@ const FC_SPINS: u32 = 1024;
 /// request is executed **exactly once**, enforced by the [`FC_BUSY`] claim: a
 /// publisher may only withdraw by moving its slot from its own opcode straight to
 /// [`FC_IDLE`], which fails once a combiner has claimed it.
+///
+/// # Why this is shaped in three functions, and how it was measured
+///
+/// `#[inline(always)]` on a body small enough to deserve it, with **everything else out
+/// of line**. That is not style: the first version was one function containing the
+/// election, the batch, the publication and the spin loop, and it cost **~40
+/// instructions per operation** on the uncontended path - read off `objdump`, not
+/// guessed. Two thirds of that was prologue and epilogue. Because the cold loop lived in
+/// the same function, LLVM allocated seven callee-saved registers for it and pushed and
+/// popped all seven on every fast-path call, and the `call fc_execute` beside them kept
+/// `op` a runtime value so the six-way dispatch ran too. On `free` - which has no 4 KiB
+/// `memset` to hide behind - that was most of the operation.
+///
+/// So the fast path is now a leaf: one `xchg`, the lock, the one primitive `op` names
+/// (folded at compile time, since every caller passes a constant), one relaxed load to
+/// see the pending mask is empty, one store. [`fc_slow`] holds the contended half and
+/// [`fc_drain`] the batch, both `#[cold]`, so neither costs the fast path a register.
+///
+/// The invariant that matters for correctness is that a request is executed **exactly
+/// once**, enforced by the [`FC_BUSY`] claim: a publisher may only withdraw by moving
+/// its slot from its own opcode straight to [`FC_IDLE`], which fails once a combiner has
+/// claimed it.
+#[inline(always)]
 fn fc_op(op: u64, arg: u64) -> u64 {
+    // The election is also the fast path: whoever takes the role serves itself with no
+    // publication and no spin.
+    if !FC_COMBINER.swap(true, Ordering::Acquire) {
+        let res = {
+            let _g = POOL_LOCK.lock();
+            // SAFETY: the pool lock is held for the whole batch, and this core is the
+            // only combiner.
+            unsafe {
+                let mine = fc_execute(op, arg);
+                fc_drain_if_pending();
+                mine
+            }
+        };
+        FC_COMBINER.store(false, Ordering::Release);
+        return res;
+    }
+    fc_slow(op, arg)
+}
+
+/// Serve the batch, but pay only a relaxed load to discover there is none.
+///
+/// # Safety
+/// As [`fc_drain`].
+#[inline(always)]
+unsafe fn fc_drain_if_pending() {
+    if FC_PENDING.load(Ordering::Relaxed) != 0 {
+        // SAFETY: delegated to the caller.
+        unsafe { fc_drain() }
+    }
+}
+
+/// The contended half: publish, wait for the combiner, and take the request back and
+/// combine ourselves if nobody picked it up.
+///
+/// `#[cold]` and out of line, because it runs only when another core already holds the
+/// role - and because leaving it in [`fc_op`] is what made the fast path expensive.
+#[cold]
+#[inline(never)]
+fn fc_slow(op: u64, arg: u64) -> u64 {
     loop {
-        // The election is also the fast path: whoever takes the role serves itself
-        // with no publication and no spin.
         if !FC_COMBINER.swap(true, Ordering::Acquire) {
             let res = {
                 let _g = POOL_LOCK.lock();
-                // SAFETY: the pool lock is held for the whole batch, and this core is
-                // the only combiner.
+                // SAFETY: the pool lock is held; this core holds the combiner role.
                 unsafe {
                     let mine = fc_execute(op, arg);
-                    fc_drain();
+                    fc_drain_if_pending();
                     mine
                 }
             };
             FC_COMBINER.store(false, Ordering::Release);
             return res;
         }
+        if let Some(res) = fc_publish_and_wait(op, arg) {
+            return res;
+        }
+    }
+}
 
-        // Someone else is combining. Publish and let them do the work; `arg` before
-        // `req` so the release store on `req` publishes both.
+/// Publish this core's request and wait for the combiner, or `None` if the request was
+/// taken back and the caller should try to combine itself.
+fn fc_publish_and_wait(op: u64, arg: u64) -> Option<u64> {
+    {
+        // `arg` before `req` so the release store on `req` publishes both.
         let cpu = crate::smp::cpu_index();
         let slot = &FC_SLOTS[cpu];
         slot.arg.store(arg, Ordering::Relaxed);
@@ -645,7 +712,7 @@ fn fc_op(op: u64, arg: u64) -> u64 {
                 FC_DONE => {
                     let res = slot.res.load(Ordering::Relaxed);
                     slot.req.store(FC_IDLE, Ordering::Relaxed);
-                    return res;
+                    return Some(res);
                 }
                 // Claimed: withdrawing now would run the request twice.
                 FC_BUSY => core::hint::spin_loop(),
@@ -661,7 +728,7 @@ fn fc_op(op: u64, arg: u64) -> u64 {
                         // Took it back - go and combine ourselves.
                         FC_PENDING.fetch_and(!(1u64 << cpu), Ordering::Relaxed);
                         FC_WITHDRAWN.fetch_add(1, Ordering::Relaxed);
-                        break;
+                        return None;
                     }
                     if spins > FC_SPINS {
                         // The CAS lost: a combiner claimed it between the load above
@@ -680,6 +747,12 @@ fn fc_op(op: u64, arg: u64) -> u64 {
 /// # Safety
 /// The pool lock must be held. Every `arg` carrying an address reaches here only from
 /// a public wrapper that has already checked [`in_pool`].
+///
+/// `#[inline(always)]` for [`fc_op`]'s measured reason: the `op` is a constant at every
+/// real call site, so this whole dispatch is compile-time there and the arm that survives
+/// is the one primitive that call wanted. It stays a runtime match inside [`fc_drain`],
+/// which genuinely reads the opcode out of a peer's slot - and that copy is cold.
+#[inline(always)]
 unsafe fn fc_execute(op: u64, arg: u64) -> u64 {
     // SAFETY: the pool lock is held; delegated to each primitive's contract.
     unsafe {
@@ -703,7 +776,14 @@ unsafe fn fc_execute(op: u64, arg: u64) -> u64 {
 ///
 /// # Safety
 /// The pool lock must be held, and the caller must hold the combiner role.
+#[cold]
+#[inline(never)]
 unsafe fn fc_drain() {
+    // A plain load first: the uncontended case is an empty mask, and paying a
+    // read-modify-write to learn that is the one avoidable atomic on this path.
+    if FC_PENDING.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     let mut mask = FC_PENDING.swap(0, Ordering::Acquire);
     while mask != 0 {
         let cpu = mask.trailing_zeros() as usize;
