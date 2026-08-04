@@ -2598,8 +2598,12 @@ allocate/stamp-every-byte/read-back/free after a rendezvous, so a frame handed t
 means one core's stamp lands in the other's frame between the write and the read - the
 corruption itself, not a proxy - with the counter still matching the bitmap and no frame
 leaked; then a **churn** pass (allocate and free, touching nothing) because the verify
-pass spends far longer outside the allocator than inside it, across which **313-1228
-requests were executed by the other core's combiner**, 0 withdrawn. That number is
+pass spends far longer outside the allocator than inside it, across which **140-469
+requests were executed by the other core's combiner** (riscv64 315, aarch64 140, x86-64
+469) with **1-6 withdrawn** - and the withdrawal count matters more than its size, since
+it means the liveness backstop and the `FC_BUSY` claim it interacts with are exercised
+rather than dead code, a withdrawal racing a claim being the one interleaving in which a
+request could run twice. That number is
 **reported, never asserted** (zero is a legal schedule, and TCG interleaves coarsely) and
 it stays modest *by design*, which is the point: change 1 left very little window for a
 second core to arrive in, so shortening the window removed most of the contention and
@@ -3600,7 +3604,7 @@ tests/        in-QEMU test kernels: cap-invariants, queue-pipeline,
               either core's frame ever holding the other's marker, the used
               counter still matching the bitmap, no frame leaked), then 1024
               churn rounds each with no page touched so the two are contending
-              on the bookkeeping alone - 313-1228 requests executed by the OTHER
+              on the bookkeeping alone - 140-469 requests executed by the OTHER
               core's flat-combining combiner, reported and never asserted - plus
               a single-core check that a frame **dirtied while free** comes back
               zeroed, which is the only shape that can catch a missing memset in

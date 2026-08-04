@@ -1502,8 +1502,14 @@ meet at a rendezvous first, and the counter is asserted to still match the bitma
 and no frame to have leaked. Then the same two cores run a **churn** pass -
 allocate and free, touching nothing - because the verify pass spends far longer
 outside the allocator than inside it and so measures the correctness, not the
-combining. Across both passes **313-1228 requests were executed by the other
-core's combiner** on riscv64, 0 withdrawn.
+combining. Across both passes **140-469 requests were
+executed by the other core's combiner** (riscv64 315, aarch64 140, x86-64 469),
+with **1-6 withdrawn**.
+
+That withdrawal count matters more than its size: it means the liveness backstop
+is *exercised* rather than dead code, and so is the `FC_BUSY` claim it interacts
+with - a withdrawal racing a claim is the one interleaving in which a request could
+be executed twice, and it is reached on every ISA on every run.
 
 That number is **reported, never asserted**. Zero is a legal schedule (one core
 running its whole share before the other starts), and TCG interleaves coarsely, so
