@@ -289,6 +289,33 @@ impl<T> SpinLock<T> {
         self.lock_contended()
     }
 
+    /// Acquire the lock **or give up immediately**, never spinning.
+    ///
+    /// For a caller whose answer to "someone else is inside" is to do something
+    /// else rather than to wait - `mm::frames`' flat combining publishes its
+    /// request to a per-CPU slot instead (docs/SMP.md 10.0g), which is only cheaper
+    /// than waiting if discovering the contention is cheap.
+    ///
+    /// Exactly [`SpinLock::lock`]'s fast path with the `#[cold]` fallback replaced
+    /// by `None`, so a successful `try_lock` costs precisely what a successful
+    /// `lock` costs: one strong `compare_exchange`. A failure is deliberately **not**
+    /// counted as contention - the contention counters mean "an acquire had to wait",
+    /// and a caller that never waits did not.
+    #[inline]
+    pub fn try_lock(&self) -> Option<SpinGuard<'_, T>> {
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Some(SpinGuard {
+                lock: self,
+                hold_start_ns: self.hold_stamp(),
+            });
+        }
+        None
+    }
+
     /// The contended acquire: spin until free, and - for a named lock with the
     /// Lock window on - count the contention, the spin iterations and the wait.
     /// `#[cold]` so the fast path stays a test and a return; the clock is read

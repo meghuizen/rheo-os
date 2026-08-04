@@ -14,11 +14,11 @@
 //! stores - so every core allocating serialised on another core's `memset`.
 //!
 //! On top of that, the hot operations go through **flat combining**
-//! ([`fc_op`], Hendler/Incze/Shavit/Tzafrir, SPAA 2010) rather than each core
+//! ([`fc_run`], Hendler/Incze/Shavit/Tzafrir, SPAA 2010) rather than each core
 //! taking the lock in turn.
 
 use crate::arch;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 pub const FRAME_SIZE: usize = 4096;
 
@@ -95,9 +95,9 @@ static FALLBACKS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUs
 /// that produced the `SYS_YIELD` FP defect: state whose safety depends on which
 /// features are enabled gets written twice and diverges).
 ///
-/// It is taken **once per batch** rather than once per operation: the hot paths reach
-/// it through [`fc_op`]'s combiner, and the diagnostics and boot-time paths take it
-/// directly. What it no longer covers is the 4 KiB zeroing, which used to be the
+/// It is taken **once per batch** rather than once per operation, and holding it *is*
+/// holding the flat-combining combiner role ([`fc_run`]); the diagnostics and boot-time
+/// paths take it directly and simply do not drain. What it no longer covers is the 4 KiB zeroing, which used to be the
 /// dominant part of every critical section here and is now done by each requesting
 /// core after its claim.
 static POOL_LOCK: crate::smp::SpinLock<()> =
@@ -455,18 +455,32 @@ unsafe fn ref_count(pa: usize) -> u8 {
 ///
 /// # Safety
 /// The pool lock must be held, and `pa` must satisfy [`in_pool`].
-unsafe fn cow_claim(pa: usize) -> u64 {
+unsafe fn cow_claim_typed(pa: usize) -> Cow {
     // SAFETY: the pool lock is held.
     unsafe {
         if ref_count(pa) <= 1 {
-            return COW_SOLE;
+            return Cow::Sole;
         }
         match claim_hinted() {
             // The old frame keeps its reference: nothing has changed, so the caller
             // can refuse the fault and the mapping stays exactly as it was.
-            None => COW_NO_FRAME,
-            Some(dst) => dst as u64,
+            None => Cow::NoFrame,
+            Some(dst) => Cow::Private(dst),
         }
+    }
+}
+
+/// [`cow_claim_typed`] in the cross-core wire form, for a request served out of a peer's
+/// slot. The sentinels are unambiguous because a pool PA is neither 0 nor 1.
+///
+/// # Safety
+/// As [`cow_claim_typed`].
+unsafe fn cow_claim(pa: usize) -> u64 {
+    // SAFETY: delegated.
+    match unsafe { cow_claim_typed(pa) } {
+        Cow::Sole => COW_SOLE,
+        Cow::NoFrame => COW_NO_FRAME,
+        Cow::Private(dst) => dst as u64,
     }
 }
 
@@ -492,13 +506,29 @@ unsafe fn cow_claim(pa: usize) -> u64 {
 //    zeroed on behalf of the batch would re-serialise precisely what moving the
 //    `memset` out of the lock unserialised.
 //
-// 2. **The uncontended path does not publish at all.** A core tries the combiner
-//    election *first*; winning it (always, on a single-CPU boot or an idle machine)
-//    means taking the lock and doing its own work directly, then draining a pending
-//    mask that is normally zero. So the cost added to an uncontended allocation is two
-//    atomics and one relaxed load - there is no separate "SMP path" to diverge from,
-//    which is the mistake docs/SUBSTRATE.md pillar 3 records as the cause of the
+// 2. **The combiner is whoever holds the lock, and the uncontended path does not
+//    publish at all.** The paper keeps the combiner role in a flag of its own because a
+//    combiner there may hold the role across several lock acquisitions; here a batch is
+//    one critical section, so a separate flag would be a second atomic claim over the
+//    same exclusivity the lock already provides. `try_lock` *is* the election: winning
+//    it (always, on a single-CPU boot or an idle machine) means doing the caller's own
+//    work directly and then draining a pending mask that is normally zero. So the cost
+//    added to an uncontended operation is **one relaxed load** on top of the lock the
+//    pre-combining code already took - and there is no separate "SMP path" to diverge
+//    from, which is the mistake docs/SUBSTRATE.md pillar 3 records as the cause of the
 //    `SYS_YIELD` FP defect.
+//
+//    One consequence, stated because it is a real if rare liveness cost: the lock's
+//    other holders (the diagnostics, the boot paths) do not drain, so a request
+//    published against one of those waits out `FC_SPINS` and is withdrawn rather than
+//    served. It is counted, and the retry then takes the lock itself.
+//
+// 2b. **The wire form is slow-path only.** A request only has to become `(op, arg)`
+//    words if it is going to be *published*, so [`fc_run`] takes the operation twice -
+//    once as a closure returning its own type, for this core, and once encoded, for a
+//    peer's slot - and the fast path never encodes or decodes anything. That is what
+//    keeps `alloc`'s `Option<usize>` from becoming a `u64` and back on the path that
+//    never left this core.
 //
 // # Preconditions
 //
@@ -573,9 +603,6 @@ const _: () = assert!(
     "FC_PENDING is a u64 bitmask over CPU indices"
 );
 
-/// Whether some core currently holds the combiner role.
-static FC_COMBINER: AtomicBool = AtomicBool::new(false);
-
 /// Requests a combiner executed **on behalf of another core** - the combining itself.
 ///
 /// The witness, because a batch of size one is indistinguishable from the plain lock:
@@ -605,15 +632,15 @@ pub fn fc_stats() -> (u64, u64) {
 /// inside it, so the retry is rare rather than a second phase of the common path.
 const FC_SPINS: u32 = 1024;
 
-/// Submit one bookkeeping operation and return its result.
+/// Run one bookkeeping operation, batched.
 ///
-/// The single entry point for every operation the hot paths use. See the module note
-/// above for the protocol; the invariant that matters for correctness is that a
-/// request is executed **exactly once**, enforced by the [`FC_BUSY`] claim: a
-/// publisher may only withdraw by moving its slot from its own opcode straight to
-/// [`FC_IDLE`], which fails once a combiner has claimed it.
+/// `mine` is this core's own work: a closure returning the operation's **own** type,
+/// called directly when we take the lock, so the uncontended caller never encodes a
+/// request it is not going to publish. `op`/`arg` are the same operation in the
+/// cross-core wire form and `decode` turns that form's `u64` back - both reached only
+/// when another core is already inside the structure.
 ///
-/// # Why this is shaped in three functions, and how it was measured
+/// # Why this is shaped in four functions, and how it was measured
 ///
 /// `#[inline(always)]` on a body small enough to deserve it, with **everything else out
 /// of line**. That is not style: the first version was one function containing the
@@ -625,34 +652,25 @@ const FC_SPINS: u32 = 1024;
 /// `op` a runtime value so the six-way dispatch ran too. On `free` - which has no 4 KiB
 /// `memset` to hide behind - that was most of the operation.
 ///
-/// So the fast path is now a leaf: one `xchg`, the lock, the one primitive `op` names
-/// (folded at compile time, since every caller passes a constant), one relaxed load to
-/// see the pending mask is empty, one store. [`fc_slow`] holds the contended half and
-/// [`fc_drain`] the batch, both `#[cold]`, so neither costs the fast path a register.
+/// So the fast path is a leaf: the lock's own `compare_exchange`, the caller's closure,
+/// one relaxed load to see the pending mask is empty, the guard's release. [`fc_slow`]
+/// holds the contended half and [`fc_drain`] the batch, both `#[cold]`, so neither costs
+/// the fast path a register.
 ///
 /// The invariant that matters for correctness is that a request is executed **exactly
 /// once**, enforced by the [`FC_BUSY`] claim: a publisher may only withdraw by moving
 /// its slot from its own opcode straight to [`FC_IDLE`], which fails once a combiner has
 /// claimed it.
 #[inline(always)]
-fn fc_op(op: u64, arg: u64) -> u64 {
-    // The election is also the fast path: whoever takes the role serves itself with no
-    // publication and no spin.
-    if !FC_COMBINER.swap(true, Ordering::Acquire) {
-        let res = {
-            let _g = POOL_LOCK.lock();
-            // SAFETY: the pool lock is held for the whole batch, and this core is the
-            // only combiner.
-            unsafe {
-                let mine = fc_execute(op, arg);
-                fc_drain_if_pending();
-                mine
-            }
-        };
-        FC_COMBINER.store(false, Ordering::Release);
+fn fc_run<R>(op: u64, arg: u64, decode: impl FnOnce(u64) -> R, mine: impl FnOnce() -> R) -> R {
+    // `try_lock` is the combiner election: holding the lock *is* holding the role.
+    if let Some(_g) = POOL_LOCK.try_lock() {
+        let res = mine();
+        // SAFETY: the pool lock is held, so this core is the combiner.
+        unsafe { fc_drain_if_pending() };
         return res;
     }
-    fc_slow(op, arg)
+    decode(fc_slow(op, arg))
 }
 
 /// Serve the batch, but pay only a relaxed load to discover there is none.
@@ -670,24 +688,20 @@ unsafe fn fc_drain_if_pending() {
 /// The contended half: publish, wait for the combiner, and take the request back and
 /// combine ourselves if nobody picked it up.
 ///
-/// `#[cold]` and out of line, because it runs only when another core already holds the
-/// role - and because leaving it in [`fc_op`] is what made the fast path expensive.
+/// `#[cold]` and out of line, because it runs only when another core is already inside
+/// the structure - and because leaving it in [`fc_run`] is what made the fast path
+/// expensive.
 #[cold]
 #[inline(never)]
 fn fc_slow(op: u64, arg: u64) -> u64 {
     loop {
-        if !FC_COMBINER.swap(true, Ordering::Acquire) {
-            let res = {
-                let _g = POOL_LOCK.lock();
-                // SAFETY: the pool lock is held; this core holds the combiner role.
-                unsafe {
-                    let mine = fc_execute(op, arg);
-                    fc_drain_if_pending();
-                    mine
-                }
-            };
-            FC_COMBINER.store(false, Ordering::Release);
-            return res;
+        if let Some(_g) = POOL_LOCK.try_lock() {
+            // SAFETY: the pool lock is held; this core is the combiner.
+            unsafe {
+                let mine = fc_execute(op, arg);
+                fc_drain_if_pending();
+                return mine;
+            }
         }
         if let Some(res) = fc_publish_and_wait(op, arg) {
             return res;
@@ -748,11 +762,9 @@ fn fc_publish_and_wait(op: u64, arg: u64) -> Option<u64> {
 /// The pool lock must be held. Every `arg` carrying an address reaches here only from
 /// a public wrapper that has already checked [`in_pool`].
 ///
-/// `#[inline(always)]` for [`fc_op`]'s measured reason: the `op` is a constant at every
-/// real call site, so this whole dispatch is compile-time there and the arm that survives
-/// is the one primitive that call wanted. It stays a runtime match inside [`fc_drain`],
-/// which genuinely reads the opcode out of a peer's slot - and that copy is cold.
-#[inline(always)]
+/// Reached only from the **cold** paths now ([`fc_slow`] and [`fc_drain`]), because
+/// [`fc_run`]'s fast path calls the primitive directly through its closure. So this is
+/// the one place the opcode is genuinely a runtime value, which is what it is for.
 unsafe fn fc_execute(op: u64, arg: u64) -> u64 {
     // SAFETY: the pool lock is held; delegated to each primitive's contract.
     unsafe {
@@ -823,10 +835,13 @@ pub fn alloc_on(node: u8) -> Option<usize> {
     if node == NODE_ANY {
         return alloc();
     }
-    let pa = fc_op(OP_ALLOC_ON, u64::from(node)) as usize;
-    if pa == 0 {
-        return None;
-    }
+    let pa = fc_run(
+        OP_ALLOC_ON,
+        u64::from(node),
+        |r| (r != 0).then_some(r as usize),
+        // SAFETY: the pool lock is held by `fc_run`'s fast path.
+        || unsafe { claim_on(node) },
+    )?;
     zero_frames(pa, 1);
     Some(pa)
 }
@@ -864,10 +879,13 @@ pub fn user_available() -> usize {
 /// The bookkeeping goes through the flat-combining batch; the 4 KiB zeroing is done
 /// here, by the requesting core, **after** the claim and outside the lock.
 pub fn alloc() -> Option<usize> {
-    let pa = fc_op(OP_ALLOC, 0) as usize;
-    if pa == 0 {
-        return None;
-    }
+    let pa = fc_run(
+        OP_ALLOC,
+        0,
+        |r| (r != 0).then_some(r as usize),
+        // SAFETY: the pool lock is held by `fc_run`'s fast path.
+        || unsafe { claim_hinted() },
+    )?;
     zero_frames(pa, 1);
     Some(pa)
 }
@@ -1002,7 +1020,13 @@ pub fn share(pa: usize) -> bool {
     if !in_pool(pa) {
         return false;
     }
-    fc_op(OP_SHARE, pa as u64) != 0
+    fc_run(
+        OP_SHARE,
+        pa as u64,
+        |r| r != 0,
+        // SAFETY: the pool lock is held by `fc_run`'s fast path; `pa` is in the pool.
+        || unsafe { add_ref(pa) },
+    )
 }
 
 /// What a **copy-on-write** write fault should do about the frame at `pa`.
@@ -1038,11 +1062,17 @@ pub fn cow_resolve(pa: usize) -> Cow {
     if !in_pool(pa) {
         return Cow::Sole;
     }
-    match fc_op(OP_COW, pa as u64) {
-        COW_SOLE => Cow::Sole,
-        COW_NO_FRAME => Cow::NoFrame,
-        dst => Cow::Private(dst as usize),
-    }
+    fc_run(
+        OP_COW,
+        pa as u64,
+        |r| match r {
+            COW_SOLE => Cow::Sole,
+            COW_NO_FRAME => Cow::NoFrame,
+            dst => Cow::Private(dst as usize),
+        },
+        // SAFETY: the pool lock is held by `fc_run`'s fast path; `pa` is in the pool.
+        || unsafe { cow_claim_typed(pa) },
+    )
 }
 
 /// How many mappings hold `pa`, or 0 if it is free or not ours. The witness a test
@@ -1052,7 +1082,13 @@ pub fn refs(pa: usize) -> u8 {
     if !in_pool(pa) {
         return 0;
     }
-    fc_op(OP_REFS, pa as u64) as u8
+    fc_run(
+        OP_REFS,
+        pa as u64,
+        |r| r as u8,
+        // SAFETY: the pool lock is held by `fc_run`'s fast path; `pa` is in the pool.
+        || unsafe { ref_count(pa) },
+    )
 }
 
 /// Drop one reference to a frame, releasing it to the pool at zero. `pa` must be a
@@ -1063,5 +1099,11 @@ pub fn refs(pa: usize) -> u8 {
 /// releases, exactly as before.
 pub fn free(pa: usize) {
     assert!(in_pool(pa), "frames::free of a non-pool address {pa:#x}");
-    fc_op(OP_FREE, pa as u64);
+    fc_run(
+        OP_FREE,
+        pa as u64,
+        |_| (),
+        // SAFETY: the pool lock is held by `fc_run`'s fast path; `pa` is in the pool.
+        || unsafe { release(pa) },
+    );
 }

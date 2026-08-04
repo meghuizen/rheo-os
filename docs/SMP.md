@@ -1468,18 +1468,35 @@ the *combiner* role, takes the lock once, executes the whole batch while the bit
 stays in its cache, and writes each result back; the others spin on a line nobody
 else writes.
 
-Two things about the shape here rather than in the paper:
+Three things about the shape here rather than in the paper, and the first two are
+what make it nearly free when nobody is contending:
 
-- **The uncontended path does not publish at all.** A core tries the election
-  *first*. Winning it - always, on a single-CPU boot or an idle machine - means
-  taking the lock and doing its own work directly, then draining a pending mask
-  that is normally zero. So the cost added to an uncontended allocation is two
-  atomics and one relaxed load, and there is no separate "SMP path" to diverge
-  from. The `FC_PENDING` bitmask exists for exactly this: a combiner with nothing
-  to do reads one word rather than scanning `MAX_CPUS` cache lines.
+- **The combiner is whoever holds the lock.** The paper gives the role its own flag
+  because a combiner there may hold it across several lock acquisitions; here a
+  batch is one critical section, so a separate flag is a second atomic claim over
+  exclusivity the lock already provides. `SpinLock::try_lock` *is* the election.
+  That deleted a static and two atomics per operation.
+- **The wire form is slow-path only.** A request only has to become `(op, arg)`
+  words if it is going to be published, so `fc_run` takes the operation twice -
+  once as a closure returning its own type, for this core, and once encoded, for a
+  peer's slot. The fast path never encodes or decodes, which is what keeps `alloc`'s
+  `Option<usize>` from round-tripping through a `u64` on the path that never left
+  this core.
 - **The batch does not zero.** Each requesting core zeroes its own frame after its
   request completes. A combiner zeroing on behalf of the batch would re-serialise
   precisely what change 1 unserialised.
+
+So the cost added to an uncontended operation is **one relaxed load** - the
+`FC_PENDING` bitmask, which exists precisely so that a combiner with nothing to do
+reads one word rather than scanning `MAX_CPUS` cache lines - on top of the lock the
+pre-combining code already took. There is no separate "SMP path" to diverge from,
+which is the mistake docs/SUBSTRATE.md pillar 3 records as the cause of the
+`SYS_YIELD` FP defect.
+
+One consequence is stated because it is a real if rare liveness cost: the lock's
+*other* holders - the diagnostics, the boot paths - do not drain, so a request
+published against one of those waits out its spin bound and is withdrawn rather
+than served. It is counted, and the retry then takes the lock itself.
 
 Executed **exactly once** is the invariant, and it is enforced by a claim rather
 than argued: a publisher may withdraw its request only by moving its slot from its
@@ -1524,44 +1541,59 @@ paths, so five benches were added (`frame_alloc_free`, `frame_alloc_on_free`,
 `frame_contig1_free`, `frame_share_free`, `frame_cow_resolve_sole`), icount
 instructions per operation, against the pre-change tree:
 
-| bench | x86-64 before -> after | riscv64 before -> after |
+Three columns, because the number moved twice and the reason each time is the
+lesson. **A** is the pre-change tree. **B** is flat combining written as one
+function. **C** is the shipped form: an `#[inline(always)]` leaf fast path,
+`try_lock` as the election, and the wire encoding confined to the slow path.
+
+| bench | x86-64 A -> B -> C | riscv64 A -> B -> C |
 |---|---|---|
-| `frame_alloc_free` | 652 -> 670 | 1728 -> 1756 |
-| `frame_alloc_on_free` | 689 -> 693 | 1778 -> 1776 |
-| `frame_contig1_free` | 883 -> 894 | 2009 -> 2026 |
-| `frame_share_free` (2 ops) | 94 -> 118 | 123 -> 156 |
-| `frame_cow_resolve_sole` | 40 -> 58 | 57 -> 85 |
+| `frame_alloc_free` | 652 -> 731 -> **656** | 1728 -> 1756 -> **1743** |
+| `frame_alloc_on_free` | 689 -> 739 -> **679** | 1778 -> 1776 -> **1755** |
+| `frame_contig1_free` | 883 -> 920 -> **886** | 2009 -> 2026 -> **2020** |
+| `frame_share_free` (2 ops) | 94 -> 173 -> **100** | 123 -> 156 -> **138** |
+| `frame_cow_resolve_sole` | 40 -> 85 -> **46** | 57 -> 85 -> **66** |
 
-`frame_contig1_free` is the clean one: `alloc_contig` did not change layer, so its
-delta is `free` alone going through the batch - **+11 instructions on x86-64, +17
-on riscv64** (RISC-V has no byte-wide atomic exchange, so an `AtomicBool` swap is
-more instructions there). `frame_share_free` is two such operations and agrees.
+`frame_contig1_free` is the clean isolation: `alloc_contig` did not change layer,
+so its delta is `free` alone going through the batch - **+3 instructions on x86-64,
++11 on riscv64**. `frame_share_free` is two such operations and agrees.
 
-**Read against `frame_alloc_free` that is +2.8% and +1.6%**, because the 4 KiB
+**And `frame_alloc_on_free` is now faster than before any of this** - 10
+instructions on x86-64, 23 on riscv64 - because change 2 collapsed three lock
+acquisitions into one, and only once the combining layer got down to ~3 did that
+win stop being buried by it.
+
+**Read against `frame_alloc_free`, the layer is +0.6% and +0.9%**, because the 4 KiB
 `memset` dominates the operation - which is the same fact as change 1: the thing
 the combining layer is measured against is precisely what used to be inside the
 lock.
 
-**And the honest reading of it: on a single-core boot flat combining is a net loss
-in instructions.** It buys nothing there and costs ~11-17. Two things icount
-cannot price cut the other way and both are lab claims, stated rather than
-assumed: an atomic RMW counts as one instruction here and costs far more than one
-on real silicon, so the true single-core cost is *worse* than the table shows; and
-the cache-line handoffs the technique removes are invisible to an emulator with no
-cache model, so the true contended saving is *better* than zero by an amount only
-hardware can report. What is defensible from this container is the shape - the fast
-path is a leaf with one extra `xchg`, one relaxed load and one store - not a
-speedup.
+**The honest reading: on a single-core boot the combining layer is still a small
+net loss** - ~3 instructions on x86-64, ~11 on riscv64 - since it buys nothing
+where there is nobody to batch with. What changed is that it is now small enough to
+be dominated by change 2's win on the NUMA path and invisible against the `memset`
+on the others, rather than being a real tax.
 
-**The first version cost ~40 instructions per operation, and `objdump` said why**
-rather than reasoning about it. One function held the election, the batch, the
-publication and the spin loop, so LLVM allocated seven callee-saved registers for
-the cold half and pushed and popped all seven on every fast-path call, and the
-`call fc_execute` beside them kept `op` a runtime value so the six-way dispatch ran
-too. Splitting it into an `#[inline(always)]` leaf fast path with `fc_slow` and
-`fc_drain` both `#[cold]` and out of line took it to 11. Recorded in
-docs/ENGINEERING.md 11: a hot path's cost can be dominated by the *cold* code
-sharing its stack frame.
+Two things icount cannot price, both stated as lab claims rather than assumed: an
+atomic RMW counts as one instruction here and costs far more on real silicon (the
+shipped form's advantage is larger than the table shows, since it removed two of
+them per operation); and the cache-line handoffs the technique removes are invisible
+to an emulator with no cache model, so the contended saving is better than zero by
+an amount only hardware can report. What is defensible from this container is the
+shape - a leaf fast path adding one relaxed load to a lock that was already taken -
+not a wall-clock speedup.
+
+**Column B cost ~40 instructions per operation, and `objdump` said why** rather
+than reasoning about it. One function held the election, the batch, the publication
+and the spin loop, so LLVM allocated seven callee-saved registers for the cold half
+and pushed and popped all seven on every fast-path call, and the `call fc_execute`
+beside them kept `op` a runtime value so the six-way dispatch ran too. Splitting it
+into an `#[inline(always)]` leaf with `fc_slow` and `fc_drain` both `#[cold]` took
+it to ~11; folding the election into `try_lock` and confining the wire encoding to
+the slow path took it to ~3. Recorded in docs/ENGINEERING.md 11: a hot path's cost
+can be dominated by the *cold* code sharing its stack frame - and the second half
+of that story is that once the frame was cheap, two atomics and a `u64` round trip
+were suddenly the whole remaining cost, which is only visible once you are counting.
 
 **Controls, both observed firing.** Deleting the zeroing makes the frame-zeroing
 check report `4096 nonzero byte(s)`; making the combiner execute each request

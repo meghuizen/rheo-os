@@ -2580,13 +2580,21 @@ Tzafrir, SPAA 2010): with the `memset` gone the lock is held for a few words, wh
 exactly the regime where N cores each taking a short lock pay N cache-line handoffs for
 trivial work - so a core publishes to its own 64-byte-aligned slot, one core wins the
 *combiner* role, takes the lock once, executes the whole batch with the bitmap in its
-cache, and writes each result back. Two shape decisions matter: **the uncontended path
-does not publish at all** (a core tries the election first, and winning it - always, on a
-single-CPU boot - means doing its own work directly and then draining a pending mask that
-is normally zero, so the added cost is two atomics and one relaxed load and there is no
-separate "SMP path" to diverge from), and **the batch does not zero** (each core zeroes
-its own frame afterwards; a combiner zeroing for the batch would re-serialise exactly what
-change 1 unserialised). Executed **exactly once** is enforced by a claim rather than
+cache, and writes each result back. Three shape decisions matter, and the first two are
+what make it nearly free uncontended: **the combiner is whoever holds the lock** (the
+paper gives the role its own flag because a combiner there spans several acquisitions;
+here a batch is one critical section, so `SpinLock::try_lock` *is* the election - which
+deleted a static and two atomics per operation), **the wire form is slow-path only** (a
+request becomes `(op, arg)` words only if it is going to be published, so `fc_run` takes
+the operation twice - a closure returning its own type for this core, and the encoded form
+for a peer's slot - and `alloc`'s `Option<usize>` never round-trips through a `u64` on the
+path that never left this core), and **the batch does not zero** (each core zeroes its own
+frame afterwards; a combiner zeroing for the batch would re-serialise exactly what change
+1 unserialised). So the added cost uncontended is **one relaxed load** on top of the lock
+the pre-combining code already took, and there is no separate "SMP path" to diverge from.
+One honest liveness note: the lock's *other* holders (diagnostics, boot paths) do not
+drain, so a request published against one of those waits out its spin bound and is
+withdrawn rather than served - counted, and the retry then takes the lock itself. Executed **exactly once** is enforced by a claim rather than
 argued - a publisher may withdraw only by moving its slot from its own opcode straight to
 idle, which fails once a combiner has moved it to *busy* - and the withdrawal, which
 exists because a publication can land just after the combiner sampled the mask, is
@@ -2607,24 +2615,30 @@ request could run twice. That number is
 **reported, never asserted** (zero is a legal schedule, and TCG interleaves coarsely) and
 it stays modest *by design*, which is the point: change 1 left very little window for a
 second core to arrive in, so shortening the window removed most of the contention and
-combining handles what is left. **The cost is measured, and the reading is honest**: the
-bench suite touched none of these paths, so five benches were added, and against the
-pre-change tree the layer costs **+11 instructions per operation on x86-64 and +17 on
-riscv64** (isolated by `frame_contig1_free`, whose `alloc_contig` half did not change
-layer) - +2.8% and +1.6% of a full `alloc`+`free`, because the 4 KiB `memset` dominates,
-which is the same fact as change 1. So **on a single-core boot flat combining is a net
-loss in instructions**: it buys nothing there and costs 11-17. Two things icount cannot
-price cut the other way and are named as lab claims rather than assumed - an atomic RMW
-counts as one instruction here and costs far more on real silicon, so the true
-single-core cost is *worse*; and the cache-line handoffs the technique removes are
-invisible to an emulator with no cache model, so the true contended saving is *better*
-than zero by an amount only hardware can report. **The first version cost ~40
-instructions and `objdump` said why**: one function held the election, the batch, the
-publication and the spin loop, so LLVM allocated seven callee-saved registers for the
-cold half and pushed and popped all seven on every fast-path call, with an un-inlined
-dispatch beside them - split into an `#[inline(always)]` leaf plus `#[cold]` remainder it
-is 11, with no logic changed (docs/ENGINEERING.md 11: a hot path's cost can be dominated
-by the cold code sharing its stack frame). Two controls observed firing (the zeroing
+combining handles what is left. **The cost is measured, and it moved twice**: the bench
+suite touched none of these paths, so five benches were added, and the number went
+652 -> 731 -> **656** instructions for `alloc`+`free` on x86-64 (1728 -> 1756 -> **1743**
+on riscv64). Written as one function, flat combining cost **~40 instructions per
+operation** and `objdump` said why: that function held the election, the batch, the
+publication and the spin loop, so LLVM allocated seven callee-saved registers for the cold
+half and pushed and popped all seven on every fast-path call, with an un-inlined dispatch
+beside them keeping the opcode a runtime value. Split into an `#[inline(always)]` leaf plus
+a `#[cold]` remainder it was ~11; folding the election into `try_lock` and confining the
+wire encoding to the slow path took it to **+3 on x86-64 and +11 on riscv64** (isolated by
+`frame_contig1_free`, whose `alloc_contig` half never changed layer). **And
+`frame_alloc_on_free` is now faster than before any of this** - 10 instructions on x86-64,
+23 on riscv64 - because change 2 collapsed three acquisitions into one, and only once the
+combining layer got down to ~3 did that win stop being buried by it. Honest: uncontended
+the layer is still a small net loss, since it buys nothing where there is nobody to batch
+with; it is now dominated by change 2's win on the NUMA path and invisible against the
+`memset` elsewhere (+0.6% of a full `alloc`+`free`). Two things icount cannot price are
+named as lab claims rather than assumed - an atomic RMW counts as one instruction here and
+costs far more on real silicon (so removing two per operation is worth more than the table
+shows), and the cache-line handoffs the technique removes are invisible to an emulator with
+no cache model (so the contended saving is better than zero by an amount only hardware can
+report). Recorded in docs/ENGINEERING.md 11: a hot path's cost can be dominated by the
+cold code sharing its stack frame - and once the frame was cheap, two atomics and a `u64`
+round trip were the whole remaining cost, which is only visible once you are counting. Two controls observed firing (the zeroing
 deleted -> `4096 nonzero byte(s)`; the combiner running each request twice -> `double
 free of <pa>`).
 **And the first version of the zeroing oracle passed with the fix deleted** - the
