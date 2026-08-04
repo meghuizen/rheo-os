@@ -251,12 +251,13 @@ fn gpu_device_args(arch: Arch) -> Vec<String> {
     // (model name passed to -device, the base name `-device help` lists it under)
     let mut models: Vec<(&str, &str)> = vec![
         ("virtio-gpu-pci,bus=rp1,disable-legacy=on", "virtio-gpu-pci"),
-        ("ati-vga", "ati-vga"),
         ("bochs-display", "bochs-display"),
         ("cirrus-vga", "cirrus-vga"),
     ];
     if arch == Arch::X86_64 {
-        // VMware SVGA and Red Hat/QXL are x86-only in QEMU.
+        // AMD (ati-vga), VMware SVGA and Red Hat/QXL are x86-only in QEMU.
+        // ati-vga requires vgabios-ati.bin ROM file, only available in x86-64 environments.
+        models.push(("ati-vga", "ati-vga"));
         models.push(("vmware-svga", "vmware-svga"));
         models.push(("qxl", "qxl"));
     }
