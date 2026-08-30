@@ -232,10 +232,16 @@ captured to a log artifact. Absolute performance numbers (P1-P12) only gate on
 the hardware lab; QEMU runs track correctness and trend microbenchmarks.
 
 **On every branch, not only `main`.** Pushes used to build only on the default
-branch, so a feature branch with no open pull request got no CI at all - which is
-how `gpuhw` sat red on two ISAs across three commits. A `concurrency` group keyed
-on the branch keeps a push and its pull-request event from starting the same
-3-ISA matrix twice, and cancels superseded runs everywhere except `main`.
+branch, so a branch was covered only while it had an open pull request; work
+pushed before one exists, or after one is closed, built nowhere. A `concurrency`
+group keyed on the branch keeps a push and its pull-request event from starting
+the same 3-ISA matrix twice, and cancels superseded runs everywhere except `main`.
+
+Worth stating plainly, since the obvious motivating story is wrong: when `gpuhw`
+went red on aarch64 and riscv64, CI **did** run and **did** report it (run #28, a
+pull-request event), and three more commits landed on top. The trigger was not the
+gap - acting on the result was. Broader triggers help with a different problem.
+
 
 A **lint job** runs first and gates on four things:
 

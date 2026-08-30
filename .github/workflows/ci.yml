@@ -8,11 +8,17 @@
 name: CI
 
 on:
-  # **Every branch, not just `main`.** Restricting pushes to `main` meant a branch
-  # with no open pull request got no CI at all, and that is not hypothetical: the
-  # `gpuhw` boot test sat red on aarch64 and riscv64 across three commits on a
-  # feature branch because nothing ever ran it. A boot regression is exactly what
-  # this pipeline exists to catch, so it has to run where the work happens.
+  # **Every branch, not just `main`.** With `push` restricted to `main`, a branch is
+  # covered only for as long as it has an open pull request - work pushed before one
+  # is opened, or after one is closed, builds nowhere. Building on every push closes
+  # that window.
+  #
+  # Stated precisely, because the tempting version of this justification is false:
+  # the `gpuhw` regression on this branch was NOT missed for want of a trigger. Run
+  # #28 (a `pull_request` event, 2026-08-04) reported it red on both aarch64 and
+  # riscv64 with `gpuhw.rs:51 ati-vga 0x1002 not recognised`, and three further
+  # commits landed anyway. CI caught it; nobody acted on it. More triggers do not fix
+  # that - only reading the result does.
   push:
   pull_request:
   # Runnable on demand against any branch: without it the only way to exercise this
