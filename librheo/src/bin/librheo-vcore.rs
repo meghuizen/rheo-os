@@ -65,10 +65,13 @@ extern "C" fn main() -> i32 {
 /// "every strand ran on the other vcore" a fact about this run rather than a
 /// likely outcome.
 fn vcore0() -> i32 {
-    for i in 0..WORK {
+    // Each strand captures its own counter rather than an index: `RAN` is a
+    // `static`, so `iter()` yields `&'static AtomicUsize`, which is exactly what a
+    // `Send + 'static` future needs and what lets the index go away.
+    for slot in RAN.iter() {
         librheo::rt::spawn_shared(async move {
             librheo::rt::yield_now().await;
-            RAN[i].fetch_add(1, Ordering::AcqRel);
+            slot.fetch_add(1, Ordering::AcqRel);
             DONE.fetch_add(1, Ordering::AcqRel);
         });
     }

@@ -159,12 +159,12 @@ extern "C" fn main() -> i32 {
     let mut qm = vec![0f32; nq];
     let mut km = vec![0f32; nk];
     let mut vm = vec![0f32; nk];
-    for i in 0..nq {
-        qm[i] = (i % 7) as f32 * 0.125 - 0.5;
+    for (i, x) in qm.iter_mut().enumerate() {
+        *x = (i % 7) as f32 * 0.125 - 0.5;
     }
-    for i in 0..nk {
-        km[i] = (i % 5) as f32 * 0.25 - 0.5;
-        vm[i] = (i % 3) as f32 * 0.5;
+    for (i, (kx, vx)) in km.iter_mut().zip(vm.iter_mut()).enumerate() {
+        *kx = (i % 5) as f32 * 0.25 - 0.5;
+        *vx = (i % 3) as f32 * 0.5;
     }
     let mut om = vec![0f32; nq];
     let mut sbuf = vec![0f32; shape.tk];

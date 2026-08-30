@@ -8,13 +8,36 @@
 name: CI
 
 on:
+  # **Every branch, not just `main`.** Restricting pushes to `main` meant a branch
+  # with no open pull request got no CI at all, and that is not hypothetical: the
+  # `gpuhw` boot test sat red on aarch64 and riscv64 across three commits on a
+  # feature branch because nothing ever ran it. A boot regression is exactly what
+  # this pipeline exists to catch, so it has to run where the work happens.
   push:
-    branches: [main]
   pull_request:
   # Runnable on demand against any branch: without it the only way to exercise this
-  # workflow is a push to `main` or an open pull request, so a fix to the workflow
-  # itself cannot be tried before it is merged.
+  # workflow is a push or an open pull request, so a fix to the workflow itself
+  # cannot be tried before it is merged.
   workflow_dispatch:
+
+# One run per branch. Now that pushes to every branch build, a branch with an open
+# pull request receives both a `push` and a `pull_request` event for the same commit,
+# which without this would start two identical runs of a 3-ISA boot matrix. The group
+# key normalises the two event shapes to the same branch name - `head.ref` is `foo` on
+# a pull_request, `ref_name` is `foo` on a push - so they collapse into one.
+#
+# Cancelling the older run is right for a feature branch, where only the tip matters,
+# and wrong for `main`, where every commit that lands deserves a full run of its own
+# rather than being superseded by the next merge - hence the condition rather than a
+# bare `true`.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
+
+# Least privilege: nothing here writes to the repository, and the default token
+# permissions are broader than that.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,6 +47,10 @@ jobs:
   lint:
     name: Format and lint
     runs-on: ubuntu-latest
+    # A hung build otherwise runs to GitHub's 6-hour default. This job builds
+    # userspace for three ISAs and clippies the whole workspace; ~25 min is the
+    # observed shape, so 60 is headroom rather than a target.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -64,13 +91,53 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: lint-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          # The key carries the commit so every run SAVES an updated cache;
+          # `restore-keys` then falls back to the newest cache for the same
+          # toolchain+lockfile. With a key that changes only when `Cargo.lock`
+          # does - the previous form - the cache is written once and never
+          # refreshed, so it goes stale and each run rebuilds more of a tree this
+          # size than it needs to.
+          key: lint-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            lint-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+            lint-${{ runner.os }}-
 
       - name: rustfmt
         run: cargo fmt --all --check
 
-      - name: clippy (xtask, host)
-        run: cargo clippy -p xtask -- -D warnings
+      # Every workspace crate that builds for the host. `xtask` was the only one
+      # linted before, leaving `rheo-abi`, `rheo-json`, `posix`, `ext4fs` and
+      # `runtime` with no coverage at all - and `runtime` is the crate whose
+      # allocator every cell and test kernel binds.
+      - name: clippy (host crates)
+        run: |
+          cargo clippy -p xtask -p rheo-abi -p rheo-json -p posix -p ext4fs -p runtime \
+            --all-targets -- -D warnings
+
+      # docs/SUBSTRATE.md 11 says Tier K - the kernel, the ABI, posix and xtask -
+      # stays zero-dependency *permanently*. That rule was written down, referenced
+      # in xtask's own source, and enforced by nothing: adding a crates.io
+      # dependency to the kernel would have been an ordinary green build. It is
+      # mechanical now.
+      #
+      # `cargo tree --prefix none` prints in-tree crates with a ` (/path)` suffix and
+      # registry crates without one, so anything left after dropping path-suffixed
+      # lines is an external dependency. Verified against a positive control:
+      # `ext4fs`, which legitimately has 18, is detected.
+      - name: Tier K stays zero-dependency (docs/SUBSTRATE.md 11)
+        run: |
+          fail=0
+          for p in kernel rheo-abi posix xtask; do
+            ext=$(cargo tree -p "$p" --edges normal --prefix none \
+                  | tail -n +2 | sed 's/ (\*)$//' | grep -v '^[[:space:]]*$' \
+                  | grep -v ' (/' | sort -u || true)
+            if [ -n "$ext" ]; then
+              echo "::error::$p is Tier K and must have no external dependencies, but has:"
+              echo "$ext"
+              fail=1
+            fi
+          done
+          exit $fail
 
       # Host model-checking of the kernel state machines that are integer-only and
       # dependency-free (verify/README.md, docs/EXECUTION-MODEL.md 8). Seconds, no
@@ -98,9 +165,52 @@ jobs:
             cargo clippy -p kernel -p qemu-tests --features smp --target "$target" $BUILD_STD_FLAGS -- -D warnings
           done
 
+      # The userspace half, which had no lint coverage either: `librheo`,
+      # `rheo-libc`, `userland` and `rheo-net` are 4 of the 12 workspace crates and
+      # they are what a cell actually runs. Linted on the **cell** target, because
+      # that is what they ship as - librheo builds hard-float there and the bare
+      # kernel target is soft-float, so the two are separate compilations with
+      # different `target_feature` cfgs (docs/LIBRHEO.md "ifunc" has the case where
+      # that difference is a compiler crash rather than a diagnostic).
+      #
+      # Two second postures are included for the same reason the kernel's `smp` one
+      # is - a feature flag is a separate compilation, and an unlinted one is an
+      # unlinted crate:
+      #   - `librheo --no-default-features` is the embedded spine, and only
+      #     `librheo-embed` is meant to link without `full`, so the bin is named.
+      #   - `rheo-net --no-default-features` is the librheo-free **codec** posture
+      #     that links beside a kernel binary for the N4b bridge, so it is linted on
+      #     the kernel target rather than the cell one.
+      #
+      # `rheo-net`'s demo bins are deliberately `--lib` only: their feature sets
+      # (`proof`, `smoltcp`, `crypto` plus soft-backend RUSTFLAGS) live in xtask, and
+      # duplicating that matrix here would be a second copy to keep in step. The
+      # library is where the code is.
+      - name: clippy (cell crates, all ISAs, extra feature postures)
+        run: |
+          set -e
+          for pair in \
+            "targets/rheo_cell-x86_64.json x86_64-unknown-none" \
+            "aarch64-unknown-none aarch64-unknown-none-softfloat" \
+            "riscv64gc-unknown-none-elf riscv64gc-unknown-none-elf"; do
+            set -- $pair; cell=$1; kern=$2
+            cargo clippy -p librheo -p rheo-libc -p userland \
+              --release --target "$cell" $BUILD_STD_FLAGS -Zjson-target-spec -- -D warnings
+            cargo clippy -p rheo-net --lib \
+              --release --target "$cell" $BUILD_STD_FLAGS -Zjson-target-spec -- -D warnings
+            cargo clippy -p librheo --no-default-features --bin librheo-embed \
+              --release --target "$cell" $BUILD_STD_FLAGS -Zjson-target-spec -- -D warnings
+            cargo clippy -p rheo-net --lib --no-default-features \
+              --release --target "$kern" $BUILD_STD_FLAGS -Zjson-target-spec -- -D warnings
+          done
+
   boot-test:
     name: Boot test (${{ matrix.arch }})
     runs-on: ubuntu-latest
+    # 71 test kernels, each with its own 120 s in-QEMU timeout, plus the fixture
+    # builds and the bench pass. Generous, but bounded - the point is that a wedged
+    # QEMU fails the job instead of occupying a runner for six hours.
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
@@ -158,7 +268,12 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: boot-${{ matrix.arch }}-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          # See the lint job's note: the commit in the key is what makes the cache
+          # refresh instead of being written once and left to rot.
+          key: boot-${{ matrix.arch }}-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            boot-${{ matrix.arch }}-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}-
+            boot-${{ matrix.arch }}-${{ runner.os }}-
 
       - name: Build and boot test kernels in QEMU
         run: cargo xtask test --arch ${{ matrix.arch }}

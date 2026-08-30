@@ -40,14 +40,21 @@
 //! wrong coefficient fails it.
 
 /// `log2(e)`, for folding an `exp` into [`exp2f`].
-pub const LOG2_E: f32 = 1.442_695_04;
+///
+/// `core`'s own constant, not a literal: it is bit-identical here (`0x3fb8aa3b`,
+/// checked) and saying which constant this is beats spelling out digits a reader
+/// has to recognise.
+pub const LOG2_E: f32 = core::f32::consts::LOG2_E;
 
 // Taylor coefficients of `2^r = e^(r ln2) = sum (r ln2)^k / k!`, k = 1..6.
-// Written as decimal literals rather than computed from `ln2`, because `const`
-// evaluation of a power series would be the same numbers by a route a reader has to
-// re-derive - and these are the numbers the accuracy claim above is about.
-pub const C1: f32 = 0.693_147_18; // ln2
-pub const C2: f32 = 0.240_226_51; // ln2^2 / 2
+//
+// `C1` is `ln2` itself, so it is named as `core`'s constant. `C2..C6` stay decimal
+// literals rather than being computed from it: `const` evaluation of a power series
+// would produce the same numbers by a route a reader has to re-derive, and these are
+// the numbers the accuracy claim above is about. Every one is the shortest literal
+// that round-trips to its `f32`, so the value is exactly what is written.
+pub const C1: f32 = core::f32::consts::LN_2; // ln2 (bit-identical to 0x3f317218)
+pub const C2: f32 = 0.240_226_5; // ln2^2 / 2
 pub const C3: f32 = 0.055_504_11; // ln2^3 / 6
 pub const C4: f32 = 0.009_618_129; // ln2^4 / 24
 pub const C5: f32 = 0.001_333_356; // ln2^5 / 120
