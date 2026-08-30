@@ -1245,6 +1245,77 @@ attach, set-scanout, transfer, flush). No claim of visible output; the 2D scanou
 command round-trip + compositor present wiring is the deliverable. **librheo A-H
 is complete.**
 
+**A cell resolves its CPU dispatch at process start, the glibc way** (docs/LIBRHEO.md
+"ifunc", `librheo/src/ifunc.rs`): runtime dispatch here was a branch on a global -
+free where the dispatched thing is a whole GEMM block, not free where it is a leaf
+evaluated per element. A symbol declared `STT_GNU_IFUNC` and aliased to a *resolver*
+makes the linker route every call through one GOT slot and emit an `R_*_IRELATIVE`
+relocation; `ifunc::apply_irel()` walks `__rela_iplt_start..__rela_iplt_end` first
+thing in the crt0, which is glibc's own static path (`ARCH_SETUP_IREL`) and needs
+**no kernel object, no verb and no loader change** - the kernel still performs no
+relocation processing, the relocations sit in a `PT_LOAD` it already maps, and the
+cell applies them to itself. `%gnu_indirect_function` assembles on all three cell
+targets, so the declaration carries **no `cfg`**. Three defects on the way, each
+found by an experiment rather than reasoning: the bracket symbols **cannot be
+referenced directly** (with no ifunc in an image LLD defines them as *absolute
+zero*, and a PC-relative reference to address 0 is `relocation
+R_RISCV_PCREL_HI20 out of range` - so the bounds are read through a `.quad` pair);
+**`.rela.dyn` is synthetic**, so naming `*(.rela.dyn)` inside `.rodata` matches
+nothing and it stayed an orphan, landing mid-page and starting the read-only
+segment **inside** the executable one - breaking the W^X page granularity
+`userland/link/*.ld` promises in its own header, and presenting as a fault with no
+output; and a **float** vector tier cannot be gated on `target_arch`, because
+librheo also compiles for the soft-float `x86_64-unknown-none` where `__m256` is
+`rustc-LLVM ERROR: Do not know how to split the result of this operator!` (a
+compiler crash - `tile::simd` escapes only because its tiers are `__m256i`). The
+resolver runs before the heap, so it may not allocate or call any dispatched symbol
+(the `Elf64_Rela` walk reads three words individually because a 24-byte struct copy
+may lower to `memcpy`, which is exactly what it is resolving); beyond glibc's
+feature check it must **observe the tier being right**, selecting AVX2 only after
+bit-identical output to scalar on fixed stack buffers. First consumer:
+`tile::fsimd::exp2f_into`, a bulk `2^x` with a scalar and an AVX2 tier,
+**bit-identical** per element to `tile::fmath::exp2f` - a constraint, not a bonus,
+since the FlashAttention oracles compare tilings against each other, and it costs
+the FMA (Rust does not contract, so neither may the vector tier) and an explicit
+NaN path (`f32 as i32` saturates while `vcvttps2dq` yields `i32::MIN`, which would
+take the underflow branch and return 0.0). It lives beside `fmath.rs` rather than in
+it because that file is `#[path]`-included **verbatim** by the kernel engine,
+`bench-core` and `tilelinux`. **It IS wired into `attn.rs`**, which is shared
+verbatim too: `fmath` carries an installable hook (a `static` fn pointer defaulting
+to the scalar loop), the verbatim includers set nothing and get scalar, and a
+librheo cell installs the ifunc-resolved kernel from its crt0 - one relaxed load and
+an indirect call **per K-block**, not per element, which is why the bulk form exists.
+The three exponential loops became "scale in place, then one bulk call", `expf(x)`
+being `exp2f(x * LOG2_E)`, so the arithmetic and its order are untouched. **The
+bit-exactness that makes this safe also makes it invisible** - every oracle,
+including `smp`'s cross-substrate hash where a librheo cell and the `tilelinux`
+Linux binary must agree, passes identically with the kernel installed or not - so
+the observable is a counter: `librheotile` runs one real attention and asserts it
+was reached **20 times** (4 query rows x 5 K-blocks, hand-computed), 0 with
+`install` suppressed. Proven by `librheotile` on **all three ISAs**: the
+image carries IRELATIVE relocations (`pending() > 0`, which is what catches
+`--gc-sections` deleting a dispatched function nothing calls - the state the first
+attempt was in), the crt0 applied **all** of them, and the resolved kernel matches
+scalar bit-for-bit over 1027 elements, deliberately not a multiple of 8 so the
+vector body and the scalar tail both run; x86-64 resolves to `avx2`, arm/riscv to
+`scalar`. Two controls observed firing (suppressing `apply_irel` gives `ifunc 0/1
+relocations applied`; corrupting one Horner coefficient makes the gate reject AVX2
+and fall back to scalar). Honest: one dispatched symbol today, and **`mem*` is
+rejected with numbers** - `bench-core`'s new `p7_*` benches measure
+`compiler_builtins`' `memcpy` against a hand-written 32-byte word copy at two sizes
+in a 4:1 ratio (so an elided copy shows up as one that does not scale), and the
+hand-written one **loses on both ISAs**: 0.031 vs 0.199 instructions/byte on aarch64
+(**6.4x**) and 0.132 vs 0.335 on x86-64 (**2.5x**). The ARM64 half **inverted the
+hypothesis that prompted the benchmark** - it was named as the case that might pay,
+and the reason its `memcpy` has a byte prologue and an 8-byte loop is that both ARM64
+targets carry `+strict-align`, so `read_unaligned::<u64>` is byte loads and shifts
+rather than an `ldr x`; `compiler_builtins` is structured *for* that constraint, and
+copying wider only pays if it aligns first too. Named rather than implied: icount is a
+path length and `memcpy` on hardware is memory-bound, so any future win is a lab
+number, and a global `memcpy` ifunc carries an ordering hazard this one does not (the
+crt0 and every resolver would need auditing for implicit copies). AVX-512 is absent rather than written and unproven, since QEMU's
+TCG exposes AVX2 but not AVX-512 and the resolver's own gate could not run on it.
+
 **rheo-net N2d** (docs/NETSTACK.md 16) makes the network **receive** side as async
 as the send side - the OS's **third interrupt source**. Before it,
 `librheo::net::recv` was a re-poll (`OP_NET_RX` returned "nothing available" and the

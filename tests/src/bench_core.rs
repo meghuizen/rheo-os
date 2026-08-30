@@ -526,6 +526,13 @@ extern "C" fn kernel_main() -> ! {
     // `bench()` loop under icount. Each reports per-op instruction length.
     bench_p5();
 
+    // ---------------------------------------------------------------- P7
+    // `memcpy` path length. Measured because the ifunc work (docs/LIBRHEO.md
+    // "ifunc") rejected a hand-written SIMD `memcpy` on the strength of what
+    // `compiler_builtins` already emits, and that rejection should rest on a
+    // number rather than on a reading of its source.
+    bench_p7();
+
     println!("bench-core: DONE");
     arch::exit(arch::ExitCode::Success)
 }
@@ -790,6 +797,121 @@ fn run_crosscell() -> (u64, u64) {
 
         let p = &(*s0).params;
         (p.ticks, p.ops)
+    }
+}
+
+/// 4 KiB source/destination for the `memcpy` benches, off the boot stack.
+static mut MC_SRC: [u8; 4096] = [0; 4096];
+static mut MC_DST: [u8; 4096] = [0; 4096];
+
+/// 32 bytes per iteration through 64-bit word pairs - the shape a hand-written
+/// `memcpy` replacement would take, measured against the one already shipped.
+///
+/// Deliberately **no vector ISA**, so it compiles on the soft-float kernel target
+/// and the comparison is against something that could actually ship.
+///
+/// It **loses, by 6.4x**, and the reason is worth recording: both ARM64 targets
+/// in this tree carry `+strict-align`, so `read_unaligned::<u64>` does not become
+/// an `ldr x` - it becomes byte loads and shifts. `compiler_builtins`' `memcpy`
+/// is structured for exactly that constraint: a byte prologue that reaches
+/// alignment, then *aligned* 8-byte accesses. Copying wider only pays if it
+/// aligns first too, which is a much narrower change than "use bigger loads"
+/// (docs/LIBRHEO.md "ifunc").
+///
+/// # Safety
+/// `dst`/`src` are valid for `n` bytes and do not overlap.
+unsafe fn copy_wide(mut dst: *mut u8, mut src: *const u8, mut n: usize) {
+    unsafe {
+        while n >= 32 {
+            let a = (src as *const u64).read_unaligned();
+            let b = (src.add(8) as *const u64).read_unaligned();
+            let c = (src.add(16) as *const u64).read_unaligned();
+            let d = (src.add(24) as *const u64).read_unaligned();
+            (dst as *mut u64).write_unaligned(a);
+            (dst.add(8) as *mut u64).write_unaligned(b);
+            (dst.add(16) as *mut u64).write_unaligned(c);
+            (dst.add(24) as *mut u64).write_unaligned(d);
+            src = src.add(32);
+            dst = dst.add(32);
+            n -= 32;
+        }
+        while n >= 8 {
+            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+            src = src.add(8);
+            dst = dst.add(8);
+            n -= 8;
+        }
+        while n > 0 {
+            dst.write(src.read());
+            src = src.add(1);
+            dst = dst.add(1);
+            n -= 1;
+        }
+    }
+}
+
+/// `memcpy` path lengths: what `compiler_builtins` ships against a wide
+/// word-pair copy, aligned and deliberately misaligned by one byte (the case
+/// whose byte-at-a-time prologue is the ARM64 headroom).
+fn bench_p7() {
+    // SAFETY: single-threaded bench kernel; the statics are used only here.
+    unsafe {
+        for (i, b) in (*core::ptr::addr_of_mut!(MC_SRC)).iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let src = core::ptr::addr_of!(MC_SRC) as *const u8;
+        let dst = core::ptr::addr_of_mut!(MC_DST) as *mut u8;
+        // `black_box` on the POINTER is not enough: it hides the address, not the
+        // memory, so a constant-size `copy_nonoverlapping` into a buffer nothing
+        // reads is dead code and LLVM deletes it - which the first version of this
+        // bench did, reporting ~130 ticks for a 4 KiB copy (0.03 instructions per
+        // byte, impossible). Both pointers are laundered so the size cannot be
+        // constant-folded, and one byte is read back **volatile** so the store
+        // cannot be elided (docs/ENGINEERING.md 11).
+        // Sizes in a 4:1 ratio with everything else held constant. A real copy
+        // scales with n; an elided one does not - which is how the first version
+        // of this bench was caught reporting 130 ticks for 4 KiB (31 bytes per
+        // instruction, impossible). `ops` is the BYTES the batch moves, so the
+        // reported per-op figure is milli-instructions per byte.
+        for (name, len) in [("p7_memcpy_1kib", 1024usize), ("p7_memcpy_4kib", 4096)] {
+            measure(name, (len * 64) as u64, 64, || {
+                let (a, b) = (core::hint::black_box(src), core::hint::black_box(dst));
+                let n = core::hint::black_box(len);
+                core::ptr::copy_nonoverlapping(a, b, n);
+                // Read at a laundered index so the observed span cannot be
+                // narrowed to one known byte.
+                let i = core::hint::black_box(len - 1);
+                core::hint::black_box(b.add(i).read_volatile());
+            });
+        }
+        for (name, len) in [
+            ("p7_memcpy_wide_1kib", 1024usize),
+            ("p7_memcpy_wide_4kib", 4096),
+        ] {
+            measure(name, (len * 64) as u64, 64, || {
+                let (a, b) = (core::hint::black_box(src), core::hint::black_box(dst));
+                let n = core::hint::black_box(len);
+                copy_wide(b, a, n);
+                let i = core::hint::black_box(len - 1);
+                core::hint::black_box(b.add(i).read_volatile());
+            });
+        }
+        // Misaligned by one byte on both sides - the case whose byte-at-a-time
+        // prologue is the ARM64 headroom.
+        measure("p7_memcpy_4kib_unaligned", 4095 * 64, 64, || {
+            let (a, b) = (core::hint::black_box(src), core::hint::black_box(dst));
+            let n = core::hint::black_box(4095usize);
+            core::ptr::copy_nonoverlapping(a.add(1), b.add(1), n);
+            let i = core::hint::black_box(4095usize);
+            core::hint::black_box(b.add(i).read_volatile());
+        });
+        measure("p7_memcpy_wide_4kib_unaligned", 4095 * 64, 64, || {
+            let (a, b) = (core::hint::black_box(src), core::hint::black_box(dst));
+            let n = core::hint::black_box(4095usize);
+            copy_wide(b.add(1), a.add(1), n);
+            let i = core::hint::black_box(4095usize);
+            core::hint::black_box(b.add(i).read_volatile());
+        });
     }
 }
 

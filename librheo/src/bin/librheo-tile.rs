@@ -89,6 +89,107 @@ extern "C" fn main() -> i32 {
     if feats.simd & sys::SIMD_AVX2 != 0 && func & (1 << tile::simd::AVX2) == 0 {
         return 90; // AVX2 available but its on-OS output did not match scalar
     }
+    // ---- ELF ifunc: bulk exp2f resolved at process start -------------------
+    //
+    // The mechanism's own gate (docs/LIBRHEO.md "ifunc"). Three separate claims,
+    // because each fails differently:
+    //
+    //  1. The image really carries IRELATIVE relocations. `pending()` reads the
+    //     linker's array bounds, so a zero here means the ifunc was never
+    //     emitted - which is exactly what `--gc-sections` does to a dispatched
+    //     function nothing calls, and would leave the other two claims vacuous.
+    //  2. The crt0 really applied them. `applied()` counts stores performed, so
+    //     `applied == pending` is the walk having finished, not having started.
+    //  3. The resolved kernel is *correct*: bit-identical, per element, to the
+    //     scalar `fmath::exp2f` this tree's attention oracles are written
+    //     against. Asserted on the value, so a tier that resolved to the wrong
+    //     address fails here rather than as a subtly wrong attention row.
+    let pending = librheo::ifunc::pending();
+    let applied = librheo::ifunc::applied();
+    let etier = tile::fsimd::tier();
+    println!(
+        "librheo-tile: ifunc {applied}/{pending} relocations applied, exp2f tier = {}",
+        tile::fsimd::tier_name(etier)
+    );
+    if pending == 0 {
+        return 91; // no IRELATIVE in the image - the ifunc was never emitted
+    }
+    if applied != pending {
+        return 92; // crt0 did not resolve every ifunc symbol
+    }
+    // 1027 is deliberately not a multiple of 8: the vector body runs 128 times
+    // and the scalar tail 3 times, so a tier that mishandled its tail fails here
+    // rather than on an odd-length attention row. The sweep covers the softmax's
+    // own range and both saturating guards.
+    const NX: usize = 1027;
+    let mut xs = vec![0f32; NX];
+    for (i, x) in xs.iter_mut().enumerate() {
+        *x = -152.0 + (i as f32) * (282.0 / NX as f32);
+    }
+    let mut got = vec![0f32; NX];
+    tile::fsimd::exp2f_into(&xs, &mut got);
+    for i in 0..NX {
+        let want = tile::fmath::exp2f(xs[i]);
+        let same = if want.is_nan() {
+            got[i].is_nan()
+        } else {
+            want.to_bits() == got[i].to_bits()
+        };
+        if !same {
+            println!(
+                "librheo-tile: exp2f_into mismatch at {i}: x={} want={:#x} got={:#x}",
+                xs[i],
+                want.to_bits(),
+                got[i].to_bits()
+            );
+            return 93;
+        }
+    }
+    // The vector tiers are bit-identical to scalar by construction, so no output
+    // oracle anywhere can tell a working `fsimd::install` from a missing one - the
+    // FlashAttention hashes match either way, which is precisely what the
+    // cross-substrate check in `smp` relies on. The only observable is whether the
+    // dispatched kernel was actually *reached*, so run one real attention and ask.
+    let shape = tile::attn::AttnShape {
+        tq: 4,
+        tk: 33,
+        d: 8,
+    };
+    let (nq, nk) = (shape.tq * shape.d, shape.tk * shape.d);
+    let mut qm = vec![0f32; nq];
+    let mut km = vec![0f32; nk];
+    let mut vm = vec![0f32; nk];
+    for (i, x) in qm.iter_mut().enumerate() {
+        *x = (i % 7) as f32 * 0.125 - 0.5;
+    }
+    for (i, (kx, vx)) in km.iter_mut().zip(vm.iter_mut()).enumerate() {
+        *kx = (i % 5) as f32 * 0.25 - 0.5;
+        *vx = (i % 3) as f32 * 0.5;
+    }
+    let mut om = vec![0f32; nq];
+    let mut sbuf = vec![0f32; shape.tk];
+    let mut abuf = vec![0f32; shape.d];
+    let before = tile::fsimd::inplace_calls();
+    if tile::attn::flash_attention_2(
+        &qm,
+        &km,
+        &vm,
+        &mut om,
+        shape,
+        shape.scale(),
+        8,
+        &mut sbuf,
+        &mut abuf,
+    )
+    .is_err()
+    {
+        return 94;
+    }
+    let exp_calls = tile::fsimd::inplace_calls() - before;
+    println!("librheo-tile: FlashAttention reached the dispatched exp2f {exp_calls} time(s)");
+    if exp_calls == 0 {
+        return 95; // attn ran on fmath's scalar fallback - install() never happened
+    }
     println!(
         "librheo-tile: tile framework OK ({N}x{N}x{N} block {}x8 strands)",
         BLOCK.m

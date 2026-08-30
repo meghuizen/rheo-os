@@ -1179,3 +1179,180 @@ Scope: single-context native cells (a Linux cell's per-context FP is `linux::thr
 above). The two schedulers are disjoint - `nproc` only ever selects native cells -
 so a switch never crosses a personality. SVE / RVV state is not enabled, so the
 areas are sized for NEON / the D extension / an XSAVE image (docs/TILES.md 4).
+
+---
+
+## ifunc - ELF indirect functions in a cell
+
+Runtime CPU dispatch in this tree was a branch on a global: read a tier byte,
+test it, switch to an implementation (`tile::simd`). Correct, and free where the
+dispatched function is a whole GEMM block - the load and two branches amortise
+over `m*n*k` work. Not free where the dispatched thing is a leaf evaluated per
+element, which is what a softmax `exp` is.
+
+`librheo/src/ifunc.rs` is the glibc mechanism instead: a symbol declared
+`STT_GNU_IFUNC` and aliased to a *resolver*, so the linker routes every call
+through one GOT slot and emits an `R_*_IRELATIVE` relocation naming the resolver.
+On a Linux system `ld.so` runs those resolvers; for a **static** binary glibc
+does it itself, walking `__rela_iplt_start..__rela_iplt_end` before `main`
+(`ARCH_SETUP_IREL`). A librheo cell is a statically linked `ET_EXEC`, so it is
+the second case and `ifunc::apply_irel()` is that walk, called first thing in the
+crt0 - before the heap, the DRBG, the capability set and the reactor, because any
+of those may call a dispatched function.
+
+**No kernel object, no verb, no loader change** (ARCHITECTURE.md 6). The kernel
+performs no relocation processing, and this does not ask it to: the relocations
+sit in an ordinary `PT_LOAD` the loader already maps, and the cell applies them
+to itself. A cell that declares no ifunc pays one compare.
+
+### What was verified rather than assumed
+
+- `%gnu_indirect_function` assembles on **all three** cell targets, so the
+  declaration needs no `cfg`. `@gnu_indirect_function` does not - `@` opens a
+  comment in the ARM assembler.
+- `rust-lld` synthesises the bracket symbols and emits `R_X86_64_IRELATIVE` (37),
+  `R_AARCH64_IRELATIVE` (1032), `R_RISCV_IRELATIVE` (58).
+- The GOT slot lands in a writable `PT_LOAD`. It is also inside `PT_GNU_RELRO`,
+  which this loader does not honour - **if it ever does, `apply_irel` must run
+  before that enforcement**, the same ordering `ld.so` is under.
+
+### Three defects this turned up
+
+1. **The bracket symbols cannot be referenced directly.** With no ifunc in the
+   image LLD still defines `__rela_iplt_start`/`__rela_iplt_end`, as *absolute
+   zero*, and a PC-relative reference from `.text` to address 0 does not reach:
+   `relocation R_RISCV_PCREL_HI20 out of range`. Every cell hits this, because
+   most declare no ifunc. The bounds are read through a `.quad` pair instead,
+   which is an absolute 64-bit relocation with no range to exceed.
+2. **`.rela.dyn` is synthetic.** Naming `*(.rela.dyn)` inside `.rodata` in the
+   cell linker script does nothing - LLD creates that *output* section itself, so
+   an input pattern never matches it and it stays an orphan. It then landed
+   mid-page and started the read-only segment **inside** the executable one,
+   breaking the W^X page granularity `userland/link/*.ld` promises in its own
+   header comment. Symptom: a fault at an address in the shared page, with no
+   output. It is an explicit page-aligned output section now, and `.iplt` /
+   `.igot.plt` are named beside `.text` / `.got.plt`.
+3. **A float vector tier cannot be gated on `target_arch`.** librheo compiles for
+   two x86-64 targets - the hard-float cell target and the soft-float
+   `x86_64-unknown-none` the kernel-side build uses - and `__m256` on the latter
+   is `rustc-LLVM ERROR: Do not know how to split the result of this operator!`,
+   a compiler crash rather than a diagnostic. `tile::simd` escapes only because
+   its tiers are `__m256i` (integer). The gate is `target_feature = "sse2"`.
+
+### The resolver environment, and one rule glibc does not have
+
+A resolver runs before the heap: no allocation, no `alloc` types, and no call to
+any ifunc-dispatched symbol (including `memcpy`, so no large struct copies - the
+`Elf64_Rela` walk reads three words individually for exactly this reason). It may
+issue a syscall, which is what lets it ask the kernel's *validated* feature report
+rather than executing `CPUID` itself.
+
+Beyond glibc's feature check it must **observe the tier being right**
+(ENGINEERING.md 1): a tier is selected only after producing bit-identical output
+to the scalar reference on a fixed stack-buffer input set. A feature bit says the
+instruction exists; it does not say this use of it is correct, and a wrong vector
+exp surfaces as a subtly wrong attention row rather than a fault.
+
+### First consumer: bulk `exp2f`
+
+`tile::fsimd::exp2f_into` - `dst[i] = 2^src[i]`, with a portable scalar tier and
+an x86 AVX2 tier, **bit-identical** per element to `tile::fmath::exp2f`. Bit
+exactness is a constraint, not a bonus: `librheotilebattle`'s FlashAttention
+oracles compare tilings against each other, so an exp differing by an ulp between
+tiers would surface as a tiling bug. It costs the FMA (Rust does not contract
+`a*b+c`, so the scalar Horner chain is separate operations and the vector tier
+must be too) and it needs the NaN path handled explicitly - `f32 as i32`
+saturates in Rust while `vcvttps2dq` yields `i32::MIN`, whose exponent field
+would otherwise take the underflow branch and return `0.0` where scalar returns
+NaN.
+
+It lives in `fsimd.rs` and not in `fmath.rs` because `fmath.rs` is
+`#[path]`-included **verbatim** by the kernel's compute engine, `bench-core` and
+the `tilelinux` Linux fixture (TILES.md 13.4b), so it cannot name anything
+librheo provides - and `attn.rs`, the shared FlashAttention recurrence, is
+included by the same builds.
+
+### Wiring it into FlashAttention
+
+The recurrence is where the exponential actually lives, so the dispatch has to
+reach it without `attn.rs` naming librheo. `fmath` carries an installable hook:
+a `static` function pointer that defaults to zero, `exp2f_inplace` that uses it
+or falls back to the scalar loop, and `set_exp2f_inplace` to install one. The
+verbatim includers set nothing and get scalar; a librheo cell installs the
+ifunc-resolved kernel from its crt0. The indirection costs one relaxed load and
+an indirect call **per K-block**, not per element, because what is installed is a
+*bulk* kernel - which is the whole reason the bulk form exists rather than a
+faster scalar `exp2f`.
+
+`attn.rs`'s three exponential loops became "scale in place, then one bulk call".
+`expf(x)` is `exp2f(x * LOG2_E)`, so folding the scale into the pass that already
+subtracts the row max is the identical arithmetic in the identical order - the
+rescale, the `l` accumulation and the AXPY are untouched, which is what keeps the
+result bit-identical.
+
+**The bit-exactness that makes this safe also makes it invisible**, and that
+needed its own answer. Every oracle in the tree - FA2 against the naive
+reference, block-size invariance, FA3 against FA2, and the `smp` cross-substrate
+check where a librheo cell and the `tilelinux` Linux binary must produce the same
+FlashAttention hash - passes *identically* whether the vector kernel is installed
+or not. So none of them can tell a working `install` from a missing one. The
+observable is a counter on the installed kernel: `librheotile` runs one real
+attention and asserts it was reached **20 times** (4 query rows x 5 K-blocks at
+`tk = 33`, `block_k = 8` - a hand-computed number), and with `install` suppressed
+that is 0 and the cell exits 95.
+
+### Proof
+
+`librheotile` on **all three ISAs**: the image carries IRELATIVE relocations
+(`pending() > 0` - which is what catches `--gc-sections` deleting a dispatched
+function nothing calls, the state the first attempt was in), the crt0 applied
+*all* of them (`applied == pending`, a count of stores performed), and the
+resolved kernel is bit-identical to scalar over 1027 elements - deliberately not
+a multiple of 8, so the vector body runs 128 times and the scalar tail 3, and a
+tier that mishandled its tail fails here rather than on an odd-length row.
+x86-64 resolves to `avx2`, arm/riscv to `scalar`.
+
+Two controls observed firing: suppressing `apply_irel` reports `ifunc 0/1
+relocations applied` and fails by name; corrupting one Horner coefficient in the
+AVX2 tier makes the resolver's gate reject it and fall back to `scalar` - so the
+gate is load-bearing and fail-safe rather than decoration.
+
+### `mem*`: rejected, with the numbers
+
+`mem*` was the obvious first consumer - it is what glibc's own ifunc is famous
+for - and it is **refused on measurement**. `bench-core`'s `p7_*` benches compare
+`compiler_builtins`' `memcpy` against a hand-written 32-bytes-per-iteration word
+copy, at two sizes in a 4:1 ratio so an elided copy is visible as one that does
+not scale:
+
+| ISA | shipped `memcpy` | hand-written wide copy | |
+|---|---|---|---|
+| aarch64 | 0.031 instr/byte | 0.199 | **6.4x worse** |
+| x86-64  | 0.132 instr/byte | 0.335 | **2.5x worse** |
+
+Misaligning both sides by one byte changes neither column materially.
+
+The x86-64 result is the expected one: `compiler_builtins` uses `rep movsb` /
+`rep movsq` there, which is at or near optimal on any core with ERMSB/FSRM.
+
+**The ARM64 result inverted the hypothesis that prompted the benchmark.** The
+guess written down first was that ARM64 was the case that might pay, because its
+`memcpy` has a byte-at-a-time alignment prologue and an 8-byte main loop and no
+`ldp`/`stp` anywhere. The reason it is shaped that way is that **both** ARM64
+targets here carry `+strict-align`, so `read_unaligned::<u64>` is not an `ldr x` -
+it is byte loads and shifts. `compiler_builtins` is structured *for* that
+constraint: reach alignment first, then use aligned 8-byte accesses. Copying wider
+only pays if it aligns first too, which is a far narrower change than "use bigger
+loads", and the remaining headroom is 8 -> 16 bytes on the main loop alone.
+
+Two things this does not settle, stated rather than implied: icount is a path
+length, and `memcpy` on real hardware is bounded by the memory subsystem QEMU does
+not model, so the *magnitude* of any future win is a lab number; and a global
+`memcpy` ifunc has an ordering hazard this one does not - anything the crt0 or a
+resolver touches before its relocation is applied would jump through an empty slot,
+so it would need the resolvers audited for implicit copies first.
+
+**Honest scope.** One dispatched symbol today. AVX-512 is absent rather than
+written and unproven: QEMU's TCG exposes AVX2 but not AVX-512, so a 16-lane tier
+could not be gated by the resolver's own correctness check on any machine in this
+tree.

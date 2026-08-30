@@ -747,9 +747,16 @@ it.
   built. What is real and tested is the *structure* - genuinely double-buffered
   staging, a genuine prologue, a fence that fires the right number of times, and an
   identical result, now also verified on four cores at once.
-- **Scalar inner loops.** The dot product and the exp are scalar; `tile::simd` is
-  where a target-specific kernel goes, and the GEMM there is the precedent. Keeping
-  these scalar is what makes them the oracle a vector path is checked against.
+- **Scalar dot product.** The dot product is scalar; `tile::simd` is where a
+  target-specific kernel goes, and the GEMM there is the precedent. Keeping it
+  scalar is what makes it the oracle a vector path is checked against.
+- **The exp is dispatched.** It was scalar, and is now one bulk call per K-block
+  through `fmath`'s installable hook, which a librheo cell fills with the
+  ifunc-resolved `tile::fsimd` kernel and every verbatim includer leaves at the
+  scalar loop (docs/LIBRHEO.md "ifunc"). The scalar `fmath::exp2f` remains the
+  oracle: the vector tiers are **bit-identical** to it, which is what keeps the
+  block-size-invariance and FA3-equals-FA2 oracles - and `smp`'s cross-substrate
+  hash against the `tilelinux` Linux binary - unchanged and meaningful.
 - **Forward only.** No backward pass, no causal mask, no dropout, no multi-head
   batching loop - each is a caller-level loop over this kernel, and none is
   claimed.

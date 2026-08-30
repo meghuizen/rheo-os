@@ -591,11 +591,14 @@ async fn work() {
         if exp2f(0.0) != 1.0 || exp2f(1.0) != 2.0 || exp2f(-2.0) != 0.25 || exp2f(10.0) != 1024.0 {
             return fail(80);
         }
-        // e = 2.718281828..., e^-1, e^-10, and 2^0.5 = 1.414213562...
-        if rel(expf(1.0), 2.718_281_8) > EPS
+        // `expf(1.0)` IS e and `exp2f(0.5)` IS sqrt(2), so they are named rather
+        // than spelled out - the oracle stays independent of `fmath` (these come
+        // from `core`, not from the function under test) and a reader can see what
+        // is being asserted. e^-1 and e^-10 have no such constant and stay literal.
+        if rel(expf(1.0), core::f32::consts::E) > EPS
             || rel(expf(-1.0), 0.367_879_44) > EPS
             || rel(expf(-10.0), 4.539_993e-5) > EPS
-            || rel(exp2f(0.5), 1.414_213_6) > EPS
+            || rel(exp2f(0.5), core::f32::consts::SQRT_2) > EPS
         {
             return fail(81);
         }

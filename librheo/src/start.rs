@@ -5,7 +5,7 @@
 //! calls the program's `main` and exits with its return code.
 
 use crate::cap::{self, CapSet};
-use crate::{mem, rt, sys};
+use crate::{ifunc, mem, rt, sys};
 
 unsafe extern "C" {
     fn main() -> i32;
@@ -94,6 +94,23 @@ extern "C" fn start_rust(arg: u64) -> ! {
     // SAFETY: runs once at process start, before any allocation, on a fresh
     // stack the kernel set up; `main` is provided by the linked program.
     unsafe {
+        // **First, before anything.** Resolving the cell's `STT_GNU_IFUNC`
+        // symbols fills the GOT slots their call sites jump through, and
+        // `memcpy`/`memset` are among them - so every line below this one, and
+        // everything `main` reaches, depends on it having run. Until it does, a
+        // call to a dispatched symbol jumps through an unfilled slot.
+        //
+        // `apply_irel` itself is a pointer loop that calls only the resolvers,
+        // which are held to the same rule (librheo::ifunc module docs). Driven
+        // from vcore 0 only: a secondary is gated behind `PRIMARY_READY` below
+        // and reaches no dispatched call before it, so the stores race nothing.
+        ifunc::apply_irel();
+        // With the GOT slots filled, hand the resolved bulk exponential to the
+        // shared FlashAttention recurrence. `attn.rs` is `#[path]`-included by
+        // builds with no librheo, so it cannot reach a librheo dispatch by name -
+        // it calls `fmath`'s hook, and this is the cell installing into it.
+        #[cfg(feature = "full")]
+        crate::tile::fsimd::install();
         mem::init_heap();
         // Before any `spawn`: the executor is per vcore and keys on this index, and the
         // hook is how the runtime is *told* it rather than inventing one.

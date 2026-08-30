@@ -231,6 +231,33 @@ code via the debug-exit/semihosting device to gate pass/fail. Serial output is
 captured to a log artifact. Absolute performance numbers (P1-P12) only gate on
 the hardware lab; QEMU runs track correctness and trend microbenchmarks.
 
+**On every branch, not only `main`.** Pushes used to build only on the default
+branch, so a branch was covered only while it had an open pull request; work
+pushed before one exists, or after one is closed, built nowhere. A `concurrency`
+group keyed on the branch keeps a push and its pull-request event from starting
+the same 3-ISA matrix twice, and cancels superseded runs everywhere except `main`.
+
+Worth stating plainly, since the obvious motivating story is wrong: when `gpuhw`
+went red on aarch64 and riscv64, CI **did** run and **did** report it (run #28, a
+pull-request event), and three more commits landed on top. The trigger was not the
+gap - acting on the result was. Broader triggers help with a different problem.
+
+
+A **lint job** runs first and gates on four things:
+
+- `cargo fmt --all --check`.
+- **clippy over the whole workspace**, at `-D warnings`. That means all 12 crates,
+  not the 3 it used to cover: the host crates (`xtask`, `rheo-abi`, `rheo-json`,
+  `posix`, `ext4fs`, `runtime`), the kernel and test kernels on all three bare
+  targets, and the cell crates (`librheo`, `rheo-libc`, `userland`, `rheo-net`) on
+  all three **cell** targets. A feature flag is a separate compilation, so the
+  extra postures are linted too - the kernel's `smp`, librheo's embedded spine, and
+  `rheo-net`'s librheo-free codec posture.
+- **Tier K stays zero-dependency** (SUBSTRATE.md 11). The kernel, the ABI, `posix`
+  and `xtask` may depend on nothing outside the tree. The rule was written down and
+  enforced by nothing; a `cargo tree` check now fails the build instead.
+- `cargo xtask verify`, the host model check of the kernel state machines.
+
 ## 10. First-day smoke test
 
 The minimal loop that proves the whole toolchain before any real subsystem
