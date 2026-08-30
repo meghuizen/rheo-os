@@ -109,18 +109,27 @@ jobs:
           # just the compiler driver: see the lint job's note on why
           # `libc6-dev-*-cross` has to be named. x86-64 needs nothing - the runner's
           # own gcc, libc and libstdc++ are the fixture toolchain there.
+          #
+          # `seabios` must be named for arm/riscv and NOT for x86: it ships the
+          # `vgabios-*.bin` blobs the legacy VGA models load at realize time, and it
+          # is a *Depends* of `qemu-system-x86` but of neither `qemu-system-arm` nor
+          # `qemu-system-misc`. Without it `-device ati-vga` (and bochs, and cirrus)
+          # makes QEMU exit during startup with `failed to find romfile` and an empty
+          # serial log, so `gpuhw` loses three of its four GPU vendors on those two
+          # ISAs. xtask probes for the blobs and skips-with-reason, so a machine
+          # without them still boots - this is what makes CI actually exercise them.
           - arch: x86_64
             qemu-package: qemu-system-x86
             gnu-target: x86_64-unknown-linux-gnu
             cross-pkgs: ""
           - arch: aarch64
-            qemu-package: qemu-system-arm
+            qemu-package: qemu-system-arm seabios
             gnu-target: aarch64-unknown-linux-gnu
             cross-pkgs: >-
               gcc-aarch64-linux-gnu libc6-dev-arm64-cross
               g++-aarch64-linux-gnu libstdc++6-arm64-cross libgcc-s1-arm64-cross
           - arch: riscv64
-            qemu-package: qemu-system-misc
+            qemu-package: qemu-system-misc seabios
             gnu-target: riscv64gc-unknown-linux-gnu
             cross-pkgs: >-
               gcc-riscv64-linux-gnu libc6-dev-riscv64-cross

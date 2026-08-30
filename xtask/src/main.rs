@@ -248,35 +248,85 @@ fn gpu_device_args(arch: Arch) -> Vec<String> {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    // (model name passed to -device, the base name `-device help` lists it under)
-    let mut models: Vec<(&str, &str)> = vec![
-        ("virtio-gpu-pci,bus=rp1,disable-legacy=on", "virtio-gpu-pci"),
+    // (spec passed to -device, the base name `-device help` lists it under, the
+    // VGA BIOS ROM the model loads at launch if it needs one)
+    //
+    // **Nothing here is gated on the ISA.** A legacy VGA part is a PCI function
+    // like any other and QEMU models these on every machine that has a PCI bus;
+    // what actually varies is whether the *ROM* the model loads is installed,
+    // which is a property of the host, not of the guest architecture. Gating on
+    // `arch` conflated the two and silently cut arm/riscv GPU coverage from four
+    // vendors to one - the probes below ask the real questions instead.
+    let models: Vec<(&str, &str, Option<&str>)> = vec![
+        (
+            "virtio-gpu-pci,bus=rp1,disable-legacy=on",
+            "virtio-gpu-pci",
+            None,
+        ),
+        (
+            "bochs-display",
+            "bochs-display",
+            Some("vgabios-bochs-display.bin"),
+        ),
+        ("cirrus-vga", "cirrus-vga", Some("vgabios-cirrus.bin")),
+        ("ati-vga", "ati-vga", Some("vgabios-ati.bin")),
+        ("vmware-svga", "vmware-svga", Some("vgabios-vmware.bin")),
+        ("qxl", "qxl", Some("vgabios-qxl.bin")),
     ];
-    if arch == Arch::X86_64 {
-        // AMD (ati-vga), Bochs, Cirrus, VMware SVGA and Red Hat/QXL are x86-only in QEMU.
-        // ati-vga requires vgabios-ati.bin, bochs-display requires vgabios-bochs-display.bin,
-        // and cirrus-vga requires vgabios-cirrus.bin ROM files, only available in x86-64 environments.
-        models.push(("bochs-display", "bochs-display"));
-        models.push(("cirrus-vga", "cirrus-vga"));
-        models.push(("ati-vga", "ati-vga"));
-        models.push(("vmware-svga", "vmware-svga"));
-        models.push(("qxl", "qxl"));
-    }
     let listing = qemu_device_listing(arch);
-    for (spec, base) in models {
+    let rom_dirs = qemu_rom_paths(arch);
+    for (spec, base, rom) in models {
         // `-device help` prints `name "ati-vga", bus PCI` - match the quoted name so
         // one model is never mistaken for another whose name contains it.
-        if listing.contains(&format!("name \"{base}\"")) {
-            args.push("-device".to_string());
-            args.push(spec.to_string());
-        } else {
+        if !listing.contains(&format!("name \"{base}\"")) {
             println!(
                 "[xtask] {} has no '{base}' device model - not attached",
                 arch.qemu()
             );
+            continue;
         }
+        // A model can exist and still refuse to launch. `-device help` lists
+        // `ati-vga` on every ISA, but the model loads `vgabios-ati.bin` at
+        // realize time, and on Debian/Ubuntu those ROMs ship in `seabios`, which
+        // is a dependency of `qemu-system-x86` and of **neither**
+        // `qemu-system-arm` nor `qemu-system-misc`. Without it QEMU exits during
+        // startup with `failed to find romfile` and the serial log is empty -
+        // the same silent-launch-failure shape QXL-without-SPICE has. So the ROM
+        // is checked the way the device model is: asked for, not assumed.
+        if let Some(rom) = rom
+            && !rom_dirs.iter().any(|d| d.join(rom).is_file())
+        {
+            println!(
+                "[xtask] {} has no '{rom}' (install the `seabios` package) - '{base}' not attached",
+                arch.qemu()
+            );
+            continue;
+        }
+        args.push("-device".to_string());
+        args.push(spec.to_string());
     }
     args
+}
+
+/// The directories QEMU searches for BIOS/ROM blobs, from `-L help`. Empty if
+/// QEMU cannot be run, in which case every ROM reads as absent and the boot
+/// itself reports the missing QEMU - the same degradation as
+/// [`qemu_device_listing`].
+fn qemu_rom_paths(arch: Arch) -> Vec<PathBuf> {
+    Command::new(arch.qemu())
+        .arg("-L")
+        .arg("help")
+        .output()
+        .map(|o| {
+            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+            s.push_str(&String::from_utf8_lossy(&o.stderr));
+            s.lines()
+                .map(str::trim)
+                .filter(|l| l.starts_with('/'))
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// What `qemu-system-<arch> -device help` prints, stdout and stderr together
