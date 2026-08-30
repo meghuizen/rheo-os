@@ -10,11 +10,16 @@ SECTIONS
 {
     . = 0x40000000;
 
-    .text : { *(.text._start) *(.text .text.*) }
+    .text : { *(.text._start) *(.text .text.*) *(.iplt) }
     . = ALIGN(4K);
+    /* Synthetic: LLD creates this output section itself, so it must be named
+       here or it is placed as an orphan - which lands it mid-page and starts
+       the read-only segment inside the executable one, breaking the W^X page
+       granularity this script's header promises (docs/LIBRHEO.md "ifunc"). */
+    .rela.dyn : { *(.rela.dyn) *(.rela.iplt) }
     .rodata : { *(.rodata .rodata.*) }
     . = ALIGN(4K);
-    .data : { *(.data .data.*) *(.got) *(.got.plt) *(.data.rel.ro*) }
+    .data : { *(.data .data.*) *(.got) *(.got.plt) *(.igot.plt) *(.data.rel.ro*) }
     . = ALIGN(4K);
     .bss : {
         __bss_start = .;

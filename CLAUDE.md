@@ -1245,6 +1245,59 @@ attach, set-scanout, transfer, flush). No claim of visible output; the 2D scanou
 command round-trip + compositor present wiring is the deliverable. **librheo A-H
 is complete.**
 
+**A cell resolves its CPU dispatch at process start, the glibc way** (docs/LIBRHEO.md
+"ifunc", `librheo/src/ifunc.rs`): runtime dispatch here was a branch on a global -
+free where the dispatched thing is a whole GEMM block, not free where it is a leaf
+evaluated per element. A symbol declared `STT_GNU_IFUNC` and aliased to a *resolver*
+makes the linker route every call through one GOT slot and emit an `R_*_IRELATIVE`
+relocation; `ifunc::apply_irel()` walks `__rela_iplt_start..__rela_iplt_end` first
+thing in the crt0, which is glibc's own static path (`ARCH_SETUP_IREL`) and needs
+**no kernel object, no verb and no loader change** - the kernel still performs no
+relocation processing, the relocations sit in a `PT_LOAD` it already maps, and the
+cell applies them to itself. `%gnu_indirect_function` assembles on all three cell
+targets, so the declaration carries **no `cfg`**. Three defects on the way, each
+found by an experiment rather than reasoning: the bracket symbols **cannot be
+referenced directly** (with no ifunc in an image LLD defines them as *absolute
+zero*, and a PC-relative reference to address 0 is `relocation
+R_RISCV_PCREL_HI20 out of range` - so the bounds are read through a `.quad` pair);
+**`.rela.dyn` is synthetic**, so naming `*(.rela.dyn)` inside `.rodata` matches
+nothing and it stayed an orphan, landing mid-page and starting the read-only
+segment **inside** the executable one - breaking the W^X page granularity
+`userland/link/*.ld` promises in its own header, and presenting as a fault with no
+output; and a **float** vector tier cannot be gated on `target_arch`, because
+librheo also compiles for the soft-float `x86_64-unknown-none` where `__m256` is
+`rustc-LLVM ERROR: Do not know how to split the result of this operator!` (a
+compiler crash - `tile::simd` escapes only because its tiers are `__m256i`). The
+resolver runs before the heap, so it may not allocate or call any dispatched symbol
+(the `Elf64_Rela` walk reads three words individually because a 24-byte struct copy
+may lower to `memcpy`, which is exactly what it is resolving); beyond glibc's
+feature check it must **observe the tier being right**, selecting AVX2 only after
+bit-identical output to scalar on fixed stack buffers. First consumer:
+`tile::fsimd::exp2f_into`, a bulk `2^x` with a scalar and an AVX2 tier,
+**bit-identical** per element to `tile::fmath::exp2f` - a constraint, not a bonus,
+since the FlashAttention oracles compare tilings against each other, and it costs
+the FMA (Rust does not contract, so neither may the vector tier) and an explicit
+NaN path (`f32 as i32` saturates while `vcvttps2dq` yields `i32::MIN`, which would
+take the underflow branch and return 0.0). It lives beside `fmath.rs` rather than in
+it because that file is `#[path]`-included **verbatim** by the kernel engine,
+`bench-core` and `tilelinux` - the same reason the vectorised exp is **not yet wired
+into `attn.rs`**, which is shared verbatim too and so cannot call a librheo-only
+dispatch (named, not half-done). Proven by `librheotile` on **all three ISAs**: the
+image carries IRELATIVE relocations (`pending() > 0`, which is what catches
+`--gc-sections` deleting a dispatched function nothing calls - the state the first
+attempt was in), the crt0 applied **all** of them, and the resolved kernel matches
+scalar bit-for-bit over 1027 elements, deliberately not a multiple of 8 so the
+vector body and the scalar tail both run; x86-64 resolves to `avx2`, arm/riscv to
+`scalar`. Two controls observed firing (suppressing `apply_irel` gives `ifunc 0/1
+relocations applied`; corrupting one Horner coefficient makes the gate reject AVX2
+and fall back to scalar). Honest: one dispatched symbol today, and **`mem*` was
+rejected on measurement** rather than deferred - `compiler_builtins` already uses
+`rep movsb`/`rep movsq` on x86-64 and a word-at-a-time path with alignment handling
+elsewhere, so a hand-written SIMD `memcpy` would risk a regression while claiming a
+win; ARM64 with 16-byte NEON chunks is the case that might still pay and needs a
+benchmark first. AVX-512 is absent rather than written and unproven, since QEMU's
+TCG exposes AVX2 but not AVX-512 and the resolver's own gate could not run on it.
+
 **rheo-net N2d** (docs/NETSTACK.md 16) makes the network **receive** side as async
 as the send side - the OS's **third interrupt source**. Before it,
 `librheo::net::recv` was a re-poll (`OP_NET_RX` returned "nothing available" and the

@@ -27,6 +27,7 @@ extern crate alloc;
 // capabilities, the async reactor, the heap, and the raw syscall/queue ABI - it
 // can still do a queue round-trip and exit, proving librheo scales down.
 pub mod cap;
+pub mod ifunc;
 pub mod mem;
 pub mod rt;
 mod start;

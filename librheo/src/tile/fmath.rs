@@ -46,12 +46,12 @@ pub const LOG2_E: f32 = 1.442_695_04;
 // Written as decimal literals rather than computed from `ln2`, because `const`
 // evaluation of a power series would be the same numbers by a route a reader has to
 // re-derive - and these are the numbers the accuracy claim above is about.
-const C1: f32 = 0.693_147_18; // ln2
-const C2: f32 = 0.240_226_51; // ln2^2 / 2
-const C3: f32 = 0.055_504_11; // ln2^3 / 6
-const C4: f32 = 0.009_618_129; // ln2^4 / 24
-const C5: f32 = 0.001_333_356; // ln2^5 / 120
-const C6: f32 = 0.000_154_035; // ln2^6 / 720
+pub const C1: f32 = 0.693_147_18; // ln2
+pub const C2: f32 = 0.240_226_51; // ln2^2 / 2
+pub const C3: f32 = 0.055_504_11; // ln2^3 / 6
+pub const C4: f32 = 0.009_618_129; // ln2^4 / 24
+pub const C5: f32 = 0.001_333_356; // ln2^5 / 120
+pub const C6: f32 = 0.000_154_035; // ln2^6 / 720
 
 /// `2^x` for `f32`.
 ///

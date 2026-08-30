@@ -16,6 +16,7 @@
 
 pub mod attn;
 pub mod fmath;
+pub mod fsimd;
 pub mod kernels;
 pub mod simd;
 

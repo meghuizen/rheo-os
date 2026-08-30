@@ -89,6 +89,62 @@ extern "C" fn main() -> i32 {
     if feats.simd & sys::SIMD_AVX2 != 0 && func & (1 << tile::simd::AVX2) == 0 {
         return 90; // AVX2 available but its on-OS output did not match scalar
     }
+    // ---- ELF ifunc: bulk exp2f resolved at process start -------------------
+    //
+    // The mechanism's own gate (docs/LIBRHEO.md "ifunc"). Three separate claims,
+    // because each fails differently:
+    //
+    //  1. The image really carries IRELATIVE relocations. `pending()` reads the
+    //     linker's array bounds, so a zero here means the ifunc was never
+    //     emitted - which is exactly what `--gc-sections` does to a dispatched
+    //     function nothing calls, and would leave the other two claims vacuous.
+    //  2. The crt0 really applied them. `applied()` counts stores performed, so
+    //     `applied == pending` is the walk having finished, not having started.
+    //  3. The resolved kernel is *correct*: bit-identical, per element, to the
+    //     scalar `fmath::exp2f` this tree's attention oracles are written
+    //     against. Asserted on the value, so a tier that resolved to the wrong
+    //     address fails here rather than as a subtly wrong attention row.
+    let pending = librheo::ifunc::pending();
+    let applied = librheo::ifunc::applied();
+    let etier = tile::fsimd::tier();
+    println!(
+        "librheo-tile: ifunc {applied}/{pending} relocations applied, exp2f tier = {}",
+        tile::fsimd::tier_name(etier)
+    );
+    if pending == 0 {
+        return 91; // no IRELATIVE in the image - the ifunc was never emitted
+    }
+    if applied != pending {
+        return 92; // crt0 did not resolve every ifunc symbol
+    }
+    // 1027 is deliberately not a multiple of 8: the vector body runs 128 times
+    // and the scalar tail 3 times, so a tier that mishandled its tail fails here
+    // rather than on an odd-length attention row. The sweep covers the softmax's
+    // own range and both saturating guards.
+    const NX: usize = 1027;
+    let mut xs = vec![0f32; NX];
+    for (i, x) in xs.iter_mut().enumerate() {
+        *x = -152.0 + (i as f32) * (282.0 / NX as f32);
+    }
+    let mut got = vec![0f32; NX];
+    tile::fsimd::exp2f_into(&xs, &mut got);
+    for i in 0..NX {
+        let want = tile::fmath::exp2f(xs[i]);
+        let same = if want.is_nan() {
+            got[i].is_nan()
+        } else {
+            want.to_bits() == got[i].to_bits()
+        };
+        if !same {
+            println!(
+                "librheo-tile: exp2f_into mismatch at {i}: x={} want={:#x} got={:#x}",
+                xs[i],
+                want.to_bits(),
+                got[i].to_bits()
+            );
+            return 93;
+        }
+    }
     println!(
         "librheo-tile: tile framework OK ({N}x{N}x{N} block {}x8 strands)",
         BLOCK.m
