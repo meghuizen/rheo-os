@@ -105,6 +105,12 @@ extern "C" fn start_rust(arg: u64) -> ! {
         // from vcore 0 only: a secondary is gated behind `PRIMARY_READY` below
         // and reaches no dispatched call before it, so the stores race nothing.
         ifunc::apply_irel();
+        // With the GOT slots filled, hand the resolved bulk exponential to the
+        // shared FlashAttention recurrence. `attn.rs` is `#[path]`-included by
+        // builds with no librheo, so it cannot reach a librheo dispatch by name -
+        // it calls `fmath`'s hook, and this is the cell installing into it.
+        #[cfg(feature = "full")]
+        crate::tile::fsimd::install();
         mem::init_heap();
         // Before any `spawn`: the executor is per vcore and keys on this index, and the
         // hook is how the runtime is *told* it rather than inventing one.

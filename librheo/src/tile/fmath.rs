@@ -113,6 +113,61 @@ fn scalb(y: f32, n: i32) -> f32 {
     y * f32::from_bits((e as u32) << 23)
 }
 
+/// Signature of a bulk in-place `2^x` kernel: `n` floats at `p`, each replaced by
+/// `2^` itself. `extern "C"` because the implementation that replaces the default
+/// is reached as an address rather than by name (see [`set_exp2f_inplace`]).
+pub type Exp2fInplaceFn = unsafe extern "C" fn(*mut f32, usize);
+
+/// The installed bulk kernel, or 0 for "use the scalar loop below".
+///
+/// This indirection exists because of a build constraint, not a design
+/// preference. This file is `#[path]`-included **verbatim** by builds that have
+/// no librheo - the `tilelinux` static-glibc fixture among them - so it cannot
+/// name a librheo dispatch, and [`super::attn`] (included by the same builds)
+/// cannot either. A pointer that defaults to the scalar path lets the shared
+/// recurrence call one function while each build supplies what it has: nothing
+/// at all for the verbatim includers, and the ifunc-resolved vector kernel for a
+/// librheo cell (`tile::fsimd::install`).
+///
+/// The cost is one relaxed load and an indirect call **per K-block**, not per
+/// element, because what is installed is a *bulk* kernel - which is the whole
+/// reason the bulk form exists.
+static EXP2F_INPLACE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Install a bulk `2^x` kernel for [`exp2f_inplace`] to use.
+///
+/// The installed kernel **must** be bit-identical to [`exp2f`] per element on
+/// finite inputs, and NaN-for-NaN. It is not a place to trade accuracy for
+/// speed: the FlashAttention oracles compare tilings of the same problem against
+/// each other, so a kernel that differed by an ulp would surface as a tiling bug
+/// rather than as an accuracy question.
+///
+/// Called once at process start, before any attention kernel runs.
+pub fn set_exp2f_inplace(f: Exp2fInplaceFn) {
+    EXP2F_INPLACE.store(f as usize, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// `xs[i] = 2^xs[i]`, through the installed bulk kernel if there is one.
+///
+/// Bit-identical to calling [`exp2f`] on each element either way - that is the
+/// contract [`set_exp2f_inplace`] imposes on what it accepts.
+#[inline]
+pub fn exp2f_inplace(xs: &mut [f32]) {
+    let p = EXP2F_INPLACE.load(core::sync::atomic::Ordering::Relaxed);
+    if p != 0 {
+        // SAFETY: `p` was installed by `set_exp2f_inplace` from a fn item of
+        // this exact signature, and `xs` is a valid mutable slice of `len`.
+        unsafe {
+            let f: Exp2fInplaceFn = core::mem::transmute(p);
+            f(xs.as_mut_ptr(), xs.len());
+        }
+        return;
+    }
+    for x in xs.iter_mut() {
+        *x = exp2f(*x);
+    }
+}
+
 /// The largest of `xs`, or `-inf` for an empty slice.
 ///
 /// Here rather than as an iterator chain because `f32` is not `Ord`, so the obvious

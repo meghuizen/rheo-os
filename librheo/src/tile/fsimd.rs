@@ -76,6 +76,47 @@ unsafe extern "C" {
     fn rheo_exp2f_into(src: *const f32, dst: *mut f32, n: usize);
 }
 
+/// In-place form: `p[i] = 2^p[i]`, through the same ifunc.
+///
+/// Passing one pointer as both source and destination is safe for every tier
+/// here and is the *only* aliasing they support: each lane is loaded and stored
+/// at the same index, so exact aliasing is a read-then-write of one element.
+/// Partial overlap is not supported and cannot arise - this is the only caller
+/// that aliases, and it aliases exactly.
+///
+/// # Safety
+/// `p` is valid for reads and writes of `n` `f32`s.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn rheo_exp2f_inplace(p: *mut f32, n: usize) {
+    INPLACE_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // SAFETY: caller's contract; exact aliasing is supported (above).
+    unsafe { rheo_exp2f_into(p, p, n) }
+}
+
+/// Calls that reached the installed bulk kernel.
+///
+/// This counter is the *only* way to tell that the attention path is using the
+/// dispatched exponential, and it exists for that reason: the vector tiers are
+/// bit-identical to the scalar one by construction, so a missing
+/// [`install`] would produce **exactly the same output** as a working one. The
+/// hash oracles cannot see the difference; this can.
+static INPLACE_CALLS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// How many times the installed bulk kernel has been called.
+pub fn inplace_calls() -> usize {
+    INPLACE_CALLS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Install the ifunc-resolved bulk kernel as the exponential
+/// [`super::attn`]'s FlashAttention recurrence calls.
+///
+/// Called once from the crt0, after `ifunc::apply_irel`. Without it the shared
+/// recurrence uses `fmath`'s scalar loop - which is exactly what the builds that
+/// `#[path]`-include `attn.rs` without librheo do, and why the hook exists.
+pub fn install() {
+    super::fmath::set_exp2f_inplace(rheo_exp2f_inplace);
+}
+
 /// Tier codes, shared with [`tier_name`] and the selection report.
 pub const SCALAR: u8 = 0;
 /// x86 AVX2 - 8 lanes.

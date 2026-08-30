@@ -145,6 +145,51 @@ extern "C" fn main() -> i32 {
             return 93;
         }
     }
+    // The vector tiers are bit-identical to scalar by construction, so no output
+    // oracle anywhere can tell a working `fsimd::install` from a missing one - the
+    // FlashAttention hashes match either way, which is precisely what the
+    // cross-substrate check in `smp` relies on. The only observable is whether the
+    // dispatched kernel was actually *reached*, so run one real attention and ask.
+    let shape = tile::attn::AttnShape {
+        tq: 4,
+        tk: 33,
+        d: 8,
+    };
+    let (nq, nk) = (shape.tq * shape.d, shape.tk * shape.d);
+    let mut qm = vec![0f32; nq];
+    let mut km = vec![0f32; nk];
+    let mut vm = vec![0f32; nk];
+    for i in 0..nq {
+        qm[i] = (i % 7) as f32 * 0.125 - 0.5;
+    }
+    for i in 0..nk {
+        km[i] = (i % 5) as f32 * 0.25 - 0.5;
+        vm[i] = (i % 3) as f32 * 0.5;
+    }
+    let mut om = vec![0f32; nq];
+    let mut sbuf = vec![0f32; shape.tk];
+    let mut abuf = vec![0f32; shape.d];
+    let before = tile::fsimd::inplace_calls();
+    if tile::attn::flash_attention_2(
+        &qm,
+        &km,
+        &vm,
+        &mut om,
+        shape,
+        shape.scale(),
+        8,
+        &mut sbuf,
+        &mut abuf,
+    )
+    .is_err()
+    {
+        return 94;
+    }
+    let exp_calls = tile::fsimd::inplace_calls() - before;
+    println!("librheo-tile: FlashAttention reached the dispatched exp2f {exp_calls} time(s)");
+    if exp_calls == 0 {
+        return 95; // attn ran on fmath's scalar fallback - install() never happened
+    }
     println!(
         "librheo-tile: tile framework OK ({N}x{N}x{N} block {}x8 strands)",
         BLOCK.m

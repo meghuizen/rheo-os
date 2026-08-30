@@ -65,7 +65,7 @@
 //! module is included by the dependency-free build postures, where there is no
 //! allocator to call.
 
-use super::fmath::{expf, rowmax};
+use super::fmath::{LOG2_E, exp2f_inplace, expf, rowmax};
 
 /// Why an attention call was refused.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -149,9 +149,17 @@ pub fn attention_reference(
             s[j] = dot(qi, &k[j * d..j * d + d]) * scale;
         }
         let m = rowmax(&s[..tk]);
+        // `expf(x)` is `exp2f(x * LOG2_E)`, so folding the scale in and calling the
+        // bulk `2^x` is the identical arithmetic in the identical order - the
+        // rescale and the `l` accumulation are untouched. What it buys is that the
+        // exponential becomes one call over `tk` elements instead of `tk` calls,
+        // which is what a vector kernel needs to exist at all (fmath::exp2f_inplace).
+        for x in s[..tk].iter_mut() {
+            *x = (*x - m) * LOG2_E;
+        }
+        exp2f_inplace(&mut s[..tk]);
         let mut l = 0.0f32;
         for j in 0..tk {
-            s[j] = expf(s[j] - m);
             l += s[j];
         }
         let orow = &mut o[i * d..i * d + d];
@@ -312,8 +320,12 @@ pub fn flash_row_resume(
                 *x *= c;
             }
         }
+        for x in s[..n].iter_mut() {
+            *x = (*x - m_new) * LOG2_E;
+        }
+        exp2f_inplace(&mut s[..n]);
         for j in 0..n {
-            let p = expf(s[j] - m_new);
+            let p = s[j];
             l += p;
             let vj = &v[(base + j) * d..(base + j) * d + d];
             for e in 0..d {
@@ -426,8 +438,12 @@ pub fn flash_attention_3(
                     *x *= c;
                 }
             }
+            for x in s[..n].iter_mut() {
+                *x = (*x - m_new) * LOG2_E;
+            }
+            exp2f_inplace(&mut s[..n]);
             for j in 0..n {
-                let p = expf(s[j] - m_new);
+                let p = s[j];
                 l += p;
                 let vj = &vb[j * d..j * d + d];
                 for e in 0..d {

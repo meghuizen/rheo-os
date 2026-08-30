@@ -1280,9 +1280,19 @@ the FMA (Rust does not contract, so neither may the vector tier) and an explicit
 NaN path (`f32 as i32` saturates while `vcvttps2dq` yields `i32::MIN`, which would
 take the underflow branch and return 0.0). It lives beside `fmath.rs` rather than in
 it because that file is `#[path]`-included **verbatim** by the kernel engine,
-`bench-core` and `tilelinux` - the same reason the vectorised exp is **not yet wired
-into `attn.rs`**, which is shared verbatim too and so cannot call a librheo-only
-dispatch (named, not half-done). Proven by `librheotile` on **all three ISAs**: the
+`bench-core` and `tilelinux`. **It IS wired into `attn.rs`**, which is shared
+verbatim too: `fmath` carries an installable hook (a `static` fn pointer defaulting
+to the scalar loop), the verbatim includers set nothing and get scalar, and a
+librheo cell installs the ifunc-resolved kernel from its crt0 - one relaxed load and
+an indirect call **per K-block**, not per element, which is why the bulk form exists.
+The three exponential loops became "scale in place, then one bulk call", `expf(x)`
+being `exp2f(x * LOG2_E)`, so the arithmetic and its order are untouched. **The
+bit-exactness that makes this safe also makes it invisible** - every oracle,
+including `smp`'s cross-substrate hash where a librheo cell and the `tilelinux`
+Linux binary must agree, passes identically with the kernel installed or not - so
+the observable is a counter: `librheotile` runs one real attention and asserts it
+was reached **20 times** (4 query rows x 5 K-blocks, hand-computed), 0 with
+`install` suppressed. Proven by `librheotile` on **all three ISAs**: the
 image carries IRELATIVE relocations (`pending() > 0`, which is what catches
 `--gc-sections` deleting a dispatched function nothing calls - the state the first
 attempt was in), the crt0 applied **all** of them, and the resolved kernel matches
@@ -1290,12 +1300,20 @@ scalar bit-for-bit over 1027 elements, deliberately not a multiple of 8 so the
 vector body and the scalar tail both run; x86-64 resolves to `avx2`, arm/riscv to
 `scalar`. Two controls observed firing (suppressing `apply_irel` gives `ifunc 0/1
 relocations applied`; corrupting one Horner coefficient makes the gate reject AVX2
-and fall back to scalar). Honest: one dispatched symbol today, and **`mem*` was
-rejected on measurement** rather than deferred - `compiler_builtins` already uses
-`rep movsb`/`rep movsq` on x86-64 and a word-at-a-time path with alignment handling
-elsewhere, so a hand-written SIMD `memcpy` would risk a regression while claiming a
-win; ARM64 with 16-byte NEON chunks is the case that might still pay and needs a
-benchmark first. AVX-512 is absent rather than written and unproven, since QEMU's
+and fall back to scalar). Honest: one dispatched symbol today, and **`mem*` is
+rejected with numbers** - `bench-core`'s new `p7_*` benches measure
+`compiler_builtins`' `memcpy` against a hand-written 32-byte word copy at two sizes
+in a 4:1 ratio (so an elided copy shows up as one that does not scale), and the
+hand-written one **loses on both ISAs**: 0.031 vs 0.199 instructions/byte on aarch64
+(**6.4x**) and 0.132 vs 0.335 on x86-64 (**2.5x**). The ARM64 half **inverted the
+hypothesis that prompted the benchmark** - it was named as the case that might pay,
+and the reason its `memcpy` has a byte prologue and an 8-byte loop is that both ARM64
+targets carry `+strict-align`, so `read_unaligned::<u64>` is byte loads and shifts
+rather than an `ldr x`; `compiler_builtins` is structured *for* that constraint, and
+copying wider only pays if it aligns first too. Named rather than implied: icount is a
+path length and `memcpy` on hardware is memory-bound, so any future win is a lab
+number, and a global `memcpy` ifunc carries an ordering hazard this one does not (the
+crt0 and every resolver would need auditing for implicit copies). AVX-512 is absent rather than written and unproven, since QEMU's
 TCG exposes AVX2 but not AVX-512 and the resolver's own gate could not run on it.
 
 **rheo-net N2d** (docs/NETSTACK.md 16) makes the network **receive** side as async
