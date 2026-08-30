@@ -856,8 +856,8 @@ unsafe fn copy_wide(mut dst: *mut u8, mut src: *const u8, mut n: usize) {
 fn bench_p7() {
     // SAFETY: single-threaded bench kernel; the statics are used only here.
     unsafe {
-        for i in 0..4096 {
-            MC_SRC[i] = i as u8;
+        for (i, b) in (*core::ptr::addr_of_mut!(MC_SRC)).iter_mut().enumerate() {
+            *b = i as u8;
         }
         let src = core::ptr::addr_of!(MC_SRC) as *const u8;
         let dst = core::ptr::addr_of_mut!(MC_DST) as *mut u8;
